@@ -11,6 +11,8 @@ The current slice implements:
 - block layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
+- a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
+- browser navigation, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
 It is a headless laboratory, not a web-compatible browser. The script runtime covers the demo's DOM and event path, while networking, media, accessibility, GPU APIs, WebAssembly, and the operating-system window remain outside this slice.
@@ -18,7 +20,7 @@ It is a headless laboratory, not a web-compatible browser. The script runtime co
 Run the deterministic demo from the repository root:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/demo.html --output target/ceri-engine-lab.bmp --width 800 --height 520 --click run-check
+cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/demo.html --url https://app.ceri.invalid/ --output target/ceri-engine-lab.bmp --width 800 --height 520 --click run-check
 ```
 
-The command executes inline scripts before layout and can dispatch a deterministic click with `--click ID`. It prints the layout tree, event result, console output, and number of non-background pixels. The output can be a plain PPM or BMP image, so the paint path does not depend on an image library.
+The command places the input into the engine's packaged resource bundle, navigates the app origin without opening a listener, executes inline scripts before layout, and can dispatch a deterministic click with `--click ID`. A missing extensionless route falls back to the packaged shell, while missing files receive an engine-owned recovery document. It prints the navigation result, layout tree, event result, console output, and number of non-background pixels. The output can be a plain PPM or BMP image, so the paint path does not depend on an image library.

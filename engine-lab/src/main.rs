@@ -1,39 +1,43 @@
-use ceri_engine_lab::{Document, ScriptRuntime, Size, Stylesheet, layout};
-use std::cell::RefCell;
+use ceri_engine_lab::{APP_ORIGIN, Browser, ResourceBundle, Size};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 struct Options {
     input: PathBuf,
     output: PathBuf,
     viewport: Size,
     clicks: Vec<String>,
+    url: String,
 }
 
 fn main() -> Result<(), String> {
     let options = parse_args(env::args_os().skip(1))?;
     let source = fs::read_to_string(&options.input)
         .map_err(|error| format!("could not read {}: {error}", options.input.display()))?;
-    let document = Rc::new(RefCell::new(
-        Document::parse(&source).map_err(|error| error.to_string())?,
-    ));
-    let mut runtime = ScriptRuntime::new(document.clone());
-    runtime
-        .execute_scripts()
+    let mut resources = ResourceBundle::default();
+    resources
+        .insert(
+            "/index.html",
+            "text/html; charset=utf-8",
+            source.into_bytes(),
+        )
         .map_err(|error| error.to_string())?;
+    let mut browser = Browser::new(resources);
+    let status = browser
+        .navigate(&options.url)
+        .map_err(|error| error.to_string())?;
+    println!("navigation {}: {status}", options.url);
     for id in &options.clicks {
-        let dispatched = runtime.click_id(id).map_err(|error| error.to_string())?;
+        let dispatched = browser.click_id(id).map_err(|error| error.to_string())?;
         println!(
             "click #{id}: {}",
             if dispatched { "handled" } else { "no listener" }
         );
     }
-    let stylesheet = Stylesheet::parse(&document.borrow().style_text())
-        .map_err(|error| format!("stylesheet error: {error}"))?;
-    let document = document.borrow();
-    let layout = layout(&document, &stylesheet, options.viewport);
+    let layout = browser
+        .layout(options.viewport)
+        .map_err(|error| error.to_string())?;
     let canvas = layout.paint();
     if let Some(parent) = options
         .output
@@ -63,7 +67,7 @@ fn main() -> Result<(), String> {
         canvas.non_background_pixels(),
         options.output.display()
     );
-    for log in runtime.logs() {
+    for log in browser.console_logs() {
         println!("console: {log}");
     }
     Ok(())
@@ -78,6 +82,7 @@ where
     let mut width = 800;
     let mut height = 520;
     let mut clicks = Vec::new();
+    let mut url = format!("{APP_ORIGIN}/");
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let argument = argument
@@ -89,9 +94,10 @@ where
             "--width" => width = parse_dimension(next_value(&mut args, "--width")?, "width")?,
             "--height" => height = parse_dimension(next_value(&mut args, "--height")?, "height")?,
             "--click" => clicks.push(next_value(&mut args, "--click")?),
+            "--url" => url = next_value(&mut args, "--url")?,
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--output FILE] [--width PX] [--height PX] [--click ID]"
+                    "usage: ceri-engine-lab --input FILE [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID]"
                 );
                 std::process::exit(0);
             }
@@ -103,6 +109,7 @@ where
         input,
         output,
         clicks,
+        url,
         viewport: Size {
             width: width as f32,
             height: height as f32,
