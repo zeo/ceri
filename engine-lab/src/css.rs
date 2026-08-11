@@ -4,6 +4,7 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
     Block,
+    Flex,
     Inline,
     None,
 }
@@ -121,6 +122,28 @@ pub(crate) enum FontWeight {
     Bold,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlexDirection {
+    Row,
+    Column,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JustifyContent {
+    FlexStart,
+    Center,
+    FlexEnd,
+    SpaceBetween,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlignItems {
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Style {
     pub display: Display,
@@ -136,6 +159,11 @@ pub(crate) struct Style {
     pub border_color: Color,
     pub text_align: TextAlign,
     pub font_weight: FontWeight,
+    pub flex_direction: FlexDirection,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    pub gap: Length,
+    pub flex_grow: f32,
 }
 
 impl Style {
@@ -159,6 +187,11 @@ impl Style {
             border_color: Color::transparent(),
             text_align: TextAlign::Left,
             font_weight: parent_weight,
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::FlexStart,
+            align_items: AlignItems::Stretch,
+            gap: Length::Px(0.0),
+            flex_grow: 0.0,
         };
         match name {
             "body" => {
@@ -413,6 +446,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "display" => {
             style.display = match value.trim().to_ascii_lowercase().as_str() {
                 "none" => Display::None,
+                "flex" => Display::Flex,
                 "inline" => Display::Inline,
                 _ => Display::Block,
             };
@@ -440,6 +474,36 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "font-weight" => {
             if value.trim().eq_ignore_ascii_case("bold") || value.trim() == "700" {
                 style.font_weight = FontWeight::Bold;
+            }
+        }
+        "flex-direction" => {
+            style.flex_direction = if value.trim().eq_ignore_ascii_case("column") {
+                FlexDirection::Column
+            } else {
+                FlexDirection::Row
+            };
+        }
+        "justify-content" => {
+            style.justify_content = match value.trim().to_ascii_lowercase().as_str() {
+                "center" => JustifyContent::Center,
+                "flex-end" | "end" => JustifyContent::FlexEnd,
+                "space-between" => JustifyContent::SpaceBetween,
+                _ => JustifyContent::FlexStart,
+            };
+        }
+        "align-items" => {
+            style.align_items = match value.trim().to_ascii_lowercase().as_str() {
+                "flex-start" | "start" => AlignItems::FlexStart,
+                "center" => AlignItems::Center,
+                "flex-end" | "end" => AlignItems::FlexEnd,
+                _ => AlignItems::Stretch,
+            };
+        }
+        "gap" | "row-gap" | "column-gap" => style.gap = parse_length(value).unwrap_or(style.gap),
+        "flex-grow" => style.flex_grow = parse_number(value).unwrap_or(style.flex_grow).max(0.0),
+        "flex" => {
+            if let Some(grow) = value.split_ascii_whitespace().find_map(parse_number) {
+                style.flex_grow = grow.max(0.0);
             }
         }
         "text-align" => {
@@ -540,6 +604,10 @@ fn parse_line_height(value: &str) -> Option<Length> {
     parse_length(value)
 }
 
+fn parse_number(value: &str) -> Option<f32> {
+    value.trim().parse().ok()
+}
+
 fn default_display(name: &str) -> Display {
     match name {
         "#document" | "html" | "body" | "address" | "article" | "aside" | "blockquote" | "div"
@@ -627,5 +695,27 @@ mod tests {
         assert_eq!(edges.right, Length::Px(2.0));
         assert_eq!(edges.bottom, Length::Px(3.0));
         assert_eq!(edges.left, Length::Px(4.0));
+    }
+
+    #[test]
+    fn parses_core_flex_properties() {
+        let stylesheet = Stylesheet::parse(
+            ".row { display: flex; flex-direction: column; justify-content: center; align-items: flex-end; gap: 12px; flex-grow: 2; }",
+        )
+        .expect("stylesheet should parse");
+        let element = Element::new("div");
+        let style =
+            stylesheet.style_for_inherited(&element, 16.0, Color::BLACK, FontWeight::Normal);
+        assert_eq!(style.display, Display::Block);
+        let mut element = Element::new("div");
+        element.attrs.insert("class".to_string(), "row".to_string());
+        let style =
+            stylesheet.style_for_inherited(&element, 16.0, Color::BLACK, FontWeight::Normal);
+        assert_eq!(style.display, Display::Flex);
+        assert_eq!(style.flex_direction, FlexDirection::Column);
+        assert_eq!(style.justify_content, JustifyContent::Center);
+        assert_eq!(style.align_items, AlignItems::FlexEnd);
+        assert_eq!(style.gap, Length::Px(12.0));
+        assert_eq!(style.flex_grow, 2.0);
     }
 }

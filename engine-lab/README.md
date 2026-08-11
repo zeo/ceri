@@ -8,7 +8,7 @@ The current slice implements:
 - HTML entity decoding for common named and numeric entities
 - CSS rules with tag, class, and id selectors
 - a deterministic cascade with selector specificity
-- block layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
+- block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
@@ -25,3 +25,9 @@ cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/demo.html 
 ```
 
 The command loads the asset root into the engine's packaged resource bundle, navigates the app origin without opening a listener, resolves the demo's external CSS and JavaScript, and can dispatch a deterministic click with `--click ID`. A missing extensionless route falls back to the packaged shell, while missing top-level or required subresources receive an engine-owned recovery document. It prints the navigation result, layout tree, event result, console output, and number of non-background pixels. The output can be a plain PPM or BMP image, so the paint path does not depend on an image library.
+
+The flex sample exercises row growth, gaps, column composition, and alignment:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/flex-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-flex-demo.bmp --width 800 --height 420
+```

@@ -1,0 +1,49 @@
+<!doctype html>
+<style>
+  body {
+    margin: 24px;
+    background-color: #07131f;
+    color: #d8eef2;
+  }
+  main {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 22px;
+    background-color: #102638;
+    border: 2px solid #2c6676;
+  }
+  h1 {
+    margin: 0;
+    color: #6ee7c5;
+    font-size: 26px;
+  }
+  p {
+    margin: 0;
+  }
+  .row {
+    display: flex;
+    gap: 12px;
+  }
+  .card {
+    flex-grow: 1;
+    padding: 14px;
+    color: #07131f;
+    background-color: #6ee7c5;
+  }
+  .card.gold {
+    background-color: #ffd479;
+  }
+  .card.blue {
+    background-color: #7fc8ff;
+  }
+</style>
+<main>
+  <h1>custom flex layout</h1>
+  <p>row growth, gap spacing, and column composition</p>
+  <div class="row">
+    <section class="card">one</section>
+    <section class="card gold">two</section>
+    <section class="card blue">three</section>
+  </div>
+</main>
