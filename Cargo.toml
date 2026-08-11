@@ -1,0 +1,45 @@
+[package]
+name = "ceri"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A Rust-owned desktop web runtime with a bundled Chromium engine"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ceri"
+path = "src/main.rs"
+
+[[bin]]
+name = "ceri_helper"
+path = "src/bin/ceri_helper.rs"
+
+[[bin]]
+name = "ceri_bundle"
+path = "src/bin/ceri_bundle.rs"
+
+[features]
+default = ["sandbox"]
+sandbox = ["cef/sandbox"]
+
+[package.metadata.cef.bundle]
+helper_name = "ceri_helper"
+
+[dependencies]
+cef = { version = "=150.2.1", features = ["build-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSEvent",
+    "NSResponder",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

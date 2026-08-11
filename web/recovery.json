@@ -1,0 +1,6 @@
+{
+  "status": "armed",
+  "strategy": "replace renderer once",
+  "preserves": ["local storage", "bundled assets"],
+  "attempts": 1
+}
