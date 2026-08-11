@@ -1,11 +1,15 @@
 use crate::css::Stylesheet;
-use crate::dom::Document;
+use crate::dom::{Document, ScriptSource, StylesheetSource};
 use crate::layout::{LayoutDocument, Size, layout as build_layout};
 use crate::paint::Canvas;
 use crate::script::ScriptRuntime;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub const APP_ORIGIN: &str = "https://app.ceri.invalid";
@@ -66,6 +70,47 @@ impl AppUrl {
     pub fn fragment(&self) -> &str {
         &self.fragment
     }
+
+    pub fn resolve(&self, reference: &str) -> Result<Self, NavigationError> {
+        if reference.contains("://") {
+            return Self::parse(reference);
+        }
+        let (target, fragment) = reference
+            .split_once('#')
+            .map_or((reference, ""), |(target, fragment)| (target, fragment));
+        let (raw_path, query, query_present) = target
+            .split_once('?')
+            .map_or((target, "", false), |(path, query)| (path, query, true));
+        let path = if raw_path.is_empty() {
+            self.path.clone()
+        } else if raw_path.starts_with('/') {
+            raw_path.to_string()
+        } else {
+            let directory = if self.path.ends_with('/') {
+                self.path.as_str()
+            } else {
+                self.path.rsplit_once('/').map_or("/", |(directory, _)| {
+                    if directory.is_empty() { "/" } else { directory }
+                })
+            };
+            if directory == "/" {
+                format!("/{raw_path}")
+            } else {
+                format!("{directory}/{raw_path}")
+            }
+        };
+        Ok(Self {
+            path: resolve_reference_path(&path)?,
+            query: if query_present {
+                query.to_string()
+            } else if raw_path.is_empty() {
+                self.query.clone()
+            } else {
+                String::new()
+            },
+            fragment: fragment.to_string(),
+        })
+    }
 }
 
 impl fmt::Display for AppUrl {
@@ -110,6 +155,20 @@ pub struct ResourceBundle {
 }
 
 impl ResourceBundle {
+    pub fn from_directory(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = fs::canonicalize(root)?;
+        if !fs::metadata(&root)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource root is not a directory",
+            ));
+        }
+        let mut resources = Self::default();
+        let mut visited = BTreeSet::new();
+        collect_directory(&root, &root, &mut resources, &mut visited)?;
+        Ok(resources)
+    }
+
     pub fn insert(
         &mut self,
         path: &str,
@@ -142,6 +201,13 @@ impl ResourceBundle {
             return Ok(resource.clone());
         }
         Err(NavigationError::ResourceNotFound(url.path().to_string()))
+    }
+
+    fn load_subresource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
+        self.resources
+            .get(url.path())
+            .cloned()
+            .ok_or_else(|| NavigationError::ResourceNotFound(url.path().to_string()))
     }
 }
 
@@ -191,6 +257,8 @@ pub enum NavigationError {
     EmptySegment,
     InvalidResourcePath(String),
     ResourceNotFound(String),
+    UnsupportedMimeType { path: String, mime_type: String },
+    InvalidUtf8(String),
     Script(String),
     Stylesheet(String),
     NoPage,
@@ -221,6 +289,13 @@ impl fmt::Display for NavigationError {
             Self::EmptySegment => formatter.write_str("empty path segments are not allowed"),
             Self::InvalidResourcePath(path) => write!(formatter, "invalid resource path: {path}"),
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
+            Self::UnsupportedMimeType { path, mime_type } => {
+                write!(
+                    formatter,
+                    "unsupported resource type for {path}: {mime_type}"
+                )
+            }
+            Self::InvalidUtf8(path) => write!(formatter, "resource is not UTF-8: {path}"),
             Self::Script(detail) => write!(formatter, "script execution failed: {detail}"),
             Self::Stylesheet(detail) => write!(formatter, "stylesheet parsing failed: {detail}"),
             Self::NoPage => formatter.write_str("the browser has no loaded page"),
@@ -233,6 +308,7 @@ impl std::error::Error for NavigationError {}
 struct Page {
     document: Rc<RefCell<Document>>,
     runtime: ScriptRuntime,
+    stylesheet: String,
 }
 
 pub struct Browser {
@@ -290,14 +366,28 @@ impl Browser {
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
+        let stylesheet_sources = document.borrow().stylesheet_sources();
+        let stylesheet = match self.load_stylesheets(&url, &stylesheet_sources) {
+            Ok(stylesheet) => stylesheet,
+            Err(error) => {
+                self.install_error_page(&url, 500, &error.to_string());
+                self.record_navigation(url);
+                return Ok(NavigationStatus::ErrorPage { status: 500 });
+            }
+        };
+        let script_sources = document.borrow().script_sources();
         let mut runtime = ScriptRuntime::new(document.clone());
-        if let Err(error) = runtime.execute_scripts() {
+        if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             self.install_error_page(&url, 500, &error.to_string());
             self.record_navigation(url);
             return Ok(NavigationStatus::ErrorPage { status: 500 });
         }
 
-        self.page = Some(Page { document, runtime });
+        self.page = Some(Page {
+            document,
+            runtime,
+            stylesheet,
+        });
         self.record_navigation(url);
         Ok(NavigationStatus::Loaded)
     }
@@ -334,10 +424,11 @@ impl Browser {
     }
 
     pub fn layout(&self, viewport: Size) -> Result<LayoutDocument, NavigationError> {
-        let document = self.document()?;
+        let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+        let document = page.document.clone();
         let document = document.borrow();
         let stylesheet =
-            Stylesheet::parse(&document.style_text()).map_err(NavigationError::Stylesheet)?;
+            Stylesheet::parse(&page.stylesheet).map_err(NavigationError::Stylesheet)?;
         Ok(build_layout(&document, &stylesheet, viewport))
     }
 
@@ -354,14 +445,75 @@ impl Browser {
         self.history.push(url);
     }
 
+    fn load_stylesheets(
+        &self,
+        base: &AppUrl,
+        sources: &[StylesheetSource],
+    ) -> Result<String, NavigationError> {
+        let mut stylesheet = String::new();
+        for source in sources {
+            let source = match source {
+                StylesheetSource::Inline(source) => source.clone(),
+                StylesheetSource::External(reference) => {
+                    let url = base.resolve(reference)?;
+                    let resource = self.resources.load_subresource(&url)?;
+                    if !is_css(&resource) {
+                        return Err(NavigationError::UnsupportedMimeType {
+                            path: url.path().to_string(),
+                            mime_type: resource.mime_type,
+                        });
+                    }
+                    String::from_utf8(resource.body)
+                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?
+                }
+            };
+            if !stylesheet.is_empty() {
+                stylesheet.push('\n');
+            }
+            stylesheet.push_str(&source);
+        }
+        Ok(stylesheet)
+    }
+
+    fn execute_scripts(
+        &self,
+        base: &AppUrl,
+        sources: &[ScriptSource],
+        runtime: &mut ScriptRuntime,
+    ) -> Result<(), NavigationError> {
+        for source in sources {
+            let source = match source {
+                ScriptSource::Inline(source) => source.clone(),
+                ScriptSource::External(reference) => {
+                    let url = base.resolve(reference)?;
+                    let resource = self.resources.load_subresource(&url)?;
+                    if !is_javascript(&resource) {
+                        return Err(NavigationError::UnsupportedMimeType {
+                            path: url.path().to_string(),
+                            mime_type: resource.mime_type,
+                        });
+                    }
+                    String::from_utf8(resource.body)
+                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?
+                }
+            };
+            runtime
+                .execute(&source)
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn install_error_page(&mut self, url: &AppUrl, status: u16, detail: &str) {
         let source = error_page_source(status, &url.to_string(), detail);
         let document = Rc::new(RefCell::new(
             Document::parse(&source).expect("built-in recovery document should parse"),
         ));
+        let stylesheet = document.borrow().style_text();
         self.page = Some(Page {
             runtime: ScriptRuntime::new(document.clone()),
             document,
+            stylesheet,
         });
     }
 }
@@ -372,6 +524,26 @@ fn is_html(resource: &Resource) -> bool {
         .split(';')
         .next()
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+}
+
+fn is_css(resource: &Resource) -> bool {
+    resource
+        .mime_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/css"))
+}
+
+fn is_javascript(resource: &Resource) -> bool {
+    resource.mime_type.split(';').next().is_some_and(|mime| {
+        matches!(
+            mime.trim().to_ascii_lowercase().as_str(),
+            "text/javascript"
+                | "application/javascript"
+                | "application/ecmascript"
+                | "text/ecmascript"
+        )
+    })
 }
 
 fn error_page_source(status: u16, url: &str, detail: &str) -> String {
@@ -405,6 +577,39 @@ fn normalize_resource_path(path: &str) -> Result<String, NavigationError> {
 }
 
 fn decode_path(raw_path: &str) -> Result<String, NavigationError> {
+    let path = decode_path_bytes(raw_path)?;
+    validate_path(&path)?;
+    Ok(path)
+}
+
+fn resolve_reference_path(raw_path: &str) -> Result<String, NavigationError> {
+    let path = decode_path_bytes(raw_path)?;
+    let mut segments = Vec::new();
+    for segment in path
+        .strip_prefix('/')
+        .ok_or_else(|| NavigationError::InvalidUrl(path.clone()))?
+        .split('/')
+    {
+        match segment {
+            "" => return Err(NavigationError::EmptySegment),
+            "." => {}
+            ".." => {
+                if segments.pop().is_none() {
+                    return Err(NavigationError::DotSegment);
+                }
+            }
+            segment => segments.push(segment),
+        }
+    }
+    let mut normalized = format!("/{}", segments.join("/"));
+    if path.ends_with('/') && normalized != "/" {
+        normalized.push('/');
+    }
+    validate_path(&normalized)?;
+    Ok(normalized)
+}
+
+fn decode_path_bytes(raw_path: &str) -> Result<String, NavigationError> {
     if !raw_path.starts_with('/') {
         return Err(NavigationError::InvalidUrl(raw_path.to_string()));
     }
@@ -432,9 +637,7 @@ fn decode_path(raw_path: &str) -> Result<String, NavigationError> {
         decoded.push(byte);
         cursor += 1;
     }
-    let path = String::from_utf8(decoded).map_err(|_| NavigationError::UnsafeCharacter)?;
-    validate_path(&path)?;
-    Ok(path)
+    String::from_utf8(decoded).map_err(|_| NavigationError::UnsafeCharacter)
 }
 
 fn reject_path_byte(byte: u8, encoded: bool) -> Result<(), NavigationError> {
@@ -498,6 +701,110 @@ fn is_windows_device_name(segment: &str) -> bool {
         )
 }
 
+fn collect_directory(
+    root: &Path,
+    directory: &Path,
+    resources: &mut ResourceBundle,
+    visited: &mut BTreeSet<PathBuf>,
+) -> io::Result<()> {
+    let canonical_directory = fs::canonicalize(directory)?;
+    if !canonical_directory.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "resource directory escapes the bundle root",
+        ));
+    }
+    if !visited.insert(canonical_directory) {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| matches!(name, ".git" | "target"))
+        {
+            continue;
+        }
+        let canonical_path = fs::canonicalize(&path)?;
+        if !canonical_path.starts_with(root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "resource path escapes the bundle root",
+            ));
+        }
+        if canonical_path.is_dir() {
+            collect_directory(root, &path, resources, visited)?;
+            continue;
+        }
+        if !canonical_path.is_file() {
+            continue;
+        }
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resource path is not relative to the bundle root",
+            )
+        })?;
+        let url_path = relative_url_path(relative)?;
+        let body = fs::read(&path)?;
+        resources
+            .insert(&url_path, mime_type_for(&path), body)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn relative_url_path(path: &Path) -> io::Result<String> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resource path contains a non-normal component",
+            ));
+        };
+        let segment = component.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resource path is not valid UTF-8",
+            )
+        })?;
+        segments.push(segment);
+    }
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resource path is empty",
+        ));
+    }
+    Ok(format!("/{}", segments.join("/")))
+}
+
+fn mime_type_for(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "css" => "text/css",
+        "htm" | "html" => "text/html",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "wasm" => "application/wasm",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -524,6 +831,27 @@ mod tests {
     }
 
     #[test]
+    fn loads_a_packaged_directory_without_build_outputs() {
+        let resources =
+            ResourceBundle::from_directory(env!("CARGO_MANIFEST_DIR")).expect("root should load");
+        assert_eq!(
+            resources
+                .resource("/demo.css")
+                .expect("demo stylesheet should be packaged")
+                .mime_type(),
+            "text/css"
+        );
+        assert_eq!(
+            resources
+                .resource("/demo.js")
+                .expect("demo script should be packaged")
+                .mime_type(),
+            "text/javascript"
+        );
+        assert!(resources.resource("/target/debug/engine-lab.exe").is_none());
+    }
+
+    #[test]
     fn parses_app_urls_without_a_loopback_authority() {
         let url = AppUrl::parse("HTTPS://APP.CERI.INVALID/docs/intro%2Ehtml?q=rust#top")
             .expect("app URL should parse");
@@ -533,6 +861,43 @@ mod tests {
         assert_eq!(
             url.to_string(),
             "https://app.ceri.invalid/docs/intro.html?q=rust#top"
+        );
+    }
+
+    #[test]
+    fn resolves_same_origin_resource_references() {
+        let base = AppUrl::parse("https://app.ceri.invalid/docs/index.html?q=rust#top")
+            .expect("base URL should parse");
+        assert_eq!(
+            base.resolve("theme.css")
+                .expect("relative URL should resolve")
+                .path(),
+            "/docs/theme.css"
+        );
+        assert_eq!(
+            base.resolve("../theme.css")
+                .expect("parent URL should resolve")
+                .path(),
+            "/theme.css"
+        );
+        assert_eq!(
+            base.resolve("/assets/app.js")
+                .expect("root URL should resolve")
+                .path(),
+            "/assets/app.js"
+        );
+        let query = base.resolve("?version=2").expect("query should resolve");
+        assert_eq!(query.path(), "/docs/index.html");
+        assert_eq!(query.query(), "version=2");
+        assert_eq!(query.fragment(), "");
+        let fragment = base.resolve("#section").expect("fragment should resolve");
+        assert_eq!(fragment.path(), "/docs/index.html");
+        assert_eq!(fragment.query(), "q=rust");
+        assert_eq!(fragment.fragment(), "section");
+        assert_eq!(
+            base.resolve("https://other.invalid/app.js")
+                .expect_err("cross-origin URL should fail"),
+            NavigationError::WrongOrigin
         );
     }
 
@@ -692,6 +1057,77 @@ mod tests {
                 .style_property(&status, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn loads_external_styles_and_scripts_in_document_order() {
+        let mut resources = bundle(
+            r#"<link rel="stylesheet" href="/assets/theme.css"><p id="status">idle</p><script src="/assets/boot.js"></script><script>document.getElementById("status").textContent = message;</script>"#,
+        );
+        resources
+            .insert(
+                "/assets/theme.css",
+                "text/css",
+                b"p { color: #42d3b4; }".to_vec(),
+            )
+            .expect("stylesheet should be accepted");
+        resources
+            .insert(
+                "/assets/boot.js",
+                "text/javascript; charset=utf-8",
+                b"const message = \"external script ready\";".to_vec(),
+            )
+            .expect("script should be accepted");
+        let mut browser = Browser::new(resources);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("external script ready")
+        );
+        let layout = browser
+            .layout(Size {
+                width: 320.0,
+                height: 120.0,
+            })
+            .expect("page should layout");
+        assert_eq!(
+            layout.root.children[0].text[0].color,
+            crate::Color::opaque(66, 211, 180)
+        );
+    }
+
+    #[test]
+    fn missing_external_resources_use_the_recovery_document() {
+        let mut browser = Browser::new(bundle(
+            r#"<link rel="stylesheet" href="/assets/missing.css"><p>home</p>"#,
+        ));
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("missing subresource should become recovery page"),
+            NavigationStatus::ErrorPage { status: 500 }
+        );
+        let document = browser.document().unwrap();
+        let recovery = document
+            .borrow()
+            .find_element_by_id("recovery")
+            .expect("recovery element should exist");
+        assert_eq!(
+            document
+                .borrow()
+                .element_attribute(&recovery, "data-status"),
+            Some("500".to_string())
         );
     }
 

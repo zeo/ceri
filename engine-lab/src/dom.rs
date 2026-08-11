@@ -19,6 +19,18 @@ pub enum Node {
     Text(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptSource {
+    Inline(String),
+    External(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StylesheetSource {
+    Inline(String),
+    External(String),
+}
+
 pub type NodePath = Vec<usize>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +109,18 @@ impl Document {
         let mut scripts = Vec::new();
         collect_script_text(&self.root, &mut scripts);
         scripts
+    }
+
+    pub fn script_sources(&self) -> Vec<ScriptSource> {
+        let mut scripts = Vec::new();
+        collect_script_sources(&self.root, &mut scripts);
+        scripts
+    }
+
+    pub fn stylesheet_sources(&self) -> Vec<StylesheetSource> {
+        let mut stylesheets = Vec::new();
+        collect_stylesheet_sources(&self.root, &mut stylesheets);
+        stylesheets
     }
 
     pub fn find_element_by_id(&self, id: &str) -> Option<NodePath> {
@@ -256,6 +280,44 @@ fn collect_script_text(element: &Element, scripts: &mut Vec<String>) {
     for child in &element.children {
         if let Node::Element(child) = child {
             collect_script_text(child, scripts);
+        }
+    }
+}
+
+fn collect_script_sources(element: &Element, scripts: &mut Vec<ScriptSource>) {
+    if element.name == "script" {
+        if let Some(source) = element.attr("src") {
+            scripts.push(ScriptSource::External(source.to_string()));
+        } else {
+            let mut script = String::new();
+            collect_text_nodes(element, &mut script);
+            scripts.push(ScriptSource::Inline(script));
+        }
+    }
+    for child in &element.children {
+        if let Node::Element(child) = child {
+            collect_script_sources(child, scripts);
+        }
+    }
+}
+
+fn collect_stylesheet_sources(element: &Element, stylesheets: &mut Vec<StylesheetSource>) {
+    if element.name == "style" {
+        let mut stylesheet = String::new();
+        collect_text_nodes(element, &mut stylesheet);
+        stylesheets.push(StylesheetSource::Inline(stylesheet));
+    } else if element.name == "link"
+        && element.attr("rel").is_some_and(|rel| {
+            rel.split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+        })
+        && let Some(href) = element.attr("href")
+    {
+        stylesheets.push(StylesheetSource::External(href.to_string()));
+    }
+    for child in &element.children {
+        if let Node::Element(child) = child {
+            collect_stylesheet_sources(child, stylesheets);
         }
     }
 }
@@ -669,5 +731,27 @@ mod tests {
         assert!(document.find_element_by_selector(".accent").is_some());
         assert!(document.find_element_by_selector("#second").is_some());
         assert!(document.find_element_by_selector(".missing").is_none());
+    }
+
+    #[test]
+    fn preserves_document_order_for_external_sources() {
+        let document = Document::parse(
+            "<link rel='StyleSheet' href='/theme.css'><style>p { color: red; }</style><script src='/boot.js'></script><script>console.log('inline');</script>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            document.stylesheet_sources(),
+            vec![
+                StylesheetSource::External("/theme.css".to_string()),
+                StylesheetSource::Inline("p { color: red; }".to_string()),
+            ]
+        );
+        assert_eq!(
+            document.script_sources(),
+            vec![
+                ScriptSource::External("/boot.js".to_string()),
+                ScriptSource::Inline("console.log('inline');".to_string()),
+            ]
+        );
     }
 }

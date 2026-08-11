@@ -1,7 +1,7 @@
 use ceri_engine_lab::{APP_ORIGIN, Browser, ResourceBundle, Size};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct Options {
     input: PathBuf,
@@ -9,13 +9,31 @@ struct Options {
     viewport: Size,
     clicks: Vec<String>,
     url: String,
+    asset_root: Option<PathBuf>,
 }
 
 fn main() -> Result<(), String> {
     let options = parse_args(env::args_os().skip(1))?;
     let source = fs::read_to_string(&options.input)
         .map_err(|error| format!("could not read {}: {error}", options.input.display()))?;
-    let mut resources = ResourceBundle::default();
+    let asset_root = options
+        .asset_root
+        .as_deref()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            options
+                .input
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut resources = ResourceBundle::from_directory(&asset_root).map_err(|error| {
+        format!(
+            "could not read asset root {}: {error}",
+            asset_root.display()
+        )
+    })?;
     resources
         .insert(
             "/index.html",
@@ -83,6 +101,7 @@ where
     let mut height = 520;
     let mut clicks = Vec::new();
     let mut url = format!("{APP_ORIGIN}/");
+    let mut asset_root = None;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let argument = argument
@@ -95,9 +114,12 @@ where
             "--height" => height = parse_dimension(next_value(&mut args, "--height")?, "height")?,
             "--click" => clicks.push(next_value(&mut args, "--click")?),
             "--url" => url = next_value(&mut args, "--url")?,
+            "--asset-root" => {
+                asset_root = Some(PathBuf::from(next_value(&mut args, "--asset-root")?))
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID]"
+                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID]"
                 );
                 std::process::exit(0);
             }
@@ -110,6 +132,7 @@ where
         output,
         clicks,
         url,
+        asset_root,
         viewport: Size {
             width: width as f32,
             height: height as f32,
