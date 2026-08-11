@@ -19,6 +19,8 @@ pub enum Node {
     Text(String),
 }
 
+pub type NodePath = Vec<usize>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
     pub offset: usize,
@@ -90,6 +92,116 @@ impl Document {
         collect_style_text(&self.root, &mut output);
         output
     }
+
+    pub fn script_text(&self) -> Vec<String> {
+        let mut scripts = Vec::new();
+        collect_script_text(&self.root, &mut scripts);
+        scripts
+    }
+
+    pub fn find_element_by_id(&self, id: &str) -> Option<NodePath> {
+        find_element_by_id(&self.root, id, &mut Vec::new())
+    }
+
+    pub fn find_element_by_selector(&self, selector: &str) -> Option<NodePath> {
+        let selector = selector.trim();
+        let (kind, value) = if selector.starts_with('#') || selector.starts_with('.') {
+            (selector.chars().next()?, &selector[1..])
+        } else {
+            ('t', selector)
+        };
+        find_element_by_simple_selector(&self.root, kind, value, &mut Vec::new())
+    }
+
+    pub fn element_text_content(&self, path: &[usize]) -> Option<String> {
+        let element = self.element_at(path)?;
+        let mut text = String::new();
+        collect_text_nodes(element, &mut text);
+        Some(text)
+    }
+
+    pub fn set_element_text_content(&mut self, path: &[usize], text: String) -> bool {
+        let Some(element) = self.element_at_mut(path) else {
+            return false;
+        };
+        element.children = vec![Node::Text(text)];
+        true
+    }
+
+    pub fn element_attribute(&self, path: &[usize], name: &str) -> Option<String> {
+        self.element_at(path)
+            .and_then(|element| element.attr(name).map(str::to_string))
+    }
+
+    pub fn set_element_attribute(&mut self, path: &[usize], name: &str, value: String) -> bool {
+        let Some(element) = self.element_at_mut(path) else {
+            return false;
+        };
+        element.attrs.insert(name.to_ascii_lowercase(), value);
+        true
+    }
+
+    pub fn style_property(&self, path: &[usize], property: &str) -> Option<String> {
+        let style = self.element_attribute(path, "style")?;
+        let property = css_property_name(property);
+        style.split(';').find_map(|declaration| {
+            let (name, value) = declaration.split_once(':')?;
+            (name.trim().eq_ignore_ascii_case(&property)).then(|| value.trim().to_string())
+        })
+    }
+
+    pub fn set_style_property(&mut self, path: &[usize], property: &str, value: String) -> bool {
+        let Some(element) = self.element_at_mut(path) else {
+            return false;
+        };
+        let property = css_property_name(property);
+        let mut declarations = element
+            .attr("style")
+            .unwrap_or("")
+            .split(';')
+            .filter_map(|declaration| {
+                let (name, value) = declaration.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(declaration) = declarations
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&property))
+        {
+            declaration.1 = value;
+        } else {
+            declarations.push((property, value));
+        }
+        let style = declarations
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        element.attrs.insert("style".to_string(), style);
+        true
+    }
+
+    fn element_at(&self, path: &[usize]) -> Option<&Element> {
+        let mut element = &self.root;
+        for &index in path {
+            element = match element.children.get(index)? {
+                Node::Element(child) => child,
+                Node::Text(_) => return None,
+            };
+        }
+        Some(element)
+    }
+
+    fn element_at_mut(&mut self, path: &[usize]) -> Option<&mut Element> {
+        let mut element = &mut self.root;
+        for &index in path {
+            element = match element.children.get_mut(index)? {
+                Node::Element(child) => child,
+                Node::Text(_) => return None,
+            };
+        }
+        Some(element)
+    }
 }
 
 impl Element {
@@ -133,6 +245,77 @@ fn collect_style_text(element: &Element, output: &mut String) {
             collect_style_text(child, output);
         }
     }
+}
+
+fn collect_script_text(element: &Element, scripts: &mut Vec<String>) {
+    if element.name == "script" && element.attr("src").is_none() {
+        let mut script = String::new();
+        collect_text_nodes(element, &mut script);
+        scripts.push(script);
+    }
+    for child in &element.children {
+        if let Node::Element(child) = child {
+            collect_script_text(child, scripts);
+        }
+    }
+}
+
+fn find_element_by_id(element: &Element, id: &str, path: &mut NodePath) -> Option<NodePath> {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        if child.attr("id") == Some(id) {
+            return Some(path.clone());
+        }
+        if let Some(found) = find_element_by_id(child, id, path) {
+            return Some(found);
+        }
+        path.pop();
+    }
+    None
+}
+
+fn find_element_by_simple_selector(
+    element: &Element,
+    kind: char,
+    value: &str,
+    path: &mut NodePath,
+) -> Option<NodePath> {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        let matches = match kind {
+            '#' => child.attr("id") == Some(value),
+            '.' => child.has_class(value),
+            't' => child.name == value.to_ascii_lowercase(),
+            _ => false,
+        };
+        if matches {
+            return Some(path.clone());
+        }
+        if let Some(found) = find_element_by_simple_selector(child, kind, value, path) {
+            return Some(found);
+        }
+        path.pop();
+    }
+    None
+}
+
+fn css_property_name(property: &str) -> String {
+    let mut output = String::with_capacity(property.len() + 2);
+    for character in property.chars() {
+        if character.is_ascii_uppercase() {
+            output.push('-');
+            output.push(character.to_ascii_lowercase());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn collect_text_nodes(element: &Element, output: &mut String) {
@@ -195,10 +378,23 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
         } else {
             let (name, attrs, self_closing) = parse_start_tag(raw, start)?;
             tokens.push(Token::Start {
-                name,
+                name: name.clone(),
                 attrs,
                 self_closing,
             });
+            if !self_closing && matches!(name.as_str(), "script" | "style") {
+                let rest = &source[end + 1..];
+                let marker = format!("</{name}");
+                let lower = rest.to_ascii_lowercase();
+                if let Some(close_start) = lower.find(&marker) {
+                    let raw_text = &rest[..close_start];
+                    if !raw_text.is_empty() {
+                        tokens.push(Token::Text(raw_text.to_string()));
+                    }
+                    cursor = end + 1 + close_start;
+                    continue;
+                }
+            }
         }
         cursor = end + 1;
     }
@@ -429,5 +625,49 @@ mod tests {
     fn rejects_unterminated_tags() {
         let error = Document::parse("<main").expect_err("unterminated tag should fail");
         assert!(error.message.contains("unterminated tag"));
+    }
+
+    #[test]
+    fn preserves_script_text_that_contains_comparison_operators() {
+        let document = Document::parse(
+            "<script>if (count < 2) { count = count + 1; }</script><button id='go'>go</button>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            document.script_text(),
+            vec!["if (count < 2) { count = count + 1; }".to_string()]
+        );
+    }
+
+    #[test]
+    fn mutates_text_and_style_through_a_stable_path() {
+        let mut document = Document::parse("<button id='go' style='color: red'>go</button>")
+            .expect("document should parse");
+        let path = document
+            .find_element_by_id("go")
+            .expect("button should exist");
+        assert!(document.set_element_text_content(&path, "done".to_string()));
+        assert!(document.set_style_property(&path, "backgroundColor", "#fff".to_string()));
+        assert_eq!(
+            document.element_text_content(&path).as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            document
+                .style_property(&path, "background-color")
+                .as_deref(),
+            Some("#fff")
+        );
+    }
+
+    #[test]
+    fn finds_simple_selectors() {
+        let document =
+            Document::parse("<main><p class='accent'>first</p><p id='second'>second</p></main>")
+                .expect("document should parse");
+        assert!(document.find_element_by_selector("p").is_some());
+        assert!(document.find_element_by_selector(".accent").is_some());
+        assert!(document.find_element_by_selector("#second").is_some());
+        assert!(document.find_element_by_selector(".missing").is_none());
     }
 }

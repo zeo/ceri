@@ -34,6 +34,14 @@
         height: 14px;
         background-color: #42d3b4;
       }
+      button {
+        display: block;
+        margin: 18px 0 10px;
+        padding: 8px 12px;
+        color: #07131f;
+        background-color: #6ee7c5;
+        border: 0;
+      }
     </style>
   </head>
   <body>
@@ -42,7 +50,17 @@
       <p>A custom parser, cascade, layout, and paint pipeline.</p>
       <p class="accent">No CEF. No WebKit. No browser engine dependency.</p>
       <div class="meter"><span class="fill"></span></div>
-      <p>first vertical slice / software paint / deterministic output</p>
+      <button id="run-check">run custom script</button>
+      <p id="status">first vertical slice / software paint / deterministic output</p>
     </main>
   </body>
+  <script>
+    const button = document.getElementById("run-check");
+    const status = document.getElementById("status");
+    button.addEventListener("click", () => {
+      status.textContent = "custom script handled the click";
+      status.style.color = "#6ee7c5";
+    });
+    console.log("custom script runtime ready");
+  </script>
 </html>

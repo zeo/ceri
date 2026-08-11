@@ -1,21 +1,38 @@
-use ceri_engine_lab::{Document, Size, Stylesheet, layout};
+use ceri_engine_lab::{Document, ScriptRuntime, Size, Stylesheet, layout};
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 struct Options {
     input: PathBuf,
     output: PathBuf,
     viewport: Size,
+    clicks: Vec<String>,
 }
 
 fn main() -> Result<(), String> {
     let options = parse_args(env::args_os().skip(1))?;
     let source = fs::read_to_string(&options.input)
         .map_err(|error| format!("could not read {}: {error}", options.input.display()))?;
-    let document = Document::parse(&source).map_err(|error| error.to_string())?;
-    let stylesheet = Stylesheet::parse(&document.style_text())
+    let document = Rc::new(RefCell::new(
+        Document::parse(&source).map_err(|error| error.to_string())?,
+    ));
+    let mut runtime = ScriptRuntime::new(document.clone());
+    runtime
+        .execute_scripts()
+        .map_err(|error| error.to_string())?;
+    for id in &options.clicks {
+        let dispatched = runtime.click_id(id).map_err(|error| error.to_string())?;
+        println!(
+            "click #{id}: {}",
+            if dispatched { "handled" } else { "no listener" }
+        );
+    }
+    let stylesheet = Stylesheet::parse(&document.borrow().style_text())
         .map_err(|error| format!("stylesheet error: {error}"))?;
+    let document = document.borrow();
     let layout = layout(&document, &stylesheet, options.viewport);
     let canvas = layout.paint();
     if let Some(parent) = options
@@ -46,6 +63,9 @@ fn main() -> Result<(), String> {
         canvas.non_background_pixels(),
         options.output.display()
     );
+    for log in runtime.logs() {
+        println!("console: {log}");
+    }
     Ok(())
 }
 
@@ -57,6 +77,7 @@ where
     let mut output = PathBuf::from("target/ceri-engine-lab.ppm");
     let mut width = 800;
     let mut height = 520;
+    let mut clicks = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let argument = argument
@@ -67,9 +88,10 @@ where
             "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
             "--width" => width = parse_dimension(next_value(&mut args, "--width")?, "width")?,
             "--height" => height = parse_dimension(next_value(&mut args, "--height")?, "height")?,
+            "--click" => clicks.push(next_value(&mut args, "--click")?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--output FILE] [--width PX] [--height PX]"
+                    "usage: ceri-engine-lab --input FILE [--output FILE] [--width PX] [--height PX] [--click ID]"
                 );
                 std::process::exit(0);
             }
@@ -80,6 +102,7 @@ where
     Ok(Options {
         input,
         output,
+        clicks,
         viewport: Size {
             width: width as f32,
             height: height as f32,

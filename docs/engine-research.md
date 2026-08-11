@@ -85,9 +85,9 @@ CEF remains the comparison baseline. The Servo experiment should report pass cou
 
 ## First experiment
 
-The first implementation is the separate `engine-lab` crate in this repository. It has no CEF, WebKit, Servo, JavaScript engine, GUI, or image-library dependency. Its current slice includes an HTML tokenizer and DOM tree, common entity decoding, CSS tag/class/id selectors, selector specificity, inherited text styles, block layout, inline text wrapping, borders, colors, a software paint step, a built-in bitmap font, PPM output, and a textual layout dump.
+The first implementation is the separate `engine-lab` crate in this repository. It has no CEF, WebKit, Servo, third-party JavaScript engine, GUI, or image-library dependency. Its current slice includes an HTML tokenizer and DOM tree, common entity decoding, CSS tag/class/id selectors, selector specificity, inherited text styles, block layout, inline text wrapping, borders, colors, a software paint step, a built-in bitmap font, a small JavaScript-like runtime with DOM mutation, console logging, click events, PPM or BMP output, and a textual layout dump.
 
-The custom renderer is intentionally headless. JavaScript, networking, media, accessibility, GPU APIs, and the operating-system window are future gates. The existing continuity page remains the compatibility target, but it must first be rendered through the custom pipeline before any engine adapter is attempted.
+The custom renderer is intentionally headless. The script runtime is limited to the syntax and DOM surface needed by the laboratory demo. Networking, media, accessibility, GPU APIs, WebAssembly, and the operating-system window are future gates. The existing continuity page remains the compatibility target, but it must first be rendered through the custom pipeline before any engine adapter is attempted.
 
 The experiment is useful even when a gate fails. A failure at a named gate tells us whether Ceri's stable contract is missing an abstraction. A passing slice gives us a measured basis for deciding whether to grow the custom engine or use Servo for that layer.
 
