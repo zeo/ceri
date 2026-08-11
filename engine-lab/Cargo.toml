@@ -1,0 +1,15 @@
+[package]
+name = "ceri-engine-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "An isolated from-scratch browser engine laboratory"
+
+[lib]
+name = "ceri_engine_lab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ceri-engine-lab"
+path = "src/main.rs"

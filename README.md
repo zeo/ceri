@@ -62,3 +62,9 @@ Ceri verifies the entry document before CEF initializes. Every packaged app docu
 The resolver rejects encoded separators, traversal, malformed UTF-8, Windows device names, invalid path characters, symlink escapes, and ambiguous empty path segments. Top-level extensionless routes may use the packaged `index.html`; missing subresources never fall back to the app shell.
 
 See [docs/architecture.md](docs/architecture.md) for the process model and security boundaries.
+
+## Custom engine laboratory
+
+The isolated [engine-lab](engine-lab/README.md) crate is a from-scratch Rust rendering experiment. It currently parses a small HTML and CSS subset, performs block layout, and paints a deterministic PPM image without CEF or another browser engine. It is research code and is not part of the production bundle.
+
+See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.

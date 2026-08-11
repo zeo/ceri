@@ -1,0 +1,366 @@
+use crate::css::Color;
+use crate::layout::{LayoutBox, LayoutDocument, TextRun};
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
+
+#[derive(Clone, Debug)]
+pub struct Canvas {
+    width: u32,
+    height: u32,
+    background: Color,
+    pixels: Vec<u8>,
+}
+
+impl Canvas {
+    pub fn new(width: u32, height: u32, background: Color) -> Self {
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[background.red, background.green, background.blue, 255]);
+        }
+        Self {
+            width,
+            height,
+            background,
+            pixels,
+        }
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn non_background_pixels(&self) -> usize {
+        let background = [
+            self.background.red,
+            self.background.green,
+            self.background.blue,
+        ];
+        self.pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] != background)
+            .count()
+    }
+
+    pub fn write_ppm(&self, path: &Path) -> io::Result<()> {
+        let mut file = File::create(path)?;
+        write!(file, "P6\n{} {}\n255\n", self.width, self.height)?;
+        for pixel in self.pixels.chunks_exact(4) {
+            file.write_all(&pixel[..3])?;
+        }
+        Ok(())
+    }
+
+    pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
+        let row_stride = (self.width as usize * 3 + 3) & !3;
+        let pixel_bytes = row_stride * self.height as usize;
+        let file_size = 14 + 40 + pixel_bytes;
+        let mut file = File::create(path)?;
+        file.write_all(b"BM")?;
+        file.write_all(&(file_size as u32).to_le_bytes())?;
+        file.write_all(&[0; 4])?;
+        file.write_all(&(54_u32).to_le_bytes())?;
+        file.write_all(&(40_u32).to_le_bytes())?;
+        file.write_all(&(self.width as i32).to_le_bytes())?;
+        file.write_all(&(-(self.height as i32)).to_le_bytes())?;
+        file.write_all(&(1_u16).to_le_bytes())?;
+        file.write_all(&(24_u16).to_le_bytes())?;
+        file.write_all(&[0; 4])?;
+        file.write_all(&(pixel_bytes as u32).to_le_bytes())?;
+        file.write_all(&[0; 16])?;
+        let padding = vec![0; row_stride - self.width as usize * 3];
+        for row in 0..self.height {
+            let start = row as usize * self.width as usize * 4;
+            for pixel in self.pixels[start..start + self.width as usize * 4].chunks_exact(4) {
+                file.write_all(&[pixel[2], pixel[1], pixel[0]])?;
+            }
+            file.write_all(&padding)?;
+        }
+        Ok(())
+    }
+
+    fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        if width <= 0.0 || height <= 0.0 || color.alpha == 0 {
+            return;
+        }
+        let left = x.floor().max(0.0) as u32;
+        let top = y.floor().max(0.0) as u32;
+        let right = (x + width).ceil().max(0.0).min(self.width as f32) as u32;
+        let bottom = (y + height).ceil().max(0.0).min(self.height as f32) as u32;
+        for pixel_y in top.min(self.height)..bottom.min(self.height) {
+            for pixel_x in left.min(self.width)..right.min(self.width) {
+                self.blend_pixel(pixel_x, pixel_y, color);
+            }
+        }
+    }
+
+    fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
+        let index = ((y * self.width + x) * 4) as usize;
+        let alpha = color.alpha as u32;
+        let inverse = 255 - alpha;
+        self.pixels[index] =
+            ((color.red as u32 * alpha + self.pixels[index] as u32 * inverse) / 255) as u8;
+        self.pixels[index + 1] =
+            ((color.green as u32 * alpha + self.pixels[index + 1] as u32 * inverse) / 255) as u8;
+        self.pixels[index + 2] =
+            ((color.blue as u32 * alpha + self.pixels[index + 2] as u32 * inverse) / 255) as u8;
+        self.pixels[index + 3] = 255;
+    }
+}
+
+pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
+    let mut canvas = Canvas::new(
+        document.viewport.width.max(1.0) as u32,
+        document.viewport.height.max(1.0) as u32,
+        Color::opaque(245, 248, 250),
+    );
+    paint_box(&mut canvas, &document.root);
+    canvas
+}
+
+fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox) {
+    canvas.fill_rect(
+        layout_box.rect.x,
+        layout_box.rect.y,
+        layout_box.rect.width,
+        layout_box.rect.height,
+        layout_box.background,
+    );
+    if layout_box.border_width > 0.0 {
+        let border = layout_box.border_width;
+        canvas.fill_rect(
+            layout_box.rect.x,
+            layout_box.rect.y,
+            layout_box.rect.width,
+            border,
+            layout_box.border_color,
+        );
+        canvas.fill_rect(
+            layout_box.rect.x,
+            layout_box.rect.bottom() - border,
+            layout_box.rect.width,
+            border,
+            layout_box.border_color,
+        );
+        canvas.fill_rect(
+            layout_box.rect.x,
+            layout_box.rect.y,
+            border,
+            layout_box.rect.height,
+            layout_box.border_color,
+        );
+        canvas.fill_rect(
+            layout_box.rect.x + layout_box.rect.width - border,
+            layout_box.rect.y,
+            border,
+            layout_box.rect.height,
+            layout_box.border_color,
+        );
+    }
+    for run in &layout_box.text {
+        paint_text(canvas, run);
+    }
+    for child in &layout_box.children {
+        paint_box(canvas, child);
+    }
+}
+
+fn paint_text(canvas: &mut Canvas, run: &TextRun) {
+    let scale = (run.font_size / 9.0).round().max(1.0) as u32;
+    let mut x = run.x;
+    for character in run.text.chars() {
+        let glyph = glyph_rows(character);
+        for (row, bits) in glyph.iter().enumerate() {
+            for column in 0..5 {
+                if bits & (1 << (4 - column)) != 0 {
+                    let width = if run.bold { scale + 1 } else { scale };
+                    canvas.fill_rect(
+                        x + column as f32 * scale as f32,
+                        run.y + row as f32 * scale as f32,
+                        width as f32,
+                        scale as f32,
+                        run.color,
+                    );
+                }
+            }
+        }
+        x += scale as f32 * 6.0;
+    }
+}
+
+fn glyph_rows(character: char) -> [u8; 7] {
+    match character.to_ascii_uppercase() {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0],
+        '.' => [0, 0, 0, 0, 0, 0b00110, 0b00110],
+        ':' => [0, 0b00110, 0b00110, 0, 0b00110, 0b00110, 0],
+        '!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100],
+        '?' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100],
+        '(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        ')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{LayoutBox, LayoutDocument, Rect, Size};
+
+    #[test]
+    fn painting_changes_pixels_and_writes_a_ppm_header() {
+        let document = LayoutDocument {
+            viewport: Size {
+                width: 32.0,
+                height: 24.0,
+            },
+            root: LayoutBox {
+                tag: "root".to_string(),
+                rect: Rect {
+                    x: 2.0,
+                    y: 3.0,
+                    width: 20.0,
+                    height: 10.0,
+                },
+                background: Color::opaque(10, 20, 30),
+                border_width: 0.0,
+                border_color: Color::transparent(),
+                text: vec![TextRun {
+                    text: "A".to_string(),
+                    x: 4.0,
+                    y: 5.0,
+                    width: 8.0,
+                    font_size: 12.0,
+                    color: Color::WHITE,
+                    bold: false,
+                }],
+                children: Vec::new(),
+                margin: Default::default(),
+            },
+        };
+        let canvas = paint(&document);
+        assert!(canvas.non_background_pixels() > 0);
+
+        let path = std::env::temp_dir().join(format!("ceri-engine-lab-{}.bmp", std::process::id()));
+        canvas.write_bmp(&path).expect("bmp should write");
+        let bytes = std::fs::read(&path).expect("bmp should be readable");
+        assert_eq!(&bytes[..2], b"BM");
+        std::fs::remove_file(path).expect("test bmp should be removable");
+    }
+}

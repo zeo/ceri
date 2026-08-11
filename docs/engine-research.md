@@ -4,7 +4,7 @@ Research snapshot: 2026-08-12
 
 ## Decision
 
-Ceri should keep CEF as the shipping engine while an independent engine track is explored. The first experimental backend should target Servo because it is written in Rust, exposes an embedding-oriented `WebView` API, and has active desktop support for Windows, macOS, and Linux. Servo is not ready to replace the CEF path without an application compatibility and recovery test suite.
+Ceri should keep CEF as the shipping engine while two independent engine tracks are explored. The first is a dependency-free custom engine laboratory written in Rust. The second is a Servo comparison backend because Servo is written in Rust, exposes an embedding-oriented `WebView` API, and has active desktop support for Windows, macOS, and Linux. Neither track is ready to replace the CEF path without an application compatibility and recovery test suite.
 
 This separates three different goals:
 
@@ -19,10 +19,10 @@ Writing a new engine from scratch would require a standards implementation, Java
 | Candidate | What it gives Ceri | Main gap | Decision |
 | --- | --- | --- | --- |
 | CEF with Chromium | Broad current web compatibility, multi-process isolation, GPU, media, DevTools, and desktop binaries | Large bundle and Chromium upgrade work | Keep as the shipping baseline |
-| Servo | Rust implementation, an embedding `WebView` API, WebGL and WebGPU, and Windows, macOS, Linux, Android, and OpenHarmony targets | Embedding documentation is still sparse, media needs GStreamer, the public API is evolving, and Servo has no 1.0 release or specific security guarantees | Build an isolated experimental backend |
+| Servo | Rust implementation, an embedding `WebView` API, WebGL and WebGPU, and Windows, macOS, Linux, Android, and OpenHarmony targets | Embedding documentation is still sparse, media needs GStreamer, the public API is evolving, and Servo has no 1.0 release or specific security guarantees | Keep as a comparison backend |
 | Ladybird | A genuinely independent engine built from scratch with no Blink, WebKit, or Gecko code | The project is targeting its first 2026 alpha on Linux and macOS, and it is primarily a browser project rather than an embeddable desktop runtime | Track for research, not a Ceri backend yet |
 | WPE WebKit | A focused embedded WebKit port with hardware-accelerated rendering and media support | WPE currently runs on Linux-based systems, and WebRTC is disabled in official release tarballs by default | Useful Linux comparison, not the all-platform engine |
-| New engine written by Ceri | Full ownership of architecture and policy | Full browser-engine scope, long compatibility tail, and no security history | Keep as a long-term laboratory project |
+| New engine written by Ceri | Full ownership of architecture and policy | Full browser-engine scope, long compatibility tail, and no security history | Build the isolated laboratory now |
 
 The Servo embedding chapter explicitly says its documentation is sparse and still in progress. It also documents that common desktop media support requires the GStreamer feature and platform libraries. Servo's LTS guidance says the library has no 1.0 release and is provided on a best-effort basis without specific security guarantees. Those are acceptable conditions for an isolated experiment and unacceptable conditions for silently replacing the production backend.
 
@@ -85,9 +85,11 @@ CEF remains the comparison baseline. The Servo experiment should report pass cou
 
 ## First experiment
 
-The first implementation should be a separate `engine-lab` crate or worktree. It should render the existing continuity page through Servo, use a packaged asset reader, expose only `runtimeInfo`, and record the gate results. It should not replace the CEF binary, change the default bundle, or add Servo to the production dependency graph.
+The first implementation is the separate `engine-lab` crate in this repository. It has no CEF, WebKit, Servo, JavaScript engine, GUI, or image-library dependency. Its current slice includes an HTML tokenizer and DOM tree, common entity decoding, CSS tag/class/id selectors, selector specificity, inherited text styles, block layout, inline text wrapping, borders, colors, a software paint step, a built-in bitmap font, PPM output, and a textual layout dump.
 
-The experiment is useful even if Servo fails. A failure at a named gate tells us whether Ceri's stable contract is missing an abstraction. A passing slice gives us a measured basis for deciding whether to grow the adapter.
+The custom renderer is intentionally headless. JavaScript, networking, media, accessibility, GPU APIs, and the operating-system window are future gates. The existing continuity page remains the compatibility target, but it must first be rendered through the custom pipeline before any engine adapter is attempted.
+
+The experiment is useful even when a gate fails. A failure at a named gate tells us whether Ceri's stable contract is missing an abstraction. A passing slice gives us a measured basis for deciding whether to grow the custom engine or use Servo for that layer.
 
 ## Sources
 
