@@ -416,6 +416,15 @@ impl Browser {
             .map_err(|error| NavigationError::Script(error.to_string()))
     }
 
+    pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, NavigationError> {
+        self.page
+            .as_mut()
+            .ok_or(NavigationError::NoPage)?
+            .runtime
+            .advance_time(milliseconds)
+            .map_err(|error| NavigationError::Script(error.to_string()))
+    }
+
     pub fn console_logs(&self) -> &[String] {
         self.page
             .as_ref()
@@ -1057,6 +1066,27 @@ mod tests {
                 .style_property(&status, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn browser_advances_page_tasks_deterministically() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">waiting</p><script>setTimeout(() => { document.getElementById("status").textContent = "ready"; }, 40);</script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert_eq!(browser.advance_time(39).expect("clock should advance"), 0);
+        assert_eq!(browser.advance_time(1).expect("timer should run"), 1);
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready")
         );
     }
 

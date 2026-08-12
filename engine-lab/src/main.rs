@@ -10,6 +10,7 @@ struct Options {
     clicks: Vec<String>,
     url: String,
     asset_root: Option<PathBuf>,
+    ticks: Vec<u64>,
 }
 
 fn main() -> Result<(), String> {
@@ -52,6 +53,12 @@ fn main() -> Result<(), String> {
             "click #{id}: {}",
             if dispatched { "handled" } else { "no listener" }
         );
+    }
+    for milliseconds in &options.ticks {
+        let executed = browser
+            .advance_time(*milliseconds)
+            .map_err(|error| error.to_string())?;
+        println!("advanced {milliseconds}ms: {executed} task(s)");
     }
     let layout = browser
         .layout(options.viewport)
@@ -102,6 +109,7 @@ where
     let mut clicks = Vec::new();
     let mut url = format!("{APP_ORIGIN}/");
     let mut asset_root = None;
+    let mut ticks = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let argument = argument
@@ -117,9 +125,10 @@ where
             "--asset-root" => {
                 asset_root = Some(PathBuf::from(next_value(&mut args, "--asset-root")?))
             }
+            "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID]"
+                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -133,6 +142,7 @@ where
         clicks,
         url,
         asset_root,
+        ticks,
         viewport: Size {
             width: width as f32,
             height: height as f32,
@@ -158,4 +168,10 @@ fn parse_dimension(value: String, name: &str) -> Result<u32, String> {
         return Err(format!("{name} must be a positive integer"));
     }
     Ok(dimension)
+}
+
+fn parse_delay(value: String) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| "tick must be a non-negative integer".to_string())
 }

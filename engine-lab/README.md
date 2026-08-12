@@ -11,6 +11,7 @@ The current slice implements:
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
+- a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - same-origin relative URL resolution for external stylesheets and scripts
 - browser navigation, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -31,3 +32,11 @@ The flex sample exercises row growth, gaps, column composition, and alignment:
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/flex-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-flex-demo.bmp --width 800 --height 420
 ```
+
+The task-clock sample advances the page without sleeping or relying on wall time:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/timer-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-timer-demo.bmp --width 800 --height 300 --tick 16 --tick 84
+```
+
+The first tick runs the animation frame at 16ms. The second reaches 100ms and runs the timeout. Repeating the command produces the same callbacks and pixels.

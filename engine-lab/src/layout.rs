@@ -257,7 +257,7 @@ fn layout_element(
                 if child_style.display == Display::None {
                     continue;
                 }
-                if child_style.display == Display::Block {
+                if matches!(child_style.display, Display::Block | Display::Flex) {
                     flush_line(
                         &mut line,
                         &mut text,
@@ -883,5 +883,27 @@ mod tests {
             column.children[1].rect.y,
             column.children[0].rect.bottom() + 10.0
         );
+    }
+
+    #[test]
+    fn flex_containers_remain_in_block_parent_flow() {
+        let document = Document::parse(
+            "<body><main style='display: flex;'><p>inside</p></main><p>after</p></body>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("").expect("empty css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 160.0,
+            },
+        );
+        let body = &result.root.children[0];
+        assert_eq!(body.children.len(), 2);
+        assert_eq!(body.children[0].tag, "main");
+        assert_eq!(body.children[0].children[0].tag, "p");
+        assert!(body.children[1].rect.y >= body.children[0].rect.bottom());
     }
 }

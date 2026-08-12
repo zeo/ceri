@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 24px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0;
+        color: #6ee7c5;
+        font-size: 26px;
+      }
+      p {
+        margin: 0;
+      }
+      #status {
+        color: #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>deterministic task clock</h1>
+      <p id="status">waiting for timeout</p>
+      <p id="frame">waiting for animation frame</p>
+    </main>
+  </body>
+  <script src="timer-demo.js"></script>
+</html>

@@ -45,6 +45,10 @@ enum Builtin {
     DocumentGetElementById,
     DocumentQuerySelector,
     ConsoleLog,
+    SetTimeout,
+    ClearTimeout,
+    RequestAnimationFrame,
+    CancelAnimationFrame,
     ElementAddEventListener(NodePath),
     ElementClick(NodePath),
     ElementSetAttribute(NodePath),
@@ -148,6 +152,9 @@ pub struct ScriptRuntime {
     global: EnvironmentRef,
     listeners: HashMap<NodePath, Vec<EventListener>>,
     logs: Vec<String>,
+    clock: u64,
+    next_task_id: u64,
+    tasks: Vec<ScheduledTask>,
 }
 
 #[derive(Clone)]
@@ -155,6 +162,21 @@ struct EventListener {
     event: String,
     callback: Value,
 }
+
+#[derive(Clone, Copy)]
+enum TaskKind {
+    Timeout,
+    AnimationFrame,
+}
+
+struct ScheduledTask {
+    id: u64,
+    due: u64,
+    callback: Value,
+    kind: TaskKind,
+}
+
+const MAX_TASKS_PER_ADVANCE: usize = 10_000;
 
 impl ScriptRuntime {
     pub fn new(document: Rc<RefCell<Document>>) -> Self {
@@ -166,12 +188,31 @@ impl ScriptRuntime {
                 .insert("document".to_string(), Value::Document);
             values.values.insert("window".to_string(), Value::Window);
             values.values.insert("console".to_string(), Value::Console);
+            values.values.insert(
+                "setTimeout".to_string(),
+                Value::Builtin(Builtin::SetTimeout),
+            );
+            values.values.insert(
+                "clearTimeout".to_string(),
+                Value::Builtin(Builtin::ClearTimeout),
+            );
+            values.values.insert(
+                "requestAnimationFrame".to_string(),
+                Value::Builtin(Builtin::RequestAnimationFrame),
+            );
+            values.values.insert(
+                "cancelAnimationFrame".to_string(),
+                Value::Builtin(Builtin::CancelAnimationFrame),
+            );
         }
         Self {
             document,
             global,
             listeners: HashMap::new(),
             logs: Vec::new(),
+            clock: 0,
+            next_task_id: 1,
+            tasks: Vec::new(),
         }
     }
 
@@ -203,6 +244,32 @@ impl ScriptRuntime {
 
     pub fn document(&self) -> Rc<RefCell<Document>> {
         self.document.clone()
+    }
+
+    pub fn now(&self) -> u64 {
+        self.clock
+    }
+
+    pub fn pending_task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, ScriptError> {
+        self.clock = self.clock.saturating_add(milliseconds);
+        let mut executed = 0;
+        while let Some(index) = self.next_due_task() {
+            if executed == MAX_TASKS_PER_ADVANCE {
+                return Err(runtime_error("task queue exceeded the deterministic limit"));
+            }
+            let task = self.tasks.remove(index);
+            let arguments = match task.kind {
+                TaskKind::Timeout => Vec::new(),
+                TaskKind::AnimationFrame => vec![Value::Number(self.clock as f64)],
+            };
+            self.call(task.callback, arguments)?;
+            executed += 1;
+        }
+        Ok(executed)
     }
 
     fn execute_statements(
@@ -363,6 +430,10 @@ impl ScriptRuntime {
             Value::Window => match property {
                 "document" => Ok(Value::Document),
                 "console" => Ok(Value::Console),
+                "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
+                "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
+                "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
+                "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
                 _ => Err(runtime_error(format!("window has no property {property}"))),
             },
             Value::Console if property == "log" => Ok(Value::Builtin(Builtin::ConsoleLog)),
@@ -502,6 +573,28 @@ impl ScriptRuntime {
                 );
                 Ok(Value::Undefined)
             }
+            Builtin::SetTimeout => self.schedule_task(arguments, TaskKind::Timeout),
+            Builtin::ClearTimeout => {
+                let id = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0) as u64;
+                self.tasks.retain(|task| task.id != id);
+                Ok(Value::Undefined)
+            }
+            Builtin::RequestAnimationFrame => {
+                self.schedule_task(arguments, TaskKind::AnimationFrame)
+            }
+            Builtin::CancelAnimationFrame => {
+                let id = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0) as u64;
+                self.tasks.retain(|task| task.id != id);
+                Ok(Value::Undefined)
+            }
             Builtin::ElementAddEventListener(path) => {
                 let event = arguments
                     .first()
@@ -564,6 +657,51 @@ impl ScriptRuntime {
             self.call(callback, vec![Value::String(event.to_string())])?;
         }
         Ok(had_callbacks)
+    }
+
+    fn schedule_task(
+        &mut self,
+        arguments: Vec<Value>,
+        kind: TaskKind,
+    ) -> Result<Value, ScriptError> {
+        let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(callback, Value::Function(_)) {
+            return Err(runtime_error("scheduled task must be a function"));
+        }
+        let delay = match kind {
+            TaskKind::Timeout => arguments
+                .get(1)
+                .map(Value::number)
+                .transpose()?
+                .map_or(0, delay_milliseconds),
+            TaskKind::AnimationFrame => 16,
+        };
+        let id = self.next_task_id;
+        self.next_task_id = self.next_task_id.saturating_add(1);
+        self.tasks.push(ScheduledTask {
+            id,
+            due: self.clock.saturating_add(delay),
+            callback,
+            kind,
+        });
+        Ok(Value::Number(id as f64))
+    }
+
+    fn next_due_task(&self) -> Option<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.due <= self.clock)
+            .min_by_key(|(_, task)| (task.due, task.id))
+            .map(|(index, _)| index)
+    }
+}
+
+fn delay_milliseconds(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        value.floor() as u64
     }
 }
 
@@ -1400,6 +1538,80 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("two")
+        );
+    }
+
+    #[test]
+    fn executes_timeout_tasks_after_deterministic_time_advance() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                setTimeout(() => { status.textContent = "later"; }, 25);
+                "#,
+            )
+            .expect("timeout should schedule");
+        assert_eq!(runtime.pending_task_count(), 1);
+        assert_eq!(runtime.advance_time(24).expect("clock should advance"), 0);
+        assert_eq!(runtime.advance_time(1).expect("timeout should run"), 1);
+        assert_eq!(runtime.now(), 25);
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("later")
+        );
+    }
+
+    #[test]
+    fn animation_frames_receive_the_deterministic_timestamp() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                requestAnimationFrame((timestamp) => { status.textContent = timestamp; });
+                "#,
+            )
+            .expect("animation frame should schedule");
+        assert_eq!(runtime.advance_time(15).expect("clock should advance"), 0);
+        assert_eq!(runtime.advance_time(1).expect("frame should run"), 1);
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("16")
+        );
+    }
+
+    #[test]
+    fn canceled_tasks_do_not_run() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const task = window.setTimeout(() => { status.textContent = "bad"; }, 0);
+                window.clearTimeout(task);
+                "#,
+            )
+            .expect("task should schedule and cancel");
+        assert_eq!(runtime.advance_time(0).expect("clock should advance"), 0);
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("idle")
         );
     }
 
