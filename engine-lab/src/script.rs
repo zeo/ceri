@@ -36,6 +36,7 @@ type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
 pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
 type FormDataHandle = Rc<RefCell<FormDataData>>;
 type BlobHandle = Rc<BlobData>;
+type FileHandle = Rc<FileData>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
@@ -97,6 +98,7 @@ enum Value {
     Storage(StorageHandle),
     FormData(FormDataHandle),
     Blob(BlobHandle),
+    File(FileHandle),
     CanvasContext(CanvasContextHandle),
     AbortController(AbortControllerHandle),
     AbortSignal(AbortSignalHandle),
@@ -109,6 +111,7 @@ enum Value {
     UrlSearchParamsConstructor,
     FormDataConstructor,
     BlobConstructor,
+    FileConstructor,
     MapConstructor,
     SetConstructor,
     ErrorConstructor,
@@ -169,6 +172,9 @@ enum Builtin {
     BlobSlice(BlobHandle),
     BlobText(BlobHandle),
     BlobBytes(BlobHandle),
+    FileSlice(FileHandle),
+    FileText(FileHandle),
+    FileBytes(FileHandle),
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -689,6 +695,13 @@ struct BlobData {
     mime_type: String,
 }
 
+struct FileData {
+    bytes: Vec<u8>,
+    mime_type: String,
+    name: String,
+    last_modified: i64,
+}
+
 struct HeadersData {
     values: BTreeMap<String, String>,
     mutable: bool,
@@ -1006,6 +1019,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("Blob".to_string(), Value::BlobConstructor);
+            values
+                .values
+                .insert("File".to_string(), Value::FileConstructor);
             values
                 .values
                 .insert("Request".to_string(), Value::RequestConstructor);
@@ -2297,6 +2313,19 @@ impl ScriptRuntime {
             Value::BlobConstructor => Err(runtime_error(format!(
                 "Blob has no property {property}"
             ))),
+            Value::File(file) => match property {
+                "size" => Ok(Value::Number(file.bytes.len() as f64)),
+                "type" => Ok(Value::String(file.mime_type.clone())),
+                "name" => Ok(Value::String(file.name.clone())),
+                "lastModified" => Ok(Value::Number(file.last_modified as f64)),
+                "slice" => Ok(Value::Builtin(Builtin::FileSlice(file))),
+                "text" => Ok(Value::Builtin(Builtin::FileText(file))),
+                "arrayBuffer" => Ok(Value::Builtin(Builtin::FileBytes(file))),
+                _ => Err(runtime_error(format!("File has no property {property}"))),
+            },
+            Value::FileConstructor => Err(runtime_error(format!(
+                "File has no property {property}"
+            ))),
             Value::CanvasContext(context) => match property {
                 "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style))),
                 "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
@@ -2886,6 +2915,7 @@ impl ScriptRuntime {
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             Value::FormDataConstructor => self.construct_form_data(arguments),
             Value::BlobConstructor => self.construct_blob(arguments),
+            Value::FileConstructor => self.construct_file(arguments),
             Value::HeadersConstructor => self.construct_headers(arguments),
             Value::RequestConstructor => self.construct_request(arguments),
             Value::ResponseConstructor => self.construct_response(arguments),
@@ -3081,45 +3111,24 @@ impl ScriptRuntime {
     }
 
     fn construct_blob(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let parts = match arguments.first().map(Value::resolve) {
-            None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(parts)) => parts.borrow().clone(),
-            Some(_) => return Err(runtime_error("Blob parts must be an array")),
-        };
-        let mut bytes = Vec::new();
-        for part in parts {
-            match part.resolve() {
-                Value::Bytes(part) => bytes.extend_from_slice(part.as_ref()),
-                Value::Blob(part) => bytes.extend_from_slice(&part.bytes),
-                part => bytes.extend_from_slice(part.string_value().as_bytes()),
-            }
-        }
-        let mime_type = match arguments.get(1).map(Value::resolve) {
-            None | Some(Value::Undefined) | Some(Value::Null) => String::new(),
-            Some(Value::Object(options)) => {
-                let options = options.borrow();
-                if options.keys().any(|key| !matches!(key.as_str(), "type" | "endings")) {
-                    return Err(runtime_error("Blob options contain an unsupported key"));
-                }
-                if let Some(endings) = options.get("endings").map(Value::resolve) {
-                    let valid = matches!(endings, Value::Undefined)
-                        || matches!(endings, Value::String(value) if value == "transparent");
-                    if !valid {
-                        return Err(runtime_error("Blob endings must be transparent"));
-                    }
-                }
-                options
-                    .get("type")
-                    .map(Value::resolve)
-                    .and_then(|value| match value {
-                        Value::Undefined => None,
-                        value => Some(normalize_blob_type(&value.string_value())),
-                    })
-                    .unwrap_or_default()
-            }
-            Some(_) => return Err(runtime_error("Blob options must be an object")),
-        };
+        let bytes = blob_parts_bytes(arguments.first())?;
+        let (mime_type, _) = blob_options(arguments.get(1), false)?;
         Ok(Value::Blob(Rc::new(BlobData { bytes, mime_type })))
+    }
+
+    fn construct_file(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let bytes = blob_parts_bytes(arguments.first())?;
+        let name = arguments
+            .get(1)
+            .map(Value::string_value)
+            .ok_or_else(|| runtime_error("File constructor requires a name"))?;
+        let (mime_type, last_modified) = blob_options(arguments.get(2), true)?;
+        Ok(Value::File(Rc::new(FileData {
+            bytes,
+            mime_type,
+            name: normalize_file_name(&name),
+            last_modified,
+        })))
     }
 
     fn construct_headers(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -4062,11 +4071,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::BlobSlice(blob) => {
-                let size = blob.bytes.len() as i64;
-                let start = blob_slice_index(arguments.first(), size, 0)?;
-                let end = blob_slice_index(arguments.get(1), size, size)?;
-                let start = start.min(end) as usize;
-                let end = end.max(start as i64).min(size) as usize;
+                let (start, end) = blob_slice_range(&arguments, blob.bytes.len() as i64)?;
                 let mime_type = arguments
                     .get(2)
                     .map(Value::resolve)
@@ -4085,6 +4090,27 @@ impl ScriptRuntime {
             ))),
             Builtin::BlobBytes(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
                 Rc::new(blob.bytes.clone()),
+            )))),
+            Builtin::FileSlice(file) => {
+                let (start, end) = blob_slice_range(&arguments, file.bytes.len() as i64)?;
+                let mime_type = arguments
+                    .get(2)
+                    .map(Value::resolve)
+                    .and_then(|value| match value {
+                        Value::Undefined => None,
+                        value => Some(normalize_blob_type(&value.string_value())),
+                    })
+                    .unwrap_or_default();
+                Ok(Value::Blob(Rc::new(BlobData {
+                    bytes: file.bytes[start..end].to_vec(),
+                    mime_type,
+                })))
+            }
+            Builtin::FileText(file) => Ok(Value::Promise(self.fulfilled_promise(
+                Value::String(String::from_utf8_lossy(&file.bytes).into_owned()),
+            ))),
+            Builtin::FileBytes(file) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
+                Rc::new(file.bytes.clone()),
             )))),
             Builtin::JsonParse => {
                 let source = arguments
@@ -5350,6 +5376,7 @@ impl Value {
             Self::Storage(_) => "[object Storage]".to_string(),
             Self::FormData(_) => "[object FormData]".to_string(),
             Self::Blob(_) => "[object Blob]".to_string(),
+            Self::File(_) => "[object File]".to_string(),
             Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
             Self::AbortController(_) => "[object AbortController]".to_string(),
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
@@ -5363,6 +5390,7 @@ impl Value {
             }
             Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::BlobConstructor => "[function Blob]".to_string(),
+            Self::FileConstructor => "[function File]".to_string(),
             Self::MapConstructor => "[function Map]".to_string(),
             Self::SetConstructor => "[function Set]".to_string(),
             Self::ErrorConstructor => "[function Error]".to_string(),
@@ -5727,6 +5755,10 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             blob.bytes.clone(),
             (!blob.mime_type.is_empty()).then(|| blob.mime_type.clone()),
         )),
+        Value::File(file) => Ok((
+            file.bytes.clone(),
+            (!file.mime_type.is_empty()).then(|| file.mime_type.clone()),
+        )),
         Value::UrlSearchParams(params) => Ok((
             serialize_form_urlencoded(&params.borrow().pairs).into_bytes(),
             Some("application/x-www-form-urlencoded;charset=UTF-8".to_string()),
@@ -5736,7 +5768,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             Ok((body, Some(boundary)))
         }
         _ => Err(runtime_error(
-            "body must be a string, ArrayBuffer, Blob, URLSearchParams, or FormData",
+            "body must be a string, ArrayBuffer, Blob, File, URLSearchParams, or FormData",
         )),
     }
 }
@@ -5771,6 +5803,14 @@ fn blob_slice_index(
     })
 }
 
+fn blob_slice_range(arguments: &[Value], size: i64) -> Result<(usize, usize), ScriptError> {
+    let start = blob_slice_index(arguments.first(), size, 0)?;
+    let end = blob_slice_index(arguments.get(1), size, size)?;
+    let start = start.min(end) as usize;
+    let end = end.max(start as i64).min(size) as usize;
+    Ok((start, end))
+}
+
 fn normalize_blob_type(value: &str) -> String {
     if value
         .bytes()
@@ -5780,6 +5820,86 @@ fn normalize_blob_type(value: &str) -> String {
     } else {
         String::new()
     }
+}
+
+fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
+    let parts = match parts.map(Value::resolve) {
+        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(parts)) => parts.borrow().clone(),
+        Some(_) => return Err(runtime_error("Blob parts must be an array")),
+    };
+    let mut bytes = Vec::new();
+    for part in parts {
+        match part.resolve() {
+            Value::Bytes(part) => bytes.extend_from_slice(part.as_ref()),
+            Value::Blob(part) => bytes.extend_from_slice(&part.bytes),
+            Value::File(part) => bytes.extend_from_slice(&part.bytes),
+            part => bytes.extend_from_slice(part.string_value().as_bytes()),
+        }
+    }
+    Ok(bytes)
+}
+
+fn blob_options(
+    options: Option<&Value>,
+    include_last_modified: bool,
+) -> Result<(String, i64), ScriptError> {
+    let Some(options) = options.map(Value::resolve) else {
+        return Ok((String::new(), 0));
+    };
+    let options = match options {
+        Value::Undefined | Value::Null => return Ok((String::new(), 0)),
+        Value::Object(options) => options,
+        _ => return Err(runtime_error("Blob options must be an object")),
+    };
+    let options = options.borrow();
+    if options.keys().any(|key| match key.as_str() {
+        "type" | "endings" => false,
+        "lastModified" => !include_last_modified,
+        _ => true,
+    }) {
+        return Err(runtime_error("Blob options contain an unsupported key"));
+    }
+    if let Some(endings) = options.get("endings").map(Value::resolve) {
+        let valid = matches!(endings, Value::Undefined)
+            || matches!(endings, Value::String(value) if value == "transparent");
+        if !valid {
+            return Err(runtime_error("Blob endings must be transparent"));
+        }
+    }
+    let mime_type = options
+        .get("type")
+        .map(Value::resolve)
+        .and_then(|value| match value {
+            Value::Undefined => None,
+            value => Some(normalize_blob_type(&value.string_value())),
+        })
+        .unwrap_or_default();
+    let last_modified = if !include_last_modified {
+        0
+    } else {
+        match options.get("lastModified").map(Value::resolve) {
+            None | Some(Value::Undefined) => 0,
+            Some(Value::Null) => 0,
+            Some(value) => {
+                let number = value.number()?;
+                if !number.is_finite() {
+                    return Err(runtime_error("File lastModified must be finite"));
+                }
+                number.floor().max(0.0) as i64
+            }
+        }
+    };
+    Ok((mime_type, last_modified))
+}
+
+fn normalize_file_name(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
@@ -5902,6 +6022,7 @@ fn evaluate_binary(
         BinaryOperator::InstanceOf => Ok(Value::Bool(match (left, right) {
             (Value::Error(_), Value::ErrorConstructor) => true,
             (Value::Blob(_), Value::BlobConstructor) => true,
+            (Value::File(_), Value::FileConstructor | Value::BlobConstructor) => true,
             (Value::Error(error), Value::Class(class)) => {
                 error.class_name == class.name
                     || (class.name == "Error" && error.class_name == "Error")
@@ -5945,6 +6066,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Storage(_)
         | Value::FormData(_)
         | Value::Blob(_)
+        | Value::File(_)
         | Value::CanvasContext(_)
         | Value::AbortController(_)
         | Value::AbortSignal(_)
@@ -5965,6 +6087,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
         | Value::BlobConstructor
+        | Value::FileConstructor
         | Value::MapConstructor
         | Value::SetConstructor
         | Value::ErrorConstructor
@@ -6010,6 +6133,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
+        (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
@@ -9633,6 +9757,53 @@ mod tests {
         let requests = requests.borrow();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].body(), b"hello world");
+        assert_eq!(
+            requests[0].headers().get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn file_values_preserve_metadata_and_use_blob_body_rules() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const file = new File(["report"], "docs\\report.txt", { type: "TEXT/PLAIN", lastModified: 1234.9 });
+                const part = file.slice(-4, 6, "Application/Part");
+                file.text().then((fileText) => file.arrayBuffer().then((buffer) => part.text().then((partText) => {
+                    fetch("/headers", { method: "POST", body: file }).then((response) => response.blob()).then((received) => received.text().then((body) => {
+                        status.textContent = file.name + "|" + file.lastModified + "|" + file.size + "|" + file.type + "|" + fileText + "|" + buffer.byteLength + "|" + part.size + "|" + part.type + "|" + partText + "|" + body + "|" + (file instanceof Blob) + "|" + (file instanceof File);
+                    }));
+                })));
+                "#,
+            )
+            .expect("File bodies should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("report.txt|1234|6|text/plain|report|6|4|application/part|port|ready|true|true")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body(), b"report");
         assert_eq!(
             requests[0].headers().get("content-type").map(String::as_str),
             Some("text/plain")
