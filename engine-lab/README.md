@@ -22,6 +22,7 @@ The current slice implements:
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - an embedder-owned `ResourceProvider` fallback for documents and same-origin subresources
+- an optional `native-http` `ResourceProvider` backed by Rust-native HTTPS and platform certificate verification
 - validated `ResourceRequest` metadata for provider-backed `fetch()` methods, headers, and string bodies
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, normalized headers, single-use text and JSON bodies, `arrayBuffer()`, a bounded `ReadableStream` reader, and deterministic `AbortController` preflight cancellation
@@ -43,9 +44,11 @@ The current slice implements:
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
-It is a headless laboratory, not a web-compatible browser. The script runtime covers the demo's DOM and event path, while networking, media, full platform accessibility adapters, GPU APIs, WebAssembly, and the operating-system window remain outside this slice.
+It is a headless laboratory, not a web-compatible browser. The default build keeps networking, media, full platform accessibility adapters, GPU APIs, WebAssembly, and the operating-system window outside this slice. The optional `native-http` feature adds a Rust-native HTTPS `ResourceProvider` with platform certificate verification, bounded redirects, connection reuse, proxy environment support, and a 30-second request timeout. Its API is blocking, so hosts must install it behind their own worker or navigation queue before attaching it to a UI event loop.
 
 `Browser::with_resource_provider` keeps the renderer independent of transport. The engine resolves and validates the app-origin URL, checks the packaged bundle first, and asks the provider only when that bundle misses. The provider can read a signed package, a native HTTP/TLS client, or another host-owned source. It never needs to open a listener, and it cannot receive a cross-origin `AppUrl` because the URL parser rejects those references before the provider call. Extensionless document routes use the same `/index.html` shell fallback as packaged assets.
+
+With `--features native-http`, `NativeHttpProvider::new("https://example.com/app")` maps the engine's owned `https://app.ceri.invalid` paths onto that HTTPS origin. It rejects insecure and credentialed bases, keeps redirects visible to the engine by disabling automatic redirect following, preserves response status and headers for `fetch()`, and limits response reads through ureq's bounded body reader. The provider is an opt-in transport adapter, not a loopback server or a renderer dependency.
 
 Hosts can inspect `Browser::last_navigation_failure()` or `EngineHost::last_navigation_failure()` after a recovery page is installed. The diagnostic carries the app URL, HTTP-style recovery status, and typed detail. A provider transport failure becomes status 503, while missing assets remain status 404 and parser or script failures remain status 500.
 

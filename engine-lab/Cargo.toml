@@ -13,10 +13,16 @@ path = "src/lib.rs"
 [features]
 default = []
 windowed = ["dep:softbuffer", "dep:winit"]
+native-http = ["dep:ureq"]
 
 [dependencies]
 softbuffer = { version = "=0.4.8", optional = true }
 winit = { version = "=0.30.13", optional = true }
+ureq = { version = "=3.4.0", optional = true, default-features = false, features = [
+    "gzip",
+    "platform-verifier",
+    "rustls",
+] }
 
 [[bin]]
 name = "ceri-engine-lab"
