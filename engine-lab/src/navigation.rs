@@ -1704,7 +1704,7 @@ fn is_http_token_byte(byte: u8) -> bool {
         )
 }
 
-fn normalize_headers(
+pub(crate) fn normalize_headers(
     headers: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, NavigationError> {
     let mut normalized = BTreeMap::new();

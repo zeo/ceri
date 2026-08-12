@@ -2,7 +2,7 @@ use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
     is_http_redirect, is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceCacheMode,
-    ResourceProvider, ResourceRequest, ResourceResponse, APP_ORIGIN,
+    normalize_headers, ResourceProvider, ResourceRequest, ResourceResponse, APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
 use crate::Color;
@@ -18,7 +18,7 @@ type ResponseHandle = Rc<ResponseData>;
 type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
 type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
 type ReadableStreamReaderHandle = Rc<RefCell<ReadableStreamReaderData>>;
-type HeadersHandle = Rc<BTreeMap<String, String>>;
+type HeadersHandle = Rc<RefCell<HeadersData>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
 type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
@@ -98,6 +98,7 @@ enum Value {
     AbortSignal(AbortSignalHandle),
     Console,
     Json,
+    HeadersConstructor,
     UrlConstructor,
     UrlSearchParamsConstructor,
     FormDataConstructor,
@@ -199,12 +200,15 @@ enum Builtin {
     Fetch,
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
+    HeadersAppend(HeadersHandle),
+    HeadersDelete(HeadersHandle),
     HeadersGet(HeadersHandle),
     HeadersHas(HeadersHandle),
     HeadersKeys(HeadersHandle),
     HeadersValues(HeadersHandle),
     HeadersEntries(HeadersHandle),
     HeadersForEach(HeadersHandle),
+    HeadersSet(HeadersHandle),
     ResponseClone(ResponseHandle),
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
@@ -662,6 +666,11 @@ struct FormDataData {
     pairs: Vec<(String, String)>,
 }
 
+struct HeadersData {
+    values: BTreeMap<String, String>,
+    mutable: bool,
+}
+
 struct MapData {
     entries: Vec<(Value, Value)>,
 }
@@ -953,6 +962,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("FormData".to_string(), Value::FormDataConstructor);
+            values
+                .values
+                .insert("Headers".to_string(), Value::HeadersConstructor);
             values
                 .values
                 .insert("Map".to_string(), Value::MapConstructor);
@@ -2299,12 +2311,15 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Headers(headers) => match property {
+                "append" => Ok(Value::Builtin(Builtin::HeadersAppend(headers))),
+                "delete" => Ok(Value::Builtin(Builtin::HeadersDelete(headers))),
                 "get" => Ok(Value::Builtin(Builtin::HeadersGet(headers))),
                 "has" => Ok(Value::Builtin(Builtin::HeadersHas(headers))),
                 "keys" => Ok(Value::Builtin(Builtin::HeadersKeys(headers))),
                 "values" => Ok(Value::Builtin(Builtin::HeadersValues(headers))),
                 "entries" => Ok(Value::Builtin(Builtin::HeadersEntries(headers))),
                 "forEach" => Ok(Value::Builtin(Builtin::HeadersForEach(headers))),
+                "set" => Ok(Value::Builtin(Builtin::HeadersSet(headers))),
                 _ => Err(runtime_error(format!(
                     "headers has no property {property}"
                 ))),
@@ -2777,6 +2792,7 @@ impl ScriptRuntime {
             Value::UrlConstructor => self.construct_url(arguments),
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             Value::FormDataConstructor => self.construct_form_data(arguments),
+            Value::HeadersConstructor => self.construct_headers(arguments),
             Value::MapConstructor => self.construct_map(arguments),
             Value::SetConstructor => self.construct_set(arguments),
             Value::ErrorConstructor => Ok(self.construct_error(arguments)),
@@ -2966,6 +2982,60 @@ impl ScriptRuntime {
             pairs.push((name.to_string(), value));
         }
         Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+    }
+
+    fn construct_headers(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let init = arguments
+            .first()
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        let values = match init {
+            Value::Undefined | Value::Null => BTreeMap::new(),
+            Value::Headers(headers) => headers.borrow().values.clone(),
+            Value::Object(object) => object
+                .borrow()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.string_value()))
+                .collect(),
+            Value::Array(array) => {
+                let mut values: BTreeMap<String, String> = BTreeMap::new();
+                for entry in array.borrow().iter() {
+                    let Value::Array(entry) = entry.resolve() else {
+                        return Err(runtime_error(
+                            "Headers sequence entries must be arrays",
+                        ));
+                    };
+                    let entry = entry.borrow();
+                    if entry.len() != 2 {
+                        return Err(runtime_error(
+                            "Headers sequence entries need two values",
+                        ));
+                    }
+                    let mut pair = BTreeMap::new();
+                    pair.insert(entry[0].string_value(), entry[1].string_value());
+                    let (name, value) = normalize_headers(pair)
+                        .map_err(|error| runtime_error(error.to_string()))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| runtime_error("header name is empty"))?;
+                    if let Some(existing) = values.get_mut(&name) {
+                        existing.push_str(", ");
+                        existing.push_str(&value);
+                    } else {
+                        values.insert(name, value);
+                    }
+                }
+                values
+            }
+            _ => {
+                return Err(runtime_error(
+                    "Headers constructor requires an object, sequence, or Headers",
+                ));
+            }
+        };
+        let values = normalize_headers(values).map_err(|error| runtime_error(error.to_string()))?;
+        Ok(Value::Headers(headers_handle(values, true)))
     }
 
     fn construct_map(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -3718,34 +3788,65 @@ impl ScriptRuntime {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
             }
             Builtin::PromiseCatch(promise) => self.promise_then(promise, None, arguments.first()),
+            Builtin::HeadersAppend(headers) => {
+                let (name, value) = normalized_header_pair(&arguments)?;
+                let mut headers = headers.borrow_mut();
+                if !headers.mutable {
+                    return Err(runtime_error("headers are immutable"));
+                }
+                if let Some(existing) = headers.values.get_mut(&name) {
+                    existing.push_str(", ");
+                    existing.push_str(&value);
+                } else {
+                    headers.values.insert(name, value);
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::HeadersDelete(headers) => {
+                let name = normalized_header_name(&arguments)?;
+                let mut headers = headers.borrow_mut();
+                if !headers.mutable {
+                    return Err(runtime_error("headers are immutable"));
+                }
+                headers.values.remove(&name);
+                Ok(Value::Undefined)
+            }
             Builtin::HeadersGet(headers) => {
-                let name = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
+                let name = normalized_header_name(&arguments)?;
                 Ok(headers
+                    .borrow()
+                    .values
                     .get(&name)
                     .cloned()
                     .map(Value::String)
                     .unwrap_or(Value::Null))
             }
             Builtin::HeadersHas(headers) => {
-                let name = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                Ok(Value::Bool(headers.contains_key(&name)))
+                let name = normalized_header_name(&arguments)?;
+                Ok(Value::Bool(headers.borrow().values.contains_key(&name)))
             }
             Builtin::HeadersKeys(headers) => Ok(iterator_value(
-                headers.keys().cloned().map(Value::String).collect(),
+                headers
+                    .borrow()
+                    .values
+                    .keys()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
             )),
             Builtin::HeadersValues(headers) => Ok(iterator_value(
-                headers.values().cloned().map(Value::String).collect(),
+                headers
+                    .borrow()
+                    .values
+                    .values()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
             )),
             Builtin::HeadersEntries(headers) => Ok(iterator_value(
                 headers
+                    .borrow()
+                    .values
                     .iter()
                     .map(|(name, value)| {
                         Value::Array(Rc::new(RefCell::new(vec![
@@ -3760,16 +3861,31 @@ impl ScriptRuntime {
                 if !matches!(callback, Value::Function(_)) {
                     return Err(runtime_error("headers.forEach callback must be a function"));
                 }
-                for (name, value) in headers.iter() {
+                let entries = headers
+                    .borrow()
+                    .values
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<Vec<_>>();
+                for (name, value) in entries {
                     self.call(
                         callback.clone(),
                         vec![
-                            Value::String(value.clone()),
-                            Value::String(name.clone()),
+                            Value::String(value),
+                            Value::String(name),
                             Value::Headers(headers.clone()),
                         ],
                     )?;
                 }
+                Ok(Value::Undefined)
+            }
+            Builtin::HeadersSet(headers) => {
+                let (name, value) = normalized_header_pair(&arguments)?;
+                let mut headers = headers.borrow_mut();
+                if !headers.mutable {
+                    return Err(runtime_error("headers are immutable"));
+                }
+                headers.values.insert(name, value);
                 Ok(Value::Undefined)
             }
             Builtin::ResponseClone(response) => {
@@ -4467,7 +4583,7 @@ impl ScriptRuntime {
                     url.to_string(),
                     404,
                     String::new(),
-                    Rc::new(BTreeMap::new()),
+                    headers_handle(BTreeMap::new(), false),
                     Vec::new(),
                     false,
                 ))));
@@ -4478,7 +4594,7 @@ impl ScriptRuntime {
             response.url.to_string(),
             response.response.status(),
             response.response.mime_type().to_string(),
-            Rc::new(response.response.headers().clone()),
+            headers_handle(response.response.headers().clone(), false),
             response.response.body().to_vec(),
             response.redirected,
         ))))
@@ -4777,6 +4893,7 @@ impl Value {
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
+            Self::HeadersConstructor => "[function Headers]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
                 "[function URL]".to_string()
             }
@@ -4833,6 +4950,10 @@ fn response_body(bytes: Vec<u8>) -> ResponseBodyHandle {
         disturbed: false,
         locked: false,
     }))
+}
+
+fn headers_handle(values: BTreeMap<String, String>, mutable: bool) -> HeadersHandle {
+    Rc::new(RefCell::new(HeadersData { values, mutable }))
 }
 
 fn response_data(
@@ -5210,6 +5331,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
         Value::Function(_)
         | Value::Builtin(_)
+        | Value::HeadersConstructor
         | Value::UrlConstructor
         | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
@@ -5261,6 +5383,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
         (Value::Bytes(left), Value::Bytes(right)) => Rc::ptr_eq(left, right),
+        (Value::Headers(left), Value::Headers(right)) => Rc::ptr_eq(left, right),
         (Value::ReadableStream(left), Value::ReadableStream(right)) => Rc::ptr_eq(left, right),
         (Value::ReadableStreamReader(left), Value::ReadableStreamReader(right)) => {
             Rc::ptr_eq(left, right)
@@ -5271,6 +5394,39 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 
 fn iterator_value(values: Vec<Value>) -> Value {
     Value::Iterator(Rc::new(RefCell::new(IteratorData { values, index: 0 })))
+}
+
+fn normalized_header_name(arguments: &[Value]) -> Result<String, ScriptError> {
+    let name = arguments
+        .first()
+        .map(Value::string_value)
+        .unwrap_or_default();
+    let mut header = BTreeMap::new();
+    header.insert(name, String::new());
+    normalize_headers(header)
+        .map_err(|error| runtime_error(error.to_string()))?
+        .into_iter()
+        .next()
+        .map(|(name, _)| name)
+        .ok_or_else(|| runtime_error("header name is empty"))
+}
+
+fn normalized_header_pair(arguments: &[Value]) -> Result<(String, String), ScriptError> {
+    let name = arguments
+        .first()
+        .map(Value::string_value)
+        .unwrap_or_default();
+    let value = arguments
+        .get(1)
+        .map(Value::string_value)
+        .unwrap_or_else(|| "undefined".to_string());
+    let mut header = BTreeMap::new();
+    header.insert(name, value);
+    normalize_headers(header)
+        .map_err(|error| runtime_error(error.to_string()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| runtime_error("header name is empty"))
 }
 
 const MAX_USER_ITERATOR_VALUES: usize = 10_000;
@@ -5341,7 +5497,8 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
             .iter()
             .map(|(name, value)| (name.clone(), value.string_value()))
             .collect(),
-        Some(_) => return Err(runtime_error("fetch headers must be an object")),
+        Some(Value::Headers(headers)) => headers.borrow().values.clone(),
+        Some(_) => return Err(runtime_error("fetch headers must be an object or Headers")),
     };
     let body = match options.get("body").map(Value::resolve) {
         None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
@@ -6897,7 +7054,9 @@ mod tests {
         }
     }
 
-    struct HeadersFetchProvider;
+    struct HeadersFetchProvider {
+        requests: Rc<RefCell<Vec<ResourceRequest>>>,
+    }
 
     impl ResourceProvider for HeadersFetchProvider {
         fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
@@ -6908,6 +7067,7 @@ mod tests {
             &self,
             request: &ResourceRequest,
         ) -> Result<Option<ResourceResponse>, NavigationError> {
+            self.requests.borrow_mut().push(request.clone());
             if request.url().path() != "/headers" {
                 return Ok(None);
             }
@@ -8354,10 +8514,13 @@ mod tests {
     fn response_headers_support_membership_iteration_and_for_each() {
         let document = document("<p id='status'>idle</p>");
         let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
         let mut runtime = ScriptRuntime::with_context(
             document.clone(),
             Some(ResourceBundle::default()),
-            Some(Rc::new(HeadersFetchProvider)),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
             Some(base),
             None,
             None,
@@ -8388,6 +8551,68 @@ mod tests {
             Some(
                 "true|false|content-type,x-alpha,x-zed|content-type=text/plain|content-type=text/plain;x-alpha=first;x-zed=last;"
             )
+        );
+        assert_eq!(requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn headers_construct_mutate_requests_and_keep_responses_immutable() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const requestHeaders = new Headers([["X-Test", "one"], ["X-Test", "two"]]);
+                requestHeaders.append("X-Test", "three");
+                requestHeaders.set("X-Remove", "value");
+                requestHeaders.delete("X-Remove");
+                const objectHeaders = new Headers({ "X-Object": "value" });
+                requestHeaders.set("X-Object", objectHeaders.get("x-object"));
+                const copiedHeaders = new Headers(requestHeaders);
+                copiedHeaders.set("X-Copy", "yes");
+                fetch("/headers", { headers: copiedHeaders }).then((response) => {
+                    let immutable = "";
+                    try { response.headers.set("x-new", "changed"); } catch (error) { immutable = error.message; }
+                    status.textContent = response.headers.get("x-new") + "|" + immutable;
+                });
+                "#,
+            )
+            .expect("Headers constructor and mutation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("null|headers are immutable")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers().get("x-test").map(String::as_str),
+            Some("one, two, three")
+        );
+        assert_eq!(requests[0].headers().get("x-remove"), None);
+        assert_eq!(
+            requests[0].headers().get("x-copy").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            requests[0].headers().get("x-object").map(String::as_str),
+            Some("value")
         );
     }
 
