@@ -262,6 +262,10 @@ enum Literal {
 #[derive(Clone, Debug, PartialEq)]
 enum Pattern {
     Identifier(String),
+    Default {
+        pattern: Box<Pattern>,
+        default: Box<Expr>,
+    },
     Object {
         properties: Vec<(String, Pattern)>,
         rest: Option<Box<Pattern>>,
@@ -1237,7 +1241,7 @@ impl ScriptRuntime {
     }
 
     fn bind_pattern(
-        &self,
+        &mut self,
         pattern: &Pattern,
         value: Value,
         environment: &EnvironmentRef,
@@ -1249,6 +1253,14 @@ impl ScriptRuntime {
                     .values
                     .insert(name.clone(), value);
                 Ok(())
+            }
+            Pattern::Default { pattern, default } => {
+                let value = if matches!(&value, Value::Undefined) {
+                    self.evaluate(default, environment.clone())?
+                } else {
+                    value
+                };
+                self.bind_pattern(pattern, value, environment)
             }
             Pattern::Object { properties, rest } => {
                 if matches!(value, Value::Null | Value::Undefined) {
@@ -4663,7 +4675,7 @@ impl Parser {
             return Ok(Stmt::Block(statements));
         }
         if self.take(TokenKind::Let) || self.take(TokenKind::Const) {
-            let pattern = self.parse_binding_pattern("variable")?;
+            let pattern = self.parse_binding_pattern_without_default("variable")?;
             let initializer = self
                 .take(TokenKind::Assign)
                 .then(|| self.parse_expression())
@@ -4697,7 +4709,7 @@ impl Parser {
                     self.peek().offset,
                 ));
             }
-            let pattern = self.parse_binding_pattern("for-of binding")?;
+            let pattern = self.parse_binding_pattern_without_default("for-of binding")?;
             self.expect_identifier_value("of")?;
             let iterable = self.parse_expression()?;
             self.expect(TokenKind::RParen, "for statement")?;
@@ -5111,10 +5123,22 @@ impl Parser {
     }
 
     fn parse_binding_pattern(&mut self, context: &str) -> Result<Pattern, ScriptError> {
-        match self.peek().kind.clone() {
+        self.parse_binding_pattern_with_default(context, true)
+    }
+
+    fn parse_binding_pattern_without_default(&mut self, context: &str) -> Result<Pattern, ScriptError> {
+        self.parse_binding_pattern_with_default(context, false)
+    }
+
+    fn parse_binding_pattern_with_default(
+        &mut self,
+        context: &str,
+        allow_default: bool,
+    ) -> Result<Pattern, ScriptError> {
+        let pattern = match self.peek().kind.clone() {
             TokenKind::Identifier(name) => {
                 self.advance();
-                Ok(Pattern::Identifier(name))
+                Pattern::Identifier(name)
             }
             TokenKind::LBrace => {
                 self.advance();
@@ -5122,7 +5146,9 @@ impl Parser {
                 let mut rest = None;
                 while !self.is(TokenKind::RBrace) && !self.is(TokenKind::Eof) {
                     if self.take(TokenKind::Ellipsis) {
-                        rest = Some(Box::new(self.parse_binding_pattern("object rest")?));
+                        rest = Some(Box::new(
+                            self.parse_binding_pattern_with_default("object rest", false)?,
+                        ));
                         self.take(TokenKind::Comma);
                         break;
                     }
@@ -5139,7 +5165,7 @@ impl Parser {
                     let nested = if self.take(TokenKind::Colon) {
                         self.parse_binding_pattern("object binding")?
                     } else {
-                        Pattern::Identifier(key.clone())
+                        self.parse_pattern_default(Pattern::Identifier(key.clone()))?
                     };
                     properties.push((key, nested));
                     if !self.take(TokenKind::Comma) {
@@ -5147,7 +5173,7 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RBrace, context)?;
-                Ok(Pattern::Object { properties, rest })
+                Pattern::Object { properties, rest }
             }
             TokenKind::LBracket => {
                 self.advance();
@@ -5155,7 +5181,9 @@ impl Parser {
                 let mut rest = None;
                 while !self.is(TokenKind::RBracket) && !self.is(TokenKind::Eof) {
                     if self.take(TokenKind::Ellipsis) {
-                        rest = Some(Box::new(self.parse_binding_pattern("array rest")?));
+                        rest = Some(Box::new(
+                            self.parse_binding_pattern_with_default("array rest", false)?,
+                        ));
                         self.take(TokenKind::Comma);
                         break;
                     }
@@ -5169,9 +5197,26 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RBracket, context)?;
-                Ok(Pattern::Array { items, rest })
+                Pattern::Array { items, rest }
             }
-            _ => Err(self.error(format!("expected {context}"), self.peek().offset)),
+            _ => return Err(self.error(format!("expected {context}"), self.peek().offset)),
+        };
+        if allow_default {
+            self.parse_pattern_default(pattern)
+        } else {
+            Ok(pattern)
+        }
+    }
+
+    fn parse_pattern_default(&mut self, pattern: Pattern) -> Result<Pattern, ScriptError> {
+        if self.take(TokenKind::Assign) {
+            let default = self.parse_assignment()?;
+            Ok(Pattern::Default {
+                pattern: Box::new(pattern),
+                default: Box::new(default),
+            })
+        } else {
+            Ok(pattern)
         }
     }
 
@@ -6060,6 +6105,38 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready|a|2|kept|c|1|x1y2")
+        );
+    }
+
+    #[test]
+    fn applies_defaults_to_missing_destructured_values_and_parameters() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const payload = { nested: {}, keep: "yes" };
+                const { label = "fallback", nested: { count = 2 } = {}, ...rest } = payload;
+                const [first = "first", second = first + " second", , fourth = "fourth"] = ["one"];
+                function describe({ name = "guest" } = {}) {
+                  return name;
+                }
+                let seen = "";
+                for (const { value = "missing" } of [{}, { value: "present" }]) {
+                  seen = seen + value + "|";
+                }
+                document.getElementById("status").textContent =
+                  label + "|" + count + "|" + rest.keep + "|" + first + "|" + second + "|" + fourth + "|" + describe() + "|" + describe({ name: "Ceri" }) + "|" + seen;
+                "##,
+            )
+            .expect("destructuring defaults should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("fallback|2|yes|one|one second|fourth|guest|Ceri|missing|present|")
         );
     }
 
