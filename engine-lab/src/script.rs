@@ -200,6 +200,7 @@ enum Builtin {
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
     HeadersGet(HeadersHandle),
+    ResponseClone(ResponseHandle),
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
     ResponseBytes(ResponseHandle),
@@ -2180,6 +2181,7 @@ impl ScriptRuntime {
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
                 "body" => Ok(Value::ReadableStream(response.stream.clone())),
+                "clone" => Ok(Value::Builtin(Builtin::ResponseClone(response))),
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
@@ -3638,6 +3640,20 @@ impl ScriptRuntime {
                     .cloned()
                     .map(Value::String)
                     .unwrap_or(Value::Null))
+            }
+            Builtin::ResponseClone(response) => {
+                let body = response.body.borrow();
+                if body.consumed || body.disturbed || body.locked {
+                    return Err(runtime_error("response body is already used"));
+                }
+                let cloned = response_data(
+                    response.url.clone(),
+                    response.status,
+                    response.mime_type.clone(),
+                    response.headers.clone(),
+                    body.bytes[body.cursor..].to_vec(),
+                );
+                Ok(Value::Response(Rc::new(cloned)))
             }
             Builtin::ResponseText(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
@@ -8242,6 +8258,71 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|false|true")
+        );
+    }
+
+    #[test]
+    fn response_clone_preserves_metadata_and_has_an_independent_body() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"hello".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    const copy = response.clone();
+                    response.text().then((original) => {
+                        copy.text().then((cloned) => {
+                            status.textContent = original + "|" + cloned + "|" + copy.status + "|" + copy.url;
+                        });
+                    });
+                });
+                "#,
+            )
+            .expect("response clone should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello|hello|200|https://app.ceri.invalid/data.txt")
+        );
+    }
+
+    #[test]
+    fn response_clone_rejects_a_disturbed_body() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"hello".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    response.text().then(() => {
+                        try { response.clone(); } catch (error) { status.textContent = error; }
+                    });
+                });
+                "#,
+            )
+            .expect("response clone rejection should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("response body is already used")
         );
     }
 
