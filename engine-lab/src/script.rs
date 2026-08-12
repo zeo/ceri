@@ -249,6 +249,7 @@ pub struct ScriptRuntime {
     window_listeners: HashMap<String, Vec<Value>>,
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
+    control_checked: HashMap<NodePath, bool>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -504,6 +505,7 @@ impl ScriptRuntime {
             window_listeners: HashMap::new(),
             focused_element: None,
             control_values: HashMap::new(),
+            control_checked: HashMap::new(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,
@@ -540,6 +542,7 @@ impl ScriptRuntime {
         let dispatch = self.dispatch_event(path.clone(), "click")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
+            self.apply_click_default(&path);
             let reference = self.document.borrow().link_reference(&path);
             if let Some(reference) = reference {
                 self.request_location_navigation(reference, false);
@@ -630,6 +633,29 @@ impl ScriptRuntime {
 
     pub fn now(&self) -> u64 {
         self.clock
+    }
+
+    fn apply_click_default(&mut self, path: &[usize]) {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return;
+        };
+        if element.name != "input" {
+            return;
+        }
+        let input_type = element
+            .attr("type")
+            .map(|kind| kind.to_ascii_lowercase())
+            .unwrap_or_default();
+        match input_type.as_str() {
+            "checkbox" => {
+                let checked = self.control_checked_path(path);
+                self.control_checked.insert(path.to_vec(), !checked);
+            }
+            "radio" => {
+                self.control_checked.insert(path.to_vec(), true);
+            }
+            _ => {}
+        }
     }
 
     pub fn pending_task_count(&self) -> usize {
@@ -988,6 +1014,7 @@ impl ScriptRuntime {
                         .element_value(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "checked" => Value::Bool(self.element_checked(&handle)),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
                     "querySelector" => {
@@ -1233,6 +1260,7 @@ impl ScriptRuntime {
         property: &str,
         value: Value,
     ) -> Result<(), ScriptError> {
+        let truthy = value.truthy();
         let value = value.string_value();
         let updated = match object {
             Value::Element(handle) => match property {
@@ -1241,6 +1269,7 @@ impl ScriptRuntime {
                 "id" => self.set_element_attribute(&handle, "id", value),
                 "innerHTML" => self.set_element_inner_html(&handle, value)?,
                 "value" => self.set_element_value(&handle, value),
+                "checked" => self.set_element_checked(&handle, truthy),
                 _ => false,
             },
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
@@ -1328,6 +1357,13 @@ impl ScriptRuntime {
         }
     }
 
+    fn element_checked(&self, handle: &ElementHandle) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self.control_checked_path(&path),
+            ElementLocation::Detached(element) => element.attr("checked").is_some(),
+        }
+    }
+
     fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => {
@@ -1391,10 +1427,16 @@ impl ScriptRuntime {
     fn set_element_attribute(&mut self, handle: &ElementHandle, name: &str, value: String) -> bool {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow_mut()
-                .set_element_attribute(&path, name, value),
+            ElementLocation::Attached(path) => {
+                let changed = self
+                    .document
+                    .borrow_mut()
+                    .set_element_attribute(&path, name, value);
+                if changed && name.eq_ignore_ascii_case("checked") {
+                    self.control_checked.insert(path, true);
+                }
+                changed
+            }
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
                 let ElementLocation::Detached(element) = &mut *location else {
@@ -1481,6 +1523,37 @@ impl ScriptRuntime {
         }
     }
 
+    fn set_element_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                self.control_checked.insert(path, checked);
+                true
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                if checked {
+                    element.attrs.insert("checked".to_string(), String::new());
+                } else {
+                    element.attrs.remove("checked");
+                }
+                true
+            }
+        }
+    }
+
+    fn control_checked_path(&self, path: &[usize]) -> bool {
+        if let Some(checked) = self.control_checked.get(path) {
+            return *checked;
+        }
+        self.document
+            .borrow()
+            .element_clone(path)
+            .is_some_and(|element| element.attr("checked").is_some())
+    }
+
     fn construct_url(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
         let reference = arguments
             .first()
@@ -1552,7 +1625,7 @@ impl ScriptRuntime {
                 continue;
             }
             if matches!(input_type.as_str(), "checkbox" | "radio")
-                && element.attr("checked").is_none()
+                && !self.control_checked_path(&path)
             {
                 continue;
             }
@@ -3978,6 +4051,35 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("Updated|one|3|true|false|3|ok")
+        );
+    }
+
+    #[test]
+    fn checkbox_click_default_updates_live_form_state() {
+        let document = document(
+            r#"<form id="profile"><input id="accepted" name="accepted" type="checkbox" value="yes"><input id="veto" name="veto" type="checkbox" value="yes" checked><p id="status">idle</p></form>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const accepted = document.getElementById("accepted");
+                const veto = document.getElementById("veto");
+                veto.addEventListener("click", (event) => event.preventDefault());
+                accepted.click();
+                veto.click();
+                const data = new FormData(document.getElementById("profile"));
+                document.getElementById("status").textContent = accepted.checked + "|" + veto.checked + "|" + data.has("accepted") + "|" + data.has("veto");
+                "#,
+            )
+            .expect("checkbox click defaults should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|true|true|true")
         );
     }
 
