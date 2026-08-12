@@ -6,7 +6,7 @@ The current slice implements:
 
 - HTML tokenization and a small DOM tree
 - HTML entity decoding for common named and numeric entities
-- CSS rules with tag, class, and id selectors
+- CSS rules with compound tag, class, and id selectors, descendant matching, and direct-child matching
 - a deterministic cascade with selector specificity
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - a software paint step with a small built-in bitmap font
@@ -46,4 +46,10 @@ The dynamic-DOM sample creates a detached element, mutates it, appends it into t
 
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/dynamic-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-dynamic-demo.bmp --width 800 --height 360
+```
+
+The nested-selector sample exercises compound selectors, descendant cascade, direct-child matching, and flex layout together:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/selector-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-selector-demo.bmp --width 800 --height 360
 ```

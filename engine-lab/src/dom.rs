@@ -128,13 +128,8 @@ impl Document {
     }
 
     pub fn find_element_by_selector(&self, selector: &str) -> Option<NodePath> {
-        let selector = selector.trim();
-        let (kind, value) = if selector.starts_with('#') || selector.starts_with('.') {
-            (selector.chars().next()?, &selector[1..])
-        } else {
-            ('t', selector)
-        };
-        find_element_by_simple_selector(&self.root, kind, value, &mut Vec::new())
+        let selector = crate::css::Selector::parse(selector).ok()?;
+        find_element_by_selector(&self.root, &selector, &mut Vec::new(), &mut Vec::new())
     }
 
     pub fn element_text_content(&self, path: &[usize]) -> Option<String> {
@@ -360,10 +355,10 @@ fn find_element_by_id(element: &Element, id: &str, path: &mut NodePath) -> Optio
     None
 }
 
-fn find_element_by_simple_selector(
-    element: &Element,
-    kind: char,
-    value: &str,
+fn find_element_by_selector<'a>(
+    element: &'a Element,
+    selector: &crate::css::Selector,
+    ancestors: &mut Vec<&'a Element>,
     path: &mut NodePath,
 ) -> Option<NodePath> {
     for (index, child) in element.children.iter().enumerate() {
@@ -371,18 +366,14 @@ fn find_element_by_simple_selector(
             continue;
         };
         path.push(index);
-        let matches = match kind {
-            '#' => child.attr("id") == Some(value),
-            '.' => child.has_class(value),
-            't' => child.name == value.to_ascii_lowercase(),
-            _ => false,
-        };
-        if matches {
+        if selector.matches(child, ancestors) {
             return Some(path.clone());
         }
-        if let Some(found) = find_element_by_simple_selector(child, kind, value, path) {
+        ancestors.push(child);
+        if let Some(found) = find_element_by_selector(child, selector, ancestors, path) {
             return Some(found);
         }
+        ancestors.pop();
         path.pop();
     }
     None
@@ -791,5 +782,25 @@ mod tests {
             document.element_clone(&path).map(|element| element.name),
             Some("section".to_string())
         );
+    }
+
+    #[test]
+    fn queries_compound_descendant_and_child_selectors() {
+        let document = Document::parse(
+            "<main class='shell'><section><p class='card'>nested</p></section><p class='direct'>direct</p></main>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            document
+                .find_element_by_selector(".shell .card")
+                .and_then(|path| document.element_text_content(&path)),
+            Some("nested".to_string())
+        );
+        assert!(
+            document
+                .find_element_by_selector(".shell > .direct")
+                .is_some()
+        );
+        assert!(document.find_element_by_selector("section.card").is_none());
     }
 }

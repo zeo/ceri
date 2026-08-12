@@ -106,6 +106,7 @@ struct FlexItem<'a> {
 
 struct FlexLayoutInput<'a> {
     element: &'a Element,
+    ancestors: Vec<&'a Element>,
     style: Style,
     stylesheet: &'a Stylesheet,
     margin: ResolvedEdges,
@@ -150,6 +151,7 @@ pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> L
                 weight: FontWeight::Normal,
             },
             stylesheet,
+            &[],
         ) {
             cursor_y = child_box.rect.bottom() + child_box.margin.bottom;
             root.children.push(child_box);
@@ -177,9 +179,15 @@ fn layout_element(
     containing_width: f32,
     parent: ParentStyle,
     stylesheet: &Stylesheet,
+    ancestors: &[&Element],
 ) -> Option<LayoutBox> {
-    let style =
-        stylesheet.style_for_inherited(element, parent.font_size, parent.color, parent.weight);
+    let style = stylesheet.style_for_inherited_with_ancestors(
+        element,
+        ancestors,
+        parent.font_size,
+        parent.color,
+        parent.weight,
+    );
     if style.display == Display::None {
         return None;
     }
@@ -210,6 +218,7 @@ fn layout_element(
     if style.display == Display::Flex {
         return Some(layout_flex_element(FlexLayoutInput {
             element,
+            ancestors: ancestors.to_vec(),
             style,
             stylesheet,
             margin,
@@ -244,12 +253,15 @@ fn layout_element(
         content_x,
         align: style.text_align,
     };
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(element);
     for child in &element.children {
         match child {
             Node::Text(value) => append_inline_text(value, inline_context, &mut text, &mut line),
             Node::Element(child_element) => {
-                let child_style = stylesheet.style_for_inherited(
+                let child_style = stylesheet.style_for_inherited_with_ancestors(
                     child_element,
+                    &child_ancestors,
                     font_size,
                     style.color,
                     style.font_weight,
@@ -276,6 +288,7 @@ fn layout_element(
                             weight: style.font_weight,
                         },
                         stylesheet,
+                        &child_ancestors,
                     ) {
                         line.y = child_box.rect.bottom() + child_box.margin.bottom;
                         line.used = 0.0;
@@ -293,6 +306,7 @@ fn layout_element(
                         },
                         inline_context,
                         stylesheet,
+                        &child_ancestors,
                         &mut text,
                         &mut line,
                     );
@@ -332,6 +346,7 @@ fn layout_element(
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let FlexLayoutInput {
         element,
+        ancestors,
         style,
         stylesheet,
         margin,
@@ -348,13 +363,20 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         color: style.color,
         weight: style.font_weight,
     };
+    let mut child_ancestors = ancestors;
+    child_ancestors.push(element);
     let mut items = Vec::new();
     for child in &element.children {
         let Node::Element(child) = child else {
             continue;
         };
-        let child_style =
-            stylesheet.style_for_inherited(child, font_size, style.color, style.font_weight);
+        let child_style = stylesheet.style_for_inherited_with_ancestors(
+            child,
+            &child_ancestors,
+            font_size,
+            style.color,
+            style.font_weight,
+        );
         if child_style.display == Display::None {
             continue;
         }
@@ -439,6 +461,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             child_width,
             child_parent,
             stylesheet,
+            &child_ancestors,
         );
     }
 
@@ -583,6 +606,7 @@ fn append_inline_element(
     parent: ParentStyle,
     context: InlineContext,
     stylesheet: &Stylesheet,
+    ancestors: &[&Element],
     text: &mut Vec<TextRun>,
     line: &mut InlineLine,
 ) {
@@ -601,8 +625,13 @@ fn append_inline_element(
         }
         return;
     }
-    let style =
-        stylesheet.style_for_inherited(element, parent.font_size, parent.color, parent.weight);
+    let style = stylesheet.style_for_inherited_with_ancestors(
+        element,
+        ancestors,
+        parent.font_size,
+        parent.color,
+        parent.weight,
+    );
     if style.display == Display::None {
         return;
     }
@@ -625,6 +654,8 @@ fn append_inline_element(
         content_x: context.content_x,
         align: context.align,
     };
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(element);
     for child in &element.children {
         match child {
             Node::Text(value) => append_inline_text(value, child_context, text, line),
@@ -637,6 +668,7 @@ fn append_inline_element(
                 },
                 child_context,
                 stylesheet,
+                &child_ancestors,
                 text,
                 line,
             ),

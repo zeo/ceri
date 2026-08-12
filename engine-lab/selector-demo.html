@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 24px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main.shell {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 22px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      .shell > .title {
+        margin: 0;
+        color: #6ee7c5;
+        font-size: 26px;
+      }
+      .shell .cards {
+        display: flex;
+        gap: 12px;
+      }
+      .shell .card {
+        flex-grow: 1;
+        padding: 14px;
+        color: #07131f;
+        background-color: #6ee7c5;
+      }
+      .shell .card.emphasis {
+        background-color: #ffd479;
+      }
+      .shell > .direct {
+        margin: 0;
+        padding: 12px;
+        color: #07131f;
+        background-color: #7fc8ff;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <h1 class="title">nested selector cascade</h1>
+      <section class="cards">
+        <article class="card">descendant card</article>
+        <article class="card emphasis">compound card</article>
+      </section>
+      <p class="direct">direct child rule</p>
+    </main>
+  </body>
+</html>

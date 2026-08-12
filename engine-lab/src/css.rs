@@ -271,9 +271,10 @@ impl Stylesheet {
         Ok(Self { rules })
     }
 
-    pub(crate) fn style_for_inherited(
+    pub(crate) fn style_for_inherited_with_ancestors(
         &self,
         element: &Element,
+        ancestors: &[&Element],
         parent_font_size: f32,
         parent_color: Color,
         parent_weight: FontWeight,
@@ -285,7 +286,7 @@ impl Stylesheet {
             let Some(specificity) = rule
                 .selectors
                 .iter()
-                .filter(|selector| selector.matches(element))
+                .filter(|selector| selector.matches(element, ancestors))
                 .map(Selector::specificity)
                 .max()
             else {
@@ -332,7 +333,24 @@ struct Declaration {
 }
 
 #[derive(Clone, Debug)]
-struct Selector {
+pub(crate) struct Selector {
+    parts: Vec<SelectorPart>,
+}
+
+#[derive(Clone, Debug)]
+struct SelectorPart {
+    combinator: Option<Combinator>,
+    compound: CompoundSelector,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Combinator {
+    Descendant,
+    Child,
+}
+
+#[derive(Clone, Debug)]
+struct CompoundSelector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
@@ -346,47 +364,108 @@ impl Specificity {
 }
 
 impl Selector {
-    fn parse(source: &str) -> Result<Self, String> {
+    pub(crate) fn parse(source: &str) -> Result<Self, String> {
         let source = source.trim();
         if source.is_empty() {
             return Err("empty selector".to_string());
         }
-        if source.contains(char::is_whitespace) {
-            return Err(format!(
-                "descendant selectors are not implemented: {source}"
-            ));
-        }
-        let mut selector = Self {
-            tag: None,
-            id: None,
-            classes: Vec::new(),
-        };
         let mut cursor = 0;
+        let mut parts = Vec::new();
+        let mut combinator = None;
         while cursor < source.len() {
-            let byte = source.as_bytes()[cursor];
-            match byte {
-                b'#' => {
-                    cursor += 1;
-                    selector.id = Some(parse_selector_name(source, &mut cursor)?);
-                }
-                b'.' => {
-                    cursor += 1;
-                    selector
-                        .classes
-                        .push(parse_selector_name(source, &mut cursor)?);
-                }
-                b'*' => cursor += 1,
-                _ => {
-                    if selector.tag.is_some() {
-                        return Err(format!("invalid selector: {source}"));
-                    }
-                    selector.tag = Some(parse_selector_name(source, &mut cursor)?);
-                }
+            let had_whitespace = skip_selector_whitespace(source, &mut cursor);
+            if cursor >= source.len() {
+                break;
             }
+            if source.as_bytes()[cursor] == b'>' {
+                if parts.is_empty() || combinator.is_some() {
+                    return Err(format!("invalid child combinator in selector: {source}"));
+                }
+                combinator = Some(Combinator::Child);
+                cursor += 1;
+                continue;
+            }
+            if !parts.is_empty() && combinator.is_none() && had_whitespace {
+                combinator = Some(Combinator::Descendant);
+            }
+            let compound = parse_compound_selector(source, &mut cursor)?;
+            parts.push(SelectorPart {
+                combinator: if parts.is_empty() {
+                    None
+                } else {
+                    Some(combinator.take().unwrap_or(Combinator::Descendant))
+                },
+                compound,
+            });
         }
-        Ok(selector)
+        if parts.is_empty() || combinator.is_some() {
+            return Err(format!("selector has no final compound: {source}"));
+        }
+        Ok(Self { parts })
     }
 
+    pub(crate) fn matches(&self, element: &Element, ancestors: &[&Element]) -> bool {
+        let Some(last) = self.parts.last() else {
+            return false;
+        };
+        self.matches_part(self.parts.len() - 1, &last.compound, element, ancestors)
+    }
+
+    fn matches_part(
+        &self,
+        index: usize,
+        compound: &CompoundSelector,
+        element: &Element,
+        ancestors: &[&Element],
+    ) -> bool {
+        if !compound.matches(element) {
+            return false;
+        }
+        if index == 0 {
+            return true;
+        }
+        match self.parts[index].combinator {
+            Some(Combinator::Child) => ancestors.last().is_some_and(|parent| {
+                self.matches_part(
+                    index - 1,
+                    &self.parts[index - 1].compound,
+                    parent,
+                    &ancestors[..ancestors.len() - 1],
+                )
+            }),
+            Some(Combinator::Descendant) => {
+                ancestors
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .any(|(parent_index, parent)| {
+                        self.matches_part(
+                            index - 1,
+                            &self.parts[index - 1].compound,
+                            parent,
+                            &ancestors[..parent_index],
+                        )
+                    })
+            }
+            None => false,
+        }
+    }
+
+    fn specificity(&self) -> Specificity {
+        self.parts
+            .iter()
+            .fold(Specificity(0, 0, 0), |specificity, part| {
+                let part_specificity = part.compound.specificity();
+                Specificity(
+                    specificity.0 + part_specificity.0,
+                    specificity.1 + part_specificity.1,
+                    specificity.2 + part_specificity.2,
+                )
+            })
+    }
+}
+
+impl CompoundSelector {
     fn matches(&self, element: &Element) -> bool {
         self.tag.as_deref().is_none_or(|tag| tag == element.name)
             && self
@@ -403,6 +482,49 @@ impl Selector {
             u32::from(self.tag.is_some()),
         )
     }
+}
+
+fn skip_selector_whitespace(source: &str, cursor: &mut usize) -> bool {
+    let start = *cursor;
+    while *cursor < source.len() && source.as_bytes()[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
+    }
+    *cursor > start
+}
+
+fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundSelector, String> {
+    let mut selector = CompoundSelector {
+        tag: None,
+        id: None,
+        classes: Vec::new(),
+    };
+    let start = *cursor;
+    while *cursor < source.len() {
+        match source.as_bytes()[*cursor] {
+            b'#' => {
+                *cursor += 1;
+                selector.id = Some(parse_selector_name(source, cursor)?);
+            }
+            b'.' => {
+                *cursor += 1;
+                selector.classes.push(parse_selector_name(source, cursor)?);
+            }
+            b'*' => *cursor += 1,
+            byte if byte.is_ascii_whitespace() || byte == b'>' => break,
+            _ => {
+                if selector.tag.is_some() {
+                    return Err(format!("invalid compound selector: {source}"));
+                }
+                selector.tag = Some(parse_selector_name(source, cursor)?);
+            }
+        }
+    }
+    if *cursor == start {
+        return Err(format!(
+            "selector has no compound at byte {start}: {source}"
+        ));
+    }
+    Ok(selector)
 }
 
 fn parse_selector_name(source: &str, cursor: &mut usize) -> Result<String, String> {
@@ -682,7 +804,13 @@ mod tests {
         element.attrs.insert("id".to_string(), "hero".to_string());
         assert_eq!(
             stylesheet
-                .style_for_inherited(&element, 16.0, Color::BLACK, FontWeight::Normal)
+                .style_for_inherited_with_ancestors(
+                    &element,
+                    &[],
+                    16.0,
+                    Color::BLACK,
+                    FontWeight::Normal
+                )
                 .color,
             Color::opaque(66, 211, 180)
         );
@@ -704,18 +832,59 @@ mod tests {
         )
         .expect("stylesheet should parse");
         let element = Element::new("div");
-        let style =
-            stylesheet.style_for_inherited(&element, 16.0, Color::BLACK, FontWeight::Normal);
+        let style = stylesheet.style_for_inherited_with_ancestors(
+            &element,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
         assert_eq!(style.display, Display::Block);
         let mut element = Element::new("div");
         element.attrs.insert("class".to_string(), "row".to_string());
-        let style =
-            stylesheet.style_for_inherited(&element, 16.0, Color::BLACK, FontWeight::Normal);
+        let style = stylesheet.style_for_inherited_with_ancestors(
+            &element,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
         assert_eq!(style.display, Display::Flex);
         assert_eq!(style.flex_direction, FlexDirection::Column);
         assert_eq!(style.justify_content, JustifyContent::Center);
         assert_eq!(style.align_items, AlignItems::FlexEnd);
         assert_eq!(style.gap, Length::Px(12.0));
         assert_eq!(style.flex_grow, 2.0);
+    }
+
+    #[test]
+    fn matches_descendant_and_child_selector_relationships() {
+        let stylesheet =
+            Stylesheet::parse(".shell .card { color: red; } .shell > .direct { color: blue; }")
+                .expect("stylesheet should parse");
+        let mut shell = Element::new("main");
+        shell.attrs.insert("class".to_string(), "shell".to_string());
+        let mut card = Element::new("section");
+        card.attrs.insert("class".to_string(), "card".to_string());
+        let mut direct = Element::new("p");
+        direct
+            .attrs
+            .insert("class".to_string(), "direct".to_string());
+        let card_style = stylesheet.style_for_inherited_with_ancestors(
+            &card,
+            &[&shell],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        let direct_style = stylesheet.style_for_inherited_with_ancestors(
+            &direct,
+            &[&shell],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(card_style.color, Color::opaque(255, 0, 0));
+        assert_eq!(direct_style.color, Color::opaque(0, 0, 255));
     }
 }
