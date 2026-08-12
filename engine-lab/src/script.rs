@@ -1,7 +1,7 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::navigation::{AppUrl, ResourceBundle};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
@@ -9,6 +9,8 @@ type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
 type ResponseHandle = Rc<ResponseData>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
+type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
+type ArrayHandle = Rc<RefCell<Vec<Value>>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -35,6 +37,8 @@ enum Value {
     Bool(bool),
     Number(f64),
     String(String),
+    Object(ObjectHandle),
+    Array(ArrayHandle),
     Element(ElementHandle),
     Style(ElementHandle),
     ClassList(ElementHandle),
@@ -44,6 +48,7 @@ enum Value {
     Document,
     Window,
     Console,
+    Json,
     Function(Rc<Function>),
     Builtin(Builtin),
 }
@@ -54,6 +59,8 @@ enum Builtin {
     DocumentQuerySelector,
     DocumentCreateElement,
     ConsoleLog,
+    JsonParse,
+    JsonStringify,
     SetTimeout,
     ClearTimeout,
     RequestAnimationFrame,
@@ -72,6 +79,7 @@ enum Builtin {
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
     ResponseText(ResponseHandle),
+    ResponseJson(ResponseHandle),
 }
 
 struct Function {
@@ -113,6 +121,12 @@ enum Expr {
         object: Box<Expr>,
         property: String,
     },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
+    Object(Vec<(String, Expr)>),
+    Array(Vec<Expr>),
     Call {
         callee: Box<Expr>,
         arguments: Vec<Expr>,
@@ -271,6 +285,7 @@ impl ScriptRuntime {
                 .insert("document".to_string(), Value::Document);
             values.values.insert("window".to_string(), Value::Window);
             values.values.insert("console".to_string(), Value::Console);
+            values.values.insert("JSON".to_string(), Value::Json);
             values
                 .values
                 .insert("fetch".to_string(), Value::Builtin(Builtin::Fetch));
@@ -492,6 +507,28 @@ impl ScriptRuntime {
                 let object = self.evaluate(object, environment)?;
                 self.member(object, property)
             }
+            Expr::Index { object, index } => {
+                let object = self.evaluate(object, environment.clone())?;
+                let index = self.evaluate(index, environment)?;
+                self.index(object, index)
+            }
+            Expr::Object(properties) => {
+                let mut object = BTreeMap::new();
+                for (property, expression) in properties {
+                    object.insert(
+                        property.clone(),
+                        self.evaluate(expression, environment.clone())?,
+                    );
+                }
+                Ok(Value::Object(Rc::new(RefCell::new(object))))
+            }
+            Expr::Array(expressions) => {
+                let values = expressions
+                    .iter()
+                    .map(|expression| self.evaluate(expression, environment.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Array(Rc::new(RefCell::new(values))))
+            }
             Expr::Call { callee, arguments } => {
                 let callee = self.evaluate(callee, environment.clone())?;
                 let arguments = arguments
@@ -542,6 +579,7 @@ impl ScriptRuntime {
             Value::Window => match property {
                 "document" => Ok(Value::Document),
                 "console" => Ok(Value::Console),
+                "JSON" => Ok(Value::Json),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
@@ -630,9 +668,34 @@ impl ScriptRuntime {
                 "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
                 "mimeType" => Ok(Value::String(response.mime_type.clone())),
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
+                "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
                 ))),
+            },
+            Value::Object(object) => Ok(object
+                .borrow()
+                .get(property)
+                .cloned()
+                .unwrap_or(Value::Undefined)),
+            Value::Array(array) => {
+                if property == "length" {
+                    Ok(Value::Number(array.borrow().len() as f64))
+                } else {
+                    let index = property
+                        .parse::<usize>()
+                        .map_err(|_| runtime_error(format!("array has no property {property}")))?;
+                    Ok(array
+                        .borrow()
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(Value::Undefined))
+                }
+            }
+            Value::Json => match property {
+                "parse" => Ok(Value::Builtin(Builtin::JsonParse)),
+                "stringify" => Ok(Value::Builtin(Builtin::JsonStringify)),
+                _ => Err(runtime_error(format!("JSON has no property {property}"))),
             },
             Value::Promise(promise) => match property {
                 "then" => Ok(Value::Builtin(Builtin::PromiseThen(promise))),
@@ -640,6 +703,39 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!("promise has no property {property}"))),
             },
             _ => Err(runtime_error(format!("value has no property {property}"))),
+        }
+    }
+
+    fn index(&self, object: Value, index: Value) -> Result<Value, ScriptError> {
+        match object {
+            Value::Object(object) => Ok(object
+                .borrow()
+                .get(&index.string_value())
+                .cloned()
+                .unwrap_or(Value::Undefined)),
+            Value::Array(array) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(array
+                    .borrow()
+                    .get(index as usize)
+                    .cloned()
+                    .unwrap_or(Value::Undefined))
+            }
+            Value::String(string) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(string
+                    .chars()
+                    .nth(index as usize)
+                    .map(|character| Value::String(character.to_string()))
+                    .unwrap_or(Value::Undefined))
+            }
+            _ => Err(runtime_error("value cannot be indexed")),
         }
     }
 
@@ -864,6 +960,17 @@ impl ScriptRuntime {
                 );
                 Ok(Value::Undefined)
             }
+            Builtin::JsonParse => {
+                let source = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.parse_json(&source)
+            }
+            Builtin::JsonStringify => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                serialize_json(&value).map(Value::String)
+            }
             Builtin::Fetch => Ok(Value::Promise(self.fetch(arguments.first()))),
             Builtin::PromiseThen(promise) => {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
@@ -872,6 +979,13 @@ impl ScriptRuntime {
             Builtin::ResponseText(response) => Ok(Value::Promise(self.fulfilled_promise(
                 Value::String(String::from_utf8_lossy(&response.body).into_owned()),
             ))),
+            Builtin::ResponseJson(response) => {
+                let source = String::from_utf8_lossy(&response.body);
+                match self.parse_json(&source) {
+                    Ok(value) => Ok(Value::Promise(self.fulfilled_promise(value))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+                }
+            }
             Builtin::SetTimeout => self.schedule_task(arguments, TaskKind::Timeout),
             Builtin::ClearTimeout => {
                 let id = arguments
@@ -1188,6 +1302,15 @@ impl ScriptRuntime {
         })))
     }
 
+    fn parse_json(&mut self, source: &str) -> Result<Value, ScriptError> {
+        let mut parser = Parser::new(source)?;
+        let expression = parser.parse_expression()?;
+        if !parser.is(TokenKind::Eof) {
+            return Err(runtime_error("JSON input has trailing tokens"));
+        }
+        self.evaluate(&expression, self.global.clone())
+    }
+
     fn schedule_task(
         &mut self,
         arguments: Vec<Value>,
@@ -1393,6 +1516,8 @@ impl Value {
             Self::Number(value) if value.fract() == 0.0 => format!("{value:.0}"),
             Self::Number(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Object(_) => "[object Object]".to_string(),
+            Self::Array(_) => "[array]".to_string(),
             Self::Element(_) => "[element]".to_string(),
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
@@ -1402,6 +1527,7 @@ impl Value {
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
             Self::Console => "[console]".to_string(),
+            Self::Json => "[object JSON]".to_string(),
             Self::Function(_) => "[function]".to_string(),
             Self::Builtin(_) => "[function]".to_string(),
         }
@@ -1410,6 +1536,61 @@ impl Value {
     fn display_string(&self) -> String {
         self.string_value()
     }
+}
+
+fn serialize_json(value: &Value) -> Result<String, ScriptError> {
+    match value {
+        Value::Undefined => Ok("null".to_string()),
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) if value.is_finite() => Ok(if value.fract() == 0.0 {
+            format!("{value:.0}")
+        } else {
+            value.to_string()
+        }),
+        Value::Number(_) => Ok("null".to_string()),
+        Value::String(value) => Ok(escape_json_string(value)),
+        Value::Array(values) => values
+            .borrow()
+            .iter()
+            .map(serialize_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| format!("[{}]", values.join(","))),
+        Value::Object(properties) => properties
+            .borrow()
+            .iter()
+            .map(|(key, value)| {
+                Ok(format!(
+                    "{}:{}",
+                    escape_json_string(key),
+                    serialize_json(value)?
+                ))
+            })
+            .collect::<Result<Vec<_>, ScriptError>>()
+            .map(|properties| format!("{{{}}}", properties.join(","))),
+        _ => Err(runtime_error("value cannot be serialized as JSON")),
+    }
+}
+
+fn escape_json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn class_name(value: &Value) -> Result<String, ScriptError> {
@@ -1705,6 +1886,13 @@ impl Parser {
                     object: Box::new(expression),
                     property,
                 };
+            } else if self.take(TokenKind::LBracket) {
+                let index = self.parse_expression()?;
+                self.expect(TokenKind::RBracket, "index expression")?;
+                expression = Expr::Index {
+                    object: Box::new(expression),
+                    index: Box::new(index),
+                };
             } else if self.take(TokenKind::LParen) {
                 let mut arguments = Vec::new();
                 if !self.is(TokenKind::RParen) {
@@ -1746,6 +1934,8 @@ impl Parser {
                 }
             }
             TokenKind::Function => self.parse_function_expression(),
+            TokenKind::LBrace => self.parse_object_literal(),
+            TokenKind::LBracket => self.parse_array_literal(),
             TokenKind::LParen => {
                 let expression = self.parse_expression()?;
                 self.expect(TokenKind::RParen, "parenthesized expression")?;
@@ -1753,6 +1943,50 @@ impl Parser {
             }
             other => Err(self.error(format!("unexpected token {other:?}"), token.offset)),
         }
+    }
+
+    fn parse_object_literal(&mut self) -> Result<Expr, ScriptError> {
+        let mut properties = Vec::new();
+        if !self.is(TokenKind::RBrace) {
+            loop {
+                let key = self.advance();
+                let key = match key.kind {
+                    TokenKind::Identifier(key) | TokenKind::String(key) => key,
+                    _ => {
+                        return Err(
+                            self.error("expected object property name".to_string(), key.offset)
+                        );
+                    }
+                };
+                self.expect(TokenKind::Colon, "object property")?;
+                properties.push((key, self.parse_expression()?));
+                if !self.take(TokenKind::Comma) {
+                    break;
+                }
+                if self.is(TokenKind::RBrace) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RBrace, "object literal")?;
+        Ok(Expr::Object(properties))
+    }
+
+    fn parse_array_literal(&mut self) -> Result<Expr, ScriptError> {
+        let mut values = Vec::new();
+        if !self.is(TokenKind::RBracket) {
+            loop {
+                values.push(self.parse_expression()?);
+                if !self.take(TokenKind::Comma) {
+                    break;
+                }
+                if self.is(TokenKind::RBracket) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RBracket, "array literal")?;
+        Ok(Expr::Array(values))
     }
 
     fn try_parse_arrow_function(&mut self) -> Result<Option<Expr>, ScriptError> {
@@ -1892,7 +2126,10 @@ enum TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
+    Colon,
     Dot,
     Semicolon,
     Arrow,
@@ -2042,7 +2279,10 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
             [b')', ..] => (TokenKind::RParen, 1),
             [b'{', ..] => (TokenKind::LBrace, 1),
             [b'}', ..] => (TokenKind::RBrace, 1),
+            [b'[', ..] => (TokenKind::LBracket, 1),
+            [b']', ..] => (TokenKind::RBracket, 1),
             [b',', ..] => (TokenKind::Comma, 1),
+            [b':', ..] => (TokenKind::Colon, 1),
             [b'.', ..] => (TokenKind::Dot, 1),
             [b';', ..] => (TokenKind::Semicolon, 1),
             [b'+', ..] => (TokenKind::Plus, 1),
@@ -2518,6 +2758,70 @@ mod tests {
     }
 
     #[test]
+    fn response_json_returns_structured_values_through_the_promise_chain() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/data.json",
+                "application/json",
+                br#"{"message":"hello","items":[4,5]}"#.to_vec(),
+            )
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.json")
+                    .then((response) => response.json())
+                    .then((data) => {
+                        status.textContent = data.message + "|" + data.items[0] + "|" + data.items.length;
+                    });
+                "#,
+            )
+            .expect("response.json should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello|4|2")
+        );
+    }
+
+    #[test]
+    fn response_json_rejects_invalid_payloads() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/broken.json", "application/json", b"{broken".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/broken.json")
+                    .then((response) => response.json())
+                    .catch((error) => { status.textContent = "invalid"; });
+                "#,
+            )
+            .expect("invalid JSON should reject the response promise");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("invalid")
+        );
+    }
+
+    #[test]
     fn chained_promise_rejection_reaches_catch() {
         let document = document("<p id='status'>idle</p>");
         let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
@@ -2570,6 +2874,30 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("start|sync|callback")
+        );
+    }
+
+    #[test]
+    fn json_parse_and_stringify_support_objects_arrays_and_indexes() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const parsed = JSON.parse("{\"message\":\"ready\",\"items\":[1,2]}");
+                const serialized = JSON.stringify({ ok: true, count: parsed.items.length });
+                status.textContent = parsed.message + "|" + parsed.items[1] + "|" + serialized;
+                "#,
+            )
+            .expect("JSON operations should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready|2|{\"count\":2,\"ok\":true}")
         );
     }
 
