@@ -84,6 +84,20 @@ impl EngineHost {
         Ok(handled)
     }
 
+    pub fn go(&mut self, delta: isize) -> Result<bool, NavigationError> {
+        let handled = self.browser.go(delta)?;
+        self.dirty |= handled;
+        Ok(handled)
+    }
+
+    pub fn back(&mut self) -> Result<bool, NavigationError> {
+        self.go(-1)
+    }
+
+    pub fn forward(&mut self) -> Result<bool, NavigationError> {
+        self.go(1)
+    }
+
     pub fn input(&mut self, event: InputEvent) -> Result<InputResult, NavigationError> {
         let result = match event {
             InputEvent::Resize(viewport) => {
@@ -285,5 +299,37 @@ mod tests {
                 .as_deref(),
             Some("down up click")
         );
+    }
+
+    #[test]
+    fn host_exposes_session_history_traversal() {
+        let mut resources = bundle(r#"<a id="go" href="/about.html">about</a>"#);
+        resources
+            .insert(
+                "/about.html",
+                "text/html",
+                b"<p id='status'>about</p>".to_vec(),
+            )
+            .expect("about page should be accepted");
+        let mut host = EngineHost::new(
+            Browser::new(resources),
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(host.click_id("go").expect("link should activate"));
+        assert_eq!(
+            host.browser().current_url().expect("URL should exist").path(),
+            "/about.html"
+        );
+        assert!(host.back().expect("history back should run"));
+        assert_eq!(
+            host.browser().current_url().expect("URL should exist").path(),
+            "/"
+        );
+        assert!(host.render().expect("history frame should render").is_some());
     }
 }

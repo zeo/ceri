@@ -73,7 +73,7 @@ The same sample can dispatch a pointer location through layout hit testing inste
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo-pointer.bmp --width 800 --height 360 --click-at 60,160
 ```
 
-`EngineHost` is the native-window boundary. A platform adapter navigates it, submits `InputEvent` values, calls `render`, and uploads `Frame.canvas.rgba_pixels()` using `Frame.canvas.bytes_per_row()`. The lab CLI uses this boundary for navigation, coordinate input, timers, and presentation.
+`EngineHost` is the native-window boundary. A platform adapter navigates it, submits `InputEvent` values, calls `render`, and uploads `Frame.canvas.rgba_pixels()` using `Frame.canvas.bytes_per_row()`. It also exposes session-history `go`, `back`, and `forward` operations so native navigation controls can use the same browser state as page scripts. The lab CLI uses this boundary for navigation, coordinate input, timers, and presentation.
 
 The default lab build stays dependency-free. The optional `windowed` feature adds a small native desktop adapter built with pinned `winit` 0.30.13 and `softbuffer` 0.4.8. It creates a platform window, forwards resize and pointer events, advances the deterministic page clock, and presents the custom engine's RGBA canvas through a CPU surface. It does not add CEF, WebKit, Edge WebView2, a loopback server, or a JavaScript engine.
 
@@ -99,6 +99,7 @@ The navigation demo exercises link default actions and `Location.replace()` acro
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-link.bmp --click open-link
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-replace.bmp --click replace-link
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-spa.bmp --click push-link --click back-link
 ```
 
-The first command activates `/navigation-about.html` through a nested link. The second uses `window.location.replace()` and preserves the query and fragment in the app-owned URL. Redirects are bounded so a page cannot grow the call stack indefinitely. External origins, loopback listeners, and network transports remain outside this laboratory slice.
+The first command activates `/navigation-about.html` through a nested link. The second uses `window.location.replace()` and preserves the query and fragment in the app-owned URL. The third adds a same-document route with `history.pushState()`, then traverses it with `history.back()` and `popstate`. Full-page history entries reload their packaged document, while same-document entries retain the DOM and runtime. External origins, loopback listeners, and network transports remain outside this laboratory slice.

@@ -315,11 +315,22 @@ struct Page {
     stylesheet: String,
 }
 
+enum HistoryCommit {
+    Push { state: String },
+    Replace { state: String },
+    Traverse { index: usize, state: String },
+}
+
 pub struct Browser {
     resources: ResourceBundle,
     page: Option<Page>,
     current_url: Option<AppUrl>,
     history: Vec<AppUrl>,
+    history_states: Vec<String>,
+    history_document_ids: Vec<u64>,
+    history_index: Option<usize>,
+    current_document_id: Option<u64>,
+    next_document_id: u64,
 }
 
 impl Browser {
@@ -329,25 +340,36 @@ impl Browser {
             page: None,
             current_url: None,
             history: Vec::new(),
+            history_states: Vec::new(),
+            history_document_ids: Vec::new(),
+            history_index: None,
+            current_document_id: None,
+            next_document_id: 1,
         }
     }
 
     pub fn navigate(&mut self, input: &str) -> Result<NavigationStatus, NavigationError> {
         let url = AppUrl::parse(input)?;
-        self.navigate_url(url, false, 0)
+        self.navigate_url(
+            url,
+            HistoryCommit::Push {
+                state: "null".to_string(),
+            },
+            0,
+        )
     }
 
     fn navigate_url(
         &mut self,
         url: AppUrl,
-        replace_history: bool,
+        commit: HistoryCommit,
         redirect_depth: usize,
     ) -> Result<NavigationStatus, NavigationError> {
         let resource = match self.resources.load(&url) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
                 self.install_error_page(&url, 404, &format!("resource not found: {path}"));
-                self.record_navigation(url, replace_history);
+                self.commit_new_document(url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 404 });
             }
             Err(error) => return Err(error),
@@ -359,7 +381,7 @@ impl Browser {
                 415,
                 &format!("unsupported top-level resource: {}", resource.mime_type),
             );
-            self.record_navigation(url, replace_history);
+            self.commit_new_document(url, commit);
             return Ok(NavigationStatus::ErrorPage { status: 415 });
         }
 
@@ -367,7 +389,7 @@ impl Browser {
             Ok(source) => source,
             Err(error) => {
                 self.install_error_page(&url, 500, &format!("HTML resource is not UTF-8: {error}"));
-                self.record_navigation(url, replace_history);
+                self.commit_new_document(url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
@@ -375,7 +397,7 @@ impl Browser {
             Ok(document) => Rc::new(RefCell::new(document)),
             Err(error) => {
                 self.install_error_page(&url, 500, &error.to_string());
-                self.record_navigation(url, replace_history);
+                self.commit_new_document(url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
@@ -384,7 +406,7 @@ impl Browser {
             Ok(stylesheet) => stylesheet,
             Err(error) => {
                 self.install_error_page(&url, 500, &error.to_string());
-                self.record_navigation(url, replace_history);
+                self.commit_new_document(url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
@@ -393,7 +415,7 @@ impl Browser {
             ScriptRuntime::with_resources(document.clone(), self.resources.clone(), url.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             self.install_error_page(&url, 500, &error.to_string());
-            self.record_navigation(url, replace_history);
+            self.commit_new_document(url, commit);
             return Ok(NavigationStatus::ErrorPage { status: 500 });
         }
 
@@ -403,7 +425,7 @@ impl Browser {
             runtime,
             stylesheet,
         });
-        self.record_navigation(url, replace_history);
+        self.commit_new_document(url, commit);
         if let Some(request) = pending_navigation {
             return self.follow_navigation(request, redirect_depth);
         }
@@ -416,6 +438,20 @@ impl Browser {
 
     pub fn history(&self) -> &[AppUrl] {
         &self.history
+    }
+
+    pub fn go(&mut self, delta: isize) -> Result<bool, NavigationError> {
+        let before = self.history_index;
+        self.traverse_history(delta)?;
+        Ok(before != self.history_index)
+    }
+
+    pub fn back(&mut self) -> Result<bool, NavigationError> {
+        self.go(-1)
+    }
+
+    pub fn forward(&mut self) -> Result<bool, NavigationError> {
+        self.go(1)
     }
 
     pub fn document(&self) -> Result<Rc<RefCell<Document>>, NavigationError> {
@@ -537,21 +573,148 @@ impl Browser {
         if redirect_depth >= MAX_NAVIGATION_REDIRECTS {
             return Err(NavigationError::NavigationLoop);
         }
-        let base = self.current_url.clone().ok_or(NavigationError::NoPage)?;
-        let url = base.resolve(&request.reference)?;
-        self.navigate_url(url, request.replace_history, redirect_depth + 1)
+        match request {
+            NavigationRequest::Navigate {
+                reference,
+                replace_history,
+            } => {
+                let base = self.current_url.clone().ok_or(NavigationError::NoPage)?;
+                let url = base.resolve(&reference)?;
+                let commit = if replace_history {
+                    HistoryCommit::Replace {
+                        state: "null".to_string(),
+                    }
+                } else {
+                    HistoryCommit::Push {
+                        state: "null".to_string(),
+                    }
+                };
+                self.navigate_url(url, commit, redirect_depth + 1)
+            }
+            NavigationRequest::PushState { reference, state } => {
+                self.apply_state_navigation(reference, state, false)?;
+                Ok(NavigationStatus::Loaded)
+            }
+            NavigationRequest::ReplaceState { reference, state } => {
+                self.apply_state_navigation(reference, state, true)?;
+                Ok(NavigationStatus::Loaded)
+            }
+            NavigationRequest::Traverse { delta } => self.traverse_history(delta),
+        }
     }
 
-    fn record_navigation(&mut self, url: AppUrl, replace_history: bool) {
-        self.current_url = Some(url.clone());
-        if replace_history {
-            if let Some(current) = self.history.last_mut() {
-                *current = url;
-            } else {
-                self.history.push(url);
-            }
+    fn apply_state_navigation(
+        &mut self,
+        reference: String,
+        state: String,
+        replace_history: bool,
+    ) -> Result<(), NavigationError> {
+        let base = self.current_url.clone().ok_or(NavigationError::NoPage)?;
+        let url = base.resolve(&reference)?;
+        let document_id = self.current_document_id.ok_or(NavigationError::NoPage)?;
+        {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime.set_location(url.clone());
+            page.runtime
+                .set_history_state_serialized(&state)
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
+        }
+        let commit = if replace_history {
+            HistoryCommit::Replace { state }
         } else {
-            self.history.push(url);
+            HistoryCommit::Push { state }
+        };
+        self.commit_navigation(url, commit, document_id);
+        Ok(())
+    }
+
+    fn traverse_history(&mut self, delta: isize) -> Result<NavigationStatus, NavigationError> {
+        let current = self.history_index.ok_or(NavigationError::NoPage)?;
+        let target = current as isize + delta;
+        if target < 0 || target >= self.history.len() as isize {
+            return Ok(NavigationStatus::Loaded);
+        }
+        let target = target as usize;
+        let url = self.history[target].clone();
+        let state = self.history_states[target].clone();
+        let document_id = self.history_document_ids[target];
+        if self.current_document_id == Some(document_id) {
+            self.history_index = Some(target);
+            self.current_url = Some(url.clone());
+            {
+                let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+                page.runtime.set_location(url);
+                page.runtime
+                    .set_history_position(self.history.len(), target);
+                page.runtime
+                    .set_history_state_serialized(&state)
+                    .map_err(|error| NavigationError::Script(error.to_string()))?;
+                page.runtime
+                    .dispatch_popstate(&state)
+                    .map_err(|error| NavigationError::Script(error.to_string()))?;
+            }
+            self.process_pending_navigation()?;
+            return Ok(NavigationStatus::Loaded);
+        }
+        self.navigate_url(
+            url,
+            HistoryCommit::Traverse {
+                index: target,
+                state,
+            },
+            0,
+        )
+    }
+
+    fn allocate_document_id(&mut self) -> u64 {
+        let document_id = self.next_document_id;
+        self.next_document_id = self.next_document_id.saturating_add(1);
+        document_id
+    }
+
+    fn commit_new_document(&mut self, url: AppUrl, commit: HistoryCommit) {
+        let document_id = self.allocate_document_id();
+        self.commit_navigation(url, commit, document_id);
+    }
+
+    fn commit_navigation(&mut self, url: AppUrl, commit: HistoryCommit, document_id: u64) {
+        match commit {
+            HistoryCommit::Push { state } => {
+                let next = self.history_index.map_or(0, |index| index + 1);
+                self.history.truncate(next);
+                self.history_states.truncate(next);
+                self.history_document_ids.truncate(next);
+                self.history.push(url.clone());
+                self.history_states.push(state);
+                self.history_document_ids.push(document_id);
+                self.history_index = Some(next);
+            }
+            HistoryCommit::Replace { state } => {
+                if let Some(index) = self.history_index {
+                    self.history[index] = url.clone();
+                    self.history_states[index] = state;
+                    self.history_document_ids[index] = document_id;
+                } else {
+                    self.history.push(url.clone());
+                    self.history_states.push(state);
+                    self.history_document_ids.push(document_id);
+                    self.history_index = Some(0);
+                }
+            }
+            HistoryCommit::Traverse { index, state } => {
+                self.history[index] = url.clone();
+                self.history_states[index] = state;
+                self.history_document_ids[index] = document_id;
+                self.history_index = Some(index);
+            }
+        }
+        self.current_url = Some(url.clone());
+        self.current_document_id = Some(document_id);
+        let history_length = self.history.len();
+        let history_index = self.history_index.unwrap_or(0);
+        if let Some(page) = self.page.as_mut() {
+            page.runtime
+                .set_history_position(history_length, history_index);
         }
     }
 
@@ -930,6 +1093,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     fn bundle(shell: &str) -> ResourceBundle {
         let mut resources = ResourceBundle::default();
@@ -1189,6 +1353,153 @@ mod tests {
         assert!(browser.click_id("go").expect("location assignment should navigate"));
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 2);
+    }
+
+    #[test]
+    fn spa_history_push_state_and_popstate_keep_the_document() {
+        let mut browser = Browser::new(bundle(
+            r#"<button id="push">push</button><button id="back">back</button><p id="status">home</p><script>
+                const status = document.getElementById("status");
+                window.addEventListener("popstate", (event) => {
+                    if (event.state === null) {
+                        status.textContent = location.pathname + "|none";
+                    } else {
+                        status.textContent = location.pathname + "|" + event.state.view;
+                    }
+                });
+                document.getElementById("push").addEventListener("click", () => {
+                    window.history.pushState({ view: "details" }, "", "/details");
+                    status.textContent = location.pathname + "|" + window.history.state.view + "/" + window.history.length;
+                });
+                document.getElementById("back").addEventListener("click", () => {
+                    window.history.back();
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        let home_document = browser.document().expect("home document should exist");
+        assert!(browser.click_id("push").expect("pushState should run"));
+        assert_eq!(browser.current_url().unwrap().path(), "/details");
+        assert_eq!(browser.history().len(), 2);
+        assert!(Rc::ptr_eq(
+            &home_document,
+            &browser.document().expect("SPA document should remain loaded")
+        ));
+        let status = browser
+            .document()
+            .expect("SPA document should exist")
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            browser
+                .document()
+                .expect("SPA document should exist")
+                .borrow()
+                .element_text_content(&status)
+                .as_deref(),
+            Some("/details|details/2")
+        );
+        assert!(browser.click_id("back").expect("history.back should run"));
+        assert_eq!(browser.current_url().unwrap().path(), "/");
+        assert!(Rc::ptr_eq(
+            &home_document,
+            &browser.document().expect("SPA document should remain loaded")
+        ));
+        assert_eq!(
+            browser
+                .document()
+                .expect("SPA document should exist")
+                .borrow()
+                .element_text_content(&status)
+                .as_deref(),
+            Some("/|none")
+        );
+        assert!(browser.forward().expect("history forward should run"));
+        assert_eq!(browser.current_url().unwrap().path(), "/details");
+        assert_eq!(
+            browser
+                .document()
+                .expect("SPA document should exist")
+                .borrow()
+                .element_text_content(&status)
+                .as_deref(),
+            Some("/details|details")
+        );
+    }
+
+    #[test]
+    fn history_replace_state_updates_the_current_entry() {
+        let mut browser = Browser::new(bundle(
+            r#"<button id="replace">replace</button><p id="status">home</p><script>
+                const status = document.getElementById("status");
+                document.getElementById("replace").addEventListener("click", () => {
+                    history.replaceState({ view: "settings" }, "", "/settings");
+                    status.textContent = window.history.state.view + "/" + window.history.length;
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser
+            .click_id("replace")
+            .expect("replaceState should run"));
+        assert_eq!(browser.current_url().unwrap().path(), "/settings");
+        assert_eq!(browser.history().len(), 1);
+        let document = browser.document().expect("SPA document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("settings/1")
+        );
+    }
+
+    #[test]
+    fn history_traversal_reloads_different_documents() {
+        let mut resources = bundle(
+            r#"<a id="about" href="/about.html">about</a><p id="status">home</p>"#,
+        );
+        resources
+            .insert(
+                "/about.html",
+                "text/html",
+                br#"<p id="status">about</p>"#.to_vec(),
+            )
+            .expect("about page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("about").expect("about link should activate"));
+        assert_eq!(browser.current_url().unwrap().path(), "/about.html");
+        assert!(browser.back().expect("history back should run"));
+        assert_eq!(browser.current_url().unwrap().path(), "/");
+        let document = browser.document().expect("home document should reload");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("home")
+        );
+        assert!(browser.forward().expect("history forward should run"));
+        assert_eq!(browser.current_url().unwrap().path(), "/about.html");
+        let document = browser.document().expect("about document should reload");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("about")
+        );
     }
 
     #[test]

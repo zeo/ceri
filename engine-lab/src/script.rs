@@ -11,6 +11,8 @@ type ResponseHandle = Rc<ResponseData>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
 type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
+type LocationHandle = Rc<RefCell<AppUrl>>;
+type HistoryHandle = Rc<RefCell<HistoryData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -47,7 +49,8 @@ enum Value {
     Promise(PromiseHandle),
     Document,
     Window,
-    Location(AppUrl),
+    Location(LocationHandle),
+    History(HistoryHandle),
     Console,
     Json,
     Function(Rc<Function>),
@@ -63,6 +66,12 @@ enum Builtin {
     EventPreventDefault(Rc<RefCell<EventState>>),
     LocationAssign,
     LocationReplace,
+    WindowAddEventListener,
+    HistoryPushState,
+    HistoryReplaceState,
+    HistoryBack,
+    HistoryForward,
+    HistoryGo,
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -195,7 +204,10 @@ pub struct ScriptRuntime {
     resources: Option<ResourceBundle>,
     base_url: Option<AppUrl>,
     global: EnvironmentRef,
+    location: LocationHandle,
+    history: HistoryHandle,
     listeners: HashMap<NodePath, Vec<EventListener>>,
+    window_listeners: HashMap<String, Vec<Value>>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -216,6 +228,7 @@ struct EventData {
     target: NodePath,
     current_target: NodePath,
     state: Rc<RefCell<EventState>>,
+    history_state: Rc<RefCell<Value>>,
 }
 
 #[derive(Default)]
@@ -223,10 +236,29 @@ struct EventState {
     default_prevented: bool,
 }
 
+struct HistoryData {
+    state: Value,
+    length: usize,
+    index: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NavigationRequest {
-    pub(crate) reference: String,
-    pub(crate) replace_history: bool,
+pub(crate) enum NavigationRequest {
+    Navigate {
+        reference: String,
+        replace_history: bool,
+    },
+    PushState {
+        reference: String,
+        state: String,
+    },
+    ReplaceState {
+        reference: String,
+        state: String,
+    },
+    Traverse {
+        delta: isize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -301,9 +333,14 @@ impl ScriptRuntime {
         base_url: Option<AppUrl>,
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
-        let location = base_url.clone().unwrap_or_else(|| {
+        let location = Rc::new(RefCell::new(base_url.clone().unwrap_or_else(|| {
             AppUrl::parse("https://app.ceri.invalid/").expect("built-in app origin should parse")
-        });
+        })));
+        let history = Rc::new(RefCell::new(HistoryData {
+            state: Value::Null,
+            length: 0,
+            index: 0,
+        }));
         {
             let mut values = global.borrow_mut();
             values
@@ -312,7 +349,11 @@ impl ScriptRuntime {
             values.values.insert("window".to_string(), Value::Window);
             values
                 .values
-                .insert("location".to_string(), Value::Location(location));
+                .insert("location".to_string(), Value::Location(location.clone()));
+            values.values.insert(
+                "history".to_string(),
+                Value::History(history.clone()),
+            );
             values.values.insert("console".to_string(), Value::Console);
             values.values.insert("JSON".to_string(), Value::Json);
             values
@@ -340,7 +381,10 @@ impl ScriptRuntime {
             resources,
             base_url,
             global,
+            location,
+            history,
             listeners: HashMap::new(),
+            window_listeners: HashMap::new(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,
@@ -374,10 +418,11 @@ impl ScriptRuntime {
 
     pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
         let dispatch = self.dispatch_event(path.clone(), "click")?;
+        self.drain_microtasks()?;
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
             let reference = self.document.borrow().link_reference(&path);
             if let Some(reference) = reference {
-                self.request_navigation(reference, false);
+                self.request_location_navigation(reference, false);
             }
         }
         Ok(dispatch.handled)
@@ -388,7 +433,9 @@ impl ScriptRuntime {
         path: NodePath,
         event: &str,
     ) -> Result<bool, ScriptError> {
-        Ok(self.dispatch_event(path, event)?.handled)
+        let dispatch = self.dispatch_event(path, event)?;
+        self.drain_microtasks()?;
+        Ok(dispatch.handled)
     }
 
     pub fn logs(&self) -> &[String] {
@@ -411,12 +458,76 @@ impl ScriptRuntime {
         self.pending_navigation.take()
     }
 
-    fn request_navigation(&mut self, reference: String, replace_history: bool) {
+    pub(crate) fn set_location(&mut self, url: AppUrl) {
+        self.base_url = Some(url.clone());
+        *self.location.borrow_mut() = url;
+    }
+
+    pub(crate) fn set_history_state_serialized(
+        &mut self,
+        serialized: &str,
+    ) -> Result<(), ScriptError> {
+        let state = self.parse_json(serialized)?;
+        self.history.borrow_mut().state = state;
+        Ok(())
+    }
+
+    pub(crate) fn set_history_position(&mut self, length: usize, index: usize) {
+        let mut history = self.history.borrow_mut();
+        history.length = length;
+        history.index = index;
+    }
+
+    fn apply_history_state_locally(
+        &mut self,
+        reference: &str,
+        serialized: &str,
+    ) -> Result<(), ScriptError> {
+        let base = self.location.borrow().clone();
+        let url = base
+            .resolve(reference)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let state = self.parse_json(serialized)?;
+        self.base_url = Some(url.clone());
+        *self.location.borrow_mut() = url;
+        self.history.borrow_mut().state = state;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_popstate(&mut self, serialized: &str) -> Result<bool, ScriptError> {
+        let state = self.parse_json(serialized)?;
+        let callbacks = self
+            .window_listeners
+            .get("popstate")
+            .cloned()
+            .unwrap_or_default();
+        let event = Value::Event(EventData {
+            event_type: "popstate".to_string(),
+            target: Vec::new(),
+            current_target: Vec::new(),
+            state: Rc::new(RefCell::new(EventState::default())),
+            history_state: Rc::new(RefCell::new(state)),
+        });
+        for callback in callbacks {
+            self.call(callback, vec![event.clone()])?;
+        }
+        self.drain_microtasks()?;
+        Ok(self
+            .window_listeners
+            .get("popstate")
+            .is_some_and(|listeners| !listeners.is_empty()))
+    }
+
+    fn request_location_navigation(&mut self, reference: String, replace_history: bool) {
+        self.queue_navigation(NavigationRequest::Navigate {
+            reference,
+            replace_history,
+        });
+    }
+
+    fn queue_navigation(&mut self, request: NavigationRequest) {
         if self.pending_navigation.is_none() {
-            self.pending_navigation = Some(NavigationRequest {
-                reference,
-                replace_history,
-            });
+            self.pending_navigation = Some(request);
         }
     }
 
@@ -604,7 +715,7 @@ impl ScriptRuntime {
         match target {
             Expr::Identifier(name) => {
                 if name == "location" {
-                    self.request_navigation(value.string_value(), false);
+                    self.request_location_navigation(value.string_value(), false);
                     return Ok(());
                 }
                 if !environment.borrow_mut().assign(name, value.clone()) {
@@ -637,7 +748,13 @@ impl ScriptRuntime {
                     .borrow()
                     .get("location")
                     .ok_or_else(|| runtime_error("window location is unavailable")),
+                "history" => self
+                    .global
+                    .borrow()
+                    .get("history")
+                    .ok_or_else(|| runtime_error("window history is unavailable")),
                 "console" => Ok(Value::Console),
+                "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
                 "JSON" => Ok(Value::Json),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
@@ -720,12 +837,15 @@ impl ScriptRuntime {
                     event.current_target.clone(),
                 ))),
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
+                "state" => Ok(event.history_state.borrow().clone()),
                 "preventDefault" => Ok(Value::Builtin(Builtin::EventPreventDefault(
                     event.state.clone(),
                 ))),
                 _ => Err(runtime_error(format!("event has no property {property}"))),
             },
-            Value::Location(url) => match property {
+            Value::Location(url) => {
+                let url = url.borrow();
+                match property {
                 "href" => Ok(Value::String(url.to_string())),
                 "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
                 "protocol" => Ok(Value::String("https:".to_string())),
@@ -745,6 +865,17 @@ impl ScriptRuntime {
                 "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
                 "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
                 _ => Err(runtime_error(format!("location has no property {property}"))),
+                }
+            }
+            Value::History(history) => match property {
+                "state" => Ok(history.borrow().state.clone()),
+                "length" => Ok(Value::Number(history.borrow().length as f64)),
+                "pushState" => Ok(Value::Builtin(Builtin::HistoryPushState)),
+                "replaceState" => Ok(Value::Builtin(Builtin::HistoryReplaceState)),
+                "back" => Ok(Value::Builtin(Builtin::HistoryBack)),
+                "forward" => Ok(Value::Builtin(Builtin::HistoryForward)),
+                "go" => Ok(Value::Builtin(Builtin::HistoryGo)),
+                _ => Err(runtime_error(format!("history has no property {property}"))),
             },
             Value::Response(response) => match property {
                 "url" => Ok(Value::String(response.url.clone())),
@@ -840,11 +971,11 @@ impl ScriptRuntime {
             },
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
             Value::Window if property == "location" => {
-                self.request_navigation(value, false);
+                self.request_location_navigation(value, false);
                 true
             }
             Value::Location(_) if property == "href" => {
-                self.request_navigation(value, false);
+                self.request_location_navigation(value, false);
                 true
             }
             _ => false,
@@ -1056,12 +1187,27 @@ impl ScriptRuntime {
                 state.borrow_mut().default_prevented = true;
                 Ok(Value::Undefined)
             }
+            Builtin::WindowAddEventListener => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error("window event listener must be a function"));
+                }
+                self.window_listeners
+                    .entry(event)
+                    .or_default()
+                    .push(callback);
+                Ok(Value::Undefined)
+            }
             Builtin::LocationAssign => {
                 let reference = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_else(|| "undefined".to_string());
-                self.request_navigation(reference, false);
+                self.request_location_navigation(reference, false);
                 Ok(Value::Undefined)
             }
             Builtin::LocationReplace => {
@@ -1069,7 +1215,53 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_else(|| "undefined".to_string());
-                self.request_navigation(reference, true);
+                self.request_location_navigation(reference, true);
+                Ok(Value::Undefined)
+            }
+            Builtin::HistoryPushState => {
+                let state = arguments.first().cloned().unwrap_or(Value::Null);
+                let state = serialize_json(&state)?;
+                let reference = arguments
+                    .get(2)
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.apply_history_state_locally(&reference, &state)?;
+                let index = self.history.borrow().index;
+                self.history.borrow_mut().length = index.saturating_add(2);
+                self.queue_navigation(NavigationRequest::PushState { reference, state });
+                Ok(Value::Undefined)
+            }
+            Builtin::HistoryReplaceState => {
+                let state = arguments.first().cloned().unwrap_or(Value::Null);
+                let state = serialize_json(&state)?;
+                let reference = arguments
+                    .get(2)
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.apply_history_state_locally(&reference, &state)?;
+                self.queue_navigation(NavigationRequest::ReplaceState { reference, state });
+                Ok(Value::Undefined)
+            }
+            Builtin::HistoryBack => {
+                self.queue_navigation(NavigationRequest::Traverse { delta: -1 });
+                Ok(Value::Undefined)
+            }
+            Builtin::HistoryForward => {
+                self.queue_navigation(NavigationRequest::Traverse { delta: 1 });
+                Ok(Value::Undefined)
+            }
+            Builtin::HistoryGo => {
+                let delta = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0);
+                if !delta.is_finite() || delta.fract() != 0.0 {
+                    return Err(runtime_error("history.go offset must be an integer"));
+                }
+                let delta = isize::try_from(delta as i128)
+                    .map_err(|_| runtime_error("history.go offset is out of range"))?;
+                self.queue_navigation(NavigationRequest::Traverse { delta });
                 Ok(Value::Undefined)
             }
             Builtin::JsonParse => {
@@ -1248,6 +1440,7 @@ impl ScriptRuntime {
                 target: target.clone(),
                 current_target: current.clone(),
                 state: state.clone(),
+                history_state: Rc::new(RefCell::new(Value::Null)),
             });
             for callback in callbacks {
                 self.call(callback, vec![event_value.clone()])?;
@@ -1643,7 +1836,8 @@ impl Value {
             Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
-            Self::Location(value) => value.to_string(),
+            Self::Location(value) => value.borrow().to_string(),
+            Self::History(_) => "[object History]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::Function(_) => "[function]".to_string(),
@@ -2656,6 +2850,41 @@ mod tests {
     }
 
     #[test]
+    fn click_turn_drains_promise_microtasks() {
+        let document = document(r#"<button id="go">load</button><p id="status">idle</p>"#);
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"ready".to_vec())
+            .expect("data resource should be accepted");
+        let mut runtime = ScriptRuntime::with_resources(
+            document.clone(),
+            resources,
+            AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse"),
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                document.getElementById("go").addEventListener("click", () => {
+                    fetch("/data.txt").then((response) => response.text()).then((body) => {
+                        status.textContent = body;
+                    });
+                });
+                "#,
+            )
+            .expect("listener should register");
+        assert!(runtime.click_id("go").expect("click should dispatch"));
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready")
+        );
+    }
+
+    #[test]
     fn location_exposes_url_parts_and_queues_replacement() {
         let document = document(r#"<p id="status">idle</p>"#);
         let mut runtime = ScriptRuntime::with_resources(
@@ -2689,7 +2918,7 @@ mod tests {
         );
         assert_eq!(
             runtime.take_navigation_request(),
-            Some(NavigationRequest {
+            Some(NavigationRequest::Navigate {
                 reference: "../next.html".to_string(),
                 replace_history: true,
             })
