@@ -127,6 +127,19 @@ impl Document {
         find_element_by_id(&self.root, id, &mut Vec::new())
     }
 
+    pub fn link_reference(&self, path: &[usize]) -> Option<String> {
+        let mut candidate = path.to_vec();
+        loop {
+            let element = self.element_at(&candidate)?;
+            if element.name == "a"
+                && let Some(href) = element.attr("href")
+            {
+                return Some(href.to_string());
+            }
+            candidate.pop()?;
+        }
+    }
+
     pub fn find_element_by_selector(&self, selector: &str) -> Option<NodePath> {
         self.find_element_by_selector_within(&[], selector)
     }

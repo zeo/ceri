@@ -1,5 +1,5 @@
 use crate::dom::{Document, Element, Node, NodePath};
-use crate::navigation::{AppUrl, ResourceBundle};
+use crate::navigation::{APP_ORIGIN, AppUrl, ResourceBundle};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -47,6 +47,7 @@ enum Value {
     Promise(PromiseHandle),
     Document,
     Window,
+    Location(AppUrl),
     Console,
     Json,
     Function(Rc<Function>),
@@ -59,6 +60,9 @@ enum Builtin {
     DocumentQuerySelector,
     DocumentCreateElement,
     ConsoleLog,
+    EventPreventDefault(Rc<RefCell<EventState>>),
+    LocationAssign,
+    LocationReplace,
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -197,6 +201,7 @@ pub struct ScriptRuntime {
     next_task_id: u64,
     tasks: Vec<ScheduledTask>,
     microtasks: VecDeque<Microtask>,
+    pending_navigation: Option<NavigationRequest>,
 }
 
 #[derive(Clone)]
@@ -210,6 +215,24 @@ struct EventData {
     event_type: String,
     target: NodePath,
     current_target: NodePath,
+    state: Rc<RefCell<EventState>>,
+}
+
+#[derive(Default)]
+struct EventState {
+    default_prevented: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NavigationRequest {
+    pub(crate) reference: String,
+    pub(crate) replace_history: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EventDispatch {
+    pub(crate) handled: bool,
+    pub(crate) default_prevented: bool,
 }
 
 struct ResponseData {
@@ -278,12 +301,18 @@ impl ScriptRuntime {
         base_url: Option<AppUrl>,
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
+        let location = base_url.clone().unwrap_or_else(|| {
+            AppUrl::parse("https://app.ceri.invalid/").expect("built-in app origin should parse")
+        });
         {
             let mut values = global.borrow_mut();
             values
                 .values
                 .insert("document".to_string(), Value::Document);
             values.values.insert("window".to_string(), Value::Window);
+            values
+                .values
+                .insert("location".to_string(), Value::Location(location));
             values.values.insert("console".to_string(), Value::Console);
             values.values.insert("JSON".to_string(), Value::Json);
             values
@@ -317,6 +346,7 @@ impl ScriptRuntime {
             next_task_id: 1,
             tasks: Vec::new(),
             microtasks: VecDeque::new(),
+            pending_navigation: None,
         }
     }
 
@@ -343,7 +373,14 @@ impl ScriptRuntime {
     }
 
     pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
-        self.dispatch_event(path, "click")
+        let dispatch = self.dispatch_event(path.clone(), "click")?;
+        if !dispatch.default_prevented && self.pending_navigation.is_none() {
+            let reference = self.document.borrow().link_reference(&path);
+            if let Some(reference) = reference {
+                self.request_navigation(reference, false);
+            }
+        }
+        Ok(dispatch.handled)
     }
 
     pub fn dispatch_path_event(
@@ -351,7 +388,7 @@ impl ScriptRuntime {
         path: NodePath,
         event: &str,
     ) -> Result<bool, ScriptError> {
-        self.dispatch_event(path, event)
+        Ok(self.dispatch_event(path, event)?.handled)
     }
 
     pub fn logs(&self) -> &[String] {
@@ -368,6 +405,19 @@ impl ScriptRuntime {
 
     pub fn pending_task_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    pub(crate) fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
+        self.pending_navigation.take()
+    }
+
+    fn request_navigation(&mut self, reference: String, replace_history: bool) {
+        if self.pending_navigation.is_none() {
+            self.pending_navigation = Some(NavigationRequest {
+                reference,
+                replace_history,
+            });
+        }
     }
 
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, ScriptError> {
@@ -553,6 +603,10 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         match target {
             Expr::Identifier(name) => {
+                if name == "location" {
+                    self.request_navigation(value.string_value(), false);
+                    return Ok(());
+                }
                 if !environment.borrow_mut().assign(name, value.clone()) {
                     environment.borrow_mut().values.insert(name.clone(), value);
                 }
@@ -578,6 +632,11 @@ impl ScriptRuntime {
             },
             Value::Window => match property {
                 "document" => Ok(Value::Document),
+                "location" => self
+                    .global
+                    .borrow()
+                    .get("location")
+                    .ok_or_else(|| runtime_error("window location is unavailable")),
                 "console" => Ok(Value::Console),
                 "JSON" => Ok(Value::Json),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
@@ -660,7 +719,32 @@ impl ScriptRuntime {
                 "currentTarget" => Ok(Value::Element(attached_handle(
                     event.current_target.clone(),
                 ))),
+                "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
+                "preventDefault" => Ok(Value::Builtin(Builtin::EventPreventDefault(
+                    event.state.clone(),
+                ))),
                 _ => Err(runtime_error(format!("event has no property {property}"))),
+            },
+            Value::Location(url) => match property {
+                "href" => Ok(Value::String(url.to_string())),
+                "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
+                "protocol" => Ok(Value::String("https:".to_string())),
+                "host" => Ok(Value::String("app.ceri.invalid".to_string())),
+                "hostname" => Ok(Value::String("app.ceri.invalid".to_string())),
+                "pathname" => Ok(Value::String(url.path().to_string())),
+                "search" => Ok(Value::String(if url.query().is_empty() {
+                    String::new()
+                } else {
+                    format!("?{}", url.query())
+                })),
+                "hash" => Ok(Value::String(if url.fragment().is_empty() {
+                    String::new()
+                } else {
+                    format!("#{}", url.fragment())
+                })),
+                "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
+                "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
+                _ => Err(runtime_error(format!("location has no property {property}"))),
             },
             Value::Response(response) => match property {
                 "url" => Ok(Value::String(response.url.clone())),
@@ -755,6 +839,14 @@ impl ScriptRuntime {
                 _ => false,
             },
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
+            Value::Window if property == "location" => {
+                self.request_navigation(value, false);
+                true
+            }
+            Value::Location(_) if property == "href" => {
+                self.request_navigation(value, false);
+                true
+            }
             _ => false,
         };
         updated
@@ -960,6 +1052,26 @@ impl ScriptRuntime {
                 );
                 Ok(Value::Undefined)
             }
+            Builtin::EventPreventDefault(state) => {
+                state.borrow_mut().default_prevented = true;
+                Ok(Value::Undefined)
+            }
+            Builtin::LocationAssign => {
+                let reference = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                self.request_navigation(reference, false);
+                Ok(Value::Undefined)
+            }
+            Builtin::LocationReplace => {
+                let reference = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                self.request_navigation(reference, true);
+                Ok(Value::Undefined)
+            }
             Builtin::JsonParse => {
                 let source = arguments
                     .first()
@@ -1024,7 +1136,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementClick(path) => {
-                self.dispatch_event(path, "click")?;
+                self.click_path(path)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementAppendChild(path) => {
@@ -1116,10 +1228,11 @@ impl ScriptRuntime {
         }
     }
 
-    fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<bool, ScriptError> {
+    fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<EventDispatch, ScriptError> {
         let target = path.clone();
         let mut current = path;
         let mut had_callbacks = false;
+        let state = Rc::new(RefCell::new(EventState::default()));
         loop {
             let callbacks = self
                 .listeners
@@ -1134,6 +1247,7 @@ impl ScriptRuntime {
                 event_type: event.to_string(),
                 target: target.clone(),
                 current_target: current.clone(),
+                state: state.clone(),
             });
             for callback in callbacks {
                 self.call(callback, vec![event_value.clone()])?;
@@ -1143,7 +1257,10 @@ impl ScriptRuntime {
             }
             current.pop();
         }
-        Ok(had_callbacks)
+        Ok(EventDispatch {
+            handled: had_callbacks,
+            default_prevented: state.borrow().default_prevented,
+        })
     }
 
     fn fulfilled_promise(&self, value: Value) -> PromiseHandle {
@@ -1526,6 +1643,7 @@ impl Value {
             Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
+            Self::Location(value) => value.to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::Function(_) => "[function]".to_string(),
@@ -2500,6 +2618,81 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("click:label:button|root")
+        );
+    }
+
+    #[test]
+    fn event_default_can_be_cancelled() {
+        let document = document(
+            r#"<a id="go" href="/next.html">open</a><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const link = document.getElementById("go");
+                const status = document.getElementById("status");
+                link.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    status.textContent = event.defaultPrevented;
+                });
+                "#,
+            )
+            .expect("listener should register");
+        assert!(runtime.click_id("go").expect("click should dispatch"));
+        assert_eq!(
+            document
+                .borrow()
+                .element_text_content(
+                    &document
+                        .borrow()
+                        .find_element_by_id("status")
+                        .expect("status should exist"),
+                )
+                .as_deref(),
+            Some("true")
+        );
+        assert!(runtime.take_navigation_request().is_none());
+    }
+
+    #[test]
+    fn location_exposes_url_parts_and_queues_replacement() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::with_resources(
+            document.clone(),
+            ResourceBundle::default(),
+            AppUrl::parse("https://app.ceri.invalid/docs/index.html?mode=lab#top")
+                .expect("location URL should parse"),
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                status.textContent = location.href + "|" + location.pathname + "|" + location.search + "|" + location.hash + "|" + window.location.origin;
+                location.replace("../next.html");
+                "#,
+            )
+            .expect("location script should execute");
+        assert_eq!(
+            document
+                .borrow()
+                .element_text_content(
+                    &document
+                        .borrow()
+                        .find_element_by_id("status")
+                        .expect("status should exist"),
+                )
+                .as_deref(),
+            Some(
+                "https://app.ceri.invalid/docs/index.html?mode=lab#top|/docs/index.html|?mode=lab|#top|https://app.ceri.invalid",
+            )
+        );
+        assert_eq!(
+            runtime.take_navigation_request(),
+            Some(NavigationRequest {
+                reference: "../next.html".to_string(),
+                replace_history: true,
+            })
         );
     }
 

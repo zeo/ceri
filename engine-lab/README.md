@@ -14,7 +14,7 @@ The current slice implements:
 - a software paint step with a small built-in bitmap font
 - a platform-neutral `EngineHost` frame and input boundary
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
-- bubbling DOM events with `type`, `target`, and `currentTarget` values
+- bubbling DOM events with `type`, `target`, `currentTarget`, `defaultPrevented`, and `preventDefault()`
 - element attributes, inline styles, and `classList` state mutation
 - stable detached and attached element handles with `document.createElement` and `appendChild`
 - parsed fragment replacement and serialization through `innerHTML`
@@ -22,7 +22,7 @@ The current slice implements:
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
-- browser navigation, extensionless app-shell fallback, history, and app-owned recovery pages
+- app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
 It is a headless laboratory, not a web-compatible browser. The script runtime covers the demo's DOM and event path, while networking, media, accessibility, GPU APIs, WebAssembly, and the operating-system window remain outside this slice.
@@ -93,3 +93,12 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 This first fetch slice is deterministic and limited to packaged same-origin resources. It returns a promise with `then()` and `catch()` and a response with `status`, `ok`, `url`, `mimeType`, promise-returning `text()`, and promise-returning `json()`. The runtime supports basic JSON objects, arrays, property access, numeric indexes, `JSON.parse`, and deterministic `JSON.stringify`. Microtasks drain after each script turn and clock advance. Missing resources resolve with status 404, while rejected origins reject the promise. Streaming bodies, network transports, request methods, and broader JavaScript object semantics remain separate compatibility gates.
+
+The navigation demo exercises link default actions and `Location.replace()` across packaged pages:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-link.bmp --click open-link
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-replace.bmp --click replace-link
+```
+
+The first command activates `/navigation-about.html` through a nested link. The second uses `window.location.replace()` and preserves the query and fragment in the app-owned URL. Redirects are bounded so a page cannot grow the call stack indefinitely. External origins, loopback listeners, and network transports remain outside this laboratory slice.

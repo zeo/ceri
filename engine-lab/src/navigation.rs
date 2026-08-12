@@ -2,7 +2,7 @@ use crate::css::Stylesheet;
 use crate::dom::{Document, ScriptSource, StylesheetSource};
 use crate::layout::{LayoutDocument, Size, layout as build_layout};
 use crate::paint::Canvas;
-use crate::script::ScriptRuntime;
+use crate::script::{NavigationRequest, ScriptRuntime};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -262,6 +262,7 @@ pub enum NavigationError {
     Script(String),
     Stylesheet(String),
     NoPage,
+    NavigationLoop,
 }
 
 impl fmt::Display for NavigationError {
@@ -299,11 +300,14 @@ impl fmt::Display for NavigationError {
             Self::Script(detail) => write!(formatter, "script execution failed: {detail}"),
             Self::Stylesheet(detail) => write!(formatter, "stylesheet parsing failed: {detail}"),
             Self::NoPage => formatter.write_str("the browser has no loaded page"),
+            Self::NavigationLoop => formatter.write_str("navigation exceeded the redirect limit"),
         }
     }
 }
 
 impl std::error::Error for NavigationError {}
+
+const MAX_NAVIGATION_REDIRECTS: usize = 16;
 
 struct Page {
     document: Rc<RefCell<Document>>,
@@ -330,11 +334,20 @@ impl Browser {
 
     pub fn navigate(&mut self, input: &str) -> Result<NavigationStatus, NavigationError> {
         let url = AppUrl::parse(input)?;
+        self.navigate_url(url, false, 0)
+    }
+
+    fn navigate_url(
+        &mut self,
+        url: AppUrl,
+        replace_history: bool,
+        redirect_depth: usize,
+    ) -> Result<NavigationStatus, NavigationError> {
         let resource = match self.resources.load(&url) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
                 self.install_error_page(&url, 404, &format!("resource not found: {path}"));
-                self.record_navigation(url);
+                self.record_navigation(url, replace_history);
                 return Ok(NavigationStatus::ErrorPage { status: 404 });
             }
             Err(error) => return Err(error),
@@ -346,7 +359,7 @@ impl Browser {
                 415,
                 &format!("unsupported top-level resource: {}", resource.mime_type),
             );
-            self.record_navigation(url);
+            self.record_navigation(url, replace_history);
             return Ok(NavigationStatus::ErrorPage { status: 415 });
         }
 
@@ -354,7 +367,7 @@ impl Browser {
             Ok(source) => source,
             Err(error) => {
                 self.install_error_page(&url, 500, &format!("HTML resource is not UTF-8: {error}"));
-                self.record_navigation(url);
+                self.record_navigation(url, replace_history);
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
@@ -362,7 +375,7 @@ impl Browser {
             Ok(document) => Rc::new(RefCell::new(document)),
             Err(error) => {
                 self.install_error_page(&url, 500, &error.to_string());
-                self.record_navigation(url);
+                self.record_navigation(url, replace_history);
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
@@ -371,7 +384,7 @@ impl Browser {
             Ok(stylesheet) => stylesheet,
             Err(error) => {
                 self.install_error_page(&url, 500, &error.to_string());
-                self.record_navigation(url);
+                self.record_navigation(url, replace_history);
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
@@ -380,16 +393,20 @@ impl Browser {
             ScriptRuntime::with_resources(document.clone(), self.resources.clone(), url.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             self.install_error_page(&url, 500, &error.to_string());
-            self.record_navigation(url);
+            self.record_navigation(url, replace_history);
             return Ok(NavigationStatus::ErrorPage { status: 500 });
         }
 
+        let pending_navigation = runtime.take_navigation_request();
         self.page = Some(Page {
             document,
             runtime,
             stylesheet,
         });
-        self.record_navigation(url);
+        self.record_navigation(url, replace_history);
+        if let Some(request) = pending_navigation {
+            return self.follow_navigation(request, redirect_depth);
+        }
         Ok(NavigationStatus::Loaded)
     }
 
@@ -409,16 +426,22 @@ impl Browser {
     }
 
     pub fn click_id(&mut self, id: &str) -> Result<bool, NavigationError> {
-        self.page
-            .as_mut()
-            .ok_or(NavigationError::NoPage)?
-            .runtime
-            .click_id(id)
-            .map_err(|error| NavigationError::Script(error.to_string()))
+        let path = {
+            let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+            page.document.borrow().find_element_by_id(id)
+        };
+        let Some(path) = path else {
+            return Ok(false);
+        };
+        self.activate_path(path)
     }
 
     pub fn click_at(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
-        self.dispatch_at(viewport, x, y, "click")
+        let path = self.layout(viewport)?.hit_test(x, y);
+        let Some(path) = path else {
+            return Ok(false);
+        };
+        self.activate_path(path)
     }
 
     pub fn dispatch_at(
@@ -432,21 +455,28 @@ impl Browser {
         let Some(path) = path else {
             return Ok(false);
         };
-        self.page
-            .as_mut()
-            .ok_or(NavigationError::NoPage)?
-            .runtime
-            .dispatch_path_event(path, event)
-            .map_err(|error| NavigationError::Script(error.to_string()))
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .dispatch_path_event(path, event)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
     }
 
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, NavigationError> {
-        self.page
-            .as_mut()
-            .ok_or(NavigationError::NoPage)?
-            .runtime
-            .advance_time(milliseconds)
-            .map_err(|error| NavigationError::Script(error.to_string()))
+        let executed = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .advance_time(milliseconds)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        self.process_pending_navigation()?;
+        Ok(executed)
     }
 
     pub fn console_logs(&self) -> &[String] {
@@ -473,9 +503,56 @@ impl Browser {
         Ok(self.layout(viewport)?.describe())
     }
 
-    fn record_navigation(&mut self, url: AppUrl) {
+    fn activate_path(&mut self, path: Vec<usize>) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .click_path(path)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    fn process_pending_navigation(
+        &mut self,
+    ) -> Result<Option<NavigationStatus>, NavigationError> {
+        let request = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime.take_navigation_request()
+        };
+        request
+            .map(|request| self.follow_navigation(request, 0))
+            .transpose()
+    }
+
+    fn follow_navigation(
+        &mut self,
+        request: NavigationRequest,
+        redirect_depth: usize,
+    ) -> Result<NavigationStatus, NavigationError> {
+        if redirect_depth >= MAX_NAVIGATION_REDIRECTS {
+            return Err(NavigationError::NavigationLoop);
+        }
+        let base = self.current_url.clone().ok_or(NavigationError::NoPage)?;
+        let url = base.resolve(&request.reference)?;
+        self.navigate_url(url, request.replace_history, redirect_depth + 1)
+    }
+
+    fn record_navigation(&mut self, url: AppUrl, replace_history: bool) {
         self.current_url = Some(url.clone());
-        self.history.push(url);
+        if replace_history {
+            if let Some(current) = self.history.last_mut() {
+                *current = url;
+            } else {
+                self.history.push(url);
+            }
+        } else {
+            self.history.push(url);
+        }
     }
 
     fn load_stylesheets(
@@ -617,6 +694,9 @@ fn decode_path(raw_path: &str) -> Result<String, NavigationError> {
 
 fn resolve_reference_path(raw_path: &str) -> Result<String, NavigationError> {
     let path = decode_path_bytes(raw_path)?;
+    if path == "/" {
+        return Ok(path);
+    }
     let mut segments = Vec::new();
     for segment in path
         .strip_prefix('/')
@@ -919,6 +999,12 @@ mod tests {
                 .path(),
             "/assets/app.js"
         );
+        assert_eq!(
+            base.resolve("/")
+                .expect("root navigation should resolve")
+                .path(),
+            "/"
+        );
         let query = base.resolve("?version=2").expect("query should resolve");
         assert_eq!(query.path(), "/docs/index.html");
         assert_eq!(query.query(), "version=2");
@@ -993,6 +1079,127 @@ mod tests {
         );
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 2);
+    }
+
+    #[test]
+    fn activates_nested_links_without_a_loopback_server() {
+        let mut resources = bundle(
+            r#"<main><a id="go" href="/about.html"><span id="label">open</span></a><p id="status">home</p></main>"#,
+        );
+        resources
+            .insert(
+                "/about.html",
+                "text/html",
+                br#"<p id="status">about</p>"#.to_vec(),
+            )
+            .expect("about page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("label").expect("nested link should activate"));
+        assert_eq!(browser.current_url().unwrap().path(), "/about.html");
+        assert_eq!(browser.history().len(), 2);
+        let document = browser.document().expect("about document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("about")
+        );
+    }
+
+    #[test]
+    fn click_default_navigation_respects_prevent_default() {
+        let mut browser = Browser::new(bundle(
+            r#"<a id="go" href="/about.html"><span id="label">open</span></a><p id="status">home</p><script>
+                const link = document.getElementById("go");
+                const status = document.getElementById("status");
+                link.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    status.textContent = event.defaultPrevented;
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("label").expect("click should dispatch"));
+        assert_eq!(browser.current_url().unwrap().path(), "/");
+        assert_eq!(browser.history().len(), 1);
+        let document = browser.document().expect("home document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn location_replace_navigates_and_replaces_history() {
+        let mut resources = bundle(
+            r#"<button id="go">open</button><p id="status">home</p><script>
+                document.getElementById("go").addEventListener("click", () => {
+                    window.location.replace("/about.html");
+                });
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/about.html",
+                "text/html",
+                br#"<p id="status">about</p>"#.to_vec(),
+            )
+            .expect("about page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("go").expect("location replace should navigate"));
+        assert_eq!(browser.current_url().unwrap().path(), "/about.html");
+        assert_eq!(browser.history().len(), 1);
+        assert_eq!(browser.history()[0].path(), "/about.html");
+    }
+
+    #[test]
+    fn location_assignment_navigates_with_push_history() {
+        let mut resources = bundle(
+            r#"<button id="go">open</button><script>
+                document.getElementById("go").addEventListener("click", () => {
+                    window.location = "/about.html";
+                });
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/about.html",
+                "text/html",
+                br#"<p id="status">about</p>"#.to_vec(),
+            )
+            .expect("about page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("go").expect("location assignment should navigate"));
+        assert_eq!(browser.current_url().unwrap().path(), "/about.html");
+        assert_eq!(browser.history().len(), 2);
+    }
+
+    #[test]
+    fn location_redirects_are_bounded() {
+        let mut browser = Browser::new(bundle(r#"<script>location.href = "/";</script>"#));
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect_err("redirect loop should be rejected"),
+            NavigationError::NavigationLoop
+        );
     }
 
     #[test]

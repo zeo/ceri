@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 24px;
+        background-color: #08141e;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #123044;
+        border: 2px solid #3d8190;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+      }
+      a,
+      button {
+        display: block;
+        margin: 14px 0;
+        padding: 8px 12px;
+        color: #08141e;
+        background-color: #6ee7c5;
+        border: 0;
+      }
+      #status {
+        color: #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>packaged navigation</h1>
+      <p>Links and Location stay inside the app-owned HTTPS origin.</p>
+      <a id="open-link" href="/navigation-about.html"><span>open about page</span></a>
+      <button id="replace-link">replace with query and fragment</button>
+      <p id="status">waiting at the packaged origin</p>
+    </main>
+  </body>
+  <script src="navigation-demo.js"></script>
+</html>
