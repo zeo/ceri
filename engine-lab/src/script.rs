@@ -6002,18 +6002,203 @@ fn form_data_from_body(body: &[u8], mime_type: &str) -> Result<Value, ScriptErro
         .map(str::trim)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if media_type != "application/x-www-form-urlencoded" {
+    let pairs = if media_type == "application/x-www-form-urlencoded" {
+        let source = String::from_utf8(body.to_vec())
+            .map_err(|_| runtime_error("formData() body is not valid UTF-8"))?;
+        parse_form_urlencoded(&source)?
+            .into_iter()
+            .map(|(name, value)| (name, FormDataEntry::Text(value)))
+            .collect()
+    } else if media_type == "multipart/form-data" {
+        parse_multipart_form_data(body, mime_type)?
+    } else {
         return Err(runtime_error(
-            "formData() only supports application/x-www-form-urlencoded bodies",
+            "formData() body must be URL-encoded or multipart/form-data",
+        ));
+    };
+    Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+}
+
+fn parse_multipart_form_data(
+    body: &[u8],
+    mime_type: &str,
+) -> Result<Vec<(String, FormDataEntry)>, ScriptError> {
+    let boundary = multipart_boundary(mime_type)
+        .ok_or_else(|| runtime_error("multipart/form-data body has no boundary"))?;
+    if boundary.is_empty() || boundary.contains('\r') || boundary.contains('\n') {
+        return Err(runtime_error("multipart/form-data boundary is invalid"));
+    }
+    let delimiter = format!("--{boundary}").into_bytes();
+    let mut cursor = 0;
+    let mut entries = Vec::new();
+    loop {
+        if body.get(cursor..cursor + delimiter.len()) != Some(delimiter.as_slice()) {
+            return Err(runtime_error("multipart/form-data delimiter is missing"));
+        }
+        cursor += delimiter.len();
+        if body.get(cursor..cursor + 2) == Some(b"--") {
+            cursor += 2;
+            if body.get(cursor..cursor + 2) == Some(b"\r\n") {
+                cursor += 2;
+            }
+            if cursor != body.len() {
+                return Err(runtime_error("multipart/form-data has trailing bytes"));
+            }
+            return Ok(entries);
+        }
+        if body.get(cursor..cursor + 2) != Some(b"\r\n") {
+            return Err(runtime_error("multipart/form-data delimiter is malformed"));
+        }
+        cursor += 2;
+        let header_end = find_bytes(body, b"\r\n\r\n", cursor)
+            .ok_or_else(|| runtime_error("multipart/form-data part headers are incomplete"))?;
+        let headers = parse_multipart_part_headers(&body[cursor..header_end])?;
+        cursor = header_end + 4;
+        let next = find_bytes(body, &format!("\r\n--{boundary}").into_bytes(), cursor)
+            .ok_or_else(|| runtime_error("multipart/form-data part delimiter is missing"))?;
+        let content = &body[cursor..next];
+        let (name, filename, content_type) = headers;
+        let value = if let Some(filename) = filename {
+            FormDataEntry::File(Rc::new(FileData {
+                bytes: content.to_vec(),
+                mime_type: content_type.unwrap_or_else(|| "text/plain".to_string()),
+                name: normalize_file_name(&filename),
+                last_modified: 0,
+            }))
+        } else {
+            let text = String::from_utf8(content.to_vec())
+                .map_err(|_| runtime_error("multipart/form-data text part is not UTF-8"))?;
+            FormDataEntry::Text(text.trim_start_matches('\u{feff}').to_string())
+        };
+        entries.push((name, value));
+        cursor = next + 2;
+    }
+}
+
+fn multipart_boundary(mime_type: &str) -> Option<String> {
+    let mut parameters = split_multipart_parameters(mime_type).into_iter();
+    if !parameters
+        .next()?
+        .trim()
+        .eq_ignore_ascii_case("multipart/form-data")
+    {
+        return None;
+    }
+    parameters.find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        let value = value.trim();
+        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+            Some(value[1..value.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"))
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+fn parse_multipart_part_headers(
+    bytes: &[u8],
+) -> Result<(String, Option<String>, Option<String>), ScriptError> {
+    let source = String::from_utf8(bytes.to_vec())
+        .map_err(|_| runtime_error("multipart/form-data headers are not UTF-8"))?;
+    let mut disposition = None;
+    let mut content_type = None;
+    for line in source.split("\r\n") {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| runtime_error("multipart/form-data header is malformed"))?;
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-disposition" => disposition = Some(value.trim().to_string()),
+            "content-type" => content_type = Some(normalize_blob_type(value.trim())),
+            _ => {}
+        }
+    }
+    let disposition = disposition
+        .ok_or_else(|| runtime_error("multipart/form-data part has no Content-Disposition"))?;
+    let mut parameters = split_multipart_parameters(&disposition).into_iter();
+    if !parameters
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("form-data"))
+    {
+        return Err(runtime_error(
+            "multipart/form-data Content-Disposition is not form-data",
         ));
     }
-    let source = String::from_utf8(body.to_vec())
-        .map_err(|_| runtime_error("formData() body is not valid UTF-8"))?;
-    let pairs = parse_form_urlencoded(&source)?
-        .into_iter()
-        .map(|(name, value)| (name, FormDataEntry::Text(value)))
-        .collect();
-    Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+    let mut field_name = None;
+    let mut filename = None;
+    for parameter in parameters {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        let value = parse_multipart_parameter(value.trim());
+        match name.trim().to_ascii_lowercase().as_str() {
+            "name" => field_name = Some(value),
+            "filename" => filename = Some(value),
+            _ => {}
+        }
+    }
+    Ok((
+        field_name.ok_or_else(|| runtime_error("multipart/form-data part has no name"))?,
+        filename,
+        content_type,
+    ))
+}
+
+fn parse_multipart_parameter(value: &str) -> String {
+    let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let mut parsed = String::new();
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            parsed.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            parsed.push(character);
+        }
+    }
+    parsed
+        .replace("%0D", "\r")
+        .replace("%0A", "\n")
+}
+
+fn split_multipart_parameters(value: &str) -> Vec<String> {
+    let mut parameters = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == ';' && !quoted {
+            parameters.push(value[start..index].trim().to_string());
+            start = index + character.len_utf8();
+        }
+    }
+    parameters.push(value[start..].trim().to_string());
+    parameters
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(start.min(haystack.len()));
+    }
+    haystack
+        .get(start..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| start + offset)
 }
 
 fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
@@ -8099,6 +8284,22 @@ mod tests {
                 )
                 .map(Some);
             }
+            if request.url().path() == "/echo-form" {
+                let mime_type = request
+                    .headers()
+                    .get("content-type")
+                    .cloned()
+                    .unwrap_or_default();
+                let mut headers = BTreeMap::new();
+                headers.insert("Content-Type".to_string(), mime_type.clone());
+                return ResourceResponse::new(
+                    200,
+                    mime_type,
+                    headers,
+                    request.body().to_vec(),
+                )
+                .map(Some);
+            }
             if request.url().path() != "/headers" {
                 return Ok(None);
             }
@@ -10158,6 +10359,52 @@ mod tests {
             requests[0].body(),
             b"------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\ntwo\r\n------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"blob\"; filename=\"blob\"\r\nContent-Type: application/blob\r\n\r\nblob----ceri-form-data-boundary\r\n------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"file\"; filename=\"custom.bin\"\r\nContent-Type: application/file\r\n\r\nfile-bytes\r\n------ceri-form-data-boundaryx--\r\n"
         );
+    }
+
+    #[test]
+    fn form_data_multipart_round_trip_restores_text_and_file_entries() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const data = new FormData();
+                data.append("text", "two");
+                data.append("text", "three");
+                data.append("blob", new Blob(["blob-bytes"], { type: "application/blob" }));
+                data.append("file", new File(["file-bytes"], "custom.bin", { type: "application/file" }));
+                fetch("/echo-form", { method: "POST", body: data }).then((response) => response.formData()).then((roundTrip) => {
+                    const file = roundTrip.get("file");
+                    file.text().then((fileText) => {
+                        const blob = roundTrip.get("blob");
+                        status.textContent = roundTrip.get("text") + "|" + roundTrip.getAll("text").length + "|" + blob.name + "|" + blob.type + "|" + file.name + "|" + file.type + "|" + fileText;
+                    });
+                });
+                "#,
+            )
+            .expect("multipart FormData round trip should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("two|2|blob|application/blob|custom.bin|application/file|file-bytes")
+        );
+        assert_eq!(requests.borrow().len(), 1);
     }
 
     #[test]
