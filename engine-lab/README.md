@@ -12,6 +12,7 @@ The current slice implements:
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - bubbling DOM events with `type`, `target`, and `currentTarget` values
+- element attributes, inline styles, and `classList` state mutation
 - stable detached and attached element handles with `document.createElement` and `appendChild`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle

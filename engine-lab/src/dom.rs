@@ -173,6 +173,31 @@ impl Document {
         true
     }
 
+    pub fn element_has_class(&self, path: &[usize], class: &str) -> bool {
+        self.element_at(path)
+            .is_some_and(|element| element.has_class(class))
+    }
+
+    pub fn add_element_class(&mut self, path: &[usize], class: &str) -> bool {
+        self.element_at_mut(path)
+            .is_some_and(|element| element.add_class(class))
+    }
+
+    pub fn remove_element_class(&mut self, path: &[usize], class: &str) -> bool {
+        self.element_at_mut(path)
+            .is_some_and(|element| element.remove_class(class))
+    }
+
+    pub fn toggle_element_class(
+        &mut self,
+        path: &[usize],
+        class: &str,
+        force: Option<bool>,
+    ) -> Option<bool> {
+        self.element_at_mut(path)
+            .map(|element| element.toggle_class(class, force))
+    }
+
     pub fn style_property(&self, path: &[usize], property: &str) -> Option<String> {
         self.element_at(path)?.style_property(property)
     }
@@ -227,7 +252,53 @@ impl Element {
     }
 
     pub fn has_class(&self, class: &str) -> bool {
+        let Some(class) = class_token(class) else {
+            return false;
+        };
         self.classes().any(|candidate| candidate == class)
+    }
+
+    pub fn add_class(&mut self, class: &str) -> bool {
+        let Some(class) = class_token(class) else {
+            return false;
+        };
+        if self.has_class(class) {
+            return false;
+        }
+        let classes = self
+            .classes()
+            .chain(std::iter::once(class))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.attrs.insert("class".to_string(), classes);
+        true
+    }
+
+    pub fn remove_class(&mut self, class: &str) -> bool {
+        let Some(class) = class_token(class) else {
+            return false;
+        };
+        if !self.has_class(class) {
+            return false;
+        }
+        let classes = self
+            .classes()
+            .filter(|candidate| *candidate != class)
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.attrs.insert("class".to_string(), classes);
+        true
+    }
+
+    pub fn toggle_class(&mut self, class: &str, force: Option<bool>) -> bool {
+        let present = self.has_class(class);
+        let enabled = force.unwrap_or(!present);
+        if enabled {
+            self.add_class(class);
+        } else {
+            self.remove_class(class);
+        }
+        enabled
     }
 
     pub fn style_property(&self, property: &str) -> Option<String> {
@@ -266,6 +337,15 @@ impl Element {
         self.attrs.insert("style".to_string(), style);
         true
     }
+}
+
+fn class_token(class: &str) -> Option<&str> {
+    let class = class.trim();
+    (!class.is_empty()
+        && !class
+            .chars()
+            .any(|character| character.is_ascii_whitespace()))
+    .then_some(class)
 }
 
 fn append_node(root: &mut Element, stack: &mut [Element], node: Node) {

@@ -34,6 +34,7 @@ enum Value {
     String(String),
     Element(ElementHandle),
     Style(ElementHandle),
+    ClassList(ElementHandle),
     Event(EventData),
     Document,
     Window,
@@ -57,6 +58,10 @@ enum Builtin {
     ElementAppendChild(NodePath),
     ElementSetAttribute(NodePath),
     ElementGetAttribute(NodePath),
+    ElementClassListAdd(ElementHandle),
+    ElementClassListRemove(ElementHandle),
+    ElementClassListContains(ElementHandle),
+    ElementClassListToggle(ElementHandle),
 }
 
 struct Function {
@@ -380,11 +385,20 @@ impl ScriptRuntime {
                 right,
             } => {
                 let left = self.evaluate(left, environment.clone())?;
-                if *operator == BinaryOperator::And && !left.truthy() {
-                    return Ok(left);
-                }
-                if *operator == BinaryOperator::Or && left.truthy() {
-                    return Ok(left);
+                match operator {
+                    BinaryOperator::And => {
+                        if !left.truthy() {
+                            return Ok(left);
+                        }
+                        return self.evaluate(right, environment);
+                    }
+                    BinaryOperator::Or => {
+                        if left.truthy() {
+                            return Ok(left);
+                        }
+                        return self.evaluate(right, environment);
+                    }
+                    _ => {}
                 }
                 let right = self.evaluate(right, environment)?;
                 evaluate_binary(*operator, left, right)
@@ -471,6 +485,7 @@ impl ScriptRuntime {
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
                     "style" => Value::Style(handle),
+                    "classList" => Value::ClassList(handle),
                     "addEventListener" => {
                         Value::Builtin(Builtin::ElementAddEventListener(path.ok_or_else(|| {
                             runtime_error("detached element cannot receive events")
@@ -502,6 +517,15 @@ impl ScriptRuntime {
                 .element_style_property(&handle, property)
                 .map(Value::String)
                 .unwrap_or_else(|| Value::String(String::new()))),
+            Value::ClassList(handle) => match property {
+                "add" => Ok(Value::Builtin(Builtin::ElementClassListAdd(handle))),
+                "remove" => Ok(Value::Builtin(Builtin::ElementClassListRemove(handle))),
+                "contains" => Ok(Value::Builtin(Builtin::ElementClassListContains(handle))),
+                "toggle" => Ok(Value::Builtin(Builtin::ElementClassListToggle(handle))),
+                _ => Err(runtime_error(format!(
+                    "classList has no property {property}"
+                ))),
+            },
             Value::Event(event) => match property {
                 "type" => Ok(Value::String(event.event_type.clone())),
                 "target" => Ok(Value::Element(attached_handle(event.target.clone()))),
@@ -791,6 +815,29 @@ impl ScriptRuntime {
                     .map(Value::String)
                     .unwrap_or(Value::Null))
             }
+            Builtin::ElementClassListAdd(handle) => {
+                for argument in arguments {
+                    let class = class_name(&argument)?;
+                    self.add_class(&handle, &class)?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementClassListRemove(handle) => {
+                for argument in arguments {
+                    let class = class_name(&argument)?;
+                    self.remove_class(&handle, &class)?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementClassListContains(handle) => {
+                let class = first_class_name(&arguments)?;
+                Ok(Value::Bool(self.has_class(&handle, &class)?))
+            }
+            Builtin::ElementClassListToggle(handle) => {
+                let class = first_class_name(&arguments)?;
+                let force = arguments.get(1).map(Value::truthy);
+                Ok(Value::Bool(self.toggle_class(&handle, &class, force)?))
+            }
         }
     }
 
@@ -859,6 +906,78 @@ impl ScriptRuntime {
             .filter(|(_, task)| task.due <= self.clock)
             .min_by_key(|(_, task)| (task.due, task.id))
             .map(|(index, _)| index)
+    }
+
+    fn has_class(&self, handle: &ElementHandle, class: &str) -> Result<bool, ScriptError> {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                Ok(self.document.borrow().element_has_class(&path, class))
+            }
+            ElementLocation::Detached(element) => Ok(element.has_class(class)),
+        }
+    }
+
+    fn add_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => {
+                self.document.borrow_mut().add_element_class(&path, class);
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return Err(runtime_error("element handle changed during classList.add"));
+                };
+                element.add_class(class);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => {
+                self.document
+                    .borrow_mut()
+                    .remove_element_class(&path, class);
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return Err(runtime_error(
+                        "element handle changed during classList.remove",
+                    ));
+                };
+                element.remove_class(class);
+            }
+        }
+        Ok(())
+    }
+
+    fn toggle_class(
+        &mut self,
+        handle: &ElementHandle,
+        class: &str,
+        force: Option<bool>,
+    ) -> Result<bool, ScriptError> {
+        let location = handle.borrow().clone();
+        Ok(match location {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow_mut()
+                .toggle_element_class(&path, class, force)
+                .ok_or_else(|| runtime_error("element handle is no longer in the document"))?,
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return Err(runtime_error(
+                        "element handle changed during classList.toggle",
+                    ));
+                };
+                element.toggle_class(class, force)
+            }
+        })
     }
 }
 
@@ -959,6 +1078,7 @@ impl Value {
             Self::String(value) => value.clone(),
             Self::Element(_) => "[element]".to_string(),
             Self::Style(_) => "[style]".to_string(),
+            Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
@@ -971,6 +1091,28 @@ impl Value {
     fn display_string(&self) -> String {
         self.string_value()
     }
+}
+
+fn class_name(value: &Value) -> Result<String, ScriptError> {
+    let class = value.string_value();
+    let trimmed = class.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|character| character.is_ascii_whitespace())
+    {
+        return Err(runtime_error(
+            "classList token must be a single non-empty name",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn first_class_name(arguments: &[Value]) -> Result<String, ScriptError> {
+    arguments
+        .first()
+        .ok_or_else(|| runtime_error("classList method requires a class name"))
+        .and_then(class_name)
 }
 
 fn evaluate_binary(
@@ -1870,6 +2012,57 @@ mod tests {
                 .style_property(&created, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn mutates_attached_and_detached_classes_through_class_list() {
+        let document = document("<main id='mount'><p id='status' class='ready'>idle</p></main>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const mount = document.getElementById("mount");
+                const status = document.getElementById("status");
+                status.classList.add("active", "open");
+                status.classList.remove("ready");
+                status.classList.toggle("open");
+                status.classList.toggle("selected", true);
+                if (!status.classList.contains("open") && status.classList.contains("selected")) {
+                    status.textContent = status.className;
+                }
+                const card = document.createElement("section");
+                card.classList.add("created");
+                mount.appendChild(card);
+                card.classList.toggle("created", false);
+                "##,
+            )
+            .expect("classList mutations should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document
+                .borrow()
+                .element_attribute(&status, "class")
+                .as_deref(),
+            Some("active selected")
+        );
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("active selected")
+        );
+        let created = document
+            .borrow()
+            .find_element_by_selector("section")
+            .expect("created element should exist");
+        assert_eq!(
+            document
+                .borrow()
+                .element_attribute(&created, "class")
+                .as_deref(),
+            Some("")
         );
     }
 
