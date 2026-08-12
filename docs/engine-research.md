@@ -51,7 +51,7 @@ The provider seam is now exercised by host-backed integration tests covering the
 
 The current fetch experiment includes shared single-use response bodies, `arrayBuffer()`, one stable response stream object, a bounded default `ReadableStream` reader with deterministic byte chunks, and `tee()` branches that lock the source body. Full stream backpressure, BYOB readers, and wiring native transport into a production navigation queue remain separate gates.
 
-An optional `native-http` feature now supplies a Rust-native HTTPS `ResourceProvider` with platform certificate verification, connection reuse, a 30-second timeout, and automatic redirect suppression so the engine retains redirect policy. Because the current provider contract is synchronous, it must run behind a host worker or navigation queue before use in a UI event loop. This proves a real transport adapter without making the renderer depend on CEF, Edge WebView2, or a loopback listener.
+An optional `native-http` feature now supplies a Rust-native HTTPS `ResourceProvider` with platform certificate verification, connection reuse, a 30-second timeout, and automatic redirect suppression so the engine retains redirect policy. Navigation consumes provider responses with their HTTP status, so upstream 404 and 503 failures reach the typed recovery page without extensionless shell fallback. Because the current provider contract is synchronous, it must run behind a host worker or navigation queue before use in a UI event loop. This proves a real transport adapter without making the renderer depend on CEF, Edge WebView2, or a loopback listener.
 
 An experimental backend must pass these gates in order:
 

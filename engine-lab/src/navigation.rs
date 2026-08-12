@@ -440,6 +440,7 @@ pub enum NavigationError {
     RequestBodyNotAllowed(String),
     InvalidResponseStatus(u16),
     InvalidResponseMimeType,
+    HttpStatus { path: String, status: u16 },
     ResourceNotFound(String),
     ResourceProvider(String),
     UnsupportedMimeType { path: String, mime_type: String },
@@ -489,6 +490,9 @@ impl fmt::Display for NavigationError {
             Self::InvalidResponseMimeType => {
                 formatter.write_str("resource response MIME type is empty")
             }
+            Self::HttpStatus { path, status } => {
+                write!(formatter, "resource request returned HTTP {status}: {path}")
+            }
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
             Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
             Self::UnsupportedMimeType { path, mime_type } => {
@@ -511,11 +515,30 @@ impl std::error::Error for NavigationError {}
 const MAX_NAVIGATION_REDIRECTS: usize = 16;
 
 fn recovery_status(error: &NavigationError) -> u16 {
-    if matches!(error, NavigationError::ResourceProvider(_)) {
-        503
-    } else {
-        500
+    match error {
+        NavigationError::HttpStatus { status, .. } => *status,
+        NavigationError::ResourceProvider(_) => 503,
+        _ => 500,
     }
+}
+
+fn load_provider_resource(
+    provider: &dyn ResourceProvider,
+    url: &AppUrl,
+) -> Result<Option<Resource>, NavigationError> {
+    let Some(response) = provider.provide_response(&ResourceRequest::get(url.clone()))? else {
+        return Ok(None);
+    };
+    if !(200..300).contains(&response.status()) {
+        return Err(NavigationError::HttpStatus {
+            path: url.path().to_string(),
+            status: response.status(),
+        });
+    }
+    Ok(Some(Resource::new(
+        response.mime_type().to_string(),
+        response.body().to_vec(),
+    )))
 }
 
 struct Page {
@@ -588,7 +611,7 @@ impl Browser {
             Ok(resource) => Ok(resource),
             Err(NavigationError::ResourceNotFound(path)) => {
                 if let Some(provider) = &self.resource_provider
-                    && let Some(resource) = provider.provide(url)?
+                    && let Some(resource) = load_provider_resource(provider.as_ref(), url)?
                 {
                     return Ok(resource);
                 }
@@ -596,7 +619,7 @@ impl Browser {
                     && let Some(provider) = &self.resource_provider
                 {
                     let shell_url = url.with_path("/index.html")?;
-                    if let Some(resource) = provider.provide(&shell_url)? {
+                    if let Some(resource) = load_provider_resource(provider.as_ref(), &shell_url)? {
                         return Ok(resource);
                     }
                 }
@@ -611,7 +634,7 @@ impl Browser {
             Ok(resource) => Ok(resource),
             Err(NavigationError::ResourceNotFound(path)) => {
                 if let Some(provider) = &self.resource_provider
-                    && let Some(resource) = provider.provide(url)?
+                    && let Some(resource) = load_provider_resource(provider.as_ref(), url)?
                 {
                     return Ok(resource);
                 }
@@ -644,6 +667,12 @@ impl Browser {
                 self.install_error_page(&url, 404, &format!("resource not found: {path}"));
                 self.commit_new_document(url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 404 });
+            }
+            Err(error @ NavigationError::HttpStatus { .. }) => {
+                let status = recovery_status(&error);
+                self.install_error_page(&url, status, &error.to_string());
+                self.commit_new_document(url, commit);
+                return Ok(NavigationStatus::ErrorPage { status });
             }
             Err(error @ NavigationError::ResourceProvider(_)) => {
                 self.install_error_page(&url, 503, &error.to_string());
@@ -1655,6 +1684,33 @@ mod tests {
         }
     }
 
+    struct StatusProvider {
+        status: u16,
+        paths: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ResourceProvider for StatusProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            self.paths
+                .borrow_mut()
+                .push(request.url().path().to_string());
+            ResourceResponse::new(
+                self.status,
+                "text/html",
+                BTreeMap::new(),
+                b"upstream status".to_vec(),
+            )
+            .map(Some)
+        }
+    }
+
     struct RequestProvider {
         resources: BTreeMap<String, Resource>,
         requests: Rc<RefCell<Vec<ResourceRequest>>>,
@@ -2273,6 +2329,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_http_status_reaches_recovery_without_shell_fallback() {
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(StatusProvider {
+            status: 404,
+            paths: paths.clone(),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/dashboard")
+                .expect("provider status should become recovery"),
+            NavigationStatus::ErrorPage { status: 404 }
+        );
+        assert_eq!(&*paths.borrow(), &["/dashboard".to_string()]);
+        let failure = browser
+            .last_navigation_failure()
+            .expect("provider status should expose a diagnostic");
+        assert_eq!(failure.status, 404);
+        assert_eq!(
+            failure.detail,
+            "resource request returned HTTP 404: /dashboard"
+        );
+    }
+
+    #[test]
     fn script_failures_are_contained_by_a_recovery_document() {
         let mut browser = Browser::new(bundle("<script>missing?</script>"));
         assert_eq!(
@@ -2557,7 +2638,8 @@ mod tests {
         );
         let request = requests
             .borrow()
-            .first()
+            .iter()
+            .find(|request| request.method() == "POST")
             .cloned()
             .expect("provider should receive the fetch request");
         assert_eq!(request.method(), "POST");
