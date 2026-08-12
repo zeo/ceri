@@ -35,6 +35,7 @@ type UrlHandle = Rc<RefCell<UrlData>>;
 type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
 pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
 type FormDataHandle = Rc<RefCell<FormDataData>>;
+type BlobHandle = Rc<BlobData>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
@@ -95,6 +96,7 @@ enum Value {
     UrlSearchParams(UrlSearchParamsHandle),
     Storage(StorageHandle),
     FormData(FormDataHandle),
+    Blob(BlobHandle),
     CanvasContext(CanvasContextHandle),
     AbortController(AbortControllerHandle),
     AbortSignal(AbortSignalHandle),
@@ -106,6 +108,7 @@ enum Value {
     UrlConstructor,
     UrlSearchParamsConstructor,
     FormDataConstructor,
+    BlobConstructor,
     MapConstructor,
     SetConstructor,
     ErrorConstructor,
@@ -163,6 +166,9 @@ enum Builtin {
     FormDataGetAll(FormDataHandle),
     FormDataHas(FormDataHandle),
     FormDataSet(FormDataHandle),
+    BlobSlice(BlobHandle),
+    BlobText(BlobHandle),
+    BlobBytes(BlobHandle),
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -210,6 +216,7 @@ enum Builtin {
     RequestClone(RequestHandle),
     RequestText(RequestHandle),
     RequestBytes(RequestHandle),
+    RequestBlob(RequestHandle),
     HeadersAppend(HeadersHandle),
     HeadersDelete(HeadersHandle),
     HeadersGet(HeadersHandle),
@@ -223,6 +230,7 @@ enum Builtin {
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
     ResponseBytes(ResponseHandle),
+    ResponseBlob(ResponseHandle),
     ReadableStreamGetReader(ReadableStreamHandle),
     ReadableStreamCancel(ReadableStreamHandle),
     ReadableStreamTee(ReadableStreamHandle),
@@ -676,6 +684,11 @@ struct FormDataData {
     pairs: Vec<(String, String)>,
 }
 
+struct BlobData {
+    bytes: Vec<u8>,
+    mime_type: String,
+}
+
 struct HeadersData {
     values: BTreeMap<String, String>,
     mutable: bool,
@@ -990,6 +1003,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("FormData".to_string(), Value::FormDataConstructor);
+            values
+                .values
+                .insert("Blob".to_string(), Value::BlobConstructor);
             values
                 .values
                 .insert("Request".to_string(), Value::RequestConstructor);
@@ -2270,6 +2286,17 @@ impl ScriptRuntime {
                 "set" => Ok(Value::Builtin(Builtin::FormDataSet(form_data))),
                 _ => Err(runtime_error(format!("FormData has no property {property}"))),
             },
+            Value::Blob(blob) => match property {
+                "size" => Ok(Value::Number(blob.bytes.len() as f64)),
+                "type" => Ok(Value::String(blob.mime_type.clone())),
+                "slice" => Ok(Value::Builtin(Builtin::BlobSlice(blob))),
+                "text" => Ok(Value::Builtin(Builtin::BlobText(blob))),
+                "arrayBuffer" => Ok(Value::Builtin(Builtin::BlobBytes(blob))),
+                _ => Err(runtime_error(format!("Blob has no property {property}"))),
+            },
+            Value::BlobConstructor => Err(runtime_error(format!(
+                "Blob has no property {property}"
+            ))),
             Value::CanvasContext(context) => match property {
                 "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style))),
                 "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
@@ -2317,6 +2344,7 @@ impl ScriptRuntime {
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
+                "blob" => Ok(Value::Builtin(Builtin::ResponseBlob(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
                 ))),
@@ -2345,6 +2373,7 @@ impl ScriptRuntime {
                 "clone" => Ok(Value::Builtin(Builtin::RequestClone(request))),
                 "text" => Ok(Value::Builtin(Builtin::RequestText(request))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::RequestBytes(request))),
+                "blob" => Ok(Value::Builtin(Builtin::RequestBlob(request))),
                 _ => Err(runtime_error(format!(
                     "request has no property {property}"
                 ))),
@@ -2856,6 +2885,7 @@ impl ScriptRuntime {
             Value::UrlConstructor => self.construct_url(arguments),
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             Value::FormDataConstructor => self.construct_form_data(arguments),
+            Value::BlobConstructor => self.construct_blob(arguments),
             Value::HeadersConstructor => self.construct_headers(arguments),
             Value::RequestConstructor => self.construct_request(arguments),
             Value::ResponseConstructor => self.construct_response(arguments),
@@ -3048,6 +3078,48 @@ impl ScriptRuntime {
             pairs.push((name.to_string(), value));
         }
         Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+    }
+
+    fn construct_blob(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let parts = match arguments.first().map(Value::resolve) {
+            None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(parts)) => parts.borrow().clone(),
+            Some(_) => return Err(runtime_error("Blob parts must be an array")),
+        };
+        let mut bytes = Vec::new();
+        for part in parts {
+            match part.resolve() {
+                Value::Bytes(part) => bytes.extend_from_slice(part.as_ref()),
+                Value::Blob(part) => bytes.extend_from_slice(&part.bytes),
+                part => bytes.extend_from_slice(part.string_value().as_bytes()),
+            }
+        }
+        let mime_type = match arguments.get(1).map(Value::resolve) {
+            None | Some(Value::Undefined) | Some(Value::Null) => String::new(),
+            Some(Value::Object(options)) => {
+                let options = options.borrow();
+                if options.keys().any(|key| !matches!(key.as_str(), "type" | "endings")) {
+                    return Err(runtime_error("Blob options contain an unsupported key"));
+                }
+                if let Some(endings) = options.get("endings").map(Value::resolve) {
+                    let valid = matches!(endings, Value::Undefined)
+                        || matches!(endings, Value::String(value) if value == "transparent");
+                    if !valid {
+                        return Err(runtime_error("Blob endings must be transparent"));
+                    }
+                }
+                options
+                    .get("type")
+                    .map(Value::resolve)
+                    .and_then(|value| match value {
+                        Value::Undefined => None,
+                        value => Some(normalize_blob_type(&value.string_value())),
+                    })
+                    .unwrap_or_default()
+            }
+            Some(_) => return Err(runtime_error("Blob options must be an object")),
+        };
+        Ok(Value::Blob(Rc::new(BlobData { bytes, mime_type })))
     }
 
     fn construct_headers(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -3989,6 +4061,31 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
+            Builtin::BlobSlice(blob) => {
+                let size = blob.bytes.len() as i64;
+                let start = blob_slice_index(arguments.first(), size, 0)?;
+                let end = blob_slice_index(arguments.get(1), size, size)?;
+                let start = start.min(end) as usize;
+                let end = end.max(start as i64).min(size) as usize;
+                let mime_type = arguments
+                    .get(2)
+                    .map(Value::resolve)
+                    .and_then(|value| match value {
+                        Value::Undefined => None,
+                        value => Some(normalize_blob_type(&value.string_value())),
+                    })
+                    .unwrap_or_default();
+                Ok(Value::Blob(Rc::new(BlobData {
+                    bytes: blob.bytes[start..end].to_vec(),
+                    mime_type,
+                })))
+            }
+            Builtin::BlobText(blob) => Ok(Value::Promise(self.fulfilled_promise(
+                Value::String(String::from_utf8_lossy(&blob.bytes).into_owned()),
+            ))),
+            Builtin::BlobBytes(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
+                Rc::new(blob.bytes.clone()),
+            )))),
             Builtin::JsonParse => {
                 let source = arguments
                     .first()
@@ -4017,6 +4114,21 @@ impl ScriptRuntime {
             Builtin::RequestBytes(request) => match self.consume_request_body(&request) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(Rc::new(
                     body,
+                ))))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
+            Builtin::RequestBlob(request) => match self.consume_request_body(&request) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Blob(Rc::new(
+                    BlobData {
+                        bytes: body,
+                        mime_type: request
+                            .headers
+                            .borrow()
+                            .values
+                            .get("content-type")
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
                 ))))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
@@ -4227,6 +4339,15 @@ impl ScriptRuntime {
             Builtin::ResponseBytes(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(Rc::new(
                     body,
+                ))))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
+            Builtin::ResponseBlob(response) => match self.consume_response_body(&response) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Blob(Rc::new(
+                    BlobData {
+                        bytes: body,
+                        mime_type: response.mime_type.clone(),
+                    },
                 ))))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
@@ -5228,6 +5349,7 @@ impl Value {
             Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
             Self::Storage(_) => "[object Storage]".to_string(),
             Self::FormData(_) => "[object FormData]".to_string(),
+            Self::Blob(_) => "[object Blob]".to_string(),
             Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
             Self::AbortController(_) => "[object AbortController]".to_string(),
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
@@ -5240,6 +5362,7 @@ impl Value {
                 "[function URL]".to_string()
             }
             Self::FormDataConstructor => "[function FormData]".to_string(),
+            Self::BlobConstructor => "[function Blob]".to_string(),
             Self::MapConstructor => "[function Map]".to_string(),
             Self::SetConstructor => "[function Set]".to_string(),
             Self::ErrorConstructor => "[function Error]".to_string(),
@@ -5600,6 +5723,10 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             Some("text/plain;charset=UTF-8".to_string()),
         )),
         Value::Bytes(bytes) => Ok((bytes.as_ref().clone(), None)),
+        Value::Blob(blob) => Ok((
+            blob.bytes.clone(),
+            (!blob.mime_type.is_empty()).then(|| blob.mime_type.clone()),
+        )),
         Value::UrlSearchParams(params) => Ok((
             serialize_form_urlencoded(&params.borrow().pairs).into_bytes(),
             Some("application/x-www-form-urlencoded;charset=UTF-8".to_string()),
@@ -5609,8 +5736,49 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             Ok((body, Some(boundary)))
         }
         _ => Err(runtime_error(
-            "body must be a string, ArrayBuffer, URLSearchParams, or FormData",
+            "body must be a string, ArrayBuffer, Blob, URLSearchParams, or FormData",
         )),
+    }
+}
+
+fn blob_slice_index(
+    value: Option<&Value>,
+    size: i64,
+    default: i64,
+) -> Result<i64, ScriptError> {
+    let Some(value) = value.map(Value::resolve) else {
+        return Ok(default);
+    };
+    let number = match value {
+        Value::Undefined => default as f64,
+        Value::Null => 0.0,
+        value => value.number()?,
+    };
+    if number.is_nan() {
+        return Ok(0);
+    }
+    if number == f64::INFINITY {
+        return Ok(size);
+    }
+    if number == f64::NEG_INFINITY {
+        return Ok(0);
+    }
+    let integer = number.trunc() as i64;
+    Ok(if integer < 0 {
+        (size + integer).max(0)
+    } else {
+        integer.min(size)
+    })
+}
+
+fn normalize_blob_type(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        value.to_ascii_lowercase()
+    } else {
+        String::new()
     }
 }
 
@@ -5733,6 +5901,7 @@ fn evaluate_binary(
         BinaryOperator::GreaterEqual => Ok(Value::Bool(left.number()? >= right.number()?)),
         BinaryOperator::InstanceOf => Ok(Value::Bool(match (left, right) {
             (Value::Error(_), Value::ErrorConstructor) => true,
+            (Value::Blob(_), Value::BlobConstructor) => true,
             (Value::Error(error), Value::Class(class)) => {
                 error.class_name == class.name
                     || (class.name == "Error" && error.class_name == "Error")
@@ -5775,6 +5944,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::UrlSearchParams(_)
         | Value::Storage(_)
         | Value::FormData(_)
+        | Value::Blob(_)
         | Value::CanvasContext(_)
         | Value::AbortController(_)
         | Value::AbortSignal(_)
@@ -5794,6 +5964,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::UrlConstructor
         | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
+        | Value::BlobConstructor
         | Value::MapConstructor
         | Value::SetConstructor
         | Value::ErrorConstructor
@@ -5838,6 +6009,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
+        (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
@@ -9413,6 +9585,57 @@ mod tests {
         assert_eq!(
             requests[1].headers().get("content-type").map(String::as_str),
             Some("application/custom")
+        );
+    }
+
+    #[test]
+    fn blob_bodies_preserve_bytes_types_and_response_reads() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const source = new Blob(["hello ", new Blob(["world"], { type: "text/inner" })], { type: "TEXT/PLAIN" });
+                const part = source.slice(-5, 11, "Application/Test");
+                source.arrayBuffer().then((buffer) => {
+                    part.text().then((partText) => {
+                        fetch("/headers", { method: "POST", body: source }).then((response) => response.blob()).then((received) => {
+                            received.text().then((body) => {
+                                status.textContent = source.size + "|" + buffer.byteLength + "|" + source.type + "|" + part.size + "|" + part.type + "|" + partText + "|" + body + "|" + received.type + "|" + received.size + "|" + (source instanceof Blob);
+                            });
+                        });
+                    });
+                });
+                "#,
+            )
+            .expect("Blob bodies should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("11|11|text/plain|5|application/test|world|ready|text/plain|5|true")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body(), b"hello world");
+        assert_eq!(
+            requests[0].headers().get("content-type").map(String::as_str),
+            Some("text/plain")
         );
     }
 
