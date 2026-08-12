@@ -14,6 +14,7 @@ use std::rc::Weak;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
+type RequestHandle = Rc<RequestData>;
 type ResponseHandle = Rc<ResponseData>;
 type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
 type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
@@ -98,7 +99,9 @@ enum Value {
     AbortSignal(AbortSignalHandle),
     Console,
     Json,
+    Request(RequestHandle),
     HeadersConstructor,
+    RequestConstructor,
     UrlConstructor,
     UrlSearchParamsConstructor,
     FormDataConstructor,
@@ -200,6 +203,9 @@ enum Builtin {
     Fetch,
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
+    RequestClone(RequestHandle),
+    RequestText(RequestHandle),
+    RequestBytes(RequestHandle),
     HeadersAppend(HeadersHandle),
     HeadersDelete(HeadersHandle),
     HeadersGet(HeadersHandle),
@@ -736,6 +742,17 @@ pub(crate) struct EventDispatch {
     pub(crate) default_prevented: bool,
 }
 
+struct RequestData {
+    url: AppUrl,
+    method: String,
+    headers: HeadersHandle,
+    body: ResponseBodyHandle,
+    stream: ReadableStreamHandle,
+    cache_mode: ResourceCacheMode,
+    redirect: FetchRedirectMode,
+    signal: Option<AbortSignalHandle>,
+}
+
 struct ResponseData {
     url: String,
     status: u16,
@@ -962,6 +979,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("FormData".to_string(), Value::FormDataConstructor);
+            values
+                .values
+                .insert("Request".to_string(), Value::RequestConstructor);
             values
                 .values
                 .insert("Headers".to_string(), Value::HeadersConstructor);
@@ -2285,6 +2305,26 @@ impl ScriptRuntime {
                     "response has no property {property}"
                 ))),
             },
+            Value::Request(request) => match property {
+                "url" => Ok(Value::String(request.url.to_string())),
+                "method" => Ok(Value::String(request.method.clone())),
+                "headers" => Ok(Value::Headers(request.headers.clone())),
+                "body" => Ok(Value::ReadableStream(request.stream.clone())),
+                "cache" => Ok(Value::String(fetch_cache_mode_name(&request.cache_mode))),
+                "redirect" => Ok(Value::String(fetch_redirect_mode_name(request.redirect))),
+                "bodyUsed" => Ok(Value::Bool(response_body_used(&request.body))),
+                "signal" => Ok(request
+                    .signal
+                    .clone()
+                    .map(Value::AbortSignal)
+                    .unwrap_or(Value::Null)),
+                "clone" => Ok(Value::Builtin(Builtin::RequestClone(request))),
+                "text" => Ok(Value::Builtin(Builtin::RequestText(request))),
+                "arrayBuffer" => Ok(Value::Builtin(Builtin::RequestBytes(request))),
+                _ => Err(runtime_error(format!(
+                    "request has no property {property}"
+                ))),
+            },
             Value::ReadableStream(stream) => match property {
                 "locked" => Ok(Value::Bool(stream.borrow().body.borrow().locked)),
                 "getReader" => Ok(Value::Builtin(Builtin::ReadableStreamGetReader(stream))),
@@ -2793,6 +2833,7 @@ impl ScriptRuntime {
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             Value::FormDataConstructor => self.construct_form_data(arguments),
             Value::HeadersConstructor => self.construct_headers(arguments),
+            Value::RequestConstructor => self.construct_request(arguments),
             Value::MapConstructor => self.construct_map(arguments),
             Value::SetConstructor => self.construct_set(arguments),
             Value::ErrorConstructor => Ok(self.construct_error(arguments)),
@@ -2990,52 +3031,109 @@ impl ScriptRuntime {
             .cloned()
             .unwrap_or(Value::Undefined)
             .resolve();
-        let values = match init {
-            Value::Undefined | Value::Null => BTreeMap::new(),
-            Value::Headers(headers) => headers.borrow().values.clone(),
-            Value::Object(object) => object
-                .borrow()
-                .iter()
-                .map(|(name, value)| (name.clone(), value.string_value()))
-                .collect(),
-            Value::Array(array) => {
-                let mut values: BTreeMap<String, String> = BTreeMap::new();
-                for entry in array.borrow().iter() {
-                    let Value::Array(entry) = entry.resolve() else {
-                        return Err(runtime_error(
-                            "Headers sequence entries must be arrays",
-                        ));
-                    };
-                    let entry = entry.borrow();
-                    if entry.len() != 2 {
-                        return Err(runtime_error(
-                            "Headers sequence entries need two values",
-                        ));
-                    }
-                    let mut pair = BTreeMap::new();
-                    pair.insert(entry[0].string_value(), entry[1].string_value());
-                    let (name, value) = normalize_headers(pair)
-                        .map_err(|error| runtime_error(error.to_string()))?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| runtime_error("header name is empty"))?;
-                    if let Some(existing) = values.get_mut(&name) {
-                        existing.push_str(", ");
-                        existing.push_str(&value);
-                    } else {
-                        values.insert(name, value);
-                    }
-                }
-                values
-            }
-            _ => {
-                return Err(runtime_error(
-                    "Headers constructor requires an object, sequence, or Headers",
-                ));
+        Ok(Value::Headers(headers_handle(header_values_from_init(init)?, true)))
+    }
+
+    fn construct_request(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let input = arguments
+            .first()
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        let (
+            url,
+            mut method,
+            mut headers,
+            mut body,
+            mut cache_mode,
+            mut redirect,
+            mut signal,
+        ) = match input {
+            Value::Request(request) => (
+                request.url.clone(),
+                request.method.clone(),
+                request.headers.borrow().values.clone(),
+                request_body_snapshot(&request.body)?,
+                request.cache_mode.clone(),
+                request.redirect,
+                request.signal.clone(),
+            ),
+            input => {
+                let base_url = self
+                    .base_url
+                    .as_ref()
+                    .ok_or_else(|| runtime_error("Request is unavailable without a document URL"))?;
+                let url = base_url
+                    .resolve(&input.string_value())
+                    .map_err(|error| runtime_error(error.to_string()))?;
+                (
+                    url,
+                    "GET".to_string(),
+                    BTreeMap::new(),
+                    Vec::new(),
+                    ResourceCacheMode::Default,
+                    FetchRedirectMode::Follow,
+                    None,
+                )
             }
         };
-        let values = normalize_headers(values).map_err(|error| runtime_error(error.to_string()))?;
-        Ok(Value::Headers(headers_handle(values, true)))
+        let init = arguments
+            .get(1)
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        let init = match init {
+            Value::Undefined | Value::Null => None,
+            Value::Object(init) => Some(init),
+            _ => return Err(runtime_error("Request init must be an object")),
+        };
+        if let Some(init) = init {
+            let init = init.borrow();
+            if init.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "method" | "headers" | "body" | "cache" | "redirect" | "signal"
+                )
+            }) {
+                return Err(runtime_error("Request init contains an unsupported key"));
+            }
+            if let Some(value) = init.get("method").map(Value::resolve) {
+                method = match value {
+                    Value::Undefined => method,
+                    Value::String(method) => method,
+                    _ => return Err(runtime_error("Request method must be a string")),
+                };
+            }
+            if let Some(value) = init.get("headers").map(Value::resolve) {
+                headers = match value {
+                    Value::Undefined => headers,
+                    Value::Null => BTreeMap::new(),
+                    value => header_values_from_init(value)?,
+                };
+            }
+            if let Some(value) = init.get("body").map(Value::resolve) {
+                body = match value {
+                    Value::Undefined => body,
+                    Value::Null => Vec::new(),
+                    Value::String(body) => body.into_bytes(),
+                    _ => return Err(runtime_error("Request body must be a string")),
+                };
+            }
+            cache_mode = parse_cache_mode(init.get("cache"), cache_mode)?;
+            redirect = parse_redirect_mode(init.get("redirect"), redirect)?;
+            signal = parse_signal(init.get("signal"), signal)?;
+        }
+        let normalized = ResourceRequest::new(url.clone(), method, headers, body)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        Ok(Value::Request(request_handle(
+            url,
+            normalized.method().to_string(),
+            normalized.headers().clone(),
+            normalized.body().to_vec(),
+            cache_mode,
+            redirect,
+            signal,
+        )))
     }
 
     fn construct_map(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -3788,6 +3886,21 @@ impl ScriptRuntime {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
             }
             Builtin::PromiseCatch(promise) => self.promise_then(promise, None, arguments.first()),
+            Builtin::RequestClone(request) => {
+                Ok(Value::Request(clone_request(&request)?))
+            }
+            Builtin::RequestText(request) => match self.consume_request_body(&request) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
+                    String::from_utf8_lossy(&body).into_owned(),
+                )))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
+            Builtin::RequestBytes(request) => match self.consume_request_body(&request) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(Rc::new(
+                    body,
+                ))))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
             Builtin::HeadersAppend(headers) => {
                 let (name, value) = normalized_header_pair(&arguments)?;
                 let mut headers = headers.borrow_mut();
@@ -4536,17 +4649,25 @@ impl ScriptRuntime {
     }
 
     fn fetch(&self, arguments: &[Value]) -> PromiseHandle {
-        let reference = arguments
+        let input = arguments
             .first()
-            .map(Value::string_value)
-            .unwrap_or_else(|| "undefined".to_string());
-        let Some(base_url) = &self.base_url else {
-            return self.rejected_promise("fetch is unavailable without a document URL");
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        let (url, request_input) = match input {
+            Value::Request(request) => (request.url.clone(), Some(request)),
+            input => {
+                let reference = input.string_value();
+                let Some(base_url) = &self.base_url else {
+                    return self.rejected_promise("fetch is unavailable without a document URL");
+                };
+                let Ok(url) = base_url.resolve(&reference) else {
+                    return self.rejected_promise(format!("fetch rejected URL {reference}"));
+                };
+                (url, None)
+            }
         };
-        let Ok(url) = base_url.resolve(&reference) else {
-            return self.rejected_promise(format!("fetch rejected URL {reference}"));
-        };
-        let options = match parse_fetch_options(arguments.get(1)) {
+        let options = match parse_fetch_options(arguments.get(1), request_input.as_ref()) {
             Ok(options) => options,
             Err(error) => return self.rejected_promise(error.message),
         };
@@ -4556,6 +4677,14 @@ impl ScriptRuntime {
                 return self.rejected_promise_value(
                     signal.reason.clone().unwrap_or_else(abort_error_value),
                 );
+            }
+        }
+        if options.body_from_request {
+            let Some(request_input) = request_input.as_ref() else {
+                return self.rejected_promise("fetch request body source is unavailable");
+            };
+            if let Err(error) = self.consume_request_body(request_input) {
+                return self.rejected_promise(error.message);
             }
         }
         let request = match ResourceRequest::new(
@@ -4604,6 +4733,17 @@ impl ScriptRuntime {
         let mut body = response.body.borrow_mut();
         if body.consumed || body.disturbed || body.locked {
             return Err(runtime_error("response body is already used"));
+        }
+        body.cursor = body.bytes.len();
+        body.consumed = true;
+        body.disturbed = true;
+        Ok(body.bytes.clone())
+    }
+
+    fn consume_request_body(&self, request: &RequestHandle) -> Result<Vec<u8>, ScriptError> {
+        let mut body = request.body.borrow_mut();
+        if body.consumed || body.disturbed || body.locked {
+            return Err(runtime_error("request body is already used"));
         }
         body.cursor = body.bytes.len();
         body.consumed = true;
@@ -4873,6 +5013,7 @@ impl Value {
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
+            Self::Request(_) => "[object Request]".to_string(),
             Self::Response(_) => "[response]".to_string(),
             Self::Bytes(_) => "[object ArrayBuffer]".to_string(),
             Self::ReadableStream(_) => "[object ReadableStream]".to_string(),
@@ -4893,6 +5034,7 @@ impl Value {
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
+            Self::RequestConstructor => "[function Request]".to_string(),
             Self::HeadersConstructor => "[function Headers]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
                 "[function URL]".to_string()
@@ -4954,6 +5096,52 @@ fn response_body(bytes: Vec<u8>) -> ResponseBodyHandle {
 
 fn headers_handle(values: BTreeMap<String, String>, mutable: bool) -> HeadersHandle {
     Rc::new(RefCell::new(HeadersData { values, mutable }))
+}
+
+fn request_body_snapshot(body: &ResponseBodyHandle) -> Result<Vec<u8>, ScriptError> {
+    let body = body.borrow();
+    if body.consumed || body.disturbed || body.locked {
+        return Err(runtime_error("request body is already used"));
+    }
+    Ok(body.bytes[body.cursor..].to_vec())
+}
+
+fn clone_request(request: &RequestHandle) -> Result<RequestHandle, ScriptError> {
+    Ok(request_handle(
+        request.url.clone(),
+        request.method.clone(),
+        request.headers.borrow().values.clone(),
+        request_body_snapshot(&request.body)?,
+        request.cache_mode.clone(),
+        request.redirect,
+        request.signal.clone(),
+    ))
+}
+
+fn request_handle(
+    url: AppUrl,
+    method: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+    cache_mode: ResourceCacheMode,
+    redirect: FetchRedirectMode,
+    signal: Option<AbortSignalHandle>,
+) -> RequestHandle {
+    let body = response_body(body);
+    let stream = Rc::new(RefCell::new(ReadableStreamData {
+        body: body.clone(),
+        canceled: false,
+    }));
+    Rc::new(RequestData {
+        url,
+        method,
+        headers: headers_handle(headers, true),
+        body,
+        stream,
+        cache_mode,
+        redirect,
+        signal,
+    })
 }
 
 fn response_data(
@@ -5303,6 +5491,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Style(_)
         | Value::ClassList(_)
         | Value::Event(_)
+        | Value::Request(_)
         | Value::Response(_)
         | Value::Bytes(_)
         | Value::ReadableStream(_)
@@ -5331,6 +5520,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
         Value::Function(_)
         | Value::Builtin(_)
+        | Value::RequestConstructor
         | Value::HeadersConstructor
         | Value::UrlConstructor
         | Value::UrlSearchParamsConstructor
@@ -5383,6 +5573,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
         (Value::Bytes(left), Value::Bytes(right)) => Rc::ptr_eq(left, right),
+        (Value::Request(left), Value::Request(right)) => Rc::ptr_eq(left, right),
         (Value::Headers(left), Value::Headers(right)) => Rc::ptr_eq(left, right),
         (Value::ReadableStream(left), Value::ReadableStream(right)) => Rc::ptr_eq(left, right),
         (Value::ReadableStreamReader(left), Value::ReadableStreamReader(right)) => {
@@ -5429,12 +5620,125 @@ fn normalized_header_pair(arguments: &[Value]) -> Result<(String, String), Scrip
         .ok_or_else(|| runtime_error("header name is empty"))
 }
 
+fn header_values_from_init(init: Value) -> Result<BTreeMap<String, String>, ScriptError> {
+    let values = match init.resolve() {
+        Value::Undefined | Value::Null => BTreeMap::new(),
+        Value::Headers(headers) => headers.borrow().values.clone(),
+        Value::Object(object) => object
+            .borrow()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.string_value()))
+            .collect(),
+        Value::Array(array) => {
+            let mut values: BTreeMap<String, String> = BTreeMap::new();
+            for entry in array.borrow().iter() {
+                let Value::Array(entry) = entry.resolve() else {
+                    return Err(runtime_error("Headers sequence entries must be arrays"));
+                };
+                let entry = entry.borrow();
+                if entry.len() != 2 {
+                    return Err(runtime_error("Headers sequence entries need two values"));
+                }
+                let mut pair = BTreeMap::new();
+                pair.insert(entry[0].string_value(), entry[1].string_value());
+                let (name, value) = normalize_headers(pair)
+                    .map_err(|error| runtime_error(error.to_string()))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| runtime_error("header name is empty"))?;
+                if let Some(existing) = values.get_mut(&name) {
+                    existing.push_str(", ");
+                    existing.push_str(&value);
+                } else {
+                    values.insert(name, value);
+                }
+            }
+            values
+        }
+        _ => {
+            return Err(runtime_error(
+                "Headers constructor requires an object, sequence, or Headers",
+            ));
+        }
+    };
+    normalize_headers(values).map_err(|error| runtime_error(error.to_string()))
+}
+
+fn parse_cache_mode(
+    value: Option<&Value>,
+    default: ResourceCacheMode,
+) -> Result<ResourceCacheMode, ScriptError> {
+    match value.map(Value::resolve) {
+        None | Some(Value::Undefined) => Ok(default),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "default" => Ok(ResourceCacheMode::Default),
+            "no-store" => Ok(ResourceCacheMode::NoStore),
+            "reload" => Ok(ResourceCacheMode::Reload),
+            "no-cache" => Ok(ResourceCacheMode::NoCache),
+            "force-cache" => Ok(ResourceCacheMode::ForceCache),
+            "only-if-cached" => Ok(ResourceCacheMode::OnlyIfCached),
+            _ => Err(runtime_error(format!("unsupported fetch cache mode {mode}"))),
+        },
+        Some(_) => Err(runtime_error("fetch cache mode must be a string")),
+    }
+}
+
+fn parse_redirect_mode(
+    value: Option<&Value>,
+    default: FetchRedirectMode,
+) -> Result<FetchRedirectMode, ScriptError> {
+    match value.map(Value::resolve) {
+        None | Some(Value::Undefined) => Ok(default),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "follow" => Ok(FetchRedirectMode::Follow),
+            "error" => Ok(FetchRedirectMode::Error),
+            "manual" => Ok(FetchRedirectMode::Manual),
+            _ => Err(runtime_error(format!("unsupported fetch redirect mode {mode}"))),
+        },
+        Some(_) => Err(runtime_error("fetch redirect mode must be a string")),
+    }
+}
+
+fn parse_signal(
+    value: Option<&Value>,
+    default: Option<AbortSignalHandle>,
+) -> Result<Option<AbortSignalHandle>, ScriptError> {
+    match value.map(Value::resolve) {
+        None | Some(Value::Undefined) => Ok(default),
+        Some(Value::Null) => Ok(None),
+        Some(Value::AbortSignal(signal)) => Ok(Some(signal)),
+        Some(_) => Err(runtime_error("fetch signal must be an AbortSignal")),
+    }
+}
+
+fn fetch_cache_mode_name(mode: &ResourceCacheMode) -> String {
+    match mode {
+        ResourceCacheMode::Default => "default",
+        ResourceCacheMode::NoStore => "no-store",
+        ResourceCacheMode::Reload => "reload",
+        ResourceCacheMode::NoCache => "no-cache",
+        ResourceCacheMode::ForceCache => "force-cache",
+        ResourceCacheMode::OnlyIfCached => "only-if-cached",
+    }
+    .to_string()
+}
+
+fn fetch_redirect_mode_name(mode: FetchRedirectMode) -> String {
+    match mode {
+        FetchRedirectMode::Follow => "follow",
+        FetchRedirectMode::Error => "error",
+        FetchRedirectMode::Manual => "manual",
+    }
+    .to_string()
+}
+
 const MAX_USER_ITERATOR_VALUES: usize = 10_000;
 
 struct FetchOptions {
     method: String,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    body_from_request: bool,
     cache_mode: ResourceCacheMode,
     redirect: FetchRedirectMode,
     signal: Option<AbortSignalHandle>,
@@ -5447,96 +5751,94 @@ enum FetchRedirectMode {
     Manual,
 }
 
-fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptError> {
+fn parse_fetch_options(
+    options: Option<&Value>,
+    request_input: Option<&RequestHandle>,
+) -> Result<FetchOptions, ScriptError> {
+    let default_method = request_input
+        .map(|request| request.method.clone())
+        .unwrap_or_else(|| "GET".to_string());
+    let default_headers = request_input
+        .map(|request| request.headers.borrow().values.clone())
+        .unwrap_or_default();
+    let default_cache = request_input
+        .map(|request| request.cache_mode.clone())
+        .unwrap_or(ResourceCacheMode::Default);
+    let default_redirect = request_input
+        .map(|request| request.redirect)
+        .unwrap_or(FetchRedirectMode::Follow);
+    let default_signal = request_input.and_then(|request| request.signal.clone());
     let Some(options) = options.map(Value::resolve) else {
         return Ok(FetchOptions {
-            method: "GET".to_string(),
-            headers: BTreeMap::new(),
-            body: Vec::new(),
-            cache_mode: ResourceCacheMode::Default,
-            redirect: FetchRedirectMode::Follow,
-            signal: None,
+            method: default_method,
+            headers: default_headers,
+            body: request_input
+                .map(|request| request_body_snapshot(&request.body))
+                .transpose()?
+                .unwrap_or_default(),
+            body_from_request: request_input.is_some(),
+            cache_mode: default_cache,
+            redirect: default_redirect,
+            signal: default_signal,
         });
     };
     if matches!(options, Value::Undefined | Value::Null) {
         return Ok(FetchOptions {
-            method: "GET".to_string(),
-            headers: BTreeMap::new(),
-            body: Vec::new(),
-            cache_mode: ResourceCacheMode::Default,
-            redirect: FetchRedirectMode::Follow,
-            signal: None,
+            method: default_method,
+            headers: default_headers,
+            body: request_input
+                .map(|request| request_body_snapshot(&request.body))
+                .transpose()?
+                .unwrap_or_default(),
+            body_from_request: request_input.is_some(),
+            cache_mode: default_cache,
+            redirect: default_redirect,
+            signal: default_signal,
         });
     }
     let Value::Object(options) = options else {
         return Err(runtime_error("fetch options must be an object"));
     };
     let options = options.borrow();
-    if options
-        .keys()
-        .any(|key| {
-            !matches!(
-                key.as_str(),
-                "method" | "headers" | "body" | "cache" | "redirect" | "signal"
-            )
-        })
-    {
+    if options.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "method" | "headers" | "body" | "cache" | "redirect" | "signal"
+        )
+    }) {
         return Err(runtime_error(
             "fetch options contain an unsupported key",
         ));
     }
     let method = match options.get("method").map(Value::resolve) {
-        None | Some(Value::Undefined) => "GET".to_string(),
+        None | Some(Value::Undefined) => default_method,
         Some(Value::String(method)) => method,
         Some(_) => return Err(runtime_error("fetch method must be a string")),
     };
     let headers = match options.get("headers").map(Value::resolve) {
-        None | Some(Value::Undefined) | Some(Value::Null) => BTreeMap::new(),
-        Some(Value::Object(headers)) => headers
-            .borrow()
-            .iter()
-            .map(|(name, value)| (name.clone(), value.string_value()))
-            .collect(),
-        Some(Value::Headers(headers)) => headers.borrow().values.clone(),
-        Some(_) => return Err(runtime_error("fetch headers must be an object or Headers")),
+        None | Some(Value::Undefined) => default_headers,
+        Some(Value::Null) => BTreeMap::new(),
+        Some(value) => header_values_from_init(value)?,
     };
     let body = match options.get("body").map(Value::resolve) {
-        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+        None | Some(Value::Undefined) => request_input
+            .map(|request| request_body_snapshot(&request.body))
+            .transpose()?
+            .unwrap_or_default(),
+        Some(Value::Null) => Vec::new(),
         Some(Value::String(body)) => body.into_bytes(),
         Some(_) => return Err(runtime_error("fetch body must be a string")),
     };
-    let cache_mode = match options.get("cache").map(Value::resolve) {
-        None | Some(Value::Undefined) => ResourceCacheMode::Default,
-        Some(Value::String(mode)) => match mode.as_str() {
-            "default" => ResourceCacheMode::Default,
-            "no-store" => ResourceCacheMode::NoStore,
-            "reload" => ResourceCacheMode::Reload,
-            "no-cache" => ResourceCacheMode::NoCache,
-            "force-cache" => ResourceCacheMode::ForceCache,
-            "only-if-cached" => ResourceCacheMode::OnlyIfCached,
-            _ => return Err(runtime_error(format!("unsupported fetch cache mode {mode}"))),
-        },
-        Some(_) => return Err(runtime_error("fetch cache mode must be a string")),
-    };
-    let redirect = match options.get("redirect").map(Value::resolve) {
-        None | Some(Value::Undefined) => FetchRedirectMode::Follow,
-        Some(Value::String(mode)) => match mode.as_str() {
-            "follow" => FetchRedirectMode::Follow,
-            "error" => FetchRedirectMode::Error,
-            "manual" => FetchRedirectMode::Manual,
-            _ => return Err(runtime_error(format!("unsupported fetch redirect mode {mode}"))),
-        },
-        Some(_) => return Err(runtime_error("fetch redirect mode must be a string")),
-    };
-    let signal = match options.get("signal").map(Value::resolve) {
-        None | Some(Value::Undefined) | Some(Value::Null) => None,
-        Some(Value::AbortSignal(signal)) => Some(signal),
-        Some(_) => return Err(runtime_error("fetch signal must be an AbortSignal")),
-    };
+    let body_from_request = request_input.is_some()
+        && matches!(options.get("body").map(Value::resolve), None | Some(Value::Undefined));
+    let cache_mode = parse_cache_mode(options.get("cache"), default_cache)?;
+    let redirect = parse_redirect_mode(options.get("redirect"), default_redirect)?;
+    let signal = parse_signal(options.get("signal"), default_signal)?;
     Ok(FetchOptions {
         method,
         headers,
         body,
+        body_from_request,
         cache_mode,
         redirect,
         signal,
@@ -8614,6 +8916,83 @@ mod tests {
             requests[0].headers().get("x-object").map(String::as_str),
             Some("value")
         );
+    }
+
+    #[test]
+    fn request_objects_clone_inspect_and_dispatch_their_body() {
+        let document = document("<p id='status'>idle</p><p id='body'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const base = new Request("/headers", {
+                    method: "POST",
+                    headers: { "X-Base": "base" },
+                    body: "base body",
+                    cache: "reload",
+                    redirect: "manual"
+                });
+                const copied = new Request(base, {
+                    method: "PUT",
+                    headers: new Headers({ "X-Override": "yes" }),
+                    body: "override body",
+                    cache: "force-cache",
+                    redirect: "follow"
+                });
+                const bodyCopy = copied.clone();
+                bodyCopy.text().then((body) => {
+                    document.getElementById("body").textContent = body + "|" + bodyCopy.bodyUsed;
+                });
+                const dispatched = copied.clone();
+                fetch(dispatched).then((response) => {
+                    let cloneError = "";
+                    try { dispatched.clone(); } catch (error) { cloneError = error.message; }
+                    status.textContent = base.method + "|" + base.url + "|" + base.cache + "|" + base.redirect + "|" + copied.method + "|" + copied.headers.get("x-override") + "|" + (copied.body === copied.body) + "|" + base.bodyUsed + "|" + copied.bodyUsed + "|" + dispatched.bodyUsed + "|" + cloneError;
+                });
+                "#,
+            )
+            .expect("Request construction and dispatch should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "POST|https://app.ceri.invalid/headers|reload|manual|PUT|yes|true|false|false|true|request body is already used"
+            )
+        );
+        let body = document
+            .borrow()
+            .find_element_by_id("body")
+            .expect("body status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&body).as_deref(),
+            Some("override body|true")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method(), "PUT");
+        assert_eq!(requests[0].body(), b"override body");
+        assert_eq!(
+            requests[0].headers().get("x-override").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(requests[0].headers().get("x-base"), None);
+        assert_eq!(requests[0].cache_mode(), &ResourceCacheMode::ForceCache);
     }
 
     #[test]
