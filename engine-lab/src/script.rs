@@ -3139,9 +3139,15 @@ impl ScriptRuntime {
             if let Some(value) = init.get("body").map(Value::resolve) {
                 body = match value {
                     Value::Undefined => body,
-                    Value::Null => Vec::new(),
-                    Value::String(body) => body.into_bytes(),
-                    _ => return Err(runtime_error("Request body must be a string")),
+                    value => {
+                        let (body, inferred_mime_type) = body_init_bytes(value)?;
+                        if let Some(mime_type) = inferred_mime_type
+                            && !headers.contains_key("content-type")
+                        {
+                            headers.insert("content-type".to_string(), mime_type.to_string());
+                        }
+                        body
+                    }
                 };
             }
             cache_mode = parse_cache_mode(init.get("cache"), cache_mode)?;
@@ -3220,18 +3226,13 @@ impl ScriptRuntime {
             }
         }
         let body_present = !matches!(body, Value::Undefined | Value::Null);
-        let body = match body {
-            Value::Undefined | Value::Null => Vec::new(),
-            Value::String(body) => body.into_bytes(),
-            Value::Bytes(bytes) => bytes.as_ref().clone(),
-            _ => return Err(runtime_error("Response body must be a string or ArrayBuffer")),
-        };
+        let (body, body_mime_type) = body_init_bytes(body)?;
         if body_present && matches!(status, 101 | 103 | 204 | 205 | 304) {
             return Err(runtime_error(
                 "Response body is not allowed for this status",
             ));
         }
-        if let Some(mime_type) = inferred_mime_type
+        if let Some(mime_type) = inferred_mime_type.or(body_mime_type)
             && !headers.contains_key("content-type")
         {
             headers.insert("content-type".to_string(), mime_type.to_string());
@@ -5588,6 +5589,24 @@ fn serialize_form_urlencoded(pairs: &[(String, String)]) -> String {
         .join("&")
 }
 
+fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<&'static str>), ScriptError> {
+    match value.resolve() {
+        Value::Undefined | Value::Null => Ok((Vec::new(), None)),
+        Value::String(body) => Ok((
+            body.into_bytes(),
+            Some("text/plain;charset=UTF-8"),
+        )),
+        Value::Bytes(bytes) => Ok((bytes.as_ref().clone(), None)),
+        Value::UrlSearchParams(params) => Ok((
+            serialize_form_urlencoded(&params.borrow().pairs).into_bytes(),
+            Some("application/x-www-form-urlencoded;charset=UTF-8"),
+        )),
+        _ => Err(runtime_error(
+            "body must be a string, ArrayBuffer, or URLSearchParams",
+        )),
+    }
+}
+
 fn encode_form_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
@@ -6026,15 +6045,22 @@ fn parse_fetch_options(
         Some(Value::Null) => BTreeMap::new(),
         Some(value) => header_values_from_init(value)?,
     };
-    let body = match options.get("body").map(Value::resolve) {
-        None | Some(Value::Undefined) => request_input
-            .map(|request| request_body_snapshot(&request.body))
-            .transpose()?
-            .unwrap_or_default(),
-        Some(Value::Null) => Vec::new(),
-        Some(Value::String(body)) => body.into_bytes(),
-        Some(_) => return Err(runtime_error("fetch body must be a string")),
+    let (body, inferred_mime_type) = match options.get("body").map(Value::resolve) {
+        None | Some(Value::Undefined) => (
+            request_input
+                .map(|request| request_body_snapshot(&request.body))
+                .transpose()?
+                .unwrap_or_default(),
+            None,
+        ),
+        Some(value) => body_init_bytes(value)?,
     };
+    let mut headers = headers;
+    if let Some(mime_type) = inferred_mime_type
+        && !headers.contains_key("content-type")
+    {
+        headers.insert("content-type".to_string(), mime_type.to_string());
+    }
     let body_from_request = request_input.is_some()
         && matches!(options.get("body").map(Value::resolve), None | Some(Value::Undefined));
     let cache_mode = parse_cache_mode(options.get("cache"), default_cache)?;
@@ -9289,6 +9315,60 @@ mod tests {
             Some(
                 "error|0|false||default|307||https://app.ceri.invalid/next|false|headers are immutable|Response redirect status is invalid"
             )
+        );
+    }
+
+    #[test]
+    fn url_search_params_bodies_encode_and_infer_content_type() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const params = new URLSearchParams([["q", "hello world"], ["tag", "rust"]]);
+                const request = new Request("/headers", { method: "POST", body: params });
+                fetch(request).then((response) => response.text()).then((body) => {
+                    fetch("/headers", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/custom" },
+                        body: new URLSearchParams([["custom", "yes"]])
+                    }).then(() => { status.textContent = body; });
+                });
+                "#,
+            )
+            .expect("URLSearchParams bodies should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body(), b"q=hello+world&tag=rust");
+        assert_eq!(
+            requests[0].headers().get("content-type").map(String::as_str),
+            Some("application/x-www-form-urlencoded;charset=UTF-8")
+        );
+        assert_eq!(requests[1].body(), b"custom=yes");
+        assert_eq!(
+            requests[1].headers().get("content-type").map(String::as_str),
+            Some("application/custom")
         );
     }
 
