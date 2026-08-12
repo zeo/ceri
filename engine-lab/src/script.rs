@@ -18,6 +18,7 @@ type ArrayHandle = Rc<RefCell<Vec<Value>>>;
 type NodeListHandle = Rc<Vec<ElementHandle>>;
 type MapHandle = Rc<RefCell<MapData>>;
 type SetHandle = Rc<RefCell<SetData>>;
+type IteratorHandle = Rc<RefCell<IteratorData>>;
 type ErrorHandle = Rc<ErrorData>;
 type ClassHandle = Rc<ClassDefinition>;
 type LocationHandle = Rc<RefCell<AppUrl>>;
@@ -58,6 +59,7 @@ enum Value {
     NodeList(NodeListHandle),
     Map(MapHandle),
     Set(SetHandle),
+    Iterator(IteratorHandle),
     Element(ElementHandle),
     Dataset(ElementHandle),
     Error(ErrorHandle),
@@ -156,7 +158,12 @@ enum Builtin {
     MapGet(MapHandle),
     MapSet(MapHandle),
     MapKeys(MapHandle),
+    MapValues(MapHandle),
+    MapEntries(MapHandle),
+    IteratorNext(IteratorHandle),
+    IteratorJoin(IteratorHandle),
     SetHas(SetHandle),
+    SetValues(SetHandle),
     PromiseReject,
     PromiseResolve,
     PromiseRejectPending(PromiseHandle),
@@ -177,7 +184,7 @@ enum Builtin {
 }
 
 struct Function {
-    params: Vec<String>,
+    params: Vec<Pattern>,
     body: Vec<Stmt>,
     environment: EnvironmentRef,
     is_async: bool,
@@ -238,7 +245,7 @@ enum Expr {
         arguments: Vec<Expr>,
     },
     Function {
-        params: Vec<String>,
+        params: Vec<Pattern>,
         body: Vec<Stmt>,
         is_async: bool,
     },
@@ -253,9 +260,22 @@ enum Literal {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum Pattern {
+    Identifier(String),
+    Object {
+        properties: Vec<(String, Pattern)>,
+        rest: Option<Box<Pattern>>,
+    },
+    Array {
+        items: Vec<Option<Pattern>>,
+        rest: Option<Box<Pattern>>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum Stmt {
     Let {
-        name: String,
+        pattern: Pattern,
         initializer: Option<Expr>,
     },
     Expression(Expr),
@@ -266,7 +286,7 @@ enum Stmt {
         alternate: Option<Box<Stmt>>,
     },
     ForOf {
-        name: String,
+        pattern: Pattern,
         iterable: Expr,
         body: Box<Stmt>,
     },
@@ -436,6 +456,11 @@ struct FormDataData {
 
 struct MapData {
     entries: Vec<(Value, Value)>,
+}
+
+struct IteratorData {
+    values: Vec<Value>,
+    index: usize,
 }
 
 struct SetData {
@@ -1151,19 +1176,93 @@ impl ScriptRuntime {
         Ok(Completion::Normal)
     }
 
+    fn bind_pattern(
+        &self,
+        pattern: &Pattern,
+        value: Value,
+        environment: &EnvironmentRef,
+    ) -> Result<(), ScriptError> {
+        match pattern {
+            Pattern::Identifier(name) => {
+                environment
+                    .borrow_mut()
+                    .values
+                    .insert(name.clone(), value);
+                Ok(())
+            }
+            Pattern::Object { properties, rest } => {
+                if matches!(value, Value::Null | Value::Undefined) {
+                    return Err(runtime_error("cannot destructure a nullish value"));
+                }
+                let mut consumed = BTreeSet::new();
+                let mut object_properties = BTreeMap::new();
+                if let Value::Object(object) = &value {
+                    object_properties = object.borrow().clone();
+                }
+                for (property, nested) in properties {
+                    consumed.insert(property.clone());
+                    let nested_value = if let Some(nested_value) = object_properties.get(property) {
+                        nested_value.clone()
+                    } else {
+                        self.member(value.clone(), property)
+                            .unwrap_or(Value::Undefined)
+                    };
+                    self.bind_pattern(nested, nested_value, environment)?;
+                }
+                if let Some(rest) = rest {
+                    let remaining = object_properties
+                        .into_iter()
+                        .filter(|(property, _)| !consumed.contains(property))
+                        .collect();
+                    self.bind_pattern(
+                        rest,
+                        Value::Object(Rc::new(RefCell::new(remaining))),
+                        environment,
+                    )?;
+                }
+                Ok(())
+            }
+            Pattern::Array { items, rest } => {
+                let values = iterable_values(value)?;
+                for (index, nested) in items.iter().enumerate() {
+                    let Some(nested) = nested else {
+                        continue;
+                    };
+                    self.bind_pattern(
+                        nested,
+                        values.get(index).cloned().unwrap_or(Value::Undefined),
+                        environment,
+                    )?;
+                }
+                if let Some(rest) = rest {
+                    let remaining = values.into_iter().skip(items.len()).collect();
+                    self.bind_pattern(
+                        rest,
+                        Value::Array(Rc::new(RefCell::new(remaining))),
+                        environment,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn execute_statement(
         &mut self,
         statement: &Stmt,
         environment: EnvironmentRef,
     ) -> Result<Completion, ScriptError> {
         match statement {
-            Stmt::Let { name, initializer } => {
+            Stmt::Let {
+                pattern,
+                initializer,
+            } => {
                 let value = initializer
                     .as_ref()
                     .map(|expression| self.evaluate(expression, environment.clone()))
                     .transpose()?
                     .unwrap_or(Value::Undefined);
-                environment.borrow_mut().values.insert(name.clone(), value);
+                self.bind_pattern(pattern, value, &environment)?;
                 Ok(Completion::Normal)
             }
             Stmt::Expression(expression) => {
@@ -1191,7 +1290,7 @@ impl ScriptRuntime {
                 }
             }
             Stmt::ForOf {
-                name,
+                pattern,
                 iterable,
                 body,
             } => {
@@ -1201,10 +1300,7 @@ impl ScriptRuntime {
                         values: HashMap::new(),
                         parent: Some(environment.clone()),
                     }));
-                    iteration
-                        .borrow_mut()
-                        .values
-                        .insert(name.clone(), value);
+                    self.bind_pattern(pattern, value, &iteration)?;
                     let completion = self.execute_statement(body, iteration)?;
                     if !matches!(completion, Completion::Normal) {
                         return Ok(completion);
@@ -1736,7 +1832,19 @@ impl ScriptRuntime {
             Value::Set(set) => match property {
                 "size" => Ok(Value::Number(set.borrow().values.len() as f64)),
                 "has" => Ok(Value::Builtin(Builtin::SetHas(set))),
+                "values" | "keys" => Ok(Value::Builtin(Builtin::SetValues(set))),
                 _ => Err(runtime_error(format!("Set has no property {property}"))),
+            },
+            Value::Iterator(iterator) => match property {
+                "length" => {
+                    let iterator = iterator.borrow();
+                    Ok(Value::Number(
+                        iterator.values.len().saturating_sub(iterator.index) as f64,
+                    ))
+                }
+                "next" => Ok(Value::Builtin(Builtin::IteratorNext(iterator))),
+                "join" => Ok(Value::Builtin(Builtin::IteratorJoin(iterator))),
+                _ => Err(runtime_error(format!("iterator has no property {property}"))),
             },
             Value::Error(error) => match property {
                 "name" => Ok(Value::String(error.name.clone())),
@@ -1811,6 +1919,8 @@ impl ScriptRuntime {
                 "get" => Ok(Value::Builtin(Builtin::MapGet(map))),
                 "set" => Ok(Value::Builtin(Builtin::MapSet(map))),
                 "keys" => Ok(Value::Builtin(Builtin::MapKeys(map))),
+                "values" => Ok(Value::Builtin(Builtin::MapValues(map))),
+                "entries" => Ok(Value::Builtin(Builtin::MapEntries(map))),
                 _ => Err(runtime_error(format!("Map has no property {property}"))),
             },
             Value::Json => match property {
@@ -2132,10 +2242,11 @@ impl ScriptRuntime {
                     parent: Some(function.environment.clone()),
                 }));
                 for (index, parameter) in function.params.iter().enumerate() {
-                    environment.borrow_mut().values.insert(
-                        parameter.clone(),
+                    self.bind_pattern(
+                        parameter,
                         arguments.get(index).cloned().unwrap_or(Value::Undefined),
-                    );
+                        &environment,
+                    )?;
                 }
                 let outcome = self.execute_statements(&function.body, environment);
                 if function.is_async {
@@ -3312,13 +3423,59 @@ impl ScriptRuntime {
                 drop(map_data);
                 Ok(Value::Map(map))
             }
-            Builtin::MapKeys(map) => Ok(Value::Array(Rc::new(RefCell::new(
+            Builtin::MapKeys(map) => Ok(iterator_value(
                 map.borrow()
                     .entries
                     .iter()
                     .map(|(key, _)| key.clone())
                     .collect(),
-            )))),
+            )),
+            Builtin::MapValues(map) => Ok(iterator_value(
+                map.borrow()
+                    .entries
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect(),
+            )),
+            Builtin::MapEntries(map) => Ok(iterator_value(
+                map.borrow()
+                    .entries
+                    .iter()
+                    .map(|(key, value)| {
+                        Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
+                    })
+                    .collect(),
+            )),
+            Builtin::IteratorNext(iterator) => {
+                let mut iterator = iterator.borrow_mut();
+                let mut result = BTreeMap::new();
+                if let Some(value) = iterator.values.get(iterator.index).cloned() {
+                    iterator.index += 1;
+                    result.insert("value".to_string(), value);
+                    result.insert("done".to_string(), Value::Bool(false));
+                } else {
+                    result.insert("value".to_string(), Value::Undefined);
+                    result.insert("done".to_string(), Value::Bool(true));
+                }
+                Ok(Value::Object(Rc::new(RefCell::new(result))))
+            }
+            Builtin::IteratorJoin(iterator) => {
+                let separator = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| ",".to_string());
+                let iterator = iterator.borrow();
+                let joined = iterator.values[iterator.index..]
+                    .iter()
+                    .map(|value| match value {
+                        Value::Undefined | Value::Null => String::new(),
+                        value => value.string_value(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(&separator);
+                Ok(Value::String(joined))
+            }
+            Builtin::SetValues(set) => Ok(iterator_value(set.borrow().values.clone())),
             Builtin::ElementClassListAdd(handle) => {
                 for argument in arguments {
                     let class = class_name(&argument)?;
@@ -3778,6 +3935,7 @@ impl Value {
             Self::NodeList(_) => "[object NodeList]".to_string(),
             Self::Map(_) => "[object Map]".to_string(),
             Self::Set(_) => "[object Set]".to_string(),
+            Self::Iterator(_) => "[object Iterator]".to_string(),
             Self::Element(_) => "[element]".to_string(),
             Self::Dataset(_) => "[object DOMStringMap]".to_string(),
             Self::Error(error) => error.message.clone(),
@@ -4124,6 +4282,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::NodeList(_)
         | Value::Map(_)
         | Value::Set(_)
+        | Value::Iterator(_)
         | Value::Element(_)
         | Value::Dataset(_)
         | Value::Style(_)
@@ -4197,6 +4356,10 @@ fn spread_values(value: Value) -> Result<Vec<Value>, ScriptError> {
     iterable_values(value)
 }
 
+fn iterator_value(values: Vec<Value>) -> Value {
+    Value::Iterator(Rc::new(RefCell::new(IteratorData { values, index: 0 })))
+}
+
 fn iterable_values(value: Value) -> Result<Vec<Value>, ScriptError> {
     match value {
         Value::Array(values) => Ok(values.borrow().clone()),
@@ -4205,6 +4368,13 @@ fn iterable_values(value: Value) -> Result<Vec<Value>, ScriptError> {
             .chars()
             .map(|character| Value::String(character.to_string()))
             .collect()),
+        Value::Iterator(iterator) => {
+            let mut iterator = iterator.borrow_mut();
+            let values = iterator.values[iterator.index..].to_vec();
+            iterator.index = iterator.values.len();
+            Ok(values)
+        }
+        Value::Set(set) => Ok(set.borrow().values.clone()),
         Value::Map(map) => Ok(map
             .borrow()
             .entries
@@ -4329,7 +4499,11 @@ impl Parser {
     ) -> Result<(), ScriptError> {
         if self.is(TokenKind::Let) || self.is(TokenKind::Const) {
             let statement = self.parse_statement()?;
-            let Stmt::Let { name, .. } = &statement else {
+            let Stmt::Let {
+                pattern: Pattern::Identifier(name),
+                ..
+            } = &statement
+            else {
                 return Err(self.error("expected exported binding".to_string(), self.peek().offset));
             };
             exports.push(ModuleExport {
@@ -4341,7 +4515,11 @@ impl Parser {
         }
         if self.is(TokenKind::Function) && self.is_next_identifier() {
             let statement = self.parse_statement()?;
-            let Stmt::Let { name, .. } = &statement else {
+            let Stmt::Let {
+                pattern: Pattern::Identifier(name),
+                ..
+            } = &statement
+            else {
                 return Err(self.error("expected exported function".to_string(), self.peek().offset));
             };
             exports.push(ModuleExport {
@@ -4401,13 +4579,16 @@ impl Parser {
             return Ok(Stmt::Block(statements));
         }
         if self.take(TokenKind::Let) || self.take(TokenKind::Const) {
-            let name = self.expect_identifier("variable name")?;
+            let pattern = self.parse_binding_pattern("variable")?;
             let initializer = self
                 .take(TokenKind::Assign)
                 .then(|| self.parse_expression())
                 .transpose()?;
             self.take(TokenKind::Semicolon);
-            return Ok(Stmt::Let { name, initializer });
+            return Ok(Stmt::Let {
+                pattern,
+                initializer,
+            });
         }
         if self.take(TokenKind::If) {
             self.expect(TokenKind::LParen, "if condition")?;
@@ -4432,13 +4613,13 @@ impl Parser {
                     self.peek().offset,
                 ));
             }
-            let name = self.expect_identifier("for-of binding")?;
+            let pattern = self.parse_binding_pattern("for-of binding")?;
             self.expect_identifier_value("of")?;
             let iterable = self.parse_expression()?;
             self.expect(TokenKind::RParen, "for statement")?;
             let body = Box::new(self.parse_statement()?);
             return Ok(Stmt::ForOf {
-                name,
+                pattern,
                 iterable,
                 body,
             });
@@ -4458,7 +4639,7 @@ impl Parser {
             let function = self.parse_function_after_name()?;
             self.take(TokenKind::Semicolon);
             return Ok(Stmt::Let {
-                name,
+                pattern: Pattern::Identifier(name),
                 initializer: Some(function),
             });
         }
@@ -4468,7 +4649,7 @@ impl Parser {
             let function = self.parse_function_after_name_with_async(true)?;
             self.take(TokenKind::Semicolon);
             return Ok(Stmt::Let {
-                name,
+                pattern: Pattern::Identifier(name),
                 initializer: Some(function),
             });
         }
@@ -4736,7 +4917,7 @@ impl Parser {
             }
             TokenKind::Identifier(name) => {
                 if self.take(TokenKind::Arrow) {
-                    Ok(self.parse_arrow_body(vec![name])?)
+                    Ok(self.parse_arrow_body(vec![Pattern::Identifier(name)])?)
                 } else {
                     Ok(Expr::Identifier(name))
                 }
@@ -4845,6 +5026,71 @@ impl Parser {
         Ok(Expr::Array(values))
     }
 
+    fn parse_binding_pattern(&mut self, context: &str) -> Result<Pattern, ScriptError> {
+        match self.peek().kind.clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                Ok(Pattern::Identifier(name))
+            }
+            TokenKind::LBrace => {
+                self.advance();
+                let mut properties = Vec::new();
+                let mut rest = None;
+                while !self.is(TokenKind::RBrace) && !self.is(TokenKind::Eof) {
+                    if self.take(TokenKind::Ellipsis) {
+                        rest = Some(Box::new(self.parse_binding_pattern("object rest")?));
+                        self.take(TokenKind::Comma);
+                        break;
+                    }
+                    let key = self.advance();
+                    let key = match key.kind {
+                        TokenKind::Identifier(key) | TokenKind::String(key) => key,
+                        _ => {
+                            return Err(self.error(
+                                "expected object binding name".to_string(),
+                                key.offset,
+                            ));
+                        }
+                    };
+                    let nested = if self.take(TokenKind::Colon) {
+                        self.parse_binding_pattern("object binding")?
+                    } else {
+                        Pattern::Identifier(key.clone())
+                    };
+                    properties.push((key, nested));
+                    if !self.take(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBrace, context)?;
+                Ok(Pattern::Object { properties, rest })
+            }
+            TokenKind::LBracket => {
+                self.advance();
+                let mut items = Vec::new();
+                let mut rest = None;
+                while !self.is(TokenKind::RBracket) && !self.is(TokenKind::Eof) {
+                    if self.take(TokenKind::Ellipsis) {
+                        rest = Some(Box::new(self.parse_binding_pattern("array rest")?));
+                        self.take(TokenKind::Comma);
+                        break;
+                    }
+                    if self.take(TokenKind::Comma) {
+                        items.push(None);
+                        continue;
+                    }
+                    items.push(Some(self.parse_binding_pattern("array binding")?));
+                    if !self.take(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBracket, context)?;
+                Ok(Pattern::Array { items, rest })
+            }
+            _ => Err(self.error(format!("expected {context}"), self.peek().offset)),
+        }
+    }
+
     fn try_parse_arrow_function(&mut self) -> Result<Option<Expr>, ScriptError> {
         if !self.is(TokenKind::LParen) {
             return Ok(None);
@@ -4854,7 +5100,7 @@ impl Parser {
         let mut params = Vec::new();
         if !self.is(TokenKind::RParen) {
             loop {
-                params.push(self.expect_identifier("arrow parameter")?);
+                params.push(self.parse_binding_pattern("arrow parameter")?);
                 if !self.take(TokenKind::Comma) {
                     break;
                 }
@@ -4867,7 +5113,7 @@ impl Parser {
         Ok(None)
     }
 
-    fn parse_arrow_body(&mut self, params: Vec<String>) -> Result<Expr, ScriptError> {
+    fn parse_arrow_body(&mut self, params: Vec<Pattern>) -> Result<Expr, ScriptError> {
         let body = if self.take(TokenKind::LBrace) {
             self.parse_block_contents()?
         } else {
@@ -4912,7 +5158,7 @@ impl Parser {
         let mut params = Vec::new();
         if !self.is(TokenKind::RParen) {
             loop {
-                params.push(self.expect_identifier("function parameter")?);
+                params.push(self.parse_binding_pattern("function parameter")?);
                 if !self.take(TokenKind::Comma) {
                     break;
                 }
@@ -5615,6 +5861,91 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("module|storage|")
+        );
+    }
+
+    #[test]
+    fn destructures_objects_arrays_and_function_parameters() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const payload = { status: "ready", nested: { count: 2 }, extra: "kept" };
+                const { status, nested: { count }, ...rest } = payload;
+                const [first, , third, ...tail] = ["a", "b", "c", "d"];
+                const format = ({ status }, [first]) => status + "|" + first;
+                let pairs = "";
+                for (const [key, value] of [["x", 1], ["y", 2]]) {
+                  pairs = pairs + key + value;
+                }
+                document.getElementById("status").textContent =
+                  format(payload, [first]) + "|" + count + "|" + rest.extra + "|" + third + "|" + tail.length + "|" + pairs;
+                "##,
+            )
+            .expect("destructuring should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready|a|2|kept|c|1|x1y2")
+        );
+    }
+
+    #[test]
+    fn map_key_iterators_expose_next_records() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const iterator = new Map([["module", 1], ["storage", 2]]).keys();
+                const { value: first, done: firstDone } = iterator.next();
+                const { value: second, done: secondDone } = iterator.next();
+                const { value: third, done: thirdDone } = iterator.next();
+                document.getElementById("status").textContent =
+                  first + "|" + firstDone + "|" + second + "|" + secondDone + "|" +
+                  thirdDone + "|" + iterator.length;
+                "##,
+            )
+            .expect("iterator records should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("module|false|storage|false|true|0")
+        );
+    }
+
+    #[test]
+    fn iterates_map_values_entries_and_set_values() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const map = new Map([["a", 1], ["b", 2]]);
+                const values = [...map.values()];
+                const entries = [...map.entries()];
+                const setValues = [...new Set(["a", "a", "b"]).values()];
+                document.getElementById("status").textContent =
+                  values.join(",") + "|" +
+                  entries.map(([key, value]) => key + value).join(",") + "|" +
+                  setValues.join(",");
+                "##,
+            )
+            .expect("map and set iterators should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1,2|a1,b2|a,b")
         );
     }
 
