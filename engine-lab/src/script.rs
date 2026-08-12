@@ -193,7 +193,9 @@ enum Builtin {
     PromiseResolve,
     PromiseRejectPending(PromiseHandle),
     PromiseResolvePending(PromiseHandle),
+    ResponseErrorConstructor,
     ResponseJsonConstructor,
+    ResponseRedirectConstructor,
     NumberParseInt,
     NumberIsFinite,
     ArrayIsArray,
@@ -2320,7 +2322,9 @@ impl ScriptRuntime {
                 ))),
             },
             Value::ResponseConstructor => match property {
+                "error" => Ok(Value::Builtin(Builtin::ResponseErrorConstructor)),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJsonConstructor)),
+                "redirect" => Ok(Value::Builtin(Builtin::ResponseRedirectConstructor)),
                 _ => Err(runtime_error(format!(
                     "Response has no property {property}"
                 ))),
@@ -4112,6 +4116,18 @@ impl ScriptRuntime {
                 headers.values.insert(name, value);
                 Ok(Value::Undefined)
             }
+            Builtin::ResponseErrorConstructor => Ok(Value::Response(Rc::new(response_data(
+                String::new(),
+                0,
+                String::new(),
+                String::new(),
+                headers_handle(BTreeMap::new(), false),
+                Vec::new(),
+                ResponseMetadata {
+                    redirected: false,
+                    response_type: "error".to_string(),
+                },
+            )))),
             Builtin::ResponseJsonConstructor => {
                 let data = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let body = serialize_json(&data)?;
@@ -4121,6 +4137,48 @@ impl ScriptRuntime {
                     init,
                     Some("application/json"),
                 )
+            }
+            Builtin::ResponseRedirectConstructor => {
+                let reference = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .ok_or_else(|| runtime_error("Response.redirect requires a URL"))?;
+                let base = self.base_url.clone().unwrap_or_else(|| {
+                    AppUrl::parse("https://app.ceri.invalid/")
+                        .expect("built-in app origin should parse")
+                });
+                let url = base
+                    .resolve(&reference)
+                    .map_err(|error| runtime_error(error.to_string()))?;
+                let status = arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(302.0);
+                if !status.is_finite()
+                    || status.fract() != 0.0
+                    || !(0.0..=u16::MAX as f64).contains(&status)
+                {
+                    return Err(runtime_error("Response redirect status is invalid"));
+                }
+                let status = status as u16;
+                if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                    return Err(runtime_error("Response redirect status is invalid"));
+                }
+                let mut headers = BTreeMap::new();
+                headers.insert("location".to_string(), url.to_string());
+                Ok(Value::Response(Rc::new(response_data(
+                    String::new(),
+                    status,
+                    String::new(),
+                    String::new(),
+                    headers_handle(headers, false),
+                    Vec::new(),
+                    ResponseMetadata {
+                        redirected: false,
+                        response_type: "default".to_string(),
+                    },
+                ))))
             }
             Builtin::ResponseClone(response) => {
                 let body = response.body.borrow();
@@ -9191,6 +9249,45 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some(
                 "default||201|Created|true|yes|null|false|true|created|response body is already used|202|Accepted|application/json|application/json|{\"answer\":42}|Response status must be an integer between 200 and 599|Response body is not allowed for this status"
+            )
+        );
+    }
+
+    #[test]
+    fn response_static_factories_build_error_and_redirects() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            None,
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const errorResponse = Response.error();
+                const redirectResponse = Response.redirect("/next", 307);
+                let immutable = "";
+                try { redirectResponse.headers.set("x-test", "blocked"); } catch (error) { immutable = error.message; }
+                let invalidStatus = "";
+                try { Response.redirect("/next", 200); } catch (error) { invalidStatus = error.message; }
+                status.textContent = errorResponse.type + "|" + errorResponse.status + "|" + errorResponse.ok + "|" + errorResponse.url + "|" + redirectResponse.type + "|" + redirectResponse.status + "|" + redirectResponse.url + "|" + redirectResponse.headers.get("location") + "|" + redirectResponse.bodyUsed + "|" + immutable + "|" + invalidStatus;
+                "#,
+            )
+            .expect("Response static factories should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "error|0|false||default|307||https://app.ceri.invalid/next|false|headers are immutable|Response redirect status is invalid"
             )
         );
     }
