@@ -80,6 +80,7 @@ enum Value {
     ClassList(ElementHandle),
     Event(EventData),
     Response(ResponseHandle),
+    ResponseConstructor,
     Bytes(BytesHandle),
     ReadableStream(ReadableStreamHandle),
     ReadableStreamReader(ReadableStreamReaderHandle),
@@ -192,6 +193,7 @@ enum Builtin {
     PromiseResolve,
     PromiseRejectPending(PromiseHandle),
     PromiseResolvePending(PromiseHandle),
+    ResponseJsonConstructor,
     NumberParseInt,
     NumberIsFinite,
     ArrayIsArray,
@@ -756,11 +758,18 @@ struct RequestData {
 struct ResponseData {
     url: String,
     status: u16,
+    status_text: String,
     mime_type: String,
     headers: HeadersHandle,
     body: ResponseBodyHandle,
     stream: ReadableStreamHandle,
     redirected: bool,
+    response_type: String,
+}
+
+struct ResponseMetadata {
+    redirected: bool,
+    response_type: String,
 }
 
 struct ResponseBodyData {
@@ -982,6 +991,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("Request".to_string(), Value::RequestConstructor);
+            values
+                .values
+                .insert("Response".to_string(), Value::ResponseConstructor);
             values
                 .values
                 .insert("Headers".to_string(), Value::HeadersConstructor);
@@ -2289,10 +2301,12 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Response(response) => match property {
+                "type" => Ok(Value::String(response.response_type.clone())),
                 "url" => Ok(Value::String(response.url.clone())),
                 "status" => Ok(Value::Number(response.status as f64)),
                 "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
                 "redirected" => Ok(Value::Bool(response.redirected)),
+                "statusText" => Ok(Value::String(response.status_text.clone())),
                 "mimeType" => Ok(Value::String(response.mime_type.clone())),
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
@@ -2303,6 +2317,12 @@ impl ScriptRuntime {
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
+                ))),
+            },
+            Value::ResponseConstructor => match property {
+                "json" => Ok(Value::Builtin(Builtin::ResponseJsonConstructor)),
+                _ => Err(runtime_error(format!(
+                    "Response has no property {property}"
                 ))),
             },
             Value::Request(request) => match property {
@@ -2834,6 +2854,7 @@ impl ScriptRuntime {
             Value::FormDataConstructor => self.construct_form_data(arguments),
             Value::HeadersConstructor => self.construct_headers(arguments),
             Value::RequestConstructor => self.construct_request(arguments),
+            Value::ResponseConstructor => self.construct_response(arguments),
             Value::MapConstructor => self.construct_map(arguments),
             Value::SetConstructor => self.construct_set(arguments),
             Value::ErrorConstructor => Ok(self.construct_error(arguments)),
@@ -3134,6 +3155,96 @@ impl ScriptRuntime {
             redirect,
             signal,
         )))
+    }
+
+    fn construct_response(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let body = arguments
+            .first()
+            .cloned()
+            .unwrap_or(Value::Null)
+            .resolve();
+        let init = arguments
+            .get(1)
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        self.construct_response_parts(body, init, None)
+    }
+
+    fn construct_response_parts(
+        &self,
+        body: Value,
+        init: Value,
+        inferred_mime_type: Option<&str>,
+    ) -> Result<Value, ScriptError> {
+        let mut status = 200;
+        let mut status_text = String::new();
+        let mut headers = BTreeMap::new();
+        let init = match init {
+            Value::Undefined | Value::Null => None,
+            Value::Object(init) => Some(init),
+            _ => return Err(runtime_error("Response init must be an object")),
+        };
+        if let Some(init) = init {
+            let init = init.borrow();
+            if let Some(value) = init.get("status").map(Value::resolve)
+                && !matches!(value, Value::Undefined)
+            {
+                let number = value.number()?;
+                if !number.is_finite()
+                    || number.fract() != 0.0
+                    || !(200.0..=599.0).contains(&number)
+                {
+                    return Err(runtime_error(
+                        "Response status must be an integer between 200 and 599",
+                    ));
+                }
+                status = number as u16;
+            }
+            if let Some(value) = init.get("statusText").map(Value::resolve)
+                && !matches!(value, Value::Undefined)
+            {
+                status_text = value.string_value();
+                if !valid_status_text(&status_text) {
+                    return Err(runtime_error("Response statusText contains invalid characters"));
+                }
+            }
+            if let Some(value) = init.get("headers").map(Value::resolve)
+                && !matches!(value, Value::Undefined | Value::Null)
+            {
+                headers = header_values_from_init(value)?;
+            }
+        }
+        let body_present = !matches!(body, Value::Undefined | Value::Null);
+        let body = match body {
+            Value::Undefined | Value::Null => Vec::new(),
+            Value::String(body) => body.into_bytes(),
+            Value::Bytes(bytes) => bytes.as_ref().clone(),
+            _ => return Err(runtime_error("Response body must be a string or ArrayBuffer")),
+        };
+        if body_present && matches!(status, 101 | 103 | 204 | 205 | 304) {
+            return Err(runtime_error(
+                "Response body is not allowed for this status",
+            ));
+        }
+        if let Some(mime_type) = inferred_mime_type
+            && !headers.contains_key("content-type")
+        {
+            headers.insert("content-type".to_string(), mime_type.to_string());
+        }
+        let mime_type = headers.get("content-type").cloned().unwrap_or_default();
+        Ok(Value::Response(Rc::new(response_data(
+            String::new(),
+            status,
+            status_text,
+            mime_type,
+            headers_handle(headers, true),
+            body,
+            ResponseMetadata {
+                redirected: false,
+                response_type: "default".to_string(),
+            },
+        ))))
     }
 
     fn construct_map(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -4001,18 +4112,36 @@ impl ScriptRuntime {
                 headers.values.insert(name, value);
                 Ok(Value::Undefined)
             }
+            Builtin::ResponseJsonConstructor => {
+                let data = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let body = serialize_json(&data)?;
+                let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                self.construct_response_parts(
+                    Value::String(body),
+                    init,
+                    Some("application/json"),
+                )
+            }
             Builtin::ResponseClone(response) => {
                 let body = response.body.borrow();
                 if body.consumed || body.disturbed || body.locked {
                     return Err(runtime_error("response body is already used"));
                 }
+                let headers = {
+                    let headers = response.headers.borrow();
+                    headers_handle(headers.values.clone(), headers.mutable)
+                };
                 let cloned = response_data(
                     response.url.clone(),
                     response.status,
+                    response.status_text.clone(),
                     response.mime_type.clone(),
-                    response.headers.clone(),
+                    headers,
                     body.bytes[body.cursor..].to_vec(),
-                    response.redirected,
+                    ResponseMetadata {
+                        redirected: response.redirected,
+                        response_type: response.response_type.clone(),
+                    },
                 );
                 Ok(Value::Response(Rc::new(cloned)))
             }
@@ -4712,9 +4841,13 @@ impl ScriptRuntime {
                     url.to_string(),
                     404,
                     String::new(),
+                    String::new(),
                     headers_handle(BTreeMap::new(), false),
                     Vec::new(),
-                    false,
+                    ResponseMetadata {
+                        redirected: false,
+                        response_type: "basic".to_string(),
+                    },
                 ))));
             }
             Err(error) => return self.rejected_promise(error.message),
@@ -4722,10 +4855,14 @@ impl ScriptRuntime {
         self.fulfilled_promise(Value::Response(Rc::new(response_data(
             response.url.to_string(),
             response.response.status(),
+            String::new(),
             response.response.mime_type().to_string(),
             headers_handle(response.response.headers().clone(), false),
             response.response.body().to_vec(),
-            response.redirected,
+            ResponseMetadata {
+                redirected: response.redirected,
+                response_type: "basic".to_string(),
+            },
         ))))
     }
 
@@ -5034,6 +5171,7 @@ impl Value {
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
+            Self::ResponseConstructor => "[function Response]".to_string(),
             Self::RequestConstructor => "[function Request]".to_string(),
             Self::HeadersConstructor => "[function Headers]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
@@ -5094,6 +5232,12 @@ fn response_body(bytes: Vec<u8>) -> ResponseBodyHandle {
     }))
 }
 
+fn valid_status_text(status_text: &str) -> bool {
+    status_text
+        .chars()
+        .all(|character| character == '\t' || character == ' ' || !character.is_control())
+}
+
 fn headers_handle(values: BTreeMap<String, String>, mutable: bool) -> HeadersHandle {
     Rc::new(RefCell::new(HeadersData { values, mutable }))
 }
@@ -5147,10 +5291,11 @@ fn request_handle(
 fn response_data(
     url: String,
     status: u16,
+    status_text: String,
     mime_type: String,
     headers: HeadersHandle,
     bytes: Vec<u8>,
-    redirected: bool,
+    metadata: ResponseMetadata,
 ) -> ResponseData {
     let body = response_body(bytes);
     let stream = Rc::new(RefCell::new(ReadableStreamData {
@@ -5160,11 +5305,13 @@ fn response_data(
     ResponseData {
         url,
         status,
+        status_text,
         mime_type,
         headers,
         body,
         stream,
-        redirected,
+        redirected: metadata.redirected,
+        response_type: metadata.response_type,
     }
 }
 
@@ -5520,6 +5667,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
         Value::Function(_)
         | Value::Builtin(_)
+        | Value::ResponseConstructor
         | Value::RequestConstructor
         | Value::HeadersConstructor
         | Value::UrlConstructor
@@ -8993,6 +9141,58 @@ mod tests {
         );
         assert_eq!(requests[0].headers().get("x-base"), None);
         assert_eq!(requests[0].cache_mode(), &ResourceCacheMode::ForceCache);
+    }
+
+    #[test]
+    fn response_constructor_exposes_status_body_clone_and_json() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            None,
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const response = new Response("created", {
+                    status: 201,
+                    statusText: "Created",
+                    headers: { "X-Trace": "one" }
+                });
+                response.headers.set("X-Added", "yes");
+                const clone = response.clone();
+                clone.headers.set("X-Clone", "yes");
+                clone.text().then((body) => {
+                    const json = Response.json({ answer: 42 }, { status: 202, statusText: "Accepted" });
+                    json.text().then((jsonBody) => {
+                        let cloneError = "";
+                        try { clone.clone(); } catch (error) { cloneError = error.message; }
+                        let invalidStatus = "";
+                        try { new Response("body", { status: 600 }); } catch (error) { invalidStatus = error.message; }
+                        let nullBody = "";
+                        try { new Response("", { status: 204 }); } catch (error) { nullBody = error.message; }
+                        status.textContent = response.type + "|" + response.url + "|" + response.status + "|" + response.statusText + "|" + response.ok + "|" + response.headers.get("x-added") + "|" + response.headers.get("x-clone") + "|" + response.bodyUsed + "|" + clone.bodyUsed + "|" + body + "|" + cloneError + "|" + json.status + "|" + json.statusText + "|" + json.mimeType + "|" + json.headers.get("content-type") + "|" + jsonBody + "|" + invalidStatus + "|" + nullBody;
+                    });
+                });
+                "#,
+            )
+            .expect("Response construction should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "default||201|Created|true|yes|null|false|true|created|response body is already used|202|Accepted|application/json|application/json|{\"answer\":42}|Response status must be an integer between 200 and 599|Response body is not allowed for this status"
+            )
+        );
     }
 
     #[test]
