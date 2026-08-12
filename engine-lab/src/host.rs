@@ -9,7 +9,7 @@ pub enum PointerButton {
     Auxiliary,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     Resize(Size),
     PointerMove {
@@ -30,6 +30,13 @@ pub enum InputEvent {
         x: f32,
         y: f32,
     },
+    KeyDown {
+        key: String,
+    },
+    TextInput {
+        text: String,
+    },
+    Blur,
     AdvanceTime(u64),
 }
 
@@ -125,6 +132,18 @@ impl EngineHost {
             },
             InputEvent::Click { x, y } => InputResult {
                 handled: self.browser.click_at(self.viewport, x, y)?,
+                ..InputResult::default()
+            },
+            InputEvent::KeyDown { key } => InputResult {
+                handled: self.browser.key_down(&key)?,
+                ..InputResult::default()
+            },
+            InputEvent::TextInput { text } => InputResult {
+                handled: self.browser.insert_text(&text)?,
+                ..InputResult::default()
+            },
+            InputEvent::Blur => InputResult {
+                handled: self.browser.blur()?,
                 ..InputResult::default()
             },
             InputEvent::AdvanceTime(milliseconds) => InputResult {
@@ -298,6 +317,50 @@ mod tests {
                 .element_text_content(&status)
                 .as_deref(),
             Some("down up click")
+        );
+    }
+
+    #[test]
+    fn host_routes_text_input_to_the_focused_control() {
+        let browser = Browser::new(bundle(
+            r#"<input id="name" value="R" style="display: block; width: 180px; height: 32px"><p id="status">idle</p><script>
+                const input = document.getElementById("name");
+                const status = document.getElementById("status");
+                input.addEventListener("input", () => { status.textContent = input.value; });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(host
+            .click_id("name")
+            .expect("click should focus the input"));
+        assert!(host
+            .input(InputEvent::TextInput {
+                text: "ust".to_string(),
+            })
+            .expect("text should be inserted")
+            .handled);
+        assert!(host
+            .input(InputEvent::KeyDown {
+                key: "Backspace".to_string(),
+            })
+            .expect("backspace should be handled")
+            .handled);
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("Rus")
         );
     }
 

@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="demo.css">
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      input {
+        display: block;
+        width: 100%;
+        height: 32px;
+        margin: 18px 0 10px;
+        padding: 4px 8px;
+        color: #07131f;
+        background-color: #d8eef2;
+        border: 0;
+      }
+      .accent {
+        color: #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>focus and input laboratory</h1>
+      <p>Native text and key events reach a focused control.</p>
+      <p class="accent">The engine owns activeElement and control value state.</p>
+      <input id="name" value="Ceri">
+      <p id="status">waiting for focus</p>
+    </main>
+  </body>
+  <script src="input-demo.js"></script>
+</html>

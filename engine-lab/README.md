@@ -23,6 +23,7 @@ The current slice implements:
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
+- focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
@@ -112,3 +113,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The demo resolves a URL against the current app location, mutates its query parameters, sorts the entries, and displays the synchronized URL string. The constructor rejects origins outside `https://app.ceri.invalid`.
+
+The input demo exercises focus, active-element state, text insertion, and key editing:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/input-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-input-demo.bmp --click name --text rust --key Backspace
+```
+
+The `--text` and `--key` switches feed the same `EngineHost` input boundary used by the optional native window adapter. The window adapter forwards winit keyboard and IME commit events through that boundary.

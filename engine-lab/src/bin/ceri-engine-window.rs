@@ -6,8 +6,9 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
+use winit::keyboard::Key;
 use winit::window::{Window, WindowId};
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
@@ -150,6 +151,9 @@ impl ApplicationHandler for App {
         };
         self.window = Some(window);
         self.surface = Some(surface);
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(true);
+        }
         self.last_tick = Instant::now();
         self.request_redraw();
     }
@@ -165,6 +169,9 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                self.submit(event_loop, InputEvent::Blur);
+            }
             WindowEvent::Resized(size) => {
                 self.submit(
                     event_loop,
@@ -200,6 +207,24 @@ impl ApplicationHandler for App {
                 if state == ElementState::Released && button == PointerButton::Primary {
                     self.submit(event_loop, InputEvent::Click { x, y });
                 }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed =>
+            {
+                let key = match event.logical_key {
+                    Key::Character(character) => character.to_string(),
+                    Key::Named(named) => format!("{named:?}"),
+                    other => format!("{other:?}"),
+                };
+                self.submit(event_loop, InputEvent::KeyDown { key });
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.submit(
+                    event_loop,
+                    InputEvent::TextInput {
+                        text: text.to_string(),
+                    },
+                );
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}

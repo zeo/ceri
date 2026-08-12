@@ -79,6 +79,8 @@ enum Builtin {
     HistoryBack,
     HistoryForward,
     HistoryGo,
+    ElementFocus(NodePath),
+    ElementBlur(NodePath),
     UrlSearchParamsAppend(UrlSearchParamsHandle),
     UrlSearchParamsDelete(UrlSearchParamsHandle),
     UrlSearchParamsGet(UrlSearchParamsHandle),
@@ -228,6 +230,8 @@ pub struct ScriptRuntime {
     history: HistoryHandle,
     listeners: HashMap<NodePath, Vec<EventListener>>,
     window_listeners: HashMap<String, Vec<Value>>,
+    focused_element: Option<NodePath>,
+    control_values: HashMap<NodePath, String>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -249,6 +253,8 @@ struct EventData {
     current_target: NodePath,
     state: Rc<RefCell<EventState>>,
     history_state: Rc<RefCell<Value>>,
+    key: String,
+    data: String,
 }
 
 #[derive(Default)]
@@ -422,6 +428,8 @@ impl ScriptRuntime {
             history,
             listeners: HashMap::new(),
             window_listeners: HashMap::new(),
+            focused_element: None,
+            control_values: HashMap::new(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,
@@ -454,6 +462,7 @@ impl ScriptRuntime {
     }
 
     pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
+        let focused = self.focus_path(path.clone())?;
         let dispatch = self.dispatch_event(path.clone(), "click")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
@@ -462,7 +471,7 @@ impl ScriptRuntime {
                 self.request_location_navigation(reference, false);
             }
         }
-        Ok(dispatch.handled)
+        Ok(dispatch.handled || focused)
     }
 
     pub fn dispatch_path_event(
@@ -472,6 +481,68 @@ impl ScriptRuntime {
     ) -> Result<bool, ScriptError> {
         let dispatch = self.dispatch_event(path, event)?;
         self.drain_microtasks()?;
+        Ok(dispatch.handled)
+    }
+
+    pub(crate) fn focus_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
+        if !self.is_focusable_path(&path) || self.focused_element.as_ref() == Some(&path) {
+            return Ok(false);
+        }
+        let previous = self.focused_element.replace(path.clone());
+        if let Some(previous) = previous {
+            self.dispatch_event(previous, "blur")?;
+            self.drain_microtasks()?;
+        }
+        self.dispatch_event(path, "focus")?;
+        self.drain_microtasks()?;
+        Ok(true)
+    }
+
+    pub(crate) fn blur_focused(&mut self) -> Result<bool, ScriptError> {
+        let Some(path) = self.focused_element.take() else {
+            return Ok(false);
+        };
+        self.dispatch_event(path, "blur")?;
+        self.drain_microtasks()?;
+        Ok(true)
+    }
+
+    pub(crate) fn insert_text(&mut self, text: &str) -> Result<bool, ScriptError> {
+        if text.is_empty() {
+            return Ok(false);
+        }
+        let Some(path) = self.focused_element.clone() else {
+            return Ok(false);
+        };
+        if !self.is_text_control_path(&path) {
+            return Ok(false);
+        }
+        let mut value = self.control_value_path(&path).unwrap_or_default();
+        value.push_str(text);
+        self.control_values.insert(path.clone(), value);
+        let dispatch = self.dispatch_event_with_details(path, "input", "", text)?;
+        self.drain_microtasks()?;
+        Ok(dispatch.handled || !text.is_empty())
+    }
+
+    pub(crate) fn key_down(&mut self, key: &str) -> Result<bool, ScriptError> {
+        let Some(path) = self.focused_element.clone() else {
+            return Ok(false);
+        };
+        let dispatch = self.dispatch_event_with_details(path.clone(), "keydown", key, "")?;
+        self.drain_microtasks()?;
+        if dispatch.default_prevented || !self.is_text_control_path(&path) {
+            return Ok(dispatch.handled);
+        }
+        if key == "Backspace" {
+            let mut value = self.control_value_path(&path).unwrap_or_default();
+            if value.pop().is_some() {
+                self.control_values.insert(path.clone(), value);
+                self.dispatch_event_with_details(path, "input", key, "")?;
+                self.drain_microtasks()?;
+                return Ok(true);
+            }
+        }
         Ok(dispatch.handled)
     }
 
@@ -515,6 +586,10 @@ impl ScriptRuntime {
         history.index = index;
     }
 
+    pub(crate) fn active_element(&self) -> Option<NodePath> {
+        self.focused_element.clone()
+    }
+
     fn apply_history_state_locally(
         &mut self,
         reference: &str,
@@ -544,6 +619,8 @@ impl ScriptRuntime {
             current_target: Vec::new(),
             state: Rc::new(RefCell::new(EventState::default())),
             history_state: Rc::new(RefCell::new(state)),
+            key: String::new(),
+            data: String::new(),
         });
         for callback in callbacks {
             self.call(callback, vec![event.clone()])?;
@@ -782,6 +859,11 @@ impl ScriptRuntime {
                 "getElementById" => Ok(Value::Builtin(Builtin::DocumentGetElementById)),
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
+                "activeElement" => Ok(self
+                    .active_element()
+                    .map(attached_handle)
+                    .map(Value::Element)
+                    .unwrap_or(Value::Null)),
                 _ => Err(runtime_error(format!(
                     "document has no property {property}"
                 ))),
@@ -828,6 +910,10 @@ impl ScriptRuntime {
                         .element_inner_html(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "value" => self
+                        .element_value(&handle)
+                        .map(Value::String)
+                        .unwrap_or_else(|| Value::String(String::new())),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
                     "querySelector" => {
@@ -842,6 +928,12 @@ impl ScriptRuntime {
                     }
                     "click" => Value::Builtin(Builtin::ElementClick(
                         path.ok_or_else(|| runtime_error("detached element cannot be clicked"))?,
+                    )),
+                    "focus" => Value::Builtin(Builtin::ElementFocus(
+                        path.ok_or_else(|| runtime_error("detached element cannot receive focus"))?,
+                    )),
+                    "blur" => Value::Builtin(Builtin::ElementBlur(
+                        path.ok_or_else(|| runtime_error("detached element cannot lose focus"))?,
                     )),
                     "appendChild" => {
                         Value::Builtin(Builtin::ElementAppendChild(path.ok_or_else(|| {
@@ -883,6 +975,8 @@ impl ScriptRuntime {
                 ))),
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
+                "key" => Ok(Value::String(event.key.clone())),
+                "data" => Ok(Value::String(event.data.clone())),
                 "preventDefault" => Ok(Value::Builtin(Builtin::EventPreventDefault(
                     event.state.clone(),
                 ))),
@@ -1038,6 +1132,7 @@ impl ScriptRuntime {
                 "className" => self.set_element_attribute(&handle, "class", value),
                 "id" => self.set_element_attribute(&handle, "id", value),
                 "innerHTML" => self.set_element_inner_html(&handle, value)?,
+                "value" => self.set_element_value(&handle, value),
                 _ => false,
             },
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
@@ -1064,6 +1159,80 @@ impl ScriptRuntime {
                 let mut text = String::new();
                 collect_element_text(&element, &mut text);
                 Some(text)
+            }
+        }
+    }
+
+    fn is_focusable_path(&self, path: &[usize]) -> bool {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return false;
+        };
+        if element.attr("disabled").is_some() {
+            return false;
+        }
+        if element.attr("tabindex").is_some() {
+            return true;
+        }
+        match element.name.as_str() {
+            "button" | "select" | "textarea" => true,
+            "input" => !element
+                .attr("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")),
+            "a" => element.attr("href").is_some(),
+            _ => false,
+        }
+    }
+
+    fn is_text_control_path(&self, path: &[usize]) -> bool {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return false;
+        };
+        match element.name.as_str() {
+            "textarea" => true,
+            "input" => !element.attr("type").is_some_and(|kind| {
+                matches!(
+                    kind.to_ascii_lowercase().as_str(),
+                    "button" | "checkbox" | "color" | "file" | "hidden" | "radio" | "range" | "reset" | "submit"
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    fn control_value_path(&self, path: &[usize]) -> Option<String> {
+        if let Some(value) = self.control_values.get(path) {
+            return Some(value.clone());
+        }
+        let element = self.document.borrow().element_clone(path)?;
+        element.attr("value").map(str::to_string).or_else(|| {
+            (element.name == "textarea").then(|| {
+                let mut text = String::new();
+                collect_element_text(&element, &mut text);
+                text
+            })
+        })
+    }
+
+    fn element_value(&self, handle: &ElementHandle) -> Option<String> {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self.control_value_path(&path),
+            ElementLocation::Detached(element) => element.attr("value").map(str::to_string),
+        }
+    }
+
+    fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                self.control_values.insert(path, value);
+                true
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                element.attrs.insert("value".to_string(), value);
+                true
             }
         }
     }
@@ -1430,6 +1599,16 @@ impl ScriptRuntime {
                 self.queue_navigation(NavigationRequest::Traverse { delta });
                 Ok(Value::Undefined)
             }
+            Builtin::ElementFocus(path) => {
+                self.focus_path(path)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementBlur(path) => {
+                if self.focused_element.as_ref() == Some(&path) {
+                    self.blur_focused()?;
+                }
+                Ok(Value::Undefined)
+            }
             Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string())),
             Builtin::UrlSearchParamsAppend(params) => {
                 let name = arguments
@@ -1699,6 +1878,16 @@ impl ScriptRuntime {
     }
 
     fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<EventDispatch, ScriptError> {
+        self.dispatch_event_with_details(path, event, "", "")
+    }
+
+    fn dispatch_event_with_details(
+        &mut self,
+        path: NodePath,
+        event: &str,
+        key: &str,
+        data: &str,
+    ) -> Result<EventDispatch, ScriptError> {
         let target = path.clone();
         let mut current = path;
         let mut had_callbacks = false;
@@ -1719,6 +1908,8 @@ impl ScriptRuntime {
                 current_target: current.clone(),
                 state: state.clone(),
                 history_state: Rc::new(RefCell::new(Value::Null)),
+                key: key.to_string(),
+                data: data.to_string(),
             });
             for callback in callbacks {
                 self.call(callback, vec![event_value.clone()])?;
@@ -3321,6 +3512,51 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready")
+        );
+    }
+
+    #[test]
+    fn focus_and_text_input_update_controls_and_events() {
+        let document = document(
+            r#"<input id="name" value="R"><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const input = document.getElementById("name");
+                const status = document.getElementById("status");
+                input.addEventListener("focus", () => {
+                    status.textContent = "focus:" + document.activeElement.id;
+                });
+                input.addEventListener("input", (event) => {
+                    status.textContent = event.data + ":" + event.target.value;
+                });
+                input.addEventListener("blur", () => {
+                    status.textContent = status.textContent + "|blur:" + document.activeElement;
+                });
+                "#,
+            )
+            .expect("focus listeners should register");
+        let input_path = document
+            .borrow()
+            .find_element_by_id("name")
+            .expect("input should exist");
+        assert!(runtime
+            .focus_path(input_path)
+            .expect("input should focus"));
+        assert!(runtime.insert_text("ust").expect("text should insert"));
+        assert!(runtime
+            .key_down("Backspace")
+            .expect("backspace should edit the value"));
+        assert!(runtime.blur_focused().expect("input should blur"));
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(":Rus|blur:null")
         );
     }
 

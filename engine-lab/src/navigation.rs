@@ -506,8 +506,59 @@ impl Browser {
         };
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            page.runtime
+            let focused = if event == "pointerdown" {
+                page.runtime
+                    .focus_path(path.clone())
+                    .map_err(|error| NavigationError::Script(error.to_string()))?
+            } else {
+                false
+            };
+            let dispatched = page
+                .runtime
                 .dispatch_path_event(path, event)
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
+            focused || dispatched
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    pub fn key_down(&mut self, key: &str) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .key_down(key)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    pub fn insert_text(&mut self, text: &str) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .insert_text(text)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    pub fn blur(&mut self) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .blur_focused()
                 .map_err(|error| NavigationError::Script(error.to_string()))?
         };
         if self.process_pending_navigation()?.is_some() {
