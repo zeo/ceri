@@ -31,6 +31,7 @@ The current slice implements:
 - static ES module graphs with same-origin packaged imports, named exports, and namespace imports
 - template literals with expression interpolation and module `import.meta.url`
 - static node-list snapshots, `dataset` reads, array spread and `map`, and bounded `Map` construction, lookup, key enumeration, and mutation
+- bounded `for...of` over arrays, node lists, strings, and maps, promise-backed async functions with `await`, `try`/`catch`/`throw`, class and error values, `typeof`, `instanceof`, conditional expressions, and the narrow `Number`, `Array`, `Object`, `String`, `Set`, and `Promise` surfaces used by the continuity page
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -78,7 +79,15 @@ The collection sample runs the first continuity-page collection expression witho
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/collection-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-collection-demo.bmp --width 800 --height 420
 ```
 
-The current collection boundary stops before `for...of`, destructuring, and general iterable protocols. Those remain explicit compatibility gates for the continuity page.
+The current collection boundary stops before destructuring, generators, and general iterator protocols. Those remain explicit compatibility gates for the continuity page.
+
+The packaged continuity page is also an integration target. It loads the real `/web/index.html`, its stylesheet, module graph, SDK module, and recovery asset through the custom resource bundle. The page reaches `3 / 4`: module loading, local storage, and packaged fetch pass; the typed native bridge reports its expected unavailable state because the laboratory host has no CEF bridge. The page stays loaded and does not fall back to a recovery document:
+
+```powershell
+cargo test --locked --manifest-path engine-lab/Cargo.toml --test continuity
+```
+
+The current language boundary stops before destructuring, generators, general iterator objects, and broader class method semantics. Those remain explicit compatibility gates.
 
 The event sample starts a click on a nested element and handles it on an ancestor through an external script:
 

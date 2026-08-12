@@ -17,6 +17,9 @@ type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
 type NodeListHandle = Rc<Vec<ElementHandle>>;
 type MapHandle = Rc<RefCell<MapData>>;
+type SetHandle = Rc<RefCell<SetData>>;
+type ErrorHandle = Rc<ErrorData>;
+type ClassHandle = Rc<ClassDefinition>;
 type LocationHandle = Rc<RefCell<AppUrl>>;
 type HistoryHandle = Rc<RefCell<HistoryData>>;
 type UrlHandle = Rc<RefCell<UrlData>>;
@@ -54,8 +57,10 @@ enum Value {
     Array(ArrayHandle),
     NodeList(NodeListHandle),
     Map(MapHandle),
+    Set(SetHandle),
     Element(ElementHandle),
     Dataset(ElementHandle),
+    Error(ErrorHandle),
     Style(ElementHandle),
     ClassList(ElementHandle),
     Event(EventData),
@@ -77,6 +82,14 @@ enum Value {
     UrlSearchParamsConstructor,
     FormDataConstructor,
     MapConstructor,
+    SetConstructor,
+    ErrorConstructor,
+    PromiseConstructor,
+    NumberNamespace,
+    ArrayNamespace,
+    ObjectNamespace,
+    StringConstructor,
+    Class(ClassHandle),
     Function(Rc<Function>),
     Builtin(Builtin),
 }
@@ -138,9 +151,19 @@ enum Builtin {
     ElementQuerySelectorAll(NodePath),
     ArrayMap(ArrayHandle),
     ArrayJoin(ArrayHandle),
+    StringSlice(String),
     MapGet(MapHandle),
     MapSet(MapHandle),
     MapKeys(MapHandle),
+    SetHas(SetHandle),
+    PromiseReject,
+    PromiseResolve,
+    PromiseRejectPending(PromiseHandle),
+    PromiseResolvePending(PromiseHandle),
+    NumberParseInt,
+    NumberIsFinite,
+    ArrayIsArray,
+    ObjectFreeze,
     ElementClassListAdd(ElementHandle),
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
@@ -156,6 +179,7 @@ struct Function {
     params: Vec<String>,
     body: Vec<Stmt>,
     environment: EnvironmentRef,
+    is_async: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -195,6 +219,11 @@ enum Expr {
         object: Box<Expr>,
         index: Box<Expr>,
     },
+    Conditional {
+        condition: Box<Expr>,
+        consequent: Box<Expr>,
+        alternate: Box<Expr>,
+    },
     Object(Vec<(String, Expr)>),
     Array(Vec<Expr>),
     Spread(Box<Expr>),
@@ -210,6 +239,7 @@ enum Expr {
     Function {
         params: Vec<String>,
         body: Vec<Stmt>,
+        is_async: bool,
     },
 }
 
@@ -233,6 +263,21 @@ enum Stmt {
         condition: Expr,
         consequent: Box<Stmt>,
         alternate: Option<Box<Stmt>>,
+    },
+    ForOf {
+        name: String,
+        iterable: Expr,
+        body: Box<Stmt>,
+    },
+    TryCatch {
+        body: Box<Stmt>,
+        catch_name: Option<String>,
+        handler: Box<Stmt>,
+    },
+    Throw(Expr),
+    Class {
+        name: String,
+        extends: Option<String>,
     },
     Return(Option<Expr>),
 }
@@ -272,6 +317,8 @@ enum UnaryOperator {
     Not,
     Negative,
     Positive,
+    TypeOf,
+    Await,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +335,7 @@ enum BinaryOperator {
     LessEqual,
     Greater,
     GreaterEqual,
+    InstanceOf,
     And,
     Or,
 }
@@ -312,6 +360,7 @@ pub struct ScriptRuntime {
     tasks: Vec<ScheduledTask>,
     microtasks: VecDeque<Microtask>,
     pending_navigation: Option<NavigationRequest>,
+    pending_exception: Option<ErrorHandle>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     loading_modules: BTreeSet<String>,
 }
@@ -385,6 +434,22 @@ struct FormDataData {
 
 struct MapData {
     entries: Vec<(Value, Value)>,
+}
+
+struct SetData {
+    values: Vec<Value>,
+}
+
+struct ErrorData {
+    name: String,
+    message: String,
+    code: Option<String>,
+    class_name: String,
+}
+
+struct ClassDefinition {
+    name: String,
+    extends: Option<String>,
 }
 
 struct CanvasContextData {
@@ -538,6 +603,27 @@ impl ScriptRuntime {
             values.values.insert("JSON".to_string(), Value::Json);
             values
                 .values
+                .insert("Number".to_string(), Value::NumberNamespace);
+            values
+                .values
+                .insert("Array".to_string(), Value::ArrayNamespace);
+            values
+                .values
+                .insert("Object".to_string(), Value::ObjectNamespace);
+            values
+                .values
+                .insert("Promise".to_string(), Value::PromiseConstructor);
+            values
+                .values
+                .insert("Set".to_string(), Value::SetConstructor);
+            values
+                .values
+                .insert("Error".to_string(), Value::ErrorConstructor);
+            values
+                .values
+                .insert("String".to_string(), Value::StringConstructor);
+            values
+                .values
                 .insert("URL".to_string(), Value::UrlConstructor);
             values.values.insert(
                 "URLSearchParams".to_string(),
@@ -597,6 +683,7 @@ impl ScriptRuntime {
             tasks: Vec::new(),
             microtasks: VecDeque::new(),
             pending_navigation: None,
+            pending_exception: None,
             module_cache: BTreeMap::new(),
             loading_modules: BTreeSet::new(),
         }
@@ -1064,6 +1151,77 @@ impl ScriptRuntime {
                     Ok(Completion::Normal)
                 }
             }
+            Stmt::ForOf {
+                name,
+                iterable,
+                body,
+            } => {
+                let values = iterable_values(self.evaluate(iterable, environment.clone())?)?;
+                for value in values {
+                    let iteration = Rc::new(RefCell::new(Environment {
+                        values: HashMap::new(),
+                        parent: Some(environment.clone()),
+                    }));
+                    iteration
+                        .borrow_mut()
+                        .values
+                        .insert(name.clone(), value);
+                    let completion = self.execute_statement(body, iteration)?;
+                    if !matches!(completion, Completion::Normal) {
+                        return Ok(completion);
+                    }
+                }
+                Ok(Completion::Normal)
+            }
+            Stmt::TryCatch {
+                body,
+                catch_name,
+                handler,
+            } => match self.execute_statement(body, environment.clone()) {
+                Ok(completion) => Ok(completion),
+                Err(error) => {
+                    let error_value = self
+                        .pending_exception
+                        .take()
+                        .map(Value::Error)
+                        .unwrap_or_else(|| {
+                            Value::Error(Rc::new(ErrorData {
+                                name: "Error".to_string(),
+                                message: error.message.clone(),
+                                code: None,
+                                class_name: "Error".to_string(),
+                            }))
+                        });
+                    let handler_environment = Rc::new(RefCell::new(Environment {
+                        values: HashMap::new(),
+                        parent: Some(environment),
+                    }));
+                    if let Some(name) = catch_name {
+                        handler_environment
+                            .borrow_mut()
+                            .values
+                            .insert(name.clone(), error_value);
+                    }
+                    self.execute_statement(handler, handler_environment)
+                }
+            },
+            Stmt::Throw(expression) => {
+                let value = self.evaluate(expression, environment)?;
+                let error = error_handle(&value);
+                let message = error.message.clone();
+                self.pending_exception = Some(error);
+                Err(runtime_error(message))
+            }
+            Stmt::Class { name, extends } => {
+                environment.borrow_mut().values.insert(
+                    name.clone(),
+                    Value::Class(Rc::new(ClassDefinition {
+                        name: name.clone(),
+                        extends: extends.clone(),
+                    })),
+                );
+                Ok(Completion::Normal)
+            }
             Stmt::Return(expression) => Ok(Completion::Return(
                 expression
                     .as_ref()
@@ -1094,6 +1252,19 @@ impl ScriptRuntime {
                     UnaryOperator::Not => Ok(Value::Bool(!value.truthy())),
                     UnaryOperator::Negative => Ok(Value::Number(-value.number()?)),
                     UnaryOperator::Positive => Ok(Value::Number(value.number()?)),
+                    UnaryOperator::TypeOf => Ok(Value::String(value_typeof(&value).to_string())),
+                    UnaryOperator::Await => self.await_value(value),
+                }
+            }
+            Expr::Conditional {
+                condition,
+                consequent,
+                alternate,
+            } => {
+                if self.evaluate(condition, environment.clone())?.truthy() {
+                    self.evaluate(consequent, environment)
+                } else {
+                    self.evaluate(alternate, environment)
                 }
             }
             Expr::Binary {
@@ -1188,10 +1359,15 @@ impl ScriptRuntime {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.call(callee, arguments)
             }
-            Expr::Function { params, body } => Ok(Value::Function(Rc::new(Function {
+            Expr::Function {
+                params,
+                body,
+                is_async,
+            } => Ok(Value::Function(Rc::new(Function {
                 params: params.clone(),
                 body: body.clone(),
                 environment,
+                is_async: *is_async,
             }))),
         }
     }
@@ -1228,6 +1404,12 @@ impl ScriptRuntime {
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
                 "querySelectorAll" => Ok(Value::Builtin(Builtin::DocumentQuerySelectorAll)),
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
+                "documentElement" => Ok(self
+                    .document
+                    .borrow()
+                    .document_element_path()
+                    .map(|path| Value::Element(attached_handle(path)))
+                    .unwrap_or(Value::Null)),
                 "activeElement" => Ok(self
                     .active_element()
                     .map(attached_handle)
@@ -1257,6 +1439,7 @@ impl ScriptRuntime {
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
                 "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
                 "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
+                "cefQuery" | "cefQueryCancel" => Ok(Value::Undefined),
                 _ => Err(runtime_error(format!("window has no property {property}"))),
             },
             Value::Console if property == "log" => Ok(Value::Builtin(Builtin::ConsoleLog)),
@@ -1284,6 +1467,9 @@ impl ScriptRuntime {
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
                     "checked" => Value::Bool(self.element_checked(&handle)),
+                    "disabled" => Value::Bool(
+                        self.element_attribute(&handle, "disabled").is_some(),
+                    ),
                     "dataset" => Value::Dataset(handle.clone()),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
@@ -1498,6 +1684,44 @@ impl ScriptRuntime {
                     "response has no property {property}"
                 ))),
             },
+            Value::String(string) => match property {
+                "length" => Ok(Value::Number(string.chars().count() as f64)),
+                "slice" => Ok(Value::Builtin(Builtin::StringSlice(string))),
+                _ => Err(runtime_error(format!("string has no property {property}"))),
+            },
+            Value::Set(set) => match property {
+                "size" => Ok(Value::Number(set.borrow().values.len() as f64)),
+                "has" => Ok(Value::Builtin(Builtin::SetHas(set))),
+                _ => Err(runtime_error(format!("Set has no property {property}"))),
+            },
+            Value::Error(error) => match property {
+                "name" => Ok(Value::String(error.name.clone())),
+                "message" => Ok(Value::String(error.message.clone())),
+                "code" => Ok(error
+                    .code
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)),
+                _ => Err(runtime_error(format!("error has no property {property}"))),
+            },
+            Value::PromiseConstructor => match property {
+                "reject" => Ok(Value::Builtin(Builtin::PromiseReject)),
+                "resolve" => Ok(Value::Builtin(Builtin::PromiseResolve)),
+                _ => Err(runtime_error(format!("Promise has no property {property}"))),
+            },
+            Value::NumberNamespace => match property {
+                "parseInt" => Ok(Value::Builtin(Builtin::NumberParseInt)),
+                "isFinite" => Ok(Value::Builtin(Builtin::NumberIsFinite)),
+                _ => Err(runtime_error(format!("Number has no property {property}"))),
+            },
+            Value::ArrayNamespace => match property {
+                "isArray" => Ok(Value::Builtin(Builtin::ArrayIsArray)),
+                _ => Err(runtime_error(format!("Array has no property {property}"))),
+            },
+            Value::ObjectNamespace => match property {
+                "freeze" => Ok(Value::Builtin(Builtin::ObjectFreeze)),
+                _ => Err(runtime_error(format!("Object has no property {property}"))),
+            },
             Value::Object(object) => Ok(object
                 .borrow()
                 .get(property)
@@ -1555,7 +1779,10 @@ impl ScriptRuntime {
                 "catch" => Ok(Value::Builtin(Builtin::PromiseCatch(promise))),
                 _ => Err(runtime_error(format!("promise has no property {property}"))),
             },
-            _ => Err(runtime_error(format!("value has no property {property}"))),
+            object => Err(runtime_error(format!(
+                "{} value has no property {property}",
+                value_typeof(&object)
+            ))),
         }
     }
 
@@ -1619,8 +1846,12 @@ impl ScriptRuntime {
                 "innerHTML" => self.set_element_inner_html(&handle, value)?,
                 "value" => self.set_element_value(&handle, value),
                 "checked" => self.set_element_checked(&handle, truthy),
+                "disabled" => self.set_element_disabled(&handle, truthy),
                 _ => false,
             },
+            Value::Dataset(handle) => {
+                self.set_element_attribute(&handle, &dataset_attribute_name(property), value)
+            }
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
             Value::CanvasContext(context) if property == "fillStyle" => {
                 self.set_canvas_fill_style(&context, &value)
@@ -1862,9 +2093,29 @@ impl ScriptRuntime {
                         arguments.get(index).cloned().unwrap_or(Value::Undefined),
                     );
                 }
-                match self.execute_statements(&function.body, environment)? {
-                    Completion::Normal => Ok(Value::Undefined),
-                    Completion::Return(value) => Ok(value),
+                let outcome = self.execute_statements(&function.body, environment);
+                if function.is_async {
+                    match outcome {
+                        Ok(Completion::Normal) => {
+                            Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
+                        }
+                        Ok(Completion::Return(value)) => {
+                            Ok(Value::Promise(self.fulfilled_promise(value)))
+                        }
+                        Err(error) => {
+                            let reason = self
+                                .pending_exception
+                                .take()
+                                .map(Value::Error)
+                                .unwrap_or_else(|| Value::String(error.message));
+                            Ok(Value::Promise(self.rejected_promise_value(reason)))
+                        }
+                    }
+                } else {
+                    match outcome? {
+                        Completion::Normal => Ok(Value::Undefined),
+                        Completion::Return(value) => Ok(value),
+                    }
                 }
             }
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
@@ -1872,7 +2123,33 @@ impl ScriptRuntime {
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             Value::FormDataConstructor => self.construct_form_data(arguments),
             Value::MapConstructor => self.construct_map(arguments),
+            Value::SetConstructor => self.construct_set(arguments),
+            Value::ErrorConstructor => Ok(self.construct_error(arguments)),
+            Value::PromiseConstructor => self.construct_promise(arguments),
+            Value::StringConstructor => Ok(Value::String(
+                arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default(),
+            )),
+            Value::Class(class) => self.construct_class(class, arguments),
             _ => Err(runtime_error("value is not callable")),
+        }
+    }
+
+    fn await_value(&mut self, value: Value) -> Result<Value, ScriptError> {
+        let Value::Promise(promise) = value else {
+            return Ok(value);
+        };
+        match promise.borrow().outcome.clone() {
+            PromiseOutcome::Fulfilled(value) => Ok(value),
+            PromiseOutcome::Rejected(reason) => {
+                let error = error_handle(&reason);
+                let message = error.message.clone();
+                self.pending_exception = Some(error);
+                Err(runtime_error(message))
+            }
+            PromiseOutcome::Pending => Err(runtime_error("awaited promise is still pending")),
         }
     }
 
@@ -1899,6 +2176,34 @@ impl ScriptRuntime {
                     element.attrs.insert("checked".to_string(), String::new());
                 } else {
                     element.attrs.remove("checked");
+                }
+                true
+            }
+        }
+    }
+
+    fn set_element_disabled(&mut self, handle: &ElementHandle, disabled: bool) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                if disabled {
+                    self.document
+                        .borrow_mut()
+                        .set_element_attribute(&path, "disabled", String::new())
+                } else {
+                    self.document
+                        .borrow_mut()
+                        .remove_element_attribute(&path, "disabled")
+                }
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                if disabled {
+                    element.attrs.insert("disabled".to_string(), String::new());
+                } else {
+                    element.attrs.remove("disabled");
                 }
                 true
             }
@@ -2016,6 +2321,65 @@ impl ScriptRuntime {
             return Err(runtime_error("Map constructor requires an array sequence"));
         }
         Ok(Value::Map(Rc::new(RefCell::new(MapData { entries }))))
+    }
+
+    fn construct_set(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let mut values = Vec::new();
+        if let Some(value) = arguments.first() {
+            for candidate in iterable_values(value.clone())? {
+                if !values.iter().any(|existing| values_equal(existing, &candidate)) {
+                    values.push(candidate);
+                }
+            }
+        }
+        Ok(Value::Set(Rc::new(RefCell::new(SetData { values }))))
+    }
+
+    fn construct_error(&self, arguments: Vec<Value>) -> Value {
+        Value::Error(Rc::new(ErrorData {
+            name: "Error".to_string(),
+            message: arguments
+                .first()
+                .map(Value::string_value)
+                .unwrap_or_default(),
+            code: None,
+            class_name: "Error".to_string(),
+        }))
+    }
+
+    fn construct_class(
+        &self,
+        class: ClassHandle,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        if class.name == "CeriBridgeError" || class.extends.as_deref() == Some("Error") {
+            return Ok(Value::Error(Rc::new(ErrorData {
+                name: class.name.clone(),
+                message: arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_default(),
+                code: arguments.first().map(Value::string_value),
+                class_name: class.name.clone(),
+            })));
+        }
+        Ok(Value::Object(Rc::new(RefCell::new(BTreeMap::new()))))
+    }
+
+    fn construct_promise(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let promise = Rc::new(RefCell::new(PromiseData {
+            outcome: PromiseOutcome::Pending,
+            reactions: Vec::new(),
+        }));
+        if let Some(executor) = arguments.first() {
+            if !matches!(executor, Value::Function(_)) {
+                return Err(runtime_error("Promise executor must be a function"));
+            }
+            let resolve = Value::Builtin(Builtin::PromiseResolvePending(promise.clone()));
+            let reject = Value::Builtin(Builtin::PromiseRejectPending(promise.clone()));
+            self.call(executor.clone(), vec![resolve, reject])?;
+        }
+        Ok(Value::Promise(promise))
     }
 
     fn submit_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
@@ -2176,6 +2540,78 @@ impl ScriptRuntime {
                     ElementLocation::Detached(Element::new(&name)),
                 ))))
             }
+            Builtin::StringSlice(string) => {
+                let length = string.chars().count() as isize;
+                let start = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0) as isize;
+                let end = arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .map(|value| value as isize)
+                    .unwrap_or(length);
+                let start = start.clamp(0, length) as usize;
+                let end = end.clamp(0, length) as usize;
+                let value = string
+                    .chars()
+                    .skip(start.min(end))
+                    .take(end.saturating_sub(start))
+                    .collect();
+                Ok(Value::String(value))
+            }
+            Builtin::SetHas(set) => {
+                let candidate = arguments.first().cloned().unwrap_or(Value::Undefined);
+                Ok(Value::Bool(
+                    set.borrow()
+                        .values
+                        .iter()
+                        .any(|value| values_equal(value, &candidate)),
+                ))
+            }
+            Builtin::PromiseReject => Ok(Value::Promise(Rc::new(RefCell::new(PromiseData {
+                outcome: PromiseOutcome::Rejected(
+                    arguments.first().cloned().unwrap_or(Value::Undefined),
+                ),
+                reactions: Vec::new(),
+            })))),
+            Builtin::PromiseResolve => Ok(Value::Promise(self.fulfilled_promise(
+                arguments.first().cloned().unwrap_or(Value::Undefined),
+            ))),
+            Builtin::PromiseRejectPending(promise) => {
+                let reason = arguments.first().cloned().unwrap_or(Value::Undefined);
+                self.settle_promise(&promise, PromiseOutcome::Rejected(reason));
+                Ok(Value::Undefined)
+            }
+            Builtin::PromiseResolvePending(promise) => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                self.settle_promise(&promise, PromiseOutcome::Fulfilled(value));
+                Ok(Value::Undefined)
+            }
+            Builtin::NumberParseInt => {
+                let source = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let radix = arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(10.0) as u32;
+                let parsed = parse_integer(&source, radix).unwrap_or(f64::NAN);
+                Ok(Value::Number(parsed))
+            }
+            Builtin::NumberIsFinite => Ok(Value::Bool(
+                arguments
+                    .first()
+                    .is_some_and(|value| matches!(value, Value::Number(number) if number.is_finite())),
+            )),
+            Builtin::ArrayIsArray => Ok(Value::Bool(
+                arguments.first().is_some_and(|value| matches!(value, Value::Array(_))),
+            )),
+            Builtin::ObjectFreeze => Ok(arguments.first().cloned().unwrap_or(Value::Undefined)),
             Builtin::ConsoleLog => {
                 self.logs.push(
                     arguments
@@ -2888,8 +3324,12 @@ impl ScriptRuntime {
     }
 
     fn rejected_promise(&self, reason: impl Into<String>) -> PromiseHandle {
+        self.rejected_promise_value(Value::String(reason.into()))
+    }
+
+    fn rejected_promise_value(&self, reason: Value) -> PromiseHandle {
         Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Rejected(Value::String(reason.into())),
+            outcome: PromiseOutcome::Rejected(reason),
             reactions: Vec::new(),
         }))
     }
@@ -3260,8 +3700,10 @@ impl Value {
             Self::Array(_) => "[array]".to_string(),
             Self::NodeList(_) => "[object NodeList]".to_string(),
             Self::Map(_) => "[object Map]".to_string(),
+            Self::Set(_) => "[object Set]".to_string(),
             Self::Element(_) => "[element]".to_string(),
             Self::Dataset(_) => "[object DOMStringMap]".to_string(),
+            Self::Error(error) => error.message.clone(),
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
@@ -3272,11 +3714,11 @@ impl Value {
             Self::Location(value) => value.borrow().to_string(),
             Self::ModuleImport(_) => "[object Module]".to_string(),
             Self::History(_) => "[object History]".to_string(),
-        Self::Url(value) => value.borrow().url.to_string(),
-        Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
-        Self::Storage(_) => "[object Storage]".to_string(),
-        Self::FormData(_) => "[object FormData]".to_string(),
-        Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
+            Self::Url(value) => value.borrow().url.to_string(),
+            Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
+            Self::Storage(_) => "[object Storage]".to_string(),
+            Self::FormData(_) => "[object FormData]".to_string(),
+            Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
@@ -3284,6 +3726,14 @@ impl Value {
             }
             Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::MapConstructor => "[function Map]".to_string(),
+            Self::SetConstructor => "[function Set]".to_string(),
+            Self::ErrorConstructor => "[function Error]".to_string(),
+            Self::PromiseConstructor => "[function Promise]".to_string(),
+            Self::NumberNamespace => "[function Number]".to_string(),
+            Self::ArrayNamespace => "[function Array]".to_string(),
+            Self::ObjectNamespace => "[function Object]".to_string(),
+            Self::StringConstructor => "[function String]".to_string(),
+            Self::Class(class) => format!("[class {}]", class.name),
             Self::Function(_) => "[function]".to_string(),
             Self::Builtin(_) => "[function]".to_string(),
         }
@@ -3355,6 +3805,22 @@ fn dataset_attribute_name(property: &str) -> String {
         }
     }
     name
+}
+
+fn parse_integer(source: &str, radix: u32) -> Option<f64> {
+    if !(2..=36).contains(&radix) {
+        return None;
+    }
+    let source = source.trim();
+    let (negative, digits) = source
+        .strip_prefix('-')
+        .map_or((false, source), |digits| (true, digits));
+    let digits = digits.strip_prefix('+').unwrap_or(digits);
+    if digits.is_empty() {
+        return None;
+    }
+    let value = i128::from_str_radix(digits, radix).ok()? as f64;
+    Some(if negative { -value } else { value })
 }
 
 fn escape_json_string(value: &str) -> String {
@@ -3560,7 +4026,76 @@ fn evaluate_binary(
         BinaryOperator::LessEqual => Ok(Value::Bool(left.number()? <= right.number()?)),
         BinaryOperator::Greater => Ok(Value::Bool(left.number()? > right.number()?)),
         BinaryOperator::GreaterEqual => Ok(Value::Bool(left.number()? >= right.number()?)),
+        BinaryOperator::InstanceOf => Ok(Value::Bool(match (left, right) {
+            (Value::Error(_), Value::ErrorConstructor) => true,
+            (Value::Error(error), Value::Class(class)) => {
+                error.class_name == class.name
+                    || (class.name == "Error" && error.class_name == "Error")
+            }
+            _ => false,
+        })),
         BinaryOperator::And | BinaryOperator::Or => unreachable!("logical operators short-circuit"),
+    }
+}
+
+fn value_typeof(value: &Value) -> &'static str {
+    match value {
+        Value::Undefined => "undefined",
+        Value::Null
+        | Value::Object(_)
+        | Value::Array(_)
+        | Value::NodeList(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Element(_)
+        | Value::Dataset(_)
+        | Value::Style(_)
+        | Value::ClassList(_)
+        | Value::Event(_)
+        | Value::Response(_)
+        | Value::Promise(_)
+        | Value::Document
+        | Value::Window
+        | Value::Location(_)
+        | Value::ModuleImport(_)
+        | Value::History(_)
+        | Value::Url(_)
+        | Value::UrlSearchParams(_)
+        | Value::Storage(_)
+        | Value::FormData(_)
+        | Value::CanvasContext(_)
+        | Value::Console
+        | Value::Json
+        | Value::Error(_) => "object",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Function(_)
+        | Value::Builtin(_)
+        | Value::UrlConstructor
+        | Value::UrlSearchParamsConstructor
+        | Value::FormDataConstructor
+        | Value::MapConstructor
+        | Value::SetConstructor
+        | Value::ErrorConstructor
+        | Value::PromiseConstructor
+        | Value::NumberNamespace
+        | Value::ArrayNamespace
+        | Value::ObjectNamespace
+        | Value::StringConstructor
+        | Value::Class(_) => "function",
+    }
+}
+
+fn error_handle(value: &Value) -> ErrorHandle {
+    match value {
+        Value::Error(error) => error.clone(),
+        _ => Rc::new(ErrorData {
+            name: "Error".to_string(),
+            message: value.string_value(),
+            code: None,
+            class_name: "Error".to_string(),
+        }),
     }
 }
 
@@ -3582,12 +4117,24 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 }
 
 fn spread_values(value: Value) -> Result<Vec<Value>, ScriptError> {
+    iterable_values(value)
+}
+
+fn iterable_values(value: Value) -> Result<Vec<Value>, ScriptError> {
     match value {
         Value::Array(values) => Ok(values.borrow().clone()),
         Value::NodeList(nodes) => Ok(nodes.iter().cloned().map(Value::Element).collect()),
         Value::String(string) => Ok(string
             .chars()
             .map(|character| Value::String(character.to_string()))
+            .collect()),
+        Value::Map(map) => Ok(map
+            .borrow()
+            .entries
+            .iter()
+            .map(|(key, value)| {
+                Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
+            })
             .collect()),
         _ => Err(runtime_error("value is not iterable")),
     }
@@ -3727,6 +4274,18 @@ impl Parser {
             statements.push(statement);
             return Ok(());
         }
+        if self.is(TokenKind::Class) {
+            let statement = self.parse_statement()?;
+            let Stmt::Class { name, .. } = &statement else {
+                return Err(self.error("expected exported class".to_string(), self.peek().offset));
+            };
+            exports.push(ModuleExport {
+                local: name.clone(),
+                exported: name.clone(),
+            });
+            statements.push(statement);
+            return Ok(());
+        }
         if self.take(TokenKind::LBrace) {
             if !self.is(TokenKind::RBrace) {
                 loop {
@@ -3788,6 +4347,25 @@ impl Parser {
                 alternate,
             });
         }
+        if self.take(TokenKind::For) {
+            self.expect(TokenKind::LParen, "for statement")?;
+            if !self.take(TokenKind::Let) && !self.take(TokenKind::Const) {
+                return Err(self.error(
+                    "for-of binding must use let or const".to_string(),
+                    self.peek().offset,
+                ));
+            }
+            let name = self.expect_identifier("for-of binding")?;
+            self.expect_identifier_value("of")?;
+            let iterable = self.parse_expression()?;
+            self.expect(TokenKind::RParen, "for statement")?;
+            let body = Box::new(self.parse_statement()?);
+            return Ok(Stmt::ForOf {
+                name,
+                iterable,
+                body,
+            });
+        }
         if self.take(TokenKind::Return) {
             let expression = if self.is(TokenKind::Semicolon) || self.is(TokenKind::RBrace) {
                 None
@@ -3807,6 +4385,41 @@ impl Parser {
                 initializer: Some(function),
             });
         }
+        if self.take(TokenKind::Async) {
+            self.expect(TokenKind::Function, "async function")?;
+            let name = self.expect_identifier("async function name")?;
+            let function = self.parse_function_after_name_with_async(true)?;
+            self.take(TokenKind::Semicolon);
+            return Ok(Stmt::Let {
+                name,
+                initializer: Some(function),
+            });
+        }
+        if self.take(TokenKind::Try) {
+            let body = Box::new(self.parse_statement()?);
+            self.expect(TokenKind::Catch, "catch clause")?;
+            let catch_name = if self.take(TokenKind::LParen) {
+                let name = self.expect_identifier("catch binding")?;
+                self.expect(TokenKind::RParen, "catch clause")?;
+                Some(name)
+            } else {
+                None
+            };
+            let handler = Box::new(self.parse_statement()?);
+            return Ok(Stmt::TryCatch {
+                body,
+                catch_name,
+                handler,
+            });
+        }
+        if self.take(TokenKind::Throw) {
+            let expression = self.parse_expression()?;
+            self.take(TokenKind::Semicolon);
+            return Ok(Stmt::Throw(expression));
+        }
+        if self.take(TokenKind::Class) {
+            return self.parse_class_declaration();
+        }
         let expression = self.parse_expression()?;
         self.take(TokenKind::Semicolon);
         Ok(Stmt::Expression(expression))
@@ -3821,12 +4434,45 @@ impl Parser {
         Ok(statements)
     }
 
+    fn parse_class_declaration(&mut self) -> Result<Stmt, ScriptError> {
+        let name = self.expect_identifier("class name")?;
+        let extends = if self.is_identifier("extends") {
+            self.advance();
+            Some(self.expect_identifier("base class name")?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LBrace, "class body")?;
+        while !self.is(TokenKind::RBrace) && !self.is(TokenKind::Eof) {
+            let method = self.expect_identifier("class method name")?;
+            let _function = self.parse_function_after_name()?;
+            if method != "constructor" {
+                return Err(self.error(
+                    "only class constructors are supported".to_string(),
+                    self.peek().offset,
+                ));
+            }
+        }
+        self.expect(TokenKind::RBrace, "class body")?;
+        Ok(Stmt::Class { name, extends })
+    }
+
     fn parse_expression(&mut self) -> Result<Expr, ScriptError> {
         self.parse_assignment()
     }
 
     fn parse_assignment(&mut self) -> Result<Expr, ScriptError> {
         let left = self.parse_or()?;
+        if self.take(TokenKind::Question) {
+            let consequent = self.parse_expression()?;
+            self.expect(TokenKind::Colon, "conditional expression")?;
+            let alternate = self.parse_assignment()?;
+            return Ok(Expr::Conditional {
+                condition: Box::new(left),
+                consequent: Box::new(consequent),
+                alternate: Box::new(alternate),
+            });
+        }
         if self.take(TokenKind::Assign) {
             let expression = self.parse_assignment()?;
             Ok(Expr::Assignment {
@@ -3876,12 +4522,14 @@ impl Parser {
                 TokenKind::LessEqual,
                 TokenKind::Greater,
                 TokenKind::GreaterEqual,
+                TokenKind::InstanceOf,
             ],
             &[
                 BinaryOperator::Less,
                 BinaryOperator::LessEqual,
                 BinaryOperator::Greater,
                 BinaryOperator::GreaterEqual,
+                BinaryOperator::InstanceOf,
             ],
         )
     }
@@ -3931,6 +4579,10 @@ impl Parser {
             Some(UnaryOperator::Negative)
         } else if self.take(TokenKind::Plus) {
             Some(UnaryOperator::Positive)
+        } else if self.take(TokenKind::TypeOf) {
+            Some(UnaryOperator::TypeOf)
+        } else if self.take(TokenKind::Await) {
+            Some(UnaryOperator::Await)
         } else {
             None
         };
@@ -3948,7 +4600,7 @@ impl Parser {
         let mut expression = self.parse_primary()?;
         loop {
             if self.take(TokenKind::Dot) {
-                let property = self.expect_identifier("property name")?;
+                let property = self.expect_property_name()?;
                 expression = Expr::Member {
                     object: Box::new(expression),
                     property,
@@ -4071,8 +4723,17 @@ impl Parser {
                         );
                     }
                 };
-                self.expect(TokenKind::Colon, "object property")?;
-                properties.push((key, self.parse_expression()?));
+                let value = if self.take(TokenKind::Colon) {
+                    self.parse_expression()?
+                } else if self.is(TokenKind::LParen) {
+                    self.parse_function_after_name_with_async(false)?
+                } else {
+                    return Err(self.error(
+                        "object property needs a value or method body".to_string(),
+                        self.peek().offset,
+                    ));
+                };
+                properties.push((key, value));
                 if !self.take(TokenKind::Comma) {
                     break;
                 }
@@ -4135,7 +4796,11 @@ impl Parser {
         } else {
             vec![Stmt::Return(Some(self.parse_expression()?))]
         };
-        Ok(Expr::Function { params, body })
+        Ok(Expr::Function {
+            params,
+            body,
+            is_async: false,
+        })
     }
 
     fn parse_function_expression(&mut self) -> Result<Expr, ScriptError> {
@@ -4143,13 +4808,29 @@ impl Parser {
             self.advance();
         }
         let function = self.parse_function_after_name()?;
-        let Expr::Function { params, body } = function else {
+        let Expr::Function {
+            params,
+            body,
+            is_async,
+        } = function
+        else {
             unreachable!("function parser returns a function expression");
         };
-        Ok(Expr::Function { params, body })
+        Ok(Expr::Function {
+            params,
+            body,
+            is_async,
+        })
     }
 
     fn parse_function_after_name(&mut self) -> Result<Expr, ScriptError> {
+        self.parse_function_after_name_with_async(false)
+    }
+
+    fn parse_function_after_name_with_async(
+        &mut self,
+        is_async: bool,
+    ) -> Result<Expr, ScriptError> {
         self.expect(TokenKind::LParen, "function parameters")?;
         let mut params = Vec::new();
         if !self.is(TokenKind::RParen) {
@@ -4163,7 +4844,11 @@ impl Parser {
         self.expect(TokenKind::RParen, "function parameters")?;
         self.expect(TokenKind::LBrace, "function body")?;
         let body = self.parse_block_contents()?;
-        Ok(Expr::Function { params, body })
+        Ok(Expr::Function {
+            params,
+            body,
+            is_async,
+        })
     }
 
     fn parse_argument_list(&mut self, context: &str) -> Result<Vec<Expr>, ScriptError> {
@@ -4229,6 +4914,15 @@ impl Parser {
         }
     }
 
+    fn expect_property_name(&mut self) -> Result<String, ScriptError> {
+        let token = self.advance();
+        match token.kind {
+            TokenKind::Identifier(name) => Ok(name),
+            TokenKind::Catch => Ok("catch".to_string()),
+            _ => Err(self.error("expected property name".to_string(), token.offset)),
+        }
+    }
+
     fn expect(&mut self, expected: TokenKind, context: &str) -> Result<(), ScriptError> {
         if self.take(expected) {
             Ok(())
@@ -4288,6 +4982,14 @@ enum TokenKind {
     If,
     Else,
     Return,
+    For,
+    Try,
+    Catch,
+    Throw,
+    Class,
+    Async,
+    Await,
+    TypeOf,
     Function,
     New,
     LParen,
@@ -4317,6 +5019,8 @@ enum TokenKind {
     GreaterEqual,
     AndAnd,
     OrOr,
+    InstanceOf,
+    Question,
     Ellipsis,
 }
 
@@ -4365,6 +5069,15 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
                 "if" => TokenKind::If,
                 "else" => TokenKind::Else,
                 "return" => TokenKind::Return,
+                "for" => TokenKind::For,
+                "try" => TokenKind::Try,
+                "catch" => TokenKind::Catch,
+                "throw" => TokenKind::Throw,
+                "class" => TokenKind::Class,
+                "async" => TokenKind::Async,
+                "await" => TokenKind::Await,
+                "typeof" => TokenKind::TypeOf,
+                "instanceof" => TokenKind::InstanceOf,
                 "function" => TokenKind::Function,
                 "new" => TokenKind::New,
                 _ => TokenKind::Identifier(identifier.to_string()),
@@ -4518,6 +5231,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
             [b'>', ..] => (TokenKind::Greater, 1),
             [b'&', b'&', ..] => (TokenKind::AndAnd, 2),
             [b'|', b'|', ..] => (TokenKind::OrOr, 2),
+            [b'?', ..] => (TokenKind::Question, 1),
             _ => {
                 return Err(ScriptError {
                     offset: start,
@@ -4568,6 +5282,7 @@ fn find_template_expression_end(source: &str, start: usize) -> Option<usize> {
             _ => {}
         }
     }
+
     None
 }
 
@@ -4797,6 +5512,32 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("module|2|2")
+        );
+    }
+
+    #[test]
+    fn iterates_map_keys_with_for_of() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const checks = new Map([["module", 1], ["storage", 2]]);
+                let output = "";
+                for (const name of checks.keys()) {
+                  output = output + name + "|";
+                }
+                document.getElementById("status").textContent = output;
+                "##,
+            )
+            .expect("for-of should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("module|storage|")
         );
     }
 

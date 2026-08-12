@@ -129,6 +129,14 @@ impl Document {
         find_element_by_id(&self.root, id, &mut Vec::new())
     }
 
+    pub fn document_element_path(&self) -> Option<NodePath> {
+        self.root
+            .children
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| matches!(node, Node::Element(_)).then_some(vec![index]))
+    }
+
     pub fn form_control_paths(&self, form_path: &[usize]) -> Option<Vec<NodePath>> {
         let form = self.element_at(form_path)?;
         (form.name == "form").then(|| {
@@ -286,6 +294,12 @@ impl Document {
         };
         element.attrs.insert(name.to_ascii_lowercase(), value);
         true
+    }
+
+    pub fn remove_element_attribute(&mut self, path: &[usize], name: &str) -> bool {
+        self.element_at_mut(path)
+            .and_then(|element| element.attrs.remove(&name.to_ascii_lowercase()))
+            .is_some()
     }
 
     pub fn element_has_class(&self, path: &[usize], class: &str) -> bool {
