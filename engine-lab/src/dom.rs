@@ -137,6 +137,17 @@ impl Document {
         })
     }
 
+    pub fn form_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
+        let mut candidate = path.to_vec();
+        while !candidate.is_empty() {
+            candidate.pop();
+            if self.element_at(&candidate).is_some_and(|element| element.name == "form") {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     pub fn link_reference(&self, path: &[usize]) -> Option<String> {
         let mut candidate = path.to_vec();
         loop {
@@ -979,6 +990,10 @@ mod tests {
         assert_eq!(
             document.form_control_paths(&form),
             Some(vec![vec![0, 0], vec![0, 1, 0], vec![0, 2]])
+        );
+        assert_eq!(
+            document.form_ancestor_path(&[0, 1, 0]),
+            Some(vec![0])
         );
     }
 

@@ -543,8 +543,13 @@ impl ScriptRuntime {
         self.drain_microtasks()?;
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
             self.apply_click_default(&path);
+            if let Some(form) = self.submit_form_for_click(&path) {
+                self.request_submit(form)?;
+            }
             let reference = self.document.borrow().link_reference(&path);
-            if let Some(reference) = reference {
+            if self.pending_navigation.is_none()
+                && let Some(reference) = reference
+            {
                 self.request_location_navigation(reference, false);
             }
         }
@@ -656,6 +661,31 @@ impl ScriptRuntime {
             }
             _ => {}
         }
+    }
+
+    fn submit_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
+        let element = self.document.borrow().element_clone(path)?;
+        let input_type = element
+            .attr("type")
+            .map(|kind| kind.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_submit = match element.name.as_str() {
+            "button" => !matches!(input_type.as_str(), "button" | "reset"),
+            "input" => input_type == "submit",
+            _ => false,
+        };
+        is_submit
+            .then(|| self.document.borrow().form_ancestor_path(path))
+            .flatten()
+    }
+
+    fn request_submit(&mut self, path: NodePath) -> Result<(), ScriptError> {
+        let dispatch = self.dispatch_event(path.clone(), "submit")?;
+        self.drain_microtasks()?;
+        if !dispatch.default_prevented {
+            self.submit_form(path)?;
+        }
+        Ok(())
     }
 
     pub fn pending_task_count(&self) -> usize {
@@ -1638,6 +1668,47 @@ impl ScriptRuntime {
         Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
     }
 
+    fn submit_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
+        let form = self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .ok_or_else(|| runtime_error("form is no longer in the document"))?;
+        let method = form
+            .attr("method")
+            .map(|method| method.to_ascii_lowercase())
+            .unwrap_or_else(|| "get".to_string());
+        if method != "get" {
+            return Err(runtime_error(
+                "only GET form submission is available in the packaged engine",
+            ));
+        }
+        let Value::FormData(form_data) = self.construct_form_data(vec![Value::Element(
+            attached_handle(path),
+        )])? else {
+            unreachable!("form data constructor returns form data");
+        };
+        let base = self
+            .base_url
+            .clone()
+            .ok_or_else(|| runtime_error("form submission requires a document URL"))?;
+        let action = form.attr("action").unwrap_or("");
+        let mut url = base
+            .resolve(action)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let encoded = serialize_form_urlencoded(&form_data.borrow().pairs);
+        if !encoded.is_empty() {
+            let query = if url.query().is_empty() {
+                encoded
+            } else {
+                format!("{}&{encoded}", url.query())
+            };
+            url = url.with_query_fragment(query, url.fragment().to_string());
+        }
+        self.request_location_navigation(url.to_string(), false);
+        Ok(())
+    }
+
     fn url_search_params(
         &self,
         url: &UrlHandle,
@@ -1842,8 +1913,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementRequestSubmit(path) => {
-                self.dispatch_event(path, "submit")?;
-                self.drain_microtasks()?;
+                self.request_submit(path)?;
                 Ok(Value::Undefined)
             }
             Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string())),

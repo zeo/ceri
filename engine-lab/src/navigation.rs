@@ -1615,6 +1615,36 @@ mod tests {
     }
 
     #[test]
+    fn form_get_submission_navigates_packaged_origin_without_a_listener() {
+        let mut resources = bundle(
+            r#"<form id="search" action="/results.html" method="get"><input name="q" value="rust browser"><button id="submit" type="submit">search</button></form>"#,
+        );
+        resources
+            .insert(
+                "/results.html",
+                "text/html",
+                br#"<p id="status"></p><script>document.getElementById("status").textContent = location.search;</script>"#.to_vec(),
+            )
+            .expect("results page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("search page should load");
+        assert!(browser.click_id("submit").expect("submit click should dispatch"));
+        assert_eq!(browser.current_url().unwrap().path(), "/results.html");
+        assert_eq!(browser.current_url().unwrap().query(), "q=rust+browser");
+        let document = browser.document().expect("results document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("?q=rust+browser")
+        );
+    }
+
+    #[test]
     fn location_redirects_are_bounded() {
         let mut browser = Browser::new(bundle(r#"<script>location.href = "/";</script>"#));
         assert_eq!(

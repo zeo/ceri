@@ -147,4 +147,4 @@ The form demo exercises named controls, `FormData`, and a cancellable submit eve
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/form-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-form-demo.bmp --click submit
 ```
 
-The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, applies cancellable checkbox click defaults, and leaves network submission to the app.
+The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, applies cancellable checkbox click defaults, and resolves a GET action back into the packaged app origin with URL-encoded pairs. POST bodies and external network transport remain outside this slice.
