@@ -7,6 +7,17 @@ pub struct Document {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessibilityNode {
+    pub role: String,
+    pub name: String,
+    pub value: Option<String>,
+    pub path: NodePath,
+    pub disabled: bool,
+    pub focusable: bool,
+    pub children: Vec<Self>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Element {
     pub name: String,
     pub attrs: BTreeMap<String, String>,
@@ -123,6 +134,28 @@ impl Document {
         let mut stylesheets = Vec::new();
         collect_stylesheet_sources(&self.root, &mut stylesheets);
         stylesheets
+    }
+
+    pub fn accessibility_tree(&self) -> AccessibilityNode {
+        let children = self
+            .root
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node {
+                Node::Element(element) => accessibility_node(element, vec![index]),
+                Node::Text(_) => None,
+            })
+            .collect();
+        AccessibilityNode {
+            role: "document".to_string(),
+            name: String::new(),
+            value: None,
+            path: Vec::new(),
+            disabled: false,
+            focusable: false,
+            children,
+        }
     }
 
     pub fn find_element_by_id(&self, id: &str) -> Option<NodePath> {
@@ -491,6 +524,192 @@ impl Element {
         self.attrs.insert("style".to_string(), style);
         true
     }
+}
+
+fn accessibility_node(element: &Element, path: NodePath) -> Option<AccessibilityNode> {
+    if is_accessibility_hidden(element) {
+        return None;
+    }
+    let children = element
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| match node {
+            Node::Element(element) => {
+                let mut child_path = path.clone();
+                child_path.push(index);
+                accessibility_node(element, child_path)
+            }
+            Node::Text(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let role = accessibility_role(element);
+    let name = accessibility_name(element);
+    let value = accessibility_value(element);
+    Some(AccessibilityNode {
+        role,
+        name,
+        value,
+        path,
+        disabled: is_accessibility_disabled(element),
+        focusable: is_accessibility_focusable(element),
+        children,
+    })
+}
+
+fn accessibility_role(element: &Element) -> String {
+    if let Some(role) = element.attr("role").filter(|role| !role.trim().is_empty()) {
+        return role.trim().to_ascii_lowercase();
+    }
+    match element.name.as_str() {
+        "main" => "main".to_string(),
+        "nav" => "navigation".to_string(),
+        "header" => "banner".to_string(),
+        "footer" => "contentinfo".to_string(),
+        "aside" => "complementary".to_string(),
+        "form" => "form".to_string(),
+        "button" => "button".to_string(),
+        "a" if element.attr("href").is_some() => "link".to_string(),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading".to_string(),
+        "img" => "img".to_string(),
+        "input" => input_accessibility_role(element),
+        "textarea" => "textbox".to_string(),
+        "select" => "combobox".to_string(),
+        "option" => "option".to_string(),
+        "ul" | "ol" => "list".to_string(),
+        "li" => "listitem".to_string(),
+        "table" => "table".to_string(),
+        "tr" => "row".to_string(),
+        "th" => "columnheader".to_string(),
+        "td" => "cell".to_string(),
+        "label" => "label".to_string(),
+        _ => "generic".to_string(),
+    }
+}
+
+fn input_accessibility_role(element: &Element) -> String {
+    match element
+        .attr("type")
+        .unwrap_or("text")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "button" | "submit" | "reset" | "image" => "button".to_string(),
+        "checkbox" => "checkbox".to_string(),
+        "radio" => "radio".to_string(),
+        "range" => "slider".to_string(),
+        "hidden" => "none".to_string(),
+        _ => "textbox".to_string(),
+    }
+}
+
+fn accessibility_name(element: &Element) -> String {
+    if let Some(label) = element.attr("aria-label").filter(|label| !label.trim().is_empty()) {
+        return label.trim().to_string();
+    }
+    if element.name == "img"
+        && let Some(alt) = element.attr("alt")
+    {
+        return alt.to_string();
+    }
+    if let Some(title) = element.attr("title").filter(|title| !title.trim().is_empty()) {
+        return title.trim().to_string();
+    }
+    if matches!(
+        element.name.as_str(),
+        "a" | "button" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "label" | "li" | "option"
+    ) || !element_has_element_child(element)
+    {
+        return element_text_content(element).trim().to_string();
+    }
+    if matches!(element.name.as_str(), "input" | "textarea") {
+        return element
+            .attr("placeholder")
+            .or_else(|| element.attr("value"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
+    String::new()
+}
+
+fn accessibility_value(element: &Element) -> Option<String> {
+    element
+        .attr("aria-valuenow")
+        .or_else(|| element.attr("value"))
+        .map(str::to_string)
+        .or_else(|| {
+            (element.name == "textarea")
+                .then(|| element_text_content(element).trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn is_accessibility_disabled(element: &Element) -> bool {
+    element.attr("disabled").is_some()
+        || element
+            .attr("aria-disabled")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn is_accessibility_focusable(element: &Element) -> bool {
+    if is_accessibility_disabled(element)
+        || (element.name == "input"
+            && element
+                .attr("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
+    {
+        return false;
+    }
+    if let Some(tabindex) = element.attr("tabindex") {
+        return tabindex.parse::<i32>().is_ok_and(|value| value >= 0);
+    }
+    matches!(
+        element.name.as_str(),
+        "a" if element.attr("href").is_some()
+    ) || matches!(
+        element.name.as_str(),
+        "button" | "input" | "select" | "textarea"
+    )
+}
+
+fn is_accessibility_hidden(element: &Element) -> bool {
+    if matches!(
+        element.name.as_str(),
+        "head" | "link" | "meta" | "script" | "style" | "template" | "title"
+    ) || (element.name == "input"
+        && element
+            .attr("type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
+    {
+        return true;
+    }
+    if element.attr("hidden").is_some()
+        || element
+            .attr("aria-hidden")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    let style = element
+        .attr("style")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace(' ', "");
+    style.contains("display:none") || style.contains("visibility:hidden")
+}
+
+fn element_has_element_child(element: &Element) -> bool {
+    element
+        .children
+        .iter()
+        .any(|node| matches!(node, Node::Element(_)))
+}
+
+fn element_text_content(element: &Element) -> String {
+    let mut text = String::new();
+    collect_text_nodes(element, &mut text);
+    text
 }
 
 fn class_token(class: &str) -> Option<&str> {
@@ -1014,6 +1233,56 @@ mod tests {
         assert_eq!(main.name, "main");
         assert_eq!(main.attr("data-kind"), Some("demo"));
         assert_eq!(main.children.len(), 1);
+    }
+
+    #[test]
+    fn builds_accessibility_roles_names_and_stable_paths() {
+        let document = Document::parse(
+            r#"<main><h1>Settings</h1><button aria-label="Save changes">Save</button><input type="checkbox" aria-label="Enable sync" disabled><a href="/help">Help</a><p hidden>secret</p></main>"#,
+        )
+        .expect("document should parse");
+        let tree = document.accessibility_tree();
+        assert_eq!(tree.role, "document");
+        let main = &tree.children[0];
+        assert_eq!((main.role.as_str(), main.path.as_slice()), ("main", [0].as_slice()));
+        assert_eq!(main.children.len(), 4);
+        assert_eq!(
+            (
+                main.children[0].role.as_str(),
+                main.children[0].name.as_str(),
+                main.children[0].path.as_slice(),
+                main.children[0].focusable,
+            ),
+            ("heading", "Settings", [0, 0].as_slice(), false)
+        );
+        assert_eq!(
+            (
+                main.children[1].role.as_str(),
+                main.children[1].name.as_str(),
+                main.children[1].path.as_slice(),
+                main.children[1].focusable,
+            ),
+            ("button", "Save changes", [0, 1].as_slice(), true)
+        );
+        assert_eq!(
+            (
+                main.children[2].role.as_str(),
+                main.children[2].name.as_str(),
+                main.children[2].path.as_slice(),
+                main.children[2].disabled,
+                main.children[2].focusable,
+            ),
+            ("checkbox", "Enable sync", [0, 2].as_slice(), true, false)
+        );
+        assert_eq!(
+            (
+                main.children[3].role.as_str(),
+                main.children[3].name.as_str(),
+                main.children[3].path.as_slice(),
+                main.children[3].focusable,
+            ),
+            ("link", "Help", [0, 3].as_slice(), true)
+        );
     }
 
     #[test]

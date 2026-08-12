@@ -13,6 +13,7 @@ The current slice implements:
 - layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
 - a platform-neutral `EngineHost` frame and input boundary
+- a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - bubbling DOM events with `type`, `target`, `currentTarget`, `defaultPrevented`, and `preventDefault()`
 - element attributes, inline styles, and `classList` state mutation
@@ -39,7 +40,7 @@ The current slice implements:
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
-It is a headless laboratory, not a web-compatible browser. The script runtime covers the demo's DOM and event path, while networking, media, accessibility, GPU APIs, WebAssembly, and the operating-system window remain outside this slice.
+It is a headless laboratory, not a web-compatible browser. The script runtime covers the demo's DOM and event path, while networking, media, full platform accessibility adapters, GPU APIs, WebAssembly, and the operating-system window remain outside this slice.
 
 Run the deterministic demo from the repository root:
 

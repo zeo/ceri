@@ -1,6 +1,7 @@
 use crate::layout::Size;
 use crate::navigation::{Browser, NavigationError, NavigationStatus};
 use crate::paint::Canvas;
+use crate::AccessibilityNode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
@@ -77,6 +78,10 @@ impl EngineHost {
 
     pub fn viewport(&self) -> Size {
         self.viewport
+    }
+
+    pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
+        self.browser.accessibility_tree()
     }
 
     pub fn navigate(&mut self, url: &str) -> Result<NavigationStatus, NavigationError> {
@@ -256,6 +261,29 @@ mod tests {
             .expect("resized frame should be present");
         assert_eq!(resized.viewport.width, 640.0);
         assert_eq!(resized.canvas.height(), 240);
+    }
+
+    #[test]
+    fn host_exposes_the_current_accessibility_tree() {
+        let browser = Browser::new(bundle(
+            r#"<main><button aria-label="Run">run</button><p hidden>ignored</p></main>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let tree = host
+            .accessibility_tree()
+            .expect("loaded page should expose an accessibility tree");
+        assert_eq!(tree.role, "document");
+        assert_eq!(tree.children[0].role, "main");
+        assert_eq!(tree.children[0].children.len(), 1);
+        assert_eq!(tree.children[0].children[0].name, "Run");
     }
 
     #[test]

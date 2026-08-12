@@ -1,5 +1,5 @@
 use crate::css::Stylesheet;
-use crate::dom::{Document, NodePath, ScriptSource, StylesheetSource};
+use crate::dom::{AccessibilityNode, Document, NodePath, ScriptSource, StylesheetSource};
 use crate::image::parse_svg;
 use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
@@ -471,6 +471,12 @@ impl Browser {
 
     pub fn current_url(&self) -> Option<&AppUrl> {
         self.current_url.as_ref()
+    }
+
+    pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
+        self.page
+            .as_ref()
+            .map(|page| page.document.borrow().accessibility_tree())
     }
 
     pub fn history(&self) -> &[AppUrl] {

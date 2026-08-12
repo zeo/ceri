@@ -8,7 +8,10 @@ mod paint;
 mod script;
 
 pub use css::{Color, Display, Stylesheet};
-pub use dom::{Document, Element, Node, ParseError, ScriptSource, StylesheetSource};
+pub use dom::{
+    AccessibilityNode, Document, Element, Node, NodePath, ParseError, ScriptSource,
+    StylesheetSource,
+};
 pub use host::{EngineHost, Frame, InputEvent, InputResult, PointerButton};
 pub use layout::{LayoutDocument, Rect, Size, layout};
 pub use navigation::{
