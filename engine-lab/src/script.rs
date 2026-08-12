@@ -347,6 +347,7 @@ pub(crate) struct ModuleExport {
 
 struct ModuleProgram {
     imports: Vec<ModuleImport>,
+    star_reexports: Vec<String>,
     statements: Vec<Stmt>,
     exports: Vec<ModuleExport>,
 }
@@ -920,6 +921,15 @@ impl ScriptRuntime {
                 values.values.insert(local.clone(), value);
             }
         }
+        let mut star_namespaces = Vec::new();
+        for source in &program.star_reexports {
+            let (dependency_url, dependency_source) = loader.load_module(&url, source)?;
+            star_namespaces.push(self.execute_module_graph(
+                &dependency_source,
+                dependency_url,
+                loader,
+            )?);
+        }
         match self.execute_statements(&program.statements, environment.clone())? {
             Completion::Normal | Completion::Return(_) => {}
         }
@@ -930,6 +940,13 @@ impl ScriptRuntime {
                 .get(&export.local)
                 .ok_or_else(|| runtime_error(format!("module export {} is undefined", export.local)))?;
             exports.insert(export.exported, value);
+        }
+        for namespace in star_namespaces {
+            for (name, value) in namespace.values {
+                if name != "default" {
+                    exports.entry(name).or_insert(value);
+                }
+            }
         }
         Ok(ModuleNamespace { values: exports })
     }
@@ -4583,6 +4600,7 @@ impl Parser {
 
     fn parse_module(&mut self) -> Result<ModuleProgram, ScriptError> {
         let mut imports = Vec::new();
+        let mut star_reexports = Vec::new();
         let mut statements = Vec::new();
         let mut exports = Vec::new();
         while !self.is(TokenKind::Eof) {
@@ -4590,13 +4608,19 @@ impl Parser {
                 imports.push(self.parse_import_declaration()?);
             } else if self.is_identifier("export") {
                 self.advance();
-                self.parse_export_declaration(&mut imports, &mut statements, &mut exports)?;
+                self.parse_export_declaration(
+                    &mut imports,
+                    &mut star_reexports,
+                    &mut statements,
+                    &mut exports,
+                )?;
             } else {
                 statements.push(self.parse_statement()?);
             }
         }
         Ok(ModuleProgram {
             imports,
+            star_reexports,
             statements,
             exports,
         })
@@ -4661,9 +4685,16 @@ impl Parser {
     fn parse_export_declaration(
         &mut self,
         imports: &mut Vec<ModuleImport>,
+        star_reexports: &mut Vec<String>,
         statements: &mut Vec<Stmt>,
         exports: &mut Vec<ModuleExport>,
     ) -> Result<(), ScriptError> {
+        if self.take(TokenKind::Star) {
+            self.expect_identifier_value("from")?;
+            star_reexports.push(self.expect_string("export-star module specifier")?);
+            self.take(TokenKind::Semicolon);
+            return Ok(());
+        }
         if self.is_identifier("default") {
             self.advance();
             if exports.iter().any(|export| export.exported == "default") {
@@ -6009,6 +6040,40 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("re-exported")
+        );
+    }
+
+    #[test]
+    fn forwards_export_star_names_without_overriding_explicit_exports() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([
+                (
+                    "/barrel.js".to_string(),
+                    r#"export * from "./source.js"; export const message = "explicit";"#.to_string(),
+                ),
+                (
+                    "/source.js".to_string(),
+                    r#"export default "hidden"; export const message = "forwarded"; export const count = 2;"#.to_string(),
+                ),
+            ]),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                r#"import { message, count } from "./barrel.js"; document.getElementById("status").textContent = message + "|" + count;"#,
+                base,
+                &mut loader,
+            )
+            .expect("export-star should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("explicit|2")
         );
     }
 
