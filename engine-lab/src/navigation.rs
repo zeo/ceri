@@ -537,7 +537,7 @@ fn load_provider_resource_at(
     let Some(response) = provider.provide_response(&ResourceRequest::get(url.clone()))? else {
         return Ok(None);
     };
-    if (300..400).contains(&response.status()) {
+    if is_http_redirect(response.status()) {
         if redirect_depth >= MAX_NAVIGATION_REDIRECTS {
             return Err(NavigationError::NavigationLoop);
         }
@@ -560,6 +560,10 @@ fn load_provider_resource_at(
         url.clone(),
         Resource::new(response.mime_type().to_string(), response.body().to_vec()),
     )))
+}
+
+fn is_http_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 struct LoadedResource {
@@ -652,11 +656,11 @@ impl Browser {
                     && let Some(provider) = &self.resource_provider
                 {
                     let shell_url = url.with_path("/index.html")?;
-                    if let Some((loaded_url, resource)) =
+                    if let Some((_, resource)) =
                         load_provider_resource(provider.as_ref(), &shell_url)?
                     {
                         return Ok(LoadedResource {
-                            url: loaded_url,
+                            url: url.clone(),
                             resource,
                         });
                     }
@@ -668,13 +672,25 @@ impl Browser {
     }
 
     fn load_subresource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
+        self.load_subresource_with_url(url)
+            .map(|loaded| loaded.resource)
+    }
+
+    fn load_subresource_with_url(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
         match self.resources.load_subresource(url) {
-            Ok(resource) => Ok(resource),
+            Ok(resource) => Ok(LoadedResource {
+                url: url.clone(),
+                resource,
+            }),
             Err(NavigationError::ResourceNotFound(path)) => {
                 if let Some(provider) = &self.resource_provider
-                    && let Some((_, resource)) = load_provider_resource(provider.as_ref(), url)?
+                    && let Some((loaded_url, resource)) =
+                        load_provider_resource(provider.as_ref(), url)?
                 {
-                    return Ok(resource);
+                    return Ok(LoadedResource {
+                        url: loaded_url,
+                        resource,
+                    });
                 }
                 Err(NavigationError::ResourceNotFound(path))
             }
@@ -1251,17 +1267,20 @@ impl Browser {
                 }
                 ScriptSource::ExternalModule(reference) => {
                     let url = base.resolve(reference)?;
-                    let resource = self.load_subresource(&url)?;
+                    let LoadedResource {
+                        url: loaded_url,
+                        resource,
+                    } = self.load_subresource_with_url(&url)?;
                     if !is_javascript(&resource) {
                         return Err(NavigationError::UnsupportedMimeType {
-                            path: url.path().to_string(),
+                            path: loaded_url.path().to_string(),
                             mime_type: resource.mime_type,
                         });
                     }
                     let source = String::from_utf8(resource.body)
-                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
+                        .map_err(|_| NavigationError::InvalidUtf8(loaded_url.path().to_string()))?;
                     runtime
-                        .execute_module(&source, url, &mut module_loader)
+                        .execute_module(&source, loaded_url, &mut module_loader)
                         .map_err(|error| NavigationError::Script(error.to_string()))?;
                     continue;
                 }
@@ -1311,15 +1330,20 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
         let url = referrer
             .resolve(reference)
             .map_err(|error| runtime_error(error.to_string()))?;
-        let resource = match self.resources.load_subresource(&url) {
-            Ok(resource) => resource,
-            Err(NavigationError::ResourceNotFound(path)) => self
-                .provider
-                .map(|provider| provider.provide_request(&ResourceRequest::get(url.clone())))
-                .transpose()
-                .map_err(|error| runtime_error(error.to_string()))?
-                .flatten()
-                .ok_or_else(|| runtime_error(format!("module {path} was not found")))?,
+        let (url, resource) = match self.resources.load_subresource(&url) {
+            Ok(resource) => (url.clone(), resource),
+            Err(NavigationError::ResourceNotFound(path)) => {
+                let Some(provider) = self.provider else {
+                    return Err(runtime_error(format!("module {path} was not found")));
+                };
+                let Some((loaded_url, resource)) =
+                    load_provider_resource(provider, &url)
+                        .map_err(|error| runtime_error(error.to_string()))?
+                else {
+                    return Err(runtime_error(format!("module {path} was not found")));
+                };
+                (loaded_url, resource)
+            }
             Err(error) => return Err(runtime_error(error.to_string())),
         };
         if !is_javascript(&resource) {
@@ -1783,6 +1807,59 @@ mod tests {
                 .map(Some),
                 _ => Ok(None),
             }
+        }
+    }
+
+    struct ModuleRedirectProvider;
+
+    impl ResourceProvider for ModuleRedirectProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            let response = match request.url().path() {
+                "/" => ResourceResponse::new(
+                    200,
+                    "text/html",
+                    BTreeMap::new(),
+                    br#"<p id="status">idle</p><script type="module" src="/entry.js"></script>"#
+                        .to_vec(),
+                ),
+                "/entry.js" => {
+                    let mut headers = BTreeMap::new();
+                    headers.insert("Location".to_string(), "/modules/entry.js".to_string());
+                    ResourceResponse::new(302, "text/javascript", headers, Vec::new())
+                }
+                "/modules/entry.js" => ResourceResponse::new(
+                    200,
+                    "text/javascript",
+                    BTreeMap::new(),
+                    br#"import { message } from "./message.js"; document.getElementById("status").textContent = message;"#
+                        .to_vec(),
+                ),
+                "/modules/message.js" => ResourceResponse::new(
+                    200,
+                    "text/javascript",
+                    BTreeMap::new(),
+                    br#"export const message = "redirected";"#.to_vec(),
+                ),
+                _ => return Ok(None),
+            }?;
+            Ok(Some(response))
+        }
+    }
+
+    struct ShellProvider;
+
+    impl ResourceProvider for ShellProvider {
+        fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok((url.path() == "/index.html").then(|| {
+                Resource::new("text/html", b"<p id='status'>shell</p>".to_vec())
+            }))
         }
     }
 
@@ -2486,6 +2563,44 @@ mod tests {
             NavigationError::NavigationLoop
         );
         assert_eq!(paths.borrow().len(), MAX_NAVIGATION_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn provider_module_redirect_updates_relative_import_base() {
+        let mut browser = Browser::with_resource_provider(
+            ResourceBundle::default(),
+            Rc::new(ModuleRedirectProvider),
+        );
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("redirected module should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("redirected")
+        );
+    }
+
+    #[test]
+    fn provider_shell_fallback_preserves_the_requested_app_url() {
+        let mut browser = Browser::with_resource_provider(
+            ResourceBundle::default(),
+            Rc::new(ShellProvider),
+        );
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/dashboard")
+                .expect("provider shell should load"),
+            NavigationStatus::Loaded
+        );
+        assert_eq!(browser.current_url().unwrap().path(), "/dashboard");
     }
 
     #[test]
