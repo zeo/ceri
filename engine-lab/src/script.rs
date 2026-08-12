@@ -1,7 +1,8 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
-    is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceProvider, APP_ORIGIN,
+    is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceCacheMode,
+    ResourceProvider, ResourceRequest, APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
 use crate::Color;
@@ -433,11 +434,21 @@ fn resolve_runtime_resource(
     provider: Option<&dyn ResourceProvider>,
     url: &AppUrl,
 ) -> Result<Option<Resource>, ScriptError> {
-    if let Some(resource) = resources.resource(url.path()).cloned() {
+    resolve_runtime_request(resources, provider, &ResourceRequest::get(url.clone()))
+}
+
+fn resolve_runtime_request(
+    resources: &ResourceBundle,
+    provider: Option<&dyn ResourceProvider>,
+    request: &ResourceRequest,
+) -> Result<Option<Resource>, ScriptError> {
+    if request.method() == "GET"
+        && let Some(resource) = resources.resource(request.url().path()).cloned()
+    {
         return Ok(Some(resource));
     }
     provider
-        .map(|provider| provider.provide(url))
+        .map(|provider| provider.provide_request(request))
         .transpose()
         .map(|resource| resource.flatten())
         .map_err(|error| runtime_error(error.to_string()))
@@ -3454,7 +3465,7 @@ impl ScriptRuntime {
                 let value = arguments.first().cloned().unwrap_or(Value::Undefined);
                 serialize_json(&value).map(Value::String)
             }
-            Builtin::Fetch => Ok(Value::Promise(self.fetch(arguments.first()))),
+            Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments))),
             Builtin::PromiseThen(promise) => {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
             }
@@ -3931,25 +3942,39 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn fetch(&self, reference: Option<&Value>) -> PromiseHandle {
-        let reference = reference
+    fn fetch(&self, arguments: &[Value]) -> PromiseHandle {
+        let reference = arguments
+            .first()
             .map(Value::string_value)
             .unwrap_or_else(|| "undefined".to_string());
-        if self.resources.is_none() && self.resource_provider.is_none() {
-            return self.rejected_promise("fetch is unavailable without a resource bundle");
-        }
         let Some(base_url) = &self.base_url else {
             return self.rejected_promise("fetch is unavailable without a document URL");
         };
         let Ok(url) = base_url.resolve(&reference) else {
             return self.rejected_promise(format!("fetch rejected URL {reference}"));
         };
+        let options = match parse_fetch_options(arguments.get(1)) {
+            Ok(options) => options,
+            Err(error) => return self.rejected_promise(error.message),
+        };
+        let request = match ResourceRequest::new(
+            url.clone(),
+            options.method,
+            options.headers,
+            options.body,
+        ) {
+            Ok(request) => request.with_cache_mode(options.cache_mode),
+            Err(error) => return self.rejected_promise(error.to_string()),
+        };
+        if self.resources.is_none() && self.resource_provider.is_none() {
+            return self.rejected_promise("fetch is unavailable without a resource bundle");
+        }
         let display_url = url.to_string();
         let resources = self.resources.clone().unwrap_or_default();
-        let resource = match resolve_runtime_resource(
+        let resource = match resolve_runtime_request(
             &resources,
             self.resource_provider.as_deref(),
-            &url,
+            &request,
         ) {
             Ok(Some(resource)) => resource,
             Ok(None) => {
@@ -4666,6 +4691,82 @@ fn iterator_value(values: Vec<Value>) -> Value {
 }
 
 const MAX_USER_ITERATOR_VALUES: usize = 10_000;
+
+struct FetchOptions {
+    method: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+    cache_mode: ResourceCacheMode,
+}
+
+fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptError> {
+    let Some(options) = options.map(Value::resolve) else {
+        return Ok(FetchOptions {
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            cache_mode: ResourceCacheMode::Default,
+        });
+    };
+    if matches!(options, Value::Undefined | Value::Null) {
+        return Ok(FetchOptions {
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            cache_mode: ResourceCacheMode::Default,
+        });
+    }
+    let Value::Object(options) = options else {
+        return Err(runtime_error("fetch options must be an object"));
+    };
+    let options = options.borrow();
+    if options
+        .keys()
+        .any(|key| !matches!(key.as_str(), "method" | "headers" | "body" | "cache"))
+    {
+        return Err(runtime_error(
+            "fetch options contain an unsupported key",
+        ));
+    }
+    let method = match options.get("method").map(Value::resolve) {
+        None | Some(Value::Undefined) => "GET".to_string(),
+        Some(Value::String(method)) => method,
+        Some(_) => return Err(runtime_error("fetch method must be a string")),
+    };
+    let headers = match options.get("headers").map(Value::resolve) {
+        None | Some(Value::Undefined) | Some(Value::Null) => BTreeMap::new(),
+        Some(Value::Object(headers)) => headers
+            .borrow()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.string_value()))
+            .collect(),
+        Some(_) => return Err(runtime_error("fetch headers must be an object")),
+    };
+    let body = match options.get("body").map(Value::resolve) {
+        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
+        Some(Value::String(body)) => body.into_bytes(),
+        Some(_) => return Err(runtime_error("fetch body must be a string")),
+    };
+    let cache_mode = match options.get("cache").map(Value::resolve) {
+        None | Some(Value::Undefined) => ResourceCacheMode::Default,
+        Some(Value::String(mode)) => match mode.as_str() {
+            "default" => ResourceCacheMode::Default,
+            "no-store" => ResourceCacheMode::NoStore,
+            "reload" => ResourceCacheMode::Reload,
+            "no-cache" => ResourceCacheMode::NoCache,
+            "force-cache" => ResourceCacheMode::ForceCache,
+            "only-if-cached" => ResourceCacheMode::OnlyIfCached,
+            _ => return Err(runtime_error(format!("unsupported fetch cache mode {mode}"))),
+        },
+        Some(_) => return Err(runtime_error("fetch cache mode must be a string")),
+    };
+    Ok(FetchOptions {
+        method,
+        headers,
+        body,
+        cache_mode,
+    })
+}
 
 impl ScriptRuntime {
     fn spread_values(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {

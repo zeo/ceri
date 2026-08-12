@@ -166,8 +166,106 @@ impl Resource {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceCacheMode {
+    Default,
+    NoStore,
+    Reload,
+    NoCache,
+    ForceCache,
+    OnlyIfCached,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceRequest {
+    url: AppUrl,
+    method: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+    cache_mode: ResourceCacheMode,
+}
+
+impl ResourceRequest {
+    pub fn new(
+        url: AppUrl,
+        method: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<Self, NavigationError> {
+        let method = method.into().trim().to_ascii_uppercase();
+        if method.is_empty() || !method.bytes().all(is_http_token_byte) {
+            return Err(NavigationError::InvalidRequestMethod(method));
+        }
+        let mut normalized_headers = BTreeMap::new();
+        for (name, value) in headers {
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+                return Err(NavigationError::InvalidRequestHeader(name));
+            }
+            let value = value.trim().to_string();
+            if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0..=31 | 127)) {
+                return Err(NavigationError::InvalidRequestHeader(name));
+            }
+            normalized_headers.insert(name, value);
+        }
+        let body = body.into();
+        if matches!(method.as_str(), "GET" | "HEAD") && !body.is_empty() {
+            return Err(NavigationError::RequestBodyNotAllowed(method));
+        }
+        Ok(Self {
+            url,
+            method,
+            headers: normalized_headers,
+            body,
+            cache_mode: ResourceCacheMode::Default,
+        })
+    }
+
+    pub fn get(url: AppUrl) -> Self {
+        Self {
+            url,
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            cache_mode: ResourceCacheMode::Default,
+        }
+    }
+
+    pub fn with_cache_mode(mut self, cache_mode: ResourceCacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    pub fn url(&self) -> &AppUrl {
+        &self.url
+    }
+
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn cache_mode(&self) -> &ResourceCacheMode {
+        &self.cache_mode
+    }
+}
+
 pub trait ResourceProvider {
     fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError>;
+
+    fn provide_request(
+        &self,
+        request: &ResourceRequest,
+    ) -> Result<Option<Resource>, NavigationError> {
+        self.provide(request.url())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -284,6 +382,9 @@ pub enum NavigationError {
     DotSegment,
     EmptySegment,
     InvalidResourcePath(String),
+    InvalidRequestMethod(String),
+    InvalidRequestHeader(String),
+    RequestBodyNotAllowed(String),
     ResourceNotFound(String),
     ResourceProvider(String),
     UnsupportedMimeType { path: String, mime_type: String },
@@ -318,6 +419,15 @@ impl fmt::Display for NavigationError {
             Self::DotSegment => formatter.write_str("dot segments are not allowed in app paths"),
             Self::EmptySegment => formatter.write_str("empty path segments are not allowed"),
             Self::InvalidResourcePath(path) => write!(formatter, "invalid resource path: {path}"),
+            Self::InvalidRequestMethod(method) => {
+                write!(formatter, "invalid resource request method: {method}")
+            }
+            Self::InvalidRequestHeader(header) => {
+                write!(formatter, "invalid resource request header: {header}")
+            }
+            Self::RequestBodyNotAllowed(method) => {
+                write!(formatter, "resource request body is not allowed for {method}")
+            }
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
             Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
             Self::UnsupportedMimeType { path, mime_type } => {
@@ -1072,7 +1182,7 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => self
                 .provider
-                .map(|provider| provider.provide(&url))
+                .map(|provider| provider.provide_request(&ResourceRequest::get(url.clone())))
                 .transpose()
                 .map_err(|error| runtime_error(error.to_string()))?
                 .flatten()
@@ -1416,10 +1526,32 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::css::Color;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     struct MemoryProvider {
@@ -1439,6 +1571,25 @@ mod tests {
             Err(NavigationError::ResourceProvider(
                 "transport unavailable".to_string(),
             ))
+        }
+    }
+
+    struct RequestProvider {
+        resources: BTreeMap<String, Resource>,
+        requests: Rc<RefCell<Vec<ResourceRequest>>>,
+    }
+
+    impl ResourceProvider for RequestProvider {
+        fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(self.resources.get(url.path()).cloned())
+        }
+
+        fn provide_request(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<Resource>, NavigationError> {
+            self.requests.borrow_mut().push(request.clone());
+            self.provide(request.url())
         }
     }
 
@@ -1590,6 +1741,28 @@ mod tests {
         );
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 2);
+    }
+
+    #[test]
+    fn validates_resource_requests_before_the_provider_boundary() {
+        let url = AppUrl::parse("https://app.ceri.invalid/api").expect("request URL should parse");
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Trace".to_string(), "lab".to_string());
+        let request = ResourceRequest::new(url, "post", headers, br#"{"ok":true}"#.to_vec())
+            .expect("request should be accepted");
+        assert_eq!(request.method(), "POST");
+        assert_eq!(request.headers().get("x-trace"), Some(&"lab".to_string()));
+        assert_eq!(request.body(), br#"{"ok":true}"#);
+        assert_eq!(
+            ResourceRequest::new(
+                request.url().clone(),
+                "GET",
+                BTreeMap::new(),
+                b"body".to_vec()
+            )
+            .expect_err("GET bodies should be rejected"),
+            NavigationError::RequestBodyNotAllowed("GET".to_string())
+        );
     }
 
     #[test]
@@ -2234,6 +2407,56 @@ mod tests {
             layout.root.children[0].text[0].color,
             Color::opaque(66, 211, 180)
         );
+    }
+
+    #[test]
+    fn forwards_fetch_request_metadata_to_the_host_provider() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut provided = BTreeMap::new();
+        provided.insert(
+            "/index.html".to_string(),
+            Resource::new(
+                "text/html",
+                br#"<p id="status">idle</p><script>fetch("/api", { method: "post", headers: { "X-Trace": "lab", "Content-Type": "application/json" }, body: "{\"name\":\"ceri\"}", cache: "no-store" }).then((response) => response.text()).then((body) => { document.getElementById("status").textContent = body; });</script>"#.to_vec(),
+            ),
+        );
+        provided.insert(
+            "/api".to_string(),
+            Resource::new("application/json", br#"{"ok":true}"#.to_vec()),
+        );
+        let provider = Rc::new(RequestProvider {
+            resources: provided,
+            requests: requests.clone(),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("request-backed page should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("{\"ok\":true}")
+        );
+        let request = requests
+            .borrow()
+            .first()
+            .cloned()
+            .expect("provider should receive the fetch request");
+        assert_eq!(request.method(), "POST");
+        assert_eq!(request.headers().get("x-trace"), Some(&"lab".to_string()));
+        assert_eq!(
+            request.headers().get("content-type"),
+            Some(&"application/json".to_string())
+        );
+        assert_eq!(request.cache_mode(), &ResourceCacheMode::NoStore);
+        assert_eq!(request.body(), br#"{"name":"ceri"}"#);
     }
 
     #[test]

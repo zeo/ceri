@@ -22,6 +22,7 @@ The current slice implements:
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - an embedder-owned `ResourceProvider` fallback for documents and same-origin subresources
+- validated `ResourceRequest` metadata for provider-backed `fetch()` methods, headers, and string bodies
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
@@ -46,6 +47,8 @@ It is a headless laboratory, not a web-compatible browser. The script runtime co
 `Browser::with_resource_provider` keeps the renderer independent of transport. The engine resolves and validates the app-origin URL, checks the packaged bundle first, and asks the provider only when that bundle misses. The provider can read a signed package, a native HTTP/TLS client, or another host-owned source. It never needs to open a listener, and it cannot receive a cross-origin `AppUrl` because the URL parser rejects those references before the provider call. Extensionless document routes use the same `/index.html` shell fallback as packaged assets.
 
 Hosts can inspect `Browser::last_navigation_failure()` or `EngineHost::last_navigation_failure()` after a recovery page is installed. The diagnostic carries the app URL, HTTP-style recovery status, and typed detail. A provider transport failure becomes status 503, while missing assets remain status 404 and parser or script failures remain status 500.
+
+`fetch(url, options)` accepts the deterministic request subset needed by a native provider: `method`, an object of `headers`, a string `body`, and the standard cache modes. Header names are normalized and control characters are rejected. Packaged GET resources are resolved locally; other requests cross the `ResourceProvider::provide_request` hook with their cache mode intact. The laboratory still returns an in-memory 200 response for a provider resource, so status mapping, streaming, redirects, and TLS policy stay with the future native transport.
 
 Run the deterministic demo from the repository root:
 

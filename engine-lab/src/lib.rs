@@ -16,7 +16,7 @@ pub use host::{EngineHost, Frame, InputEvent, InputResult, PointerButton};
 pub use layout::{LayoutDocument, Rect, Size, layout};
 pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, NavigationError, NavigationFailure, NavigationStatus, Resource,
-    ResourceBundle, ResourceProvider,
+    ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
 };
 pub use paint::Canvas;
 pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};
