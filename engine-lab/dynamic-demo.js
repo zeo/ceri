@@ -1,6 +1,6 @@
 const mount = document.getElementById("mount");
-const created = document.createElement("p");
-created.className = "created";
-created.textContent = "created element is in the document";
+const created = document.createElement("section");
+created.className = "created-card";
+created.innerHTML = '<p class="created">created fragment is in the document</p>';
 mount.appendChild(created);
-console.log("dynamic element appended");
+console.log(created.innerHTML);

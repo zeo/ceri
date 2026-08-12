@@ -485,6 +485,10 @@ impl ScriptRuntime {
                         .element_attribute(&handle, "id")
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "innerHTML" => self
+                        .element_inner_html(&handle)
+                        .map(Value::String)
+                        .unwrap_or_else(|| Value::String(String::new())),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
                     "querySelector" => {
@@ -556,6 +560,7 @@ impl ScriptRuntime {
                 "textContent" => self.set_element_text_content(&handle, value),
                 "className" => self.set_element_attribute(&handle, "class", value),
                 "id" => self.set_element_attribute(&handle, "id", value),
+                "innerHTML" => self.set_element_inner_html(&handle, value)?,
                 _ => false,
             },
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
@@ -583,6 +588,13 @@ impl ScriptRuntime {
                 self.document.borrow().element_attribute(&path, name)
             }
             ElementLocation::Detached(element) => element.attr(name).map(str::to_string),
+        }
+    }
+
+    fn element_inner_html(&self, handle: &ElementHandle) -> Option<String> {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self.document.borrow().element_inner_html(&path),
+            ElementLocation::Detached(element) => Some(element.inner_html()),
         }
     }
 
@@ -627,6 +639,33 @@ impl ScriptRuntime {
                 };
                 element.attrs.insert(name.to_ascii_lowercase(), value);
                 true
+            }
+        }
+    }
+
+    fn set_element_inner_html(
+        &mut self,
+        handle: &ElementHandle,
+        source: String,
+    ) -> Result<bool, ScriptError> {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow_mut()
+                .set_element_inner_html(&path, &source)
+                .map_err(|error| runtime_error(error.to_string())),
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return Err(runtime_error(
+                        "element handle changed during innerHTML update",
+                    ));
+                };
+                element
+                    .set_inner_html(&source)
+                    .map(|()| true)
+                    .map_err(|error| runtime_error(error.to_string()))
             }
         }
     }
@@ -1851,6 +1890,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("inside")
+        );
+    }
+
+    #[test]
+    fn replaces_and_serializes_inner_html_fragments() {
+        let document = document("<main id='mount'></main><p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const mount = document.getElementById("mount");
+                const status = document.getElementById("status");
+                const card = document.createElement("article");
+                card.innerHTML = "<p class='created'>inside &amp; ready</p>";
+                mount.appendChild(card);
+                const nested = mount.querySelector(".created");
+                status.textContent = nested.textContent + "|" + card.innerHTML;
+                mount.innerHTML = "<p class='replacement'>new</p>";
+                status.textContent = mount.querySelector(".replacement").textContent + "|" + mount.innerHTML;
+                "##,
+            )
+            .expect("innerHTML mutations should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("new|<p class=\"replacement\">new</p>")
+        );
+        let mount = document
+            .borrow()
+            .find_element_by_id("mount")
+            .expect("mount should exist");
+        assert_eq!(
+            document.borrow().element_inner_html(&mount).as_deref(),
+            Some("<p class=\"replacement\">new</p>")
         );
     }
 

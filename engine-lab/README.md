@@ -15,6 +15,7 @@ The current slice implements:
 - bubbling DOM events with `type`, `target`, and `currentTarget` values
 - element attributes, inline styles, and `classList` state mutation
 - stable detached and attached element handles with `document.createElement` and `appendChild`
+- parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - same-origin relative URL resolution for external stylesheets and scripts
@@ -45,7 +46,7 @@ cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/timer-demo
 
 The first tick runs the animation frame at 16ms. The second reaches 100ms and runs the timeout. Repeating the command produces the same callbacks and pixels.
 
-The dynamic-DOM sample creates a detached element, mutates it, appends it into the document, and paints the resulting tree:
+The dynamic-DOM sample creates a detached element, fills it with an HTML fragment through `innerHTML`, appends it into the document, and paints the resulting tree:
 
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/dynamic-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-dynamic-demo.bmp --width 800 --height 360

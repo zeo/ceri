@@ -150,6 +150,23 @@ impl Document {
         Some(text)
     }
 
+    pub fn element_inner_html(&self, path: &[usize]) -> Option<String> {
+        self.element_at(path).map(Element::inner_html)
+    }
+
+    pub fn set_element_inner_html(
+        &mut self,
+        path: &[usize],
+        source: &str,
+    ) -> Result<bool, ParseError> {
+        let fragment = Self::parse(source)?;
+        let Some(element) = self.element_at_mut(path) else {
+            return Ok(false);
+        };
+        element.children = fragment.root.children;
+        Ok(true)
+    }
+
     pub fn set_element_text_content(&mut self, path: &[usize], text: String) -> bool {
         let Some(element) = self.element_at_mut(path) else {
             return false;
@@ -323,6 +340,18 @@ impl Element {
             self.remove_class(class);
         }
         enabled
+    }
+
+    pub fn inner_html(&self) -> String {
+        let mut output = String::new();
+        serialize_nodes(&self.children, &mut output);
+        output
+    }
+
+    pub fn set_inner_html(&mut self, source: &str) -> Result<(), ParseError> {
+        let fragment = Document::parse(source)?;
+        self.children = fragment.root.children;
+        Ok(())
     }
 
     pub fn style_property(&self, property: &str) -> Option<String> {
@@ -501,6 +530,58 @@ fn collect_text_nodes(element: &Element, output: &mut String) {
         match child {
             Node::Element(child) => collect_text_nodes(child, output),
             Node::Text(text) => output.push_str(text),
+        }
+    }
+}
+
+fn serialize_nodes(nodes: &[Node], output: &mut String) {
+    for node in nodes {
+        match node {
+            Node::Element(element) => serialize_element(element, output),
+            Node::Text(text) => escape_html(text, output),
+        }
+    }
+}
+
+fn serialize_element(element: &Element, output: &mut String) {
+    output.push('<');
+    output.push_str(&element.name);
+    for (name, value) in &element.attrs {
+        output.push(' ');
+        output.push_str(name);
+        output.push_str("=\"");
+        escape_html_attribute(value, output);
+        output.push('"');
+    }
+    output.push('>');
+    if is_void_element(&element.name) {
+        return;
+    }
+    serialize_nodes(&element.children, output);
+    output.push_str("</");
+    output.push_str(&element.name);
+    output.push('>');
+}
+
+fn escape_html(text: &str, output: &mut String) {
+    for character in text.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(character),
+        }
+    }
+}
+
+fn escape_html_attribute(text: &str, output: &mut String) {
+    for character in text.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '"' => output.push_str("&quot;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(character),
         }
     }
 }
