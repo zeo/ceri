@@ -1,7 +1,7 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
-    is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceCacheMode,
+    is_http_redirect, is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceCacheMode,
     ResourceProvider, ResourceRequest, ResourceResponse, APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
@@ -480,20 +480,97 @@ fn resolve_runtime_request(
         .map_err(|error| runtime_error(error.to_string()))
 }
 
-fn resolve_runtime_response(
+fn resolve_runtime_response_with_redirects(
     resources: &ResourceBundle,
     provider: Option<&dyn ResourceProvider>,
     request: &ResourceRequest,
-) -> Result<Option<ResourceResponse>, ScriptError> {
-    if request.method() == "GET"
-        && let Some(resource) = resources.resource(request.url().path()).cloned()
-    {
-        return Ok(Some(ResourceResponse::from_resource(resource)));
+    redirect_mode: FetchRedirectMode,
+) -> Result<Option<ResolvedRuntimeResponse>, ScriptError> {
+    let mut request = request.clone();
+    let mut redirected = false;
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        let response = if request.method() == "GET"
+            && let Some(resource) = resources.resource(request.url().path()).cloned()
+        {
+            Some(ResourceResponse::from_resource(resource))
+        } else {
+            provider
+                .map(|provider| provider.provide_response(&request))
+                .transpose()
+                .map(|response| response.flatten())
+                .map_err(|error| runtime_error(error.to_string()))?
+        };
+        let Some(response) = response else {
+            return Ok(None);
+        };
+        let Some(location) = response.headers().get("location") else {
+            return Ok(Some(ResolvedRuntimeResponse {
+                url: request.url().clone(),
+                response,
+                redirected,
+            }));
+        };
+        if !is_http_redirect(response.status()) {
+            return Ok(Some(ResolvedRuntimeResponse {
+                url: request.url().clone(),
+                response,
+                redirected,
+            }));
+        }
+        match redirect_mode {
+            FetchRedirectMode::Manual => {
+                return Ok(Some(ResolvedRuntimeResponse {
+                    url: request.url().clone(),
+                    response,
+                    redirected,
+                }));
+            }
+            FetchRedirectMode::Error => {
+                return Err(runtime_error("fetch redirect was rejected"));
+            }
+            FetchRedirectMode::Follow => {}
+        }
+        let target = request
+            .url()
+            .resolve(location)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        request = redirect_request(&request, target, response.status())?;
+        redirected = true;
     }
-    provider
-        .map(|provider| provider.provide_response(request))
-        .transpose()
-        .map(|response| response.flatten())
+    Err(runtime_error("fetch redirect limit exceeded"))
+}
+
+struct ResolvedRuntimeResponse {
+    url: AppUrl,
+    response: ResourceResponse,
+    redirected: bool,
+}
+
+const MAX_FETCH_REDIRECTS: usize = 16;
+
+fn redirect_request(
+    request: &ResourceRequest,
+    target: AppUrl,
+    status: u16,
+) -> Result<ResourceRequest, ScriptError> {
+    let rewrite_to_get = match status {
+        303 => !matches!(request.method(), "GET" | "HEAD"),
+        301 | 302 => request.method() == "POST",
+        _ => false,
+    };
+    let (method, body) = if rewrite_to_get {
+        ("GET", Vec::new())
+    } else {
+        (request.method(), request.body().to_vec())
+    };
+    let mut headers = request.headers().clone();
+    if rewrite_to_get {
+        headers.remove("content-length");
+        headers.remove("content-type");
+    }
+    let cache_mode = request.cache_mode().clone();
+    ResourceRequest::new(target, method, headers, body)
+        .map(|request| request.with_cache_mode(cache_mode))
         .map_err(|error| runtime_error(error.to_string()))
 }
 
@@ -652,6 +729,7 @@ struct ResponseData {
     headers: HeadersHandle,
     body: ResponseBodyHandle,
     stream: ReadableStreamHandle,
+    redirected: bool,
 }
 
 struct ResponseBodyData {
@@ -2177,6 +2255,7 @@ impl ScriptRuntime {
                 "url" => Ok(Value::String(response.url.clone())),
                 "status" => Ok(Value::Number(response.status as f64)),
                 "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
+                "redirected" => Ok(Value::Bool(response.redirected)),
                 "mimeType" => Ok(Value::String(response.mime_type.clone())),
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
@@ -3652,6 +3731,7 @@ impl ScriptRuntime {
                     response.mime_type.clone(),
                     response.headers.clone(),
                     body.bytes[body.cursor..].to_vec(),
+                    response.redirected,
                 );
                 Ok(Value::Response(Rc::new(cloned)))
             }
@@ -4322,31 +4402,33 @@ impl ScriptRuntime {
         if self.resources.is_none() && self.resource_provider.is_none() {
             return self.rejected_promise("fetch is unavailable without a resource bundle");
         }
-        let display_url = url.to_string();
         let resources = self.resources.clone().unwrap_or_default();
-        let response = match resolve_runtime_response(
+        let response = match resolve_runtime_response_with_redirects(
             &resources,
             self.resource_provider.as_deref(),
             &request,
+            options.redirect,
         ) {
             Ok(Some(response)) => response,
             Ok(None) => {
                 return self.fulfilled_promise(Value::Response(Rc::new(response_data(
-                    display_url,
+                    url.to_string(),
                     404,
                     String::new(),
                     Rc::new(BTreeMap::new()),
                     Vec::new(),
+                    false,
                 ))));
             }
             Err(error) => return self.rejected_promise(error.message),
         };
         self.fulfilled_promise(Value::Response(Rc::new(response_data(
-            display_url,
-            response.status(),
-            response.mime_type().to_string(),
-            Rc::new(response.headers().clone()),
-            response.body().to_vec(),
+            response.url.to_string(),
+            response.response.status(),
+            response.response.mime_type().to_string(),
+            Rc::new(response.response.headers().clone()),
+            response.response.body().to_vec(),
+            response.redirected,
         ))))
     }
 
@@ -4707,6 +4789,7 @@ fn response_data(
     mime_type: String,
     headers: HeadersHandle,
     bytes: Vec<u8>,
+    redirected: bool,
 ) -> ResponseData {
     let body = response_body(bytes);
     let stream = Rc::new(RefCell::new(ReadableStreamData {
@@ -4720,6 +4803,7 @@ fn response_data(
         headers,
         body,
         stream,
+        redirected,
     }
 }
 
@@ -5144,7 +5228,15 @@ struct FetchOptions {
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
     cache_mode: ResourceCacheMode,
+    redirect: FetchRedirectMode,
     signal: Option<AbortSignalHandle>,
+}
+
+#[derive(Clone, Copy)]
+enum FetchRedirectMode {
+    Follow,
+    Error,
+    Manual,
 }
 
 fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptError> {
@@ -5154,6 +5246,7 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
             headers: BTreeMap::new(),
             body: Vec::new(),
             cache_mode: ResourceCacheMode::Default,
+            redirect: FetchRedirectMode::Follow,
             signal: None,
         });
     };
@@ -5163,6 +5256,7 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
             headers: BTreeMap::new(),
             body: Vec::new(),
             cache_mode: ResourceCacheMode::Default,
+            redirect: FetchRedirectMode::Follow,
             signal: None,
         });
     }
@@ -5172,7 +5266,12 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
     let options = options.borrow();
     if options
         .keys()
-        .any(|key| !matches!(key.as_str(), "method" | "headers" | "body" | "cache" | "signal"))
+        .any(|key| {
+            !matches!(
+                key.as_str(),
+                "method" | "headers" | "body" | "cache" | "redirect" | "signal"
+            )
+        })
     {
         return Err(runtime_error(
             "fetch options contain an unsupported key",
@@ -5210,6 +5309,16 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
         },
         Some(_) => return Err(runtime_error("fetch cache mode must be a string")),
     };
+    let redirect = match options.get("redirect").map(Value::resolve) {
+        None | Some(Value::Undefined) => FetchRedirectMode::Follow,
+        Some(Value::String(mode)) => match mode.as_str() {
+            "follow" => FetchRedirectMode::Follow,
+            "error" => FetchRedirectMode::Error,
+            "manual" => FetchRedirectMode::Manual,
+            _ => return Err(runtime_error(format!("unsupported fetch redirect mode {mode}"))),
+        },
+        Some(_) => return Err(runtime_error("fetch redirect mode must be a string")),
+    };
     let signal = match options.get("signal").map(Value::resolve) {
         None | Some(Value::Undefined) | Some(Value::Null) => None,
         Some(Value::AbortSignal(signal)) => Some(signal),
@@ -5220,6 +5329,7 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
         headers,
         body,
         cache_mode,
+        redirect,
         signal,
     })
 }
@@ -6661,6 +6771,7 @@ fn token_matches(actual: &TokenKind, expected: &TokenKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::navigation::NavigationError;
 
     fn document(source: &str) -> Rc<RefCell<Document>> {
         Rc::new(RefCell::new(
@@ -6687,6 +6798,50 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| runtime_error(format!("missing module {}", url.path())))?;
             Ok((url, source))
+        }
+    }
+
+    struct RedirectFetchProvider {
+        requests: Rc<RefCell<Vec<ResourceRequest>>>,
+    }
+
+    impl ResourceProvider for RedirectFetchProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            self.requests.borrow_mut().push(request.clone());
+            match request.url().path() {
+                "/redirect" => {
+                    let mut headers = BTreeMap::new();
+                    headers.insert("Location".to_string(), "/final".to_string());
+                    ResourceResponse::new(302, "text/plain", headers, Vec::new()).map(Some)
+                }
+                "/final" => ResourceResponse::new(
+                    200,
+                    "text/plain",
+                    BTreeMap::new(),
+                    b"followed".to_vec(),
+                )
+                .map(Some),
+                "/submit" => {
+                    let mut headers = BTreeMap::new();
+                    headers.insert("Location".to_string(), "/done".to_string());
+                    ResourceResponse::new(303, "text/plain", headers, Vec::new()).map(Some)
+                }
+                "/done" => ResourceResponse::new(
+                    200,
+                    "text/plain",
+                    BTreeMap::new(),
+                    b"submitted".to_vec(),
+                )
+                .map(Some),
+                _ => Ok(None),
+            }
         }
     }
 
@@ -8119,6 +8274,131 @@ mod tests {
                 "200|true|application/json|https://app.ceri.invalid/data.json|{\"message\":\"hello\"}"
             )
         );
+    }
+
+    #[test]
+    fn fetch_follows_same_origin_redirects_and_reports_final_response_state() {
+        let document = document("<p id='status'>idle</p>");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(RedirectFetchProvider {
+            requests: requests.clone(),
+        });
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(provider),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                fetch("/redirect").then((response) => {
+                    response.text().then((body) => {
+                        document.getElementById("status").textContent = response.status + "|" + response.redirected + "|" + response.url + "|" + body;
+                    });
+                });
+                "#,
+            )
+            .expect("fetch redirect should follow");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("200|true|https://app.ceri.invalid/final|followed")
+        );
+        assert_eq!(
+            requests
+                .borrow()
+                .iter()
+                .map(|request| request.url().path())
+                .collect::<Vec<_>>(),
+            vec!["/redirect", "/final"]
+        );
+    }
+
+    #[test]
+    fn fetch_manual_and_error_redirect_modes_are_observable() {
+        let document = document("<p id='status'>idle</p>");
+        let provider = Rc::new(RedirectFetchProvider {
+            requests: Rc::new(RefCell::new(Vec::new())),
+        });
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(provider),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                fetch("/redirect", { redirect: "manual" }).then((response) => {
+                    document.getElementById("status").textContent = response.status + "|" + response.redirected + "|" + response.url;
+                    fetch("/redirect", { redirect: "error" }).catch((error) => {
+                        document.getElementById("status").textContent = document.getElementById("status").textContent + "|" + error;
+                    });
+                });
+                "#,
+            )
+            .expect("fetch redirect modes should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("302|false|https://app.ceri.invalid/redirect|fetch redirect was rejected")
+        );
+    }
+
+    #[test]
+    fn fetch_303_rewrites_post_to_get_without_a_body() {
+        let document = document("<p id='status'>idle</p>");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(RedirectFetchProvider {
+            requests: requests.clone(),
+        });
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(provider),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                fetch("/submit", { method: "post", body: "payload" }).then((response) => {
+                    response.text().then((body) => { document.getElementById("status").textContent = body; });
+                });
+                "#,
+            )
+            .expect("POST redirect should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("submitted")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests[0].method(), "POST");
+        assert_eq!(requests[0].body(), b"payload");
+        assert_eq!(requests[1].method(), "GET");
+        assert!(requests[1].body().is_empty());
     }
 
     #[test]

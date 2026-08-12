@@ -562,7 +562,7 @@ fn load_provider_resource_at(
     )))
 }
 
-fn is_http_redirect(status: u16) -> bool {
+pub(crate) fn is_http_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
