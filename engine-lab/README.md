@@ -13,6 +13,7 @@ The current slice implements:
 - layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
 - a platform-neutral `EngineHost` frame and input boundary
+- a bounded standard-library `EngineWorker` queue that owns browser state off the native event thread
 - a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - bubbling DOM events with `type`, `target`, `currentTarget`, `defaultPrevented`, and `preventDefault()`
@@ -44,7 +45,7 @@ The current slice implements:
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
-It is a headless laboratory, not a web-compatible browser. The default build keeps networking, media, full platform accessibility adapters, GPU APIs, WebAssembly, and the operating-system window outside this slice. The optional `native-http` feature adds a Rust-native HTTPS `ResourceProvider` with platform certificate verification, bounded redirects, connection reuse, proxy environment support, and a 30-second request timeout. Its API is blocking, so hosts must install it behind their own worker or navigation queue before attaching it to a UI event loop.
+It is a headless laboratory, not a web-compatible browser. The default build keeps networking, media, full platform accessibility adapters, GPU APIs, WebAssembly, and the operating-system window outside this slice. The optional `native-http` feature adds a Rust-native HTTPS `ResourceProvider` with platform certificate verification, bounded redirects, connection reuse, proxy environment support, and a 30-second request timeout. Its API is blocking, so the native window adapter uses `EngineWorker` to keep browser state and provider calls off the UI event thread. The worker queue is bounded and drops new input when saturated instead of growing without limit.
 
 `Browser::with_resource_provider` keeps the renderer independent of transport. The engine resolves and validates the app-origin URL, checks the packaged bundle first, and asks the provider only when that bundle misses. The provider can read a signed package, a native HTTP/TLS client, or another host-owned source. It never needs to open a listener, and it cannot receive a cross-origin `AppUrl` because the URL parser rejects those references before the provider call. Extensionless document routes use the same `/index.html` shell fallback as packaged assets.
 
@@ -175,7 +176,7 @@ To load a remote app through the Rust-native HTTPS provider, pass an HTTPS base 
 cargo run --manifest-path engine-lab/Cargo.toml --features "windowed native-http" --bin ceri-engine-window -- --native-base https://example.com/app
 ```
 
-The remote mode maps `https://app.ceri.invalid/` into the supplied base, follows bounded same-origin redirects, and never opens a listener. The provider is blocking, so the current lab performs network work on the host call that loads or dispatches the page. A production window adapter must move those calls behind its navigation or worker queue before presenting a busy UI.
+The remote mode maps `https://app.ceri.invalid/` into the supplied base, follows bounded same-origin redirects, and never opens a listener. The windowed remote mode constructs the provider and browser on `EngineWorker`, then queues navigation, input, and frame work across a bounded channel. The native event thread can continue receiving window messages while a provider request is in flight.
 
 The adapter is an integration slice for Windows, macOS, and Linux desktop surfaces. It does not claim browser compatibility, mobile support, or a complete cross-platform release until those targets have their own build and runtime checks.
 

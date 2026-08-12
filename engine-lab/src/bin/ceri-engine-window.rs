@@ -1,5 +1,6 @@
 use ceri_engine_lab::{
-    APP_ORIGIN, Browser, EngineHost, InputEvent, PointerButton, ResourceBundle, Size,
+    APP_ORIGIN, Browser, EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent,
+    PointerButton, ResourceBundle, Size,
 };
 #[cfg(feature = "native-http")]
 use ceri_engine_lab::NativeHttpProvider;
@@ -17,7 +18,7 @@ use winit::window::{Window, WindowId};
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
 struct App {
-    host: EngineHost,
+    backend: WindowBackend,
     context: Context<OwnedDisplayHandle>,
     window: Option<Rc<Window>>,
     surface: Option<WindowSurface>,
@@ -25,10 +26,25 @@ struct App {
     last_tick: Instant,
 }
 
+#[cfg_attr(not(feature = "native-http"), allow(dead_code))]
+enum WindowBackend {
+    Direct(Box<EngineHost>),
+    Worker(WorkerBackend),
+}
+
+struct WorkerBackend {
+    worker: EngineWorker,
+    navigation_pending: bool,
+    time_request: Option<u64>,
+    render_request: Option<u64>,
+    latest_frame: Option<Frame>,
+    viewport: Size,
+}
+
 impl App {
-    fn new(context: Context<OwnedDisplayHandle>, host: EngineHost) -> Self {
+    fn new(context: Context<OwnedDisplayHandle>, backend: WindowBackend) -> Self {
         Self {
-            host,
+            backend,
             context,
             window: None,
             surface: None,
@@ -44,22 +60,123 @@ impl App {
     }
 
     fn submit(&mut self, event_loop: &ActiveEventLoop, event: InputEvent) -> bool {
-        match self.host.input(event) {
-            Ok(result) => {
-                if result.frame_requested {
-                    self.request_redraw();
+        let is_clock_tick = matches!(event, InputEvent::AdvanceTime(_));
+        let resize = match &event {
+            InputEvent::Resize(viewport) => Some(*viewport),
+            _ => None,
+        };
+        let mut request_redraw = false;
+        let accepted = match &mut self.backend {
+            WindowBackend::Direct(host) => match host.input(event) {
+                Ok(result) => {
+                    request_redraw = result.frame_requested;
+                    true
                 }
-                true
+                Err(error) => {
+                    eprintln!("engine input failed: {error}");
+                    event_loop.exit();
+                    false
+                }
+            },
+            WindowBackend::Worker(worker) => {
+                if is_clock_tick && worker.time_request.is_some() {
+                    return true;
+                }
+                match worker.worker.input(event) {
+                    Ok(request_id) => {
+                        if is_clock_tick {
+                            worker.time_request = Some(request_id);
+                        }
+                        if let Some(viewport) = resize {
+                            worker.viewport = viewport;
+                        }
+                        request_redraw = true;
+                        true
+                    }
+                    Err(error) if error == "engine worker queue is full" => {
+                        eprintln!("engine input dropped: {error}");
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("engine input failed: {error}");
+                        event_loop.exit();
+                        false
+                    }
+                }
             }
-            Err(error) => {
-                eprintln!("engine input failed: {error}");
-                event_loop.exit();
-                false
+        };
+        if request_redraw {
+            self.request_redraw();
+        }
+        accepted
+    }
+
+    fn poll_worker(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let mut request_redraw = false;
+        let mut failed = false;
+        if let WindowBackend::Worker(worker) = &mut self.backend {
+            for event in worker.worker.poll() {
+                match event {
+                    EngineWorkerEvent::Navigated { result, .. } => {
+                        worker.navigation_pending = false;
+                        if let Err(error) = result {
+                            eprintln!("engine navigation failed: {error}");
+                            failed = true;
+                        } else {
+                            request_redraw = true;
+                        }
+                    }
+                    EngineWorkerEvent::Input {
+                        request_id,
+                        result,
+                    } => {
+                        if worker.time_request == Some(request_id) {
+                            worker.time_request = None;
+                        }
+                        if let Err(error) = result {
+                            eprintln!("engine input failed: {error}");
+                            failed = true;
+                        } else {
+                            request_redraw = true;
+                        }
+                    }
+                    EngineWorkerEvent::Frame {
+                        request_id,
+                        result,
+                    } => {
+                        if worker.render_request == Some(request_id) {
+                            worker.render_request = None;
+                        }
+                        match result {
+                            Ok(frame) => {
+                                worker.latest_frame = frame;
+                                request_redraw = worker.latest_frame.is_some();
+                            }
+                            Err(error) => {
+                                eprintln!("engine render failed: {error}");
+                                failed = true;
+                            }
+                        }
+                    }
+                    EngineWorkerEvent::Accessibility { .. }
+                    | EngineWorkerEvent::NavigationFailure { .. } => {}
+                }
             }
         }
+        if failed {
+            event_loop.exit();
+            return false;
+        }
+        if request_redraw {
+            self.request_redraw();
+        }
+        true
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.poll_worker(event_loop) {
+            return;
+        }
         let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
             return;
         };
@@ -70,10 +187,18 @@ impl App {
             width: size.width as f32,
             height: size.height as f32,
         };
-        if self.host.viewport() != viewport
-            && !self.submit(event_loop, InputEvent::Resize(viewport))
-        {
-            return;
+        match &self.backend {
+            WindowBackend::Direct(host) if host.viewport() != viewport => {
+                if !self.submit(event_loop, InputEvent::Resize(viewport)) {
+                    return;
+                }
+            }
+            WindowBackend::Worker(worker) if worker.viewport != viewport => {
+                if !self.submit(event_loop, InputEvent::Resize(viewport)) {
+                    return;
+                }
+            }
+            _ => {}
         }
         let Some(surface) = &mut self.surface else {
             return;
@@ -88,13 +213,37 @@ impl App {
             event_loop.exit();
             return;
         }
-        let frame = match self.host.render() {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("engine render failed: {error}");
-                event_loop.exit();
-                return;
+        let frame = match &mut self.backend {
+            WindowBackend::Direct(host) => match host.render() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("engine render failed: {error}");
+                    event_loop.exit();
+                    return;
+                }
+            },
+            WindowBackend::Worker(worker) => {
+                if worker.navigation_pending {
+                    return;
+                }
+                if worker.render_request.is_none() {
+                    match worker.worker.render() {
+                        Ok(request_id) => worker.render_request = Some(request_id),
+                        Err(error) => {
+                            eprintln!("engine render queue failed: {error}");
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                }
+                let Some(frame) = worker.latest_frame.take() else {
+                    return;
+                };
+                if frame.viewport != viewport {
+                    return;
+                }
+                frame
             }
         };
         let mut buffer = match surface.buffer_mut() {
@@ -235,11 +384,20 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.poll_worker(event_loop) {
+            return;
+        }
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
         let milliseconds = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        if milliseconds > 0 {
+        let can_tick = match &self.backend {
+            WindowBackend::Direct(_) => true,
+            WindowBackend::Worker(worker) => {
+                !worker.navigation_pending && worker.time_request.is_none()
+            }
+        };
+        if milliseconds > 0 && can_tick {
             self.submit(event_loop, InputEvent::AdvanceTime(milliseconds));
         }
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
@@ -250,13 +408,30 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<(), String> {
     let native_base = parse_native_base(env::args().skip(1))?;
-    let mut resources = ResourceBundle::from_directory(env!("CARGO_MANIFEST_DIR"))
-        .map_err(|error| format!("could not load engine-lab resources: {error}"))?;
-    let browser = if let Some(base) = native_base {
+    let viewport = Size {
+        width: 800.0,
+        height: 520.0,
+    };
+    let backend = if let Some(base) = native_base {
         #[cfg(feature = "native-http")]
         {
-            let provider = NativeHttpProvider::new(base).map_err(|error| error.to_string())?;
-            Browser::with_resource_provider(ResourceBundle::default(), Rc::new(provider))
+            let mut worker = EngineWorker::spawn(viewport, move || {
+                let provider =
+                    NativeHttpProvider::new(base).map_err(|error| error.to_string())?;
+                Ok(Browser::with_resource_provider(
+                    ResourceBundle::default(),
+                    Rc::new(provider),
+                ))
+            })?;
+            worker.navigate(format!("{APP_ORIGIN}/"))?;
+            WindowBackend::Worker(WorkerBackend {
+                worker,
+                navigation_pending: true,
+                time_request: None,
+                render_request: None,
+                latest_frame: None,
+                viewport,
+            })
         }
         #[cfg(not(feature = "native-http"))]
         {
@@ -267,6 +442,8 @@ fn main() -> Result<(), String> {
             );
         }
     } else {
+        let mut resources = ResourceBundle::from_directory(env!("CARGO_MANIFEST_DIR"))
+            .map_err(|error| format!("could not load engine-lab resources: {error}"))?;
         resources
             .insert(
                 "/index.html",
@@ -274,22 +451,16 @@ fn main() -> Result<(), String> {
                 include_bytes!("../../demo.html").to_vec(),
             )
             .map_err(|error| error.to_string())?;
-        Browser::new(resources)
+        let mut host = EngineHost::new(Browser::new(resources), viewport);
+        host.navigate(&format!("{APP_ORIGIN}/"))
+            .map_err(|error| error.to_string())?;
+        WindowBackend::Direct(Box::new(host))
     };
-    let mut host = EngineHost::new(
-        browser,
-        Size {
-            width: 800.0,
-            height: 520.0,
-        },
-    );
-    host.navigate(&format!("{APP_ORIGIN}/"))
-        .map_err(|error| error.to_string())?;
 
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let context =
         Context::new(event_loop.owned_display_handle()).map_err(|error| error.to_string())?;
-    let mut app = App::new(context, host);
+    let mut app = App::new(context, backend);
     event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string())
@@ -315,7 +486,7 @@ where
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-window [--native-base HTTPS_URL]\n\nWithout --native-base, the packaged engine-lab demo is shown. With it, the window loads the app origin through the optional native HTTPS provider."
+                    "usage: ceri-engine-window [--native-base HTTPS_URL]\n\nWithout --native-base, the packaged engine-lab demo is shown. With it, EngineWorker loads the app origin through the optional native HTTPS provider."
                 );
                 std::process::exit(0);
             }

@@ -2,6 +2,8 @@ use crate::layout::Size;
 use crate::navigation::{Browser, NavigationError, NavigationFailure, NavigationStatus};
 use crate::paint::Canvas;
 use crate::AccessibilityNode;
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::thread;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
@@ -60,6 +62,190 @@ pub struct EngineHost {
     viewport: Size,
     next_frame: u64,
     dirty: bool,
+}
+
+#[derive(Debug)]
+pub enum EngineWorkerEvent {
+    Navigated {
+        request_id: u64,
+        result: Result<NavigationStatus, NavigationError>,
+    },
+    Input {
+        request_id: u64,
+        result: Result<InputResult, NavigationError>,
+    },
+    Frame {
+        request_id: u64,
+        result: Result<Option<Frame>, NavigationError>,
+    },
+    Accessibility {
+        request_id: u64,
+        tree: Option<AccessibilityNode>,
+    },
+    NavigationFailure {
+        request_id: u64,
+        failure: Option<NavigationFailure>,
+    },
+}
+
+enum EngineWorkerCommand {
+    Navigate { request_id: u64, url: String },
+    Input {
+        request_id: u64,
+        event: InputEvent,
+    },
+    Render { request_id: u64 },
+    Accessibility { request_id: u64 },
+    NavigationFailure { request_id: u64 },
+    Shutdown,
+}
+
+pub struct EngineWorker {
+    commands: SyncSender<EngineWorkerCommand>,
+    events: Receiver<EngineWorkerEvent>,
+    next_request_id: u64,
+}
+
+impl EngineWorker {
+    pub fn spawn<F>(viewport: Size, factory: F) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<Browser, String> + Send + 'static,
+    {
+        let (commands, command_receiver) = mpsc::sync_channel(64);
+        let (events, event_receiver) = mpsc::channel();
+        let (ready, ready_receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("ceri-engine".to_string())
+            .spawn(move || {
+                let browser = match factory() {
+                    Ok(browser) => browser,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = ready.send(Ok(()));
+                run_engine_worker(
+                    EngineHost::new(browser, viewport),
+                    command_receiver,
+                    events,
+                );
+            })
+            .map_err(|error| format!("could not start engine worker: {error}"))?;
+        match ready_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                commands,
+                events: event_receiver,
+                next_request_id: 1,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("engine worker stopped during initialization".to_string()),
+        }
+    }
+
+    pub fn navigate(&mut self, url: impl Into<String>) -> Result<u64, String> {
+        let request_id = self.next_request();
+        self.queue(EngineWorkerCommand::Navigate {
+            request_id,
+            url: url.into(),
+        })?;
+        Ok(request_id)
+    }
+
+    pub fn input(&mut self, event: InputEvent) -> Result<u64, String> {
+        let request_id = self.next_request();
+        self.queue(EngineWorkerCommand::Input { request_id, event })?;
+        Ok(request_id)
+    }
+
+    pub fn render(&mut self) -> Result<u64, String> {
+        let request_id = self.next_request();
+        self.queue(EngineWorkerCommand::Render { request_id })?;
+        Ok(request_id)
+    }
+
+    pub fn accessibility_tree(&mut self) -> Result<u64, String> {
+        let request_id = self.next_request();
+        self.queue(EngineWorkerCommand::Accessibility { request_id })?;
+        Ok(request_id)
+    }
+
+    pub fn last_navigation_failure(&mut self) -> Result<u64, String> {
+        let request_id = self.next_request();
+        self.queue(EngineWorkerCommand::NavigationFailure { request_id })?;
+        Ok(request_id)
+    }
+
+    pub fn poll(&self) -> Vec<EngineWorkerEvent> {
+        self.events.try_iter().collect()
+    }
+
+    pub fn wait(&self) -> Result<EngineWorkerEvent, String> {
+        self.events
+            .recv()
+            .map_err(|_| "engine worker stopped".to_string())
+    }
+
+    pub fn shutdown(self) {
+        let _ = self.commands.try_send(EngineWorkerCommand::Shutdown);
+    }
+
+    fn queue(&self, command: EngineWorkerCommand) -> Result<(), String> {
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("engine worker queue is full".to_string()),
+            Err(TrySendError::Disconnected(_)) => {
+                Err("engine worker is unavailable".to_string())
+            }
+        }
+    }
+
+    fn next_request(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        request_id
+    }
+}
+
+fn run_engine_worker(
+    mut host: EngineHost,
+    commands: Receiver<EngineWorkerCommand>,
+    events: Sender<EngineWorkerEvent>,
+) {
+    while let Ok(command) = commands.recv() {
+        let event = match command {
+            EngineWorkerCommand::Navigate { request_id, url } => {
+                EngineWorkerEvent::Navigated {
+                    request_id,
+                    result: host.navigate(&url),
+                }
+            }
+            EngineWorkerCommand::Input { request_id, event } => EngineWorkerEvent::Input {
+                request_id,
+                result: host.input(event),
+            },
+            EngineWorkerCommand::Render { request_id } => EngineWorkerEvent::Frame {
+                request_id,
+                result: host.render(),
+            },
+            EngineWorkerCommand::Accessibility { request_id } => {
+                EngineWorkerEvent::Accessibility {
+                    request_id,
+                    tree: host.accessibility_tree(),
+                }
+            }
+            EngineWorkerCommand::NavigationFailure { request_id } => {
+                EngineWorkerEvent::NavigationFailure {
+                    request_id,
+                    failure: host.last_navigation_failure().cloned(),
+                }
+            }
+            EngineWorkerCommand::Shutdown => break,
+        };
+        if events.send(event).is_err() {
+            break;
+        }
+    }
 }
 
 impl EngineHost {
@@ -186,7 +372,14 @@ impl EngineHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::navigation::ResourceBundle;
+    use crate::navigation::{
+        AppUrl, Resource, ResourceBundle, ResourceProvider, ResourceRequest, ResourceResponse,
+        APP_ORIGIN,
+    };
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::thread::ThreadId;
 
     fn bundle(source: &str) -> ResourceBundle {
         let mut resources = ResourceBundle::default();
@@ -198,6 +391,34 @@ mod tests {
             )
             .expect("HTML resource should be accepted");
         resources
+    }
+
+    struct ThreadRecordingProvider {
+        thread: Arc<Mutex<Option<ThreadId>>>,
+    }
+
+    impl ResourceProvider for ThreadRecordingProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            *self.thread.lock().expect("thread marker should not be poisoned") =
+                Some(std::thread::current().id());
+            if request.url().path() != "/" {
+                return Ok(None);
+            }
+            ResourceResponse::new(
+                200,
+                "text/html",
+                BTreeMap::new(),
+                b"<main><p id='status'>worker</p></main>".to_vec(),
+            )
+            .map(Some)
+        }
     }
 
     #[test]
@@ -426,5 +647,93 @@ mod tests {
             "/"
         );
         assert!(host.render().expect("history frame should render").is_some());
+    }
+
+    #[test]
+    fn worker_keeps_blocking_resource_work_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let provider_thread = Arc::new(Mutex::new(None));
+        let marker = provider_thread.clone();
+        let mut worker = EngineWorker::spawn(
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+            move || {
+                Ok(Browser::with_resource_provider(
+                    ResourceBundle::default(),
+                    Rc::new(ThreadRecordingProvider { thread: marker }),
+                ))
+            },
+        )
+        .expect("engine worker should start");
+        let request_id = worker
+            .navigate(format!("{APP_ORIGIN}/"))
+            .expect("navigation should queue");
+        match worker.wait().expect("worker should report navigation") {
+            EngineWorkerEvent::Navigated {
+                request_id: completed,
+                result,
+            } => {
+                assert_eq!(completed, request_id);
+                assert_eq!(result.expect("navigation should load"), NavigationStatus::Loaded);
+            }
+            other => panic!("unexpected worker event: {other:?}"),
+        }
+        let provider_thread = provider_thread
+            .lock()
+            .expect("thread marker should not be poisoned")
+            .expect("provider should record its thread");
+        assert_ne!(provider_thread, caller);
+        worker.shutdown();
+    }
+
+    #[test]
+    fn worker_preserves_command_order_and_returns_frames() {
+        let mut worker = EngineWorker::spawn(
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+            move || {
+                Ok(Browser::new(bundle(
+                    "<button id='go' style='display: block; width: 100px; height: 30px'>go</button>",
+                )))
+            },
+        )
+        .expect("engine worker should start");
+        let navigate = worker
+            .navigate(format!("{APP_ORIGIN}/"))
+            .expect("navigation should queue");
+        let input = worker
+            .input(InputEvent::Click { x: 4.0, y: 4.0 })
+            .expect("input should queue");
+        let render = worker.render().expect("render should queue");
+
+        let first = worker.wait().expect("navigation event should arrive");
+        let second = worker.wait().expect("input event should arrive");
+        let third = worker.wait().expect("frame event should arrive");
+        assert!(matches!(
+            first,
+            EngineWorkerEvent::Navigated {
+                request_id,
+                result: Ok(NavigationStatus::Loaded)
+            } if request_id == navigate
+        ));
+        assert!(matches!(
+            second,
+            EngineWorkerEvent::Input {
+                request_id,
+                result: Ok(InputResult { handled: true, .. })
+            } if request_id == input
+        ));
+        assert!(matches!(
+            third,
+            EngineWorkerEvent::Frame {
+                request_id,
+                result: Ok(Some(Frame { sequence: 1, .. }))
+            } if request_id == render
+        ));
+        worker.shutdown();
     }
 }
