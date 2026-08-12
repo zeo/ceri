@@ -24,7 +24,7 @@ The current slice implements:
 - an embedder-owned `ResourceProvider` fallback for documents and same-origin subresources
 - validated `ResourceRequest` metadata for provider-backed `fetch()` methods, headers, and string bodies
 - same-origin relative URL resolution for external stylesheets and scripts
-- packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
+- packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, JSON values, normalized headers, and deterministic `AbortController` preflight cancellation
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
 - app-origin `localStorage` and `sessionStorage` key/value stores shared across full-document navigations in one browser session
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
@@ -49,7 +49,7 @@ It is a headless laboratory, not a web-compatible browser. The script runtime co
 
 Hosts can inspect `Browser::last_navigation_failure()` or `EngineHost::last_navigation_failure()` after a recovery page is installed. The diagnostic carries the app URL, HTTP-style recovery status, and typed detail. A provider transport failure becomes status 503, while missing assets remain status 404 and parser or script failures remain status 500.
 
-`fetch(url, options)` accepts the deterministic request subset needed by a native provider: `method`, an object of `headers`, a string `body`, and the standard cache modes. Header names are normalized and control characters are rejected. Packaged GET resources are resolved locally; other requests cross the `ResourceProvider::provide_response` hook with their cache mode intact. The page can read the provider's status, MIME type, and normalized headers through the response. Streaming, redirects, and TLS policy stay with the future native transport.
+`fetch(url, options)` accepts the deterministic request subset needed by a native provider: `method`, an object of `headers`, a string `body`, the standard cache modes, and an `AbortSignal`. Header names are normalized and control characters are rejected. Packaged GET resources are resolved locally; other requests cross the `ResourceProvider::provide_response` hook with their cache mode intact. The page can read the provider's status, MIME type, and normalized headers through the response. An aborted signal rejects before the provider is called, and listeners receive one deterministic `abort` event. Streaming, redirects, and TLS policy stay with the future native transport.
 
 Run the deterministic demo from the repository root:
 
@@ -174,7 +174,7 @@ The fetch demo exercises an app-owned resource without opening a listener:
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/fetch-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-fetch-demo.bmp
 ```
 
-This first fetch slice is deterministic and limited to same-origin resources supplied by the packaged bundle or `ResourceProvider`. It returns a promise with `then()` and `catch()` and a response with `status`, `ok`, `url`, `mimeType`, promise-returning `text()`, and promise-returning `json()`. The runtime supports basic JSON objects, arrays, property access, numeric indexes, `JSON.parse`, and deterministic `JSON.stringify`. Microtasks drain after each script turn and clock advance. Missing resources resolve with status 404, while rejected origins reject the promise. A concrete network provider, streaming bodies, request methods, and broader JavaScript object semantics remain separate compatibility gates.
+This first fetch slice is deterministic and limited to same-origin resources supplied by the packaged bundle or `ResourceProvider`. It returns a promise with `then()` and `catch()` and a response with `status`, `ok`, `url`, `mimeType`, normalized `headers`, promise-returning `text()`, and promise-returning `json()`. `AbortController` and `AbortSignal` expose abort state, structured reasons, event listeners, `throwIfAborted()`, and preflight fetch rejection. The runtime supports basic JSON objects, arrays, property access, numeric indexes, `JSON.parse`, and deterministic `JSON.stringify`. Microtasks drain after each script turn and clock advance. Missing resources resolve with status 404, while rejected origins reject the promise. A concrete network provider, streaming bodies, redirects, TLS policy, and broader JavaScript object semantics remain separate compatibility gates.
 
 The navigation demo exercises link default actions and `Location.replace()` across packaged pages:
 

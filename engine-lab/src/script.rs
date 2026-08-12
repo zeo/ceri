@@ -32,6 +32,8 @@ type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
 pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
 type FormDataHandle = Rc<RefCell<FormDataData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
+type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
+type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -85,6 +87,8 @@ enum Value {
     Storage(StorageHandle),
     FormData(FormDataHandle),
     CanvasContext(CanvasContextHandle),
+    AbortController(AbortControllerHandle),
+    AbortSignal(AbortSignalHandle),
     Console,
     Json,
     UrlConstructor,
@@ -94,6 +98,7 @@ enum Value {
     SetConstructor,
     ErrorConstructor,
     PromiseConstructor,
+    AbortControllerConstructor,
     NumberNamespace,
     ArrayNamespace,
     ObjectNamespace,
@@ -190,6 +195,9 @@ enum Builtin {
     HeadersGet(HeadersHandle),
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
+    AbortControllerAbort(AbortControllerHandle),
+    AbortSignalAddEventListener(AbortSignalHandle),
+    AbortSignalThrowIfAborted(AbortSignalHandle),
 }
 
 struct Function {
@@ -587,6 +595,16 @@ struct CanvasContextData {
     fill_style: Color,
 }
 
+struct AbortSignalData {
+    aborted: bool,
+    reason: Option<Value>,
+    listeners: Vec<Value>,
+}
+
+struct AbortControllerData {
+    signal: AbortSignalHandle,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NavigationRequest {
     Navigate {
@@ -792,6 +810,10 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("Promise".to_string(), Value::PromiseConstructor);
+            values.values.insert(
+                "AbortController".to_string(),
+                Value::AbortControllerConstructor,
+            );
             values
                 .values
                 .insert("Set".to_string(), Value::SetConstructor);
@@ -1848,6 +1870,7 @@ impl ScriptRuntime {
                 "console" => Ok(Value::Console),
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
                 "JSON" => Ok(Value::Json),
+                "AbortController" => Ok(Value::AbortControllerConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
@@ -2090,6 +2113,30 @@ impl ScriptRuntime {
                 "clearRect" => Ok(Value::Builtin(Builtin::CanvasClearRect(context))),
                 _ => Err(runtime_error(format!(
                     "CanvasRenderingContext2D has no property {property}"
+                ))),
+            },
+            Value::AbortController(controller) => match property {
+                "signal" => Ok(Value::AbortSignal(controller.borrow().signal.clone())),
+                "abort" => Ok(Value::Builtin(Builtin::AbortControllerAbort(controller))),
+                _ => Err(runtime_error(format!(
+                    "AbortController has no property {property}"
+                ))),
+            },
+            Value::AbortSignal(signal) => match property {
+                "aborted" => Ok(Value::Bool(signal.borrow().aborted)),
+                "reason" => Ok(signal
+                    .borrow()
+                    .reason
+                    .clone()
+                    .unwrap_or(Value::Undefined)),
+                "addEventListener" => Ok(Value::Builtin(
+                    Builtin::AbortSignalAddEventListener(signal),
+                )),
+                "throwIfAborted" => Ok(Value::Builtin(
+                    Builtin::AbortSignalThrowIfAborted(signal),
+                )),
+                _ => Err(runtime_error(format!(
+                    "AbortSignal has no property {property}"
                 ))),
             },
             Value::Response(response) => match property {
@@ -2571,6 +2618,7 @@ impl ScriptRuntime {
             Value::SetConstructor => self.construct_set(arguments),
             Value::ErrorConstructor => Ok(self.construct_error(arguments)),
             Value::PromiseConstructor => self.construct_promise(arguments),
+            Value::AbortControllerConstructor => Ok(self.construct_abort_controller()),
             Value::StringConstructor => Ok(Value::String(
                 arguments
                     .first()
@@ -2833,6 +2881,15 @@ impl ScriptRuntime {
             self.call(executor.clone(), vec![resolve, reject])?;
         }
         Ok(Value::Promise(promise))
+    }
+
+    fn construct_abort_controller(&self) -> Value {
+        let signal = Rc::new(RefCell::new(AbortSignalData {
+            aborted: false,
+            reason: None,
+            listeners: Vec::new(),
+        }));
+        Value::AbortController(Rc::new(RefCell::new(AbortControllerData { signal })))
     }
 
     fn submit_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
@@ -3520,6 +3577,52 @@ impl ScriptRuntime {
                     Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
                 }
             }
+            Builtin::AbortControllerAbort(controller) => {
+                let reason = arguments
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(abort_error_value);
+                let signal = controller.borrow().signal.clone();
+                let listeners = {
+                    let mut signal = signal.borrow_mut();
+                    if signal.aborted {
+                        return Ok(Value::Undefined);
+                    }
+                    signal.aborted = true;
+                    signal.reason = Some(reason);
+                    std::mem::take(&mut signal.listeners)
+                };
+                for listener in listeners {
+                    self.call(listener, vec![abort_event_value()])?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::AbortSignalAddEventListener(signal) => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                if event != "abort" {
+                    return Err(runtime_error(
+                        "AbortSignal only supports abort event listeners",
+                    ));
+                }
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error("AbortSignal listener must be a function"));
+                }
+                if !signal.borrow().aborted {
+                    signal.borrow_mut().listeners.push(callback);
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::AbortSignalThrowIfAborted(signal) => {
+                if let Some(reason) = signal.borrow().reason.clone() {
+                    self.pending_exception = Some(error_handle(&reason));
+                    return Err(runtime_error(reason.string_value()));
+                }
+                Ok(Value::Undefined)
+            }
             Builtin::SetTimeout => self.schedule_task(arguments, TaskKind::Timeout),
             Builtin::ClearTimeout => {
                 let id = arguments
@@ -3997,6 +4100,14 @@ impl ScriptRuntime {
             Ok(options) => options,
             Err(error) => return self.rejected_promise(error.message),
         };
+        if let Some(signal) = options.signal.as_ref() {
+            let signal = signal.borrow();
+            if signal.aborted {
+                return self.rejected_promise_value(
+                    signal.reason.clone().unwrap_or_else(abort_error_value),
+                );
+            }
+        }
         let request = match ResourceRequest::new(
             url.clone(),
             options.method,
@@ -4312,6 +4423,8 @@ impl Value {
             Self::Storage(_) => "[object Storage]".to_string(),
             Self::FormData(_) => "[object FormData]".to_string(),
             Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
+            Self::AbortController(_) => "[object AbortController]".to_string(),
+            Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
@@ -4322,6 +4435,7 @@ impl Value {
             Self::SetConstructor => "[function Set]".to_string(),
             Self::ErrorConstructor => "[function Error]".to_string(),
             Self::PromiseConstructor => "[function Promise]".to_string(),
+            Self::AbortControllerConstructor => "[function AbortController]".to_string(),
             Self::NumberNamespace => "[function Number]".to_string(),
             Self::ArrayNamespace => "[function Array]".to_string(),
             Self::ObjectNamespace => "[function Object]".to_string(),
@@ -4343,6 +4457,22 @@ impl Value {
             _ => self.string_value(),
         }
     }
+}
+
+fn abort_error_value() -> Value {
+    Value::Error(Rc::new(ErrorData {
+        name: "AbortError".to_string(),
+        message: "The operation was aborted".to_string(),
+        code: None,
+        class_name: "Error".to_string(),
+    }))
+}
+
+fn abort_event_value() -> Value {
+    let mut event = BTreeMap::new();
+    event.insert("type".to_string(), Value::String("abort".to_string()));
+    event.insert("defaultPrevented".to_string(), Value::Bool(false));
+    Value::Object(Rc::new(RefCell::new(event)))
 }
 
 fn serialize_json(value: &Value) -> Result<String, ScriptError> {
@@ -4669,6 +4799,8 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Storage(_)
         | Value::FormData(_)
         | Value::CanvasContext(_)
+        | Value::AbortController(_)
+        | Value::AbortSignal(_)
         | Value::Console
         | Value::Json
         | Value::Error(_) => "object",
@@ -4686,6 +4818,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::SetConstructor
         | Value::ErrorConstructor
         | Value::PromiseConstructor
+        | Value::AbortControllerConstructor
         | Value::NumberNamespace
         | Value::ArrayNamespace
         | Value::ObjectNamespace
@@ -4726,6 +4859,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
+        (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
+        (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -4741,6 +4876,7 @@ struct FetchOptions {
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
     cache_mode: ResourceCacheMode,
+    signal: Option<AbortSignalHandle>,
 }
 
 fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptError> {
@@ -4750,6 +4886,7 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
             headers: BTreeMap::new(),
             body: Vec::new(),
             cache_mode: ResourceCacheMode::Default,
+            signal: None,
         });
     };
     if matches!(options, Value::Undefined | Value::Null) {
@@ -4758,6 +4895,7 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
             headers: BTreeMap::new(),
             body: Vec::new(),
             cache_mode: ResourceCacheMode::Default,
+            signal: None,
         });
     }
     let Value::Object(options) = options else {
@@ -4766,7 +4904,7 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
     let options = options.borrow();
     if options
         .keys()
-        .any(|key| !matches!(key.as_str(), "method" | "headers" | "body" | "cache"))
+        .any(|key| !matches!(key.as_str(), "method" | "headers" | "body" | "cache" | "signal"))
     {
         return Err(runtime_error(
             "fetch options contain an unsupported key",
@@ -4804,11 +4942,17 @@ fn parse_fetch_options(options: Option<&Value>) -> Result<FetchOptions, ScriptEr
         },
         Some(_) => return Err(runtime_error("fetch cache mode must be a string")),
     };
+    let signal = match options.get("signal").map(Value::resolve) {
+        None | Some(Value::Undefined) | Some(Value::Null) => None,
+        Some(Value::AbortSignal(signal)) => Some(signal),
+        Some(_) => return Err(runtime_error("fetch signal must be an AbortSignal")),
+    };
     Ok(FetchOptions {
         method,
         headers,
         body,
         cache_mode,
+        signal,
     })
 }
 
@@ -7706,6 +7850,78 @@ mod tests {
             Some(
                 "200|true|application/json|https://app.ceri.invalid/data.json|{\"message\":\"hello\"}"
             )
+        );
+    }
+
+    #[test]
+    fn abort_controller_dispatches_abort_and_rejects_preflight_fetch() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"ready".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const controller = new AbortController();
+                const signal = controller.signal;
+                signal.addEventListener("abort", (event) => {
+                    status.textContent = event.type + "|" + signal.aborted + "|" + signal.reason.name + "|" + signal.reason.message;
+                });
+                controller.abort();
+                try {
+                    signal.throwIfAborted();
+                } catch (error) {
+                    status.textContent = status.textContent + "|" + error.name + "|" + error.message;
+                }
+                fetch("/data.txt", { signal: signal }).catch((error) => {
+                    status.textContent = status.textContent + "|" + error.name + "|" + error.message;
+                });
+                "#,
+            )
+            .expect("aborted fetch should remain a rejected promise");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "abort|true|AbortError|The operation was aborted|AbortError|The operation was aborted|AbortError|The operation was aborted"
+            )
+        );
+    }
+
+    #[test]
+    fn active_abort_signal_can_be_passed_to_fetch() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"ready".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const controller = new AbortController();
+                fetch("/data.txt", { signal: controller.signal })
+                    .then((response) => response.text())
+                    .then((body) => { status.textContent = body + "|" + controller.signal.aborted; });
+                "#,
+            )
+            .expect("active signal fetch should resolve");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready|false")
         );
     }
 
