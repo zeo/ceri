@@ -1,0 +1,59 @@
+name: engine lab
+
+on:
+  push:
+    paths:
+      - ".github/workflows/engine-lab.yml"
+      - "engine-lab/**"
+  pull_request:
+    paths:
+      - ".github/workflows/engine-lab.yml"
+      - "engine-lab/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / ${{ matrix.features }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features: [default, native-http, windowed, "windowed native-http"]
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: test
+        shell: bash
+        run: |
+          if [ "${{ matrix.features }}" = "default" ]; then
+            cargo test --locked --manifest-path engine-lab/Cargo.toml --all-targets
+          else
+            cargo test --locked --manifest-path engine-lab/Cargo.toml --features "${{ matrix.features }}" --all-targets
+          fi
+      - name: clippy
+        shell: bash
+        run: |
+          if [ "${{ matrix.features }}" = "default" ]; then
+            cargo clippy --locked --manifest-path engine-lab/Cargo.toml --all-targets -- -D warnings
+          else
+            cargo clippy --locked --manifest-path engine-lab/Cargo.toml --features "${{ matrix.features }}" --all-targets -- -D warnings
+          fi
+
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: check format
+        run: cargo fmt --all -- --check
