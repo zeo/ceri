@@ -28,7 +28,7 @@ The current slice implements:
 - named form controls with live checkbox and radio-group state, `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
 - app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
-- static and dynamic ES module graphs with same-origin packaged imports, named exports, and namespace imports
+- static and dynamic ES module graphs with same-origin packaged imports, default and named exports, named re-exports, and namespace imports
 - template literals with expression interpolation and module `import.meta.url`
 - static node-list snapshots, `dataset` reads, array spread and `map`, and bounded `Map` construction, lookup, key enumeration, and mutation
 - bounded `for...of` over arrays, node lists, strings, maps, and user-defined `Symbol.iterator` objects, promise-backed async functions with `await`, `try`/`catch`/`throw`, class and error values, `typeof`, `instanceof`, conditional expressions, and the narrow `Number`, `Array`, `Object`, `String`, `Set`, `Promise`, and `Symbol.iterator` surfaces used by the continuity page
@@ -226,12 +226,18 @@ The static module demo exercises packaged module loading without a listener:
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-module-demo.bmp --width 800 --height 300
 ```
 
-The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports default and named imports, namespace imports, `export default`, `export const`, `export function`, and local export lists, caches completed modules, exposes `import.meta.url`, and rejects cycles or missing and cross-origin dependencies. Classic scripts can also use same-origin dynamic `import()` and receive a promise-backed module namespace, with deterministic rejection for missing, unsupported, and cross-origin resources. Template literals support text plus `${...}` expressions. Re-exports, live binding updates, async module evaluation, import attributes, tagged templates, nested template literals, and the rest of JavaScript grammar remain separate gates.
+The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports default and named imports, namespace imports, `export default`, `export const`, `export function`, local export lists, and named `export { ... } from` re-exports, caches completed modules, exposes `import.meta.url`, and rejects cycles or missing and cross-origin dependencies. Classic scripts can also use same-origin dynamic `import()` and receive a promise-backed module namespace, with deterministic rejection for missing, unsupported, and cross-origin resources. Template literals support text plus `${...}` expressions. Export-star re-exports, live binding updates, async module evaluation, import attributes, tagged templates, nested template literals, and the rest of JavaScript grammar remain separate gates.
 
 The default-module sample loads a packaged module with a default function and a named value:
 
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/default-module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-default-module-demo.bmp --width 800 --height 320
+```
+
+The re-export sample loads a named value through an intermediate packaged barrel module:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/reexport-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-reexport-demo.bmp --width 800 --height 320
 ```
 
 The dynamic selector demo exercises stateful CSS through the host input boundary:

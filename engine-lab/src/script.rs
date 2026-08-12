@@ -4590,7 +4590,7 @@ impl Parser {
                 imports.push(self.parse_import_declaration()?);
             } else if self.is_identifier("export") {
                 self.advance();
-                self.parse_export_declaration(&mut statements, &mut exports)?;
+                self.parse_export_declaration(&mut imports, &mut statements, &mut exports)?;
             } else {
                 statements.push(self.parse_statement()?);
             }
@@ -4660,6 +4660,7 @@ impl Parser {
 
     fn parse_export_declaration(
         &mut self,
+        imports: &mut Vec<ModuleImport>,
         statements: &mut Vec<Stmt>,
         exports: &mut Vec<ModuleExport>,
     ) -> Result<(), ScriptError> {
@@ -4729,6 +4730,7 @@ impl Parser {
             return Ok(());
         }
         if self.take(TokenKind::LBrace) {
+            let mut bindings = Vec::new();
             if !self.is(TokenKind::RBrace) {
                 loop {
                     let local = self.expect_identifier("export name")?;
@@ -4738,7 +4740,7 @@ impl Parser {
                     } else {
                         local.clone()
                     };
-                    exports.push(ModuleExport { local, exported });
+                    bindings.push((local, exported));
                     if !self.take(TokenKind::Comma) {
                         break;
                     }
@@ -4748,6 +4750,27 @@ impl Parser {
                 }
             }
             self.expect(TokenKind::RBrace, "export list")?;
+            if self.is_identifier("from") {
+                self.advance();
+                let source = self.expect_string("re-export module specifier")?;
+                for (index, (imported, exported)) in bindings.into_iter().enumerate() {
+                    let local = format!("__ceri_reexport_{}_{index}", imports.len());
+                    imports.push(ModuleImport {
+                        source: source.clone(),
+                        bindings: vec![ModuleImportBinding::Named {
+                            imported,
+                            local: local.clone(),
+                        }],
+                    });
+                    exports.push(ModuleExport { local, exported });
+                }
+            } else {
+                exports.extend(
+                    bindings
+                        .into_iter()
+                        .map(|(local, exported)| ModuleExport { local, exported }),
+                );
+            }
             self.take(TokenKind::Semicolon);
             return Ok(());
         }
@@ -5952,6 +5975,40 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("primary|secondary")
+        );
+    }
+
+    #[test]
+    fn follows_named_re_exports_through_a_packaged_barrel() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([
+                (
+                    "/barrel.js".to_string(),
+                    r#"export { message as label } from "./source.js";"#.to_string(),
+                ),
+                (
+                    "/source.js".to_string(),
+                    r#"export const message = "re-exported";"#.to_string(),
+                ),
+            ]),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                r#"import { label } from "./barrel.js"; document.getElementById("status").textContent = label;"#,
+                base,
+                &mut loader,
+            )
+            .expect("named re-export should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("re-exported")
         );
     }
 
