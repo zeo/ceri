@@ -8,6 +8,7 @@ The current slice implements:
 - HTML entity decoding for common named and numeric entities
 - CSS rules with compound tag, class, and id selectors, descendant matching, and direct-child matching
 - a deterministic cascade with selector specificity
+- document and subtree `querySelector` lookups using the same selector matcher
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events

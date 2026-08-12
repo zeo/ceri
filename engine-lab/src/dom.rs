@@ -128,8 +128,19 @@ impl Document {
     }
 
     pub fn find_element_by_selector(&self, selector: &str) -> Option<NodePath> {
+        self.find_element_by_selector_within(&[], selector)
+    }
+
+    pub fn find_element_by_selector_within(
+        &self,
+        parent: &[usize],
+        selector: &str,
+    ) -> Option<NodePath> {
         let selector = crate::css::Selector::parse(selector).ok()?;
-        find_element_by_selector(&self.root, &selector, &mut Vec::new(), &mut Vec::new())
+        let parent_element = self.element_at(parent)?;
+        let mut ancestors = self.ancestors_for_path(parent)?;
+        let mut path = parent.to_vec();
+        find_element_by_selector(parent_element, &selector, &mut ancestors, &mut path)
     }
 
     pub fn element_text_content(&self, path: &[usize]) -> Option<String> {
@@ -229,6 +240,19 @@ impl Document {
             };
         }
         Some(element)
+    }
+
+    fn ancestors_for_path(&self, path: &[usize]) -> Option<Vec<&Element>> {
+        let mut ancestors = Vec::new();
+        let mut element = &self.root;
+        for &index in path {
+            element = match element.children.get(index)? {
+                Node::Element(child) => child,
+                Node::Text(_) => return None,
+            };
+            ancestors.push(element);
+        }
+        Some(ancestors)
     }
 }
 
@@ -882,5 +906,14 @@ mod tests {
                 .is_some()
         );
         assert!(document.find_element_by_selector("section.card").is_none());
+        let shell = document
+            .find_element_by_selector(".shell")
+            .expect("shell should exist");
+        assert_eq!(
+            document
+                .find_element_by_selector_within(&shell, ".card")
+                .and_then(|path| document.element_text_content(&path)),
+            Some("nested".to_string())
+        );
     }
 }

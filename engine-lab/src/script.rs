@@ -58,6 +58,7 @@ enum Builtin {
     ElementAppendChild(NodePath),
     ElementSetAttribute(NodePath),
     ElementGetAttribute(NodePath),
+    ElementQuerySelector(NodePath),
     ElementClassListAdd(ElementHandle),
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
@@ -486,6 +487,11 @@ impl ScriptRuntime {
                         .unwrap_or_else(|| Value::String(String::new())),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
+                    "querySelector" => {
+                        Value::Builtin(Builtin::ElementQuerySelector(path.ok_or_else(|| {
+                            runtime_error("detached element cannot query descendants")
+                        })?))
+                    }
                     "addEventListener" => {
                         Value::Builtin(Builtin::ElementAddEventListener(path.ok_or_else(|| {
                             runtime_error("detached element cannot receive events")
@@ -813,6 +819,19 @@ impl ScriptRuntime {
                     .borrow()
                     .element_attribute(&path, &name)
                     .map(Value::String)
+                    .unwrap_or(Value::Null))
+            }
+            Builtin::ElementQuerySelector(path) => {
+                let selector = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(self
+                    .document
+                    .borrow()
+                    .find_element_by_selector_within(&path, &selector)
+                    .map(attached_handle)
+                    .map(Value::Element)
                     .unwrap_or(Value::Null))
             }
             Builtin::ElementClassListAdd(handle) => {
@@ -1808,6 +1827,31 @@ mod tests {
             Some("before changed")
         );
         assert_eq!(runtime.logs(), &["before changed"]);
+    }
+
+    #[test]
+    fn queries_descendants_from_an_element_handle() {
+        let document = document(
+            "<main><section class='panel'><p class='card'>inside</p></section><p class='card'>outside</p><p id='status'>idle</p></main>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const panel = document.querySelector(".panel");
+                const card = panel.querySelector(".panel .card");
+                document.getElementById("status").textContent = card.textContent;
+                "##,
+            )
+            .expect("subtree query should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("inside")
+        );
     }
 
     #[test]

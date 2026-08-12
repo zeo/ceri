@@ -1,5 +1,5 @@
 const surface = document.getElementById("surface");
-const status = document.getElementById("status");
+const status = surface.querySelector("#status");
 
 surface.addEventListener("click", (event) => {
   surface.classList.add("clicked");
