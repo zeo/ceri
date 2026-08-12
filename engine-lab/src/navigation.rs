@@ -2,7 +2,7 @@ use crate::css::Stylesheet;
 use crate::dom::{Document, ScriptSource, StylesheetSource};
 use crate::layout::{LayoutDocument, Size, layout as build_layout};
 use crate::paint::Canvas;
-use crate::script::{NavigationRequest, ScriptRuntime};
+use crate::script::{NavigationRequest, ScriptRuntime, StorageHandle};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -344,6 +344,8 @@ pub struct Browser {
     history_index: Option<usize>,
     current_document_id: Option<u64>,
     next_document_id: u64,
+    local_storage: StorageHandle,
+    session_storage: StorageHandle,
 }
 
 impl Browser {
@@ -358,6 +360,8 @@ impl Browser {
             history_index: None,
             current_document_id: None,
             next_document_id: 1,
+            local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
+            session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
         }
     }
 
@@ -424,8 +428,13 @@ impl Browser {
             }
         };
         let script_sources = document.borrow().script_sources();
-        let mut runtime =
-            ScriptRuntime::with_resources(document.clone(), self.resources.clone(), url.clone());
+        let mut runtime = ScriptRuntime::with_resources_and_storage(
+            document.clone(),
+            self.resources.clone(),
+            url.clone(),
+            self.local_storage.clone(),
+            self.session_storage.clone(),
+        );
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             self.install_error_page(&url, 500, &error.to_string());
             self.commit_new_document(url, commit);
@@ -848,7 +857,11 @@ impl Browser {
         ));
         let stylesheet = document.borrow().style_text();
         self.page = Some(Page {
-            runtime: ScriptRuntime::new(document.clone()),
+            runtime: ScriptRuntime::with_storage(
+                document.clone(),
+                self.local_storage.clone(),
+                self.session_storage.clone(),
+            ),
             document,
             stylesheet,
         });
@@ -1563,6 +1576,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("about")
+        );
+    }
+
+    #[test]
+    fn storage_survives_full_document_navigation() {
+        let mut resources = bundle(
+            r#"<a id="next" href="/next.html">next</a><script>
+                localStorage.setItem("token", "ready");
+                sessionStorage.setItem("draft", "open");
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/next.html",
+                "text/html",
+                br#"<p id="status"></p><script>
+                    const status = document.getElementById("status");
+                    status.textContent = localStorage.getItem("token") + "|" + sessionStorage.getItem("draft");
+                </script>"#
+                    .to_vec(),
+            )
+            .expect("next page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("next").expect("next link should activate"));
+        let document = browser.document().expect("next document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready|open")
         );
     }
 

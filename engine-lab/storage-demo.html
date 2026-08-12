@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="demo.css">
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      .accent {
+        color: #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>storage laboratory</h1>
+      <p>App state stays available when the browser loads another packaged document.</p>
+      <p class="accent">This run writes one local value and one session value.</p>
+      <button id="run-storage">run storage workflow</button>
+      <p id="status">waiting for storage APIs</p>
+    </main>
+  </body>
+  <script src="storage-demo.js"></script>
+</html>

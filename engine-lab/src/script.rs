@@ -16,6 +16,7 @@ type LocationHandle = Rc<RefCell<AppUrl>>;
 type HistoryHandle = Rc<RefCell<HistoryData>>;
 type UrlHandle = Rc<RefCell<UrlData>>;
 type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
+pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -56,6 +57,7 @@ enum Value {
     History(HistoryHandle),
     Url(UrlHandle),
     UrlSearchParams(UrlSearchParamsHandle),
+    Storage(StorageHandle),
     Console,
     Json,
     UrlConstructor,
@@ -90,6 +92,11 @@ enum Builtin {
     UrlSearchParamsSort(UrlSearchParamsHandle),
     UrlSearchParamsToString(UrlSearchParamsHandle),
     UrlToString(UrlHandle),
+    StorageClear(StorageHandle),
+    StorageGetItem(StorageHandle),
+    StorageKey(StorageHandle),
+    StorageRemoveItem(StorageHandle),
+    StorageSetItem(StorageHandle),
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -278,6 +285,18 @@ struct UrlSearchParamsData {
     url: Option<Weak<RefCell<UrlData>>>,
 }
 
+pub(crate) struct StorageData {
+    values: BTreeMap<String, String>,
+}
+
+impl StorageData {
+    pub(crate) fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NavigationRequest {
     Navigate {
@@ -352,7 +371,7 @@ const MAX_MICROTASKS_PER_DRAIN: usize = 10_000;
 
 impl ScriptRuntime {
     pub fn new(document: Rc<RefCell<Document>>) -> Self {
-        Self::with_context(document, None, None)
+        Self::with_context(document, None, None, None, None)
     }
 
     pub fn with_resources(
@@ -360,15 +379,45 @@ impl ScriptRuntime {
         resources: ResourceBundle,
         base_url: AppUrl,
     ) -> Self {
-        Self::with_context(document, Some(resources), Some(base_url))
+        Self::with_context(document, Some(resources), Some(base_url), None, None)
+    }
+
+    pub(crate) fn with_resources_and_storage(
+        document: Rc<RefCell<Document>>,
+        resources: ResourceBundle,
+        base_url: AppUrl,
+        local_storage: StorageHandle,
+        session_storage: StorageHandle,
+    ) -> Self {
+        Self::with_context(
+            document,
+            Some(resources),
+            Some(base_url),
+            Some(local_storage),
+            Some(session_storage),
+        )
+    }
+
+    pub(crate) fn with_storage(
+        document: Rc<RefCell<Document>>,
+        local_storage: StorageHandle,
+        session_storage: StorageHandle,
+    ) -> Self {
+        Self::with_context(document, None, None, Some(local_storage), Some(session_storage))
     }
 
     fn with_context(
         document: Rc<RefCell<Document>>,
         resources: Option<ResourceBundle>,
         base_url: Option<AppUrl>,
+        local_storage: Option<StorageHandle>,
+        session_storage: Option<StorageHandle>,
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
+        let local_storage = local_storage
+            .unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
+        let session_storage = session_storage
+            .unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
         let location = Rc::new(RefCell::new(base_url.clone().unwrap_or_else(|| {
             AppUrl::parse("https://app.ceri.invalid/").expect("built-in app origin should parse")
         })));
@@ -398,6 +447,14 @@ impl ScriptRuntime {
             values.values.insert(
                 "URLSearchParams".to_string(),
                 Value::UrlSearchParamsConstructor,
+            );
+            values.values.insert(
+                "localStorage".to_string(),
+                Value::Storage(local_storage.clone()),
+            );
+            values.values.insert(
+                "sessionStorage".to_string(),
+                Value::Storage(session_storage.clone()),
             );
             values
                 .values
@@ -1041,6 +1098,15 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!(
                     "URLSearchParams has no property {property}"
                 ))),
+            },
+            Value::Storage(storage) => match property {
+                "length" => Ok(Value::Number(storage.borrow().values.len() as f64)),
+                "key" => Ok(Value::Builtin(Builtin::StorageKey(storage))),
+                "getItem" => Ok(Value::Builtin(Builtin::StorageGetItem(storage))),
+                "setItem" => Ok(Value::Builtin(Builtin::StorageSetItem(storage))),
+                "removeItem" => Ok(Value::Builtin(Builtin::StorageRemoveItem(storage))),
+                "clear" => Ok(Value::Builtin(Builtin::StorageClear(storage))),
+                _ => Err(runtime_error(format!("storage has no property {property}"))),
             },
             Value::Response(response) => match property {
                 "url" => Ok(Value::String(response.url.clone())),
@@ -1721,6 +1787,61 @@ impl ScriptRuntime {
             Builtin::UrlSearchParamsToString(params) => Ok(Value::String(
                 serialize_form_urlencoded(&params.borrow().pairs),
             )),
+            Builtin::StorageKey(storage) => {
+                let index = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(-1.0);
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Null);
+                }
+                Ok(storage
+                    .borrow()
+                    .values
+                    .keys()
+                    .nth(index as usize)
+                    .cloned()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null))
+            }
+            Builtin::StorageGetItem(storage) => {
+                let key = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                Ok(storage
+                    .borrow()
+                    .values
+                    .get(&key)
+                    .cloned()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null))
+            }
+            Builtin::StorageSetItem(storage) => {
+                let key = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                let value = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                storage.borrow_mut().values.insert(key, value);
+                Ok(Value::Undefined)
+            }
+            Builtin::StorageRemoveItem(storage) => {
+                let key = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                storage.borrow_mut().values.remove(&key);
+                Ok(Value::Undefined)
+            }
+            Builtin::StorageClear(storage) => {
+                storage.borrow_mut().values.clear();
+                Ok(Value::Undefined)
+            }
             Builtin::JsonParse => {
                 let source = arguments
                     .first()
@@ -2308,7 +2429,8 @@ impl Value {
             Self::Location(value) => value.borrow().to_string(),
             Self::History(_) => "[object History]".to_string(),
             Self::Url(value) => value.borrow().url.to_string(),
-            Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
+        Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
+        Self::Storage(_) => "[object Storage]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
@@ -2575,6 +2697,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         | (Value::Style(left), Value::Style(right)) => left == right,
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
+        (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -3591,6 +3714,36 @@ mod tests {
             Some(
                 "/search|browser engine|2|q=browser+engine&tag=two&tag=three|https://app.ceri.invalid/search?q=browser+engine&tag=two&tag=three",
             )
+        );
+    }
+
+    #[test]
+    fn storage_exposes_standard_key_value_operations() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                localStorage.setItem("theme", "night");
+                localStorage.setItem("count", 2);
+                const before = localStorage.length + ":" + localStorage.getItem("theme") + ":" + localStorage.key(0);
+                localStorage.removeItem("count");
+                sessionStorage.setItem("draft", "open");
+                const remaining = localStorage.length;
+                const draft = sessionStorage.getItem("draft");
+                localStorage.clear();
+                sessionStorage.clear();
+                document.getElementById("status").textContent = before + ":" + remaining + ":" + draft + ":" + localStorage.length + ":" + sessionStorage.length;
+                "#,
+            )
+            .expect("storage APIs should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("2:night:count:1:open:0:0")
         );
     }
 

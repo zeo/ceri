@@ -23,6 +23,7 @@ The current slice implements:
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
+- app-origin `localStorage` and `sessionStorage` key/value stores shared across full-document navigations in one browser session
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -130,3 +131,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 Grid placement is currently row-major. Explicit `grid-column`, auto-placement modes, and subgrid remain separate compatibility work.
+
+The storage demo exercises app-owned `localStorage` and `sessionStorage` values without opening a listener:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/storage-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-storage-demo.bmp --click run-storage
+```
+
+The stores live in the `Browser` instance, so values survive full-document navigation and remain isolated from other browser instances. They are currently in-memory, with no disk persistence, quota enforcement, or cross-process sharing.
