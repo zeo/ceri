@@ -1,8 +1,28 @@
 use crate::css::Color;
+use crate::dom::NodePath;
 use crate::layout::{LayoutBox, LayoutDocument, TextRun};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CanvasCommand {
+    FillRect {
+        path: NodePath,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: Color,
+    },
+    ClearRect {
+        path: NodePath,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub struct Canvas {
@@ -106,6 +126,22 @@ impl Canvas {
         }
     }
 
+    fn fill_rect_clipped(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: Color,
+        clip: crate::layout::Rect,
+    ) {
+        let left = x.max(clip.x);
+        let top = y.max(clip.y);
+        let right = (x + width).min(clip.x + clip.width);
+        let bottom = (y + height).min(clip.y + clip.height);
+        self.fill_rect(left, top, right - left, bottom - top, color);
+    }
+
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
         let index = ((y * self.width + x) * 4) as usize;
         let alpha = color.alpha as u32;
@@ -121,16 +157,64 @@ impl Canvas {
 }
 
 pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
+    paint_with_commands(document, &[])
+}
+
+pub(crate) fn paint_with_commands(
+    document: &LayoutDocument,
+    commands: &[CanvasCommand],
+) -> Canvas {
     let mut canvas = Canvas::new(
         document.viewport.width.max(1.0) as u32,
         document.viewport.height.max(1.0) as u32,
         Color::opaque(245, 248, 250),
     );
-    paint_box(&mut canvas, &document.root);
+    paint_box(&mut canvas, &document.root, commands);
     canvas
 }
 
-fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox) {
+fn paint_canvas_command(canvas: &mut Canvas, canvas_box: &LayoutBox, command: &CanvasCommand) {
+    let (path, x, y, width, height) = match command {
+        CanvasCommand::FillRect {
+            path,
+            x,
+            y,
+            width,
+            height,
+            ..
+        }
+        | CanvasCommand::ClearRect {
+            path,
+            x,
+            y,
+            width,
+            height,
+        } => (path, *x, *y, *width, *height),
+    };
+    if path != &canvas_box.path {
+        return;
+    }
+    let color = match command {
+        CanvasCommand::FillRect { color, .. } => *color,
+        CanvasCommand::ClearRect { .. } => {
+            if canvas_box.background.alpha == 0 {
+                canvas.background
+            } else {
+                canvas_box.background
+            }
+        }
+    };
+    canvas.fill_rect_clipped(
+        canvas_box.rect.x + x,
+        canvas_box.rect.y + y,
+        width,
+        height,
+        color,
+        canvas_box.rect,
+    );
+}
+
+fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox, commands: &[CanvasCommand]) {
     canvas.fill_rect(
         layout_box.rect.x,
         layout_box.rect.y,
@@ -173,7 +257,12 @@ fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox) {
         paint_text(canvas, run);
     }
     for child in &layout_box.children {
-        paint_box(canvas, child);
+        paint_box(canvas, child, commands);
+    }
+    if layout_box.tag == "canvas" {
+        for command in commands {
+            paint_canvas_command(canvas, layout_box, command);
+        }
     }
 }
 
@@ -371,5 +460,75 @@ mod tests {
         let bytes = std::fs::read(&path).expect("bmp should be readable");
         assert_eq!(&bytes[..2], b"BM");
         std::fs::remove_file(path).expect("test bmp should be removable");
+    }
+
+    #[test]
+    fn canvas_commands_stay_in_document_paint_order() {
+        let document = LayoutDocument {
+            viewport: Size {
+                width: 20.0,
+                height: 20.0,
+            },
+            root: LayoutBox {
+                path: Vec::new(),
+                tag: "root".to_string(),
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                background: Color::opaque(245, 248, 250),
+                border_width: 0.0,
+                border_color: Color::transparent(),
+                text: Vec::new(),
+                children: vec![
+                    LayoutBox {
+                        path: vec![0],
+                        tag: "canvas".to_string(),
+                        rect: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                        background: Color::transparent(),
+                        border_width: 0.0,
+                        border_color: Color::transparent(),
+                        text: Vec::new(),
+                        children: Vec::new(),
+                        margin: Default::default(),
+                    },
+                    LayoutBox {
+                        path: vec![1],
+                        tag: "div".to_string(),
+                        rect: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                        background: Color::opaque(0, 0, 255),
+                        border_width: 0.0,
+                        border_color: Color::transparent(),
+                        text: Vec::new(),
+                        children: Vec::new(),
+                        margin: Default::default(),
+                    },
+                ],
+                margin: Default::default(),
+            },
+        };
+        let commands = [CanvasCommand::FillRect {
+            path: vec![0],
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            color: Color::opaque(255, 0, 0),
+        }];
+
+        let canvas = paint_with_commands(&document, &commands);
+        assert_eq!(&canvas.rgba_pixels()[((5 * 20 + 5) * 4) as usize..][..4], [0, 0, 255, 255]);
     }
 }

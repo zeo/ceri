@@ -26,6 +26,7 @@ The current slice implements:
 - app-origin `localStorage` and `sessionStorage` key/value stores shared across full-document navigations in one browser session
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
 - named form controls with live checkbox and radio-group state, `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
+- canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
@@ -148,3 +149,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, applies cancellable checkbox click defaults, and resolves a GET action back into the packaged app origin with URL-encoded pairs. POST bodies and external network transport remain outside this slice.
+
+The canvas demo exercises the first drawing surface without a GPU or webview:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/canvas-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-canvas-demo.bmp --click redraw
+```
+
+The current canvas context is intentionally small. It records app-owned `fillStyle`, `fillRect`, and `clearRect` commands, clips them to the laid-out canvas element, and replays them during the software paint pass. Paths, text, images, transforms, compositing, and GPU contexts remain separate compatibility gates.

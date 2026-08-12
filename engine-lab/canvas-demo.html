@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="demo.css">
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      canvas {
+        display: block;
+        width: 560px;
+        height: 180px;
+        margin: 18px 0 12px;
+        background-color: #07131f;
+        border: 2px solid #2c6676;
+      }
+      .accent {
+        color: #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>canvas 2d laboratory</h1>
+      <p>Script drawing commands are recorded by the custom engine and painted without a GPU or webview.</p>
+      <p class="accent">The button redraws the same canvas through the engine-owned frame.</p>
+      <canvas id="art"></canvas>
+      <button id="redraw">redraw canvas</button>
+      <p id="status">waiting for canvas 2d</p>
+    </main>
+  </body>
+  <script src="canvas-demo.js"></script>
+</html>

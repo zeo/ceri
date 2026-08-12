@@ -605,7 +605,13 @@ impl Browser {
     }
 
     pub fn paint(&self, viewport: Size) -> Result<Canvas, NavigationError> {
-        Ok(self.layout(viewport)?.paint())
+        let layout = self.layout(viewport)?;
+        let commands = self
+            .page
+            .as_ref()
+            .map(|page| page.runtime.canvas_commands())
+            .unwrap_or(&[]);
+        Ok(crate::paint::paint_with_commands(&layout, commands))
     }
 
     pub fn describe(&self, viewport: Size) -> Result<String, NavigationError> {
@@ -1952,5 +1958,29 @@ mod tests {
             })
             .expect("page should paint");
         assert!(canvas.non_background_pixels() > 0);
+    }
+
+    #[test]
+    fn canvas_commands_reach_the_custom_paint_path() {
+        let mut browser = Browser::new(bundle(
+            r##"<canvas id="art" style="display: block; width: 80px; height: 60px"></canvas><script>
+                const ctx = document.getElementById("art").getContext("2d");
+                ctx.fillStyle = "#ff0000";
+                ctx.fillRect(4, 5, 10, 8);
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("canvas page should load");
+        let canvas = browser
+            .paint(Size {
+                width: 160.0,
+                height: 120.0,
+            })
+            .expect("canvas page should paint");
+        assert!(canvas
+            .rgba_pixels()
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 0, 0, 255]));
     }
 }

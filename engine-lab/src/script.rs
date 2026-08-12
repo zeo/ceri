@@ -1,5 +1,7 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::navigation::{APP_ORIGIN, AppUrl, ResourceBundle};
+use crate::paint::CanvasCommand;
+use crate::Color;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -18,6 +20,7 @@ type UrlHandle = Rc<RefCell<UrlData>>;
 type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
 pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
 type FormDataHandle = Rc<RefCell<FormDataData>>;
+type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -60,6 +63,7 @@ enum Value {
     UrlSearchParams(UrlSearchParamsHandle),
     Storage(StorageHandle),
     FormData(FormDataHandle),
+    CanvasContext(CanvasContextHandle),
     Console,
     Json,
     UrlConstructor,
@@ -87,6 +91,9 @@ enum Builtin {
     ElementFocus(NodePath),
     ElementBlur(NodePath),
     ElementRequestSubmit(NodePath),
+    CanvasGetContext(NodePath),
+    CanvasFillRect(CanvasContextHandle),
+    CanvasClearRect(CanvasContextHandle),
     UrlSearchParamsAppend(UrlSearchParamsHandle),
     UrlSearchParamsDelete(UrlSearchParamsHandle),
     UrlSearchParamsGet(UrlSearchParamsHandle),
@@ -250,6 +257,8 @@ pub struct ScriptRuntime {
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
+    canvas_contexts: HashMap<NodePath, CanvasContextHandle>,
+    canvas_commands: Vec<CanvasCommand>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -310,6 +319,11 @@ impl StorageData {
 
 struct FormDataData {
     pairs: Vec<(String, String)>,
+}
+
+struct CanvasContextData {
+    path: NodePath,
+    fill_style: Color,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -506,6 +520,8 @@ impl ScriptRuntime {
             focused_element: None,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
+            canvas_contexts: HashMap::new(),
+            canvas_commands: Vec::new(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,
@@ -630,6 +646,10 @@ impl ScriptRuntime {
 
     pub fn logs(&self) -> &[String] {
         &self.logs
+    }
+
+    pub(crate) fn canvas_commands(&self) -> &[CanvasCommand] {
+        &self.canvas_commands
     }
 
     pub fn document(&self) -> Rc<RefCell<Document>> {
@@ -1089,6 +1109,22 @@ impl ScriptRuntime {
                         }
                         Value::Builtin(Builtin::ElementRequestSubmit(path))
                     }
+                    "getContext" => {
+                        let path = path.ok_or_else(|| {
+                            runtime_error("detached element cannot create a canvas context")
+                        })?;
+                        let is_canvas = self
+                            .document
+                            .borrow()
+                            .element_clone(&path)
+                            .is_some_and(|element| element.name == "canvas");
+                        if !is_canvas {
+                            return Err(runtime_error(
+                                "getContext is only available on canvas elements",
+                            ));
+                        }
+                        Value::Builtin(Builtin::CanvasGetContext(path))
+                    }
                     "appendChild" => {
                         Value::Builtin(Builtin::ElementAppendChild(path.ok_or_else(|| {
                             runtime_error("detached element cannot receive children")
@@ -1214,6 +1250,14 @@ impl ScriptRuntime {
                 "set" => Ok(Value::Builtin(Builtin::FormDataSet(form_data))),
                 _ => Err(runtime_error(format!("FormData has no property {property}"))),
             },
+            Value::CanvasContext(context) => match property {
+                "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style))),
+                "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
+                "clearRect" => Ok(Value::Builtin(Builtin::CanvasClearRect(context))),
+                _ => Err(runtime_error(format!(
+                    "CanvasRenderingContext2D has no property {property}"
+                ))),
+            },
             Value::Response(response) => match property {
                 "url" => Ok(Value::String(response.url.clone())),
                 "status" => Ok(Value::Number(response.status as f64)),
@@ -1310,6 +1354,9 @@ impl ScriptRuntime {
                 _ => false,
             },
             Value::Style(handle) => self.set_element_style_property(&handle, property, value),
+            Value::CanvasContext(context) if property == "fillStyle" => {
+                self.set_canvas_fill_style(&context, &value)
+            }
             Value::Window if property == "location" => {
                 self.request_location_navigation(value, false);
                 true
@@ -1558,6 +1605,14 @@ impl ScriptRuntime {
             Value::FormDataConstructor => self.construct_form_data(arguments),
             _ => Err(runtime_error("value is not callable")),
         }
+    }
+
+    fn set_canvas_fill_style(&mut self, context: &CanvasContextHandle, value: &str) -> bool {
+        let Some(color) = Color::parse(value) else {
+            return false;
+        };
+        context.borrow_mut().fill_style = color;
+        true
     }
 
     fn set_element_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
@@ -1921,6 +1976,55 @@ impl ScriptRuntime {
             }
             Builtin::ElementRequestSubmit(path) => {
                 self.request_submit(path)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::CanvasGetContext(path) => {
+                let kind = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                if !kind.eq_ignore_ascii_case("2d") {
+                    return Ok(Value::Null);
+                }
+                let context = self
+                    .canvas_contexts
+                    .entry(path.clone())
+                    .or_insert_with(|| {
+                        Rc::new(RefCell::new(CanvasContextData {
+                            path,
+                            fill_style: Color::BLACK,
+                        }))
+                    })
+                    .clone();
+                Ok(Value::CanvasContext(context))
+            }
+            Builtin::CanvasFillRect(context) => {
+                let x = canvas_number(&arguments, 0)?;
+                let y = canvas_number(&arguments, 1)?;
+                let width = canvas_number(&arguments, 2)?;
+                let height = canvas_number(&arguments, 3)?;
+                self.canvas_commands.push(CanvasCommand::FillRect {
+                    path: context.borrow().path.clone(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    color: context.borrow().fill_style,
+                });
+                Ok(Value::Undefined)
+            }
+            Builtin::CanvasClearRect(context) => {
+                let x = canvas_number(&arguments, 0)?;
+                let y = canvas_number(&arguments, 1)?;
+                let width = canvas_number(&arguments, 2)?;
+                let height = canvas_number(&arguments, 3)?;
+                self.canvas_commands.push(CanvasCommand::ClearRect {
+                    path: context.borrow().path.clone(),
+                    x,
+                    y,
+                    width,
+                    height,
+                });
                 Ok(Value::Undefined)
             }
             Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string())),
@@ -2776,6 +2880,7 @@ impl Value {
         Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
         Self::Storage(_) => "[object Storage]".to_string(),
         Self::FormData(_) => "[object FormData]".to_string(),
+        Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
@@ -2824,6 +2929,22 @@ fn serialize_json(value: &Value) -> Result<String, ScriptError> {
             .map(|properties| format!("{{{}}}", properties.join(","))),
         _ => Err(runtime_error("value cannot be serialized as JSON")),
     }
+}
+
+fn canvas_number(arguments: &[Value], index: usize) -> Result<f32, ScriptError> {
+    let value = arguments
+        .get(index)
+        .map(Value::number)
+        .transpose()?
+        .unwrap_or(0.0);
+    if !value.is_finite() {
+        return Err(runtime_error("canvas coordinates must be finite"));
+    }
+    Ok(value as f32)
+}
+
+fn color_css(color: Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
 }
 
 fn escape_json_string(value: &str) -> String {
@@ -3045,6 +3166,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
+        (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -4184,6 +4306,35 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("false|true|second")
+        );
+    }
+
+    #[test]
+    fn canvas_2d_context_records_fill_and_clear_commands() {
+        let document = document(
+            r#"<canvas id="art" style="display: block; width: 80px; height: 60px"></canvas><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const canvas = document.getElementById("art");
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#ff0000";
+                ctx.fillRect(4, 5, 10, 8);
+                ctx.clearRect(6, 7, 2, 2);
+                document.getElementById("status").textContent = ctx.fillStyle;
+                "##,
+            )
+            .expect("canvas APIs should execute");
+        assert_eq!(runtime.canvas_commands().len(), 2);
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("#ff0000")
         );
     }
 
