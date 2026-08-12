@@ -45,6 +45,8 @@ It is a headless laboratory, not a web-compatible browser. The script runtime co
 
 `Browser::with_resource_provider` keeps the renderer independent of transport. The engine resolves and validates the app-origin URL, checks the packaged bundle first, and asks the provider only when that bundle misses. The provider can read a signed package, a native HTTP/TLS client, or another host-owned source. It never needs to open a listener, and it cannot receive a cross-origin `AppUrl` because the URL parser rejects those references before the provider call. Extensionless document routes use the same `/index.html` shell fallback as packaged assets.
 
+Hosts can inspect `Browser::last_navigation_failure()` or `EngineHost::last_navigation_failure()` after a recovery page is installed. The diagnostic carries the app URL, HTTP-style recovery status, and typed detail. A provider transport failure becomes status 503, while missing assets remain status 404 and parser or script failures remain status 500.
+
 Run the deterministic demo from the repository root:
 
 ```powershell

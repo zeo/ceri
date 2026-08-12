@@ -69,6 +69,6 @@ The isolated [engine-lab](engine-lab/README.md) crate is a from-scratch Rust ren
 
 See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.
 
-The custom host also exposes a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths. Its resource path has an embedder-owned `ResourceProvider` seam, so a future native HTTP/TLS source can feed the same app-origin policy without a loopback listener.
+The custom host also exposes a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths. Its resource path has an embedder-owned `ResourceProvider` seam, so a future native HTTP/TLS source can feed the same app-origin policy without a loopback listener. `NavigationFailure` gives native adapters typed recovery status and detail without parsing the recovery DOM.
 
 The module laboratory now preserves live named and namespace bindings through re-exports, with imported names kept read-only while source modules update their exported cells.

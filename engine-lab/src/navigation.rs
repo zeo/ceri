@@ -261,6 +261,13 @@ impl fmt::Display for NavigationStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationFailure {
+    pub url: AppUrl,
+    pub status: u16,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NavigationError {
     InvalidUrl(String),
     InsecureScheme,
@@ -278,6 +285,7 @@ pub enum NavigationError {
     EmptySegment,
     InvalidResourcePath(String),
     ResourceNotFound(String),
+    ResourceProvider(String),
     UnsupportedMimeType { path: String, mime_type: String },
     InvalidUtf8(String),
     Script(String),
@@ -311,6 +319,7 @@ impl fmt::Display for NavigationError {
             Self::EmptySegment => formatter.write_str("empty path segments are not allowed"),
             Self::InvalidResourcePath(path) => write!(formatter, "invalid resource path: {path}"),
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
+            Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
             Self::UnsupportedMimeType { path, mime_type } => {
                 write!(
                     formatter,
@@ -330,6 +339,14 @@ impl std::error::Error for NavigationError {}
 
 const MAX_NAVIGATION_REDIRECTS: usize = 16;
 
+fn recovery_status(error: &NavigationError) -> u16 {
+    if matches!(error, NavigationError::ResourceProvider(_)) {
+        503
+    } else {
+        500
+    }
+}
+
 struct Page {
     document: Rc<RefCell<Document>>,
     runtime: ScriptRuntime,
@@ -345,6 +362,7 @@ enum HistoryCommit {
 pub struct Browser {
     resources: ResourceBundle,
     resource_provider: Option<Rc<dyn ResourceProvider>>,
+    last_navigation_failure: Option<NavigationFailure>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
     history: Vec<AppUrl>,
@@ -364,6 +382,7 @@ impl Browser {
         Self {
             resources,
             resource_provider: None,
+            last_navigation_failure: None,
             page: None,
             current_url: None,
             history: Vec::new(),
@@ -455,6 +474,11 @@ impl Browser {
                 self.commit_new_document(url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 404 });
             }
+            Err(error @ NavigationError::ResourceProvider(_)) => {
+                self.install_error_page(&url, 503, &error.to_string());
+                self.commit_new_document(url, commit);
+                return Ok(NavigationStatus::ErrorPage { status: 503 });
+            }
             Err(error) => return Err(error),
         };
 
@@ -488,9 +512,10 @@ impl Browser {
         let stylesheet = match self.load_stylesheets(&url, &stylesheet_sources) {
             Ok(stylesheet) => stylesheet,
             Err(error) => {
-                self.install_error_page(&url, 500, &error.to_string());
+                let status = recovery_status(&error);
+                self.install_error_page(&url, status, &error.to_string());
                 self.commit_new_document(url, commit);
-                return Ok(NavigationStatus::ErrorPage { status: 500 });
+                return Ok(NavigationStatus::ErrorPage { status });
             }
         };
         let script_sources = document.borrow().script_sources();
@@ -504,9 +529,10 @@ impl Browser {
             self.host_runtime_info.clone(),
         );
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
-            self.install_error_page(&url, 500, &error.to_string());
+            let status = recovery_status(&error);
+            self.install_error_page(&url, status, &error.to_string());
             self.commit_new_document(url, commit);
-            return Ok(NavigationStatus::ErrorPage { status: 500 });
+            return Ok(NavigationStatus::ErrorPage { status });
         }
 
         let pending_navigation = runtime.take_navigation_request();
@@ -515,6 +541,7 @@ impl Browser {
             runtime,
             stylesheet,
         });
+        self.last_navigation_failure = None;
         self.hovered_path = None;
         self.commit_new_document(url, commit);
         if let Some(request) = pending_navigation {
@@ -525,6 +552,10 @@ impl Browser {
 
     pub fn current_url(&self) -> Option<&AppUrl> {
         self.current_url.as_ref()
+    }
+
+    pub fn last_navigation_failure(&self) -> Option<&NavigationFailure> {
+        self.last_navigation_failure.as_ref()
     }
 
     pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
@@ -1000,6 +1031,11 @@ impl Browser {
     }
 
     fn install_error_page(&mut self, url: &AppUrl, status: u16, detail: &str) {
+        self.last_navigation_failure = Some(NavigationFailure {
+            url: url.clone(),
+            status,
+            detail: detail.to_string(),
+        });
         let source = error_page_source(status, &url.to_string(), detail);
         let document = Rc::new(RefCell::new(
             Document::parse(&source).expect("built-in recovery document should parse"),
@@ -1393,6 +1429,16 @@ mod tests {
     impl ResourceProvider for MemoryProvider {
         fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
             Ok(self.resources.get(url.path()).cloned())
+        }
+    }
+
+    struct FailingProvider;
+
+    impl ResourceProvider for FailingProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Err(NavigationError::ResourceProvider(
+                "transport unavailable".to_string(),
+            ))
         }
     }
 
@@ -1916,6 +1962,30 @@ mod tests {
                 .element_attribute(&recovery, "data-status"),
             Some("404".to_string())
         );
+        let failure = browser
+            .last_navigation_failure()
+            .expect("missing resource should expose a diagnostic");
+        assert_eq!(failure.url.path(), "/missing.js");
+        assert_eq!(failure.status, 404);
+        assert_eq!(failure.detail, "resource not found: /missing.js");
+    }
+
+    #[test]
+    fn provider_failures_install_recovery_and_expose_a_typed_diagnostic() {
+        let provider = Rc::new(FailingProvider);
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("provider failure should become recovery"),
+            NavigationStatus::ErrorPage { status: 503 }
+        );
+        let failure = browser
+            .last_navigation_failure()
+            .expect("provider failure should expose a diagnostic");
+        assert_eq!(failure.url.path(), "/");
+        assert_eq!(failure.status, 503);
+        assert_eq!(failure.detail, "resource provider failed: transport unavailable");
     }
 
     #[test]

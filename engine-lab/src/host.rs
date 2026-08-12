@@ -1,5 +1,5 @@
 use crate::layout::Size;
-use crate::navigation::{Browser, NavigationError, NavigationStatus};
+use crate::navigation::{Browser, NavigationError, NavigationFailure, NavigationStatus};
 use crate::paint::Canvas;
 use crate::AccessibilityNode;
 
@@ -82,6 +82,10 @@ impl EngineHost {
 
     pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
         self.browser.accessibility_tree()
+    }
+
+    pub fn last_navigation_failure(&self) -> Option<&NavigationFailure> {
+        self.browser.last_navigation_failure()
     }
 
     pub fn navigate(&mut self, url: &str) -> Result<NavigationStatus, NavigationError> {
