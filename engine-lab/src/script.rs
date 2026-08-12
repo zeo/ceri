@@ -15,6 +15,8 @@ type ResponseHandle = Rc<ResponseData>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
 type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
+type NodeListHandle = Rc<Vec<ElementHandle>>;
+type MapHandle = Rc<RefCell<MapData>>;
 type LocationHandle = Rc<RefCell<AppUrl>>;
 type HistoryHandle = Rc<RefCell<HistoryData>>;
 type UrlHandle = Rc<RefCell<UrlData>>;
@@ -50,7 +52,10 @@ enum Value {
     String(String),
     Object(ObjectHandle),
     Array(ArrayHandle),
+    NodeList(NodeListHandle),
+    Map(MapHandle),
     Element(ElementHandle),
+    Dataset(ElementHandle),
     Style(ElementHandle),
     ClassList(ElementHandle),
     Event(EventData),
@@ -71,6 +76,7 @@ enum Value {
     UrlConstructor,
     UrlSearchParamsConstructor,
     FormDataConstructor,
+    MapConstructor,
     Function(Rc<Function>),
     Builtin(Builtin),
 }
@@ -79,6 +85,7 @@ enum Value {
 enum Builtin {
     DocumentGetElementById,
     DocumentQuerySelector,
+    DocumentQuerySelectorAll,
     DocumentCreateElement,
     ConsoleLog,
     EventPreventDefault(Rc<RefCell<EventState>>),
@@ -128,6 +135,12 @@ enum Builtin {
     ElementSetAttribute(NodePath),
     ElementGetAttribute(NodePath),
     ElementQuerySelector(NodePath),
+    ElementQuerySelectorAll(NodePath),
+    ArrayMap(ArrayHandle),
+    ArrayJoin(ArrayHandle),
+    MapGet(MapHandle),
+    MapSet(MapHandle),
+    MapKeys(MapHandle),
     ElementClassListAdd(ElementHandle),
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
@@ -184,6 +197,7 @@ enum Expr {
     },
     Object(Vec<(String, Expr)>),
     Array(Vec<Expr>),
+    Spread(Box<Expr>),
     Template(Vec<TemplatePart>),
     Call {
         callee: Box<Expr>,
@@ -369,6 +383,10 @@ struct FormDataData {
     pairs: Vec<(String, String)>,
 }
 
+struct MapData {
+    entries: Vec<(Value, Value)>,
+}
+
 struct CanvasContextData {
     path: NodePath,
     fill_style: Color,
@@ -528,6 +546,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("FormData".to_string(), Value::FormDataConstructor);
+            values
+                .values
+                .insert("Map".to_string(), Value::MapConstructor);
             values.values.insert(
                 "localStorage".to_string(),
                 Value::Storage(local_storage.clone()),
@@ -1124,12 +1145,19 @@ impl ScriptRuntime {
                 Ok(Value::Object(Rc::new(RefCell::new(object))))
             }
             Expr::Array(expressions) => {
-                let values = expressions
-                    .iter()
-                    .map(|expression| self.evaluate(expression, environment.clone()))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut values = Vec::new();
+                for expression in expressions {
+                    if let Expr::Spread(expression) = expression {
+                        values.extend(spread_values(
+                            self.evaluate(expression, environment.clone())?,
+                        )?);
+                    } else {
+                        values.push(self.evaluate(expression, environment.clone())?);
+                    }
+                }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
+            Expr::Spread(_) => Err(runtime_error("spread is only valid in an array literal")),
             Expr::Template(parts) => {
                 let mut output = String::new();
                 for part in parts {
@@ -1198,6 +1226,7 @@ impl ScriptRuntime {
             Value::Document => match property {
                 "getElementById" => Ok(Value::Builtin(Builtin::DocumentGetElementById)),
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
+                "querySelectorAll" => Ok(Value::Builtin(Builtin::DocumentQuerySelectorAll)),
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
                 "activeElement" => Ok(self
                     .active_element()
@@ -1255,6 +1284,7 @@ impl ScriptRuntime {
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
                     "checked" => Value::Bool(self.element_checked(&handle)),
+                    "dataset" => Value::Dataset(handle.clone()),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
                     "querySelector" => {
@@ -1262,6 +1292,11 @@ impl ScriptRuntime {
                             runtime_error("detached element cannot query descendants")
                         })?))
                     }
+                    "querySelectorAll" => Value::Builtin(Builtin::ElementQuerySelectorAll(
+                        path.ok_or_else(|| {
+                            runtime_error("detached element cannot query descendants")
+                        })?,
+                    )),
                     "addEventListener" => {
                         Value::Builtin(Builtin::ElementAddEventListener(path.ok_or_else(|| {
                             runtime_error("detached element cannot receive events")
@@ -1469,19 +1504,47 @@ impl ScriptRuntime {
                 .cloned()
                 .unwrap_or(Value::Undefined)),
             Value::Array(array) => {
+                match property {
+                    "length" => Ok(Value::Number(array.borrow().len() as f64)),
+                    "map" => Ok(Value::Builtin(Builtin::ArrayMap(array))),
+                    "join" => Ok(Value::Builtin(Builtin::ArrayJoin(array))),
+                    _ => {
+                        let index = property.parse::<usize>().map_err(|_| {
+                            runtime_error(format!("array has no property {property}"))
+                        })?;
+                        Ok(array
+                            .borrow()
+                            .get(index)
+                            .cloned()
+                            .unwrap_or(Value::Undefined))
+                    }
+                }
+            }
+            Value::NodeList(nodes) => {
                 if property == "length" {
-                    Ok(Value::Number(array.borrow().len() as f64))
+                    Ok(Value::Number(nodes.len() as f64))
                 } else {
-                    let index = property
-                        .parse::<usize>()
-                        .map_err(|_| runtime_error(format!("array has no property {property}")))?;
-                    Ok(array
-                        .borrow()
+                    let index = property.parse::<usize>().map_err(|_| {
+                        runtime_error(format!("NodeList has no property {property}"))
+                    })?;
+                    Ok(nodes
                         .get(index)
                         .cloned()
+                        .map(Value::Element)
                         .unwrap_or(Value::Undefined))
                 }
             }
+            Value::Dataset(handle) => Ok(self
+                .element_attribute(&handle, &dataset_attribute_name(property))
+                .map(Value::String)
+                .unwrap_or(Value::Undefined)),
+            Value::Map(map) => match property {
+                "size" => Ok(Value::Number(map.borrow().entries.len() as f64)),
+                "get" => Ok(Value::Builtin(Builtin::MapGet(map))),
+                "set" => Ok(Value::Builtin(Builtin::MapSet(map))),
+                "keys" => Ok(Value::Builtin(Builtin::MapKeys(map))),
+                _ => Err(runtime_error(format!("Map has no property {property}"))),
+            },
             Value::Json => match property {
                 "parse" => Ok(Value::Builtin(Builtin::JsonParse)),
                 "stringify" => Ok(Value::Builtin(Builtin::JsonStringify)),
@@ -1512,6 +1575,17 @@ impl ScriptRuntime {
                     .borrow()
                     .get(index as usize)
                     .cloned()
+                    .unwrap_or(Value::Undefined))
+            }
+            Value::NodeList(nodes) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(nodes
+                    .get(index as usize)
+                    .cloned()
+                    .map(Value::Element)
                     .unwrap_or(Value::Undefined))
             }
             Value::String(string) => {
@@ -1797,6 +1871,7 @@ impl ScriptRuntime {
             Value::UrlConstructor => self.construct_url(arguments),
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             Value::FormDataConstructor => self.construct_form_data(arguments),
+            Value::MapConstructor => self.construct_map(arguments),
             _ => Err(runtime_error("value is not callable")),
         }
     }
@@ -1922,6 +1997,25 @@ impl ScriptRuntime {
             pairs.push((name.to_string(), value));
         }
         Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+    }
+
+    fn construct_map(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let mut entries = Vec::new();
+        if let Some(Value::Array(sequence)) = arguments.first() {
+            for entry in sequence.borrow().iter() {
+                let Value::Array(entry) = entry else {
+                    return Err(runtime_error("Map sequence entries must be arrays"));
+                };
+                let entry = entry.borrow();
+                if entry.len() < 2 {
+                    return Err(runtime_error("Map sequence entries need two values"));
+                }
+                entries.push((entry[0].clone(), entry[1].clone()));
+            }
+        } else if !arguments.is_empty() {
+            return Err(runtime_error("Map constructor requires an array sequence"));
+        }
+        Ok(Value::Map(Rc::new(RefCell::new(MapData { entries }))))
     }
 
     fn submit_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
@@ -2054,6 +2148,21 @@ impl ScriptRuntime {
                     .map(attached_handle)
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
+            }
+            Builtin::DocumentQuerySelectorAll => {
+                let selector = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let nodes = self
+                    .document
+                    .borrow()
+                    .find_elements_by_selector(&selector)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(attached_handle)
+                    .collect();
+                Ok(Value::NodeList(Rc::new(nodes)))
             }
             Builtin::DocumentCreateElement => {
                 let name = arguments
@@ -2614,6 +2723,89 @@ impl ScriptRuntime {
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
             }
+            Builtin::ElementQuerySelectorAll(path) => {
+                let selector = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let nodes = self
+                    .document
+                    .borrow()
+                    .find_elements_by_selector_within(&path, &selector)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(attached_handle)
+                    .collect();
+                Ok(Value::NodeList(Rc::new(nodes)))
+            }
+            Builtin::ArrayMap(array) => {
+                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error("Array.map callback must be a function"));
+                }
+                let values = array.borrow().clone();
+                let mut mapped = Vec::with_capacity(values.len());
+                for (index, value) in values.into_iter().enumerate() {
+                    mapped.push(self.call(
+                        callback.clone(),
+                        vec![
+                            value,
+                            Value::Number(index as f64),
+                            Value::Array(array.clone()),
+                        ],
+                    )?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(mapped))))
+            }
+            Builtin::ArrayJoin(array) => {
+                let separator = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| ",".to_string());
+                let joined = array
+                    .borrow()
+                    .iter()
+                    .map(|value| match value {
+                        Value::Undefined | Value::Null => String::new(),
+                        value => value.string_value(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(&separator);
+                Ok(Value::String(joined))
+            }
+            Builtin::MapGet(map) => {
+                let key = arguments.first().cloned().unwrap_or(Value::Undefined);
+                Ok(map
+                    .borrow()
+                    .entries
+                    .iter()
+                    .find(|(entry_key, _)| values_equal(entry_key, &key))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(Value::Undefined))
+            }
+            Builtin::MapSet(map) => {
+                let key = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let value = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let mut map_data = map.borrow_mut();
+                if let Some((_, entry_value)) = map_data
+                    .entries
+                    .iter_mut()
+                    .find(|(entry_key, _)| values_equal(entry_key, &key))
+                {
+                    *entry_value = value;
+                } else {
+                    map_data.entries.push((key, value));
+                }
+                drop(map_data);
+                Ok(Value::Map(map))
+            }
+            Builtin::MapKeys(map) => Ok(Value::Array(Rc::new(RefCell::new(
+                map.borrow()
+                    .entries
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect(),
+            )))),
             Builtin::ElementClassListAdd(handle) => {
                 for argument in arguments {
                     let class = class_name(&argument)?;
@@ -3066,7 +3258,10 @@ impl Value {
             Self::String(value) => value.clone(),
             Self::Object(_) => "[object Object]".to_string(),
             Self::Array(_) => "[array]".to_string(),
+            Self::NodeList(_) => "[object NodeList]".to_string(),
+            Self::Map(_) => "[object Map]".to_string(),
             Self::Element(_) => "[element]".to_string(),
+            Self::Dataset(_) => "[object DOMStringMap]".to_string(),
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
@@ -3088,6 +3283,7 @@ impl Value {
                 "[function URL]".to_string()
             }
             Self::FormDataConstructor => "[function FormData]".to_string(),
+            Self::MapConstructor => "[function Map]".to_string(),
             Self::Function(_) => "[function]".to_string(),
             Self::Builtin(_) => "[function]".to_string(),
         }
@@ -3146,6 +3342,19 @@ fn canvas_number(arguments: &[Value], index: usize) -> Result<f32, ScriptError> 
 
 fn color_css(color: Color) -> String {
     format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
+}
+
+fn dataset_attribute_name(property: &str) -> String {
+    let mut name = String::from("data-");
+    for character in property.chars() {
+        if character.is_ascii_uppercase() {
+            name.push('-');
+            name.push(character.to_ascii_lowercase());
+        } else {
+            name.push(character);
+        }
+    }
+    name
 }
 
 fn escape_json_string(value: &str) -> String {
@@ -3369,6 +3578,18 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         _ => false,
+    }
+}
+
+fn spread_values(value: Value) -> Result<Vec<Value>, ScriptError> {
+    match value {
+        Value::Array(values) => Ok(values.borrow().clone()),
+        Value::NodeList(nodes) => Ok(nodes.iter().cloned().map(Value::Element).collect()),
+        Value::String(string) => Ok(string
+            .chars()
+            .map(|character| Value::String(character.to_string()))
+            .collect()),
+        _ => Err(runtime_error("value is not iterable")),
     }
 }
 
@@ -3747,6 +3968,9 @@ impl Parser {
                         if !self.take(TokenKind::Comma) {
                             break;
                         }
+                        if self.is(TokenKind::RParen) {
+                            break;
+                        }
                     }
                 }
                 self.expect(TokenKind::RParen, "call")?;
@@ -3865,7 +4089,12 @@ impl Parser {
         let mut values = Vec::new();
         if !self.is(TokenKind::RBracket) {
             loop {
-                values.push(self.parse_expression()?);
+                let expression = if self.take(TokenKind::Ellipsis) {
+                    Expr::Spread(Box::new(self.parse_expression()?))
+                } else {
+                    self.parse_expression()?
+                };
+                values.push(expression);
                 if !self.take(TokenKind::Comma) {
                     break;
                 }
@@ -3944,6 +4173,9 @@ impl Parser {
             loop {
                 arguments.push(self.parse_expression()?);
                 if !self.take(TokenKind::Comma) {
+                    break;
+                }
+                if self.is(TokenKind::RParen) {
                     break;
                 }
             }
@@ -4085,6 +4317,7 @@ enum TokenKind {
     GreaterEqual,
     AndAnd,
     OrOr,
+    Ellipsis,
 }
 
 fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
@@ -4265,6 +4498,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
             [b']', ..] => (TokenKind::RBracket, 1),
             [b',', ..] => (TokenKind::Comma, 1),
             [b':', ..] => (TokenKind::Colon, 1),
+            [b'.', b'.', b'.', ..] => (TokenKind::Ellipsis, 3),
             [b'.', ..] => (TokenKind::Dot, 1),
             [b';', ..] => (TokenKind::Semicolon, 1),
             [b'+', ..] => (TokenKind::Plus, 1),
@@ -4533,6 +4767,36 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("inside")
+        );
+    }
+
+    #[test]
+    fn builds_a_map_from_selector_results_and_dataset_values() {
+        let document = document(
+            "<main><p data-check='module' id='module'>module</p><p data-check='template' id='template'>template</p><p id='status'>idle</p></main>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const checks = new Map(
+                  [...document.querySelectorAll("[data-check]")].map((check) => [
+                    check.dataset.check,
+                    check,
+                  ]),
+                );
+                const status = document.getElementById("status");
+                status.textContent = checks.get("module").id + "|" + checks.size + "|" + checks.keys().length;
+                "##,
+            )
+            .expect("collection expression should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("module|2|2")
         );
     }
 

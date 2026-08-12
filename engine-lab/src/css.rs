@@ -445,7 +445,14 @@ struct CompoundSelector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attributes: Vec<AttributeSelector>,
     pseudo_classes: Vec<PseudoClass>,
+}
+
+#[derive(Clone, Debug)]
+enum AttributeSelector {
+    Exists(String),
+    Equals(String, String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -593,6 +600,10 @@ impl CompoundSelector {
                 .as_deref()
                 .is_none_or(|id| element.attr("id") == Some(id))
             && self.classes.iter().all(|class| element.has_class(class))
+            && self.attributes.iter().all(|attribute| match attribute {
+                AttributeSelector::Exists(name) => element.attr(name).is_some(),
+                AttributeSelector::Equals(name, value) => element.attr(name) == Some(value),
+            })
             && self
                 .pseudo_classes
                 .iter()
@@ -602,7 +613,7 @@ impl CompoundSelector {
     fn specificity(&self) -> Specificity {
         Specificity(
             u32::from(self.id.is_some()),
-            (self.classes.len() + self.pseudo_classes.len()) as u32,
+            (self.classes.len() + self.attributes.len() + self.pseudo_classes.len()) as u32,
             u32::from(self.tag.is_some()),
         )
     }
@@ -640,6 +651,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
         tag: None,
         id: None,
         classes: Vec::new(),
+        attributes: Vec::new(),
         pseudo_classes: Vec::new(),
     };
     let start = *cursor;
@@ -665,6 +677,30 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                     _ => return Err(format!("unsupported pseudo-class: :{name}")),
                 };
                 selector.pseudo_classes.push(pseudo);
+            }
+            b'[' => {
+                *cursor += 1;
+                skip_selector_whitespace(source, cursor);
+                let name = parse_selector_name(source, cursor)?;
+                skip_selector_whitespace(source, cursor);
+                let attribute = if *cursor < source.len() && source.as_bytes()[*cursor] == b']' {
+                    *cursor += 1;
+                    AttributeSelector::Exists(name)
+                } else {
+                    if *cursor >= source.len() || source.as_bytes()[*cursor] != b'=' {
+                        return Err(format!("unsupported attribute selector: {source}"));
+                    }
+                    *cursor += 1;
+                    skip_selector_whitespace(source, cursor);
+                    let value = parse_attribute_value(source, cursor)?;
+                    skip_selector_whitespace(source, cursor);
+                    if *cursor >= source.len() || source.as_bytes()[*cursor] != b']' {
+                        return Err(format!("unterminated attribute selector: {source}"));
+                    }
+                    *cursor += 1;
+                    AttributeSelector::Equals(name, value)
+                };
+                selector.attributes.push(attribute);
             }
             b'*' => *cursor += 1,
             byte if byte.is_ascii_whitespace() || byte == b'>' => break,
@@ -698,6 +734,37 @@ fn parse_selector_name(source: &str, cursor: &mut usize) -> Result<String, Strin
         return Err(format!("selector component has no name: {source}"));
     }
     Ok(source[start..*cursor].to_ascii_lowercase())
+}
+
+fn parse_attribute_value(source: &str, cursor: &mut usize) -> Result<String, String> {
+    if *cursor >= source.len() {
+        return Err(format!("attribute selector has no value: {source}"));
+    }
+    let quote = source.as_bytes()[*cursor];
+    if quote == b'\'' || quote == b'"' {
+        *cursor += 1;
+        let start = *cursor;
+        while *cursor < source.len() && source.as_bytes()[*cursor] != quote {
+            *cursor += 1;
+        }
+        if *cursor >= source.len() {
+            return Err(format!("unterminated attribute value: {source}"));
+        }
+        let value = source[start..*cursor].to_string();
+        *cursor += 1;
+        Ok(value)
+    } else {
+        let start = *cursor;
+        while *cursor < source.len()
+            && !source.as_bytes()[*cursor].is_ascii_whitespace()
+            && source.as_bytes()[*cursor] != b']'
+        {
+            *cursor += 1;
+        }
+        (start != *cursor)
+            .then(|| source[start..*cursor].to_string())
+            .ok_or_else(|| format!("attribute selector has no value: {source}"))
+    }
 }
 
 fn parse_declarations(source: &str) -> Result<Vec<Declaration>, String> {
@@ -1175,5 +1242,26 @@ mod tests {
                 .color,
             Color::BLACK
         );
+    }
+
+    #[test]
+    fn matches_attribute_selectors() {
+        let stylesheet = Stylesheet::parse(
+            "[data-check] { color: red; } [data-check='module'] { background-color: blue; }",
+        )
+        .expect("attribute selectors should parse");
+        let mut element = Element::new("p");
+        element
+            .attrs
+            .insert("data-check".to_string(), "module".to_string());
+        let style = stylesheet.style_for_inherited_with_ancestors(
+            &element,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(style.color, Color::opaque(255, 0, 0));
+        assert_eq!(style.background, Color::opaque(0, 0, 255));
     }
 }

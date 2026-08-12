@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 32px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      ul {
+        margin: 16px 0;
+        padding: 0;
+        list-style: none;
+      }
+      li {
+        margin: 6px 0;
+        padding: 8px 12px;
+        background-color: #193c4b;
+      }
+      .pass {
+        color: #6ee7c5;
+        background-color: #245166;
+      }
+      #status {
+        color: #ffd479;
+        font-family: monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>collection laboratory</h1>
+      <p>the script builds a map from a static node list and data attributes</p>
+      <ul>
+        <li id="dom-check" data-check="dom">DOM query</li>
+        <li id="module-check" data-check="module">module collection</li>
+        <li id="template-check" data-check="template">template output</li>
+      </ul>
+      <p id="status">collection is waiting</p>
+    </main>
+    <script src="collection-demo.js"></script>
+  </body>
+</html>

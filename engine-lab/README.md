@@ -6,9 +6,9 @@ The current slice implements:
 
 - HTML tokenization and a small DOM tree
 - HTML entity decoding for common named and numeric entities
-- CSS rules with compound tag, class, and id selectors, descendant matching, and direct-child matching
+- CSS rules with compound tag, class, id, and attribute selectors, descendant matching, and direct-child matching
 - a deterministic cascade with selector specificity
-- document and subtree `querySelector` lookups using the same selector matcher
+- document and subtree `querySelector` and `querySelectorAll` lookups using the same selector matcher
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
@@ -30,6 +30,7 @@ The current slice implements:
 - app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
 - static ES module graphs with same-origin packaged imports, named exports, and namespace imports
 - template literals with expression interpolation and module `import.meta.url`
+- static node-list snapshots, `dataset` reads, array spread and `map`, and bounded `Map` construction, lookup, key enumeration, and mutation
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -70,6 +71,14 @@ The nested-selector sample exercises compound selectors, descendant cascade, dir
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/selector-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-selector-demo.bmp --width 800 --height 360
 ```
+
+The collection sample runs the first continuity-page collection expression without a listener. It queries `[data-check]` nodes, spreads the static node list into an array, maps each element to a key-value pair, reads `dataset`, and constructs a `Map`:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/collection-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-collection-demo.bmp --width 800 --height 420
+```
+
+The current collection boundary stops before `for...of`, destructuring, and general iterable protocols. Those remain explicit compatibility gates for the continuity page.
 
 The event sample starts a click on a nested element and handles it on an ancestor through an external script:
 

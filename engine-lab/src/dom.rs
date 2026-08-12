@@ -194,6 +194,10 @@ impl Document {
         self.find_element_by_selector_within(&[], selector)
     }
 
+    pub fn find_elements_by_selector(&self, selector: &str) -> Option<Vec<NodePath>> {
+        self.find_elements_by_selector_within(&[], selector)
+    }
+
     pub fn find_element_by_selector_within(
         &self,
         parent: &[usize],
@@ -204,6 +208,26 @@ impl Document {
         let mut ancestors = self.ancestors_for_path(parent)?;
         let mut path = parent.to_vec();
         find_element_by_selector(parent_element, &selector, &mut ancestors, &mut path)
+    }
+
+    pub fn find_elements_by_selector_within(
+        &self,
+        parent: &[usize],
+        selector: &str,
+    ) -> Option<Vec<NodePath>> {
+        let selector = crate::css::Selector::parse(selector).ok()?;
+        let parent_element = self.element_at(parent)?;
+        let mut ancestors = self.ancestors_for_path(parent)?;
+        let mut path = parent.to_vec();
+        let mut matches = Vec::new();
+        collect_elements_by_selector(
+            parent_element,
+            &selector,
+            &mut ancestors,
+            &mut path,
+            &mut matches,
+        );
+        Some(matches)
     }
 
     pub fn element_text_content(&self, path: &[usize]) -> Option<String> {
@@ -598,6 +622,28 @@ fn find_element_by_selector<'a>(
         path.pop();
     }
     None
+}
+
+fn collect_elements_by_selector<'a>(
+    element: &'a Element,
+    selector: &crate::css::Selector,
+    ancestors: &mut Vec<&'a Element>,
+    path: &mut NodePath,
+    matches: &mut Vec<NodePath>,
+) {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        if selector.matches(child, path, ancestors, &crate::css::StyleState::default()) {
+            matches.push(path.clone());
+        }
+        ancestors.push(child);
+        collect_elements_by_selector(child, selector, ancestors, path, matches);
+        ancestors.pop();
+        path.pop();
+    }
 }
 
 fn css_property_name(property: &str) -> String {
@@ -1016,6 +1062,25 @@ mod tests {
         assert!(document.find_element_by_selector(".accent").is_some());
         assert!(document.find_element_by_selector("#second").is_some());
         assert!(document.find_element_by_selector(".missing").is_none());
+    }
+
+    #[test]
+    fn collects_selector_matches_in_document_order() {
+        let document = Document::parse(
+            "<main><p data-check='first'>one</p><section><p data-check='second'>two</p></section><p data-check='third'>three</p></main>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            document.find_elements_by_selector("[data-check]"),
+            Some(vec![vec![0, 0], vec![0, 1, 0], vec![0, 2]])
+        );
+        let section = document
+            .find_element_by_selector("section")
+            .expect("section should exist");
+        assert_eq!(
+            document.find_elements_by_selector_within(&section, "[data-check]"),
+            Some(vec![vec![0, 1, 0]])
+        );
     }
 
     #[test]
