@@ -226,7 +226,13 @@ The static module demo exercises packaged module loading without a listener:
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-module-demo.bmp --width 800 --height 300
 ```
 
-The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports named imports, namespace imports, `export const`, `export function`, and local export lists, caches completed modules, exposes `import.meta.url`, and rejects cycles or missing and cross-origin dependencies. Classic scripts can also use same-origin dynamic `import()` and receive a promise-backed module namespace, with deterministic rejection for missing, unsupported, and cross-origin resources. Template literals support text plus `${...}` expressions. Default exports, re-exports, live binding updates, async module evaluation, import attributes, tagged templates, nested template literals, and the rest of JavaScript grammar remain separate gates.
+The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports default and named imports, namespace imports, `export default`, `export const`, `export function`, and local export lists, caches completed modules, exposes `import.meta.url`, and rejects cycles or missing and cross-origin dependencies. Classic scripts can also use same-origin dynamic `import()` and receive a promise-backed module namespace, with deterministic rejection for missing, unsupported, and cross-origin resources. Template literals support text plus `${...}` expressions. Re-exports, live binding updates, async module evaluation, import attributes, tagged templates, nested template literals, and the rest of JavaScript grammar remain separate gates.
+
+The default-module sample loads a packaged module with a default function and a named value:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/default-module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-default-module-demo.bmp --width 800 --height 320
+```
 
 The dynamic selector demo exercises stateful CSS through the host input boundary:
 

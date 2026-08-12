@@ -4663,6 +4663,27 @@ impl Parser {
         statements: &mut Vec<Stmt>,
         exports: &mut Vec<ModuleExport>,
     ) -> Result<(), ScriptError> {
+        if self.is_identifier("default") {
+            self.advance();
+            if exports.iter().any(|export| export.exported == "default") {
+                return Err(self.error(
+                    "module has more than one default export".to_string(),
+                    self.peek().offset,
+                ));
+            }
+            let local = "__ceri_default_export".to_string();
+            let initializer = self.parse_expression()?;
+            statements.push(Stmt::Let {
+                pattern: Pattern::Identifier(local.clone()),
+                initializer: Some(initializer),
+            });
+            exports.push(ModuleExport {
+                local,
+                exported: "default".to_string(),
+            });
+            self.take(TokenKind::Semicolon);
+            return Ok(());
+        }
         if self.is(TokenKind::Let) || self.is(TokenKind::Const) {
             let statement = self.parse_statement()?;
             let Stmt::Let {
@@ -5347,7 +5368,7 @@ impl Parser {
     }
 
     fn parse_function_expression(&mut self) -> Result<Expr, ScriptError> {
-        if self.is_next_identifier() {
+        if matches!(self.peek().kind, TokenKind::Identifier(_)) {
             self.advance();
         }
         let function = self.parse_function_after_name()?;
@@ -5903,6 +5924,34 @@ mod tests {
                 .expect("message export should exist")
                 .string_value(),
             "from module"
+        );
+    }
+
+    #[test]
+    fn imports_default_exports_alongside_named_exports() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([(
+                "/default.js".to_string(),
+                r#"export default "primary"; export const named = "secondary";"#.to_string(),
+            )]),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                r#"import primary, { named } from "./default.js"; document.getElementById("status").textContent = primary + "|" + named;"#,
+                base,
+                &mut loader,
+            )
+            .expect("default import should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("primary|secondary")
         );
     }
 
