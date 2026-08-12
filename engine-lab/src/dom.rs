@@ -148,6 +148,33 @@ impl Document {
         None
     }
 
+    pub fn radio_group_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
+        let radio = self.element_at(path)?;
+        if radio.name != "input"
+            || !radio
+                .attr("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
+        {
+            return None;
+        }
+        let name = radio.attr("name")?;
+        let form = self.form_ancestor_path(path)?;
+        Some(
+            self.form_control_paths(&form)?
+                .into_iter()
+                .filter(|candidate| {
+                    self.element_at(candidate).is_some_and(|element| {
+                        element.name == "input"
+                            && element
+                                .attr("type")
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
+                            && element.attr("name") == Some(name)
+                    })
+                })
+                .collect(),
+        )
+    }
+
     pub fn link_reference(&self, path: &[usize]) -> Option<String> {
         let mut candidate = path.to_vec();
         loop {

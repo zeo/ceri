@@ -657,6 +657,13 @@ impl ScriptRuntime {
                 self.control_checked.insert(path.to_vec(), !checked);
             }
             "radio" => {
+                if let Some(group) = self.document.borrow().radio_group_paths(path) {
+                    for candidate in group {
+                        if candidate != path {
+                            self.control_checked.insert(candidate, false);
+                        }
+                    }
+                }
                 self.control_checked.insert(path.to_vec(), true);
             }
             _ => {}
@@ -4150,6 +4157,33 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|true|true|true")
+        );
+    }
+
+    #[test]
+    fn radio_click_default_keeps_one_group_value() {
+        let document = document(
+            r#"<form id="profile"><input id="first" name="mode" type="radio" value="first" checked><input id="second" name="mode" type="radio" value="second"><p id="status">idle</p></form>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                document.getElementById("second").click();
+                const first = document.getElementById("first");
+                const second = document.getElementById("second");
+                const data = new FormData(document.getElementById("profile"));
+                document.getElementById("status").textContent = first.checked + "|" + second.checked + "|" + data.get("mode");
+                "#,
+            )
+            .expect("radio click defaults should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("false|true|second")
         );
     }
 
