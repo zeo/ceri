@@ -1,10 +1,11 @@
-use crate::dom::{Document, NodePath};
+use crate::dom::{Document, Element, Node, NodePath};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
+type ElementHandle = Rc<RefCell<ElementLocation>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -31,8 +32,8 @@ enum Value {
     Bool(bool),
     Number(f64),
     String(String),
-    Element(NodePath),
-    Style(NodePath),
+    Element(ElementHandle),
+    Style(ElementHandle),
     Document,
     Window,
     Console,
@@ -44,6 +45,7 @@ enum Value {
 enum Builtin {
     DocumentGetElementById,
     DocumentQuerySelector,
+    DocumentCreateElement,
     ConsoleLog,
     SetTimeout,
     ClearTimeout,
@@ -51,6 +53,7 @@ enum Builtin {
     CancelAnimationFrame,
     ElementAddEventListener(NodePath),
     ElementClick(NodePath),
+    ElementAppendChild(NodePath),
     ElementSetAttribute(NodePath),
     ElementGetAttribute(NodePath),
 }
@@ -59,6 +62,12 @@ struct Function {
     params: Vec<String>,
     body: Vec<Stmt>,
     environment: EnvironmentRef,
+}
+
+#[derive(Clone, PartialEq)]
+enum ElementLocation {
+    Attached(NodePath),
+    Detached(Element),
 }
 
 #[derive(Default)]
@@ -423,6 +432,7 @@ impl ScriptRuntime {
             Value::Document => match property {
                 "getElementById" => Ok(Value::Builtin(Builtin::DocumentGetElementById)),
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
+                "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
                 _ => Err(runtime_error(format!(
                     "document has no property {property}"
                 ))),
@@ -437,39 +447,51 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!("window has no property {property}"))),
             },
             Value::Console if property == "log" => Ok(Value::Builtin(Builtin::ConsoleLog)),
-            Value::Element(path) => {
+            Value::Element(handle) => {
+                let path = attached_path(&handle);
                 let value = match property {
                     "textContent" => self
-                        .document
-                        .borrow()
-                        .element_text_content(&path)
+                        .element_text_content(&handle)
                         .map(Value::String)
                         .unwrap_or(Value::Undefined),
                     "className" => self
-                        .document
-                        .borrow()
-                        .element_attribute(&path, "class")
+                        .element_attribute(&handle, "class")
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
                     "id" => self
-                        .document
-                        .borrow()
-                        .element_attribute(&path, "id")
+                        .element_attribute(&handle, "id")
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
-                    "style" => Value::Style(path),
-                    "addEventListener" => Value::Builtin(Builtin::ElementAddEventListener(path)),
-                    "click" => Value::Builtin(Builtin::ElementClick(path)),
-                    "setAttribute" => Value::Builtin(Builtin::ElementSetAttribute(path)),
-                    "getAttribute" => Value::Builtin(Builtin::ElementGetAttribute(path)),
+                    "style" => Value::Style(handle),
+                    "addEventListener" => {
+                        Value::Builtin(Builtin::ElementAddEventListener(path.ok_or_else(|| {
+                            runtime_error("detached element cannot receive events")
+                        })?))
+                    }
+                    "click" => Value::Builtin(Builtin::ElementClick(
+                        path.ok_or_else(|| runtime_error("detached element cannot be clicked"))?,
+                    )),
+                    "appendChild" => {
+                        Value::Builtin(Builtin::ElementAppendChild(path.ok_or_else(|| {
+                            runtime_error("detached element cannot receive children")
+                        })?))
+                    }
+                    "setAttribute" => {
+                        Value::Builtin(Builtin::ElementSetAttribute(path.ok_or_else(|| {
+                            runtime_error("detached element has no document attributes")
+                        })?))
+                    }
+                    "getAttribute" => {
+                        Value::Builtin(Builtin::ElementGetAttribute(path.ok_or_else(|| {
+                            runtime_error("detached element has no document attributes")
+                        })?))
+                    }
                     _ => return Err(runtime_error(format!("element has no property {property}"))),
                 };
                 Ok(value)
             }
-            Value::Style(path) => Ok(self
-                .document
-                .borrow()
-                .style_property(&path, property)
+            Value::Style(handle) => Ok(self
+                .element_style_property(&handle, property)
                 .map(Value::String)
                 .unwrap_or_else(|| Value::String(String::new()))),
             _ => Err(runtime_error(format!("value has no property {property}"))),
@@ -484,30 +506,105 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         let value = value.string_value();
         let updated = match object {
-            Value::Element(path) => match property {
-                "textContent" => self
-                    .document
-                    .borrow_mut()
-                    .set_element_text_content(&path, value),
-                "className" => self
-                    .document
-                    .borrow_mut()
-                    .set_element_attribute(&path, "class", value),
-                "id" => self
-                    .document
-                    .borrow_mut()
-                    .set_element_attribute(&path, "id", value),
+            Value::Element(handle) => match property {
+                "textContent" => self.set_element_text_content(&handle, value),
+                "className" => self.set_element_attribute(&handle, "class", value),
+                "id" => self.set_element_attribute(&handle, "id", value),
                 _ => false,
             },
-            Value::Style(path) => self
-                .document
-                .borrow_mut()
-                .set_style_property(&path, property, value),
+            Value::Style(handle) => self.set_element_style_property(&handle, property, value),
             _ => false,
         };
         updated
             .then_some(())
             .ok_or_else(|| runtime_error(format!("property {property} is not writable")))
+    }
+
+    fn element_text_content(&self, handle: &ElementHandle) -> Option<String> {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self.document.borrow().element_text_content(&path),
+            ElementLocation::Detached(element) => {
+                let mut text = String::new();
+                collect_element_text(&element, &mut text);
+                Some(text)
+            }
+        }
+    }
+
+    fn element_attribute(&self, handle: &ElementHandle, name: &str) -> Option<String> {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                self.document.borrow().element_attribute(&path, name)
+            }
+            ElementLocation::Detached(element) => element.attr(name).map(str::to_string),
+        }
+    }
+
+    fn element_style_property(&self, handle: &ElementHandle, property: &str) -> Option<String> {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                self.document.borrow().style_property(&path, property)
+            }
+            ElementLocation::Detached(element) => element.style_property(property),
+        }
+    }
+
+    fn set_element_text_content(&mut self, handle: &ElementHandle, text: String) -> bool {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow_mut()
+                .set_element_text_content(&path, text),
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                element.children = vec![Node::Text(text)];
+                true
+            }
+        }
+    }
+
+    fn set_element_attribute(&mut self, handle: &ElementHandle, name: &str, value: String) -> bool {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow_mut()
+                .set_element_attribute(&path, name, value),
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                element.attrs.insert(name.to_ascii_lowercase(), value);
+                true
+            }
+        }
+    }
+
+    fn set_element_style_property(
+        &mut self,
+        handle: &ElementHandle,
+        property: &str,
+        value: String,
+    ) -> bool {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow_mut()
+                .set_style_property(&path, property, value),
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                element.set_style_property(property, value)
+            }
+        }
     }
 
     fn call(&mut self, callee: Value, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -548,6 +645,7 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .find_element_by_id(&id)
+                    .map(attached_handle)
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
             }
@@ -560,8 +658,21 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .find_element_by_selector(&selector)
+                    .map(attached_handle)
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
+            }
+            Builtin::DocumentCreateElement => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return Err(runtime_error("element name must not be empty"));
+                }
+                Ok(Value::Element(Rc::new(RefCell::new(
+                    ElementLocation::Detached(Element::new(&name)),
+                ))))
             }
             Builtin::ConsoleLog => {
                 self.logs.push(
@@ -613,6 +724,30 @@ impl ScriptRuntime {
             Builtin::ElementClick(path) => {
                 self.dispatch_event(path, "click")?;
                 Ok(Value::Undefined)
+            }
+            Builtin::ElementAppendChild(path) => {
+                let child = match arguments.first() {
+                    Some(Value::Element(handle)) => handle.clone(),
+                    _ => return Err(runtime_error("appendChild expects an element")),
+                };
+                let location = child.borrow().clone();
+                let element = match location {
+                    ElementLocation::Detached(element) => element,
+                    ElementLocation::Attached(_) => {
+                        return Err(runtime_error(
+                            "appendChild currently accepts detached elements only",
+                        ));
+                    }
+                };
+                let child_path = self
+                    .document
+                    .borrow_mut()
+                    .append_element(&path, element)
+                    .ok_or_else(|| {
+                        runtime_error("appendChild parent is no longer in the document")
+                    })?;
+                *child.borrow_mut() = ElementLocation::Attached(child_path);
+                Ok(Value::Element(child))
             }
             Builtin::ElementSetAttribute(path) => {
                 let name = arguments
@@ -694,6 +829,26 @@ impl ScriptRuntime {
             .filter(|(_, task)| task.due <= self.clock)
             .min_by_key(|(_, task)| (task.due, task.id))
             .map(|(index, _)| index)
+    }
+}
+
+fn attached_handle(path: NodePath) -> ElementHandle {
+    Rc::new(RefCell::new(ElementLocation::Attached(path)))
+}
+
+fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
+    match &*handle.borrow() {
+        ElementLocation::Attached(path) => Some(path.clone()),
+        ElementLocation::Detached(_) => None,
+    }
+}
+
+fn collect_element_text(element: &Element, output: &mut String) {
+    for child in &element.children {
+        match child {
+            Node::Element(child) => collect_element_text(child, output),
+            Node::Text(text) => output.push_str(text),
+        }
     }
 }
 
@@ -1612,6 +1767,40 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("idle")
+        );
+    }
+
+    #[test]
+    fn creates_and_appends_a_detached_element_with_a_stable_handle() {
+        let document = document("<main id='mount'><p>existing</p></main>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const mount = document.getElementById("mount");
+                const card = document.createElement("section");
+                card.className = "created";
+                card.textContent = "created before append";
+                card.style.color = "#42d3b4";
+                mount.appendChild(card);
+                card.textContent = "created after append";
+                "##,
+            )
+            .expect("DOM mutation should execute");
+        let created = document
+            .borrow()
+            .find_element_by_selector(".created")
+            .expect("created element should be attached");
+        assert_eq!(
+            document.borrow().element_text_content(&created).as_deref(),
+            Some("created after append")
+        );
+        assert_eq!(
+            document
+                .borrow()
+                .style_property(&created, "color")
+                .as_deref(),
+            Some("#42d3b4")
         );
     }
 

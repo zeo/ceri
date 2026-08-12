@@ -65,6 +65,6 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 ## Custom engine laboratory
 
-The isolated [engine-lab](engine-lab/README.md) crate is a from-scratch Rust rendering experiment. It currently parses a small HTML and CSS subset, loads same-origin external CSS and JavaScript from packaged resources, runs a small script subset with DOM events and a deterministic task clock, navigates an app-owned HTTPS origin, performs block and flex layout, and paints a deterministic PPM or BMP image without CEF or another browser engine. It is research code and is not part of the production bundle.
+The isolated [engine-lab](engine-lab/README.md) crate is a from-scratch Rust rendering experiment. It currently parses a small HTML and CSS subset, loads same-origin external CSS and JavaScript from packaged resources, constructs DOM nodes from scripts, runs a small script subset with DOM events and a deterministic task clock, navigates an app-owned HTTPS origin, performs block and flex layout, and paints a deterministic PPM or BMP image without CEF or another browser engine. It is research code and is not part of the production bundle.
 
 See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.

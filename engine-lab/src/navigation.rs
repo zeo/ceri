@@ -1091,6 +1091,33 @@ mod tests {
     }
 
     #[test]
+    fn browser_runs_external_dom_construction_before_layout() {
+        let mut resources = bundle(
+            r#"<main id="mount"><p>before</p></main><script src="/assets/build.js"></script>"#,
+        );
+        resources
+            .insert(
+                "/assets/build.js",
+                "text/javascript",
+                br#"const item = document.createElement("p"); item.className = "created"; item.textContent = "after"; document.getElementById("mount").appendChild(item);"#.to_vec(),
+            )
+            .expect("script should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().unwrap();
+        let created = document
+            .borrow()
+            .find_element_by_selector(".created")
+            .expect("created element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&created).as_deref(),
+            Some("after")
+        );
+    }
+
+    #[test]
     fn loads_external_styles_and_scripts_in_document_order() {
         let mut resources = bundle(
             r#"<link rel="stylesheet" href="/assets/theme.css"><p id="status">idle</p><script src="/assets/boot.js"></script><script>document.getElementById("status").textContent = message;</script>"#,

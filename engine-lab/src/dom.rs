@@ -152,6 +152,19 @@ impl Document {
         true
     }
 
+    pub fn append_element(&mut self, parent: &[usize], element: Element) -> Option<NodePath> {
+        let mut path = parent.to_vec();
+        let parent = self.element_at_mut(parent)?;
+        let index = parent.children.len();
+        parent.children.push(Node::Element(element));
+        path.push(index);
+        Some(path)
+    }
+
+    pub fn element_clone(&self, path: &[usize]) -> Option<Element> {
+        self.element_at(path).cloned()
+    }
+
     pub fn element_attribute(&self, path: &[usize], name: &str) -> Option<String> {
         self.element_at(path)
             .and_then(|element| element.attr(name).map(str::to_string))
@@ -166,43 +179,14 @@ impl Document {
     }
 
     pub fn style_property(&self, path: &[usize], property: &str) -> Option<String> {
-        let style = self.element_attribute(path, "style")?;
-        let property = css_property_name(property);
-        style.split(';').find_map(|declaration| {
-            let (name, value) = declaration.split_once(':')?;
-            (name.trim().eq_ignore_ascii_case(&property)).then(|| value.trim().to_string())
-        })
+        self.element_at(path)?.style_property(property)
     }
 
     pub fn set_style_property(&mut self, path: &[usize], property: &str, value: String) -> bool {
         let Some(element) = self.element_at_mut(path) else {
             return false;
         };
-        let property = css_property_name(property);
-        let mut declarations = element
-            .attr("style")
-            .unwrap_or("")
-            .split(';')
-            .filter_map(|declaration| {
-                let (name, value) = declaration.split_once(':')?;
-                Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
-            })
-            .collect::<Vec<_>>();
-        if let Some(declaration) = declarations
-            .iter_mut()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&property))
-        {
-            declaration.1 = value;
-        } else {
-            declarations.push((property, value));
-        }
-        let style = declarations
-            .into_iter()
-            .map(|(name, value)| format!("{name}: {value}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        element.attrs.insert("style".to_string(), style);
-        true
+        element.set_style_property(property, value)
     }
 
     fn element_at(&self, path: &[usize]) -> Option<&Element> {
@@ -249,6 +233,43 @@ impl Element {
 
     pub fn has_class(&self, class: &str) -> bool {
         self.classes().any(|candidate| candidate == class)
+    }
+
+    pub fn style_property(&self, property: &str) -> Option<String> {
+        let style = self.attr("style")?;
+        let property = css_property_name(property);
+        style.split(';').find_map(|declaration| {
+            let (name, value) = declaration.split_once(':')?;
+            (name.trim().eq_ignore_ascii_case(&property)).then(|| value.trim().to_string())
+        })
+    }
+
+    pub fn set_style_property(&mut self, property: &str, value: String) -> bool {
+        let property = css_property_name(property);
+        let mut declarations = self
+            .attr("style")
+            .unwrap_or("")
+            .split(';')
+            .filter_map(|declaration| {
+                let (name, value) = declaration.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(declaration) = declarations
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&property))
+        {
+            declaration.1 = value;
+        } else {
+            declarations.push((property, value));
+        }
+        let style = declarations
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.attrs.insert("style".to_string(), style);
+        true
     }
 }
 
@@ -752,6 +773,23 @@ mod tests {
                 ScriptSource::External("/boot.js".to_string()),
                 ScriptSource::Inline("console.log('inline');".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn appends_an_element_and_returns_its_stable_path() {
+        let mut document =
+            Document::parse("<main id='root'><p>before</p></main>").expect("document should parse");
+        let root = document
+            .find_element_by_id("root")
+            .expect("root should exist");
+        let path = document
+            .append_element(&root, Element::new("section"))
+            .expect("child should append");
+        assert_eq!(path, vec![0, 1]);
+        assert_eq!(
+            document.element_clone(&path).map(|element| element.name),
+            Some("section".to_string())
         );
     }
 }

@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 24px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0;
+        color: #6ee7c5;
+        font-size: 26px;
+      }
+      p {
+        margin: 0;
+      }
+      #mount {
+        padding: 12px;
+        background-color: #193c4b;
+      }
+      .created {
+        margin: 8px 0 0;
+        color: #6ee7c5;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>dynamic DOM construction</h1>
+      <p>the next element is created and appended by the script runtime</p>
+      <section id="mount"><p>existing node</p></section>
+    </main>
+  </body>
+  <script src="dynamic-demo.js"></script>
+</html>
