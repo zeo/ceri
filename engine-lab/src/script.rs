@@ -650,6 +650,7 @@ struct ResponseData {
     mime_type: String,
     headers: HeadersHandle,
     body: ResponseBodyHandle,
+    stream: ReadableStreamHandle,
 }
 
 struct ResponseBodyData {
@@ -2178,12 +2179,7 @@ impl ScriptRuntime {
                 "mimeType" => Ok(Value::String(response.mime_type.clone())),
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
-                "body" => Ok(Value::ReadableStream(Rc::new(RefCell::new(
-                    ReadableStreamData {
-                        body: response.body.clone(),
-                        canceled: false,
-                    },
-                )))),
+                "body" => Ok(Value::ReadableStream(response.stream.clone())),
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
@@ -4319,23 +4315,23 @@ impl ScriptRuntime {
         ) {
             Ok(Some(response)) => response,
             Ok(None) => {
-                return self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
-                    url: display_url,
-                    status: 404,
-                    mime_type: String::new(),
-                    headers: Rc::new(BTreeMap::new()),
-                    body: response_body(Vec::new()),
-                })));
+                return self.fulfilled_promise(Value::Response(Rc::new(response_data(
+                    display_url,
+                    404,
+                    String::new(),
+                    Rc::new(BTreeMap::new()),
+                    Vec::new(),
+                ))));
             }
             Err(error) => return self.rejected_promise(error.message),
         };
-        self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
-            url: display_url,
-            status: response.status(),
-            mime_type: response.mime_type().to_string(),
-            headers: Rc::new(response.headers().clone()),
-            body: response_body(response.body().to_vec()),
-        })))
+        self.fulfilled_promise(Value::Response(Rc::new(response_data(
+            display_url,
+            response.status(),
+            response.mime_type().to_string(),
+            Rc::new(response.headers().clone()),
+            response.body().to_vec(),
+        ))))
     }
 
     fn consume_response_body(&self, response: &ResponseHandle) -> Result<Vec<u8>, ScriptError> {
@@ -4687,6 +4683,28 @@ fn response_body(bytes: Vec<u8>) -> ResponseBodyHandle {
         disturbed: false,
         locked: false,
     }))
+}
+
+fn response_data(
+    url: String,
+    status: u16,
+    mime_type: String,
+    headers: HeadersHandle,
+    bytes: Vec<u8>,
+) -> ResponseData {
+    let body = response_body(bytes);
+    let stream = Rc::new(RefCell::new(ReadableStreamData {
+        body: body.clone(),
+        canceled: false,
+    }));
+    ResponseData {
+        url,
+        status,
+        mime_type,
+        headers,
+        body,
+        stream,
+    }
 }
 
 fn response_body_used(body: &ResponseBodyHandle) -> bool {
@@ -8190,6 +8208,40 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("hello|true|response body is already used")
+        );
+    }
+
+    #[test]
+    fn response_body_stream_identity_is_stable_across_property_reads() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"hello".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    const first = response.body;
+                    const second = response.body;
+                    status.textContent = (first === second) + "|" + first.locked;
+                    second.getReader().cancel().then(() => {
+                        status.textContent = status.textContent + "|" + response.bodyUsed;
+                    });
+                });
+                "#,
+            )
+            .expect("response body identity should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|false|true")
         );
     }
 
