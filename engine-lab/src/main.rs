@@ -8,6 +8,7 @@ struct Options {
     output: PathBuf,
     viewport: Size,
     clicks: Vec<String>,
+    click_points: Vec<(f32, f32)>,
     url: String,
     asset_root: Option<PathBuf>,
     ticks: Vec<u64>,
@@ -51,6 +52,15 @@ fn main() -> Result<(), String> {
         let dispatched = browser.click_id(id).map_err(|error| error.to_string())?;
         println!(
             "click #{id}: {}",
+            if dispatched { "handled" } else { "no listener" }
+        );
+    }
+    for &(x, y) in &options.click_points {
+        let dispatched = browser
+            .click_at(options.viewport, x, y)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "click @{x},{y}: {}",
             if dispatched { "handled" } else { "no listener" }
         );
     }
@@ -107,6 +117,7 @@ where
     let mut width = 800;
     let mut height = 520;
     let mut clicks = Vec::new();
+    let mut click_points = Vec::new();
     let mut url = format!("{APP_ORIGIN}/");
     let mut asset_root = None;
     let mut ticks = Vec::new();
@@ -121,6 +132,7 @@ where
             "--width" => width = parse_dimension(next_value(&mut args, "--width")?, "width")?,
             "--height" => height = parse_dimension(next_value(&mut args, "--height")?, "height")?,
             "--click" => clicks.push(next_value(&mut args, "--click")?),
+            "--click-at" => click_points.push(parse_point(next_value(&mut args, "--click-at")?)?),
             "--url" => url = next_value(&mut args, "--url")?,
             "--asset-root" => {
                 asset_root = Some(PathBuf::from(next_value(&mut args, "--asset-root")?))
@@ -128,7 +140,7 @@ where
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--tick MS]"
+                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--click-at X,Y] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -140,6 +152,7 @@ where
         input,
         output,
         clicks,
+        click_points,
         url,
         asset_root,
         ticks,
@@ -174,4 +187,23 @@ fn parse_delay(value: String) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| "tick must be a non-negative integer".to_string())
+}
+
+fn parse_point(value: String) -> Result<(f32, f32), String> {
+    let (x, y) = value
+        .split_once(',')
+        .ok_or_else(|| "click-at must use X,Y coordinates".to_string())?;
+    let x = parse_coordinate(x.trim(), "x")?;
+    let y = parse_coordinate(y.trim(), "y")?;
+    Ok((x, y))
+}
+
+fn parse_coordinate(value: &str, name: &str) -> Result<f32, String> {
+    let coordinate = value
+        .parse::<f32>()
+        .map_err(|_| format!("{name} coordinate must be finite"))?;
+    coordinate
+        .is_finite()
+        .then_some(coordinate)
+        .ok_or_else(|| format!("{name} coordinate must be finite"))
 }

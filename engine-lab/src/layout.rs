@@ -2,7 +2,7 @@ use crate::css::{
     AlignItems, Color, Display, Edges, FlexDirection, FontWeight, JustifyContent, Style,
     Stylesheet, TextAlign,
 };
-use crate::dom::{Document, Element, Node};
+use crate::dom::{Document, Element, Node, NodePath};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Size {
@@ -37,6 +37,7 @@ pub struct TextRun {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutBox {
+    pub path: NodePath,
     pub tag: String,
     pub rect: Rect,
     pub background: Color,
@@ -96,6 +97,7 @@ struct InlineContext {
 
 struct FlexItem<'a> {
     element: &'a Element,
+    path: NodePath,
     style: Style,
     margin: ResolvedEdges,
     main_extras: f32,
@@ -106,6 +108,7 @@ struct FlexItem<'a> {
 
 struct FlexLayoutInput<'a> {
     element: &'a Element,
+    path: NodePath,
     ancestors: Vec<&'a Element>,
     style: Style,
     stylesheet: &'a Stylesheet,
@@ -119,8 +122,15 @@ struct FlexLayoutInput<'a> {
     font_size: f32,
 }
 
+struct LayoutNode<'a> {
+    element: &'a Element,
+    path: NodePath,
+    ancestors: &'a [&'a Element],
+}
+
 pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> LayoutDocument {
     let mut root = LayoutBox {
+        path: Vec::new(),
         tag: "#document".to_string(),
         rect: Rect {
             x: 0.0,
@@ -136,12 +146,17 @@ pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> L
         margin: ResolvedEdges::default(),
     };
     let mut cursor_y = 0.0;
-    for child in &document.root.children {
+    for (index, child) in document.root.children.iter().enumerate() {
         let Node::Element(element) = child else {
             continue;
         };
+        let path = vec![index];
         if let Some(child_box) = layout_element(
-            element,
+            LayoutNode {
+                element,
+                path,
+                ancestors: &[],
+            },
             0.0,
             cursor_y,
             viewport.width,
@@ -151,7 +166,6 @@ pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> L
                 weight: FontWeight::Normal,
             },
             stylesheet,
-            &[],
         ) {
             cursor_y = child_box.rect.bottom() + child_box.margin.bottom;
             root.children.push(child_box);
@@ -170,17 +184,41 @@ impl LayoutDocument {
         describe_box(&self.root, 0, &mut lines);
         lines.join("\n")
     }
+
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodePath> {
+        hit_test_box(&self.root, x, y)
+    }
+}
+
+fn hit_test_box(layout: &LayoutBox, x: f32, y: f32) -> Option<NodePath> {
+    if !contains_point(layout.rect, x, y) {
+        return None;
+    }
+    for child in layout.children.iter().rev() {
+        if let Some(path) = hit_test_box(child, x, y) {
+            return Some(path);
+        }
+    }
+    (!layout.path.is_empty()).then(|| layout.path.clone())
+}
+
+fn contains_point(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
 }
 
 fn layout_element(
-    element: &Element,
+    node: LayoutNode<'_>,
     containing_x: f32,
     containing_y: f32,
     containing_width: f32,
     parent: ParentStyle,
     stylesheet: &Stylesheet,
-    ancestors: &[&Element],
 ) -> Option<LayoutBox> {
+    let LayoutNode {
+        element,
+        path,
+        ancestors,
+    } = node;
     let style = stylesheet.style_for_inherited_with_ancestors(
         element,
         ancestors,
@@ -218,6 +256,7 @@ fn layout_element(
     if style.display == Display::Flex {
         return Some(layout_flex_element(FlexLayoutInput {
             element,
+            path,
             ancestors: ancestors.to_vec(),
             style,
             stylesheet,
@@ -255,7 +294,7 @@ fn layout_element(
     };
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(element);
-    for child in &element.children {
+    for (index, child) in element.children.iter().enumerate() {
         match child {
             Node::Text(value) => append_inline_text(value, inline_context, &mut text, &mut line),
             Node::Element(child_element) => {
@@ -277,8 +316,14 @@ fn layout_element(
                         content_width,
                         style.text_align,
                     );
+                    let mut child_path = path.clone();
+                    child_path.push(index);
                     if let Some(child_box) = layout_element(
-                        child_element,
+                        LayoutNode {
+                            element: child_element,
+                            path: child_path,
+                            ancestors: &child_ancestors,
+                        },
                         content_x,
                         line.y,
                         content_width,
@@ -288,7 +333,6 @@ fn layout_element(
                             weight: style.font_weight,
                         },
                         stylesheet,
-                        &child_ancestors,
                     ) {
                         line.y = child_box.rect.bottom() + child_box.margin.bottom;
                         line.used = 0.0;
@@ -332,6 +376,7 @@ fn layout_element(
         ..rect
     };
     Some(LayoutBox {
+        path,
         tag: element.name.clone(),
         rect,
         background: style.background,
@@ -346,6 +391,7 @@ fn layout_element(
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let FlexLayoutInput {
         element,
+        path,
         ancestors,
         style,
         stylesheet,
@@ -366,7 +412,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
     let mut items = Vec::new();
-    for child in &element.children {
+    for (index, child) in element.children.iter().enumerate() {
         let Node::Element(child) = child else {
             continue;
         };
@@ -408,8 +454,11 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             FlexDirection::Row => child_style.width.resolve(content_width, child_font_size),
             FlexDirection::Column => child_style.height.resolve(content_width, child_font_size),
         };
+        let mut child_path = path.clone();
+        child_path.push(index);
         items.push(FlexItem {
             element: child,
+            path: child_path,
             style: child_style,
             margin: child_margin,
             main_extras,
@@ -455,13 +504,16 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             content_width
         };
         item.layout = layout_element(
-            item.element,
+            LayoutNode {
+                element: item.element,
+                path: item.path.clone(),
+                ancestors: &child_ancestors,
+            },
             0.0,
             0.0,
             child_width,
             child_parent,
             stylesheet,
-            &child_ancestors,
         );
     }
 
@@ -555,6 +607,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         }
     };
     LayoutBox {
+        path,
         tag: element.name.clone(),
         rect: Rect {
             height: content_height + padding.top + padding.bottom + (border * 2.0),

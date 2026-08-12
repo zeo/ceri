@@ -10,6 +10,7 @@ The current slice implements:
 - a deterministic cascade with selector specificity
 - document and subtree `querySelector` lookups using the same selector matcher
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
+- layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - bubbling DOM events with `type`, `target`, and `currentTarget` values
@@ -62,4 +63,10 @@ The event sample starts a click on a nested element and handles it on an ancesto
 
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo.bmp --width 800 --height 360 --click label
+```
+
+The same sample can dispatch a pointer location through layout hit testing instead of naming an element:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo-pointer.bmp --width 800 --height 360 --click-at 60,160
 ```

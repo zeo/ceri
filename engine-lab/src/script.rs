@@ -258,6 +258,10 @@ impl ScriptRuntime {
         let Some(path) = self.document.borrow().find_element_by_id(id) else {
             return Ok(false);
         };
+        self.click_path(path)
+    }
+
+    pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
         self.dispatch_event(path, "click")
     }
 

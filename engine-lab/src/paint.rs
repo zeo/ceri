@@ -331,6 +331,7 @@ mod tests {
                 height: 24.0,
             },
             root: LayoutBox {
+                path: Vec::new(),
                 tag: "root".to_string(),
                 rect: Rect {
                     x: 2.0,

@@ -416,6 +416,19 @@ impl Browser {
             .map_err(|error| NavigationError::Script(error.to_string()))
     }
 
+    pub fn click_at(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
+        let path = self.layout(viewport)?.hit_test(x, y);
+        let Some(path) = path else {
+            return Ok(false);
+        };
+        self.page
+            .as_mut()
+            .ok_or(NavigationError::NoPage)?
+            .runtime
+            .click_path(path)
+            .map_err(|error| NavigationError::Script(error.to_string()))
+    }
+
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, NavigationError> {
         self.page
             .as_mut()
@@ -1066,6 +1079,41 @@ mod tests {
                 .style_property(&status, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn browser_dispatches_coordinate_clicks_through_layout_paths() {
+        let mut browser = Browser::new(bundle(
+            r##"<main><button id="go" style="display: block; width: 120px; height: 40px">run</button><p id="status">idle</p></main><script>
+                const button = document.getElementById("go");
+                const status = document.getElementById("status");
+                button.addEventListener("click", () => { status.textContent = "clicked"; });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(
+            browser
+                .click_at(
+                    Size {
+                        width: 320.0,
+                        height: 180.0,
+                    },
+                    10.0,
+                    10.0,
+                )
+                .expect("coordinate click should dispatch")
+        );
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("clicked")
         );
     }
 
