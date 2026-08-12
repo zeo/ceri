@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn page_scripts_fetch_same_origin_packaged_text() {
         let mut resources = bundle(
-            r#"<p id="status">idle</p><script>const response = fetch("/data.json"); document.getElementById("status").textContent = response.status + " " + response.text();</script>"#,
+            r#"<p id="status">idle</p><script>const status = document.getElementById("status"); fetch("/data.json").then((response) => { response.text().then((body) => { status.textContent = response.status + " " + body; }); });</script>"#,
         );
         resources
             .insert(

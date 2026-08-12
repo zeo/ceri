@@ -21,7 +21,7 @@ The current slice implements:
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - same-origin relative URL resolution for external stylesheets and scripts
-- packaged-origin `fetch()` responses with status, MIME type, URL, and text bodies
+- packaged-origin promise-based `fetch()` responses with status, MIME type, URL, and text bodies
 - browser navigation, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
@@ -92,4 +92,4 @@ The fetch demo exercises an app-owned resource without opening a listener:
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/fetch-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-fetch-demo.bmp
 ```
 
-This first fetch slice is synchronous and limited to packaged same-origin resources. It returns a response with `status`, `ok`, `url`, `mimeType`, and `text()`. Missing resources return status 404, while rejected origins return status 0. Promise scheduling, streaming bodies, network transports, request methods, and JSON object materialization remain separate compatibility gates.
+This first fetch slice is deterministic and limited to packaged same-origin resources. It returns a promise with `then()` and `catch()` and a response with `status`, `ok`, `url`, `mimeType`, and promise-returning `text()`. Microtasks drain after each script turn and clock advance. Missing resources resolve with status 404, while rejected origins reject the promise. Streaming bodies, network transports, request methods, and JSON object materialization remain separate compatibility gates.

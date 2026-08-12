@@ -1,13 +1,14 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::navigation::{AppUrl, ResourceBundle};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
 type ResponseHandle = Rc<ResponseData>;
+type PromiseHandle = Rc<RefCell<PromiseData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -39,6 +40,7 @@ enum Value {
     ClassList(ElementHandle),
     Event(EventData),
     Response(ResponseHandle),
+    Promise(PromiseHandle),
     Document,
     Window,
     Console,
@@ -67,6 +69,8 @@ enum Builtin {
     ElementClassListContains(ElementHandle),
     ElementClassListToggle(ElementHandle),
     Fetch,
+    PromiseThen(PromiseHandle),
+    PromiseCatch(PromiseHandle),
     ResponseText(ResponseHandle),
 }
 
@@ -178,6 +182,7 @@ pub struct ScriptRuntime {
     clock: u64,
     next_task_id: u64,
     tasks: Vec<ScheduledTask>,
+    microtasks: VecDeque<Microtask>,
 }
 
 #[derive(Clone)]
@@ -200,6 +205,30 @@ struct ResponseData {
     body: Vec<u8>,
 }
 
+#[derive(Clone)]
+enum PromiseOutcome {
+    Pending,
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+struct PromiseData {
+    outcome: PromiseOutcome,
+    reactions: Vec<PromiseReaction>,
+}
+
+struct Microtask {
+    callback: Value,
+    argument: Value,
+    next: PromiseHandle,
+}
+
+struct PromiseReaction {
+    fulfilled: Option<Value>,
+    rejected: Option<Value>,
+    next: PromiseHandle,
+}
+
 #[derive(Clone, Copy)]
 enum TaskKind {
     Timeout,
@@ -214,6 +243,7 @@ struct ScheduledTask {
 }
 
 const MAX_TASKS_PER_ADVANCE: usize = 10_000;
+const MAX_MICROTASKS_PER_DRAIN: usize = 10_000;
 
 impl ScriptRuntime {
     pub fn new(document: Rc<RefCell<Document>>) -> Self {
@@ -271,6 +301,7 @@ impl ScriptRuntime {
             clock: 0,
             next_task_id: 1,
             tasks: Vec::new(),
+            microtasks: VecDeque::new(),
         }
     }
 
@@ -285,7 +316,7 @@ impl ScriptRuntime {
     pub fn execute(&mut self, source: &str) -> Result<(), ScriptError> {
         let program = Parser::new(source)?.parse_program()?;
         match self.execute_statements(&program, self.global.clone())? {
-            Completion::Normal | Completion::Return(_) => Ok(()),
+            Completion::Normal | Completion::Return(_) => self.drain_microtasks(),
         }
     }
 
@@ -339,6 +370,7 @@ impl ScriptRuntime {
             self.call(task.callback, arguments)?;
             executed += 1;
         }
+        self.drain_microtasks()?;
         Ok(executed)
     }
 
@@ -602,6 +634,11 @@ impl ScriptRuntime {
                     "response has no property {property}"
                 ))),
             },
+            Value::Promise(promise) => match property {
+                "then" => Ok(Value::Builtin(Builtin::PromiseThen(promise))),
+                "catch" => Ok(Value::Builtin(Builtin::PromiseCatch(promise))),
+                _ => Err(runtime_error(format!("promise has no property {property}"))),
+            },
             _ => Err(runtime_error(format!("value has no property {property}"))),
         }
     }
@@ -827,10 +864,14 @@ impl ScriptRuntime {
                 );
                 Ok(Value::Undefined)
             }
-            Builtin::Fetch => Ok(Value::Response(self.fetch(arguments.first()))),
-            Builtin::ResponseText(response) => Ok(Value::String(
-                String::from_utf8_lossy(&response.body).into_owned(),
-            )),
+            Builtin::Fetch => Ok(Value::Promise(self.fetch(arguments.first()))),
+            Builtin::PromiseThen(promise) => {
+                self.promise_then(promise, arguments.first(), arguments.get(1))
+            }
+            Builtin::PromiseCatch(promise) => self.promise_then(promise, None, arguments.first()),
+            Builtin::ResponseText(response) => Ok(Value::Promise(self.fulfilled_promise(
+                Value::String(String::from_utf8_lossy(&response.body).into_owned()),
+            ))),
             Builtin::SetTimeout => self.schedule_task(arguments, TaskKind::Timeout),
             Builtin::ClearTimeout => {
                 let id = arguments
@@ -991,49 +1032,160 @@ impl ScriptRuntime {
         Ok(had_callbacks)
     }
 
-    fn fetch(&self, reference: Option<&Value>) -> ResponseHandle {
+    fn fulfilled_promise(&self, value: Value) -> PromiseHandle {
+        Rc::new(RefCell::new(PromiseData {
+            outcome: PromiseOutcome::Fulfilled(value),
+            reactions: Vec::new(),
+        }))
+    }
+
+    fn rejected_promise(&self, reason: impl Into<String>) -> PromiseHandle {
+        Rc::new(RefCell::new(PromiseData {
+            outcome: PromiseOutcome::Rejected(Value::String(reason.into())),
+            reactions: Vec::new(),
+        }))
+    }
+
+    fn promise_then(
+        &mut self,
+        promise: PromiseHandle,
+        fulfilled: Option<&Value>,
+        rejected: Option<&Value>,
+    ) -> Result<Value, ScriptError> {
+        for callback in fulfilled.iter().chain(rejected.iter()) {
+            if !matches!(callback, Value::Function(_)) {
+                return Err(runtime_error("promise callback must be a function"));
+            }
+        }
+        let next = Rc::new(RefCell::new(PromiseData {
+            outcome: PromiseOutcome::Pending,
+            reactions: Vec::new(),
+        }));
+        let reaction = PromiseReaction {
+            fulfilled: fulfilled.cloned(),
+            rejected: rejected.cloned(),
+            next: next.clone(),
+        };
+        let outcome = {
+            let mut promise = promise.borrow_mut();
+            match &promise.outcome {
+                PromiseOutcome::Pending => {
+                    promise.reactions.push(reaction);
+                    return Ok(Value::Promise(next));
+                }
+                PromiseOutcome::Fulfilled(value) => PromiseOutcome::Fulfilled(value.clone()),
+                PromiseOutcome::Rejected(reason) => PromiseOutcome::Rejected(reason.clone()),
+            }
+        };
+        self.queue_reaction(reaction, outcome);
+        Ok(Value::Promise(next))
+    }
+
+    fn queue_reaction(&mut self, reaction: PromiseReaction, outcome: PromiseOutcome) {
+        let (callback, argument) = match outcome.clone() {
+            PromiseOutcome::Pending => return,
+            PromiseOutcome::Fulfilled(value) => (reaction.fulfilled, value),
+            PromiseOutcome::Rejected(reason) => (reaction.rejected, reason),
+        };
+        if let Some(callback) = callback {
+            self.microtasks.push_back(Microtask {
+                callback,
+                argument,
+                next: reaction.next,
+            });
+        } else {
+            self.settle_promise(&reaction.next, outcome);
+        }
+    }
+
+    fn settle_promise(&mut self, promise: &PromiseHandle, outcome: PromiseOutcome) {
+        let reactions = {
+            let mut promise = promise.borrow_mut();
+            if !matches!(promise.outcome, PromiseOutcome::Pending) {
+                return;
+            }
+            promise.outcome = outcome.clone();
+            std::mem::take(&mut promise.reactions)
+        };
+        for reaction in reactions {
+            self.queue_reaction(reaction, outcome.clone());
+        }
+    }
+
+    fn follow_promise(&mut self, next: PromiseHandle, promise: PromiseHandle) {
+        let reaction = PromiseReaction {
+            fulfilled: None,
+            rejected: None,
+            next: next.clone(),
+        };
+        let outcome = {
+            let mut promise = promise.borrow_mut();
+            match &promise.outcome {
+                PromiseOutcome::Pending => {
+                    promise.reactions.push(reaction);
+                    return;
+                }
+                PromiseOutcome::Fulfilled(value) => PromiseOutcome::Fulfilled(value.clone()),
+                PromiseOutcome::Rejected(reason) => PromiseOutcome::Rejected(reason.clone()),
+            }
+        };
+        self.queue_reaction(reaction, outcome);
+    }
+
+    fn drain_microtasks(&mut self) -> Result<(), ScriptError> {
+        let mut executed = 0;
+        while let Some(task) = self.microtasks.pop_front() {
+            if executed == MAX_MICROTASKS_PER_DRAIN {
+                return Err(runtime_error(
+                    "microtask queue exceeded the deterministic limit",
+                ));
+            }
+            let outcome = self.call(task.callback, vec![task.argument]);
+            match outcome {
+                Ok(Value::Promise(promise)) => self.follow_promise(task.next, promise),
+                Ok(value) => {
+                    self.settle_promise(&task.next, PromiseOutcome::Fulfilled(value));
+                }
+                Err(error) => {
+                    self.settle_promise(
+                        &task.next,
+                        PromiseOutcome::Rejected(Value::String(error.to_string())),
+                    );
+                }
+            }
+            executed += 1;
+        }
+        Ok(())
+    }
+
+    fn fetch(&self, reference: Option<&Value>) -> PromiseHandle {
         let reference = reference
             .map(Value::string_value)
             .unwrap_or_else(|| "undefined".to_string());
         let Some(resources) = &self.resources else {
-            return Rc::new(ResponseData {
-                url: reference,
-                status: 0,
-                mime_type: String::new(),
-                body: Vec::new(),
-            });
+            return self.rejected_promise("fetch is unavailable without a resource bundle");
         };
         let Some(base_url) = &self.base_url else {
-            return Rc::new(ResponseData {
-                url: reference,
-                status: 0,
-                mime_type: String::new(),
-                body: Vec::new(),
-            });
+            return self.rejected_promise("fetch is unavailable without a document URL");
         };
         let Ok(url) = base_url.resolve(&reference) else {
-            return Rc::new(ResponseData {
-                url: reference,
-                status: 0,
-                mime_type: String::new(),
-                body: Vec::new(),
-            });
+            return self.rejected_promise(format!("fetch rejected URL {reference}"));
         };
         let display_url = url.to_string();
         let Some(resource) = resources.resource(url.path()) else {
-            return Rc::new(ResponseData {
+            return self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
                 url: display_url,
                 status: 404,
                 mime_type: String::new(),
                 body: Vec::new(),
-            });
+            })));
         };
-        Rc::new(ResponseData {
+        self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
             url: display_url,
             status: 200,
             mime_type: resource.mime_type().to_string(),
             body: resource.body().to_vec(),
-        })
+        })))
     }
 
     fn schedule_task(
@@ -1246,6 +1398,7 @@ impl Value {
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
             Self::Response(_) => "[response]".to_string(),
+            Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
             Self::Console => "[console]".to_string(),
@@ -2310,11 +2463,15 @@ mod tests {
         runtime
             .execute(
                 r#"
-                const response = fetch("./data.json");
-                document.getElementById("status").textContent = response.status + "|" + response.ok + "|" + response.mimeType + "|" + response.url + "|" + response.text();
+                const status = document.getElementById("status");
+                fetch("./data.json").then((response) => {
+                    response.text().then((body) => {
+                        status.textContent = response.status + "|" + response.ok + "|" + response.mimeType + "|" + response.url + "|" + body;
+                    });
+                });
                 "#,
             )
-            .expect("packaged fetch should execute");
+            .expect("packaged promise fetch should execute");
         let status = document
             .borrow()
             .find_element_by_id("status")
@@ -2339,12 +2496,17 @@ mod tests {
         runtime
             .execute(
                 r#"
-                const missing = fetch("/missing.json");
-                const external = fetch("https://other.invalid/data.json");
-                document.getElementById("status").textContent = missing.status + "|" + missing.ok + "|" + external.status + "|" + external.ok;
+                const status = document.getElementById("status");
+                let missing = "";
+                fetch("/missing.json").then((response) => {
+                    missing = response.status + "|" + response.ok;
+                });
+                fetch("https://other.invalid/data.json").catch((error) => {
+                    status.textContent = missing + "|0|false";
+                });
                 "#,
             )
-            .expect("fetch failures should remain response values");
+            .expect("fetch failures should remain promise values");
         let status = document
             .borrow()
             .find_element_by_id("status")
@@ -2352,6 +2514,62 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("404|false|0|false")
+        );
+    }
+
+    #[test]
+    fn chained_promise_rejection_reaches_catch() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime =
+            ScriptRuntime::with_resources(document.clone(), ResourceBundle::default(), base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("https://other.invalid/data.json")
+                    .then((response) => { status.textContent = "unexpected"; })
+                    .catch((error) => { status.textContent = "caught"; });
+                "#,
+            )
+            .expect("chained rejection should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("caught")
+        );
+    }
+
+    #[test]
+    fn promise_callbacks_run_after_the_current_script_turn() {
+        let document = document("<p id='status'>start</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"ready".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then(() => {
+                    status.textContent = status.textContent + "|callback";
+                });
+                status.textContent = status.textContent + "|sync";
+                "#,
+            )
+            .expect("promise callback should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("start|sync|callback")
         );
     }
 
