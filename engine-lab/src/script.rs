@@ -59,6 +59,7 @@ enum Value {
     Document,
     Window,
     Location(LocationHandle),
+    ModuleImport(AppUrl),
     History(HistoryHandle),
     Url(UrlHandle),
     UrlSearchParams(UrlSearchParamsHandle),
@@ -183,6 +184,7 @@ enum Expr {
     },
     Object(Vec<(String, Expr)>),
     Array(Vec<Expr>),
+    Template(Vec<TemplatePart>),
     Call {
         callee: Box<Expr>,
         arguments: Vec<Expr>,
@@ -219,6 +221,12 @@ enum Stmt {
         alternate: Option<Box<Stmt>>,
     },
     Return(Option<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TemplatePart {
+    Text(String),
+    Expression(Box<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -630,6 +638,10 @@ impl ScriptRuntime {
             values: HashMap::new(),
             parent: Some(self.global.clone()),
         }));
+        environment
+            .borrow_mut()
+            .values
+            .insert("import".to_string(), Value::ModuleImport(url.clone()));
         for import in &program.imports {
             let (dependency_url, dependency_source) = loader.load_module(&url, &import.source)?;
             let namespace = self.execute_module_graph(&dependency_source, dependency_url, loader)?;
@@ -1118,6 +1130,20 @@ impl ScriptRuntime {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
+            Expr::Template(parts) => {
+                let mut output = String::new();
+                for part in parts {
+                    match part {
+                        TemplatePart::Text(text) => output.push_str(text),
+                        TemplatePart::Expression(expression) => output.push_str(
+                            &self
+                                .evaluate(expression, environment.clone())?
+                                .string_value(),
+                        ),
+                    }
+                }
+                Ok(Value::String(output))
+            }
             Expr::Call { callee, arguments } => {
                 let callee = self.evaluate(callee, environment.clone())?;
                 let arguments = arguments
@@ -1353,6 +1379,17 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!("location has no property {property}"))),
                 }
             }
+            Value::ModuleImport(url) if property == "meta" => {
+                let mut meta = BTreeMap::new();
+                meta.insert(
+                    "url".to_string(),
+                    Value::String(url.to_string()),
+                );
+                Ok(Value::Object(Rc::new(RefCell::new(meta))))
+            }
+            Value::ModuleImport(_) => Err(runtime_error(format!(
+                "import has no property {property}"
+            ))),
             Value::History(history) => match property {
                 "state" => Ok(history.borrow().state.clone()),
                 "length" => Ok(Value::Number(history.borrow().length as f64)),
@@ -3038,6 +3075,7 @@ impl Value {
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
             Self::Location(value) => value.borrow().to_string(),
+            Self::ModuleImport(_) => "[object Module]".to_string(),
             Self::History(_) => "[object History]".to_string(),
         Self::Url(value) => value.borrow().url.to_string(),
         Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
@@ -3731,6 +3769,7 @@ impl Parser {
         match token.kind {
             TokenKind::Number(value) => Ok(Expr::Literal(Literal::Number(value))),
             TokenKind::String(value) => Ok(Expr::Literal(Literal::String(value))),
+            TokenKind::Template(value) => Ok(Expr::Template(self.parse_template_parts(&value)?)),
             TokenKind::True => Ok(Expr::Literal(Literal::Bool(true))),
             TokenKind::False => Ok(Expr::Literal(Literal::Bool(false))),
             TokenKind::Null => Ok(Expr::Literal(Literal::Null)),
@@ -3759,6 +3798,40 @@ impl Parser {
             }
             other => Err(self.error(format!("unexpected token {other:?}"), token.offset)),
         }
+    }
+
+    fn parse_template_parts(&self, source: &str) -> Result<Vec<TemplatePart>, ScriptError> {
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        let mut text_start = 0;
+        while let Some(relative_start) = source[cursor..].find("${") {
+            let start = cursor + relative_start;
+            if start > text_start {
+                parts.push(TemplatePart::Text(source[text_start..start].to_string()));
+            }
+            let expression_start = start + 2;
+            let end = find_template_expression_end(source, expression_start).ok_or_else(|| {
+                self.error(
+                    "unterminated template interpolation".to_string(),
+                    start,
+                )
+            })?;
+            let mut parser = Parser::new(&source[expression_start..end])?;
+            let expression = parser.parse_expression()?;
+            if !parser.is(TokenKind::Eof) {
+                return Err(self.error(
+                    "template interpolation contains trailing tokens".to_string(),
+                    expression_start + parser.peek().offset,
+                ));
+            }
+            parts.push(TemplatePart::Expression(Box::new(expression)));
+            cursor = end + 1;
+            text_start = cursor;
+        }
+        if text_start < source.len() {
+            parts.push(TemplatePart::Text(source[text_start..].to_string()));
+        }
+        Ok(parts)
     }
 
     fn parse_object_literal(&mut self) -> Result<Expr, ScriptError> {
@@ -3974,6 +4047,7 @@ enum TokenKind {
     Identifier(String),
     Number(f64),
     String(String),
+    Template(String),
     True,
     False,
     Null,
@@ -4136,6 +4210,51 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
             });
             continue;
         }
+        if byte == b'`' {
+            let start = cursor;
+            cursor += 1;
+            let mut value = String::new();
+            let mut escaped = false;
+            while cursor < source.len() {
+                let character = source[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor stays on a character boundary");
+                cursor += character.len_utf8();
+                if escaped {
+                    value.push(match character {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '`' {
+                    tokens.push(Token {
+                        kind: TokenKind::Template(value),
+                        offset: start,
+                    });
+                    break;
+                } else {
+                    value.push(character);
+                }
+                if cursor == source.len() {
+                    return Err(ScriptError {
+                        offset: start,
+                        message: "unterminated template literal".to_string(),
+                    });
+                }
+            }
+            if !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Template(_))) {
+                return Err(ScriptError {
+                    offset: start,
+                    message: "unterminated template literal".to_string(),
+                });
+            }
+            continue;
+        }
         let start = cursor;
         let (kind, width) = match source.as_bytes()[cursor..].as_ref() {
             [b'(', ..] => (TokenKind::LParen, 1),
@@ -4186,6 +4305,36 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
         offset: source.len(),
     });
     Ok(tokens)
+}
+
+fn find_template_expression_end(source: &str, start: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, character) in source[start..].char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn token_matches(actual: &TokenKind, expected: &TokenKind) -> bool {
@@ -4287,6 +4436,54 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.message.contains("cyclic module import"));
+    }
+
+    #[test]
+    fn evaluates_template_interpolation_in_classic_scripts() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const count = 3;
+                document.getElementById("status").textContent = `ready ${count}|${1 + 2}`;
+                "#,
+            )
+            .expect("template literal should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready 3|3")
+        );
+    }
+
+    #[test]
+    fn exposes_import_meta_url_to_modules() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/entry.js")
+            .expect("module URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::new(),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                r#"document.getElementById("status").textContent = `loaded ${new URL(import.meta.url).pathname}`;"#,
+                base,
+                &mut loader,
+            )
+            .expect("import.meta should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("loaded /entry.js")
+        );
     }
 
     #[test]

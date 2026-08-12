@@ -29,6 +29,7 @@ The current slice implements:
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
 - app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
 - static ES module graphs with same-origin packaged imports, named exports, and namespace imports
+- template literals with expression interpolation and module `import.meta.url`
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -175,7 +176,7 @@ The static module demo exercises packaged module loading without a listener:
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-module-demo.bmp --width 800 --height 300
 ```
 
-The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports named imports, namespace imports, `export const`, `export function`, and local export lists, caches completed modules, and rejects cycles or missing and cross-origin dependencies. Dynamic `import()`, default exports, re-exports, live binding updates, async module evaluation, and the rest of JavaScript grammar remain separate gates.
+The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports named imports, namespace imports, `export const`, `export function`, and local export lists, caches completed modules, exposes `import.meta.url`, and rejects cycles or missing and cross-origin dependencies. Template literals support text plus `${...}` expressions. Dynamic `import()`, default exports, re-exports, live binding updates, async module evaluation, tagged templates, nested template literals, and the rest of JavaScript grammar remain separate gates.
 
 The dynamic selector demo exercises stateful CSS through the host input boundary:
 
