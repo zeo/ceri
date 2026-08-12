@@ -1,6 +1,6 @@
 use crate::css::{
     AlignItems, Color, Display, Edges, FlexDirection, FontWeight, GridTemplate, GridTrack,
-    JustifyContent, Style, Stylesheet, TextAlign,
+    JustifyContent, Style, StyleContext, StyleState, Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
 
@@ -95,6 +95,16 @@ struct InlineContext {
     align: TextAlign,
 }
 
+struct InlineElementInput<'a> {
+    element: &'a Element,
+    path: &'a [usize],
+    parent: ParentStyle,
+    context: InlineContext,
+    stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
+    ancestors: &'a [&'a Element],
+}
+
 struct FlexItem<'a> {
     element: &'a Element,
     path: NodePath,
@@ -112,6 +122,7 @@ struct FlexLayoutInput<'a> {
     ancestors: Vec<&'a Element>,
     style: Style,
     stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
     border: f32,
@@ -136,6 +147,7 @@ struct GridLayoutInput<'a> {
     ancestors: Vec<&'a Element>,
     style: Style,
     stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
     border: f32,
@@ -153,6 +165,15 @@ struct LayoutNode<'a> {
 }
 
 pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> LayoutDocument {
+    layout_with_state(document, stylesheet, viewport, &StyleState::default())
+}
+
+pub fn layout_with_state(
+    document: &Document,
+    stylesheet: &Stylesheet,
+    viewport: Size,
+    style_state: &StyleState,
+) -> LayoutDocument {
     let mut root = LayoutBox {
         path: Vec::new(),
         tag: "#document".to_string(),
@@ -190,6 +211,7 @@ pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> L
                 weight: FontWeight::Normal,
             },
             stylesheet,
+            style_state,
         ) {
             cursor_y = child_box.rect.bottom() + child_box.margin.bottom;
             root.children.push(child_box);
@@ -237,19 +259,22 @@ fn layout_element(
     containing_width: f32,
     parent: ParentStyle,
     stylesheet: &Stylesheet,
+    style_state: &StyleState,
 ) -> Option<LayoutBox> {
     let LayoutNode {
         element,
         path,
         ancestors,
     } = node;
-    let style = stylesheet.style_for_inherited_with_ancestors(
+    let style = stylesheet.style_for(StyleContext {
         element,
+        path: &path,
         ancestors,
-        parent.font_size,
-        parent.color,
-        parent.weight,
-    );
+        parent_font_size: parent.font_size,
+        parent_color: parent.color,
+        parent_weight: parent.weight,
+        state: style_state,
+    });
     if style.display == Display::None {
         return None;
     }
@@ -284,6 +309,7 @@ fn layout_element(
             ancestors: ancestors.to_vec(),
             style,
             stylesheet,
+            style_state,
             margin,
             padding,
             border,
@@ -301,6 +327,7 @@ fn layout_element(
             ancestors: ancestors.to_vec(),
             style,
             stylesheet,
+            style_state,
             margin,
             padding,
             border,
@@ -339,13 +366,17 @@ fn layout_element(
         match child {
             Node::Text(value) => append_inline_text(value, inline_context, &mut text, &mut line),
             Node::Element(child_element) => {
-                let child_style = stylesheet.style_for_inherited_with_ancestors(
-                    child_element,
-                    &child_ancestors,
-                    font_size,
-                    style.color,
-                    style.font_weight,
-                );
+                let mut child_path = path.clone();
+                child_path.push(index);
+                let child_style = stylesheet.style_for(StyleContext {
+                    element: child_element,
+                    path: &child_path,
+                    ancestors: &child_ancestors,
+                    parent_font_size: font_size,
+                    parent_color: style.color,
+                    parent_weight: style.font_weight,
+                    state: style_state,
+                });
                 if child_style.display == Display::None {
                     continue;
                 }
@@ -360,8 +391,6 @@ fn layout_element(
                         content_width,
                         style.text_align,
                     );
-                    let mut child_path = path.clone();
-                    child_path.push(index);
                     if let Some(child_box) = layout_element(
                         LayoutNode {
                             element: child_element,
@@ -377,6 +406,7 @@ fn layout_element(
                             weight: style.font_weight,
                         },
                         stylesheet,
+                        style_state,
                     ) {
                         line.y = child_box.rect.bottom() + child_box.margin.bottom;
                         line.used = 0.0;
@@ -386,15 +416,19 @@ fn layout_element(
                     }
                 } else {
                     append_inline_element(
-                        child_element,
-                        ParentStyle {
-                            font_size,
-                            color: style.color,
-                            weight: style.font_weight,
+                        InlineElementInput {
+                            element: child_element,
+                            path: &child_path,
+                            parent: ParentStyle {
+                                font_size,
+                                color: style.color,
+                                weight: style.font_weight,
+                            },
+                            context: inline_context,
+                            stylesheet,
+                            style_state,
+                            ancestors: &child_ancestors,
                         },
-                        inline_context,
-                        stylesheet,
-                        &child_ancestors,
                         &mut text,
                         &mut line,
                     );
@@ -439,6 +473,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         ancestors,
         style,
         stylesheet,
+        style_state,
         margin,
         padding,
         border,
@@ -460,13 +495,17 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         let Node::Element(child) = child else {
             continue;
         };
-        let child_style = stylesheet.style_for_inherited_with_ancestors(
-            child,
-            &child_ancestors,
-            font_size,
-            style.color,
-            style.font_weight,
-        );
+        let mut child_path = path.clone();
+        child_path.push(index);
+        let child_style = stylesheet.style_for(StyleContext {
+            element: child,
+            path: &child_path,
+            ancestors: &child_ancestors,
+            parent_font_size: font_size,
+            parent_color: style.color,
+            parent_weight: style.font_weight,
+            state: style_state,
+        });
         if child_style.display == Display::None {
             continue;
         }
@@ -498,8 +537,6 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             FlexDirection::Row => child_style.width.resolve(content_width, child_font_size),
             FlexDirection::Column => child_style.height.resolve(content_width, child_font_size),
         };
-        let mut child_path = path.clone();
-        child_path.push(index);
         items.push(FlexItem {
             element: child,
             path: child_path,
@@ -558,6 +595,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             child_width,
             child_parent,
             stylesheet,
+            style_state,
         );
     }
 
@@ -673,6 +711,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         ancestors,
         style,
         stylesheet,
+        style_state,
         margin,
         padding,
         border,
@@ -694,13 +733,17 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let Node::Element(child) = child else {
             continue;
         };
-        let child_style = stylesheet.style_for_inherited_with_ancestors(
-            child,
-            &child_ancestors,
-            font_size,
-            style.color,
-            style.font_weight,
-        );
+        let mut child_path = path.clone();
+        child_path.push(index);
+        let child_style = stylesheet.style_for(StyleContext {
+            element: child,
+            path: &child_path,
+            ancestors: &child_ancestors,
+            parent_font_size: font_size,
+            parent_color: style.color,
+            parent_weight: style.font_weight,
+            state: style_state,
+        });
         if child_style.display == Display::None {
             continue;
         }
@@ -710,8 +753,6 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             .unwrap_or(font_size)
             .max(1.0);
         let child_margin = resolve_edges(child_style.margin, content_width, child_font_size);
-        let mut child_path = path.clone();
-        child_path.push(index);
         items.push(GridItem {
             element: child,
             path: child_path,
@@ -752,6 +793,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             column_width.max(0.0),
             child_parent,
             stylesheet,
+            style_state,
         );
     }
     let mut intrinsic_rows = vec![0.0_f32; row_count];
@@ -920,14 +962,19 @@ fn translate_layout_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
 }
 
 fn append_inline_element(
-    element: &Element,
-    parent: ParentStyle,
-    context: InlineContext,
-    stylesheet: &Stylesheet,
-    ancestors: &[&Element],
+    input: InlineElementInput<'_>,
     text: &mut Vec<TextRun>,
     line: &mut InlineLine,
 ) {
+    let InlineElementInput {
+        element,
+        path,
+        parent,
+        context,
+        stylesheet,
+        style_state,
+        ancestors,
+    } = input;
     if element.name == "br" {
         if line.fragments.is_empty() {
             line.y += context.line_height;
@@ -943,13 +990,15 @@ fn append_inline_element(
         }
         return;
     }
-    let style = stylesheet.style_for_inherited_with_ancestors(
+    let style = stylesheet.style_for(StyleContext {
         element,
+        path,
         ancestors,
-        parent.font_size,
-        parent.color,
-        parent.weight,
-    );
+        parent_font_size: parent.font_size,
+        parent_color: parent.color,
+        parent_weight: parent.weight,
+        state: style_state,
+    });
     if style.display == Display::None {
         return;
     }
@@ -974,22 +1023,30 @@ fn append_inline_element(
     };
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(element);
-    for child in &element.children {
+    for (index, child) in element.children.iter().enumerate() {
         match child {
             Node::Text(value) => append_inline_text(value, child_context, text, line),
-            Node::Element(child) => append_inline_element(
-                child,
-                ParentStyle {
-                    font_size,
-                    color: style.color,
-                    weight: style.font_weight,
-                },
-                child_context,
-                stylesheet,
-                &child_ancestors,
-                text,
-                line,
-            ),
+            Node::Element(child) => {
+                let mut child_path = path.to_vec();
+                child_path.push(index);
+                append_inline_element(
+                    InlineElementInput {
+                        element: child,
+                        path: &child_path,
+                        parent: ParentStyle {
+                            font_size,
+                            color: style.color,
+                            weight: style.font_weight,
+                        },
+                        context: child_context,
+                        stylesheet,
+                        style_state,
+                        ancestors: &child_ancestors,
+                    },
+                    text,
+                    line,
+                )
+            }
         }
     }
 }

@@ -1,0 +1,75 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      button {
+        display: block;
+        width: 240px;
+        height: 44px;
+        margin: 18px 0 12px;
+        color: #07131f;
+        background-color: #6ee7c5;
+        border: 3px solid #6ee7c5;
+      }
+      button:hover {
+        color: #07131f;
+        background-color: #ffd479;
+      }
+      button:focus {
+        border-color: #e06c75;
+      }
+      input {
+        display: block;
+        width: 24px;
+        height: 24px;
+        margin: 16px 0 8px;
+        background-color: #07131f;
+        border: 2px solid #2c6676;
+      }
+      input:checked {
+        background-color: #6ee7c5;
+        border-color: #6ee7c5;
+      }
+      input:disabled {
+        background-color: #314452;
+      }
+      .enabled {
+        color: #6ee7c5;
+      }
+      .disabled {
+        color: #8fa3ad;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>dynamic selector laboratory</h1>
+      <p>Pointer movement, focus, and live form state change the computed style.</p>
+      <button id="action">hover and focus this button</button>
+      <input id="switch" type="checkbox" name="switch">
+      <p id="enabled" class="enabled">enabled control</p>
+      <p id="disabled" class="disabled">disabled control</p>
+      <input id="locked" type="checkbox" disabled>
+      <p id="status">waiting for state</p>
+    </main>
+  </body>
+  <script src="state-demo.js"></script>
+</html>

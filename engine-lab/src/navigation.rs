@@ -1,6 +1,6 @@
 use crate::css::Stylesheet;
-use crate::dom::{Document, ScriptSource, StylesheetSource};
-use crate::layout::{LayoutDocument, Size, layout as build_layout};
+use crate::dom::{Document, NodePath, ScriptSource, StylesheetSource};
+use crate::layout::{LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
 use crate::script::{NavigationRequest, ScriptRuntime, StorageHandle};
 use std::cell::RefCell;
@@ -346,6 +346,7 @@ pub struct Browser {
     next_document_id: u64,
     local_storage: StorageHandle,
     session_storage: StorageHandle,
+    hovered_path: Option<NodePath>,
 }
 
 impl Browser {
@@ -362,6 +363,7 @@ impl Browser {
             next_document_id: 1,
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
+            hovered_path: None,
         }
     }
 
@@ -447,6 +449,7 @@ impl Browser {
             runtime,
             stylesheet,
         });
+        self.hovered_path = None;
         self.commit_new_document(url, commit);
         if let Some(request) = pending_navigation {
             return self.follow_navigation(request, redirect_depth);
@@ -510,8 +513,14 @@ impl Browser {
         event: &str,
     ) -> Result<bool, NavigationError> {
         let path = self.layout(viewport)?.hit_test(x, y);
+        let hover_changed = if event == "pointermove" && self.hovered_path != path {
+            self.hovered_path = path.clone();
+            true
+        } else {
+            false
+        };
         let Some(path) = path else {
-            return Ok(false);
+            return Ok(hover_changed);
         };
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
@@ -531,7 +540,7 @@ impl Browser {
         if self.process_pending_navigation()?.is_some() {
             Ok(true)
         } else {
-            Ok(handled)
+            Ok(handled || hover_changed)
         }
     }
 
@@ -601,7 +610,8 @@ impl Browser {
         let document = document.borrow();
         let stylesheet =
             Stylesheet::parse(&page.stylesheet).map_err(NavigationError::Stylesheet)?;
-        Ok(build_layout(&document, &stylesheet, viewport))
+        let style_state = page.runtime.style_state(self.hovered_path.clone());
+        Ok(build_layout(&document, &stylesheet, viewport, &style_state))
     }
 
     pub fn paint(&self, viewport: Size) -> Result<Canvas, NavigationError> {
@@ -1176,6 +1186,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::Color;
     use std::rc::Rc;
 
     fn bundle(shell: &str) -> ResourceBundle {
@@ -1982,5 +1993,76 @@ mod tests {
             .rgba_pixels()
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn dynamic_pseudo_classes_follow_pointer_focus_and_checked_state() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                button { display: block; width: 120px; height: 40px; background: #111111; }
+                button:hover { background: #ff0000; }
+                button:focus { border: 3px solid #00ff00; }
+                input { display: block; width: 24px; height: 24px; background: #111111; }
+                input:checked { background: #0000ff; }
+            </style>
+            <button id="go">go</button><input id="check" type="checkbox">"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("pseudo-class page should load");
+        let initial = browser
+            .layout(Size {
+                width: 240.0,
+                height: 180.0,
+            })
+            .expect("initial layout should build");
+        assert_eq!(initial.root.children[0].background, Color::opaque(17, 17, 17));
+        assert_eq!(initial.root.children[0].border_width, 0.0);
+
+        assert!(browser
+            .dispatch_at(
+                Size {
+                    width: 240.0,
+                    height: 180.0,
+                },
+                20.0,
+                20.0,
+                "pointermove",
+            )
+            .expect("pointer move should update hover"));
+        let hovered = browser
+            .layout(Size {
+                width: 240.0,
+                height: 180.0,
+            })
+            .expect("hovered layout should build");
+        assert_eq!(hovered.root.children[0].background, Color::opaque(255, 0, 0));
+
+        assert!(browser
+            .click_at(
+                Size {
+                    width: 240.0,
+                    height: 180.0,
+                },
+                20.0,
+                20.0,
+            )
+            .expect("button click should focus"));
+        let focused = browser
+            .layout(Size {
+                width: 240.0,
+                height: 180.0,
+            })
+            .expect("focused layout should build");
+        assert_eq!(focused.root.children[0].border_width, 3.0);
+
+        assert!(browser.click_id("check").expect("checkbox should click"));
+        let checked = browser
+            .layout(Size {
+                width: 240.0,
+                height: 180.0,
+            })
+            .expect("checked layout should build");
+        assert_eq!(checked.root.children[1].background, Color::opaque(0, 0, 255));
     }
 }

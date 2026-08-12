@@ -9,6 +9,7 @@ struct Options {
     viewport: Size,
     clicks: Vec<String>,
     click_points: Vec<(f32, f32)>,
+    pointer_moves: Vec<(f32, f32)>,
     text_inputs: Vec<String>,
     keys: Vec<String>,
     url: String,
@@ -50,6 +51,19 @@ fn main() -> Result<(), String> {
         .navigate(&options.url)
         .map_err(|error| error.to_string())?;
     println!("navigation {}: {status}", options.url);
+    for &(x, y) in &options.pointer_moves {
+        let result = host
+            .input(InputEvent::PointerMove { x, y })
+            .map_err(|error| error.to_string())?;
+        println!(
+            "pointer move @{x},{y}: {}",
+            if result.handled {
+                "state changed"
+            } else {
+                "unchanged"
+            }
+        );
+    }
     for id in &options.clicks {
         let dispatched = host.click_id(id).map_err(|error| error.to_string())?;
         println!(
@@ -157,6 +171,7 @@ where
     let mut height = 520;
     let mut clicks = Vec::new();
     let mut click_points = Vec::new();
+    let mut pointer_moves = Vec::new();
     let mut text_inputs = Vec::new();
     let mut keys = Vec::new();
     let mut url = format!("{APP_ORIGIN}/");
@@ -174,6 +189,7 @@ where
             "--height" => height = parse_dimension(next_value(&mut args, "--height")?, "height")?,
             "--click" => clicks.push(next_value(&mut args, "--click")?),
             "--click-at" => click_points.push(parse_point(next_value(&mut args, "--click-at")?)?),
+            "--move-at" => pointer_moves.push(parse_point(next_value(&mut args, "--move-at")?)?),
             "--text" => text_inputs.push(next_value(&mut args, "--text")?),
             "--key" => keys.push(next_value(&mut args, "--key")?),
             "--url" => url = next_value(&mut args, "--url")?,
@@ -183,7 +199,7 @@ where
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--click-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -196,6 +212,7 @@ where
         output,
         clicks,
         click_points,
+        pointer_moves,
         text_inputs,
         keys,
         url,

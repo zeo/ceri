@@ -1,5 +1,5 @@
-use crate::dom::Element;
-use std::collections::HashMap;
+use crate::dom::{Element, NodePath};
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
@@ -143,6 +143,47 @@ pub(crate) enum AlignItems {
     FlexStart,
     Center,
     FlexEnd,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StyleState {
+    pub(crate) hovered_path: Option<NodePath>,
+    pub(crate) focused_path: Option<NodePath>,
+    pub(crate) checked_paths: BTreeSet<NodePath>,
+    pub(crate) unchecked_paths: BTreeSet<NodePath>,
+}
+
+impl StyleState {
+    fn is_hovered(&self, path: &[usize]) -> bool {
+        self.hovered_path
+            .as_deref()
+            .is_some_and(|hovered| hovered.starts_with(path))
+    }
+
+    fn is_focused(&self, path: &[usize]) -> bool {
+        self.focused_path.as_deref() == Some(path)
+    }
+
+    fn is_checked(&self, element: &Element, path: &[usize]) -> bool {
+        if self.checked_paths.contains(path) {
+            return true;
+        }
+        if self.unchecked_paths.contains(path) {
+            false
+        } else {
+            element.attr("checked").is_some()
+        }
+    }
+}
+
+pub(crate) struct StyleContext<'a> {
+    pub(crate) element: &'a Element,
+    pub(crate) path: &'a [usize],
+    pub(crate) ancestors: &'a [&'a Element],
+    pub(crate) parent_font_size: f32,
+    pub(crate) parent_color: Color,
+    pub(crate) parent_weight: FontWeight,
+    pub(crate) state: &'a StyleState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -299,14 +340,16 @@ impl Stylesheet {
         Ok(Self { rules })
     }
 
-    pub(crate) fn style_for_inherited_with_ancestors(
-        &self,
-        element: &Element,
-        ancestors: &[&Element],
-        parent_font_size: f32,
-        parent_color: Color,
-        parent_weight: FontWeight,
-    ) -> Style {
+    pub(crate) fn style_for(&self, context: StyleContext<'_>) -> Style {
+        let StyleContext {
+            element,
+            path,
+            ancestors,
+            parent_font_size,
+            parent_color,
+            parent_weight,
+            state,
+        } = context;
         let mut style =
             Style::default_for(&element.name, parent_font_size, parent_color, parent_weight);
         let mut values: HashMap<String, (Specificity, usize, String)> = HashMap::new();
@@ -314,7 +357,7 @@ impl Stylesheet {
             let Some(specificity) = rule
                 .selectors
                 .iter()
-                .filter(|selector| selector.matches(element, ancestors))
+                .filter(|selector| selector.matches(element, path, ancestors, state))
                 .map(Selector::specificity)
                 .max()
             else {
@@ -344,6 +387,26 @@ impl Stylesheet {
             apply_declaration(&mut style, &property, &value);
         }
         style
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_for_inherited_with_ancestors(
+        &self,
+        element: &Element,
+        ancestors: &[&Element],
+        parent_font_size: f32,
+        parent_color: Color,
+        parent_weight: FontWeight,
+    ) -> Style {
+        self.style_for(StyleContext {
+            element,
+            path: &[],
+            ancestors,
+            parent_font_size,
+            parent_color,
+            parent_weight,
+            state: &StyleState::default(),
+        })
     }
 }
 
@@ -382,6 +445,16 @@ struct CompoundSelector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    pseudo_classes: Vec<PseudoClass>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PseudoClass {
+    Hover,
+    Focus,
+    Checked,
+    Disabled,
+    Enabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -432,11 +505,24 @@ impl Selector {
         Ok(Self { parts })
     }
 
-    pub(crate) fn matches(&self, element: &Element, ancestors: &[&Element]) -> bool {
+    pub(crate) fn matches(
+        &self,
+        element: &Element,
+        path: &[usize],
+        ancestors: &[&Element],
+        state: &StyleState,
+    ) -> bool {
         let Some(last) = self.parts.last() else {
             return false;
         };
-        self.matches_part(self.parts.len() - 1, &last.compound, element, ancestors)
+        self.matches_part(
+            self.parts.len() - 1,
+            &last.compound,
+            element,
+            path,
+            ancestors,
+            state,
+        )
     }
 
     fn matches_part(
@@ -444,9 +530,11 @@ impl Selector {
         index: usize,
         compound: &CompoundSelector,
         element: &Element,
+        path: &[usize],
         ancestors: &[&Element],
+        state: &StyleState,
     ) -> bool {
-        if !compound.matches(element) {
+        if !compound.matches(element, path, state) {
             return false;
         }
         if index == 0 {
@@ -458,7 +546,9 @@ impl Selector {
                     index - 1,
                     &self.parts[index - 1].compound,
                     parent,
+                    &path[..path.len().saturating_sub(1)],
                     &ancestors[..ancestors.len() - 1],
+                    state,
                 )
             }),
             Some(Combinator::Descendant) => {
@@ -471,7 +561,9 @@ impl Selector {
                             index - 1,
                             &self.parts[index - 1].compound,
                             parent,
+                            &path[..(parent_index + 1).min(path.len())],
                             &ancestors[..parent_index],
+                            state,
                         )
                     })
             }
@@ -494,21 +586,44 @@ impl Selector {
 }
 
 impl CompoundSelector {
-    fn matches(&self, element: &Element) -> bool {
+    fn matches(&self, element: &Element, path: &[usize], state: &StyleState) -> bool {
         self.tag.as_deref().is_none_or(|tag| tag == element.name)
             && self
                 .id
                 .as_deref()
                 .is_none_or(|id| element.attr("id") == Some(id))
             && self.classes.iter().all(|class| element.has_class(class))
+            && self
+                .pseudo_classes
+                .iter()
+                .all(|pseudo| pseudo.matches(element, path, state))
     }
 
     fn specificity(&self) -> Specificity {
         Specificity(
             u32::from(self.id.is_some()),
-            self.classes.len() as u32,
+            (self.classes.len() + self.pseudo_classes.len()) as u32,
             u32::from(self.tag.is_some()),
         )
+    }
+}
+
+impl PseudoClass {
+    fn matches(self, element: &Element, path: &[usize], state: &StyleState) -> bool {
+        match self {
+            Self::Hover => state.is_hovered(path),
+            Self::Focus => state.is_focused(path),
+            Self::Checked => {
+                element.name == "input"
+                    && element.attr("type").is_some_and(|kind| {
+                        kind.eq_ignore_ascii_case("checkbox")
+                            || kind.eq_ignore_ascii_case("radio")
+                    })
+                    && state.is_checked(element, path)
+            }
+            Self::Disabled => element.attrs.contains_key("disabled"),
+            Self::Enabled => !element.attrs.contains_key("disabled"),
+        }
     }
 }
 
@@ -525,6 +640,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
         tag: None,
         id: None,
         classes: Vec::new(),
+        pseudo_classes: Vec::new(),
     };
     let start = *cursor;
     while *cursor < source.len() {
@@ -536,6 +652,19 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
             b'.' => {
                 *cursor += 1;
                 selector.classes.push(parse_selector_name(source, cursor)?);
+            }
+            b':' => {
+                *cursor += 1;
+                let name = parse_selector_name(source, cursor)?;
+                let pseudo = match name.as_str() {
+                    "hover" => PseudoClass::Hover,
+                    "focus" => PseudoClass::Focus,
+                    "checked" => PseudoClass::Checked,
+                    "disabled" => PseudoClass::Disabled,
+                    "enabled" => PseudoClass::Enabled,
+                    _ => return Err(format!("unsupported pseudo-class: :{name}")),
+                };
+                selector.pseudo_classes.push(pseudo);
             }
             b'*' => *cursor += 1,
             byte if byte.is_ascii_whitespace() || byte == b'>' => break,
@@ -985,5 +1114,66 @@ mod tests {
         );
         assert_eq!(card_style.color, Color::opaque(255, 0, 0));
         assert_eq!(direct_style.color, Color::opaque(0, 0, 255));
+    }
+
+    #[test]
+    fn matches_dynamic_pseudo_classes_from_style_state() {
+        let stylesheet = Stylesheet::parse(
+            "button:hover { color: red; } input:checked { color: blue; } input:disabled { color: yellow; }",
+        )
+        .expect("stylesheet should parse");
+        let button = Element::new("button");
+        let mut input = Element::new("input");
+        input
+            .attrs
+            .insert("type".to_string(), "checkbox".to_string());
+        input.attrs.insert("checked".to_string(), String::new());
+        let mut state = StyleState {
+            hovered_path: Some(vec![0]),
+            ..StyleState::default()
+        };
+        assert_eq!(
+            stylesheet
+                .style_for(StyleContext {
+                    element: &button,
+                    path: &[0],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    state: &state,
+                })
+                .color,
+            Color::opaque(255, 0, 0)
+        );
+        assert_eq!(
+            stylesheet
+                .style_for(StyleContext {
+                    element: &input,
+                    path: &[1],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    state: &state,
+                })
+                .color,
+            Color::opaque(0, 0, 255)
+        );
+        state.unchecked_paths.insert(vec![1]);
+        assert_eq!(
+            stylesheet
+                .style_for(StyleContext {
+                    element: &input,
+                    path: &[1],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    state: &state,
+                })
+                .color,
+            Color::BLACK
+        );
     }
 }

@@ -574,7 +574,7 @@ fn find_element_by_selector<'a>(
             continue;
         };
         path.push(index);
-        if selector.matches(child, ancestors) {
+        if selector.matches(child, path, ancestors, &crate::css::StyleState::default()) {
             return Some(path.clone());
         }
         ancestors.push(child);

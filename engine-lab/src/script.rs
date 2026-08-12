@@ -1,4 +1,5 @@
 use crate::dom::{Document, Element, Node, NodePath};
+use crate::css::StyleState;
 use crate::navigation::{APP_ORIGIN, AppUrl, ResourceBundle};
 use crate::paint::CanvasCommand;
 use crate::Color;
@@ -554,11 +555,19 @@ impl ScriptRuntime {
     }
 
     pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
+        if self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_some_and(|element| element.attrs.contains_key("disabled"))
+        {
+            return Ok(false);
+        }
         let focused = self.focus_path(path.clone())?;
         let dispatch = self.dispatch_event(path.clone(), "click")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
-            self.apply_click_default(&path);
+            self.apply_click_default(&path)?;
             if let Some(form) = self.submit_form_for_click(&path) {
                 self.request_submit(form)?;
             }
@@ -652,6 +661,22 @@ impl ScriptRuntime {
         &self.canvas_commands
     }
 
+    pub(crate) fn style_state(&self, hovered_path: Option<NodePath>) -> StyleState {
+        let mut state = StyleState {
+            hovered_path,
+            focused_path: self.focused_element.clone(),
+            ..StyleState::default()
+        };
+        for (path, checked) in &self.control_checked {
+            if *checked {
+                state.checked_paths.insert(path.clone());
+            } else {
+                state.unchecked_paths.insert(path.clone());
+            }
+        }
+        state
+    }
+
     pub fn document(&self) -> Rc<RefCell<Document>> {
         self.document.clone()
     }
@@ -660,23 +685,25 @@ impl ScriptRuntime {
         self.clock
     }
 
-    fn apply_click_default(&mut self, path: &[usize]) {
+    fn apply_click_default(&mut self, path: &[usize]) -> Result<(), ScriptError> {
         let Some(element) = self.document.borrow().element_clone(path) else {
-            return;
+            return Ok(());
         };
         if element.name != "input" {
-            return;
+            return Ok(());
         }
         let input_type = element
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
             .unwrap_or_default();
-        match input_type.as_str() {
+        let changed = match input_type.as_str() {
             "checkbox" => {
                 let checked = self.control_checked_path(path);
                 self.control_checked.insert(path.to_vec(), !checked);
+                true
             }
             "radio" => {
+                let was_checked = self.control_checked_path(path);
                 if let Some(group) = self.document.borrow().radio_group_paths(path) {
                     for candidate in group {
                         if candidate != path {
@@ -685,9 +712,17 @@ impl ScriptRuntime {
                     }
                 }
                 self.control_checked.insert(path.to_vec(), true);
+                !was_checked
             }
-            _ => {}
+            _ => false,
+        };
+        if changed {
+            self.dispatch_event(path.to_vec(), "input")?;
+            self.drain_microtasks()?;
+            self.dispatch_event(path.to_vec(), "change")?;
+            self.drain_microtasks()?;
         }
+        Ok(())
     }
 
     fn submit_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
@@ -4264,11 +4299,13 @@ mod tests {
                 r#"
                 const accepted = document.getElementById("accepted");
                 const veto = document.getElementById("veto");
+                let changed = false;
+                accepted.addEventListener("change", () => { changed = accepted.checked; });
                 veto.addEventListener("click", (event) => event.preventDefault());
                 accepted.click();
                 veto.click();
                 const data = new FormData(document.getElementById("profile"));
-                document.getElementById("status").textContent = accepted.checked + "|" + veto.checked + "|" + data.has("accepted") + "|" + data.has("veto");
+                document.getElementById("status").textContent = accepted.checked + "|" + veto.checked + "|" + changed + "|" + data.has("accepted") + "|" + data.has("veto");
                 "#,
             )
             .expect("checkbox click defaults should execute");
@@ -4278,7 +4315,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("true|true|true|true")
+            Some("true|true|true|true|true")
         );
     }
 

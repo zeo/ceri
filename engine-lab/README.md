@@ -27,6 +27,7 @@ The current slice implements:
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
 - named form controls with live checkbox and radio-group state, `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
+- dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
@@ -157,3 +158,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The current canvas context is intentionally small. It records app-owned `fillStyle`, `fillRect`, and `clearRect` commands, clips them to the laid-out canvas element, and replays them during the software paint pass. Paths, text, images, transforms, compositing, and GPU contexts remain separate compatibility gates.
+
+The dynamic selector demo exercises stateful CSS through the host input boundary:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/state-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-state-demo.bmp --move-at 80,260 --click switch
+```
+
+The `--move-at` switch dispatches a pointer move before the click, while the click updates focus and checkbox state. The layout and paint pass then recompute pseudo-class styles without a page reload.
