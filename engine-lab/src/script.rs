@@ -686,8 +686,14 @@ impl StorageData {
     }
 }
 
+#[derive(Clone)]
+enum FormDataEntry {
+    Text(String),
+    File(FileHandle),
+}
+
 struct FormDataData {
-    pairs: Vec<(String, String)>,
+    pairs: Vec<(String, FormDataEntry)>,
 }
 
 struct BlobData {
@@ -3105,7 +3111,7 @@ impl ScriptRuntime {
                 .control_value_path(&path)
                 .or_else(|| element.attr("value").map(str::to_string))
                 .unwrap_or_default();
-            pairs.push((name.to_string(), value));
+            pairs.push((name.to_string(), FormDataEntry::Text(value)));
         }
         Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
     }
@@ -3451,7 +3457,16 @@ impl ScriptRuntime {
         let mut url = base
             .resolve(action)
             .map_err(|error| runtime_error(error.to_string()))?;
-        let encoded = serialize_form_urlencoded(&form_data.borrow().pairs);
+        let pairs = form_data
+            .borrow()
+            .pairs
+            .iter()
+            .filter_map(|(name, value)| match value {
+                FormDataEntry::Text(value) => Some((name.clone(), value.clone())),
+                FormDataEntry::File(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let encoded = serialize_form_urlencoded(&pairs);
         if !encoded.is_empty() {
             let query = if url.query().is_empty() {
                 encoded
@@ -3979,10 +3994,10 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let value = arguments
-                    .get(1)
-                    .map(Value::string_value)
-                    .unwrap_or_else(|| "undefined".to_string());
+                let value = form_data_entry(
+                    arguments.get(1),
+                    form_data_filename(arguments.get(2)),
+                );
                 form_data.borrow_mut().pairs.push((name, value));
                 Ok(Value::Undefined)
             }
@@ -4007,7 +4022,7 @@ impl ScriptRuntime {
                     .pairs
                     .iter()
                     .find(|(entry_name, _)| entry_name == &name)
-                    .map(|(_, value)| Value::String(value.clone()))
+                    .map(|(_, value)| form_data_entry_value(value))
                     .unwrap_or(Value::Null))
             }
             Builtin::FormDataGetAll(form_data) => {
@@ -4021,7 +4036,7 @@ impl ScriptRuntime {
                         .pairs
                         .iter()
                         .filter(|(entry_name, _)| entry_name == &name)
-                        .map(|(_, value)| Value::String(value.clone()))
+                        .map(|(_, value)| form_data_entry_value(value))
                         .collect(),
                 ))))
             }
@@ -4043,10 +4058,10 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let value = arguments
-                    .get(1)
-                    .map(Value::string_value)
-                    .unwrap_or_else(|| "undefined".to_string());
+                let value = form_data_entry(
+                    arguments.get(1),
+                    form_data_filename(arguments.get(2)),
+                );
                 let mut form_data = form_data.borrow_mut();
                 if let Some(index) = form_data
                     .pairs
@@ -5902,26 +5917,92 @@ fn normalize_file_name(value: &str) -> String {
         .to_string()
 }
 
+fn form_data_filename(value: Option<&Value>) -> Option<String> {
+    value
+        .map(Value::resolve)
+        .and_then(|value| match value {
+            Value::Undefined => None,
+            value => Some(normalize_file_name(&value.string_value())),
+        })
+}
+
+fn form_data_file(blob: &BlobHandle, name: String) -> FileHandle {
+    Rc::new(FileData {
+        bytes: blob.bytes.clone(),
+        mime_type: blob.mime_type.clone(),
+        name,
+        last_modified: 0,
+    })
+}
+
+fn form_data_file_with_name(file: &FileHandle, name: Option<String>) -> FileHandle {
+    name.map_or_else(|| file.clone(), |name| {
+        Rc::new(FileData {
+            bytes: file.bytes.clone(),
+            mime_type: file.mime_type.clone(),
+            name,
+            last_modified: file.last_modified,
+        })
+    })
+}
+
+fn form_data_entry(value: Option<&Value>, filename: Option<String>) -> FormDataEntry {
+    match value.map(Value::resolve).unwrap_or(Value::Undefined) {
+        Value::Blob(blob) => FormDataEntry::File(form_data_file(
+            &blob,
+            filename.unwrap_or_else(|| "blob".to_string()),
+        )),
+        Value::File(file) => FormDataEntry::File(form_data_file_with_name(&file, filename)),
+        value => FormDataEntry::Text(value.string_value()),
+    }
+}
+
+fn form_data_entry_value(entry: &FormDataEntry) -> Value {
+    match entry {
+        FormDataEntry::Text(value) => Value::String(value.clone()),
+        FormDataEntry::File(file) => Value::File(file.clone()),
+    }
+}
+
 fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
     let pairs = form_data.borrow().pairs.clone();
     let mut boundary = "----ceri-form-data-boundary".to_string();
-    while pairs
-        .iter()
-        .any(|(name, value)| name.contains(&boundary) || value.contains(&boundary))
-    {
+    while pairs.iter().any(|(name, value)| {
+        name.contains(&boundary) || form_data_entry_contains(value, &boundary)
+    }) {
         boundary.push('x');
     }
     let mut body = Vec::new();
     for (name, value) in pairs {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-                multipart_parameter(&name)
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(value.as_bytes());
+        match value {
+            FormDataEntry::Text(value) => {
+                body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                        multipart_parameter(&name)
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(value.as_bytes());
+            }
+            FormDataEntry::File(file) => {
+                let mime_type = if file.mime_type.is_empty() {
+                    "application/octet-stream"
+                } else {
+                    &file.mime_type
+                };
+                body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {mime_type}\r\n\r\n",
+                        multipart_parameter(&name),
+                        multipart_parameter(&file.name)
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(&file.bytes);
+            }
+        }
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
@@ -5929,6 +6010,16 @@ fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
         body,
         format!("multipart/form-data; boundary={boundary}"),
     )
+}
+
+fn form_data_entry_contains(entry: &FormDataEntry, boundary: &str) -> bool {
+    match entry {
+        FormDataEntry::Text(value) => value.contains(boundary),
+        FormDataEntry::File(file) => {
+            file.name.contains(boundary)
+                || file.bytes.windows(boundary.len()).any(|window| window == boundary.as_bytes())
+        }
+    }
 }
 
 fn multipart_parameter(value: &str) -> String {
@@ -9904,6 +9995,61 @@ mod tests {
         ));
         assert!(body.contains("prefix----ceri-form-data-boundary\r\n"));
         assert!(body.ends_with("------ceri-form-data-boundaryx--\r\n"));
+    }
+
+    #[test]
+    fn form_data_file_entries_preserve_order_and_emit_file_parts() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const data = new FormData();
+                const blob = new Blob(["blob----ceri-form-data-boundary"], { type: "application/blob" });
+                const file = new File(["file-bytes"], "dir/report.bin", { type: "application/file" });
+                data.append("text", "one");
+                data.append("blob", blob);
+                data.append("file", file, "uploads/custom.bin");
+                data.set("text", "two");
+                const blobEntry = data.get("blob");
+                const fileEntry = data.get("file");
+                fetch("/headers", { method: "POST", body: data }).then(() => {
+                    status.textContent = blobEntry.name + "|" + blobEntry.type + "|" + fileEntry.name + "|" + fileEntry.type + "|" + data.getAll("file").length;
+                });
+                "#,
+            )
+            .expect("FormData file entries should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("blob|application/blob|custom.bin|application/file|1")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers().get("content-type").map(String::as_str),
+            Some("multipart/form-data; boundary=----ceri-form-data-boundaryx")
+        );
+        assert_eq!(
+            requests[0].body(),
+            b"------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\ntwo\r\n------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"blob\"; filename=\"blob\"\r\nContent-Type: application/blob\r\n\r\nblob----ceri-form-data-boundary\r\n------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"file\"; filename=\"custom.bin\"\r\nContent-Type: application/file\r\n\r\nfile-bytes\r\n------ceri-form-data-boundaryx--\r\n"
+        );
     }
 
     #[test]
