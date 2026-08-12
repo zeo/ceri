@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="event-demo.css">
+  </head>
+  <body>
+    <main id="surface">
+      <h1>event propagation</h1>
+      <p>the listener lives on the surface, while the click starts on the nested label</p>
+      <button id="action"><span id="label">dispatch nested click</span></button>
+      <p id="status">waiting for a click</p>
+    </main>
+  </body>
+  <script src="event-demo.js"></script>
+</html>

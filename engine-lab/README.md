@@ -11,6 +11,7 @@ The current slice implements:
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - a software paint step with a small built-in bitmap font
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
+- bubbling DOM events with `type`, `target`, and `currentTarget` values
 - stable detached and attached element handles with `document.createElement` and `appendChild`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
@@ -52,4 +53,10 @@ The nested-selector sample exercises compound selectors, descendant cascade, dir
 
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/selector-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-selector-demo.bmp --width 800 --height 360
+```
+
+The event sample starts a click on a nested element and handles it on an ancestor through an external script:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo.bmp --width 800 --height 360 --click label
 ```

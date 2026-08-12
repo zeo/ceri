@@ -1,0 +1,32 @@
+body {
+  margin: 24px;
+  background-color: #07131f;
+  color: #d8eef2;
+}
+
+main {
+  padding: 22px;
+  background-color: #102638;
+  border: 2px solid #2c6676;
+}
+
+h1 {
+  margin: 0 0 12px;
+  color: #6ee7c5;
+  font-size: 26px;
+}
+
+p {
+  margin: 10px 0;
+}
+
+button {
+  display: block;
+  padding: 12px;
+  color: #07131f;
+  background-color: #ffd479;
+}
+
+#status {
+  color: #7fc8ff;
+}

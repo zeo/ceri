@@ -34,6 +34,7 @@ enum Value {
     String(String),
     Element(ElementHandle),
     Style(ElementHandle),
+    Event(EventData),
     Document,
     Window,
     Console,
@@ -170,6 +171,13 @@ pub struct ScriptRuntime {
 struct EventListener {
     event: String,
     callback: Value,
+}
+
+#[derive(Clone)]
+struct EventData {
+    event_type: String,
+    target: NodePath,
+    current_target: NodePath,
 }
 
 #[derive(Clone, Copy)]
@@ -494,6 +502,14 @@ impl ScriptRuntime {
                 .element_style_property(&handle, property)
                 .map(Value::String)
                 .unwrap_or_else(|| Value::String(String::new()))),
+            Value::Event(event) => match property {
+                "type" => Ok(Value::String(event.event_type.clone())),
+                "target" => Ok(Value::Element(attached_handle(event.target.clone()))),
+                "currentTarget" => Ok(Value::Element(attached_handle(
+                    event.current_target.clone(),
+                ))),
+                _ => Err(runtime_error(format!("event has no property {property}"))),
+            },
             _ => Err(runtime_error(format!("value has no property {property}"))),
         }
     }
@@ -779,17 +795,31 @@ impl ScriptRuntime {
     }
 
     fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<bool, ScriptError> {
-        let callbacks = self
-            .listeners
-            .get(&path)
-            .into_iter()
-            .flatten()
-            .filter(|listener| listener.event == event)
-            .map(|listener| listener.callback.clone())
-            .collect::<Vec<_>>();
-        let had_callbacks = !callbacks.is_empty();
-        for callback in callbacks {
-            self.call(callback, vec![Value::String(event.to_string())])?;
+        let target = path.clone();
+        let mut current = path;
+        let mut had_callbacks = false;
+        loop {
+            let callbacks = self
+                .listeners
+                .get(&current)
+                .into_iter()
+                .flatten()
+                .filter(|listener| listener.event == event)
+                .map(|listener| listener.callback.clone())
+                .collect::<Vec<_>>();
+            had_callbacks |= !callbacks.is_empty();
+            let event_value = Value::Event(EventData {
+                event_type: event.to_string(),
+                target: target.clone(),
+                current_target: current.clone(),
+            });
+            for callback in callbacks {
+                self.call(callback, vec![event_value.clone()])?;
+            }
+            if current.is_empty() {
+                break;
+            }
+            current.pop();
         }
         Ok(had_callbacks)
     }
@@ -929,6 +959,7 @@ impl Value {
             Self::String(value) => value.clone(),
             Self::Element(_) => "[element]".to_string(),
             Self::Style(_) => "[style]".to_string(),
+            Self::Event(_) => "[event]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
             Self::Console => "[console]".to_string(),
@@ -1668,6 +1699,44 @@ mod tests {
                 .style_property(&status, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn bubbles_events_with_target_and_current_target() {
+        let document = document(
+            "<main id='root'><button id='button'><span id='label'>before</span></button><p id='status'>idle</p></main>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const root = document.getElementById("root");
+                const button = document.getElementById("button");
+                const label = document.getElementById("label");
+                const status = document.getElementById("status");
+                button.addEventListener("click", (event) => {
+                    status.textContent = event.type + ":" + event.target.id + ":" + event.currentTarget.id;
+                });
+                root.addEventListener("click", (event) => {
+                    status.textContent = status.textContent + "|" + event.currentTarget.id;
+                });
+                label.click();
+                "##,
+            )
+            .expect("listeners should register and bubble");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("click:label:button|root")
+        );
+        assert!(runtime.click_id("label").expect("click should dispatch"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("click:label:button|root")
         );
     }
 
