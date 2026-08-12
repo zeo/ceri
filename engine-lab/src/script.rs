@@ -169,6 +169,10 @@ enum Builtin {
     FormDataGetAll(FormDataHandle),
     FormDataHas(FormDataHandle),
     FormDataSet(FormDataHandle),
+    FormDataKeys(FormDataHandle),
+    FormDataValues(FormDataHandle),
+    FormDataEntries(FormDataHandle),
+    FormDataForEach(FormDataHandle),
     BlobSlice(BlobHandle),
     BlobText(BlobHandle),
     BlobBytes(BlobHandle),
@@ -2308,6 +2312,12 @@ impl ScriptRuntime {
                 "getAll" => Ok(Value::Builtin(Builtin::FormDataGetAll(form_data))),
                 "has" => Ok(Value::Builtin(Builtin::FormDataHas(form_data))),
                 "set" => Ok(Value::Builtin(Builtin::FormDataSet(form_data))),
+                "keys" => Ok(Value::Builtin(Builtin::FormDataKeys(form_data))),
+                "values" => Ok(Value::Builtin(Builtin::FormDataValues(form_data))),
+                "entries" | "@@iterator" => {
+                    Ok(Value::Builtin(Builtin::FormDataEntries(form_data)))
+                }
+                "forEach" => Ok(Value::Builtin(Builtin::FormDataForEach(form_data))),
                 _ => Err(runtime_error(format!("FormData has no property {property}"))),
             },
             Value::Blob(blob) => match property {
@@ -2615,6 +2625,9 @@ impl ScriptRuntime {
                     .nth(index as usize)
                     .map(|character| Value::String(character.to_string()))
                     .unwrap_or(Value::Undefined))
+            }
+            Value::FormData(form_data) if index.property_key() == "@@iterator" => {
+                Ok(Value::Builtin(Builtin::FormDataEntries(form_data)))
             }
             Value::Bytes(bytes) => {
                 let index = index.number()?;
@@ -4086,6 +4099,53 @@ impl ScriptRuntime {
                     });
                 } else {
                     form_data.pairs.push((name, value));
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::FormDataKeys(form_data) => Ok(iterator_value(
+                form_data
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .map(|(name, _)| Value::String(name.clone()))
+                    .collect(),
+            )),
+            Builtin::FormDataValues(form_data) => Ok(iterator_value(
+                form_data
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .map(|(_, value)| form_data_entry_value(value))
+                    .collect(),
+            )),
+            Builtin::FormDataEntries(form_data) => Ok(iterator_value(
+                form_data
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .map(|(name, value)| {
+                        Value::Array(Rc::new(RefCell::new(vec![
+                            Value::String(name.clone()),
+                            form_data_entry_value(value),
+                        ])))
+                    })
+                    .collect(),
+            )),
+            Builtin::FormDataForEach(form_data) => {
+                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error("FormData.forEach callback must be a function"));
+                }
+                let entries = form_data.borrow().pairs.clone();
+                for (name, value) in entries {
+                    self.call(
+                        callback.clone(),
+                        vec![
+                            form_data_entry_value(&value),
+                            Value::String(name),
+                            Value::FormData(form_data.clone()),
+                        ],
+                    )?;
                 }
                 Ok(Value::Undefined)
             }
@@ -6771,6 +6831,17 @@ impl ScriptRuntime {
                 .iter()
                 .map(|(key, value)| {
                     Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
+                })
+                .collect()),
+            Value::FormData(form_data) => Ok(form_data
+                .borrow()
+                .pairs
+                .iter()
+                .map(|(name, value)| {
+                    Value::Array(Rc::new(RefCell::new(vec![
+                        Value::String(name.clone()),
+                        form_data_entry_value(value),
+                    ])))
                 })
                 .collect()),
             Value::Object(object) => {
@@ -10405,6 +10476,45 @@ mod tests {
             Some("two|2|blob|application/blob|custom.bin|application/file|file-bytes")
         );
         assert_eq!(requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn form_data_iteration_preserves_order_and_file_values() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const data = new FormData();
+                data.append("first", "one");
+                data.append("file", new File(["bytes"], "name.txt", { type: "text/plain" }));
+                data.append("first", "two");
+                const keys = data.keys();
+                const firstKey = keys.next().value;
+                const secondKey = keys.next().value;
+                const values = data.values();
+                const firstValue = values.next().value;
+                const fileValue = values.next().value;
+                const firstEntry = data.entries().next().value;
+                const symbolEntry = data[Symbol.iterator]().next().value;
+                const spread = [...data];
+                let seen = "";
+                data.forEach((value, name) => { seen = seen + name + ";"; });
+                document.getElementById("status").textContent =
+                  firstKey + "|" + secondKey + "|" + firstValue + "|" + fileValue.name + "|" +
+                  firstEntry[0] + "|" + firstEntry[1] + "|" + seen + "|" + spread.length + "|" +
+                  symbolEntry[0] + "|" + spread[1][1].name;
+                "#,
+            )
+            .expect("FormData iteration should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("first|file|one|name.txt|first|one|first;file;first;|3|first|name.txt")
+        );
     }
 
     #[test]

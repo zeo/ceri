@@ -53,6 +53,8 @@ The current fetch experiment includes shared single-use response bodies, `arrayB
 
 An optional `native-http` feature now supplies a Rust-native HTTPS `ResourceProvider` with platform certificate verification, connection reuse, a 30-second timeout, and automatic redirect suppression so the engine retains redirect policy. Navigation follows a bounded chain of same-origin relative locations, rejects cross-origin locations, and consumes provider responses with their HTTP status, so upstream 404 and 503 failures reach the typed recovery page without extensionless shell fallback. Redirected modules resolve relative imports from their final URL. The new bounded `EngineWorker` owns `Browser` and `EngineHost` on a dedicated standard-library thread, and the native window adapter uses it for remote mode so blocking provider calls never run on the UI event thread. This proves a real transport adapter without making the renderer depend on CEF, Edge WebView2, or a loopback listener.
 
+FormData values expose ordered key, value, and entry iterators, `forEach()`, and `Symbol.iterator`, including File values without collapsing them to strings.
+
 An experimental backend must pass these gates in order:
 
 ### Boot and origin
