@@ -55,6 +55,8 @@ An optional `native-http` feature now supplies a Rust-native HTTPS `ResourceProv
 
 FormData values expose ordered key, value, and entry iterators, `forEach()`, and `Symbol.iterator`, including File values without collapsing them to strings.
 
+URLSearchParams now exposes the matching ordered key, value, entry, `forEach()`, and `Symbol.iterator` surface, with mutations still synchronized to its owning URL.
+
 An experimental backend must pass these gates in order:
 
 ### Boot and origin

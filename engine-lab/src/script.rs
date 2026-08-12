@@ -157,6 +157,10 @@ enum Builtin {
     UrlSearchParamsSet(UrlSearchParamsHandle),
     UrlSearchParamsSort(UrlSearchParamsHandle),
     UrlSearchParamsToString(UrlSearchParamsHandle),
+    UrlSearchParamsKeys(UrlSearchParamsHandle),
+    UrlSearchParamsValues(UrlSearchParamsHandle),
+    UrlSearchParamsEntries(UrlSearchParamsHandle),
+    UrlSearchParamsForEach(UrlSearchParamsHandle),
     UrlToString(UrlHandle),
     StorageClear(StorageHandle),
     StorageGetItem(StorageHandle),
@@ -2292,6 +2296,12 @@ impl ScriptRuntime {
                 "set" => Ok(Value::Builtin(Builtin::UrlSearchParamsSet(params))),
                 "sort" => Ok(Value::Builtin(Builtin::UrlSearchParamsSort(params))),
                 "toString" => Ok(Value::Builtin(Builtin::UrlSearchParamsToString(params))),
+                "keys" => Ok(Value::Builtin(Builtin::UrlSearchParamsKeys(params))),
+                "values" => Ok(Value::Builtin(Builtin::UrlSearchParamsValues(params))),
+                "entries" | "@@iterator" => {
+                    Ok(Value::Builtin(Builtin::UrlSearchParamsEntries(params)))
+                }
+                "forEach" => Ok(Value::Builtin(Builtin::UrlSearchParamsForEach(params))),
                 _ => Err(runtime_error(format!(
                     "URLSearchParams has no property {property}"
                 ))),
@@ -2628,6 +2638,9 @@ impl ScriptRuntime {
             }
             Value::FormData(form_data) if index.property_key() == "@@iterator" => {
                 Ok(Value::Builtin(Builtin::FormDataEntries(form_data)))
+            }
+            Value::UrlSearchParams(params) if index.property_key() == "@@iterator" => {
+                Ok(Value::Builtin(Builtin::UrlSearchParamsEntries(params)))
             }
             Value::Bytes(bytes) => {
                 let index = index.number()?;
@@ -3951,6 +3964,55 @@ impl ScriptRuntime {
             Builtin::UrlSearchParamsToString(params) => Ok(Value::String(
                 serialize_form_urlencoded(&params.borrow().pairs),
             )),
+            Builtin::UrlSearchParamsKeys(params) => Ok(iterator_value(
+                params
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .map(|(name, _)| Value::String(name.clone()))
+                    .collect(),
+            )),
+            Builtin::UrlSearchParamsValues(params) => Ok(iterator_value(
+                params
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .map(|(_, value)| Value::String(value.clone()))
+                    .collect(),
+            )),
+            Builtin::UrlSearchParamsEntries(params) => Ok(iterator_value(
+                params
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .map(|(name, value)| {
+                        Value::Array(Rc::new(RefCell::new(vec![
+                            Value::String(name.clone()),
+                            Value::String(value.clone()),
+                        ])))
+                    })
+                    .collect(),
+            )),
+            Builtin::UrlSearchParamsForEach(params) => {
+                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error(
+                        "URLSearchParams.forEach callback must be a function",
+                    ));
+                }
+                let pairs = params.borrow().pairs.clone();
+                for (name, value) in pairs {
+                    self.call(
+                        callback.clone(),
+                        vec![
+                            Value::String(value),
+                            Value::String(name),
+                            Value::UrlSearchParams(params.clone()),
+                        ],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
             Builtin::StorageKey(storage) => {
                 let index = arguments
                     .first()
@@ -6833,6 +6895,17 @@ impl ScriptRuntime {
                     Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
                 })
                 .collect()),
+            Value::UrlSearchParams(params) => Ok(params
+                .borrow()
+                .pairs
+                .iter()
+                .map(|(name, value)| {
+                    Value::Array(Rc::new(RefCell::new(vec![
+                        Value::String(name.clone()),
+                        Value::String(value.clone()),
+                    ])))
+                })
+                .collect()),
             Value::FormData(form_data) => Ok(form_data
                 .borrow()
                 .pairs
@@ -9365,6 +9438,54 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some(
                 "/search|browser engine|2|q=browser+engine&tag=two&tag=three|https://app.ceri.invalid/search?q=browser+engine&tag=two&tag=three",
+            )
+        );
+    }
+
+    #[test]
+    fn url_search_params_iteration_preserves_duplicates_and_url_linkage() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::with_resources(
+            document.clone(),
+            ResourceBundle::default(),
+            AppUrl::parse("https://app.ceri.invalid/docs/index.html")
+                .expect("base URL should parse"),
+        );
+        runtime
+            .execute(
+                r#"
+                const url = new URL("/search?mode=one&mode=two&tag=rust");
+                const params = url.searchParams;
+                const keys = params.keys();
+                const firstKey = keys.next().value;
+                const secondKey = keys.next().value;
+                const values = params.values();
+                const firstValue = values.next().value;
+                const secondValue = values.next().value;
+                const firstEntry = params.entries().next().value;
+                const symbolEntry = params[Symbol.iterator]().next().value;
+                const spread = [...params];
+                let seen = "";
+                params.forEach((value, name) => { seen = seen + name + "=" + value + ";"; });
+                params.append("mode", "three");
+                const appended = url.search;
+                params.sort();
+                const sorted = url.search;
+                document.getElementById("status").textContent =
+                  firstKey + "|" + secondKey + "|" + firstValue + "|" + secondValue + "|" +
+                  firstEntry[0] + "|" + firstEntry[1] + "|" + seen + "|" + spread.length + "|" +
+                  appended + "|" + sorted + "|" + symbolEntry[0] + "=" + symbolEntry[1];
+                "#,
+            )
+            .expect("URLSearchParams iteration should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "mode|mode|one|two|mode|one|mode=one;mode=two;tag=rust;|3|?mode=one&mode=two&tag=rust&mode=three|?mode=one&mode=two&mode=three&tag=rust|mode=one",
             )
         );
     }
