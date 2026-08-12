@@ -1,6 +1,6 @@
 # Ceri engine laboratory
 
-This crate is a deliberately small browser-engine experiment written with the Rust standard library. It has no CEF, WebKit, Servo, third-party JavaScript engine, or GUI dependency.
+This crate is a deliberately small browser-engine experiment written with the Rust standard library. Its default build has no CEF, WebKit, Servo, third-party JavaScript engine, or GUI dependency.
 
 The current slice implements:
 
@@ -73,3 +73,14 @@ cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo
 ```
 
 `EngineHost` is the native-window boundary. A platform adapter navigates it, submits `InputEvent` values, calls `render`, and uploads `Frame.canvas.rgba_pixels()` using `Frame.canvas.bytes_per_row()`. The lab CLI uses this boundary for navigation, coordinate input, timers, and presentation.
+
+The default lab build stays dependency-free. The optional `windowed` feature adds a small native desktop adapter built with pinned `winit` 0.30.13 and `softbuffer` 0.4.8. It creates a platform window, forwards resize and pointer events, advances the deterministic page clock, and presents the custom engine's RGBA canvas through a CPU surface. It does not add CEF, WebKit, Edge WebView2, a loopback server, or a JavaScript engine.
+
+Compile the adapter from the repository root:
+
+```powershell
+cargo check --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri-engine-window
+cargo run --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri-engine-window
+```
+
+The adapter is an integration slice for Windows, macOS, and Linux desktop surfaces. It does not claim browser compatibility, mobile support, or a complete cross-platform release until those targets have their own build and runtime checks.

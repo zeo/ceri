@@ -10,6 +10,19 @@ description = "An isolated from-scratch browser engine laboratory"
 name = "ceri_engine_lab"
 path = "src/lib.rs"
 
+[features]
+default = []
+windowed = ["dep:softbuffer", "dep:winit"]
+
+[dependencies]
+softbuffer = { version = "=0.4.8", optional = true }
+winit = { version = "=0.30.13", optional = true }
+
 [[bin]]
 name = "ceri-engine-lab"
 path = "src/main.rs"
+
+[[bin]]
+name = "ceri-engine-window"
+path = "src/bin/ceri-engine-window.rs"
+required-features = ["windowed"]
