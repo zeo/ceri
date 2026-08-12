@@ -1,7 +1,10 @@
 use ceri_engine_lab::{
     APP_ORIGIN, Browser, EngineHost, InputEvent, PointerButton, ResourceBundle, Size,
 };
+#[cfg(feature = "native-http")]
+use ceri_engine_lab::NativeHttpProvider;
 use softbuffer::{Context, Surface};
+use std::env;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -246,17 +249,35 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<(), String> {
+    let native_base = parse_native_base(env::args().skip(1))?;
     let mut resources = ResourceBundle::from_directory(env!("CARGO_MANIFEST_DIR"))
         .map_err(|error| format!("could not load engine-lab resources: {error}"))?;
-    resources
-        .insert(
-            "/index.html",
-            "text/html; charset=utf-8",
-            include_bytes!("../../demo.html").to_vec(),
-        )
-        .map_err(|error| error.to_string())?;
+    let browser = if let Some(base) = native_base {
+        #[cfg(feature = "native-http")]
+        {
+            let provider = NativeHttpProvider::new(base).map_err(|error| error.to_string())?;
+            Browser::with_resource_provider(ResourceBundle::default(), Rc::new(provider))
+        }
+        #[cfg(not(feature = "native-http"))]
+        {
+            let _ = base;
+            return Err(
+                "--native-base requires the native-http feature: cargo run --features \"windowed native-http\""
+                    .to_string(),
+            );
+        }
+    } else {
+        resources
+            .insert(
+                "/index.html",
+                "text/html; charset=utf-8",
+                include_bytes!("../../demo.html").to_vec(),
+            )
+            .map_err(|error| error.to_string())?;
+        Browser::new(resources)
+    };
     let mut host = EngineHost::new(
-        Browser::new(resources),
+        browser,
         Size {
             width: 800.0,
             height: 520.0,
@@ -272,4 +293,54 @@ fn main() -> Result<(), String> {
     event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string())
+}
+
+fn parse_native_base<I>(arguments: I) -> Result<Option<String>, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut arguments = arguments.into_iter();
+    let mut native_base = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--native-base" => {
+                if native_base.is_some() {
+                    return Err("--native-base may only be provided once".to_string());
+                }
+                native_base = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--native-base requires an HTTPS URL".to_string())?,
+                );
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: ceri-engine-window [--native-base HTTPS_URL]\n\nWithout --native-base, the packaged engine-lab demo is shown. With it, the window loads the app origin through the optional native HTTPS provider."
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(native_base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_native_base;
+
+    #[test]
+    fn parses_optional_native_base() {
+        assert_eq!(
+            parse_native_base(vec!["--native-base".to_string(), "https://example.test".to_string()])
+                .expect("native base should parse")
+                .as_deref(),
+            Some("https://example.test")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_window_arguments() {
+        assert!(parse_native_base(vec!["--unknown".to_string()]).is_err());
+    }
 }

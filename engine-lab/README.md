@@ -169,6 +169,14 @@ cargo check --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri
 cargo run --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri-engine-window
 ```
 
+To load a remote app through the Rust-native HTTPS provider, pass an HTTPS base URL and enable both optional features:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --features "windowed native-http" --bin ceri-engine-window -- --native-base https://example.com/app
+```
+
+The remote mode maps `https://app.ceri.invalid/` into the supplied base, follows bounded same-origin redirects, and never opens a listener. The provider is blocking, so the current lab performs network work on the host call that loads or dispatches the page. A production window adapter must move those calls behind its navigation or worker queue before presenting a busy UI.
+
 The adapter is an integration slice for Windows, macOS, and Linux desktop surfaces. It does not claim browser compatibility, mobile support, or a complete cross-platform release until those targets have their own build and runtime checks.
 
 The fetch demo exercises an app-owned resource without opening a listener:
