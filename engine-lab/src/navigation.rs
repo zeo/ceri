@@ -823,7 +823,9 @@ impl Browser {
         let document = document.borrow();
         let stylesheet =
             Stylesheet::parse(&page.stylesheet).map_err(NavigationError::Stylesheet)?;
-        let style_state = page.runtime.style_state(self.hovered_path.clone());
+        let mut style_state = page.runtime.style_state(self.hovered_path.clone());
+        style_state.viewport_width = viewport.width;
+        style_state.viewport_height = viewport.height;
         let mut layout = build_layout(&document, &stylesheet, viewport, &style_state);
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(base, &document, &mut layout);
@@ -2595,6 +2597,46 @@ mod tests {
             })
             .expect("page should paint");
         assert!(canvas.non_background_pixels() > 0);
+    }
+
+    #[test]
+    fn media_queries_follow_the_requested_viewport() {
+        let mut browser = Browser::new(bundle(
+            "<style>p { color: red; } @media screen and (min-width: 500px) { p { color: blue; } } @media (max-height: 100px) { p { color: #42d3b4; } }</style><p>responsive</p>",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("responsive page should load");
+        let narrow = browser
+            .layout(Size {
+                width: 400.0,
+                height: 200.0,
+            })
+            .expect("narrow layout should build");
+        assert_eq!(
+            narrow.root.children[0].text[0].color,
+            Color::opaque(255, 0, 0)
+        );
+        let wide = browser
+            .layout(Size {
+                width: 600.0,
+                height: 200.0,
+            })
+            .expect("wide layout should build");
+        assert_eq!(
+            wide.root.children[0].text[0].color,
+            Color::opaque(0, 0, 255)
+        );
+        let short = browser
+            .layout(Size {
+                width: 400.0,
+                height: 80.0,
+            })
+            .expect("short layout should build");
+        assert_eq!(
+            short.root.children[0].text[0].color,
+            Color::opaque(66, 211, 180)
+        );
     }
 
     #[test]

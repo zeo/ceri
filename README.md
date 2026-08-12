@@ -71,4 +71,4 @@ See [docs/engine-research.md](docs/engine-research.md) for the candidate compari
 
 The custom host also exposes a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths. Its resource path has an embedder-owned `ResourceProvider` seam, so a future native HTTP/TLS source can feed the same app-origin policy without a loopback listener. `ResourceRequest` carries validated fetch methods, headers, and bodies across that seam, while `NavigationFailure` gives native adapters typed recovery status and detail without parsing the recovery DOM.
 
-The module laboratory now preserves live named and namespace bindings through re-exports, with imported names kept read-only while source modules update their exported cells.
+The module laboratory now preserves live named and namespace bindings through re-exports, with imported names kept read-only while source modules update their exported cells. Its stylesheet path also reevaluates bounded `@media` width and height conditions for each native viewport.

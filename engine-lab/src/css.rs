@@ -145,12 +145,14 @@ pub(crate) enum AlignItems {
     FlexEnd,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StyleState {
     pub(crate) hovered_path: Option<NodePath>,
     pub(crate) focused_path: Option<NodePath>,
     pub(crate) checked_paths: BTreeSet<NodePath>,
     pub(crate) unchecked_paths: BTreeSet<NodePath>,
+    pub(crate) viewport_width: f32,
+    pub(crate) viewport_height: f32,
 }
 
 impl StyleState {
@@ -314,29 +316,7 @@ impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = strip_comments(source);
         let mut rules = Vec::new();
-        let mut cursor = 0;
-        while let Some(relative_open) = source[cursor..].find('{') {
-            let open = cursor + relative_open;
-            let selector_text = source[cursor..open].trim();
-            let Some(relative_close) = source[open + 1..].find('}') else {
-                return Err("stylesheet rule has no closing brace".to_string());
-            };
-            let close = open + 1 + relative_close;
-            let selectors = selector_text
-                .split(',')
-                .map(Selector::parse)
-                .collect::<Result<Vec<_>, _>>()?;
-            let declarations = parse_declarations(&source[open + 1..close])?;
-            rules.push(Rule {
-                selectors,
-                declarations,
-                order: rules.len(),
-            });
-            cursor = close + 1;
-        }
-        if !source[cursor..].trim().is_empty() {
-            return Err("stylesheet has text outside a rule".to_string());
-        }
+        parse_rules(&source, None, &mut rules)?;
         Ok(Self { rules })
     }
 
@@ -354,6 +334,13 @@ impl Stylesheet {
             Style::default_for(&element.name, parent_font_size, parent_color, parent_weight);
         let mut values: HashMap<String, (Specificity, usize, String)> = HashMap::new();
         for rule in &self.rules {
+            if rule
+                .media
+                .as_ref()
+                .is_some_and(|media| !media.matches(state))
+            {
+                continue;
+            }
             let Some(specificity) = rule
                 .selectors
                 .iter()
@@ -415,6 +402,31 @@ struct Rule {
     selectors: Vec<Selector>,
     declarations: Vec<Declaration>,
     order: usize,
+    media: Option<MediaCondition>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MediaCondition {
+    min_width: Option<f32>,
+    max_width: Option<f32>,
+    min_height: Option<f32>,
+    max_height: Option<f32>,
+}
+
+impl MediaCondition {
+    fn matches(&self, state: &StyleState) -> bool {
+        self.min_width
+            .is_none_or(|value| state.viewport_width >= value)
+            && self
+                .max_width
+                .is_none_or(|value| state.viewport_width <= value)
+            && self
+                .min_height
+                .is_none_or(|value| state.viewport_height >= value)
+            && self
+                .max_height
+                .is_none_or(|value| state.viewport_height <= value)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -765,6 +777,116 @@ fn parse_attribute_value(source: &str, cursor: &mut usize) -> Result<String, Str
             .then(|| source[start..*cursor].to_string())
             .ok_or_else(|| format!("attribute selector has no value: {source}"))
     }
+}
+
+fn parse_rules(
+    source: &str,
+    media: Option<MediaCondition>,
+    rules: &mut Vec<Rule>,
+) -> Result<(), String> {
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let remaining = &source[cursor..];
+        let Some(relative_open) = remaining.find('{') else {
+            if remaining.trim().is_empty() {
+                break;
+            }
+            return Err("stylesheet has text outside a rule".to_string());
+        };
+        let open = cursor + relative_open;
+        let header = source[cursor..open].trim();
+        if header.is_empty() {
+            return Err("stylesheet rule has no selector".to_string());
+        }
+        let close = matching_brace(source, open)?;
+        let body = &source[open + 1..close];
+        if header
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@media"))
+        {
+            let nested_media = parse_media_condition(header)?;
+            if media.is_some() {
+                return Err("nested media rules are not supported".to_string());
+            }
+            parse_rules(body, Some(nested_media), rules)?;
+        } else if header.starts_with('@') {
+            return Err(format!("unsupported at-rule: {header}"));
+        } else {
+            let selectors = header
+                .split(',')
+                .map(Selector::parse)
+                .collect::<Result<Vec<_>, _>>()?;
+            let declarations = parse_declarations(body)?;
+            rules.push(Rule {
+                selectors,
+                declarations,
+                order: rules.len(),
+                media: media.clone(),
+            });
+        }
+        cursor = close + 1;
+    }
+    Ok(())
+}
+
+fn matching_brace(source: &str, open: usize) -> Result<usize, String> {
+    let bytes = source.as_bytes();
+    let mut depth = 0;
+    for (offset, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("stylesheet rule has no closing brace".to_string())
+}
+
+fn parse_media_condition(header: &str) -> Result<MediaCondition, String> {
+    let query = header
+        .get(6..)
+        .ok_or_else(|| format!("invalid media rule: {header}"))?
+        .trim()
+        .to_ascii_lowercase();
+    let mut condition = MediaCondition::default();
+    for raw_feature in query.split("and") {
+        let feature = raw_feature.trim().trim_matches(['(', ')']).trim();
+        if feature.is_empty()
+            || feature.eq_ignore_ascii_case("all")
+            || feature.eq_ignore_ascii_case("screen")
+        {
+            continue;
+        }
+        let Some((name, value)) = feature.split_once(':') else {
+            return Err(format!("unsupported media feature: {feature}"));
+        };
+        let value = parse_media_dimension(value)?;
+        match name.trim().to_ascii_lowercase().as_str() {
+            "min-width" => condition.min_width = Some(value),
+            "max-width" => condition.max_width = Some(value),
+            "min-height" => condition.min_height = Some(value),
+            "max-height" => condition.max_height = Some(value),
+            _ => return Err(format!("unsupported media feature: {name}")),
+        }
+    }
+    Ok(condition)
+}
+
+fn parse_media_dimension(value: &str) -> Result<f32, String> {
+    let value = value.trim();
+    let value = value.strip_suffix("px").unwrap_or(value).trim();
+    let value = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid media dimension: {value}"))?;
+    value
+        .is_finite()
+        .then_some(value.max(0.0))
+        .ok_or_else(|| "media dimension must be finite".to_string())
 }
 
 fn parse_declarations(source: &str) -> Result<Vec<Declaration>, String> {

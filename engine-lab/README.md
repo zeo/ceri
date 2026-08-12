@@ -38,6 +38,7 @@ The current slice implements:
 - bounded object and array destructuring in declarations, `for...of` bindings, and function parameters, including default values and computed object keys, plus `Map` key iterators with `next()` records
 - an engine-owned `window.ceriQuery` runtime identity promise, with the shared SDK retaining its `window.cefQuery` fallback for the production adapter
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
+- viewport-aware `@media` rules for `screen`, `all`, and min/max width or height conditions
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
@@ -274,3 +275,5 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The `--move-at` switch dispatches a pointer move before the click, while the click updates focus and checkbox state. The layout and paint pass then recompute pseudo-class styles without a page reload.
+
+The responsive CSS subset reevaluates `@media screen` and `@media all` rules on every layout using the requested viewport. It supports `min-width`, `max-width`, `min-height`, and `max-height` in pixels. Unsupported at-rules and media features surface as stylesheet errors instead of being silently treated as ordinary selectors.
