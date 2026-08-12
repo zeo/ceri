@@ -28,6 +28,7 @@ The current slice implements:
 - named form controls with live checkbox and radio-group state, `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
 - app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
+- static ES module graphs with same-origin packaged imports, named exports, and namespace imports
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -167,6 +168,14 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The current image slice accepts app-origin `image/svg+xml` resources, enforces bounded dimensions, and rasterizes `rect`, `circle`, `line`, inherited paint, and simple inline style declarations. Broken, unsupported, or cross-origin image references stay absent from the frame instead of escaping the resource boundary. PNG, JPEG, animated formats, filters, text, paths, and image decoding remain separate gates.
+
+The static module demo exercises packaged module loading without a listener:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-module-demo.bmp --width 800 --height 300
+```
+
+The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports named imports, namespace imports, `export const`, `export function`, and local export lists, caches completed modules, and rejects cycles or missing and cross-origin dependencies. Dynamic `import()`, default exports, re-exports, live binding updates, async module evaluation, and the rest of JavaScript grammar remain separate gates.
 
 The dynamic selector demo exercises stateful CSS through the host input boundary:
 

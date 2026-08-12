@@ -4,7 +4,7 @@ use crate::navigation::{APP_ORIGIN, AppUrl, ResourceBundle};
 use crate::paint::CanvasCommand;
 use crate::Color;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -221,6 +221,30 @@ enum Stmt {
     Return(Option<Expr>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleImportBinding {
+    Named { imported: String, local: String },
+    Namespace { local: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModuleImport {
+    pub(crate) source: String,
+    pub(crate) bindings: Vec<ModuleImportBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModuleExport {
+    pub(crate) local: String,
+    pub(crate) exported: String,
+}
+
+struct ModuleProgram {
+    imports: Vec<ModuleImport>,
+    statements: Vec<Stmt>,
+    exports: Vec<ModuleExport>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UnaryOperator {
     Not,
@@ -266,6 +290,21 @@ pub struct ScriptRuntime {
     tasks: Vec<ScheduledTask>,
     microtasks: VecDeque<Microtask>,
     pending_navigation: Option<NavigationRequest>,
+    module_cache: BTreeMap<String, ModuleNamespace>,
+    loading_modules: BTreeSet<String>,
+}
+
+pub(crate) trait ModuleSourceLoader {
+    fn load_module(
+        &mut self,
+        referrer: &AppUrl,
+        reference: &str,
+    ) -> Result<(AppUrl, String), ScriptError>;
+}
+
+#[derive(Clone)]
+pub(crate) struct ModuleNamespace {
+    values: BTreeMap<String, Value>,
 }
 
 #[derive(Clone)]
@@ -529,6 +568,8 @@ impl ScriptRuntime {
             tasks: Vec::new(),
             microtasks: VecDeque::new(),
             pending_navigation: None,
+            module_cache: BTreeMap::new(),
+            loading_modules: BTreeSet::new(),
         }
     }
 
@@ -545,6 +586,87 @@ impl ScriptRuntime {
         match self.execute_statements(&program, self.global.clone())? {
             Completion::Normal | Completion::Return(_) => self.drain_microtasks(),
         }
+    }
+
+    pub(crate) fn execute_module<L: ModuleSourceLoader>(
+        &mut self,
+        source: &str,
+        url: AppUrl,
+        loader: &mut L,
+    ) -> Result<ModuleNamespace, ScriptError> {
+        let namespace = self.execute_module_graph(source, url, loader)?;
+        self.drain_microtasks()?;
+        Ok(namespace)
+    }
+
+    fn execute_module_graph<L: ModuleSourceLoader>(
+        &mut self,
+        source: &str,
+        url: AppUrl,
+        loader: &mut L,
+    ) -> Result<ModuleNamespace, ScriptError> {
+        let key = url.to_string();
+        if let Some(namespace) = self.module_cache.get(&key) {
+            return Ok(namespace.clone());
+        }
+        if !self.loading_modules.insert(key.clone()) {
+            return Err(runtime_error(format!("cyclic module import at {key}")));
+        }
+        let result = self.execute_module_body(source, url.clone(), loader);
+        self.loading_modules.remove(&key);
+        let namespace = result?;
+        self.module_cache.insert(key, namespace.clone());
+        Ok(namespace)
+    }
+
+    fn execute_module_body<L: ModuleSourceLoader>(
+        &mut self,
+        source: &str,
+        url: AppUrl,
+        loader: &mut L,
+    ) -> Result<ModuleNamespace, ScriptError> {
+        let program = Parser::new(source)?.parse_module()?;
+        let environment = Rc::new(RefCell::new(Environment {
+            values: HashMap::new(),
+            parent: Some(self.global.clone()),
+        }));
+        for import in &program.imports {
+            let (dependency_url, dependency_source) = loader.load_module(&url, &import.source)?;
+            let namespace = self.execute_module_graph(&dependency_source, dependency_url, loader)?;
+            let mut values = environment.borrow_mut();
+            for binding in &import.bindings {
+                let value = match binding {
+                    ModuleImportBinding::Named { imported, .. } => namespace
+                        .values
+                        .get(imported)
+                        .cloned()
+                        .ok_or_else(|| {
+                            runtime_error(format!(
+                                "module {} has no export {imported}",
+                                import.source
+                            ))
+                        })?,
+                    ModuleImportBinding::Namespace { .. } => namespace.object_value(),
+                };
+                let local = match binding {
+                    ModuleImportBinding::Named { local, .. }
+                    | ModuleImportBinding::Namespace { local } => local,
+                };
+                values.values.insert(local.clone(), value);
+            }
+        }
+        match self.execute_statements(&program.statements, environment.clone())? {
+            Completion::Normal | Completion::Return(_) => {}
+        }
+        let values = environment.borrow();
+        let mut exports = BTreeMap::new();
+        for export in program.exports {
+            let value = values
+                .get(&export.local)
+                .ok_or_else(|| runtime_error(format!("module export {} is undefined", export.local)))?;
+            exports.insert(export.exported, value);
+        }
+        Ok(ModuleNamespace { values: exports })
     }
 
     pub fn click_id(&mut self, id: &str) -> Result<bool, ScriptError> {
@@ -2858,6 +2980,12 @@ impl Environment {
     }
 }
 
+impl ModuleNamespace {
+    fn object_value(&self) -> Value {
+        Value::Object(Rc::new(RefCell::new(self.values.clone())))
+    }
+}
+
 impl Literal {
     fn to_value(&self) -> Value {
         match self {
@@ -3206,7 +3334,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn runtime_error(message: impl Into<String>) -> ScriptError {
+pub(crate) fn runtime_error(message: impl Into<String>) -> ScriptError {
     ScriptError {
         offset: 0,
         message: message.into(),
@@ -3232,6 +3360,141 @@ impl Parser {
             statements.push(self.parse_statement()?);
         }
         Ok(statements)
+    }
+
+    fn parse_module(&mut self) -> Result<ModuleProgram, ScriptError> {
+        let mut imports = Vec::new();
+        let mut statements = Vec::new();
+        let mut exports = Vec::new();
+        while !self.is(TokenKind::Eof) {
+            if self.is_identifier("import") && !self.is_next(TokenKind::Dot) {
+                imports.push(self.parse_import_declaration()?);
+            } else if self.is_identifier("export") {
+                self.advance();
+                self.parse_export_declaration(&mut statements, &mut exports)?;
+            } else {
+                statements.push(self.parse_statement()?);
+            }
+        }
+        Ok(ModuleProgram {
+            imports,
+            statements,
+            exports,
+        })
+    }
+
+    fn parse_import_declaration(&mut self) -> Result<ModuleImport, ScriptError> {
+        self.expect_identifier_value("import")?;
+        if let TokenKind::String(source) = self.peek().kind.clone() {
+            self.advance();
+            self.take(TokenKind::Semicolon);
+            return Ok(ModuleImport {
+                source,
+                bindings: Vec::new(),
+            });
+        }
+        let mut bindings = Vec::new();
+        if let TokenKind::Identifier(local) = self.peek().kind.clone() {
+            self.advance();
+            bindings.push(ModuleImportBinding::Named {
+                imported: "default".to_string(),
+                local,
+            });
+            self.take(TokenKind::Comma);
+        }
+        if self.take(TokenKind::Star) {
+            self.expect_identifier_value("as")?;
+            let local = self.expect_identifier("namespace import name")?;
+            bindings.push(ModuleImportBinding::Namespace { local });
+        } else if self.take(TokenKind::LBrace) {
+            if !self.is(TokenKind::RBrace) {
+                loop {
+                    let imported = self.expect_identifier("import name")?;
+                    let local = if self.is_identifier("as") {
+                        self.advance();
+                        self.expect_identifier("local import name")?
+                    } else {
+                        imported.clone()
+                    };
+                    bindings.push(ModuleImportBinding::Named { imported, local });
+                    if !self.take(TokenKind::Comma) {
+                        break;
+                    }
+                    if self.is(TokenKind::RBrace) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RBrace, "named imports")?;
+        }
+        self.expect_identifier_value("from")?;
+        let source = self.expect_string("module specifier")?;
+        self.take(TokenKind::Semicolon);
+        if bindings.is_empty() {
+            return Err(self.error(
+                "module import has no bindings".to_string(),
+                self.peek().offset,
+            ));
+        }
+        Ok(ModuleImport { source, bindings })
+    }
+
+    fn parse_export_declaration(
+        &mut self,
+        statements: &mut Vec<Stmt>,
+        exports: &mut Vec<ModuleExport>,
+    ) -> Result<(), ScriptError> {
+        if self.is(TokenKind::Let) || self.is(TokenKind::Const) {
+            let statement = self.parse_statement()?;
+            let Stmt::Let { name, .. } = &statement else {
+                return Err(self.error("expected exported binding".to_string(), self.peek().offset));
+            };
+            exports.push(ModuleExport {
+                local: name.clone(),
+                exported: name.clone(),
+            });
+            statements.push(statement);
+            return Ok(());
+        }
+        if self.is(TokenKind::Function) && self.is_next_identifier() {
+            let statement = self.parse_statement()?;
+            let Stmt::Let { name, .. } = &statement else {
+                return Err(self.error("expected exported function".to_string(), self.peek().offset));
+            };
+            exports.push(ModuleExport {
+                local: name.clone(),
+                exported: name.clone(),
+            });
+            statements.push(statement);
+            return Ok(());
+        }
+        if self.take(TokenKind::LBrace) {
+            if !self.is(TokenKind::RBrace) {
+                loop {
+                    let local = self.expect_identifier("export name")?;
+                    let exported = if self.is_identifier("as") {
+                        self.advance();
+                        self.expect_identifier("export alias")?
+                    } else {
+                        local.clone()
+                    };
+                    exports.push(ModuleExport { local, exported });
+                    if !self.take(TokenKind::Comma) {
+                        break;
+                    }
+                    if self.is(TokenKind::RBrace) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RBrace, "export list")?;
+            self.take(TokenKind::Semicolon);
+            return Ok(());
+        }
+        Err(self.error(
+            "module export form is outside the supported subset".to_string(),
+            self.peek().offset,
+        ))
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, ScriptError> {
@@ -3623,6 +3886,36 @@ impl Parser {
         )
     }
 
+    fn is_identifier(&self, expected: &str) -> bool {
+        matches!(&self.peek().kind, TokenKind::Identifier(name) if name == expected)
+    }
+
+    fn is_next(&self, expected: TokenKind) -> bool {
+        self.tokens
+            .get(self.index + 1)
+            .is_some_and(|token| token_matches(&token.kind, &expected))
+    }
+
+    fn expect_identifier_value(&mut self, expected: &str) -> Result<(), ScriptError> {
+        if self.is_identifier(expected) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.error(
+                format!("expected {expected}"),
+                self.peek().offset,
+            ))
+        }
+    }
+
+    fn expect_string(&mut self, context: &str) -> Result<String, ScriptError> {
+        let token = self.advance();
+        match token.kind {
+            TokenKind::String(value) => Ok(value),
+            _ => Err(self.error(format!("expected {context}"), token.offset)),
+        }
+    }
+
     fn expect_identifier(&mut self, context: &str) -> Result<String, ScriptError> {
         let token = self.advance();
         match token.kind {
@@ -3912,6 +4205,88 @@ mod tests {
         Rc::new(RefCell::new(
             Document::parse(source).expect("document should parse"),
         ))
+    }
+
+    struct StaticModuleLoader {
+        modules: BTreeMap<String, String>,
+    }
+
+    impl ModuleSourceLoader for StaticModuleLoader {
+        fn load_module(
+            &mut self,
+            referrer: &AppUrl,
+            reference: &str,
+        ) -> Result<(AppUrl, String), ScriptError> {
+            let url = referrer
+                .resolve(reference)
+                .map_err(|error| runtime_error(error.to_string()))?;
+            let source = self
+                .modules
+                .get(url.path())
+                .cloned()
+                .ok_or_else(|| runtime_error(format!("missing module {}", url.path())))?;
+            Ok((url, source))
+        }
+    }
+
+    #[test]
+    fn executes_a_static_module_graph_with_named_and_namespace_imports() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([(
+                "/message.js".to_string(),
+                r#"export const message = "from module"; export function suffix(value) { return value + " ready"; }"#.to_string(),
+            )]),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let namespace = runtime
+            .execute_module(
+                r#"import { message, suffix as addSuffix } from "./message.js"; import * as messages from "./message.js"; document.getElementById("status").textContent = addSuffix(messages.message) + "|" + message; export { message };"#,
+                base,
+                &mut loader,
+            )
+            .expect("module graph should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("from module ready|from module")
+        );
+        assert_eq!(
+            namespace
+                .values
+                .get("message")
+                .expect("message export should exist")
+                .string_value(),
+            "from module"
+        );
+    }
+
+    #[test]
+    fn rejects_cyclic_module_graphs() {
+        let document = document("<p>module</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([
+                (
+                    "/a.js".to_string(),
+                    "import \"./b.js\"; export const a = 1;".to_string(),
+                ),
+                (
+                    "/b.js".to_string(),
+                    "import \"./a.js\"; export const b = 2;".to_string(),
+                ),
+            ]),
+        };
+        let mut runtime = ScriptRuntime::new(document);
+        let error = match runtime.execute_module("import \"./a.js\";", base, &mut loader) {
+            Ok(_) => panic!("cyclic graph should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("cyclic module import"));
     }
 
     #[test]

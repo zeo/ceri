@@ -3,7 +3,9 @@ use crate::dom::{Document, NodePath, ScriptSource, StylesheetSource};
 use crate::image::parse_svg;
 use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
-use crate::script::{NavigationRequest, ScriptRuntime, StorageHandle};
+use crate::script::{
+    ModuleSourceLoader, NavigationRequest, ScriptRuntime, StorageHandle, runtime_error,
+};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -879,6 +881,9 @@ impl Browser {
         sources: &[ScriptSource],
         runtime: &mut ScriptRuntime,
     ) -> Result<(), NavigationError> {
+        let mut module_loader = PackagedModuleLoader {
+            resources: &self.resources,
+        };
         for source in sources {
             let source = match source {
                 ScriptSource::Inline(source) => source.clone(),
@@ -893,6 +898,28 @@ impl Browser {
                     }
                     String::from_utf8(resource.body)
                         .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?
+                }
+                ScriptSource::InlineModule(source) => {
+                    runtime
+                        .execute_module(source, base.clone(), &mut module_loader)
+                        .map_err(|error| NavigationError::Script(error.to_string()))?;
+                    continue;
+                }
+                ScriptSource::ExternalModule(reference) => {
+                    let url = base.resolve(reference)?;
+                    let resource = self.resources.load_subresource(&url)?;
+                    if !is_javascript(&resource) {
+                        return Err(NavigationError::UnsupportedMimeType {
+                            path: url.path().to_string(),
+                            mime_type: resource.mime_type,
+                        });
+                    }
+                    let source = String::from_utf8(resource.body)
+                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
+                    runtime
+                        .execute_module(&source, url, &mut module_loader)
+                        .map_err(|error| NavigationError::Script(error.to_string()))?;
+                    continue;
                 }
             };
             runtime
@@ -917,6 +944,36 @@ impl Browser {
             document,
             stylesheet,
         });
+    }
+}
+
+struct PackagedModuleLoader<'a> {
+    resources: &'a ResourceBundle,
+}
+
+impl ModuleSourceLoader for PackagedModuleLoader<'_> {
+    fn load_module(
+        &mut self,
+        referrer: &AppUrl,
+        reference: &str,
+    ) -> Result<(AppUrl, String), crate::script::ScriptError> {
+        let url = referrer
+            .resolve(reference)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let resource = self
+            .resources
+            .load_subresource(&url)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        if !is_javascript(&resource) {
+            return Err(runtime_error(format!(
+                "module {} has unsupported MIME type {}",
+                url.path(),
+                resource.mime_type
+            )));
+        }
+        let source = String::from_utf8(resource.body)
+            .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
+        Ok((url, source))
     }
 }
 
@@ -1950,6 +2007,73 @@ mod tests {
         assert_eq!(
             layout.root.children[0].text[0].color,
             crate::Color::opaque(66, 211, 180)
+        );
+    }
+
+    #[test]
+    fn packaged_static_modules_execute_with_same_origin_imports() {
+        let mut resources = bundle(
+            r#"<p id="status">idle</p><script type="module" src="/entry.js"></script>"#,
+        );
+        resources
+            .insert(
+                "/entry.js",
+                "text/javascript",
+                br#"import { message, suffix as addSuffix } from "./message.js"; import * as messages from "./message.js"; document.getElementById("status").textContent = addSuffix(messages.message) + "|" + message;"#.to_vec(),
+            )
+            .expect("entry module should be accepted");
+        resources
+            .insert(
+                "/message.js",
+                "text/javascript",
+                br#"export const message = "from module"; export function suffix(value) { return value + " ready"; }"#.to_vec(),
+            )
+            .expect("dependency module should be accepted");
+        let mut browser = Browser::new(resources);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("module page should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("from module ready|from module")
+        );
+    }
+
+    #[test]
+    fn cross_origin_module_imports_install_the_recovery_document() {
+        let mut resources = bundle(
+            r#"<p>before</p><script type="module" src="/entry.js"></script>"#,
+        );
+        resources
+            .insert(
+                "/entry.js",
+                "text/javascript",
+                br#"import "https://outside.invalid/module.js";"#.to_vec(),
+            )
+            .expect("entry module should be accepted");
+        let mut browser = Browser::new(resources);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("module failure should become recovery"),
+            NavigationStatus::ErrorPage { status: 500 }
+        );
+        let document = browser.document().expect("recovery document should exist");
+        let recovery = document
+            .borrow()
+            .find_element_by_id("recovery")
+            .expect("recovery element should exist");
+        assert_eq!(
+            document.borrow().element_attribute(&recovery, "data-status"),
+            Some("500".to_string())
         );
     }
 

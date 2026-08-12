@@ -23,6 +23,8 @@ pub enum Node {
 pub enum ScriptSource {
     Inline(String),
     External(String),
+    InlineModule(String),
+    ExternalModule(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,12 +498,23 @@ fn collect_script_text(element: &Element, scripts: &mut Vec<String>) {
 
 fn collect_script_sources(element: &Element, scripts: &mut Vec<ScriptSource>) {
     if element.name == "script" {
+        let is_module = element.attr("type").is_some_and(|kind| {
+            kind.trim().eq_ignore_ascii_case("module")
+        });
         if let Some(source) = element.attr("src") {
-            scripts.push(ScriptSource::External(source.to_string()));
+            scripts.push(if is_module {
+                ScriptSource::ExternalModule(source.to_string())
+            } else {
+                ScriptSource::External(source.to_string())
+            });
         } else {
             let mut script = String::new();
             collect_text_nodes(element, &mut script);
-            scripts.push(ScriptSource::Inline(script));
+            scripts.push(if is_module {
+                ScriptSource::InlineModule(script)
+            } else {
+                ScriptSource::Inline(script)
+            });
         }
     }
     for child in &element.children {
@@ -1027,7 +1040,7 @@ mod tests {
     #[test]
     fn preserves_document_order_for_external_sources() {
         let document = Document::parse(
-            "<link rel='StyleSheet' href='/theme.css'><style>p { color: red; }</style><script src='/boot.js'></script><script>console.log('inline');</script>",
+            "<link rel='StyleSheet' href='/theme.css'><style>p { color: red; }</style><script src='/boot.js'></script><script>console.log('inline');</script><script type='module' src='/entry.js'></script><script type='module'>console.log('inline module');</script>",
         )
         .expect("document should parse");
         assert_eq!(
@@ -1042,6 +1055,8 @@ mod tests {
             vec![
                 ScriptSource::External("/boot.js".to_string()),
                 ScriptSource::Inline("console.log('inline');".to_string()),
+                ScriptSource::ExternalModule("/entry.js".to_string()),
+                ScriptSource::InlineModule("console.log('inline module');".to_string()),
             ]
         );
     }
