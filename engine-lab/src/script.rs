@@ -205,6 +205,7 @@ enum Builtin {
     ResponseBytes(ResponseHandle),
     ReadableStreamGetReader(ReadableStreamHandle),
     ReadableStreamCancel(ReadableStreamHandle),
+    ReadableStreamTee(ReadableStreamHandle),
     ReadableStreamReaderRead(ReadableStreamReaderHandle),
     ReadableStreamReaderReleaseLock(ReadableStreamReaderHandle),
     ReadableStreamReaderCancel(ReadableStreamReaderHandle),
@@ -2194,6 +2195,7 @@ impl ScriptRuntime {
                 "locked" => Ok(Value::Bool(stream.borrow().body.borrow().locked)),
                 "getReader" => Ok(Value::Builtin(Builtin::ReadableStreamGetReader(stream))),
                 "cancel" => Ok(Value::Builtin(Builtin::ReadableStreamCancel(stream))),
+                "tee" => Ok(Value::Builtin(Builtin::ReadableStreamTee(stream))),
                 _ => Err(runtime_error(format!(
                     "ReadableStream has no property {property}"
                 ))),
@@ -3693,6 +3695,27 @@ impl ScriptRuntime {
                 }
                 stream.canceled = true;
                 Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
+            }
+            Builtin::ReadableStreamTee(stream) => {
+                let body = stream.borrow().body.clone();
+                let mut body_state = body.borrow_mut();
+                if body_state.locked || body_state.disturbed || body_state.consumed {
+                    return Err(runtime_error("readable stream is already used"));
+                }
+                let remaining = body_state.bytes[body_state.cursor..].to_vec();
+                body_state.cursor = body_state.bytes.len();
+                body_state.disturbed = true;
+                body_state.locked = true;
+                drop(body_state);
+                let left = Value::ReadableStream(Rc::new(RefCell::new(ReadableStreamData {
+                    body: response_body(remaining.clone()),
+                    canceled: false,
+                })));
+                let right = Value::ReadableStream(Rc::new(RefCell::new(ReadableStreamData {
+                    body: response_body(remaining),
+                    canceled: false,
+                })));
+                Ok(Value::Array(Rc::new(RefCell::new(vec![left, right]))))
             }
             Builtin::ReadableStreamReaderRead(reader) => {
                 let reader = reader.borrow();
@@ -8209,6 +8232,44 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|true|16|10|true")
+        );
+    }
+
+    #[test]
+    fn response_body_stream_tee_clones_remaining_bytes_and_locks_source() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"abcd".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    const pair = response.body.tee();
+                    const left = pair[0].getReader();
+                    const right = pair[1].getReader();
+                    left.read().then((first) => {
+                        right.read().then((second) => {
+                            left.read().then((end) => {
+                                status.textContent = response.bodyUsed + "|" + first.value.length + "|" + second.value.length + "|" + end.done;
+                            });
+                        });
+                    });
+                });
+                "#,
+            )
+            .expect("response body tee should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|4|4|true")
         );
     }
 
