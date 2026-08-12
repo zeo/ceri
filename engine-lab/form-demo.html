@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="demo.css">
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      label {
+        display: block;
+        margin: 12px 0 4px;
+        color: #ffd479;
+      }
+      input,
+      textarea {
+        display: block;
+        width: 100%;
+        padding: 6px 8px;
+        color: #07131f;
+        background-color: #d8eef2;
+        border: 0;
+      }
+      textarea {
+        height: 54px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>form data laboratory</h1>
+      <p>Named controls become an app-owned FormData payload.</p>
+      <form id="profile">
+        <label for="name">name</label>
+        <input id="name" name="name" value="Ceri">
+        <label for="note">note</label>
+        <textarea id="note" name="note">from scratch</textarea>
+        <label><input id="remember" name="remember" type="checkbox" value="yes" checked> remember</label>
+        <button id="submit" type="submit">submit form</button>
+      </form>
+      <p id="status">waiting for form data</p>
+    </main>
+  </body>
+  <script src="form-demo.js"></script>
+</html>

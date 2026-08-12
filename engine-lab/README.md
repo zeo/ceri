@@ -25,6 +25,7 @@ The current slice implements:
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
 - app-origin `localStorage` and `sessionStorage` key/value stores shared across full-document navigations in one browser session
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
+- named form controls with `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
@@ -139,3 +140,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The stores live in the `Browser` instance, so values survive full-document navigation and remain isolated from other browser instances. They are currently in-memory, with no disk persistence, quota enforcement, or cross-process sharing.
+
+The form demo exercises named controls, `FormData`, and a cancellable submit event:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/form-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-form-demo.bmp --click submit
+```
+
+The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, and leaves network submission to the app.

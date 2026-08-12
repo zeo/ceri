@@ -127,6 +127,16 @@ impl Document {
         find_element_by_id(&self.root, id, &mut Vec::new())
     }
 
+    pub fn form_control_paths(&self, form_path: &[usize]) -> Option<Vec<NodePath>> {
+        let form = self.element_at(form_path)?;
+        (form.name == "form").then(|| {
+            let mut paths = Vec::new();
+            let mut path = form_path.to_vec();
+            collect_form_control_paths(form, &mut path, &mut paths);
+            paths
+        })
+    }
+
     pub fn link_reference(&self, path: &[usize]) -> Option<String> {
         let mut candidate = path.to_vec();
         loop {
@@ -499,6 +509,20 @@ fn find_element_by_id(element: &Element, id: &str, path: &mut NodePath) -> Optio
         path.pop();
     }
     None
+}
+
+fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        if matches!(child.name.as_str(), "button" | "input" | "select" | "textarea") {
+            paths.push(path.clone());
+        }
+        collect_form_control_paths(child, path, paths);
+        path.pop();
+    }
 }
 
 fn find_element_by_selector<'a>(
@@ -941,6 +965,21 @@ mod tests {
         assert!(document.find_element_by_selector(".accent").is_some());
         assert!(document.find_element_by_selector("#second").is_some());
         assert!(document.find_element_by_selector(".missing").is_none());
+    }
+
+    #[test]
+    fn collects_form_controls_in_document_order() {
+        let document = Document::parse(
+            "<form id='profile'><input name='name'><fieldset><textarea name='note'></textarea></fieldset><button name='save'>save</button></form>",
+        )
+        .expect("document should parse");
+        let form = document
+            .find_element_by_id("profile")
+            .expect("form should exist");
+        assert_eq!(
+            document.form_control_paths(&form),
+            Some(vec![vec![0, 0], vec![0, 1, 0], vec![0, 2]])
+        );
     }
 
     #[test]

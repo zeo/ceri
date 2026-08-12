@@ -17,6 +17,7 @@ type HistoryHandle = Rc<RefCell<HistoryData>>;
 type UrlHandle = Rc<RefCell<UrlData>>;
 type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
 pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
+type FormDataHandle = Rc<RefCell<FormDataData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -58,10 +59,12 @@ enum Value {
     Url(UrlHandle),
     UrlSearchParams(UrlSearchParamsHandle),
     Storage(StorageHandle),
+    FormData(FormDataHandle),
     Console,
     Json,
     UrlConstructor,
     UrlSearchParamsConstructor,
+    FormDataConstructor,
     Function(Rc<Function>),
     Builtin(Builtin),
 }
@@ -83,6 +86,7 @@ enum Builtin {
     HistoryGo,
     ElementFocus(NodePath),
     ElementBlur(NodePath),
+    ElementRequestSubmit(NodePath),
     UrlSearchParamsAppend(UrlSearchParamsHandle),
     UrlSearchParamsDelete(UrlSearchParamsHandle),
     UrlSearchParamsGet(UrlSearchParamsHandle),
@@ -97,6 +101,12 @@ enum Builtin {
     StorageKey(StorageHandle),
     StorageRemoveItem(StorageHandle),
     StorageSetItem(StorageHandle),
+    FormDataAppend(FormDataHandle),
+    FormDataDelete(FormDataHandle),
+    FormDataGet(FormDataHandle),
+    FormDataGetAll(FormDataHandle),
+    FormDataHas(FormDataHandle),
+    FormDataSet(FormDataHandle),
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -297,6 +307,10 @@ impl StorageData {
     }
 }
 
+struct FormDataData {
+    pairs: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NavigationRequest {
     Navigate {
@@ -448,6 +462,9 @@ impl ScriptRuntime {
                 "URLSearchParams".to_string(),
                 Value::UrlSearchParamsConstructor,
             );
+            values
+                .values
+                .insert("FormData".to_string(), Value::FormDataConstructor);
             values.values.insert(
                 "localStorage".to_string(),
                 Value::Storage(local_storage.clone()),
@@ -992,6 +1009,22 @@ impl ScriptRuntime {
                     "blur" => Value::Builtin(Builtin::ElementBlur(
                         path.ok_or_else(|| runtime_error("detached element cannot lose focus"))?,
                     )),
+                    "requestSubmit" => {
+                        let path = path.ok_or_else(|| {
+                            runtime_error("detached element cannot submit")
+                        })?;
+                        let is_form = self
+                            .document
+                            .borrow()
+                            .element_clone(&path)
+                            .is_some_and(|element| element.name == "form");
+                        if !is_form {
+                            return Err(runtime_error(
+                                "requestSubmit is only available on form elements",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementRequestSubmit(path))
+                    }
                     "appendChild" => {
                         Value::Builtin(Builtin::ElementAppendChild(path.ok_or_else(|| {
                             runtime_error("detached element cannot receive children")
@@ -1107,6 +1140,15 @@ impl ScriptRuntime {
                 "removeItem" => Ok(Value::Builtin(Builtin::StorageRemoveItem(storage))),
                 "clear" => Ok(Value::Builtin(Builtin::StorageClear(storage))),
                 _ => Err(runtime_error(format!("storage has no property {property}"))),
+            },
+            Value::FormData(form_data) => match property {
+                "append" => Ok(Value::Builtin(Builtin::FormDataAppend(form_data))),
+                "delete" => Ok(Value::Builtin(Builtin::FormDataDelete(form_data))),
+                "get" => Ok(Value::Builtin(Builtin::FormDataGet(form_data))),
+                "getAll" => Ok(Value::Builtin(Builtin::FormDataGetAll(form_data))),
+                "has" => Ok(Value::Builtin(Builtin::FormDataHas(form_data))),
+                "set" => Ok(Value::Builtin(Builtin::FormDataSet(form_data))),
+                _ => Err(runtime_error(format!("FormData has no property {property}"))),
             },
             Value::Response(response) => match property {
                 "url" => Ok(Value::String(response.url.clone())),
@@ -1434,6 +1476,7 @@ impl ScriptRuntime {
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
             Value::UrlConstructor => self.construct_url(arguments),
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
+            Value::FormDataConstructor => self.construct_form_data(arguments),
             _ => Err(runtime_error("value is not callable")),
         }
     }
@@ -1470,6 +1513,56 @@ impl ScriptRuntime {
         Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
             UrlSearchParamsData { pairs, url: None },
         ))))
+    }
+
+    fn construct_form_data(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let Some(form) = arguments.first() else {
+            return Ok(Value::FormData(Rc::new(RefCell::new(FormDataData {
+                pairs: Vec::new(),
+            }))));
+        };
+        let Value::Element(handle) = form else {
+            return Err(runtime_error("FormData constructor requires a form element"));
+        };
+        let path = attached_path(handle)
+            .ok_or_else(|| runtime_error("FormData constructor requires an attached form"))?;
+        let paths = self
+            .document
+            .borrow()
+            .form_control_paths(&path)
+            .ok_or_else(|| runtime_error("FormData constructor requires a form element"))?;
+        let mut pairs = Vec::new();
+        for path in paths {
+            let element = self
+                .document
+                .borrow()
+                .element_clone(&path)
+                .ok_or_else(|| runtime_error("form control is no longer in the document"))?;
+            let Some(name) = element.attr("name").filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            if element.attr("disabled").is_some() {
+                continue;
+            }
+            let input_type = element
+                .attr("type")
+                .map(|kind| kind.to_ascii_lowercase())
+                .unwrap_or_default();
+            if matches!(input_type.as_str(), "button" | "file" | "reset" | "submit") {
+                continue;
+            }
+            if matches!(input_type.as_str(), "checkbox" | "radio")
+                && element.attr("checked").is_none()
+            {
+                continue;
+            }
+            let value = self
+                .control_value_path(&path)
+                .or_else(|| element.attr("value").map(str::to_string))
+                .unwrap_or_default();
+            pairs.push((name.to_string(), value));
+        }
+        Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
     }
 
     fn url_search_params(
@@ -1675,6 +1768,11 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
+            Builtin::ElementRequestSubmit(path) => {
+                self.dispatch_event(path, "submit")?;
+                self.drain_microtasks()?;
+                Ok(Value::Undefined)
+            }
             Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string())),
             Builtin::UrlSearchParamsAppend(params) => {
                 let name = arguments
@@ -1840,6 +1938,102 @@ impl ScriptRuntime {
             }
             Builtin::StorageClear(storage) => {
                 storage.borrow_mut().values.clear();
+                Ok(Value::Undefined)
+            }
+            Builtin::FormDataAppend(form_data) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let value = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                form_data.borrow_mut().pairs.push((name, value));
+                Ok(Value::Undefined)
+            }
+            Builtin::FormDataDelete(form_data) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                form_data
+                    .borrow_mut()
+                    .pairs
+                    .retain(|(entry_name, _)| entry_name != &name);
+                Ok(Value::Undefined)
+            }
+            Builtin::FormDataGet(form_data) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(form_data
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .find(|(entry_name, _)| entry_name == &name)
+                    .map(|(_, value)| Value::String(value.clone()))
+                    .unwrap_or(Value::Null))
+            }
+            Builtin::FormDataGetAll(form_data) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(Value::Array(Rc::new(RefCell::new(
+                    form_data
+                        .borrow()
+                        .pairs
+                        .iter()
+                        .filter(|(entry_name, _)| entry_name == &name)
+                        .map(|(_, value)| Value::String(value.clone()))
+                        .collect(),
+                ))))
+            }
+            Builtin::FormDataHas(form_data) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(Value::Bool(
+                    form_data
+                        .borrow()
+                        .pairs
+                        .iter()
+                        .any(|(entry_name, _)| entry_name == &name),
+                ))
+            }
+            Builtin::FormDataSet(form_data) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let value = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                let mut form_data = form_data.borrow_mut();
+                if let Some(index) = form_data
+                    .pairs
+                    .iter()
+                    .position(|(entry_name, _)| entry_name == &name)
+                {
+                    form_data.pairs[index].1 = value;
+                    let mut kept = false;
+                    form_data.pairs.retain(|(entry_name, _)| {
+                        if entry_name != &name {
+                            true
+                        } else if kept {
+                            false
+                        } else {
+                            kept = true;
+                            true
+                        }
+                    });
+                } else {
+                    form_data.pairs.push((name, value));
+                }
                 Ok(Value::Undefined)
             }
             Builtin::JsonParse => {
@@ -2428,14 +2622,16 @@ impl Value {
             Self::Window => "[window]".to_string(),
             Self::Location(value) => value.borrow().to_string(),
             Self::History(_) => "[object History]".to_string(),
-            Self::Url(value) => value.borrow().url.to_string(),
+        Self::Url(value) => value.borrow().url.to_string(),
         Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
         Self::Storage(_) => "[object Storage]".to_string(),
+        Self::FormData(_) => "[object FormData]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
                 "[function URL]".to_string()
             }
+            Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::Function(_) => "[function]".to_string(),
             Self::Builtin(_) => "[function]".to_string(),
         }
@@ -2698,6 +2894,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
+        (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -3744,6 +3941,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("2:night:count:1:open:0:0")
+        );
+    }
+
+    #[test]
+    fn form_data_collects_named_controls_and_dispatches_submit() {
+        let document = document(
+            r#"<form id="profile"><input name="name" value="Ceri"><input name="tag" value="one"><input name="tag" value="two"><input name="disabled" value="skip" disabled><input name="check" type="checkbox" value="yes"><textarea name="note">draft</textarea></form><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const form = document.getElementById("profile");
+                const data = new FormData(form);
+                data.append("tag", "three");
+                const first = data.get("tag");
+                const tags = data.getAll("tag");
+                const hasNote = data.has("note");
+                data.set("name", "Updated");
+                data.delete("note");
+                const empty = new FormData();
+                empty.append("empty", "ok");
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    document.getElementById("status").textContent = data.get("name") + "|" + first + "|" + tags.length + "|" + hasNote + "|" + data.has("note") + "|" + data.getAll("tag").length + "|" + empty.get("empty");
+                });
+                form.requestSubmit();
+                "#,
+            )
+            .expect("FormData APIs should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("Updated|one|3|true|false|3|ok")
         );
     }
 
