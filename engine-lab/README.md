@@ -31,7 +31,7 @@ The current slice implements:
 - static and dynamic ES module graphs with same-origin packaged imports, named exports, and namespace imports
 - template literals with expression interpolation and module `import.meta.url`
 - static node-list snapshots, `dataset` reads, array spread and `map`, and bounded `Map` construction, lookup, key enumeration, and mutation
-- bounded `for...of` over arrays, node lists, strings, and maps, promise-backed async functions with `await`, `try`/`catch`/`throw`, class and error values, `typeof`, `instanceof`, conditional expressions, and the narrow `Number`, `Array`, `Object`, `String`, `Set`, and `Promise` surfaces used by the continuity page
+- bounded `for...of` over arrays, node lists, strings, maps, and user-defined `Symbol.iterator` objects, promise-backed async functions with `await`, `try`/`catch`/`throw`, class and error values, `typeof`, `instanceof`, conditional expressions, and the narrow `Number`, `Array`, `Object`, `String`, `Set`, `Promise`, and `Symbol.iterator` surfaces used by the continuity page
 - bounded object and array destructuring in declarations, `for...of` bindings, and function parameters, including default values and computed object keys, plus `Map` key iterators with `next()` records
 - an engine-owned `window.ceriQuery` runtime identity promise, with the shared SDK retaining its `window.cefQuery` fallback for the production adapter
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
@@ -107,13 +107,19 @@ The computed-key sample resolves object-pattern property names from string varia
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/computed-key-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-computed-key-demo.bmp --width 800 --height 320
 ```
 
+The iterator sample defines a `Symbol.iterator` method, returns `next()` records from a closure, and consumes the values through `for...of`:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/iterator-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-iterator-demo.bmp --width 800 --height 320
+```
+
 The packaged continuity page is also an integration target. It loads the real `/web/index.html`, its stylesheet, module graph, SDK module, and recovery asset through the custom resource bundle. The page reaches `4 / 4`: module loading, local storage, packaged fetch, and the engine-owned runtime identity query pass. The page stays loaded and does not fall back to a recovery document:
 
 ```powershell
 cargo test --locked --manifest-path engine-lab/Cargo.toml --test continuity
 ```
 
-The current language boundary stops before generators, user-defined iterator objects, broader class method semantics, and dynamic import attributes. Those remain explicit compatibility gates.
+The current language boundary stops before generators, broader class method semantics, and dynamic import attributes. Those remain explicit compatibility gates.
 
 The event sample starts a click on a nested element and handles it on an ancestor through an external script:
 

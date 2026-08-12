@@ -54,6 +54,7 @@ enum Value {
     Bool(bool),
     Number(f64),
     String(String),
+    Symbol(String),
     Object(ObjectHandle),
     Array(ArrayHandle),
     NodeList(NodeListHandle),
@@ -91,6 +92,7 @@ enum Value {
     ArrayNamespace,
     ObjectNamespace,
     StringConstructor,
+    SymbolNamespace,
     Class(ClassHandle),
     Function(Rc<Function>),
     Builtin(Builtin),
@@ -232,7 +234,7 @@ enum Expr {
         consequent: Box<Expr>,
         alternate: Box<Expr>,
     },
-    Object(Vec<(String, Expr)>),
+    Object(Vec<(ObjectLiteralKey, Expr)>),
     Array(Vec<Expr>),
     Spread(Box<Expr>),
     Template(Vec<TemplatePart>),
@@ -257,6 +259,12 @@ enum Literal {
     Bool(bool),
     Number(f64),
     String(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ObjectLiteralKey {
+    Static(String),
+    Computed(Expr),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -725,6 +733,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("String".to_string(), Value::StringConstructor);
+            values
+                .values
+                .insert("Symbol".to_string(), Value::SymbolNamespace);
             values
                 .values
                 .insert("URL".to_string(), Value::UrlConstructor);
@@ -1307,7 +1318,7 @@ impl ScriptRuntime {
                 Ok(())
             }
             Pattern::Array { items, rest } => {
-                let values = iterable_values(value)?;
+                let values = self.iterable_values(value)?;
                 for (index, nested) in items.iter().enumerate() {
                     let Some(nested) = nested else {
                         continue;
@@ -1378,7 +1389,8 @@ impl ScriptRuntime {
                 iterable,
                 body,
             } => {
-                let values = iterable_values(self.evaluate(iterable, environment.clone())?)?;
+                let iterable = self.evaluate(iterable, environment.clone())?;
+                let values = self.iterable_values(iterable)?;
                 for value in values {
                     let iteration = Rc::new(RefCell::new(Environment {
                         values: HashMap::new(),
@@ -1526,9 +1538,15 @@ impl ScriptRuntime {
             }
             Expr::Object(properties) => {
                 let mut object = BTreeMap::new();
-                for (property, expression) in properties {
+                for (key, expression) in properties {
+                    let property = match key {
+                        ObjectLiteralKey::Static(property) => property.clone(),
+                        ObjectLiteralKey::Computed(key_expression) => self
+                            .evaluate(key_expression, environment.clone())
+                            .map(|value| value.property_key())?,
+                    };
                     object.insert(
-                        property.clone(),
+                        property,
                         self.evaluate(expression, environment.clone())?,
                     );
                 }
@@ -1538,9 +1556,8 @@ impl ScriptRuntime {
                 let mut values = Vec::new();
                 for expression in expressions {
                     if let Expr::Spread(expression) = expression {
-                        values.extend(spread_values(
-                            self.evaluate(expression, environment.clone())?,
-                        )?);
+                        let spread = self.evaluate(expression, environment.clone())?;
+                        values.extend(self.spread_values(spread)?);
                     } else {
                         values.push(self.evaluate(expression, environment.clone())?);
                     }
@@ -1982,6 +1999,10 @@ impl ScriptRuntime {
                 "freeze" => Ok(Value::Builtin(Builtin::ObjectFreeze)),
                 _ => Err(runtime_error(format!("Object has no property {property}"))),
             },
+            Value::SymbolNamespace => match property {
+                "iterator" => Ok(Value::Symbol("@@iterator".to_string())),
+                _ => Err(runtime_error(format!("Symbol has no property {property}"))),
+            },
             Value::Object(object) => Ok(object
                 .borrow()
                 .get(property)
@@ -2052,7 +2073,7 @@ impl ScriptRuntime {
         match object {
             Value::Object(object) => Ok(object
                 .borrow()
-                .get(&index.string_value())
+                .get(&index.property_key())
                 .cloned()
                 .unwrap_or(Value::Undefined)),
             Value::Array(array) => {
@@ -2594,10 +2615,10 @@ impl ScriptRuntime {
         Ok(Value::Map(Rc::new(RefCell::new(MapData { entries }))))
     }
 
-    fn construct_set(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+    fn construct_set(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
         let mut values = Vec::new();
         if let Some(value) = arguments.first() {
-            for candidate in iterable_values(value.clone())? {
+            for candidate in self.iterable_values(value.clone())? {
                 if !values.iter().any(|existing| values_equal(existing, &candidate)) {
                     values.push(candidate);
                 }
@@ -4038,6 +4059,7 @@ impl Value {
             Self::Number(value) if value.fract() == 0.0 => format!("{value:.0}"),
             Self::Number(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Symbol(value) => format!("Symbol({value})"),
             Self::Object(_) => "[object Object]".to_string(),
             Self::Array(_) => "[array]".to_string(),
             Self::NodeList(_) => "[object NodeList]".to_string(),
@@ -4076,6 +4098,7 @@ impl Value {
             Self::ArrayNamespace => "[function Array]".to_string(),
             Self::ObjectNamespace => "[function Object]".to_string(),
             Self::StringConstructor => "[function String]".to_string(),
+            Self::SymbolNamespace => "[function Symbol]".to_string(),
             Self::Class(class) => format!("[class {}]", class.name),
             Self::Function(_) => "[function]".to_string(),
             Self::Builtin(_) => "[function]".to_string(),
@@ -4084,6 +4107,13 @@ impl Value {
 
     fn display_string(&self) -> String {
         self.string_value()
+    }
+
+    fn property_key(&self) -> String {
+        match self {
+            Self::Symbol(value) => value.clone(),
+            _ => self.string_value(),
+        }
     }
 }
 
@@ -4414,6 +4444,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Bool(_) => "boolean",
         Value::Number(_) => "number",
         Value::String(_) => "string",
+        Value::Symbol(_) => "symbol",
         Value::Function(_)
         | Value::Builtin(_)
         | Value::UrlConstructor
@@ -4427,6 +4458,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::ArrayNamespace
         | Value::ObjectNamespace
         | Value::StringConstructor
+        | Value::SymbolNamespace
         | Value::Class(_) => "function",
     }
 }
@@ -4449,6 +4481,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
@@ -4460,38 +4493,63 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn spread_values(value: Value) -> Result<Vec<Value>, ScriptError> {
-    iterable_values(value)
-}
-
 fn iterator_value(values: Vec<Value>) -> Value {
     Value::Iterator(Rc::new(RefCell::new(IteratorData { values, index: 0 })))
 }
 
-fn iterable_values(value: Value) -> Result<Vec<Value>, ScriptError> {
-    match value {
-        Value::Array(values) => Ok(values.borrow().clone()),
-        Value::NodeList(nodes) => Ok(nodes.iter().cloned().map(Value::Element).collect()),
-        Value::String(string) => Ok(string
-            .chars()
-            .map(|character| Value::String(character.to_string()))
-            .collect()),
-        Value::Iterator(iterator) => {
-            let mut iterator = iterator.borrow_mut();
-            let values = iterator.values[iterator.index..].to_vec();
-            iterator.index = iterator.values.len();
-            Ok(values)
+const MAX_USER_ITERATOR_VALUES: usize = 10_000;
+
+impl ScriptRuntime {
+    fn spread_values(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
+        self.iterable_values(value)
+    }
+
+    fn iterable_values(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
+        match value {
+            Value::Array(values) => Ok(values.borrow().clone()),
+            Value::NodeList(nodes) => Ok(nodes.iter().cloned().map(Value::Element).collect()),
+            Value::String(string) => Ok(string
+                .chars()
+                .map(|character| Value::String(character.to_string()))
+                .collect()),
+            Value::Iterator(iterator) => {
+                let mut iterator = iterator.borrow_mut();
+                let values = iterator.values[iterator.index..].to_vec();
+                iterator.index = iterator.values.len();
+                Ok(values)
+            }
+            Value::Set(set) => Ok(set.borrow().values.clone()),
+            Value::Map(map) => Ok(map
+                .borrow()
+                .entries
+                .iter()
+                .map(|(key, value)| {
+                    Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
+                })
+                .collect()),
+            Value::Object(object) => {
+                let iterator = object.borrow().get("@@iterator").cloned();
+                let Some(iterator) = iterator else {
+                    return Err(runtime_error("value is not iterable"));
+                };
+                let iterator = self.call(iterator, Vec::new())?;
+                let mut values = Vec::new();
+                loop {
+                    if values.len() == MAX_USER_ITERATOR_VALUES {
+                        return Err(runtime_error(
+                            "user-defined iterator exceeded the deterministic limit",
+                        ));
+                    }
+                    let next = self.member(iterator.clone(), "next")?;
+                    let record = self.call(next, Vec::new())?;
+                    if self.member(record.clone(), "done")?.truthy() {
+                        return Ok(values);
+                    }
+                    values.push(self.member(record, "value")?);
+                }
+            }
+            _ => Err(runtime_error("value is not iterable")),
         }
-        Value::Set(set) => Ok(set.borrow().values.clone()),
-        Value::Map(map) => Ok(map
-            .borrow()
-            .entries
-            .iter()
-            .map(|(key, value)| {
-                Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
-            })
-            .collect()),
-        _ => Err(runtime_error("value is not iterable")),
     }
 }
 
@@ -5080,14 +5138,22 @@ impl Parser {
         let mut properties = Vec::new();
         if !self.is(TokenKind::RBrace) {
             loop {
-                let key = self.advance();
-                let key = match key.kind {
-                    TokenKind::Identifier(key) | TokenKind::String(key) => key,
-                    _ => {
-                        return Err(
-                            self.error("expected object property name".to_string(), key.offset)
-                        );
-                    }
+                let key = if self.take(TokenKind::LBracket) {
+                    let expression = self.parse_expression()?;
+                    self.expect(TokenKind::RBracket, "computed object property name")?;
+                    ObjectLiteralKey::Computed(expression)
+                } else {
+                    let token = self.advance();
+                    let key = match token.kind {
+                        TokenKind::Identifier(key) | TokenKind::String(key) => key,
+                        _ => {
+                            return Err(self.error(
+                                "expected object property name".to_string(),
+                                token.offset,
+                            ));
+                        }
+                    };
+                    ObjectLiteralKey::Static(key)
                 };
                 let value = if self.take(TokenKind::Colon) {
                     self.parse_expression()?
@@ -6189,6 +6255,68 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready|2|yes|undefined|undefined")
         );
+    }
+
+    #[test]
+    fn iterates_user_defined_symbol_iterators() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const values = ["a", "b", "c"];
+                let index = 0;
+                const iterable = {
+                  [Symbol.iterator]() {
+                    return {
+                      next() {
+                        if (index < values.length) {
+                          const value = values[index];
+                          index = index + 1;
+                          return { value: value, done: false };
+                        }
+                        return { done: true };
+                      }
+                    };
+                  }
+                };
+                let output = "";
+                for (const value of iterable) {
+                  output = output + value;
+                }
+                document.getElementById("status").textContent = output;
+                "##,
+            )
+            .expect("user-defined iterator should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn rejects_user_defined_iterators_that_never_finish() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document);
+        let error = runtime
+            .execute(
+                r##"
+                const iterable = {
+                  [Symbol.iterator]() {
+                    return { next() { return { value: 1, done: false }; } };
+                  }
+                };
+                [...iterable];
+                "##,
+            )
+            .expect_err("an endless iterator should hit the deterministic limit");
+        assert!(error
+            .message
+            .contains("user-defined iterator exceeded the deterministic limit"));
     }
 
     #[test]
