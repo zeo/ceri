@@ -1,6 +1,8 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
-use crate::navigation::{is_javascript, is_json, APP_ORIGIN, AppUrl, ResourceBundle};
+use crate::navigation::{
+    is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceProvider, APP_ORIGIN,
+};
 use crate::paint::CanvasCommand;
 use crate::Color;
 use std::cell::RefCell;
@@ -389,6 +391,7 @@ enum BinaryOperator {
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
     resources: Option<ResourceBundle>,
+    resource_provider: Option<Rc<dyn ResourceProvider>>,
     base_url: Option<AppUrl>,
     global: EnvironmentRef,
     location: LocationHandle,
@@ -422,6 +425,22 @@ pub(crate) trait ModuleSourceLoader {
 
 struct RuntimeModuleLoader<'a> {
     resources: &'a ResourceBundle,
+    provider: Option<&'a dyn ResourceProvider>,
+}
+
+fn resolve_runtime_resource(
+    resources: &ResourceBundle,
+    provider: Option<&dyn ResourceProvider>,
+    url: &AppUrl,
+) -> Result<Option<Resource>, ScriptError> {
+    if let Some(resource) = resources.resource(url.path()).cloned() {
+        return Ok(Some(resource));
+    }
+    provider
+        .map(|provider| provider.provide(url))
+        .transpose()
+        .map(|resource| resource.flatten())
+        .map_err(|error| runtime_error(error.to_string()))
 }
 
 impl ModuleSourceLoader for RuntimeModuleLoader<'_> {
@@ -433,11 +452,9 @@ impl ModuleSourceLoader for RuntimeModuleLoader<'_> {
         let url = referrer
             .resolve(reference)
             .map_err(|error| runtime_error(error.to_string()))?;
-        let resource = self
-            .resources
-            .resource(url.path())
+        let resource = resolve_runtime_resource(self.resources, self.provider, &url)?
             .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
-        if !is_javascript(resource) {
+        if !is_javascript(&resource) {
             return Err(runtime_error(format!(
                 "module {} has unsupported MIME type {}",
                 url.path(),
@@ -638,7 +655,7 @@ impl HostRuntimeInfo {
 
 impl ScriptRuntime {
     pub fn new(document: Rc<RefCell<Document>>) -> Self {
-        Self::with_context(document, None, None, None, None, None)
+        Self::with_context(document, None, None, None, None, None, None)
     }
 
     pub fn with_resources(
@@ -646,12 +663,21 @@ impl ScriptRuntime {
         resources: ResourceBundle,
         base_url: AppUrl,
     ) -> Self {
-        Self::with_context(document, Some(resources), Some(base_url), None, None, None)
+        Self::with_context(
+            document,
+            Some(resources),
+            None,
+            Some(base_url),
+            None,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn with_resources_and_storage_and_runtime_info(
         document: Rc<RefCell<Document>>,
         resources: ResourceBundle,
+        resource_provider: Option<Rc<dyn ResourceProvider>>,
         base_url: AppUrl,
         local_storage: StorageHandle,
         session_storage: StorageHandle,
@@ -660,6 +686,7 @@ impl ScriptRuntime {
         Self::with_context(
             document,
             Some(resources),
+            resource_provider,
             Some(base_url),
             Some(local_storage),
             Some(session_storage),
@@ -677,6 +704,7 @@ impl ScriptRuntime {
             document,
             None,
             None,
+            None,
             Some(local_storage),
             Some(session_storage),
             host_runtime_info,
@@ -686,6 +714,7 @@ impl ScriptRuntime {
     fn with_context(
         document: Rc<RefCell<Document>>,
         resources: Option<ResourceBundle>,
+        resource_provider: Option<Rc<dyn ResourceProvider>>,
         base_url: Option<AppUrl>,
         local_storage: Option<StorageHandle>,
         session_storage: Option<StorageHandle>,
@@ -787,6 +816,7 @@ impl ScriptRuntime {
         Self {
             document,
             resources,
+            resource_provider,
             base_url,
             global,
             location,
@@ -847,16 +877,21 @@ impl ScriptRuntime {
             .resolve(&reference.string_value())
             .map_err(|error| runtime_error(error.to_string()))?;
         let import_type = parse_dynamic_import_type(attributes)?;
+        if self.resources.is_none() && self.resource_provider.is_none() {
+            return Err(runtime_error(
+                "dynamic import is unavailable without resources",
+            ));
+        }
         let resources = self
             .resources
             .clone()
-            .ok_or_else(|| runtime_error("dynamic import is unavailable without resources"))?;
-        let resource = resources
-            .resource(url.path())
+            .unwrap_or_default();
+        let provider = self.resource_provider.clone();
+        let resource = resolve_runtime_resource(&resources, provider.as_deref(), &url)?
             .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
         match import_type {
             None => {
-                if !is_javascript(resource) {
+                if !is_javascript(&resource) {
                     return Err(runtime_error(format!(
                         "module {} has unsupported MIME type {}",
                         url.path(),
@@ -867,11 +902,12 @@ impl ScriptRuntime {
                     .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
                 let mut loader = RuntimeModuleLoader {
                     resources: &resources,
+                    provider: provider.as_deref(),
                 };
                 self.execute_module_graph(&source, url, &mut loader)
             }
             Some(DynamicImportType::Json) => {
-                if !is_json(resource) {
+                if !is_json(&resource) {
                     return Err(runtime_error(format!(
                         "module {} has unsupported MIME type {}",
                         url.path(),
@@ -3899,9 +3935,9 @@ impl ScriptRuntime {
         let reference = reference
             .map(Value::string_value)
             .unwrap_or_else(|| "undefined".to_string());
-        let Some(resources) = &self.resources else {
+        if self.resources.is_none() && self.resource_provider.is_none() {
             return self.rejected_promise("fetch is unavailable without a resource bundle");
-        };
+        }
         let Some(base_url) = &self.base_url else {
             return self.rejected_promise("fetch is unavailable without a document URL");
         };
@@ -3909,13 +3945,22 @@ impl ScriptRuntime {
             return self.rejected_promise(format!("fetch rejected URL {reference}"));
         };
         let display_url = url.to_string();
-        let Some(resource) = resources.resource(url.path()) else {
-            return self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
-                url: display_url,
-                status: 404,
-                mime_type: String::new(),
-                body: Vec::new(),
-            })));
+        let resources = self.resources.clone().unwrap_or_default();
+        let resource = match resolve_runtime_resource(
+            &resources,
+            self.resource_provider.as_deref(),
+            &url,
+        ) {
+            Ok(Some(resource)) => resource,
+            Ok(None) => {
+                return self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
+                    url: display_url,
+                    status: 404,
+                    mime_type: String::new(),
+                    body: Vec::new(),
+                })));
+            }
+            Err(error) => return self.rejected_promise(error.message),
         };
         self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
             url: display_url,

@@ -21,6 +21,7 @@ The current slice implements:
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
+- an embedder-owned `ResourceProvider` fallback for documents and same-origin subresources
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
@@ -41,6 +42,8 @@ The current slice implements:
 - PPM or BMP output and a textual layout dump
 
 It is a headless laboratory, not a web-compatible browser. The script runtime covers the demo's DOM and event path, while networking, media, full platform accessibility adapters, GPU APIs, WebAssembly, and the operating-system window remain outside this slice.
+
+`Browser::with_resource_provider` keeps the renderer independent of transport. The engine resolves and validates the app-origin URL, checks the packaged bundle first, and asks the provider only when that bundle misses. The provider can read a signed package, a native HTTP/TLS client, or another host-owned source. It never needs to open a listener, and it cannot receive a cross-origin `AppUrl` because the URL parser rejects those references before the provider call. Extensionless document routes use the same `/index.html` shell fallback as packaged assets.
 
 Run the deterministic demo from the repository root:
 
@@ -165,7 +168,7 @@ The fetch demo exercises an app-owned resource without opening a listener:
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/fetch-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-fetch-demo.bmp
 ```
 
-This first fetch slice is deterministic and limited to packaged same-origin resources. It returns a promise with `then()` and `catch()` and a response with `status`, `ok`, `url`, `mimeType`, promise-returning `text()`, and promise-returning `json()`. The runtime supports basic JSON objects, arrays, property access, numeric indexes, `JSON.parse`, and deterministic `JSON.stringify`. Microtasks drain after each script turn and clock advance. Missing resources resolve with status 404, while rejected origins reject the promise. Streaming bodies, network transports, request methods, and broader JavaScript object semantics remain separate compatibility gates.
+This first fetch slice is deterministic and limited to same-origin resources supplied by the packaged bundle or `ResourceProvider`. It returns a promise with `then()` and `catch()` and a response with `status`, `ok`, `url`, `mimeType`, promise-returning `text()`, and promise-returning `json()`. The runtime supports basic JSON objects, arrays, property access, numeric indexes, `JSON.parse`, and deterministic `JSON.stringify`. Microtasks drain after each script turn and clock advance. Missing resources resolve with status 404, while rejected origins reject the promise. A concrete network provider, streaming bodies, request methods, and broader JavaScript object semantics remain separate compatibility gates.
 
 The navigation demo exercises link default actions and `Location.replace()` across packaged pages:
 

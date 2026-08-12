@@ -166,6 +166,10 @@ impl Resource {
     }
 }
 
+pub trait ResourceProvider {
+    fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResourceBundle {
     resources: BTreeMap<String, Resource>,
@@ -340,6 +344,7 @@ enum HistoryCommit {
 
 pub struct Browser {
     resources: ResourceBundle,
+    resource_provider: Option<Rc<dyn ResourceProvider>>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
     history: Vec<AppUrl>,
@@ -358,6 +363,7 @@ impl Browser {
     pub fn new(resources: ResourceBundle) -> Self {
         Self {
             resources,
+            resource_provider: None,
             page: None,
             current_url: None,
             history: Vec::new(),
@@ -373,9 +379,56 @@ impl Browser {
         }
     }
 
+    pub fn with_resource_provider(
+        resources: ResourceBundle,
+        resource_provider: Rc<dyn ResourceProvider>,
+    ) -> Self {
+        let mut browser = Self::new(resources);
+        browser.resource_provider = Some(resource_provider);
+        browser
+    }
+
     pub fn with_host_runtime_info(mut self, info: HostRuntimeInfo) -> Self {
         self.host_runtime_info = Some(info);
         self
+    }
+
+    fn load_resource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
+        match self.resources.load(url) {
+            Ok(resource) => Ok(resource),
+            Err(NavigationError::ResourceNotFound(path)) => {
+                if let Some(provider) = &self.resource_provider
+                    && let Some(resource) = provider.provide(url)?
+                {
+                    return Ok(resource);
+                }
+                if is_extensionless_path(url.path())
+                    && let Some(provider) = &self.resource_provider
+                {
+                    let shell_url = url.with_path("/index.html")?;
+                    if let Some(resource) = provider.provide(&shell_url)? {
+                        return Ok(resource);
+                    }
+                }
+                Err(NavigationError::ResourceNotFound(path))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_subresource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
+        match self.resources.load_subresource(url) {
+            Ok(resource) => Ok(resource),
+            Err(NavigationError::ResourceNotFound(path)) => {
+                if let Some(provider) = &self.resource_provider
+                    && let Some(resource) = provider.provide(url)?
+                {
+                    return Ok(resource);
+                }
+                Err(NavigationError::ResourceNotFound(path))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn navigate(&mut self, input: &str) -> Result<NavigationStatus, NavigationError> {
@@ -395,7 +448,7 @@ impl Browser {
         commit: HistoryCommit,
         redirect_depth: usize,
     ) -> Result<NavigationStatus, NavigationError> {
-        let resource = match self.resources.load(&url) {
+        let resource = match self.load_resource(&url) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
                 self.install_error_page(&url, 404, &format!("resource not found: {path}"));
@@ -444,6 +497,7 @@ impl Browser {
         let mut runtime = ScriptRuntime::with_resources_and_storage_and_runtime_info(
             document.clone(),
             self.resources.clone(),
+            self.resource_provider.clone(),
             url.clone(),
             self.local_storage.clone(),
             self.session_storage.clone(),
@@ -665,7 +719,7 @@ impl Browser {
             let Ok(url) = base.resolve(&reference) else {
                 continue;
             };
-            let Ok(resource) = self.resources.load_subresource(&url) else {
+            let Ok(resource) = self.load_subresource(&url) else {
                 continue;
             };
             if !is_svg(&resource) {
@@ -871,7 +925,7 @@ impl Browser {
                 StylesheetSource::Inline(source) => source.clone(),
                 StylesheetSource::External(reference) => {
                     let url = base.resolve(reference)?;
-                    let resource = self.resources.load_subresource(&url)?;
+                    let resource = self.load_subresource(&url)?;
                     if !is_css(&resource) {
                         return Err(NavigationError::UnsupportedMimeType {
                             path: url.path().to_string(),
@@ -898,13 +952,14 @@ impl Browser {
     ) -> Result<(), NavigationError> {
         let mut module_loader = PackagedModuleLoader {
             resources: &self.resources,
+            provider: self.resource_provider.as_deref(),
         };
         for source in sources {
             let source = match source {
                 ScriptSource::Inline(source) => source.clone(),
                 ScriptSource::External(reference) => {
                     let url = base.resolve(reference)?;
-                    let resource = self.resources.load_subresource(&url)?;
+                    let resource = self.load_subresource(&url)?;
                     if !is_javascript(&resource) {
                         return Err(NavigationError::UnsupportedMimeType {
                             path: url.path().to_string(),
@@ -922,7 +977,7 @@ impl Browser {
                 }
                 ScriptSource::ExternalModule(reference) => {
                     let url = base.resolve(reference)?;
-                    let resource = self.resources.load_subresource(&url)?;
+                    let resource = self.load_subresource(&url)?;
                     if !is_javascript(&resource) {
                         return Err(NavigationError::UnsupportedMimeType {
                             path: url.path().to_string(),
@@ -965,6 +1020,7 @@ impl Browser {
 
 struct PackagedModuleLoader<'a> {
     resources: &'a ResourceBundle,
+    provider: Option<&'a dyn ResourceProvider>,
 }
 
 impl ModuleSourceLoader for PackagedModuleLoader<'_> {
@@ -976,10 +1032,17 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
         let url = referrer
             .resolve(reference)
             .map_err(|error| runtime_error(error.to_string()))?;
-        let resource = self
-            .resources
-            .load_subresource(&url)
-            .map_err(|error| runtime_error(error.to_string()))?;
+        let resource = match self.resources.load_subresource(&url) {
+            Ok(resource) => resource,
+            Err(NavigationError::ResourceNotFound(path)) => self
+                .provider
+                .map(|provider| provider.provide(&url))
+                .transpose()
+                .map_err(|error| runtime_error(error.to_string()))?
+                .flatten()
+                .ok_or_else(|| runtime_error(format!("module {path} was not found")))?,
+            Err(error) => return Err(runtime_error(error.to_string())),
+        };
         if !is_javascript(&resource) {
             return Err(runtime_error(format!(
                 "module {} has unsupported MIME type {}",
@@ -1322,6 +1385,16 @@ mod tests {
     use super::*;
     use crate::css::Color;
     use std::rc::Rc;
+
+    struct MemoryProvider {
+        resources: BTreeMap<String, Resource>,
+    }
+
+    impl ResourceProvider for MemoryProvider {
+        fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(self.resources.get(url.path()).cloned())
+        }
+    }
 
     fn bundle(shell: &str) -> ResourceBundle {
         let mut resources = ResourceBundle::default();
@@ -2031,6 +2104,65 @@ mod tests {
         assert_eq!(
             layout.root.children[0].text[0].color,
             crate::Color::opaque(66, 211, 180)
+        );
+    }
+
+    #[test]
+    fn loads_the_document_and_all_subresources_from_a_host_provider() {
+        let mut provided = BTreeMap::new();
+        provided.insert(
+            "/index.html".to_string(),
+            Resource::new(
+                "text/html; charset=utf-8",
+                br#"<link rel="stylesheet" href="/theme.css"><p id="status">idle</p><script type="module" src="/entry.js"></script>"#.to_vec(),
+            ),
+        );
+        provided.insert(
+            "/theme.css".to_string(),
+            Resource::new("text/css", b"p { color: #42d3b4; }".to_vec()),
+        );
+        provided.insert(
+            "/entry.js".to_string(),
+            Resource::new(
+                "text/javascript",
+                br#"import { label } from "./message.js"; fetch("/data.json").then((response) => response.json()).then((data) => { document.getElementById("status").textContent = label + "|" + data.message; });"#.to_vec(),
+            ),
+        );
+        provided.insert(
+            "/message.js".to_string(),
+            Resource::new("text/javascript", br#"export const label = "provider";"#.to_vec()),
+        );
+        provided.insert(
+            "/data.json".to_string(),
+            Resource::new("application/json", br#"{"message":"ready"}"#.to_vec()),
+        );
+
+        let provider = Rc::new(MemoryProvider { resources: provided });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("provider-backed page should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("provider|ready")
+        );
+        let layout = browser
+            .layout(Size {
+                width: 320.0,
+                height: 120.0,
+            })
+            .expect("provider-backed page should layout");
+        assert_eq!(
+            layout.root.children[0].text[0].color,
+            Color::opaque(66, 211, 180)
         );
     }
 
