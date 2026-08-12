@@ -1,4 +1,5 @@
 use crate::dom::{Document, Element, Node, NodePath};
+use crate::navigation::{AppUrl, ResourceBundle};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -6,6 +7,7 @@ use std::rc::Rc;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
+type ResponseHandle = Rc<ResponseData>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -36,6 +38,7 @@ enum Value {
     Style(ElementHandle),
     ClassList(ElementHandle),
     Event(EventData),
+    Response(ResponseHandle),
     Document,
     Window,
     Console,
@@ -63,6 +66,8 @@ enum Builtin {
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
     ElementClassListToggle(ElementHandle),
+    Fetch,
+    ResponseText(ResponseHandle),
 }
 
 struct Function {
@@ -165,6 +170,8 @@ enum BinaryOperator {
 
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
+    resources: Option<ResourceBundle>,
+    base_url: Option<AppUrl>,
     global: EnvironmentRef,
     listeners: HashMap<NodePath, Vec<EventListener>>,
     logs: Vec<String>,
@@ -186,6 +193,13 @@ struct EventData {
     current_target: NodePath,
 }
 
+struct ResponseData {
+    url: String,
+    status: u16,
+    mime_type: String,
+    body: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 enum TaskKind {
     Timeout,
@@ -203,6 +217,22 @@ const MAX_TASKS_PER_ADVANCE: usize = 10_000;
 
 impl ScriptRuntime {
     pub fn new(document: Rc<RefCell<Document>>) -> Self {
+        Self::with_context(document, None, None)
+    }
+
+    pub fn with_resources(
+        document: Rc<RefCell<Document>>,
+        resources: ResourceBundle,
+        base_url: AppUrl,
+    ) -> Self {
+        Self::with_context(document, Some(resources), Some(base_url))
+    }
+
+    fn with_context(
+        document: Rc<RefCell<Document>>,
+        resources: Option<ResourceBundle>,
+        base_url: Option<AppUrl>,
+    ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
         {
             let mut values = global.borrow_mut();
@@ -211,6 +241,9 @@ impl ScriptRuntime {
                 .insert("document".to_string(), Value::Document);
             values.values.insert("window".to_string(), Value::Window);
             values.values.insert("console".to_string(), Value::Console);
+            values
+                .values
+                .insert("fetch".to_string(), Value::Builtin(Builtin::Fetch));
             values.values.insert(
                 "setTimeout".to_string(),
                 Value::Builtin(Builtin::SetTimeout),
@@ -230,6 +263,8 @@ impl ScriptRuntime {
         }
         Self {
             document,
+            resources,
+            base_url,
             global,
             listeners: HashMap::new(),
             logs: Vec::new(),
@@ -475,6 +510,7 @@ impl ScriptRuntime {
             Value::Window => match property {
                 "document" => Ok(Value::Document),
                 "console" => Ok(Value::Console),
+                "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
                 "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
@@ -555,6 +591,16 @@ impl ScriptRuntime {
                     event.current_target.clone(),
                 ))),
                 _ => Err(runtime_error(format!("event has no property {property}"))),
+            },
+            Value::Response(response) => match property {
+                "url" => Ok(Value::String(response.url.clone())),
+                "status" => Ok(Value::Number(response.status as f64)),
+                "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
+                "mimeType" => Ok(Value::String(response.mime_type.clone())),
+                "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
+                _ => Err(runtime_error(format!(
+                    "response has no property {property}"
+                ))),
             },
             _ => Err(runtime_error(format!("value has no property {property}"))),
         }
@@ -781,6 +827,10 @@ impl ScriptRuntime {
                 );
                 Ok(Value::Undefined)
             }
+            Builtin::Fetch => Ok(Value::Response(self.fetch(arguments.first()))),
+            Builtin::ResponseText(response) => Ok(Value::String(
+                String::from_utf8_lossy(&response.body).into_owned(),
+            )),
             Builtin::SetTimeout => self.schedule_task(arguments, TaskKind::Timeout),
             Builtin::ClearTimeout => {
                 let id = arguments
@@ -939,6 +989,51 @@ impl ScriptRuntime {
             current.pop();
         }
         Ok(had_callbacks)
+    }
+
+    fn fetch(&self, reference: Option<&Value>) -> ResponseHandle {
+        let reference = reference
+            .map(Value::string_value)
+            .unwrap_or_else(|| "undefined".to_string());
+        let Some(resources) = &self.resources else {
+            return Rc::new(ResponseData {
+                url: reference,
+                status: 0,
+                mime_type: String::new(),
+                body: Vec::new(),
+            });
+        };
+        let Some(base_url) = &self.base_url else {
+            return Rc::new(ResponseData {
+                url: reference,
+                status: 0,
+                mime_type: String::new(),
+                body: Vec::new(),
+            });
+        };
+        let Ok(url) = base_url.resolve(&reference) else {
+            return Rc::new(ResponseData {
+                url: reference,
+                status: 0,
+                mime_type: String::new(),
+                body: Vec::new(),
+            });
+        };
+        let display_url = url.to_string();
+        let Some(resource) = resources.resource(url.path()) else {
+            return Rc::new(ResponseData {
+                url: display_url,
+                status: 404,
+                mime_type: String::new(),
+                body: Vec::new(),
+            });
+        };
+        Rc::new(ResponseData {
+            url: display_url,
+            status: 200,
+            mime_type: resource.mime_type().to_string(),
+            body: resource.body().to_vec(),
+        })
     }
 
     fn schedule_task(
@@ -1150,6 +1245,7 @@ impl Value {
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
+            Self::Response(_) => "[response]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
             Self::Console => "[console]".to_string(),
@@ -2195,6 +2291,67 @@ mod tests {
                 .element_attribute(&created, "class")
                 .as_deref(),
             Some("")
+        );
+    }
+
+    #[test]
+    fn fetch_reads_a_same_origin_packaged_resource() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/data.json",
+                "application/json",
+                br#"{"message":"hello"}"#.to_vec(),
+            )
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const response = fetch("./data.json");
+                document.getElementById("status").textContent = response.status + "|" + response.ok + "|" + response.mimeType + "|" + response.url + "|" + response.text();
+                "#,
+            )
+            .expect("packaged fetch should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "200|true|application/json|https://app.ceri.invalid/data.json|{\"message\":\"hello\"}"
+            )
+        );
+    }
+
+    #[test]
+    fn fetch_reports_missing_and_cross_origin_resources_without_leaving_the_page() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/index.html", "text/html", b"<p>shell</p>".to_vec())
+            .expect("shell should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const missing = fetch("/missing.json");
+                const external = fetch("https://other.invalid/data.json");
+                document.getElementById("status").textContent = missing.status + "|" + missing.ok + "|" + external.status + "|" + external.ok;
+                "#,
+            )
+            .expect("fetch failures should remain response values");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("404|false|0|false")
         );
     }
 

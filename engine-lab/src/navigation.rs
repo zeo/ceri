@@ -376,7 +376,8 @@ impl Browser {
             }
         };
         let script_sources = document.borrow().script_sources();
-        let mut runtime = ScriptRuntime::new(document.clone());
+        let mut runtime =
+            ScriptRuntime::with_resources(document.clone(), self.resources.clone(), url.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             self.install_error_page(&url, 500, &error.to_string());
             self.record_navigation(url);
@@ -1219,6 +1220,36 @@ mod tests {
         assert_eq!(
             layout.root.children[0].text[0].color,
             crate::Color::opaque(66, 211, 180)
+        );
+    }
+
+    #[test]
+    fn page_scripts_fetch_same_origin_packaged_text() {
+        let mut resources = bundle(
+            r#"<p id="status">idle</p><script>const response = fetch("/data.json"); document.getElementById("status").textContent = response.status + " " + response.text();</script>"#,
+        );
+        resources
+            .insert(
+                "/data.json",
+                "application/json",
+                br#"{"message":"from bundle"}"#.to_vec(),
+            )
+            .expect("data resource should be accepted");
+        let mut browser = Browser::new(resources);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("200 {\"message\":\"from bundle\"}")
         );
     }
 

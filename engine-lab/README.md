@@ -21,6 +21,7 @@ The current slice implements:
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - same-origin relative URL resolution for external stylesheets and scripts
+- packaged-origin `fetch()` responses with status, MIME type, URL, and text bodies
 - browser navigation, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
@@ -84,3 +85,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri-e
 ```
 
 The adapter is an integration slice for Windows, macOS, and Linux desktop surfaces. It does not claim browser compatibility, mobile support, or a complete cross-platform release until those targets have their own build and runtime checks.
+
+The fetch demo exercises an app-owned resource without opening a listener:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/fetch-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-fetch-demo.bmp
+```
+
+This first fetch slice is synchronous and limited to packaged same-origin resources. It returns a response with `status`, `ok`, `url`, `mimeType`, and `text()`. Missing resources return status 404, while rejected origins return status 0. Promise scheduling, streaming bodies, network transports, request methods, and JSON object materialization remain separate compatibility gates.
