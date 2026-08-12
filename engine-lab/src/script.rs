@@ -142,6 +142,7 @@ enum Builtin {
     ClearTimeout,
     RequestAnimationFrame,
     CancelAnimationFrame,
+    CeriQuery,
     ElementAddEventListener(NodePath),
     ElementClick(NodePath),
     ElementAppendChild(NodePath),
@@ -361,6 +362,7 @@ pub struct ScriptRuntime {
     microtasks: VecDeque<Microtask>,
     pending_navigation: Option<NavigationRequest>,
     pending_exception: Option<ErrorHandle>,
+    host_runtime_info: Option<HostRuntimeInfo>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     loading_modules: BTreeSet<String>,
 }
@@ -528,10 +530,35 @@ struct ScheduledTask {
 
 const MAX_TASKS_PER_ADVANCE: usize = 10_000;
 const MAX_MICROTASKS_PER_DRAIN: usize = 10_000;
+const RUNTIME_INFO_REQUEST: &str = r#"{"method":"runtimeInfo","version":1}"#;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostRuntimeInfo {
+    pub engine: String,
+    pub chromium: String,
+    pub recovery: String,
+    pub session: String,
+}
+
+impl HostRuntimeInfo {
+    pub fn new(
+        engine: impl Into<String>,
+        chromium: impl Into<String>,
+        recovery: impl Into<String>,
+        session: impl Into<String>,
+    ) -> Self {
+        Self {
+            engine: engine.into(),
+            chromium: chromium.into(),
+            recovery: recovery.into(),
+            session: session.into(),
+        }
+    }
+}
 
 impl ScriptRuntime {
     pub fn new(document: Rc<RefCell<Document>>) -> Self {
-        Self::with_context(document, None, None, None, None)
+        Self::with_context(document, None, None, None, None, None)
     }
 
     pub fn with_resources(
@@ -539,15 +566,16 @@ impl ScriptRuntime {
         resources: ResourceBundle,
         base_url: AppUrl,
     ) -> Self {
-        Self::with_context(document, Some(resources), Some(base_url), None, None)
+        Self::with_context(document, Some(resources), Some(base_url), None, None, None)
     }
 
-    pub(crate) fn with_resources_and_storage(
+    pub(crate) fn with_resources_and_storage_and_runtime_info(
         document: Rc<RefCell<Document>>,
         resources: ResourceBundle,
         base_url: AppUrl,
         local_storage: StorageHandle,
         session_storage: StorageHandle,
+        host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
         Self::with_context(
             document,
@@ -555,15 +583,24 @@ impl ScriptRuntime {
             Some(base_url),
             Some(local_storage),
             Some(session_storage),
+            host_runtime_info,
         )
     }
 
-    pub(crate) fn with_storage(
+    pub(crate) fn with_storage_and_runtime_info(
         document: Rc<RefCell<Document>>,
         local_storage: StorageHandle,
         session_storage: StorageHandle,
+        host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
-        Self::with_context(document, None, None, Some(local_storage), Some(session_storage))
+        Self::with_context(
+            document,
+            None,
+            None,
+            Some(local_storage),
+            Some(session_storage),
+            host_runtime_info,
+        )
     }
 
     fn with_context(
@@ -572,6 +609,7 @@ impl ScriptRuntime {
         base_url: Option<AppUrl>,
         local_storage: Option<StorageHandle>,
         session_storage: Option<StorageHandle>,
+        host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
         let local_storage = local_storage
@@ -684,6 +722,7 @@ impl ScriptRuntime {
             microtasks: VecDeque::new(),
             pending_navigation: None,
             pending_exception: None,
+            host_runtime_info,
             module_cache: BTreeMap::new(),
             loading_modules: BTreeSet::new(),
         }
@@ -1439,6 +1478,11 @@ impl ScriptRuntime {
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
                 "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
                 "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
+                "ceriQuery" => Ok(self
+                    .host_runtime_info
+                    .as_ref()
+                    .map(|_| Value::Builtin(Builtin::CeriQuery))
+                    .unwrap_or(Value::Undefined)),
                 "cefQuery" | "cefQueryCancel" => Ok(Value::Undefined),
                 _ => Err(runtime_error(format!("window has no property {property}"))),
             },
@@ -2141,15 +2185,23 @@ impl ScriptRuntime {
         let Value::Promise(promise) = value else {
             return Ok(value);
         };
-        match promise.borrow().outcome.clone() {
-            PromiseOutcome::Fulfilled(value) => Ok(value),
-            PromiseOutcome::Rejected(reason) => {
-                let error = error_handle(&reason);
-                let message = error.message.clone();
-                self.pending_exception = Some(error);
-                Err(runtime_error(message))
+        loop {
+            let outcome = promise.borrow().outcome.clone();
+            match outcome {
+                PromiseOutcome::Fulfilled(value) => return Ok(value),
+                PromiseOutcome::Rejected(reason) => {
+                    let error = error_handle(&reason);
+                    let message = error.message.clone();
+                    self.pending_exception = Some(error);
+                    return Err(runtime_error(message));
+                }
+                PromiseOutcome::Pending => {
+                    self.drain_microtasks()?;
+                    if matches!(promise.borrow().outcome, PromiseOutcome::Pending) {
+                        return Err(runtime_error("awaited promise is still pending"));
+                    }
+                }
             }
-            PromiseOutcome::Pending => Err(runtime_error("awaited promise is still pending")),
         }
     }
 
@@ -3076,6 +3128,31 @@ impl ScriptRuntime {
                     .unwrap_or(0.0) as u64;
                 self.tasks.retain(|task| task.id != id);
                 Ok(Value::Undefined)
+            }
+            Builtin::CeriQuery => {
+                let request = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let Some(info) = self.host_runtime_info.clone() else {
+                    return Ok(Value::Promise(
+                        self.rejected_promise("host bridge is unavailable"),
+                    ));
+                };
+                if request != RUNTIME_INFO_REQUEST {
+                    return Ok(Value::Promise(self.rejected_promise(
+                        "host bridge rejected an unsupported request",
+                    )));
+                }
+                let mut payload = BTreeMap::new();
+                payload.insert("engine".to_string(), Value::String(info.engine));
+                payload.insert("chromium".to_string(), Value::String(info.chromium));
+                payload.insert("recovery".to_string(), Value::String(info.recovery));
+                payload.insert("session".to_string(), Value::String(info.session));
+                let response = serialize_json(&Value::Object(Rc::new(RefCell::new(payload))))?;
+                Ok(Value::Promise(
+                    self.fulfilled_promise(Value::String(response)),
+                ))
             }
             Builtin::ElementAddEventListener(path) => {
                 let event = arguments
@@ -6392,6 +6469,31 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("start|sync|callback")
+        );
+    }
+
+    #[test]
+    fn await_drains_a_fulfilled_promise_chain() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                async function readStatus() {
+                  return await Promise.resolve("ready").then((value) => value + "!");
+                }
+                readStatus().then((value) => { status.textContent = value; });
+                "#,
+            )
+            .expect("await should drain a fulfilled promise chain");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready!")
         );
     }
 

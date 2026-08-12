@@ -33,7 +33,7 @@ The origin gives normal browser code a stable secure context for modules, storag
 
 ## Runtime bridge
 
-The SDK keeps the familiar `window.cefQuery` call shape so existing CEF-oriented web code can be adapted without adding a Node dependency. Ceri installs the function from the Rust render-process handler. The handler:
+The SDK keeps the familiar `window.cefQuery` call shape so existing CEF-oriented web code can be adapted without adding a Node dependency. Experimental backends can provide the promise-based `window.ceriQuery` method first, while the SDK falls back to `cefQuery` for the shipping adapter. Ceri installs the CEF function from the Rust render-process handler. The handler:
 
 1. accepts one object with a string request
 2. rejects persistent queries

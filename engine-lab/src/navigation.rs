@@ -4,7 +4,8 @@ use crate::image::parse_svg;
 use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
 use crate::script::{
-    ModuleSourceLoader, NavigationRequest, ScriptRuntime, StorageHandle, runtime_error,
+    HostRuntimeInfo, ModuleSourceLoader, NavigationRequest, ScriptRuntime, StorageHandle,
+    runtime_error,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -350,6 +351,7 @@ pub struct Browser {
     local_storage: StorageHandle,
     session_storage: StorageHandle,
     hovered_path: Option<NodePath>,
+    host_runtime_info: Option<HostRuntimeInfo>,
 }
 
 impl Browser {
@@ -367,7 +369,13 @@ impl Browser {
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_path: None,
+            host_runtime_info: None,
         }
+    }
+
+    pub fn with_host_runtime_info(mut self, info: HostRuntimeInfo) -> Self {
+        self.host_runtime_info = Some(info);
+        self
     }
 
     pub fn navigate(&mut self, input: &str) -> Result<NavigationStatus, NavigationError> {
@@ -433,12 +441,13 @@ impl Browser {
             }
         };
         let script_sources = document.borrow().script_sources();
-        let mut runtime = ScriptRuntime::with_resources_and_storage(
+        let mut runtime = ScriptRuntime::with_resources_and_storage_and_runtime_info(
             document.clone(),
             self.resources.clone(),
             url.clone(),
             self.local_storage.clone(),
             self.session_storage.clone(),
+            self.host_runtime_info.clone(),
         );
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             self.install_error_page(&url, 500, &error.to_string());
@@ -936,10 +945,11 @@ impl Browser {
         ));
         let stylesheet = document.borrow().style_text();
         self.page = Some(Page {
-            runtime: ScriptRuntime::with_storage(
+            runtime: ScriptRuntime::with_storage_and_runtime_info(
                 document.clone(),
                 self.local_storage.clone(),
                 self.session_storage.clone(),
+                self.host_runtime_info.clone(),
             ),
             document,
             stylesheet,

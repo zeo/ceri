@@ -32,6 +32,7 @@ The current slice implements:
 - template literals with expression interpolation and module `import.meta.url`
 - static node-list snapshots, `dataset` reads, array spread and `map`, and bounded `Map` construction, lookup, key enumeration, and mutation
 - bounded `for...of` over arrays, node lists, strings, and maps, promise-backed async functions with `await`, `try`/`catch`/`throw`, class and error values, `typeof`, `instanceof`, conditional expressions, and the narrow `Number`, `Array`, `Object`, `String`, `Set`, and `Promise` surfaces used by the continuity page
+- an engine-owned `window.ceriQuery` runtime identity promise, with the shared SDK retaining its `window.cefQuery` fallback for the production adapter
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -81,7 +82,7 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 
 The current collection boundary stops before destructuring, generators, and general iterator protocols. Those remain explicit compatibility gates for the continuity page.
 
-The packaged continuity page is also an integration target. It loads the real `/web/index.html`, its stylesheet, module graph, SDK module, and recovery asset through the custom resource bundle. The page reaches `3 / 4`: module loading, local storage, and packaged fetch pass; the typed native bridge reports its expected unavailable state because the laboratory host has no CEF bridge. The page stays loaded and does not fall back to a recovery document:
+The packaged continuity page is also an integration target. It loads the real `/web/index.html`, its stylesheet, module graph, SDK module, and recovery asset through the custom resource bundle. The page reaches `4 / 4`: module loading, local storage, packaged fetch, and the engine-owned runtime identity query pass. The page stays loaded and does not fall back to a recovery document:
 
 ```powershell
 cargo test --locked --manifest-path engine-lab/Cargo.toml --test continuity

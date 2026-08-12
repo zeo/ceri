@@ -48,6 +48,10 @@ function decodeRuntimeInfo(response) {
 }
 
 export function runtimeInfo() {
+  if (typeof window !== "undefined" && typeof window.ceriQuery === "function") {
+    return window.ceriQuery(RUNTIME_INFO_REQUEST).then(decodeRuntimeInfo);
+  }
+
   if (typeof window === "undefined" || typeof window.cefQuery !== "function") {
     return Promise.reject(
       new CeriBridgeError(

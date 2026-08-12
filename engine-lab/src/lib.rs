@@ -15,4 +15,4 @@ pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, NavigationError, NavigationStatus, Resource, ResourceBundle,
 };
 pub use paint::Canvas;
-pub use script::{ScriptError, ScriptRuntime};
+pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};

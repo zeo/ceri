@@ -69,7 +69,7 @@ function faultMessage(fault) {
 async function runContinuityCheck() {
   runButton.disabled = true;
   runButton.textContent = "Checking";
-  runtimeLine.textContent = "waiting for cefQuery";
+  runtimeLine.textContent = "waiting for host bridge";
 
   for (const name of checks.keys()) {
     updateCheck(name, "running", "check in progress");

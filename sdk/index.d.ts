@@ -30,6 +30,7 @@ export interface CefQueryRequest {
 
 declare global {
   interface Window {
+    ceriQuery?: (request: string) => Promise<string>;
     cefQuery?: (request: CefQueryRequest) => number;
     cefQueryCancel?: (queryId: number) => void;
   }
