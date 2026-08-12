@@ -45,7 +45,7 @@ The production app contract should not expose CEF types. The browser implementat
 
 The asset resolver, `https://app.ceri.invalid` origin, SDK response shapes, recovery documents, and host-owned `ResourceProvider` contract can remain shared by CEF and an experimental engine. CEF-specific window and process code stays in its adapter. A future Servo adapter can use the same application contract without making Servo a production dependency.
 
-The provider seam is now exercised by host-backed integration tests covering the document, stylesheet, module graph, JSON fetched by the page, and a POST request with normalized headers and a body. It keeps the transport choice outside the renderer and leaves a concrete native HTTP/TLS provider as a later gate. Recovery pages also expose a typed URL, status, and detail diagnostic, so a native adapter does not need to scrape the document to classify a failed load. The renderer now reevaluates a bounded viewport-aware `@media` subset during layout, which is the first responsive cross-window gate.
+The provider seam is now exercised by host-backed integration tests covering the document, stylesheet, module graph, JSON fetched by the page, and a POST request with normalized headers, a body, a 201 response, and a response header read through `response.headers.get()`. It keeps the transport choice outside the renderer and leaves a concrete native HTTP/TLS provider as a later gate. Recovery pages also expose a typed URL, status, and detail diagnostic, so a native adapter does not need to scrape the document to classify a failed load. The renderer now reevaluates a bounded viewport-aware `@media` subset during layout, which is the first responsive cross-window gate.
 
 ## Compatibility gates
 

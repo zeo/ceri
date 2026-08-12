@@ -49,7 +49,7 @@ It is a headless laboratory, not a web-compatible browser. The script runtime co
 
 Hosts can inspect `Browser::last_navigation_failure()` or `EngineHost::last_navigation_failure()` after a recovery page is installed. The diagnostic carries the app URL, HTTP-style recovery status, and typed detail. A provider transport failure becomes status 503, while missing assets remain status 404 and parser or script failures remain status 500.
 
-`fetch(url, options)` accepts the deterministic request subset needed by a native provider: `method`, an object of `headers`, a string `body`, and the standard cache modes. Header names are normalized and control characters are rejected. Packaged GET resources are resolved locally; other requests cross the `ResourceProvider::provide_request` hook with their cache mode intact. The laboratory still returns an in-memory 200 response for a provider resource, so status mapping, streaming, redirects, and TLS policy stay with the future native transport.
+`fetch(url, options)` accepts the deterministic request subset needed by a native provider: `method`, an object of `headers`, a string `body`, and the standard cache modes. Header names are normalized and control characters are rejected. Packaged GET resources are resolved locally; other requests cross the `ResourceProvider::provide_response` hook with their cache mode intact. The page can read the provider's status, MIME type, and normalized headers through the response. Streaming, redirects, and TLS policy stay with the future native transport.
 
 Run the deterministic demo from the repository root:
 

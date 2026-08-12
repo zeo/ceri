@@ -167,6 +167,62 @@ impl Resource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceResponse {
+    status: u16,
+    mime_type: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl ResourceResponse {
+    pub fn new(
+        status: u16,
+        mime_type: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<Self, NavigationError> {
+        if !(100..=599).contains(&status) {
+            return Err(NavigationError::InvalidResponseStatus(status));
+        }
+        let mime_type = mime_type.into().trim().to_string();
+        if mime_type.is_empty() {
+            return Err(NavigationError::InvalidResponseMimeType);
+        }
+        Ok(Self {
+            status,
+            mime_type,
+            headers: normalize_headers(headers)?,
+            body: body.into(),
+        })
+    }
+
+    pub(crate) fn from_resource(resource: Resource) -> Self {
+        Self {
+            status: 200,
+            mime_type: resource.mime_type,
+            headers: BTreeMap::new(),
+            body: resource.body,
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceCacheMode {
     Default,
     NoStore,
@@ -196,18 +252,7 @@ impl ResourceRequest {
         if method.is_empty() || !method.bytes().all(is_http_token_byte) {
             return Err(NavigationError::InvalidRequestMethod(method));
         }
-        let mut normalized_headers = BTreeMap::new();
-        for (name, value) in headers {
-            let name = name.trim().to_ascii_lowercase();
-            if name.is_empty() || !name.bytes().all(is_http_token_byte) {
-                return Err(NavigationError::InvalidRequestHeader(name));
-            }
-            let value = value.trim().to_string();
-            if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0..=31 | 127)) {
-                return Err(NavigationError::InvalidRequestHeader(name));
-            }
-            normalized_headers.insert(name, value);
-        }
+        let normalized_headers = normalize_headers(headers)?;
         let body = body.into();
         if matches!(method.as_str(), "GET" | "HEAD") && !body.is_empty() {
             return Err(NavigationError::RequestBodyNotAllowed(method));
@@ -265,6 +310,14 @@ pub trait ResourceProvider {
         request: &ResourceRequest,
     ) -> Result<Option<Resource>, NavigationError> {
         self.provide(request.url())
+    }
+
+    fn provide_response(
+        &self,
+        request: &ResourceRequest,
+    ) -> Result<Option<ResourceResponse>, NavigationError> {
+        self.provide_request(request)
+            .map(|resource| resource.map(ResourceResponse::from_resource))
     }
 }
 
@@ -385,6 +438,8 @@ pub enum NavigationError {
     InvalidRequestMethod(String),
     InvalidRequestHeader(String),
     RequestBodyNotAllowed(String),
+    InvalidResponseStatus(u16),
+    InvalidResponseMimeType,
     ResourceNotFound(String),
     ResourceProvider(String),
     UnsupportedMimeType { path: String, mime_type: String },
@@ -427,6 +482,12 @@ impl fmt::Display for NavigationError {
             }
             Self::RequestBodyNotAllowed(method) => {
                 write!(formatter, "resource request body is not allowed for {method}")
+            }
+            Self::InvalidResponseStatus(status) => {
+                write!(formatter, "invalid resource response status: {status}")
+            }
+            Self::InvalidResponseMimeType => {
+                formatter.write_str("resource response MIME type is empty")
             }
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
             Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
@@ -1549,6 +1610,24 @@ fn is_http_token_byte(byte: u8) -> bool {
         )
 }
 
+fn normalize_headers(
+    headers: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, NavigationError> {
+    let mut normalized = BTreeMap::new();
+    for (name, value) in headers {
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(NavigationError::InvalidRequestHeader(name));
+        }
+        let value = value.trim().to_string();
+        if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0..=31 | 127)) {
+            return Err(NavigationError::InvalidRequestHeader(name));
+        }
+        normalized.insert(name, value);
+    }
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,12 +1665,23 @@ mod tests {
             Ok(self.resources.get(url.path()).cloned())
         }
 
-        fn provide_request(
+        fn provide_response(
             &self,
             request: &ResourceRequest,
-        ) -> Result<Option<Resource>, NavigationError> {
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
             self.requests.borrow_mut().push(request.clone());
-            self.provide(request.url())
+            let Some(resource) = self.provide(request.url())? else {
+                return Ok(None);
+            };
+            let mut headers = BTreeMap::new();
+            headers.insert("X-Provider".to_string(), "yes".to_string());
+            ResourceResponse::new(
+                201,
+                resource.mime_type().to_string(),
+                headers,
+                resource.body().to_vec(),
+            )
+            .map(Some)
         }
     }
 
@@ -1764,6 +1854,25 @@ mod tests {
             )
             .expect_err("GET bodies should be rejected"),
             NavigationError::RequestBodyNotAllowed("GET".to_string())
+        );
+        let mut response_headers = BTreeMap::new();
+        response_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        let response = ResourceResponse::new(
+            201,
+            "application/json; charset=utf-8",
+            response_headers,
+            br#"{"ok":true}"#.to_vec(),
+        )
+        .expect("response should be accepted");
+        assert_eq!(response.status(), 201);
+        assert_eq!(
+            response.headers().get("content-type"),
+            Some(&"application/json".to_string())
+        );
+        assert_eq!(
+            ResourceResponse::new(99, "text/plain", BTreeMap::new(), Vec::new())
+                .expect_err("invalid response statuses should be rejected"),
+            NavigationError::InvalidResponseStatus(99)
         );
     }
 
@@ -2419,7 +2528,7 @@ mod tests {
             "/index.html".to_string(),
             Resource::new(
                 "text/html",
-                br#"<p id="status">idle</p><script>fetch("/api", { method: "post", headers: { "X-Trace": "lab", "Content-Type": "application/json" }, body: "{\"name\":\"ceri\"}", cache: "no-store" }).then((response) => response.text()).then((body) => { document.getElementById("status").textContent = body; });</script>"#.to_vec(),
+                br#"<p id="status">idle</p><script>fetch("/api", { method: "post", headers: { "X-Trace": "lab", "Content-Type": "application/json" }, body: "{\"name\":\"ceri\"}", cache: "no-store" }).then((response) => response.text().then((body) => { document.getElementById("status").textContent = response.status + "|" + response.headers.get("x-provider") + "|" + body; }));</script>"#.to_vec(),
             ),
         );
         provided.insert(
@@ -2444,7 +2553,7 @@ mod tests {
             .expect("status element should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("{\"ok\":true}")
+            Some("201|yes|{\"ok\":true}")
         );
         let request = requests
             .borrow()

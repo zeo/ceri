@@ -2,7 +2,7 @@ use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
     is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceCacheMode,
-    ResourceProvider, ResourceRequest, APP_ORIGIN,
+    ResourceProvider, ResourceRequest, ResourceResponse, APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
 use crate::Color;
@@ -15,6 +15,7 @@ use std::rc::Weak;
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
 type ResponseHandle = Rc<ResponseData>;
+type HeadersHandle = Rc<BTreeMap<String, String>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
 type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
@@ -72,6 +73,7 @@ enum Value {
     ClassList(ElementHandle),
     Event(EventData),
     Response(ResponseHandle),
+    Headers(HeadersHandle),
     Promise(PromiseHandle),
     Document,
     Window,
@@ -185,6 +187,7 @@ enum Builtin {
     Fetch,
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
+    HeadersGet(HeadersHandle),
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
 }
@@ -454,6 +457,23 @@ fn resolve_runtime_request(
         .map_err(|error| runtime_error(error.to_string()))
 }
 
+fn resolve_runtime_response(
+    resources: &ResourceBundle,
+    provider: Option<&dyn ResourceProvider>,
+    request: &ResourceRequest,
+) -> Result<Option<ResourceResponse>, ScriptError> {
+    if request.method() == "GET"
+        && let Some(resource) = resources.resource(request.url().path()).cloned()
+    {
+        return Ok(Some(ResourceResponse::from_resource(resource)));
+    }
+    provider
+        .map(|provider| provider.provide_response(request))
+        .transpose()
+        .map(|response| response.flatten())
+        .map_err(|error| runtime_error(error.to_string()))
+}
+
 impl ModuleSourceLoader for RuntimeModuleLoader<'_> {
     fn load_module(
         &mut self,
@@ -596,6 +616,7 @@ struct ResponseData {
     url: String,
     status: u16,
     mime_type: String,
+    headers: HeadersHandle,
     body: Vec<u8>,
 }
 
@@ -2076,10 +2097,17 @@ impl ScriptRuntime {
                 "status" => Ok(Value::Number(response.status as f64)),
                 "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
                 "mimeType" => Ok(Value::String(response.mime_type.clone())),
+                "headers" => Ok(Value::Headers(response.headers.clone())),
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
+                ))),
+            },
+            Value::Headers(headers) => match property {
+                "get" => Ok(Value::Builtin(Builtin::HeadersGet(headers))),
+                _ => Err(runtime_error(format!(
+                    "headers has no property {property}"
                 ))),
             },
             Value::String(string) => match property {
@@ -3470,6 +3498,18 @@ impl ScriptRuntime {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
             }
             Builtin::PromiseCatch(promise) => self.promise_then(promise, None, arguments.first()),
+            Builtin::HeadersGet(headers) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                Ok(headers
+                    .get(&name)
+                    .cloned()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null))
+            }
             Builtin::ResponseText(response) => Ok(Value::Promise(self.fulfilled_promise(
                 Value::String(String::from_utf8_lossy(&response.body).into_owned()),
             ))),
@@ -3971,17 +4011,18 @@ impl ScriptRuntime {
         }
         let display_url = url.to_string();
         let resources = self.resources.clone().unwrap_or_default();
-        let resource = match resolve_runtime_request(
+        let response = match resolve_runtime_response(
             &resources,
             self.resource_provider.as_deref(),
             &request,
         ) {
-            Ok(Some(resource)) => resource,
+            Ok(Some(response)) => response,
             Ok(None) => {
                 return self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
                     url: display_url,
                     status: 404,
                     mime_type: String::new(),
+                    headers: Rc::new(BTreeMap::new()),
                     body: Vec::new(),
                 })));
             }
@@ -3989,9 +4030,10 @@ impl ScriptRuntime {
         };
         self.fulfilled_promise(Value::Response(Rc::new(ResponseData {
             url: display_url,
-            status: 200,
-            mime_type: resource.mime_type().to_string(),
-            body: resource.body().to_vec(),
+            status: response.status(),
+            mime_type: response.mime_type().to_string(),
+            headers: Rc::new(response.headers().clone()),
+            body: response.body().to_vec(),
         })))
     }
 
@@ -4258,6 +4300,7 @@ impl Value {
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
             Self::Response(_) => "[response]".to_string(),
+            Self::Headers(_) => "[object Headers]".to_string(),
             Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
@@ -4614,6 +4657,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::ClassList(_)
         | Value::Event(_)
         | Value::Response(_)
+        | Value::Headers(_)
         | Value::Promise(_)
         | Value::Document
         | Value::Window
