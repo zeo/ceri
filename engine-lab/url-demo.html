@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="demo.css">
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 12px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      .accent {
+        color: #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>URL API laboratory</h1>
+      <p>Same-origin URL construction and mutable query parameters.</p>
+      <p class="accent">The query is encoded without opening a listener.</p>
+      <button id="run-url">run URL workflow</button>
+      <p id="status">waiting for URL APIs</p>
+    </main>
+  </body>
+  <script src="url-demo.js"></script>
+</html>

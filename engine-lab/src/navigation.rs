@@ -71,6 +71,19 @@ impl AppUrl {
         &self.fragment
     }
 
+    pub fn with_query_fragment(&self, query: impl Into<String>, fragment: impl Into<String>) -> Self {
+        Self {
+            path: self.path.clone(),
+            query: query.into(),
+            fragment: fragment.into(),
+        }
+    }
+
+    pub fn with_path(&self, path: &str) -> Result<Self, NavigationError> {
+        let path = if path.is_empty() { "/" } else { path };
+        Self::parse(&format!("{APP_ORIGIN}{path}"))
+    }
+
     pub fn resolve(&self, reference: &str) -> Result<Self, NavigationError> {
         if reference.contains("://") {
             return Self::parse(reference);

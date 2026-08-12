@@ -22,6 +22,7 @@ The current slice implements:
 - a strict `https://app.ceri.invalid` URL model with an in-memory packaged resource bundle
 - same-origin relative URL resolution for external stylesheets and scripts
 - packaged-origin promise-based `fetch()` responses with status, MIME type, URL, text bodies, and JSON values
+- app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
@@ -103,3 +104,11 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The first command activates `/navigation-about.html` through a nested link. The second uses `window.location.replace()` and preserves the query and fragment in the app-owned URL. The third adds a same-document route with `history.pushState()`, then traverses it with `history.back()` and `popstate`. Full-page history entries reload their packaged document, while same-document entries retain the DOM and runtime. External origins, loopback listeners, and network transports remain outside this laboratory slice.
+
+The URL demo exercises the app-origin `URL` and `URLSearchParams` APIs without a listener:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/url-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-url-demo.bmp --click run-url
+```
+
+The demo resolves a URL against the current app location, mutates its query parameters, sorts the entries, and displays the synchronized URL string. The constructor rejects origins outside `https://app.ceri.invalid`.

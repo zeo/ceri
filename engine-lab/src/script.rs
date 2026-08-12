@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
+use std::rc::Weak;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
@@ -13,6 +14,8 @@ type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
 type LocationHandle = Rc<RefCell<AppUrl>>;
 type HistoryHandle = Rc<RefCell<HistoryData>>;
+type UrlHandle = Rc<RefCell<UrlData>>;
+type UrlSearchParamsHandle = Rc<RefCell<UrlSearchParamsData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -51,8 +54,12 @@ enum Value {
     Window,
     Location(LocationHandle),
     History(HistoryHandle),
+    Url(UrlHandle),
+    UrlSearchParams(UrlSearchParamsHandle),
     Console,
     Json,
+    UrlConstructor,
+    UrlSearchParamsConstructor,
     Function(Rc<Function>),
     Builtin(Builtin),
 }
@@ -72,6 +79,15 @@ enum Builtin {
     HistoryBack,
     HistoryForward,
     HistoryGo,
+    UrlSearchParamsAppend(UrlSearchParamsHandle),
+    UrlSearchParamsDelete(UrlSearchParamsHandle),
+    UrlSearchParamsGet(UrlSearchParamsHandle),
+    UrlSearchParamsGetAll(UrlSearchParamsHandle),
+    UrlSearchParamsHas(UrlSearchParamsHandle),
+    UrlSearchParamsSet(UrlSearchParamsHandle),
+    UrlSearchParamsSort(UrlSearchParamsHandle),
+    UrlSearchParamsToString(UrlSearchParamsHandle),
+    UrlToString(UrlHandle),
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -141,6 +157,10 @@ enum Expr {
     Object(Vec<(String, Expr)>),
     Array(Vec<Expr>),
     Call {
+        callee: Box<Expr>,
+        arguments: Vec<Expr>,
+    },
+    New {
         callee: Box<Expr>,
         arguments: Vec<Expr>,
     },
@@ -240,6 +260,16 @@ struct HistoryData {
     state: Value,
     length: usize,
     index: usize,
+}
+
+struct UrlData {
+    url: AppUrl,
+    search_params: Option<UrlSearchParamsHandle>,
+}
+
+struct UrlSearchParamsData {
+    pairs: Vec<(String, String)>,
+    url: Option<Weak<RefCell<UrlData>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,6 +386,13 @@ impl ScriptRuntime {
             );
             values.values.insert("console".to_string(), Value::Console);
             values.values.insert("JSON".to_string(), Value::Json);
+            values
+                .values
+                .insert("URL".to_string(), Value::UrlConstructor);
+            values.values.insert(
+                "URLSearchParams".to_string(),
+                Value::UrlSearchParamsConstructor,
+            );
             values
                 .values
                 .insert("fetch".to_string(), Value::Builtin(Builtin::Fetch));
@@ -698,6 +735,14 @@ impl ScriptRuntime {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.call(callee, arguments)
             }
+            Expr::New { callee, arguments } => {
+                let callee = self.evaluate(callee, environment.clone())?;
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.evaluate(argument, environment.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.call(callee, arguments)
+            }
             Expr::Function { params, body } => Ok(Value::Function(Rc::new(Function {
                 params: params.clone(),
                 body: body.clone(),
@@ -877,6 +922,32 @@ impl ScriptRuntime {
                 "go" => Ok(Value::Builtin(Builtin::HistoryGo)),
                 _ => Err(runtime_error(format!("history has no property {property}"))),
             },
+            Value::Url(url) => match property {
+                "href" => Ok(Value::String(url.borrow().url.to_string())),
+                "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
+                "protocol" => Ok(Value::String("https:".to_string())),
+                "host" | "hostname" => Ok(Value::String("app.ceri.invalid".to_string())),
+                "pathname" => Ok(Value::String(url.borrow().url.path().to_string())),
+                "search" => Ok(Value::String(search_component(&url.borrow().url))),
+                "hash" => Ok(Value::String(fragment_component(&url.borrow().url))),
+                "searchParams" => Ok(Value::UrlSearchParams(self.url_search_params(&url)?)),
+                "toString" => Ok(Value::Builtin(Builtin::UrlToString(url))),
+                _ => Err(runtime_error(format!("URL has no property {property}"))),
+            },
+            Value::UrlSearchParams(params) => match property {
+                "size" => Ok(Value::Number(params.borrow().pairs.len() as f64)),
+                "append" => Ok(Value::Builtin(Builtin::UrlSearchParamsAppend(params))),
+                "delete" => Ok(Value::Builtin(Builtin::UrlSearchParamsDelete(params))),
+                "get" => Ok(Value::Builtin(Builtin::UrlSearchParamsGet(params))),
+                "getAll" => Ok(Value::Builtin(Builtin::UrlSearchParamsGetAll(params))),
+                "has" => Ok(Value::Builtin(Builtin::UrlSearchParamsHas(params))),
+                "set" => Ok(Value::Builtin(Builtin::UrlSearchParamsSet(params))),
+                "sort" => Ok(Value::Builtin(Builtin::UrlSearchParamsSort(params))),
+                "toString" => Ok(Value::Builtin(Builtin::UrlSearchParamsToString(params))),
+                _ => Err(runtime_error(format!(
+                    "URLSearchParams has no property {property}"
+                ))),
+            },
             Value::Response(response) => match property {
                 "url" => Ok(Value::String(response.url.clone())),
                 "status" => Ok(Value::Number(response.status as f64)),
@@ -978,6 +1049,7 @@ impl ScriptRuntime {
                 self.request_location_navigation(value, false);
                 true
             }
+            Value::Url(url) => self.assign_url_property(&url, property, &value)?,
             _ => false,
         };
         updated
@@ -1125,8 +1197,102 @@ impl ScriptRuntime {
                 }
             }
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
+            Value::UrlConstructor => self.construct_url(arguments),
+            Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
             _ => Err(runtime_error("value is not callable")),
         }
+    }
+
+    fn construct_url(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let reference = arguments
+            .first()
+            .map(Value::string_value)
+            .ok_or_else(|| runtime_error("URL constructor requires a URL"))?;
+        let base = match arguments.get(1) {
+            Some(Value::Url(url)) => url.borrow().url.clone(),
+            Some(value) => AppUrl::parse(&value.string_value())
+                .map_err(|error| runtime_error(error.to_string()))?,
+            None => self.base_url.clone().unwrap_or_else(|| {
+                AppUrl::parse("https://app.ceri.invalid/")
+                    .expect("built-in app origin should parse")
+            }),
+        };
+        let url = base
+            .resolve(&reference)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        Ok(Value::Url(Rc::new(RefCell::new(UrlData {
+            url,
+            search_params: None,
+        }))))
+    }
+
+    fn construct_url_search_params(
+        &self,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        let value = arguments.first().cloned().unwrap_or(Value::Null);
+        let pairs = params_from_value(&value)?;
+        Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
+            UrlSearchParamsData { pairs, url: None },
+        ))))
+    }
+
+    fn url_search_params(
+        &self,
+        url: &UrlHandle,
+    ) -> Result<UrlSearchParamsHandle, ScriptError> {
+        if let Some(params) = url.borrow().search_params.clone() {
+            return Ok(params);
+        }
+        let pairs = parse_form_urlencoded(url.borrow().url.query())?;
+        let params = Rc::new(RefCell::new(UrlSearchParamsData {
+            pairs,
+            url: Some(Rc::downgrade(url)),
+        }));
+        url.borrow_mut().search_params = Some(params.clone());
+        Ok(params)
+    }
+
+    fn assign_url_property(
+        &mut self,
+        url: &UrlHandle,
+        property: &str,
+        value: &str,
+    ) -> Result<bool, ScriptError> {
+        let current = url.borrow().url.clone();
+        let updated = match property {
+            "href" => current
+                .resolve(value)
+                .map_err(|error| runtime_error(error.to_string()))?,
+            "pathname" => current
+                .with_path(value)
+                .map_err(|error| runtime_error(error.to_string()))?
+                .with_query_fragment(current.query().to_string(), current.fragment().to_string()),
+            "search" => current.with_query_fragment(
+                value.strip_prefix('?').unwrap_or(value).to_string(),
+                current.fragment().to_string(),
+            ),
+            "hash" => current.with_query_fragment(
+                current.query().to_string(),
+                value.strip_prefix('#').unwrap_or(value).to_string(),
+            ),
+            _ => return Ok(false),
+        };
+        let params = url.borrow().search_params.clone();
+        url.borrow_mut().url = updated.clone();
+        if let Some(params) = params {
+            params.borrow_mut().pairs = parse_form_urlencoded(updated.query())?;
+        }
+        Ok(true)
+    }
+
+    fn sync_url_search_params(&self, params: &UrlSearchParamsHandle) {
+        let Some(url) = params.borrow().url.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let query = serialize_form_urlencoded(&params.borrow().pairs);
+        let current = url.borrow().url.clone();
+        url.borrow_mut().url = current.with_query_fragment(query, current.fragment().to_string());
     }
 
     fn call_builtin(
@@ -1264,6 +1430,118 @@ impl ScriptRuntime {
                 self.queue_navigation(NavigationRequest::Traverse { delta });
                 Ok(Value::Undefined)
             }
+            Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string())),
+            Builtin::UrlSearchParamsAppend(params) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let value = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                params.borrow_mut().pairs.push((name, value));
+                self.sync_url_search_params(&params);
+                Ok(Value::Undefined)
+            }
+            Builtin::UrlSearchParamsDelete(params) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let value = arguments.get(1).map(Value::string_value);
+                params.borrow_mut().pairs.retain(|(entry_name, entry_value)| {
+                    entry_name != &name || value.as_ref().is_some_and(|value| entry_value != value)
+                });
+                self.sync_url_search_params(&params);
+                Ok(Value::Undefined)
+            }
+            Builtin::UrlSearchParamsGet(params) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(params
+                    .borrow()
+                    .pairs
+                    .iter()
+                    .find(|(entry_name, _)| entry_name == &name)
+                    .map(|(_, value)| Value::String(value.clone()))
+                    .unwrap_or(Value::Null))
+            }
+            Builtin::UrlSearchParamsGetAll(params) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(Value::Array(Rc::new(RefCell::new(
+                    params
+                        .borrow()
+                        .pairs
+                        .iter()
+                        .filter(|(entry_name, _)| entry_name == &name)
+                        .map(|(_, value)| Value::String(value.clone()))
+                        .collect(),
+                ))))
+            }
+            Builtin::UrlSearchParamsHas(params) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let value = arguments.get(1).map(Value::string_value);
+                Ok(Value::Bool(params.borrow().pairs.iter().any(
+                    |(entry_name, entry_value)| {
+                        entry_name == &name
+                            && value.as_ref().is_none_or(|value| entry_value == value)
+                    },
+                )))
+            }
+            Builtin::UrlSearchParamsSet(params) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let value = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                let mut pairs = params.borrow_mut();
+                if let Some(index) = pairs
+                    .pairs
+                    .iter()
+                    .position(|(entry_name, _)| entry_name == &name)
+                {
+                    pairs.pairs[index].1 = value.clone();
+                    let mut kept = false;
+                    pairs.pairs.retain(|(entry_name, _)| {
+                        if entry_name != &name {
+                            true
+                        } else if kept {
+                            false
+                        } else {
+                            kept = true;
+                            true
+                        }
+                    });
+                } else {
+                    pairs.pairs.push((name, value));
+                }
+                drop(pairs);
+                self.sync_url_search_params(&params);
+                Ok(Value::Undefined)
+            }
+            Builtin::UrlSearchParamsSort(params) => {
+                params
+                    .borrow_mut()
+                    .pairs
+                    .sort_by(|left, right| left.0.cmp(&right.0));
+                self.sync_url_search_params(&params);
+                Ok(Value::Undefined)
+            }
+            Builtin::UrlSearchParamsToString(params) => Ok(Value::String(
+                serialize_form_urlencoded(&params.borrow().pairs),
+            )),
             Builtin::JsonParse => {
                 let source = arguments
                     .first()
@@ -1838,8 +2116,13 @@ impl Value {
             Self::Window => "[window]".to_string(),
             Self::Location(value) => value.borrow().to_string(),
             Self::History(_) => "[object History]".to_string(),
+            Self::Url(value) => value.borrow().url.to_string(),
+            Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
+            Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
+                "[function URL]".to_string()
+            }
             Self::Function(_) => "[function]".to_string(),
             Self::Builtin(_) => "[function]".to_string(),
         }
@@ -1903,6 +2186,136 @@ fn escape_json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn search_component(url: &AppUrl) -> String {
+    if url.query().is_empty() {
+        String::new()
+    } else {
+        format!("?{}", url.query())
+    }
+}
+
+fn fragment_component(url: &AppUrl) -> String {
+    if url.fragment().is_empty() {
+        String::new()
+    } else {
+        format!("#{}", url.fragment())
+    }
+}
+
+fn params_from_value(value: &Value) -> Result<Vec<(String, String)>, ScriptError> {
+    match value {
+        Value::Undefined | Value::Null => Ok(Vec::new()),
+        Value::String(value) => parse_form_urlencoded(value.strip_prefix('?').unwrap_or(value)),
+        Value::UrlSearchParams(params) => Ok(params.borrow().pairs.clone()),
+        Value::Object(object) => Ok(object
+            .borrow()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.string_value()))
+            .collect()),
+        Value::Array(array) => {
+            let mut pairs = Vec::new();
+            for entry in array.borrow().iter() {
+                let Value::Array(entry) = entry else {
+                    return Err(runtime_error(
+                        "URLSearchParams sequence entries must be arrays",
+                    ));
+                };
+                let entry = entry.borrow();
+                if entry.len() != 2 {
+                    return Err(runtime_error(
+                        "URLSearchParams sequence entries need two values",
+                    ));
+                }
+                pairs.push((entry[0].string_value(), entry[1].string_value()));
+            }
+            Ok(pairs)
+        }
+        _ => parse_form_urlencoded(&value.string_value()),
+    }
+}
+
+fn parse_form_urlencoded(query: &str) -> Result<Vec<(String, String)>, ScriptError> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    query
+        .split('&')
+        .map(|entry| {
+            let (name, value) = entry.split_once('=').map_or((entry, ""), |pair| pair);
+            Ok((decode_form_component(name)?, decode_form_component(value)?))
+        })
+        .collect()
+}
+
+fn decode_form_component(value: &str) -> Result<String, ScriptError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let high = bytes
+                    .get(index + 1)
+                    .and_then(|byte| hex_value(*byte))
+                    .ok_or_else(|| runtime_error("URLSearchParams has invalid percent encoding"))?;
+                let low = bytes
+                    .get(index + 2)
+                    .and_then(|byte| hex_value(*byte))
+                    .ok_or_else(|| runtime_error("URLSearchParams has invalid percent encoding"))?;
+                decoded.push((high << 4) | low);
+                index += 2;
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| runtime_error("URLSearchParams contains invalid UTF-8"))
+}
+
+fn serialize_form_urlencoded(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{}={}",
+                encode_form_component(name),
+                encode_form_component(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn encode_form_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                encoded.push(*byte as char)
+            }
+            b' ' => encoded.push('+'),
+            byte => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    encoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn class_name(value: &Value) -> Result<String, ScriptError> {
@@ -1969,6 +2382,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
+        (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
+        (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -2238,6 +2653,14 @@ impl Parser {
             TokenKind::True => Ok(Expr::Literal(Literal::Bool(true))),
             TokenKind::False => Ok(Expr::Literal(Literal::Bool(false))),
             TokenKind::Null => Ok(Expr::Literal(Literal::Null)),
+            TokenKind::New => {
+                let callee = self.parse_primary()?;
+                let arguments = self.parse_argument_list("constructor")?;
+                Ok(Expr::New {
+                    callee: Box::new(callee),
+                    arguments,
+                })
+            }
             TokenKind::Identifier(name) => {
                 if self.take(TokenKind::Arrow) {
                     Ok(self.parse_arrow_body(vec![name])?)
@@ -2360,6 +2783,21 @@ impl Parser {
         Ok(Expr::Function { params, body })
     }
 
+    fn parse_argument_list(&mut self, context: &str) -> Result<Vec<Expr>, ScriptError> {
+        self.expect(TokenKind::LParen, context)?;
+        let mut arguments = Vec::new();
+        if !self.is(TokenKind::RParen) {
+            loop {
+                arguments.push(self.parse_expression()?);
+                if !self.take(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen, context)?;
+        Ok(arguments)
+    }
+
     fn is_next_identifier(&self) -> bool {
         matches!(
             self.tokens.get(self.index + 1).map(|token| &token.kind),
@@ -2434,6 +2872,7 @@ enum TokenKind {
     Else,
     Return,
     Function,
+    New,
     LParen,
     RParen,
     LBrace,
@@ -2509,6 +2948,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
                 "else" => TokenKind::Else,
                 "return" => TokenKind::Return,
                 "function" => TokenKind::Function,
+                "new" => TokenKind::New,
                 _ => TokenKind::Identifier(identifier.to_string()),
             };
             tokens.push(Token {
@@ -2882,6 +3322,68 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready")
         );
+    }
+
+    #[test]
+    fn url_and_search_params_support_spa_query_workflows() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::with_resources(
+            document.clone(),
+            ResourceBundle::default(),
+            AppUrl::parse("https://app.ceri.invalid/docs/index.html")
+                .expect("base URL should parse"),
+        );
+        runtime
+            .execute(
+                r#"
+                const url = new URL("/search?q=rust&tag=one&tag=two");
+                const params = url.searchParams;
+                params.set("q", "browser engine");
+                params.append("tag", "three");
+                params.delete("tag", "one");
+                params.sort();
+                document.getElementById("status").textContent = url.pathname + "|" + params.get("q") + "|" + params.getAll("tag").length + "|" + params.toString() + "|" + url.href;
+                "#,
+            )
+            .expect("URL APIs should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "/search|browser engine|2|q=browser+engine&tag=two&tag=three|https://app.ceri.invalid/search?q=browser+engine&tag=two&tag=three",
+            )
+        );
+    }
+
+    #[test]
+    fn url_constructor_resolves_against_explicit_app_base() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const base = new URL("https://app.ceri.invalid/docs/index.html?old=1");
+                const next = new URL("../next.html?x=1", base);
+                document.getElementById("status").textContent = next.href + "|" + next.origin + "|" + next.search;
+                "#,
+            )
+            .expect("URL constructor should accept a base");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("https://app.ceri.invalid/next.html?x=1|https://app.ceri.invalid|?x=1")
+        );
+
+        let error = runtime
+            .execute("new URL(\"https://other.invalid/\");")
+            .expect_err("cross-origin URL should be rejected");
+        assert!(error.message.contains("outside the app origin"));
     }
 
     #[test]
