@@ -1003,7 +1003,7 @@ fn is_css(resource: &Resource) -> bool {
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/css"))
 }
 
-fn is_javascript(resource: &Resource) -> bool {
+pub(crate) fn is_javascript(resource: &Resource) -> bool {
     resource.mime_type.split(';').next().is_some_and(|mime| {
         matches!(
             mime.trim().to_ascii_lowercase().as_str(),

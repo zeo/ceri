@@ -1,6 +1,6 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
-use crate::navigation::{APP_ORIGIN, AppUrl, ResourceBundle};
+use crate::navigation::{is_javascript, APP_ORIGIN, AppUrl, ResourceBundle};
 use crate::paint::CanvasCommand;
 use crate::Color;
 use std::cell::RefCell;
@@ -395,6 +395,36 @@ pub(crate) trait ModuleSourceLoader {
     ) -> Result<(AppUrl, String), ScriptError>;
 }
 
+struct RuntimeModuleLoader<'a> {
+    resources: &'a ResourceBundle,
+}
+
+impl ModuleSourceLoader for RuntimeModuleLoader<'_> {
+    fn load_module(
+        &mut self,
+        referrer: &AppUrl,
+        reference: &str,
+    ) -> Result<(AppUrl, String), ScriptError> {
+        let url = referrer
+            .resolve(reference)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let resource = self
+            .resources
+            .resource(url.path())
+            .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
+        if !is_javascript(resource) {
+            return Err(runtime_error(format!(
+                "module {} has unsupported MIME type {}",
+                url.path(),
+                resource.mime_type()
+            )));
+        }
+        let source = String::from_utf8(resource.body().to_vec())
+            .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
+        Ok((url, source))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ModuleNamespace {
     values: BTreeMap<String, Value>,
@@ -777,6 +807,36 @@ impl ScriptRuntime {
         let namespace = self.execute_module_graph(source, url, loader)?;
         self.drain_microtasks()?;
         Ok(namespace)
+    }
+
+    fn dynamic_import(
+        &mut self,
+        base_url: AppUrl,
+        reference: &Value,
+    ) -> Result<ModuleNamespace, ScriptError> {
+        let url = base_url
+            .resolve(&reference.string_value())
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let resources = self
+            .resources
+            .clone()
+            .ok_or_else(|| runtime_error("dynamic import is unavailable without resources"))?;
+        let resource = resources
+            .resource(url.path())
+            .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
+        if !is_javascript(resource) {
+            return Err(runtime_error(format!(
+                "module {} has unsupported MIME type {}",
+                url.path(),
+                resource.mime_type()
+            )));
+        }
+        let source = String::from_utf8(resource.body().to_vec())
+            .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
+        let mut loader = RuntimeModuleLoader {
+            resources: &resources,
+        };
+        self.execute_module_graph(&source, url, &mut loader)
     }
 
     fn execute_module_graph<L: ModuleSourceLoader>(
@@ -1479,6 +1539,30 @@ impl ScriptRuntime {
                 Ok(Value::String(output))
             }
             Expr::Call { callee, arguments } => {
+                if matches!(callee.as_ref(), Expr::Identifier(name) if name == "import") {
+                    let base_url = environment
+                        .borrow()
+                        .get("import")
+                        .and_then(|value| match value {
+                            Value::ModuleImport(url) => Some(url),
+                            _ => None,
+                        })
+                        .or_else(|| self.base_url.clone());
+                    let outcome = match (base_url, arguments.first()) {
+                        (Some(base_url), Some(argument)) => {
+                            self.evaluate(argument, environment.clone())
+                                .and_then(|reference| self.dynamic_import(base_url, &reference))
+                        }
+                        (None, _) => Err(runtime_error(
+                            "dynamic import requires a document URL",
+                        )),
+                        (_, None) => Err(runtime_error("dynamic import requires a specifier")),
+                    };
+                    return Ok(Value::Promise(match outcome {
+                        Ok(namespace) => self.fulfilled_promise(namespace.object_value()),
+                        Err(error) => self.rejected_promise(error.message),
+                    }));
+                }
                 let callee = self.evaluate(callee, environment.clone())?;
                 let arguments = arguments
                     .iter()
@@ -5683,6 +5767,91 @@ mod tests {
                 .expect("message export should exist")
                 .string_value(),
             "from module"
+        );
+    }
+
+    #[test]
+    fn dynamically_imports_a_packaged_module_from_a_classic_script() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/dynamic.js",
+                "text/javascript; charset=utf-8",
+                b"import { suffix } from \"./dynamic-child.js\"; export const message = suffix(\"loaded\"); export const count = 2;".to_vec(),
+            )
+            .expect("module resource should be accepted");
+        resources
+            .insert(
+                "/dynamic-child.js",
+                "text/javascript",
+                b"export function suffix(value) { return value; }".to_vec(),
+            )
+            .expect("child module resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                import("./dynamic.js").then((module) => {
+                    status.textContent = module.message + "|" + module.count;
+                });
+                "#,
+            )
+            .expect("classic dynamic import should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("loaded|2")
+        );
+    }
+
+    #[test]
+    fn awaits_a_dynamic_import_and_reports_rejections() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/dynamic.js",
+                "application/javascript",
+                b"export const message = \"async\"; export const count = 3;".to_vec(),
+            )
+            .expect("module resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                async function load() {
+                    const { message, count } = await import("./dynamic.js");
+                    return message + "|" + count;
+                }
+                load().then((value) => {
+                    status.textContent = value;
+                });
+                import("./missing.js").catch((error) => {
+                    status.textContent = status.textContent + "|" + error;
+                });
+                import("https://other.invalid/dynamic.js").catch((error) => {
+                    status.textContent = status.textContent + "|" + error;
+                });
+                "#,
+            )
+            .expect("async dynamic import should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "async|3|module /missing.js was not found|URL is outside the app origin",
+            )
         );
     }
 

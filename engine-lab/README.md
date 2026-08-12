@@ -28,7 +28,7 @@ The current slice implements:
 - named form controls with live checkbox and radio-group state, `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
 - app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
-- static ES module graphs with same-origin packaged imports, named exports, and namespace imports
+- static and dynamic ES module graphs with same-origin packaged imports, named exports, and namespace imports
 - template literals with expression interpolation and module `import.meta.url`
 - static node-list snapshots, `dataset` reads, array spread and `map`, and bounded `Map` construction, lookup, key enumeration, and mutation
 - bounded `for...of` over arrays, node lists, strings, and maps, promise-backed async functions with `await`, `try`/`catch`/`throw`, class and error values, `typeof`, `instanceof`, conditional expressions, and the narrow `Number`, `Array`, `Object`, `String`, `Set`, and `Promise` surfaces used by the continuity page
@@ -89,13 +89,19 @@ The destructuring sample exercises nested object and array bindings, object rest
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/destructure-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-destructure-demo.bmp --width 800 --height 320
 ```
 
+The dynamic-module sample runs a classic script that imports a same-origin packaged module, awaits its namespace object, destructures the exports, and joins an exported array:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/dynamic-import-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-dynamic-import-demo.bmp --width 800 --height 320
+```
+
 The packaged continuity page is also an integration target. It loads the real `/web/index.html`, its stylesheet, module graph, SDK module, and recovery asset through the custom resource bundle. The page reaches `4 / 4`: module loading, local storage, packaged fetch, and the engine-owned runtime identity query pass. The page stays loaded and does not fall back to a recovery document:
 
 ```powershell
 cargo test --locked --manifest-path engine-lab/Cargo.toml --test continuity
 ```
 
-The current language boundary stops before generators, user-defined iterator objects, destructuring defaults, computed destructuring keys, and broader class method semantics. Those remain explicit compatibility gates.
+The current language boundary stops before generators, user-defined iterator objects, destructuring defaults, computed destructuring keys, broader class method semantics, and dynamic import attributes. Those remain explicit compatibility gates.
 
 The event sample starts a click on a nested element and handles it on an ancestor through an external script:
 
