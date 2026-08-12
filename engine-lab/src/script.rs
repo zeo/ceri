@@ -1,6 +1,6 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
-use crate::navigation::{is_javascript, APP_ORIGIN, AppUrl, ResourceBundle};
+use crate::navigation::{is_javascript, is_json, APP_ORIGIN, AppUrl, ResourceBundle};
 use crate::paint::CanvasCommand;
 use crate::Color;
 use std::cell::RefCell;
@@ -350,6 +350,11 @@ struct ModuleProgram {
     star_reexports: Vec<String>,
     statements: Vec<Stmt>,
     exports: Vec<ModuleExport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DynamicImportType {
+    Json,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -835,10 +840,12 @@ impl ScriptRuntime {
         &mut self,
         base_url: AppUrl,
         reference: &Value,
+        attributes: Option<&Value>,
     ) -> Result<ModuleNamespace, ScriptError> {
         let url = base_url
             .resolve(&reference.string_value())
             .map_err(|error| runtime_error(error.to_string()))?;
+        let import_type = parse_dynamic_import_type(attributes)?;
         let resources = self
             .resources
             .clone()
@@ -846,19 +853,47 @@ impl ScriptRuntime {
         let resource = resources
             .resource(url.path())
             .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
-        if !is_javascript(resource) {
-            return Err(runtime_error(format!(
-                "module {} has unsupported MIME type {}",
-                url.path(),
-                resource.mime_type()
-            )));
+        if matches!(import_type, Some(DynamicImportType::Json))
+            && is_json(resource)
+            && let Some(namespace) = self.module_cache.get(&url.to_string())
+        {
+            return Ok(namespace.clone());
         }
-        let source = String::from_utf8(resource.body().to_vec())
-            .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
-        let mut loader = RuntimeModuleLoader {
-            resources: &resources,
-        };
-        self.execute_module_graph(&source, url, &mut loader)
+        match import_type {
+            None => {
+                if !is_javascript(resource) {
+                    return Err(runtime_error(format!(
+                        "module {} has unsupported MIME type {}",
+                        url.path(),
+                        resource.mime_type()
+                    )));
+                }
+                let source = String::from_utf8(resource.body().to_vec())
+                    .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
+                let mut loader = RuntimeModuleLoader {
+                    resources: &resources,
+                };
+                self.execute_module_graph(&source, url, &mut loader)
+            }
+            Some(DynamicImportType::Json) => {
+                if !is_json(resource) {
+                    return Err(runtime_error(format!(
+                        "module {} has unsupported MIME type {}",
+                        url.path(),
+                        resource.mime_type()
+                    )));
+                }
+                let source = String::from_utf8(resource.body().to_vec())
+                    .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
+                let value = self.parse_json(&source)?;
+                let mut values = BTreeMap::new();
+                values.insert("default".to_string(), value);
+                let namespace = ModuleNamespace { values };
+                self.module_cache
+                    .insert(url.to_string(), namespace.clone());
+                Ok(namespace)
+            }
+        }
     }
 
     fn execute_module_graph<L: ModuleSourceLoader>(
@@ -1608,8 +1643,30 @@ impl ScriptRuntime {
                         .or_else(|| self.base_url.clone());
                     let outcome = match (base_url, arguments.first()) {
                         (Some(base_url), Some(argument)) => {
-                            self.evaluate(argument, environment.clone())
-                                .and_then(|reference| self.dynamic_import(base_url, &reference))
+                            if arguments.len() > 2 {
+                                Err(runtime_error(
+                                    "dynamic import accepts at most two arguments",
+                                ))
+                            } else {
+                                self.evaluate(argument, environment.clone()).and_then(
+                                    |reference| {
+                                        let attributes = arguments
+                                            .get(1)
+                                            .map(|argument| {
+                                                self.evaluate(argument, environment.clone())
+                                            })
+                                            .transpose()?;
+                                        let attributes = attributes.as_ref().filter(|value| {
+                                            !matches!(value, Value::Undefined)
+                                        });
+                                        self.dynamic_import(
+                                            base_url,
+                                            &reference,
+                                            attributes,
+                                        )
+                                    },
+                                )
+                            }
                         }
                         (None, _) => Err(runtime_error(
                             "dynamic import requires a document URL",
@@ -4577,6 +4634,43 @@ pub(crate) fn runtime_error(message: impl Into<String>) -> ScriptError {
     }
 }
 
+fn parse_dynamic_import_type(
+    attributes: Option<&Value>,
+) -> Result<Option<DynamicImportType>, ScriptError> {
+    let Some(attributes) = attributes else {
+        return Ok(None);
+    };
+    let Value::Object(attributes) = attributes else {
+        return Err(runtime_error("dynamic import options must be an object"));
+    };
+    let attributes = attributes.borrow();
+    if attributes.keys().any(|key| key != "with") {
+        return Err(runtime_error("dynamic import options contain an unsupported key"));
+    }
+    let Some(with) = attributes.get("with") else {
+        return Err(runtime_error("dynamic import options require a with object"));
+    };
+    let Value::Object(with) = with else {
+        return Err(runtime_error("dynamic import with must be an object"));
+    };
+    let with = with.borrow();
+    if with.keys().any(|key| key != "type") {
+        return Err(runtime_error("dynamic import with contains an unsupported key"));
+    }
+    let Some(module_type) = with.get("type") else {
+        return Err(runtime_error("dynamic import with requires a type"));
+    };
+    let Value::String(module_type) = module_type else {
+        return Err(runtime_error("dynamic import type must be a string"));
+    };
+    if module_type != "json" {
+        return Err(runtime_error(format!(
+            "unsupported dynamic import type {module_type}"
+        )));
+    }
+    Ok(Some(DynamicImportType::Json))
+}
+
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
@@ -6114,6 +6208,72 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("loaded|2")
+        );
+    }
+
+    #[test]
+    fn dynamically_imports_a_json_module_with_explicit_attributes() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/config.json",
+                "application/json; charset=utf-8",
+                br#"{"label":"json","count":2}"#.to_vec(),
+            )
+            .expect("JSON resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                import("./config.json", { with: { type: "json" } }).then((module) => {
+                    status.textContent = module.default.label + "|" + module.default.count;
+                });
+                "#,
+            )
+            .expect("JSON dynamic import should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("json|2")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_dynamic_import_attributes() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/config.json",
+                "application/json",
+                br#"{"label":"json"}"#.to_vec(),
+            )
+            .expect("JSON resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                import("./config.json", { with: { type: "css" } }).catch((error) => {
+                    status.textContent = error;
+                });
+                "#,
+            )
+            .expect("unsupported JSON type should stay a rejected promise");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("unsupported dynamic import type css")
         );
     }
 

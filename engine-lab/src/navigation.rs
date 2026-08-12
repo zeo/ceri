@@ -1015,6 +1015,14 @@ pub(crate) fn is_javascript(resource: &Resource) -> bool {
     })
 }
 
+pub(crate) fn is_json(resource: &Resource) -> bool {
+    resource
+        .mime_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+}
+
 fn is_svg(resource: &Resource) -> bool {
     resource
         .mime_type
