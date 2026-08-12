@@ -260,6 +260,12 @@ enum Literal {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum ObjectPatternKey {
+    Static(String),
+    Computed(Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum Pattern {
     Identifier(String),
     Default {
@@ -267,7 +273,7 @@ enum Pattern {
         default: Box<Expr>,
     },
     Object {
-        properties: Vec<(String, Pattern)>,
+        properties: Vec<(ObjectPatternKey, Pattern)>,
         rest: Option<Box<Pattern>>,
     },
     Array {
@@ -1271,12 +1277,18 @@ impl ScriptRuntime {
                 if let Value::Object(object) = &value {
                     object_properties = object.borrow().clone();
                 }
-                for (property, nested) in properties {
+                for (key, nested) in properties {
+                    let property = match key {
+                        ObjectPatternKey::Static(property) => property.clone(),
+                        ObjectPatternKey::Computed(expression) => self
+                            .evaluate(expression, environment.clone())?
+                            .string_value(),
+                    };
                     consumed.insert(property.clone());
-                    let nested_value = if let Some(nested_value) = object_properties.get(property) {
+                    let nested_value = if let Some(nested_value) = object_properties.get(&property) {
                         nested_value.clone()
                     } else {
-                        self.member(value.clone(), property)
+                        self.member(value.clone(), &property)
                             .unwrap_or(Value::Undefined)
                     };
                     self.bind_pattern(nested, nested_value, environment)?;
@@ -5152,19 +5164,32 @@ impl Parser {
                         self.take(TokenKind::Comma);
                         break;
                     }
-                    let key = self.advance();
-                    let key = match key.kind {
-                        TokenKind::Identifier(key) | TokenKind::String(key) => key,
-                        _ => {
-                            return Err(self.error(
-                                "expected object binding name".to_string(),
-                                key.offset,
-                            ));
-                        }
+                    let key = if self.take(TokenKind::LBracket) {
+                        let expression = self.parse_expression()?;
+                        self.expect(TokenKind::RBracket, "computed object binding name")?;
+                        ObjectPatternKey::Computed(expression)
+                    } else {
+                        let token = self.advance();
+                        let key = match token.kind {
+                            TokenKind::Identifier(key) | TokenKind::String(key) => key,
+                            _ => {
+                                return Err(self.error(
+                                    "expected object binding name".to_string(),
+                                    token.offset,
+                                ));
+                            }
+                        };
+                        ObjectPatternKey::Static(key)
                     };
                     let nested = if self.take(TokenKind::Colon) {
                         self.parse_binding_pattern("object binding")?
                     } else {
+                        let ObjectPatternKey::Static(key) = &key else {
+                            return Err(self.error(
+                                "computed object binding needs a target".to_string(),
+                                self.peek().offset,
+                            ));
+                        };
                         self.parse_pattern_default(Pattern::Identifier(key.clone()))?
                     };
                     properties.push((key, nested));
@@ -6137,6 +6162,32 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("fallback|2|yes|one|one second|fourth|guest|Ceri|missing|present|")
+        );
+    }
+
+    #[test]
+    fn resolves_computed_object_pattern_keys_and_excludes_them_from_rest() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const payload = { status: "ready", count: 2, keep: "yes" };
+                const statusKey = "status";
+                const countKey = "count";
+                const { [statusKey]: status, [countKey]: count, ...rest } = payload;
+                document.getElementById("status").textContent =
+                  status + "|" + count + "|" + rest.keep + "|" + rest.status + "|" + rest.count;
+                "##,
+            )
+            .expect("computed object keys should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready|2|yes|undefined|undefined")
         );
     }
 
