@@ -525,20 +525,46 @@ fn recovery_status(error: &NavigationError) -> u16 {
 fn load_provider_resource(
     provider: &dyn ResourceProvider,
     url: &AppUrl,
-) -> Result<Option<Resource>, NavigationError> {
+) -> Result<Option<(AppUrl, Resource)>, NavigationError> {
+    load_provider_resource_at(provider, url, 0)
+}
+
+fn load_provider_resource_at(
+    provider: &dyn ResourceProvider,
+    url: &AppUrl,
+    redirect_depth: usize,
+) -> Result<Option<(AppUrl, Resource)>, NavigationError> {
     let Some(response) = provider.provide_response(&ResourceRequest::get(url.clone()))? else {
         return Ok(None);
     };
+    if (300..400).contains(&response.status()) {
+        if redirect_depth >= MAX_NAVIGATION_REDIRECTS {
+            return Err(NavigationError::NavigationLoop);
+        }
+        let Some(location) = response.headers().get("location") else {
+            return Err(NavigationError::HttpStatus {
+                path: url.path().to_string(),
+                status: response.status(),
+            });
+        };
+        let target = url.resolve(location)?;
+        return load_provider_resource_at(provider, &target, redirect_depth + 1);
+    }
     if !(200..300).contains(&response.status()) {
         return Err(NavigationError::HttpStatus {
             path: url.path().to_string(),
             status: response.status(),
         });
     }
-    Ok(Some(Resource::new(
-        response.mime_type().to_string(),
-        response.body().to_vec(),
+    Ok(Some((
+        url.clone(),
+        Resource::new(response.mime_type().to_string(), response.body().to_vec()),
     )))
+}
+
+struct LoadedResource {
+    url: AppUrl,
+    resource: Resource,
 }
 
 struct Page {
@@ -606,21 +632,33 @@ impl Browser {
         self
     }
 
-    fn load_resource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
+    fn load_resource(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
         match self.resources.load(url) {
-            Ok(resource) => Ok(resource),
+            Ok(resource) => Ok(LoadedResource {
+                url: url.clone(),
+                resource,
+            }),
             Err(NavigationError::ResourceNotFound(path)) => {
                 if let Some(provider) = &self.resource_provider
-                    && let Some(resource) = load_provider_resource(provider.as_ref(), url)?
+                    && let Some((loaded_url, resource)) =
+                        load_provider_resource(provider.as_ref(), url)?
                 {
-                    return Ok(resource);
+                    return Ok(LoadedResource {
+                        url: loaded_url,
+                        resource,
+                    });
                 }
                 if is_extensionless_path(url.path())
                     && let Some(provider) = &self.resource_provider
                 {
                     let shell_url = url.with_path("/index.html")?;
-                    if let Some(resource) = load_provider_resource(provider.as_ref(), &shell_url)? {
-                        return Ok(resource);
+                    if let Some((loaded_url, resource)) =
+                        load_provider_resource(provider.as_ref(), &shell_url)?
+                    {
+                        return Ok(LoadedResource {
+                            url: loaded_url,
+                            resource,
+                        });
                     }
                 }
                 Err(NavigationError::ResourceNotFound(path))
@@ -634,7 +672,7 @@ impl Browser {
             Ok(resource) => Ok(resource),
             Err(NavigationError::ResourceNotFound(path)) => {
                 if let Some(provider) = &self.resource_provider
-                    && let Some(resource) = load_provider_resource(provider.as_ref(), url)?
+                    && let Some((_, resource)) = load_provider_resource(provider.as_ref(), url)?
                 {
                     return Ok(resource);
                 }
@@ -661,7 +699,10 @@ impl Browser {
         commit: HistoryCommit,
         redirect_depth: usize,
     ) -> Result<NavigationStatus, NavigationError> {
-        let resource = match self.load_resource(&url) {
+        let LoadedResource {
+            url,
+            resource,
+        } = match self.load_resource(&url) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
                 self.install_error_page(&url, 404, &format!("resource not found: {path}"));
@@ -1711,6 +1752,40 @@ mod tests {
         }
     }
 
+    struct RedirectProvider {
+        location: String,
+        paths: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ResourceProvider for RedirectProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            let path = request.url().path().to_string();
+            self.paths.borrow_mut().push(path.clone());
+            match path.as_str() {
+                "/" => {
+                    let mut headers = BTreeMap::new();
+                    headers.insert("Location".to_string(), self.location.clone());
+                    ResourceResponse::new(302, "text/html", headers, Vec::new()).map(Some)
+                }
+                "/login" => ResourceResponse::new(
+                    200,
+                    "text/html",
+                    BTreeMap::new(),
+                    b"<p id='status'>login</p>".to_vec(),
+                )
+                .map(Some),
+                _ => Ok(None),
+            }
+        }
+    }
+
     struct RequestProvider {
         resources: BTreeMap<String, Resource>,
         requests: Rc<RefCell<Vec<ResourceRequest>>>,
@@ -2351,6 +2426,66 @@ mod tests {
             failure.detail,
             "resource request returned HTTP 404: /dashboard"
         );
+    }
+
+    #[test]
+    fn provider_relative_redirects_follow_with_one_history_entry() {
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(RedirectProvider {
+            location: "/login".to_string(),
+            paths: paths.clone(),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("provider redirect should resolve"),
+            NavigationStatus::Loaded
+        );
+        assert_eq!(browser.current_url().unwrap().path(), "/login");
+        assert_eq!(browser.history().len(), 1);
+        assert_eq!(&*paths.borrow(), &["/".to_string(), "/login".to_string()]);
+        let document = browser.document().expect("redirected document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("login")
+        );
+    }
+
+    #[test]
+    fn provider_cross_origin_redirects_are_rejected() {
+        let provider = Rc::new(RedirectProvider {
+            location: "https://other.invalid/login".to_string(),
+            paths: Rc::new(RefCell::new(Vec::new())),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect_err("cross-origin provider redirect should be rejected"),
+            NavigationError::WrongOrigin
+        );
+    }
+
+    #[test]
+    fn provider_redirect_loops_stop_at_the_navigation_limit() {
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(RedirectProvider {
+            location: "/".to_string(),
+            paths: paths.clone(),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect_err("provider redirect loop should be bounded"),
+            NavigationError::NavigationLoop
+        );
+        assert_eq!(paths.borrow().len(), MAX_NAVIGATION_REDIRECTS + 1);
     }
 
     #[test]
