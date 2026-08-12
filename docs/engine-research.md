@@ -49,6 +49,8 @@ The provider seam is now exercised by host-backed integration tests covering the
 
 ## Compatibility gates
 
+The current fetch experiment includes shared single-use response bodies, `arrayBuffer()`, and a bounded default `ReadableStream` reader with deterministic byte chunks. Full stream backpressure, teeing, BYOB readers, and native network transport remain separate gates.
+
 An experimental backend must pass these gates in order:
 
 ### Boot and origin

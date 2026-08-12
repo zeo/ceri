@@ -15,6 +15,9 @@ use std::rc::Weak;
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
 type ResponseHandle = Rc<ResponseData>;
+type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
+type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
+type ReadableStreamReaderHandle = Rc<RefCell<ReadableStreamReaderData>>;
 type HeadersHandle = Rc<BTreeMap<String, String>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
 type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
@@ -34,6 +37,7 @@ type FormDataHandle = Rc<RefCell<FormDataData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
+type BytesHandle = Rc<Vec<u8>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -75,6 +79,9 @@ enum Value {
     ClassList(ElementHandle),
     Event(EventData),
     Response(ResponseHandle),
+    Bytes(BytesHandle),
+    ReadableStream(ReadableStreamHandle),
+    ReadableStreamReader(ReadableStreamReaderHandle),
     Headers(HeadersHandle),
     Promise(PromiseHandle),
     Document,
@@ -195,6 +202,12 @@ enum Builtin {
     HeadersGet(HeadersHandle),
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
+    ResponseBytes(ResponseHandle),
+    ReadableStreamGetReader(ReadableStreamHandle),
+    ReadableStreamCancel(ReadableStreamHandle),
+    ReadableStreamReaderRead(ReadableStreamReaderHandle),
+    ReadableStreamReaderReleaseLock(ReadableStreamReaderHandle),
+    ReadableStreamReaderCancel(ReadableStreamReaderHandle),
     AbortControllerAbort(AbortControllerHandle),
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
@@ -635,7 +648,25 @@ struct ResponseData {
     status: u16,
     mime_type: String,
     headers: HeadersHandle,
-    body: Vec<u8>,
+    body: ResponseBodyHandle,
+}
+
+struct ResponseBodyData {
+    bytes: Vec<u8>,
+    cursor: usize,
+    consumed: bool,
+    disturbed: bool,
+    locked: bool,
+}
+
+struct ReadableStreamData {
+    body: ResponseBodyHandle,
+    canceled: bool,
+}
+
+struct ReadableStreamReaderData {
+    body: ResponseBodyHandle,
+    released: bool,
 }
 
 #[derive(Clone)]
@@ -2145,10 +2176,42 @@ impl ScriptRuntime {
                 "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
                 "mimeType" => Ok(Value::String(response.mime_type.clone())),
                 "headers" => Ok(Value::Headers(response.headers.clone())),
+                "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
+                "body" => Ok(Value::ReadableStream(Rc::new(RefCell::new(
+                    ReadableStreamData {
+                        body: response.body.clone(),
+                        canceled: false,
+                    },
+                )))),
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
+                "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
+                ))),
+            },
+            Value::ReadableStream(stream) => match property {
+                "locked" => Ok(Value::Bool(stream.borrow().body.borrow().locked)),
+                "getReader" => Ok(Value::Builtin(Builtin::ReadableStreamGetReader(stream))),
+                "cancel" => Ok(Value::Builtin(Builtin::ReadableStreamCancel(stream))),
+                _ => Err(runtime_error(format!(
+                    "ReadableStream has no property {property}"
+                ))),
+            },
+            Value::ReadableStreamReader(reader) => match property {
+                "read" => Ok(Value::Builtin(Builtin::ReadableStreamReaderRead(reader))),
+                "releaseLock" => Ok(Value::Builtin(
+                    Builtin::ReadableStreamReaderReleaseLock(reader),
+                )),
+                "cancel" => Ok(Value::Builtin(Builtin::ReadableStreamReaderCancel(reader))),
+                _ => Err(runtime_error(format!(
+                    "ReadableStreamDefaultReader has no property {property}"
+                ))),
+            },
+            Value::Bytes(bytes) => match property {
+                "byteLength" | "length" => Ok(Value::Number(bytes.len() as f64)),
+                _ => Err(runtime_error(format!(
+                    "ArrayBuffer has no property {property}"
                 ))),
             },
             Value::Headers(headers) => match property {
@@ -2315,6 +2378,17 @@ impl ScriptRuntime {
                     .chars()
                     .nth(index as usize)
                     .map(|character| Value::String(character.to_string()))
+                    .unwrap_or(Value::Undefined))
+            }
+            Value::Bytes(bytes) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(bytes
+                    .get(index as usize)
+                    .copied()
+                    .map(|byte| Value::Number(byte as f64))
                     .unwrap_or(Value::Undefined))
             }
             _ => Err(runtime_error("value cannot be indexed")),
@@ -3567,15 +3641,108 @@ impl ScriptRuntime {
                     .map(Value::String)
                     .unwrap_or(Value::Null))
             }
-            Builtin::ResponseText(response) => Ok(Value::Promise(self.fulfilled_promise(
-                Value::String(String::from_utf8_lossy(&response.body).into_owned()),
-            ))),
+            Builtin::ResponseText(response) => match self.consume_response_body(&response) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
+                    String::from_utf8_lossy(&body).into_owned(),
+                )))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
             Builtin::ResponseJson(response) => {
-                let source = String::from_utf8_lossy(&response.body);
+                let body = match self.consume_response_body(&response) {
+                    Ok(body) => body,
+                    Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+                };
+                let source = String::from_utf8_lossy(&body);
                 match self.parse_json(&source) {
                     Ok(value) => Ok(Value::Promise(self.fulfilled_promise(value))),
                     Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
                 }
+            }
+            Builtin::ResponseBytes(response) => match self.consume_response_body(&response) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(Rc::new(
+                    body,
+                ))))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
+            Builtin::ReadableStreamGetReader(stream) => {
+                let body = stream.borrow().body.clone();
+                let mut body_state = body.borrow_mut();
+                if body_state.locked || body_state.disturbed || body_state.consumed {
+                    return Err(runtime_error("readable stream is already used"));
+                }
+                body_state.locked = true;
+                drop(body_state);
+                Ok(Value::ReadableStreamReader(Rc::new(RefCell::new(
+                    ReadableStreamReaderData {
+                        body,
+                        released: false,
+                    },
+                ))))
+            }
+            Builtin::ReadableStreamCancel(stream) => {
+                let mut stream = stream.borrow_mut();
+                if stream.canceled {
+                    return Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)));
+                }
+                {
+                    let mut body = stream.body.borrow_mut();
+                    body.cursor = body.bytes.len();
+                    body.consumed = true;
+                    body.disturbed = true;
+                    body.locked = false;
+                }
+                stream.canceled = true;
+                Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
+            }
+            Builtin::ReadableStreamReaderRead(reader) => {
+                let reader = reader.borrow();
+                if reader.released {
+                    return Ok(Value::Promise(
+                        self.rejected_promise("readable stream reader has been released"),
+                    ));
+                }
+                let mut body = reader.body.borrow_mut();
+                if body.cursor >= body.bytes.len() {
+                    body.consumed = true;
+                    body.disturbed = true;
+                    return Ok(Value::Promise(self.fulfilled_promise(read_result(
+                        Value::Undefined,
+                        true,
+                    ))));
+                }
+                body.disturbed = true;
+                let end = body.cursor.saturating_add(16).min(body.bytes.len());
+                let chunk = Rc::new(body.bytes[body.cursor..end].to_vec());
+                body.cursor = end;
+                Ok(Value::Promise(self.fulfilled_promise(read_result(
+                    Value::Bytes(chunk),
+                    false,
+                ))))
+            }
+            Builtin::ReadableStreamReaderReleaseLock(reader) => {
+                let mut reader = reader.borrow_mut();
+                if !reader.released {
+                    reader.body.borrow_mut().locked = false;
+                    reader.released = true;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ReadableStreamReaderCancel(reader) => {
+                let mut reader = reader.borrow_mut();
+                if reader.released {
+                    return Ok(Value::Promise(
+                        self.rejected_promise("readable stream reader has been released"),
+                    ));
+                }
+                {
+                    let mut body = reader.body.borrow_mut();
+                    body.cursor = body.bytes.len();
+                    body.consumed = true;
+                    body.disturbed = true;
+                    body.locked = false;
+                }
+                reader.released = true;
+                Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
             }
             Builtin::AbortControllerAbort(controller) => {
                 let reason = arguments
@@ -4134,7 +4301,7 @@ impl ScriptRuntime {
                     status: 404,
                     mime_type: String::new(),
                     headers: Rc::new(BTreeMap::new()),
-                    body: Vec::new(),
+                    body: response_body(Vec::new()),
                 })));
             }
             Err(error) => return self.rejected_promise(error.message),
@@ -4144,8 +4311,19 @@ impl ScriptRuntime {
             status: response.status(),
             mime_type: response.mime_type().to_string(),
             headers: Rc::new(response.headers().clone()),
-            body: response.body().to_vec(),
+            body: response_body(response.body().to_vec()),
         })))
+    }
+
+    fn consume_response_body(&self, response: &ResponseHandle) -> Result<Vec<u8>, ScriptError> {
+        let mut body = response.body.borrow_mut();
+        if body.consumed || body.disturbed || body.locked {
+            return Err(runtime_error("response body is already used"));
+        }
+        body.cursor = body.bytes.len();
+        body.consumed = true;
+        body.disturbed = true;
+        Ok(body.bytes.clone())
     }
 
     fn parse_json(&mut self, source: &str) -> Result<Value, ScriptError> {
@@ -4411,6 +4589,9 @@ impl Value {
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
             Self::Response(_) => "[response]".to_string(),
+            Self::Bytes(_) => "[object ArrayBuffer]".to_string(),
+            Self::ReadableStream(_) => "[object ReadableStream]".to_string(),
+            Self::ReadableStreamReader(_) => "[object ReadableStreamDefaultReader]".to_string(),
             Self::Headers(_) => "[object Headers]".to_string(),
             Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
@@ -4473,6 +4654,28 @@ fn abort_event_value() -> Value {
     event.insert("type".to_string(), Value::String("abort".to_string()));
     event.insert("defaultPrevented".to_string(), Value::Bool(false));
     Value::Object(Rc::new(RefCell::new(event)))
+}
+
+fn response_body(bytes: Vec<u8>) -> ResponseBodyHandle {
+    Rc::new(RefCell::new(ResponseBodyData {
+        bytes,
+        cursor: 0,
+        consumed: false,
+        disturbed: false,
+        locked: false,
+    }))
+}
+
+fn response_body_used(body: &ResponseBodyHandle) -> bool {
+    let body = body.borrow();
+    body.consumed || body.disturbed || body.locked
+}
+
+fn read_result(value: Value, done: bool) -> Value {
+    let mut result = BTreeMap::new();
+    result.insert("value".to_string(), value);
+    result.insert("done".to_string(), Value::Bool(done));
+    Value::Object(Rc::new(RefCell::new(result)))
 }
 
 fn serialize_json(value: &Value) -> Result<String, ScriptError> {
@@ -4787,6 +4990,9 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::ClassList(_)
         | Value::Event(_)
         | Value::Response(_)
+        | Value::Bytes(_)
+        | Value::ReadableStream(_)
+        | Value::ReadableStreamReader(_)
         | Value::Headers(_)
         | Value::Promise(_)
         | Value::Document
@@ -4861,6 +5067,11 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
+        (Value::Bytes(left), Value::Bytes(right)) => Rc::ptr_eq(left, right),
+        (Value::ReadableStream(left), Value::ReadableStream(right)) => Rc::ptr_eq(left, right),
+        (Value::ReadableStreamReader(left), Value::ReadableStreamReader(right)) => {
+            Rc::ptr_eq(left, right)
+        }
         _ => false,
     }
 }
@@ -7922,6 +8133,147 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready|false")
+        );
+    }
+
+    #[test]
+    fn response_body_consumption_is_single_use() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"hello".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    response.text().then((body) => {
+                        status.textContent = body + "|" + response.bodyUsed;
+                        response.text().catch((error) => {
+                            status.textContent = status.textContent + "|" + error;
+                        });
+                    });
+                });
+                "#,
+            )
+            .expect("response body should be consumed once");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello|true|response body is already used")
+        );
+    }
+
+    #[test]
+    fn response_body_stream_reads_fixed_chunks_and_reports_done() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/data.txt",
+                "text/plain",
+                b"0123456789abcdefghijklmnop".to_vec(),
+            )
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    const stream = response.body;
+                    const reader = stream.getReader();
+                    reader.read().then((first) => {
+                        reader.read().then((second) => {
+                            reader.read().then((third) => {
+                                status.textContent = stream.locked + "|" + response.bodyUsed + "|" + first.value.length + "|" + second.value.length + "|" + third.done;
+                                reader.releaseLock();
+                            });
+                        });
+                    });
+                });
+                "#,
+            )
+            .expect("response body stream should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|true|16|10|true")
+        );
+    }
+
+    #[test]
+    fn response_array_buffer_exposes_bytes_and_body_used_state() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.bin", "application/octet-stream", vec![4, 8, 15, 16])
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.bin").then((response) => {
+                    response.arrayBuffer().then((buffer) => {
+                        status.textContent = buffer.byteLength + "|" + buffer[1] + "|" + response.bodyUsed;
+                    });
+                });
+                "#,
+            )
+            .expect("arrayBuffer should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("4|8|true")
+        );
+    }
+
+    #[test]
+    fn response_reader_cancel_disturbs_the_shared_body() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"cancel me".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/data.txt").then((response) => {
+                    const reader = response.body.getReader();
+                    reader.cancel("stop").then(() => {
+                        response.text().catch((error) => {
+                            status.textContent = response.bodyUsed + "|" + error;
+                        });
+                    });
+                });
+                "#,
+            )
+            .expect("reader cancellation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|response body is already used")
         );
     }
 
