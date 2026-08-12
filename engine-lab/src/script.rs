@@ -55,6 +55,7 @@ enum Value {
     Number(f64),
     String(String),
     Symbol(String),
+    Binding(Rc<RefCell<Value>>, bool),
     Object(ObjectHandle),
     Array(ArrayHandle),
     NodeList(NodeListHandle),
@@ -853,12 +854,6 @@ impl ScriptRuntime {
         let resource = resources
             .resource(url.path())
             .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
-        if matches!(import_type, Some(DynamicImportType::Json))
-            && is_json(resource)
-            && let Some(namespace) = self.module_cache.get(&url.to_string())
-        {
-            return Ok(namespace.clone());
-        }
         match import_type {
             None => {
                 if !is_javascript(resource) {
@@ -888,10 +883,7 @@ impl ScriptRuntime {
                 let value = self.parse_json(&source)?;
                 let mut values = BTreeMap::new();
                 values.insert("default".to_string(), value);
-                let namespace = ModuleNamespace { values };
-                self.module_cache
-                    .insert(url.to_string(), namespace.clone());
-                Ok(namespace)
+                Ok(ModuleNamespace { values })
             }
         }
     }
@@ -931,6 +923,14 @@ impl ScriptRuntime {
             .borrow_mut()
             .values
             .insert("import".to_string(), Value::ModuleImport(url.clone()));
+        {
+            let mut values = environment.borrow_mut();
+            for export in &program.exports {
+                values.values.entry(export.local.clone()).or_insert_with(|| {
+                    Value::Binding(Rc::new(RefCell::new(Value::Undefined)), true)
+                });
+            }
+        }
         for import in &program.imports {
             let (dependency_url, dependency_source) = loader.load_module(&url, &import.source)?;
             let namespace = self.execute_module_graph(&dependency_source, dependency_url, loader)?;
@@ -948,6 +948,10 @@ impl ScriptRuntime {
                             ))
                         })?,
                     ModuleImportBinding::Namespace { .. } => namespace.object_value(),
+                };
+                let value = match value {
+                    Value::Binding(binding, _) => Value::Binding(binding, false),
+                    value => value,
                 };
                 let local = match binding {
                     ModuleImportBinding::Named { local, .. }
@@ -972,7 +976,7 @@ impl ScriptRuntime {
         let mut exports = BTreeMap::new();
         for export in program.exports {
             let value = values
-                .get(&export.local)
+                .get_raw(&export.local)
                 .ok_or_else(|| runtime_error(format!("module export {} is undefined", export.local)))?;
             exports.insert(export.exported, value);
         }
@@ -1317,10 +1321,15 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         match pattern {
             Pattern::Identifier(name) => {
-                environment
-                    .borrow_mut()
-                    .values
-                    .insert(name.clone(), value);
+                let existing = environment.borrow().values.get(name).cloned();
+                if let Some(Value::Binding(binding, true)) = existing {
+                    *binding.borrow_mut() = value;
+                } else {
+                    environment
+                        .borrow_mut()
+                        .values
+                        .insert(name.clone(), value);
+                }
                 Ok(())
             }
             Pattern::Default { pattern, default } => {
@@ -1496,13 +1505,16 @@ impl ScriptRuntime {
                 Err(runtime_error(message))
             }
             Stmt::Class { name, extends } => {
-                environment.borrow_mut().values.insert(
-                    name.clone(),
-                    Value::Class(Rc::new(ClassDefinition {
-                        name: name.clone(),
-                        extends: extends.clone(),
-                    })),
-                );
+                let class = Value::Class(Rc::new(ClassDefinition {
+                    name: name.clone(),
+                    extends: extends.clone(),
+                }));
+                let existing = environment.borrow().values.get(name).cloned();
+                if let Some(Value::Binding(binding, true)) = existing {
+                    *binding.borrow_mut() = class;
+                } else {
+                    environment.borrow_mut().values.insert(name.clone(), class);
+                }
                 Ok(Completion::Normal)
             }
             Stmt::Return(expression) => Ok(Completion::Return(
@@ -1718,7 +1730,7 @@ impl ScriptRuntime {
                     self.request_location_navigation(value.string_value(), false);
                     return Ok(());
                 }
-                if !environment.borrow_mut().assign(name, value.clone()) {
+                if !environment.borrow_mut().assign(name, value.clone())? {
                     environment.borrow_mut().values.insert(name.clone(), value);
                 }
                 Ok(())
@@ -1732,7 +1744,7 @@ impl ScriptRuntime {
     }
 
     fn member(&self, object: Value, property: &str) -> Result<Value, ScriptError> {
-        match object {
+        match object.resolve() {
             Value::Document => match property {
                 "getElementById" => Ok(Value::Builtin(Builtin::DocumentGetElementById)),
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
@@ -2080,7 +2092,7 @@ impl ScriptRuntime {
             Value::Object(object) => Ok(object
                 .borrow()
                 .get(property)
-                .cloned()
+                .map(Value::resolve)
                 .unwrap_or(Value::Undefined)),
             Value::Array(array) => {
                 match property {
@@ -2144,11 +2156,11 @@ impl ScriptRuntime {
     }
 
     fn index(&self, object: Value, index: Value) -> Result<Value, ScriptError> {
-        match object {
+        match object.resolve() {
             Value::Object(object) => Ok(object
                 .borrow()
                 .get(&index.property_key())
-                .cloned()
+                .map(Value::resolve)
                 .unwrap_or(Value::Undefined)),
             Value::Array(array) => {
                 let index = index.number()?;
@@ -2195,7 +2207,7 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         let truthy = value.truthy();
         let value = value.string_value();
-        let updated = match object {
+        let updated = match object.resolve() {
             Value::Element(handle) => match property {
                 "textContent" => self.set_element_text_content(&handle, value),
                 "className" => self.set_element_attribute(&handle, "class", value),
@@ -2438,7 +2450,7 @@ impl ScriptRuntime {
     }
 
     fn call(&mut self, callee: Value, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        match callee {
+        match callee.resolve() {
             Value::Function(function) => {
                 let environment = Rc::new(RefCell::new(Environment {
                     values: HashMap::new(),
@@ -4067,21 +4079,39 @@ enum Completion {
 
 impl Environment {
     fn get(&self, name: &str) -> Option<Value> {
-        self.values.get(name).cloned().or_else(|| {
+        self.get_raw(name).map(|value| value.resolve()).or_else(|| {
             self.parent
                 .as_ref()
                 .and_then(|parent| parent.borrow().get(name))
         })
     }
 
-    fn assign(&mut self, name: &str, value: Value) -> bool {
-        if self.values.contains_key(name) {
-            self.values.insert(name.to_string(), value);
-            true
+    fn get_raw(&self, name: &str) -> Option<Value> {
+        self.values.get(name).cloned().or_else(|| {
+            self.parent
+                .as_ref()
+                .and_then(|parent| parent.borrow().get_raw(name))
+        })
+    }
+
+    fn assign(&mut self, name: &str, value: Value) -> Result<bool, ScriptError> {
+        if let Some(existing) = self.values.get(name).cloned() {
+            match existing {
+                Value::Binding(binding, true) => *binding.borrow_mut() = value,
+                Value::Binding(_, false) => {
+                    return Err(runtime_error(format!(
+                        "cannot assign to imported binding {name}"
+                    )))
+                }
+                _ => {
+                    self.values.insert(name.to_string(), value);
+                }
+            }
+            Ok(true)
         } else if let Some(parent) = &self.parent {
             parent.borrow_mut().assign(name, value)
         } else {
-            false
+            Ok(false)
         }
     }
 }
@@ -4104,8 +4134,16 @@ impl Literal {
 }
 
 impl Value {
-    fn truthy(&self) -> bool {
+    fn resolve(&self) -> Value {
         match self {
+            Self::Binding(binding, _) => binding.borrow().resolve(),
+            _ => self.clone(),
+        }
+    }
+
+    fn truthy(&self) -> bool {
+        let value = self.resolve();
+        match &value {
             Self::Undefined | Self::Null => false,
             Self::Bool(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
@@ -4115,7 +4153,8 @@ impl Value {
     }
 
     fn number(&self) -> Result<f64, ScriptError> {
-        match self {
+        let value = self.resolve();
+        match &value {
             Self::Number(value) => Ok(*value),
             Self::String(value) => value
                 .parse()
@@ -4126,7 +4165,8 @@ impl Value {
     }
 
     fn string_value(&self) -> String {
-        match self {
+        let value = self.resolve();
+        match &value {
             Self::Undefined => "undefined".to_string(),
             Self::Null => "null".to_string(),
             Self::Bool(value) => value.to_string(),
@@ -4134,6 +4174,7 @@ impl Value {
             Self::Number(value) => value.to_string(),
             Self::String(value) => value.clone(),
             Self::Symbol(value) => format!("Symbol({value})"),
+            Self::Binding(_, _) => unreachable!("binding values resolve before formatting"),
             Self::Object(_) => "[object Object]".to_string(),
             Self::Array(_) => "[array]".to_string(),
             Self::NodeList(_) => "[object NodeList]".to_string(),
@@ -4184,7 +4225,7 @@ impl Value {
     }
 
     fn property_key(&self) -> String {
-        match self {
+        match self.resolve() {
             Self::Symbol(value) => value.clone(),
             _ => self.string_value(),
         }
@@ -4192,7 +4233,8 @@ impl Value {
 }
 
 fn serialize_json(value: &Value) -> Result<String, ScriptError> {
-    match value {
+    let value = value.resolve();
+    match &value {
         Value::Undefined => Ok("null".to_string()),
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(value.to_string()),
@@ -4486,7 +4528,8 @@ fn evaluate_binary(
 }
 
 fn value_typeof(value: &Value) -> &'static str {
-    match value {
+    let value = value.resolve();
+    match &value {
         Value::Undefined => "undefined",
         Value::Null
         | Value::Object(_)
@@ -4519,6 +4562,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Number(_) => "number",
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
+        Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
         Value::Function(_)
         | Value::Builtin(_)
         | Value::UrlConstructor
@@ -4538,7 +4582,7 @@ fn value_typeof(value: &Value) -> &'static str {
 }
 
 fn error_handle(value: &Value) -> ErrorHandle {
-    match value {
+    match value.resolve() {
         Value::Error(error) => error.clone(),
         _ => Rc::new(ErrorData {
             name: "Error".to_string(),
@@ -4550,12 +4594,17 @@ fn error_handle(value: &Value) -> ErrorHandle {
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
+    let left = left.resolve();
+    let right = right.resolve();
+    match (&left, &right) {
         (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::Binding(_, _), _) | (_, Value::Binding(_, _)) => {
+            unreachable!("binding values resolve before comparison")
+        }
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
@@ -4579,7 +4628,7 @@ impl ScriptRuntime {
     }
 
     fn iterable_values(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
-        match value {
+        match value.resolve() {
             Value::Array(values) => Ok(values.borrow().clone()),
             Value::NodeList(nodes) => Ok(nodes.iter().cloned().map(Value::Element).collect()),
             Value::String(string) => Ok(string
@@ -6169,6 +6218,70 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("explicit|2")
         );
+    }
+
+    #[test]
+    fn keeps_named_and_namespace_imports_live_after_source_updates() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([
+                (
+                    "/barrel.js".to_string(),
+                    r#"export { count, increment } from "./counter.js";"#.to_string(),
+                ),
+                (
+                    "/counter.js".to_string(),
+                    r#"export let count = 1; export function increment() { count = count + 1; }"#
+                        .to_string(),
+                ),
+            ]),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                r#"
+                import { count, increment } from "./barrel.js";
+                import * as counter from "./barrel.js";
+                const status = document.getElementById("status");
+                status.textContent = count + "|" + counter.count;
+                increment();
+                status.textContent = status.textContent + "|" + count + "|" + counter.count;
+                "#,
+                base,
+                &mut loader,
+            )
+            .expect("live module bindings should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|1|2|2")
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_to_an_imported_live_binding() {
+        let document = document("<p>module</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([(
+                "/counter.js".to_string(),
+                "export let count = 1;".to_string(),
+            )]),
+        };
+        let mut runtime = ScriptRuntime::new(document);
+        let error = match runtime.execute_module(
+            r#"import { count } from "./counter.js"; count = 2;"#,
+            base,
+            &mut loader,
+        ) {
+            Ok(_) => panic!("imported bindings should be read-only"),
+            Err(error) => error,
+        };
+        assert_eq!(error.message, "cannot assign to imported binding count");
     }
 
     #[test]
