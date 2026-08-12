@@ -1,4 +1,4 @@
-use ceri_engine_lab::{APP_ORIGIN, Browser, ResourceBundle, Size};
+use ceri_engine_lab::{APP_ORIGIN, Browser, EngineHost, InputEvent, ResourceBundle, Size};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,37 +43,46 @@ fn main() -> Result<(), String> {
             source.into_bytes(),
         )
         .map_err(|error| error.to_string())?;
-    let mut browser = Browser::new(resources);
-    let status = browser
+    let mut host = EngineHost::new(Browser::new(resources), options.viewport);
+    let status = host
         .navigate(&options.url)
         .map_err(|error| error.to_string())?;
     println!("navigation {}: {status}", options.url);
     for id in &options.clicks {
-        let dispatched = browser.click_id(id).map_err(|error| error.to_string())?;
+        let dispatched = host.click_id(id).map_err(|error| error.to_string())?;
         println!(
             "click #{id}: {}",
             if dispatched { "handled" } else { "no listener" }
         );
     }
     for &(x, y) in &options.click_points {
-        let dispatched = browser
-            .click_at(options.viewport, x, y)
+        let result = host
+            .input(InputEvent::Click { x, y })
             .map_err(|error| error.to_string())?;
         println!(
             "click @{x},{y}: {}",
-            if dispatched { "handled" } else { "no listener" }
+            if result.handled {
+                "handled"
+            } else {
+                "no listener"
+            }
         );
     }
     for milliseconds in &options.ticks {
-        let executed = browser
-            .advance_time(*milliseconds)
+        let executed = host
+            .input(InputEvent::AdvanceTime(*milliseconds))
             .map_err(|error| error.to_string())?;
-        println!("advanced {milliseconds}ms: {executed} task(s)");
+        println!("advanced {milliseconds}ms: {} task(s)", executed.tasks_run);
     }
-    let layout = browser
+    let layout = host
+        .browser()
         .layout(options.viewport)
         .map_err(|error| error.to_string())?;
-    let canvas = layout.paint();
+    let frame = host
+        .render()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "host did not produce a frame".to_string())?;
+    let canvas = frame.canvas;
     if let Some(parent) = options
         .output
         .parent()
@@ -102,7 +111,7 @@ fn main() -> Result<(), String> {
         canvas.non_background_pixels(),
         options.output.display()
     );
-    for log in browser.console_logs() {
+    for log in host.browser().console_logs() {
         println!("console: {log}");
     }
     Ok(())

@@ -417,6 +417,16 @@ impl Browser {
     }
 
     pub fn click_at(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
+        self.dispatch_at(viewport, x, y, "click")
+    }
+
+    pub fn dispatch_at(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+        event: &str,
+    ) -> Result<bool, NavigationError> {
         let path = self.layout(viewport)?.hit_test(x, y);
         let Some(path) = path else {
             return Ok(false);
@@ -425,7 +435,7 @@ impl Browser {
             .as_mut()
             .ok_or(NavigationError::NoPage)?
             .runtime
-            .click_path(path)
+            .dispatch_path_event(path, event)
             .map_err(|error| NavigationError::Script(error.to_string()))
     }
 

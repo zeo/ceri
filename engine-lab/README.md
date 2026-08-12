@@ -12,6 +12,7 @@ The current slice implements:
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
 - layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
+- a platform-neutral `EngineHost` frame and input boundary
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - bubbling DOM events with `type`, `target`, and `currentTarget` values
 - element attributes, inline styles, and `classList` state mutation
@@ -70,3 +71,5 @@ The same sample can dispatch a pointer location through layout hit testing inste
 ```powershell
 cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo-pointer.bmp --width 800 --height 360 --click-at 60,160
 ```
+
+`EngineHost` is the native-window boundary. A platform adapter navigates it, submits `InputEvent` values, calls `render`, and uploads `Frame.canvas.rgba_pixels()` using `Frame.canvas.bytes_per_row()`. The lab CLI uses this boundary for navigation, coordinate input, timers, and presentation.

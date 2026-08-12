@@ -265,6 +265,14 @@ impl ScriptRuntime {
         self.dispatch_event(path, "click")
     }
 
+    pub fn dispatch_path_event(
+        &mut self,
+        path: NodePath,
+        event: &str,
+    ) -> Result<bool, ScriptError> {
+        self.dispatch_event(path, event)
+    }
+
     pub fn logs(&self) -> &[String] {
         &self.logs
     }

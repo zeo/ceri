@@ -34,6 +34,14 @@ impl Canvas {
         self.height
     }
 
+    pub fn rgba_pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    pub fn bytes_per_row(&self) -> usize {
+        self.width as usize * 4
+    }
+
     pub fn non_background_pixels(&self) -> usize {
         let background = [
             self.background.red,
