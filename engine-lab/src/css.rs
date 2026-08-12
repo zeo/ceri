@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub enum Display {
     Block,
     Flex,
+    Grid,
     Inline,
     None,
 }
@@ -145,6 +146,29 @@ pub(crate) enum AlignItems {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum GridTrack {
+    Auto,
+    Px(f32),
+    Percent(f32),
+    Fr(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GridTemplate {
+    pub tracks: [GridTrack; 8],
+    pub count: usize,
+}
+
+impl GridTemplate {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            tracks: [GridTrack::Auto; 8],
+            count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Style {
     pub display: Display,
     pub width: Length,
@@ -164,6 +188,8 @@ pub(crate) struct Style {
     pub align_items: AlignItems,
     pub gap: Length,
     pub flex_grow: f32,
+    pub grid_template_columns: GridTemplate,
+    pub grid_template_rows: GridTemplate,
 }
 
 impl Style {
@@ -192,6 +218,8 @@ impl Style {
             align_items: AlignItems::Stretch,
             gap: Length::Px(0.0),
             flex_grow: 0.0,
+            grid_template_columns: GridTemplate::empty(),
+            grid_template_rows: GridTemplate::empty(),
         };
         match name {
             "body" => {
@@ -569,6 +597,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             style.display = match value.trim().to_ascii_lowercase().as_str() {
                 "none" => Display::None,
                 "flex" => Display::Flex,
+                "grid" => Display::Grid,
                 "inline" => Display::Inline,
                 _ => Display::Block,
             };
@@ -622,6 +651,8 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "gap" | "row-gap" | "column-gap" => style.gap = parse_length(value).unwrap_or(style.gap),
+        "grid-template-columns" => style.grid_template_columns = parse_grid_template(value),
+        "grid-template-rows" => style.grid_template_rows = parse_grid_template(value),
         "flex-grow" => style.flex_grow = parse_number(value).unwrap_or(style.flex_grow).max(0.0),
         "flex" => {
             if let Some(grow) = value.split_ascii_whitespace().find_map(parse_number) {
@@ -728,6 +759,49 @@ fn parse_line_height(value: &str) -> Option<Length> {
 
 fn parse_number(value: &str) -> Option<f32> {
     value.trim().parse().ok()
+}
+
+fn parse_grid_template(value: &str) -> GridTemplate {
+    let mut template = GridTemplate::empty();
+    let mut tracks = Vec::new();
+    let value = value.replace(", ", ",");
+    for token in value.split_ascii_whitespace() {
+        if let Some(contents) = token
+            .strip_prefix("repeat(")
+            .and_then(|contents| contents.strip_suffix(')'))
+            && let Some((count, track)) = contents.split_once(',')
+            && let Ok(count) = count.trim().parse::<usize>()
+            && let Some(track) = parse_grid_track(track.trim())
+        {
+            tracks.extend(std::iter::repeat_n(track, count));
+            continue;
+        }
+        if let Some(track) = parse_grid_track(token) {
+            tracks.push(track);
+        }
+    }
+    for (index, track) in tracks.into_iter().take(template.tracks.len()).enumerate() {
+        template.tracks[index] = track;
+        template.count += 1;
+    }
+    template
+}
+
+fn parse_grid_track(value: &str) -> Option<GridTrack> {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "auto" {
+        return Some(GridTrack::Auto);
+    }
+    if let Some(value) = value.strip_suffix("fr") {
+        return value.parse::<f32>().ok().filter(|value| *value > 0.0).map(GridTrack::Fr);
+    }
+    if let Some(value) = value.strip_suffix("px") {
+        return value.parse::<f32>().ok().map(GridTrack::Px);
+    }
+    if let Some(value) = value.strip_suffix('%') {
+        return value.parse::<f32>().ok().map(GridTrack::Percent);
+    }
+    None
 }
 
 fn default_display(name: &str) -> Display {
@@ -855,6 +929,31 @@ mod tests {
         assert_eq!(style.align_items, AlignItems::FlexEnd);
         assert_eq!(style.gap, Length::Px(12.0));
         assert_eq!(style.flex_grow, 2.0);
+    }
+
+    #[test]
+    fn parses_core_grid_tracks() {
+        let stylesheet = Stylesheet::parse(
+            ".grid { display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: 48px auto; gap: 12px; }",
+        )
+        .expect("stylesheet should parse");
+        let mut element = Element::new("div");
+        element
+            .attrs
+            .insert("class".to_string(), "grid".to_string());
+        let style = stylesheet.style_for_inherited_with_ancestors(
+            &element,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(style.display, Display::Grid);
+        assert_eq!(style.grid_template_columns.count, 2);
+        assert_eq!(style.grid_template_columns.tracks[0], GridTrack::Fr(1.0));
+        assert_eq!(style.grid_template_rows.count, 2);
+        assert_eq!(style.grid_template_rows.tracks[0], GridTrack::Px(48.0));
+        assert_eq!(style.gap, Length::Px(12.0));
     }
 
     #[test]

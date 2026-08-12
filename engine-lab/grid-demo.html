@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        margin: 28px;
+        background-color: #07131f;
+        color: #d8eef2;
+      }
+      main {
+        padding: 24px;
+        background-color: #102638;
+        border: 2px solid #2c6676;
+      }
+      h1 {
+        margin: 0 0 16px;
+        color: #6ee7c5;
+        font-size: 28px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-template-rows: 72px 72px;
+        gap: 12px;
+      }
+      .card {
+        padding: 12px;
+        color: #07131f;
+        background-color: #6ee7c5;
+        border: 2px solid #ffd479;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>grid layout laboratory</h1>
+      <div class="grid">
+        <div class="card">first card</div>
+        <div class="card">second card</div>
+        <div class="card">third card</div>
+        <div class="card">fourth card</div>
+      </div>
+    </main>
+  </body>
+</html>

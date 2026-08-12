@@ -1,6 +1,6 @@
 use crate::css::{
-    AlignItems, Color, Display, Edges, FlexDirection, FontWeight, JustifyContent, Style,
-    Stylesheet, TextAlign,
+    AlignItems, Color, Display, Edges, FlexDirection, FontWeight, GridTemplate, GridTrack,
+    JustifyContent, Style, Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
 
@@ -107,6 +107,30 @@ struct FlexItem<'a> {
 }
 
 struct FlexLayoutInput<'a> {
+    element: &'a Element,
+    path: NodePath,
+    ancestors: Vec<&'a Element>,
+    style: Style,
+    stylesheet: &'a Stylesheet,
+    margin: ResolvedEdges,
+    padding: ResolvedEdges,
+    border: f32,
+    rect: Rect,
+    content_x: f32,
+    content_y: f32,
+    content_width: f32,
+    font_size: f32,
+}
+
+struct GridItem<'a> {
+    element: &'a Element,
+    path: NodePath,
+    style: Style,
+    margin: ResolvedEdges,
+    layout: Option<LayoutBox>,
+}
+
+struct GridLayoutInput<'a> {
     element: &'a Element,
     path: NodePath,
     ancestors: Vec<&'a Element>,
@@ -270,6 +294,23 @@ fn layout_element(
             font_size,
         }));
     }
+    if style.display == Display::Grid {
+        return Some(layout_grid_element(GridLayoutInput {
+            element,
+            path,
+            ancestors: ancestors.to_vec(),
+            style,
+            stylesheet,
+            margin,
+            padding,
+            border,
+            rect,
+            content_x,
+            content_y,
+            content_width,
+            font_size,
+        }));
+    }
     let line_height = style
         .line_height
         .resolve(font_size, font_size)
@@ -308,7 +349,10 @@ fn layout_element(
                 if child_style.display == Display::None {
                     continue;
                 }
-                if matches!(child_style.display, Display::Block | Display::Flex) {
+                if matches!(
+                    child_style.display,
+                    Display::Block | Display::Flex | Display::Grid
+                ) {
                     flush_line(
                         &mut line,
                         &mut text,
@@ -620,6 +664,227 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         children,
         margin,
     }
+}
+
+fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
+    let GridLayoutInput {
+        element,
+        path,
+        ancestors,
+        style,
+        stylesheet,
+        margin,
+        padding,
+        border,
+        rect,
+        content_x,
+        content_y,
+        content_width,
+        font_size,
+    } = input;
+    let child_parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+    };
+    let mut child_ancestors = ancestors;
+    child_ancestors.push(element);
+    let mut items = Vec::new();
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        let child_style = stylesheet.style_for_inherited_with_ancestors(
+            child,
+            &child_ancestors,
+            font_size,
+            style.color,
+            style.font_weight,
+        );
+        if child_style.display == Display::None {
+            continue;
+        }
+        let child_font_size = child_style
+            .font_size
+            .resolve(font_size, font_size)
+            .unwrap_or(font_size)
+            .max(1.0);
+        let child_margin = resolve_edges(child_style.margin, content_width, child_font_size);
+        let mut child_path = path.clone();
+        child_path.push(index);
+        items.push(GridItem {
+            element: child,
+            path: child_path,
+            style: child_style,
+            margin: child_margin,
+            layout: None,
+        });
+    }
+    let column_count = style.grid_template_columns.count.max(1);
+    let row_count = style
+        .grid_template_rows
+        .count
+        .max(items.len().div_ceil(column_count));
+    let gap = style
+        .gap
+        .resolve(content_width, font_size)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let zero_intrinsic = vec![0.0_f32; column_count];
+    let column_widths = resolve_grid_tracks(
+        style.grid_template_columns,
+        column_count,
+        content_width,
+        gap,
+        &zero_intrinsic,
+    );
+    for (index, item) in items.iter_mut().enumerate() {
+        let column = index % column_count;
+        let column_width = column_widths[column];
+        item.layout = layout_element(
+            LayoutNode {
+                element: item.element,
+                path: item.path.clone(),
+                ancestors: &child_ancestors,
+            },
+            0.0,
+            0.0,
+            column_width.max(0.0),
+            child_parent,
+            stylesheet,
+        );
+    }
+    let mut intrinsic_rows = vec![0.0_f32; row_count];
+    for (index, item) in items.iter().enumerate() {
+        let row = index / column_count;
+        if let Some(child) = item.layout.as_ref() {
+            intrinsic_rows[row] = intrinsic_rows[row]
+                .max(child.rect.height + item.margin.top + item.margin.bottom);
+        }
+    }
+    let explicit_height = style.height.resolve(content_width, font_size);
+    let row_available = explicit_height
+        .unwrap_or_else(|| intrinsic_rows.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32);
+    let row_heights = resolve_grid_tracks(
+        style.grid_template_rows,
+        row_count,
+        row_available,
+        gap,
+        &intrinsic_rows,
+    );
+    let mut column_offsets = Vec::with_capacity(column_count);
+    let mut offset = 0.0;
+    for width in &column_widths {
+        column_offsets.push(offset);
+        offset += *width + gap;
+    }
+    let mut row_offsets = Vec::with_capacity(row_count);
+    offset = 0.0;
+    for height in &row_heights {
+        row_offsets.push(offset);
+        offset += *height + gap;
+    }
+    let mut children = Vec::new();
+    for (index, item) in items.iter_mut().enumerate() {
+        let Some(mut child) = item.layout.take() else {
+            continue;
+        };
+        let column = index % column_count;
+        let row = index / column_count;
+        if item.style.width == crate::css::Length::Auto {
+            child.rect.width = (column_widths[column] - item.margin.left - item.margin.right).max(0.0);
+        }
+        if explicit_height.is_some() && item.style.height == crate::css::Length::Auto {
+            child.rect.height =
+                (row_heights[row] - item.margin.top - item.margin.bottom).max(0.0);
+        }
+        let desired_x = content_x + column_offsets[column] + item.margin.left;
+        let desired_y = content_y + row_offsets[row] + item.margin.top;
+        let offset_x = desired_x - child.rect.x;
+        let offset_y = desired_y - child.rect.y;
+        translate_layout_box(&mut child, offset_x, offset_y);
+        children.push(child);
+    }
+    let content_height = explicit_height.unwrap_or_else(|| {
+        row_heights.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32
+    });
+    LayoutBox {
+        path,
+        tag: element.name.clone(),
+        rect: Rect {
+            height: content_height + padding.top + padding.bottom + border * 2.0,
+            ..rect
+        },
+        background: style.background,
+        border_width: border,
+        border_color: style.border_color,
+        text: Vec::new(),
+        children,
+        margin,
+    }
+}
+
+fn resolve_grid_tracks(
+    template: GridTemplate,
+    count: usize,
+    available: f32,
+    gap: f32,
+    intrinsic: &[f32],
+) -> Vec<f32> {
+    let tracks = (0..count)
+        .map(|index| {
+            if index < template.count {
+                template.tracks[index]
+            } else {
+                GridTrack::Auto
+            }
+        })
+        .collect::<Vec<_>>();
+    let fixed = tracks
+        .iter()
+        .map(|track| match track {
+            GridTrack::Px(value) => *value,
+            GridTrack::Percent(value) => available * *value / 100.0,
+            GridTrack::Auto | GridTrack::Fr(_) => 0.0,
+        })
+        .sum::<f32>();
+    let fr_total = tracks
+        .iter()
+        .map(|track| match track {
+            GridTrack::Fr(value) => *value,
+            GridTrack::Auto | GridTrack::Px(_) | GridTrack::Percent(_) => 0.0,
+        })
+        .sum::<f32>();
+    let auto_count = tracks
+        .iter()
+        .filter(|track| matches!(track, GridTrack::Auto))
+        .count();
+    let free = (available - fixed - gap * count.saturating_sub(1) as f32).max(0.0);
+    let auto_share = if fr_total == 0.0 && auto_count > 0 {
+        free / auto_count as f32
+    } else {
+        0.0
+    };
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| match track {
+            GridTrack::Px(value) => value.max(0.0),
+            GridTrack::Percent(value) => (available * value / 100.0).max(0.0),
+            GridTrack::Fr(value) => {
+                if fr_total > 0.0 {
+                    free * value / fr_total
+                } else {
+                    intrinsic.get(index).copied().unwrap_or(0.0)
+                }
+            }
+            GridTrack::Auto => intrinsic
+                .get(index)
+                .copied()
+                .filter(|value| *value > 0.0)
+                .unwrap_or(auto_share),
+        })
+        .collect()
 }
 
 fn justify_offsets(justify: JustifyContent, free: f32, count: usize) -> (f32, f32) {
@@ -990,5 +1255,30 @@ mod tests {
         assert_eq!(body.children[0].tag, "main");
         assert_eq!(body.children[0].children[0].tag, "p");
         assert!(body.children[1].rect.y >= body.children[0].rect.bottom());
+    }
+
+    #[test]
+    fn grid_places_children_in_tracks_with_gap() {
+        let document = Document::parse(
+            "<style>#grid { display: grid; width: 200px; grid-template-columns: 1fr 2fr; grid-template-rows: 30px 40px; gap: 10px; } #grid > p { height: 20px; margin: 0; }</style><div id='grid'><p>one</p><p>two</p><p>three</p><p>four</p></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 160.0,
+            },
+        );
+        let grid = &result.root.children[0];
+        assert_eq!(grid.rect.width, 200.0);
+        assert_eq!(grid.rect.height, 80.0);
+        assert_eq!(grid.children.len(), 4);
+        assert!((grid.children[0].rect.width - 63.333).abs() < 0.01);
+        assert!((grid.children[1].rect.x - 73.333).abs() < 0.01);
+        assert_eq!(grid.children[2].rect.y, 40.0);
+        assert_eq!(grid.children[3].rect.y, 40.0);
     }
 }
