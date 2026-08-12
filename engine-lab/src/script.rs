@@ -3144,7 +3144,7 @@ impl ScriptRuntime {
                         if let Some(mime_type) = inferred_mime_type
                             && !headers.contains_key("content-type")
                         {
-                            headers.insert("content-type".to_string(), mime_type.to_string());
+                            headers.insert("content-type".to_string(), mime_type);
                         }
                         body
                     }
@@ -3232,10 +3232,13 @@ impl ScriptRuntime {
                 "Response body is not allowed for this status",
             ));
         }
-        if let Some(mime_type) = inferred_mime_type.or(body_mime_type)
+        let mime_type = inferred_mime_type
+            .map(str::to_string)
+            .or(body_mime_type);
+        if let Some(mime_type) = mime_type
             && !headers.contains_key("content-type")
         {
-            headers.insert("content-type".to_string(), mime_type.to_string());
+            headers.insert("content-type".to_string(), mime_type);
         }
         let mime_type = headers.get("content-type").cloned().unwrap_or_default();
         Ok(Value::Response(Rc::new(response_data(
@@ -5589,22 +5592,63 @@ fn serialize_form_urlencoded(pairs: &[(String, String)]) -> String {
         .join("&")
 }
 
-fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<&'static str>), ScriptError> {
+fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptError> {
     match value.resolve() {
         Value::Undefined | Value::Null => Ok((Vec::new(), None)),
         Value::String(body) => Ok((
             body.into_bytes(),
-            Some("text/plain;charset=UTF-8"),
+            Some("text/plain;charset=UTF-8".to_string()),
         )),
         Value::Bytes(bytes) => Ok((bytes.as_ref().clone(), None)),
         Value::UrlSearchParams(params) => Ok((
             serialize_form_urlencoded(&params.borrow().pairs).into_bytes(),
-            Some("application/x-www-form-urlencoded;charset=UTF-8"),
+            Some("application/x-www-form-urlencoded;charset=UTF-8".to_string()),
         )),
+        Value::FormData(form_data) => {
+            let (body, boundary) = multipart_form_data_body(&form_data);
+            Ok((body, Some(boundary)))
+        }
         _ => Err(runtime_error(
-            "body must be a string, ArrayBuffer, or URLSearchParams",
+            "body must be a string, ArrayBuffer, URLSearchParams, or FormData",
         )),
     }
+}
+
+fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
+    let pairs = form_data.borrow().pairs.clone();
+    let mut boundary = "----ceri-form-data-boundary".to_string();
+    while pairs
+        .iter()
+        .any(|(name, value)| name.contains(&boundary) || value.contains(&boundary))
+    {
+        boundary.push('x');
+    }
+    let mut body = Vec::new();
+    for (name, value) in pairs {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                multipart_parameter(&name)
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (
+        body,
+        format!("multipart/form-data; boundary={boundary}"),
+    )
+}
+
+fn multipart_parameter(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
 }
 
 fn encode_form_component(value: &str) -> String {
@@ -6059,7 +6103,7 @@ fn parse_fetch_options(
     if let Some(mime_type) = inferred_mime_type
         && !headers.contains_key("content-type")
     {
-        headers.insert("content-type".to_string(), mime_type.to_string());
+        headers.insert("content-type".to_string(), mime_type);
     }
     let body_from_request = request_input.is_some()
         && matches!(options.get("body").map(Value::resolve), None | Some(Value::Undefined));
@@ -9370,6 +9414,102 @@ mod tests {
             requests[1].headers().get("content-type").map(String::as_str),
             Some("application/custom")
         );
+    }
+
+    #[test]
+    fn form_data_bodies_encode_ordered_text_entries() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const data = new FormData();
+                data.append("field", "first");
+                data.append("note", "line\nvalue");
+                fetch("/headers", { method: "POST", body: data }).then(() => { status.textContent = "done"; });
+                "#,
+            )
+            .expect("FormData bodies should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("done")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers().get("content-type").map(String::as_str),
+            Some("multipart/form-data; boundary=----ceri-form-data-boundary")
+        );
+        assert_eq!(
+            requests[0].body(),
+            b"------ceri-form-data-boundary\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nfirst\r\n------ceri-form-data-boundary\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nline\nvalue\r\n------ceri-form-data-boundary--\r\n"
+        );
+    }
+
+    #[test]
+    fn form_data_multipart_escapes_parameters_and_avoids_boundary_collisions() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const data = new FormData();
+                data.append("na\"me\\\r\n", "prefix----ceri-form-data-boundary");
+                fetch("/headers", { method: "POST", body: data }).then(() => { status.textContent = "done"; });
+                "#,
+            )
+            .expect("FormData multipart escaping should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("done")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers().get("content-type").map(String::as_str),
+            Some("multipart/form-data; boundary=----ceri-form-data-boundaryx")
+        );
+        let body = String::from_utf8(requests[0].body().to_vec())
+            .expect("text-only FormData should use UTF-8 bytes");
+        assert!(body.starts_with(
+            "------ceri-form-data-boundaryx\r\nContent-Disposition: form-data; name=\"na\\\"me\\\\%0D%0A\"\r\n\r\n"
+        ));
+        assert!(body.contains("prefix----ceri-form-data-boundary\r\n"));
+        assert!(body.ends_with("------ceri-form-data-boundaryx--\r\n"));
     }
 
     #[test]
