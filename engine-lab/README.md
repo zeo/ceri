@@ -25,7 +25,7 @@ The current slice implements:
 - an optional `native-http` `ResourceProvider` backed by Rust-native HTTPS and platform certificate verification
 - validated `ResourceRequest` metadata for provider-backed `fetch()` methods, headers, and string bodies
 - same-origin relative URL resolution for external stylesheets and scripts
-- packaged-origin promise-based `fetch()` responses with status, MIME type, URL, normalized headers, single-use text and JSON bodies, `arrayBuffer()`, `clone()`, a bounded `ReadableStream` reader, deterministic tee branches, and deterministic `AbortController` preflight cancellation
+- packaged-origin promise-based `fetch()` responses with status, MIME type, URL, normalized headers, case-insensitive membership checks, deterministic key, value, and entry iterators, `forEach()`, single-use text and JSON bodies, `arrayBuffer()`, `clone()`, a bounded `ReadableStream` reader, deterministic tee branches, and deterministic `AbortController` preflight cancellation
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
 - app-origin `localStorage` and `sessionStorage` key/value stores shared across full-document navigations in one browser session
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing

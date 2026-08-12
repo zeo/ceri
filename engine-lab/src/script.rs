@@ -200,6 +200,11 @@ enum Builtin {
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
     HeadersGet(HeadersHandle),
+    HeadersHas(HeadersHandle),
+    HeadersKeys(HeadersHandle),
+    HeadersValues(HeadersHandle),
+    HeadersEntries(HeadersHandle),
+    HeadersForEach(HeadersHandle),
     ResponseClone(ResponseHandle),
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
@@ -2295,6 +2300,11 @@ impl ScriptRuntime {
             },
             Value::Headers(headers) => match property {
                 "get" => Ok(Value::Builtin(Builtin::HeadersGet(headers))),
+                "has" => Ok(Value::Builtin(Builtin::HeadersHas(headers))),
+                "keys" => Ok(Value::Builtin(Builtin::HeadersKeys(headers))),
+                "values" => Ok(Value::Builtin(Builtin::HeadersValues(headers))),
+                "entries" => Ok(Value::Builtin(Builtin::HeadersEntries(headers))),
+                "forEach" => Ok(Value::Builtin(Builtin::HeadersForEach(headers))),
                 _ => Err(runtime_error(format!(
                     "headers has no property {property}"
                 ))),
@@ -3719,6 +3729,48 @@ impl ScriptRuntime {
                     .cloned()
                     .map(Value::String)
                     .unwrap_or(Value::Null))
+            }
+            Builtin::HeadersHas(headers) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                Ok(Value::Bool(headers.contains_key(&name)))
+            }
+            Builtin::HeadersKeys(headers) => Ok(iterator_value(
+                headers.keys().cloned().map(Value::String).collect(),
+            )),
+            Builtin::HeadersValues(headers) => Ok(iterator_value(
+                headers.values().cloned().map(Value::String).collect(),
+            )),
+            Builtin::HeadersEntries(headers) => Ok(iterator_value(
+                headers
+                    .iter()
+                    .map(|(name, value)| {
+                        Value::Array(Rc::new(RefCell::new(vec![
+                            Value::String(name.clone()),
+                            Value::String(value.clone()),
+                        ])))
+                    })
+                    .collect(),
+            )),
+            Builtin::HeadersForEach(headers) => {
+                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error("headers.forEach callback must be a function"));
+                }
+                for (name, value) in headers.iter() {
+                    self.call(
+                        callback.clone(),
+                        vec![
+                            Value::String(value.clone()),
+                            Value::String(name.clone()),
+                            Value::Headers(headers.clone()),
+                        ],
+                    )?;
+                }
+                Ok(Value::Undefined)
             }
             Builtin::ResponseClone(response) => {
                 let body = response.body.borrow();
@@ -6845,6 +6897,28 @@ mod tests {
         }
     }
 
+    struct HeadersFetchProvider;
+
+    impl ResourceProvider for HeadersFetchProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            if request.url().path() != "/headers" {
+                return Ok(None);
+            }
+            let mut headers = BTreeMap::new();
+            headers.insert("X-Zed".to_string(), "last".to_string());
+            headers.insert("Content-Type".to_string(), "text/plain".to_string());
+            headers.insert("X-Alpha".to_string(), "first".to_string());
+            ResourceResponse::new(200, "text/plain", headers, b"ready".to_vec()).map(Some)
+        }
+    }
+
     #[test]
     fn executes_a_static_module_graph_with_named_and_namespace_imports() {
         let document = document("<p id='status'>idle</p>");
@@ -8272,6 +8346,47 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some(
                 "200|true|application/json|https://app.ceri.invalid/data.json|{\"message\":\"hello\"}"
+            )
+        );
+    }
+
+    #[test]
+    fn response_headers_support_membership_iteration_and_for_each() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider)),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("/headers").then((response) => {
+                    const keys = response.headers.keys();
+                    const first = response.headers.entries().next();
+                    let visited = "";
+                    response.headers.forEach((value, name) => {
+                        visited = visited + name + "=" + value + ";";
+                    });
+                    status.textContent = response.headers.has("X-Alpha") + "|" + response.headers.has("missing") + "|" + keys.join(",") + "|" + first.value[0] + "=" + first.value[1] + "|" + visited;
+                });
+                "#,
+            )
+            .expect("response header iteration should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "true|false|content-type,x-alpha,x-zed|content-type=text/plain|content-type=text/plain;x-alpha=first;x-zed=last;"
             )
         );
     }
