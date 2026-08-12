@@ -1,6 +1,7 @@
 use crate::css::Color;
 use crate::dom::NodePath;
-use crate::layout::{LayoutBox, LayoutDocument, TextRun};
+use crate::image::Image;
+use crate::layout::{ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -169,7 +170,7 @@ pub(crate) fn paint_with_commands(
         document.viewport.height.max(1.0) as u32,
         Color::opaque(245, 248, 250),
     );
-    paint_box(&mut canvas, &document.root, commands);
+    paint_box(&mut canvas, &document.root, commands, &document.images);
     canvas
 }
 
@@ -214,7 +215,12 @@ fn paint_canvas_command(canvas: &mut Canvas, canvas_box: &LayoutBox, command: &C
     );
 }
 
-fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox, commands: &[CanvasCommand]) {
+fn paint_box(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    commands: &[CanvasCommand],
+    images: &[ImageLayer],
+) {
     canvas.fill_rect(
         layout_box.rect.x,
         layout_box.rect.y,
@@ -222,6 +228,21 @@ fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox, commands: &[CanvasComm
         layout_box.rect.height,
         layout_box.background,
     );
+    if layout_box.tag == "img"
+        && let Some(layer) = images.iter().find(|layer| layer.path == layout_box.path)
+    {
+        let inset = layout_box.border_width.max(0.0);
+        paint_image(
+            canvas,
+            &layer.image,
+            Rect {
+                x: layout_box.rect.x + inset,
+                y: layout_box.rect.y + inset,
+                width: (layout_box.rect.width - inset * 2.0).max(0.0),
+                height: (layout_box.rect.height - inset * 2.0).max(0.0),
+            },
+        );
+    }
     if layout_box.border_width > 0.0 {
         let border = layout_box.border_width;
         canvas.fill_rect(
@@ -257,11 +278,35 @@ fn paint_box(canvas: &mut Canvas, layout_box: &LayoutBox, commands: &[CanvasComm
         paint_text(canvas, run);
     }
     for child in &layout_box.children {
-        paint_box(canvas, child, commands);
+        paint_box(canvas, child, commands, images);
     }
     if layout_box.tag == "canvas" {
         for command in commands {
             paint_canvas_command(canvas, layout_box, command);
+        }
+    }
+}
+
+fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let left = rect.x.floor().max(0.0) as u32;
+    let top = rect.y.floor().max(0.0) as u32;
+    let right = (rect.x + rect.width).ceil().max(0.0).min(canvas.width as f32) as u32;
+    let bottom = (rect.y + rect.height)
+        .ceil()
+        .max(0.0)
+        .min(canvas.height as f32) as u32;
+    for pixel_y in top.min(canvas.height)..bottom.min(canvas.height) {
+        let source_y = (((pixel_y as f32 - rect.y) / rect.height) * image.height as f32)
+            .floor()
+            .clamp(0.0, image.height.saturating_sub(1) as f32) as u32;
+        for pixel_x in left.min(canvas.width)..right.min(canvas.width) {
+            let source_x = (((pixel_x as f32 - rect.x) / rect.width) * image.width as f32)
+                .floor()
+                .clamp(0.0, image.width.saturating_sub(1) as f32) as u32;
+            canvas.blend_pixel(pixel_x, pixel_y, image.pixel(source_x, source_y));
         }
     }
 }
@@ -451,6 +496,7 @@ mod tests {
                 children: Vec::new(),
                 margin: Default::default(),
             },
+            images: Vec::new(),
         };
         let canvas = paint(&document);
         assert!(canvas.non_background_pixels() > 0);
@@ -518,6 +564,7 @@ mod tests {
                 ],
                 margin: Default::default(),
             },
+            images: Vec::new(),
         };
         let commands = [CanvasCommand::FillRect {
             path: vec![0],

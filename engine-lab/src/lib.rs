@@ -1,6 +1,7 @@
 mod css;
 mod dom;
 mod host;
+mod image;
 mod layout;
 mod navigation;
 mod paint;

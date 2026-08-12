@@ -3,6 +3,7 @@ use crate::css::{
     JustifyContent, Style, StyleContext, StyleState, Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
+use crate::image::Image;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Size {
@@ -52,6 +53,13 @@ pub struct LayoutBox {
 pub struct LayoutDocument {
     pub viewport: Size,
     pub root: LayoutBox,
+    pub(crate) images: Vec<ImageLayer>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ImageLayer {
+    pub(crate) path: NodePath,
+    pub(crate) image: Image,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -217,7 +225,11 @@ pub fn layout_with_state(
             root.children.push(child_box);
         }
     }
-    LayoutDocument { viewport, root }
+    LayoutDocument {
+        viewport,
+        root,
+        images: Vec::new(),
+    }
 }
 
 impl LayoutDocument {

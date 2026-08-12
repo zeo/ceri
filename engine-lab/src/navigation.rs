@@ -1,6 +1,7 @@
 use crate::css::Stylesheet;
 use crate::dom::{Document, NodePath, ScriptSource, StylesheetSource};
-use crate::layout::{LayoutDocument, Size, layout_with_state as build_layout};
+use crate::image::parse_svg;
+use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
 use crate::script::{NavigationRequest, ScriptRuntime, StorageHandle};
 use std::cell::RefCell;
@@ -611,7 +612,11 @@ impl Browser {
         let stylesheet =
             Stylesheet::parse(&page.stylesheet).map_err(NavigationError::Stylesheet)?;
         let style_state = page.runtime.style_state(self.hovered_path.clone());
-        Ok(build_layout(&document, &stylesheet, viewport, &style_state))
+        let mut layout = build_layout(&document, &stylesheet, viewport, &style_state);
+        if let Some(base) = self.current_url.as_ref() {
+            self.attach_image_layers(base, &document, &mut layout);
+        }
+        Ok(layout)
     }
 
     pub fn paint(&self, viewport: Size) -> Result<Canvas, NavigationError> {
@@ -626,6 +631,37 @@ impl Browser {
 
     pub fn describe(&self, viewport: Size) -> Result<String, NavigationError> {
         Ok(self.layout(viewport)?.describe())
+    }
+
+    fn attach_image_layers(
+        &self,
+        base: &AppUrl,
+        document: &Document,
+        layout: &mut LayoutDocument,
+    ) {
+        let mut paths = Vec::new();
+        collect_image_paths(&layout.root, &mut paths);
+        for path in paths {
+            let Some(reference) = document.element_attribute(&path, "src") else {
+                continue;
+            };
+            let Ok(url) = base.resolve(&reference) else {
+                continue;
+            };
+            let Ok(resource) = self.resources.load_subresource(&url) else {
+                continue;
+            };
+            if !is_svg(&resource) {
+                continue;
+            }
+            let Ok(source) = std::str::from_utf8(resource.body()) else {
+                continue;
+            };
+            let Ok(image) = parse_svg(source) else {
+                continue;
+            };
+            layout.images.push(ImageLayer { path, image });
+        }
     }
 
     fn activate_path(&mut self, path: Vec<usize>) -> Result<bool, NavigationError> {
@@ -910,6 +946,23 @@ fn is_javascript(resource: &Resource) -> bool {
                 | "text/ecmascript"
         )
     })
+}
+
+fn is_svg(resource: &Resource) -> bool {
+    resource
+        .mime_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/svg+xml"))
+}
+
+fn collect_image_paths(layout: &crate::layout::LayoutBox, paths: &mut Vec<NodePath>) {
+    if layout.tag == "img" {
+        paths.push(layout.path.clone());
+    }
+    for child in &layout.children {
+        collect_image_paths(child, paths);
+    }
 }
 
 fn error_page_source(status: u16, url: &str, detail: &str) -> String {
@@ -1993,6 +2046,69 @@ mod tests {
             .rgba_pixels()
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn packaged_svg_images_reach_the_custom_paint_path() {
+        let mut resources = bundle(
+            r#"<img id="icon" src="/icon.svg" style="display: block; width: 80px; height: 48px">"#,
+        );
+        resources
+            .insert(
+                "/icon.svg",
+                "image/svg+xml",
+                br##"<svg width="16" height="10" viewbox="0 0 16 10"><rect width="16" height="10" fill="#07131f"/><circle cx="5" cy="5" r="3" fill="#6ee7c5"/><rect x="10" y="2" width="4" height="6" fill="#e06c75"/></svg>"##.to_vec(),
+            )
+            .expect("svg resource should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("image page should load");
+        let layout = browser
+            .layout(Size {
+                width: 120.0,
+                height: 80.0,
+            })
+            .expect("image layout should build");
+        assert_eq!(layout.images.len(), 1);
+        let canvas = browser
+            .paint(Size {
+                width: 120.0,
+                height: 80.0,
+            })
+            .expect("image page should paint");
+        assert!(canvas
+            .rgba_pixels()
+            .chunks_exact(4)
+            .any(|pixel| pixel == [110, 231, 197, 255]));
+        assert!(canvas
+            .rgba_pixels()
+            .chunks_exact(4)
+            .any(|pixel| pixel == [224, 108, 117, 255]));
+    }
+
+    #[test]
+    fn unsupported_or_cross_origin_images_stay_out_of_the_frame() {
+        let mut resources = bundle(
+            r#"<img src="/fake.png" style="display: block; width: 24px; height: 24px"><img src="https://outside.invalid/icon.svg" style="display: block; width: 24px; height: 24px">"#,
+        );
+        resources
+            .insert("/fake.png", "image/png", vec![0, 1, 2, 3])
+            .expect("fake image resource should be accepted");
+        let mut browser = Browser::new(resources);
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load"),
+            NavigationStatus::Loaded
+        );
+        let layout = browser
+            .layout(Size {
+                width: 120.0,
+                height: 80.0,
+            })
+            .expect("layout should build");
+        assert!(layout.images.is_empty());
     }
 
     #[test]

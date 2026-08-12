@@ -27,6 +27,7 @@ The current slice implements:
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
 - named form controls with live checkbox and radio-group state, `FormData` construction, pair mutation, and deterministic `requestSubmit()` events
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
+- app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -158,6 +159,14 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 The current canvas context is intentionally small. It records app-owned `fillStyle`, `fillRect`, and `clearRect` commands, clips them to the laid-out canvas element, and replays them during the software paint pass. Paths, text, images, transforms, compositing, and GPU contexts remain separate compatibility gates.
+
+The packaged SVG demo exercises a dependency-free image path:
+
+```powershell
+cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/image-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-image-demo.bmp
+```
+
+The current image slice accepts app-origin `image/svg+xml` resources, enforces bounded dimensions, and rasterizes `rect`, `circle`, `line`, inherited paint, and simple inline style declarations. Broken, unsupported, or cross-origin image references stay absent from the frame instead of escaping the resource boundary. PNG, JPEG, animated formats, filters, text, paths, and image decoding remain separate gates.
 
 The dynamic selector demo exercises stateful CSS through the host input boundary:
 
