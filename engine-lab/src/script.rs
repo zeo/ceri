@@ -223,6 +223,7 @@ enum Builtin {
     RequestText(RequestHandle),
     RequestBytes(RequestHandle),
     RequestBlob(RequestHandle),
+    RequestFormData(RequestHandle),
     HeadersAppend(HeadersHandle),
     HeadersDelete(HeadersHandle),
     HeadersGet(HeadersHandle),
@@ -237,6 +238,7 @@ enum Builtin {
     ResponseJson(ResponseHandle),
     ResponseBytes(ResponseHandle),
     ResponseBlob(ResponseHandle),
+    ResponseFormData(ResponseHandle),
     ReadableStreamGetReader(ReadableStreamHandle),
     ReadableStreamCancel(ReadableStreamHandle),
     ReadableStreamTee(ReadableStreamHandle),
@@ -2380,6 +2382,7 @@ impl ScriptRuntime {
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
                 "blob" => Ok(Value::Builtin(Builtin::ResponseBlob(response))),
+                "formData" => Ok(Value::Builtin(Builtin::ResponseFormData(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
                 ))),
@@ -2409,6 +2412,7 @@ impl ScriptRuntime {
                 "text" => Ok(Value::Builtin(Builtin::RequestText(request))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::RequestBytes(request))),
                 "blob" => Ok(Value::Builtin(Builtin::RequestBlob(request))),
+                "formData" => Ok(Value::Builtin(Builtin::RequestFormData(request))),
                 _ => Err(runtime_error(format!(
                     "request has no property {property}"
                 ))),
@@ -4173,6 +4177,23 @@ impl ScriptRuntime {
                 ))))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
+            Builtin::RequestFormData(request) => {
+                let body = match self.consume_request_body(&request) {
+                    Ok(body) => body,
+                    Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+                };
+                let mime_type = request
+                    .headers
+                    .borrow()
+                    .values
+                    .get("content-type")
+                    .cloned()
+                    .unwrap_or_default();
+                match form_data_from_body(&body, &mime_type) {
+                    Ok(form_data) => Ok(Value::Promise(self.fulfilled_promise(form_data))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+                }
+            }
             Builtin::HeadersAppend(headers) => {
                 let (name, value) = normalized_header_pair(&arguments)?;
                 let mut headers = headers.borrow_mut();
@@ -4392,6 +4413,16 @@ impl ScriptRuntime {
                 ))))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
+            Builtin::ResponseFormData(response) => {
+                let body = match self.consume_response_body(&response) {
+                    Ok(body) => body,
+                    Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+                };
+                match form_data_from_body(&body, &response.mime_type) {
+                    Ok(form_data) => Ok(Value::Promise(self.fulfilled_promise(form_data))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+                }
+            }
             Builtin::ReadableStreamGetReader(stream) => {
                 let body = stream.borrow().body.clone();
                 let mut body_state = body.borrow_mut();
@@ -5962,6 +5993,27 @@ fn form_data_entry_value(entry: &FormDataEntry) -> Value {
         FormDataEntry::Text(value) => Value::String(value.clone()),
         FormDataEntry::File(file) => Value::File(file.clone()),
     }
+}
+
+fn form_data_from_body(body: &[u8], mime_type: &str) -> Result<Value, ScriptError> {
+    let media_type = mime_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if media_type != "application/x-www-form-urlencoded" {
+        return Err(runtime_error(
+            "formData() only supports application/x-www-form-urlencoded bodies",
+        ));
+    }
+    let source = String::from_utf8(body.to_vec())
+        .map_err(|_| runtime_error("formData() body is not valid UTF-8"))?;
+    let pairs = parse_form_urlencoded(&source)?
+        .into_iter()
+        .map(|(name, value)| (name, FormDataEntry::Text(value)))
+        .collect();
+    Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
 }
 
 fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
@@ -8033,6 +8085,20 @@ mod tests {
             request: &ResourceRequest,
         ) -> Result<Option<ResourceResponse>, NavigationError> {
             self.requests.borrow_mut().push(request.clone());
+            if request.url().path() == "/form" {
+                let mut headers = BTreeMap::new();
+                headers.insert(
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded;charset=UTF-8".to_string(),
+                );
+                return ResourceResponse::new(
+                    200,
+                    "application/x-www-form-urlencoded;charset=UTF-8",
+                    headers,
+                    b"answer=42&answer=second+value".to_vec(),
+                )
+                .map(Some);
+            }
             if request.url().path() != "/headers" {
                 return Ok(None);
             }
@@ -9801,6 +9867,48 @@ mod tests {
             requests[1].headers().get("content-type").map(String::as_str),
             Some("application/custom")
         );
+    }
+
+    #[test]
+    fn form_data_reads_decode_urlencoded_body_and_consume_once() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            Some(ResourceBundle::default()),
+            Some(Rc::new(HeadersFetchProvider {
+                requests: requests.clone(),
+            })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const request = new Request("/headers", { method: "POST", body: new URLSearchParams([["q", "hello world"], ["q", "second"]]) });
+                request.formData().then((data) => {
+                    data.append("extra", "yes");
+                    fetch("/form").then((response) => response.formData()).then((responseData) => {
+                        status.textContent = data.get("q") + "|" + data.getAll("q").length + "|" + data.get("extra") + "|" + responseData.get("answer") + "|" + responseData.getAll("answer").length;
+                        status.textContent = status.textContent + "|" + request.bodyUsed;
+                    }, (error) => { status.textContent = error.message; });
+                });
+                "#,
+            )
+            .expect("formData body reads should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello world|2|yes|42|2|true")
+        );
+        assert_eq!(requests.borrow().len(), 1);
     }
 
     #[test]
