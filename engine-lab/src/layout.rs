@@ -1,6 +1,6 @@
 use crate::css::{
     AlignItems, Color, Display, Edges, FlexDirection, FontWeight, GridTemplate, GridTrack,
-    JustifyContent, Style, StyleContext, StyleState, Stylesheet, TextAlign,
+    JustifyContent, Overflow, Position, Style, StyleContext, StyleState, Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::image::Image;
@@ -46,6 +46,7 @@ pub struct LayoutBox {
     pub border_color: Color,
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
+    pub(crate) overflow: Overflow,
     pub(crate) margin: ResolvedEdges,
 }
 
@@ -139,6 +140,10 @@ struct FlexLayoutInput<'a> {
     content_y: f32,
     content_width: f32,
     font_size: f32,
+    viewport: Size,
+    containing_block: ContainingBlock,
+    inherited_containing_block: ContainingBlock,
+    mode: LayoutMode,
 }
 
 struct GridItem<'a> {
@@ -164,6 +169,10 @@ struct GridLayoutInput<'a> {
     content_y: f32,
     content_width: f32,
     font_size: f32,
+    viewport: Size,
+    containing_block: ContainingBlock,
+    inherited_containing_block: ContainingBlock,
+    mode: LayoutMode,
 }
 
 struct LayoutNode<'a> {
@@ -172,8 +181,57 @@ struct LayoutNode<'a> {
     ancestors: &'a [&'a Element],
 }
 
+struct ElementLayoutInput<'node, 'style> {
+    node: LayoutNode<'node>,
+    containing_x: f32,
+    containing_y: f32,
+    containing_width: f32,
+    parent: ParentStyle,
+    context: LayoutContext<'style>,
+}
+
 pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> LayoutDocument {
     layout_with_state(document, stylesheet, viewport, &StyleState::default())
+}
+
+#[derive(Clone, Copy)]
+struct ContainingBlock {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Flow,
+    Absolute,
+    Fixed,
+}
+
+struct PositionedNode<'a> {
+    element: &'a Element,
+    path: NodePath,
+}
+
+#[derive(Clone, Copy)]
+struct LayoutContext<'a> {
+    viewport: Size,
+    containing_block: ContainingBlock,
+    mode: LayoutMode,
+    stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
+}
+
+#[derive(Clone, Copy)]
+struct PositionedLayoutContext<'a, 'b> {
+    containing_block: ContainingBlock,
+    viewport: ContainingBlock,
+    viewport_size: Size,
+    parent: ParentStyle,
+    ancestors: &'b [&'a Element],
+    stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
 }
 
 pub fn layout_with_state(
@@ -182,6 +240,12 @@ pub fn layout_with_state(
     viewport: Size,
     style_state: &StyleState,
 ) -> LayoutDocument {
+    let viewport_block = ContainingBlock {
+        x: 0.0,
+        y: 0.0,
+        width: viewport.width,
+        height: viewport.height,
+    };
     let mut root = LayoutBox {
         path: Vec::new(),
         tag: "#document".to_string(),
@@ -196,35 +260,72 @@ pub fn layout_with_state(
         border_color: Color::transparent(),
         text: Vec::new(),
         children: Vec::new(),
+        overflow: Overflow::Visible,
         margin: ResolvedEdges::default(),
     };
     let mut cursor_y = 0.0;
+    let mut positioned = Vec::new();
     for (index, child) in document.root.children.iter().enumerate() {
         let Node::Element(element) = child else {
             continue;
         };
         let path = vec![index];
-        if let Some(child_box) = layout_element(
-            LayoutNode {
+        let style = stylesheet.style_for(StyleContext {
+            element,
+            path: &path,
+            ancestors: &[],
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            state: style_state,
+        });
+        if style.position.is_out_of_flow() {
+            positioned.push(PositionedNode { element, path });
+            continue;
+        }
+        if let Some(child_box) = layout_element(ElementLayoutInput {
+            node: LayoutNode {
                 element,
                 path,
                 ancestors: &[],
             },
-            0.0,
-            cursor_y,
-            viewport.width,
-            ParentStyle {
+            containing_x: 0.0,
+            containing_y: cursor_y,
+            containing_width: viewport.width,
+            parent: ParentStyle {
                 font_size: 16.0,
                 color: Color::BLACK,
                 weight: FontWeight::Normal,
             },
-            stylesheet,
-            style_state,
-        ) {
+            context: LayoutContext {
+                viewport,
+                containing_block: viewport_block,
+                mode: LayoutMode::Flow,
+                stylesheet,
+                style_state,
+            },
+        }) {
             cursor_y = child_box.rect.bottom() + child_box.margin.bottom;
             root.children.push(child_box);
         }
     }
+    append_positioned_nodes(
+        &mut root.children,
+        positioned,
+        PositionedLayoutContext {
+            containing_block: viewport_block,
+            viewport: viewport_block,
+            viewport_size: viewport,
+            parent: ParentStyle {
+                font_size: 16.0,
+                color: Color::BLACK,
+                weight: FontWeight::Normal,
+            },
+            ancestors: &[],
+            stylesheet,
+            style_state,
+        },
+    );
     LayoutDocument {
         viewport,
         root,
@@ -244,35 +345,180 @@ impl LayoutDocument {
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodePath> {
-        hit_test_box(&self.root, x, y)
+        hit_test_box(&self.root, x, y, Some(self.root.rect))
     }
 }
 
-fn hit_test_box(layout: &LayoutBox, x: f32, y: f32) -> Option<NodePath> {
-    if !contains_point(layout.rect, x, y) {
+fn viewport_block(viewport: Size) -> ContainingBlock {
+    ContainingBlock {
+        x: 0.0,
+        y: 0.0,
+        width: viewport.width,
+        height: viewport.height,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedInsets {
+    top: Option<f32>,
+    right: Option<f32>,
+    bottom: Option<f32>,
+    left: Option<f32>,
+}
+
+fn resolve_insets(edges: Edges, containing: ContainingBlock, font_size: f32) -> ResolvedInsets {
+    ResolvedInsets {
+        top: edges.top.resolve(containing.height, font_size),
+        right: edges.right.resolve(containing.width, font_size),
+        bottom: edges.bottom.resolve(containing.height, font_size),
+        left: edges.left.resolve(containing.width, font_size),
+    }
+}
+
+fn position_layout_box(
+    layout: &mut LayoutBox,
+    style: Style,
+    mode: LayoutMode,
+    containing: ContainingBlock,
+    font_size: f32,
+) {
+    let inset = resolve_insets(style.inset, containing, font_size);
+    let x = if let Some(left) = inset.left {
+        containing.x + left + layout.margin.left
+    } else if let Some(right) = inset.right {
+        containing.x + containing.width - right - layout.rect.width - layout.margin.right
+    } else {
+        containing.x + layout.margin.left
+    };
+    let y = if let Some(top) = inset.top {
+        containing.y + top + layout.margin.top
+    } else if let Some(bottom) = inset.bottom {
+        containing.y + containing.height - bottom - layout.rect.height - layout.margin.bottom
+    } else {
+        containing.y + layout.margin.top
+    };
+    if mode == LayoutMode::Fixed || mode == LayoutMode::Absolute {
+        let offset_x = x - layout.rect.x;
+        let offset_y = y - layout.rect.y;
+        translate_layout_box(layout, offset_x, offset_y);
+    }
+}
+
+fn append_positioned_nodes(
+    children: &mut Vec<LayoutBox>,
+    nodes: Vec<PositionedNode<'_>>,
+    context: PositionedLayoutContext<'_, '_>,
+) {
+    let PositionedLayoutContext {
+        containing_block,
+        viewport,
+        viewport_size,
+        parent,
+        ancestors,
+        stylesheet,
+        style_state,
+    } = context;
+    for node in nodes {
+        let style = stylesheet.style_for(StyleContext {
+            element: node.element,
+            path: &node.path,
+            ancestors,
+            parent_font_size: parent.font_size,
+            parent_color: parent.color,
+            parent_weight: parent.weight,
+            state: style_state,
+        });
+        let mode = if style.position == Position::Fixed {
+            LayoutMode::Fixed
+        } else {
+            LayoutMode::Absolute
+        };
+        if let Some(layout) = layout_element(ElementLayoutInput {
+            node: LayoutNode {
+                element: node.element,
+                path: node.path,
+                ancestors,
+            },
+            containing_x: 0.0,
+            containing_y: 0.0,
+            containing_width: containing_block.width,
+            parent,
+            context: LayoutContext {
+                viewport: viewport_size,
+                containing_block: if mode == LayoutMode::Fixed {
+                    viewport
+                } else {
+                    containing_block
+                },
+                mode,
+                stylesheet,
+                style_state,
+            },
+        }) {
+            children.push(layout);
+        }
+    }
+}
+
+fn hit_test_box(layout: &LayoutBox, x: f32, y: f32, clip: Option<Rect>) -> Option<NodePath> {
+    if let Some(clip) = clip
+        && !contains_point(clip, x, y)
+    {
         return None;
     }
+    let inside_layout = contains_point(layout.rect, x, y);
+    let child_clip = if layout.overflow == Overflow::Hidden {
+        intersect_rect(clip, layout.rect)
+    } else {
+        clip
+    };
     for child in layout.children.iter().rev() {
-        if let Some(path) = hit_test_box(child, x, y) {
+        if let Some(path) = hit_test_box(child, x, y, child_clip) {
             return Some(path);
         }
     }
-    (!layout.path.is_empty()).then(|| layout.path.clone())
+    (inside_layout && !layout.path.is_empty()).then(|| layout.path.clone())
 }
 
 fn contains_point(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
 }
 
-fn layout_element(
-    node: LayoutNode<'_>,
-    containing_x: f32,
-    containing_y: f32,
-    containing_width: f32,
-    parent: ParentStyle,
-    stylesheet: &Stylesheet,
-    style_state: &StyleState,
-) -> Option<LayoutBox> {
+fn intersect_rect(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    let Some(parent) = parent else {
+        return Some(rect);
+    };
+    let left = parent.x.max(rect.x);
+    let top = parent.y.max(rect.y);
+    let right = (parent.x + parent.width).min(rect.x + rect.width);
+    let bottom = (parent.y + parent.height).min(rect.y + rect.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
+    let ElementLayoutInput {
+        node,
+        containing_x,
+        containing_y,
+        containing_width,
+        parent,
+        context:
+            LayoutContext {
+                viewport,
+                containing_block,
+                mode,
+                stylesheet,
+                style_state,
+            },
+    } = input;
     let LayoutNode {
         element,
         path,
@@ -290,6 +536,15 @@ fn layout_element(
     if style.display == Display::None {
         return None;
     }
+    let position_block = match mode {
+        LayoutMode::Flow | LayoutMode::Absolute => containing_block,
+        LayoutMode::Fixed => ContainingBlock {
+            x: 0.0,
+            y: 0.0,
+            width: viewport.width,
+            height: viewport.height,
+        },
+    };
     let font_size = style
         .font_size
         .resolve(parent.font_size, parent.font_size)
@@ -300,17 +555,49 @@ fn layout_element(
     let border = style.border_width.max(0.0);
     let horizontal_extras =
         margin.left + margin.right + padding.left + padding.right + (border * 2.0);
+    let explicit_height = style.height.resolve(containing_width, font_size);
+    let inset = resolve_insets(style.inset, position_block, font_size);
     let content_width = style
         .width
         .resolve(containing_width, font_size)
+        .or_else(|| {
+            (mode != LayoutMode::Flow && inset.left.is_some() && inset.right.is_some()).then(|| {
+                (position_block.width
+                    - inset.left.unwrap_or(0.0)
+                    - inset.right.unwrap_or(0.0)
+                    - horizontal_extras)
+                    .max(0.0)
+            })
+        })
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
         .max(0.0);
     let border_box_width = content_width + padding.left + padding.right + (border * 2.0);
     let rect = Rect {
-        x: containing_x + margin.left,
-        y: containing_y + margin.top,
+        x: if mode == LayoutMode::Flow {
+            containing_x + margin.left
+        } else {
+            position_block.x
+        },
+        y: if mode == LayoutMode::Flow {
+            containing_y + margin.top
+        } else {
+            position_block.y
+        },
         width: border_box_width,
         height: 0.0,
+    };
+    let local_containing_block = ContainingBlock {
+        x: rect.x,
+        y: rect.y,
+        width: border_box_width,
+        height: explicit_height
+            .map(|height| height.max(0.0) + padding.top + padding.bottom + (border * 2.0))
+            .unwrap_or(0.0),
+    };
+    let descendant_block = if style.position == Position::Static {
+        containing_block
+    } else {
+        local_containing_block
     };
     let content_x = rect.x + border + padding.left;
     let content_y = rect.y + border + padding.top;
@@ -330,6 +617,10 @@ fn layout_element(
             content_y,
             content_width,
             font_size,
+            viewport,
+            containing_block: descendant_block,
+            inherited_containing_block: containing_block,
+            mode,
         }));
     }
     if style.display == Display::Grid {
@@ -348,6 +639,10 @@ fn layout_element(
             content_y,
             content_width,
             font_size,
+            viewport,
+            containing_block: descendant_block,
+            inherited_containing_block: containing_block,
+            mode,
         }));
     }
     let line_height = style
@@ -363,6 +658,7 @@ fn layout_element(
     };
     let mut text = Vec::new();
     let mut children = Vec::new();
+    let mut positioned = Vec::new();
     let inline_context = InlineContext {
         font_size,
         line_height,
@@ -392,6 +688,13 @@ fn layout_element(
                 if child_style.display == Display::None {
                     continue;
                 }
+                if child_style.position.is_out_of_flow() {
+                    positioned.push(PositionedNode {
+                        element: child_element,
+                        path: child_path,
+                    });
+                    continue;
+                }
                 if matches!(
                     child_style.display,
                     Display::Block | Display::Flex | Display::Grid
@@ -403,23 +706,28 @@ fn layout_element(
                         content_width,
                         style.text_align,
                     );
-                    if let Some(child_box) = layout_element(
-                        LayoutNode {
+                    if let Some(child_box) = layout_element(ElementLayoutInput {
+                        node: LayoutNode {
                             element: child_element,
                             path: child_path,
                             ancestors: &child_ancestors,
                         },
-                        content_x,
-                        line.y,
-                        content_width,
-                        ParentStyle {
+                        containing_x: content_x,
+                        containing_y: line.y,
+                        containing_width: content_width,
+                        parent: ParentStyle {
                             font_size,
                             color: style.color,
                             weight: style.font_weight,
                         },
-                        stylesheet,
-                        style_state,
-                    ) {
+                        context: LayoutContext {
+                            viewport,
+                            containing_block: descendant_block,
+                            mode: LayoutMode::Flow,
+                            stylesheet,
+                            style_state,
+                        },
+                    }) {
                         line.y = child_box.rect.bottom() + child_box.margin.bottom;
                         line.used = 0.0;
                         line.height = line_height;
@@ -455,9 +763,7 @@ fn layout_element(
         content_width,
         style.text_align,
     );
-    let content_height = style
-        .height
-        .resolve(containing_width, font_size)
+    let content_height = explicit_height
         .unwrap_or((line.y - content_y).max(0.0))
         .max(0.0);
     let border_box_height = content_height + padding.top + padding.bottom + (border * 2.0);
@@ -465,7 +771,7 @@ fn layout_element(
         height: border_box_height,
         ..rect
     };
-    Some(LayoutBox {
+    let mut layout = LayoutBox {
         path,
         tag: element.name.clone(),
         rect,
@@ -474,8 +780,40 @@ fn layout_element(
         border_color: style.border_color,
         text,
         children,
+        overflow: style.overflow,
         margin,
-    })
+    };
+    if mode != LayoutMode::Flow {
+        position_layout_box(&mut layout, style, mode, position_block, font_size);
+    }
+    let positioned_block = ContainingBlock {
+        x: layout.rect.x,
+        y: layout.rect.y,
+        width: layout.rect.width,
+        height: layout.rect.height,
+    };
+    append_positioned_nodes(
+        &mut layout.children,
+        positioned,
+        PositionedLayoutContext {
+            containing_block: if style.position == Position::Static {
+                containing_block
+            } else {
+                positioned_block
+            },
+            viewport: viewport_block(viewport),
+            viewport_size: viewport,
+            parent: ParentStyle {
+                font_size,
+                color: style.color,
+                weight: style.font_weight,
+            },
+            ancestors: &child_ancestors,
+            stylesheet,
+            style_state,
+        },
+    );
+    Some(layout)
 }
 
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
@@ -494,6 +832,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         content_y,
         content_width,
         font_size,
+        viewport,
+        containing_block,
+        inherited_containing_block,
+        mode,
     } = input;
     let child_parent = ParentStyle {
         font_size,
@@ -503,6 +845,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
     let mut items = Vec::new();
+    let mut positioned = Vec::new();
     for (index, child) in element.children.iter().enumerate() {
         let Node::Element(child) = child else {
             continue;
@@ -519,6 +862,13 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             state: style_state,
         });
         if child_style.display == Display::None {
+            continue;
+        }
+        if child_style.position.is_out_of_flow() {
+            positioned.push(PositionedNode {
+                element: child,
+                path: child_path,
+            });
             continue;
         }
         let child_font_size = child_style
@@ -596,19 +946,28 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         } else {
             content_width
         };
-        item.layout = layout_element(
-            LayoutNode {
+        item.layout = layout_element(ElementLayoutInput {
+            node: LayoutNode {
                 element: item.element,
                 path: item.path.clone(),
                 ancestors: &child_ancestors,
             },
-            0.0,
-            0.0,
-            child_width,
-            child_parent,
-            stylesheet,
-            style_state,
-        );
+            containing_x: 0.0,
+            containing_y: 0.0,
+            containing_width: child_width,
+            parent: child_parent,
+            context: LayoutContext {
+                viewport,
+                containing_block: if style.position == Position::Static {
+                    inherited_containing_block
+                } else {
+                    containing_block
+                },
+                mode: LayoutMode::Flow,
+                stylesheet,
+                style_state,
+            },
+        });
     }
 
     let mut children = Vec::new();
@@ -700,7 +1059,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             main_size
         }
     };
-    LayoutBox {
+    let mut layout = LayoutBox {
         path,
         tag: element.name.clone(),
         rect: Rect {
@@ -712,8 +1071,46 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         border_color: style.border_color,
         text: Vec::new(),
         children,
+        overflow: style.overflow,
         margin,
+    };
+    if mode != LayoutMode::Flow {
+        position_layout_box(
+            &mut layout,
+            style,
+            mode,
+            if mode == LayoutMode::Fixed {
+                viewport_block(viewport)
+            } else {
+                inherited_containing_block
+            },
+            font_size,
+        );
     }
+    let positioned_block = ContainingBlock {
+        x: layout.rect.x,
+        y: layout.rect.y,
+        width: layout.rect.width,
+        height: layout.rect.height,
+    };
+    append_positioned_nodes(
+        &mut layout.children,
+        positioned,
+        PositionedLayoutContext {
+            containing_block: if style.position == Position::Static {
+                inherited_containing_block
+            } else {
+                positioned_block
+            },
+            viewport: viewport_block(viewport),
+            viewport_size: viewport,
+            parent: child_parent,
+            ancestors: &child_ancestors,
+            stylesheet,
+            style_state,
+        },
+    );
+    layout
 }
 
 fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
@@ -732,6 +1129,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         content_y,
         content_width,
         font_size,
+        viewport,
+        containing_block,
+        inherited_containing_block,
+        mode,
     } = input;
     let child_parent = ParentStyle {
         font_size,
@@ -741,6 +1142,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
     let mut items = Vec::new();
+    let mut positioned = Vec::new();
     for (index, child) in element.children.iter().enumerate() {
         let Node::Element(child) = child else {
             continue;
@@ -757,6 +1159,13 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             state: style_state,
         });
         if child_style.display == Display::None {
+            continue;
+        }
+        if child_style.position.is_out_of_flow() {
+            positioned.push(PositionedNode {
+                element: child,
+                path: child_path,
+            });
             continue;
         }
         let child_font_size = child_style
@@ -794,31 +1203,41 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     for (index, item) in items.iter_mut().enumerate() {
         let column = index % column_count;
         let column_width = column_widths[column];
-        item.layout = layout_element(
-            LayoutNode {
+        item.layout = layout_element(ElementLayoutInput {
+            node: LayoutNode {
                 element: item.element,
                 path: item.path.clone(),
                 ancestors: &child_ancestors,
             },
-            0.0,
-            0.0,
-            column_width.max(0.0),
-            child_parent,
-            stylesheet,
-            style_state,
-        );
+            containing_x: 0.0,
+            containing_y: 0.0,
+            containing_width: column_width.max(0.0),
+            parent: child_parent,
+            context: LayoutContext {
+                viewport,
+                containing_block: if style.position == Position::Static {
+                    inherited_containing_block
+                } else {
+                    containing_block
+                },
+                mode: LayoutMode::Flow,
+                stylesheet,
+                style_state,
+            },
+        });
     }
     let mut intrinsic_rows = vec![0.0_f32; row_count];
     for (index, item) in items.iter().enumerate() {
         let row = index / column_count;
         if let Some(child) = item.layout.as_ref() {
-            intrinsic_rows[row] = intrinsic_rows[row]
-                .max(child.rect.height + item.margin.top + item.margin.bottom);
+            intrinsic_rows[row] =
+                intrinsic_rows[row].max(child.rect.height + item.margin.top + item.margin.bottom);
         }
     }
     let explicit_height = style.height.resolve(content_width, font_size);
-    let row_available = explicit_height
-        .unwrap_or_else(|| intrinsic_rows.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32);
+    let row_available = explicit_height.unwrap_or_else(|| {
+        intrinsic_rows.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32
+    });
     let row_heights = resolve_grid_tracks(
         style.grid_template_rows,
         row_count,
@@ -846,11 +1265,11 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let column = index % column_count;
         let row = index / column_count;
         if item.style.width == crate::css::Length::Auto {
-            child.rect.width = (column_widths[column] - item.margin.left - item.margin.right).max(0.0);
+            child.rect.width =
+                (column_widths[column] - item.margin.left - item.margin.right).max(0.0);
         }
         if explicit_height.is_some() && item.style.height == crate::css::Length::Auto {
-            child.rect.height =
-                (row_heights[row] - item.margin.top - item.margin.bottom).max(0.0);
+            child.rect.height = (row_heights[row] - item.margin.top - item.margin.bottom).max(0.0);
         }
         let desired_x = content_x + column_offsets[column] + item.margin.left;
         let desired_y = content_y + row_offsets[row] + item.margin.top;
@@ -862,7 +1281,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let content_height = explicit_height.unwrap_or_else(|| {
         row_heights.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32
     });
-    LayoutBox {
+    let mut layout = LayoutBox {
         path,
         tag: element.name.clone(),
         rect: Rect {
@@ -874,8 +1293,46 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         border_color: style.border_color,
         text: Vec::new(),
         children,
+        overflow: style.overflow,
         margin,
+    };
+    if mode != LayoutMode::Flow {
+        position_layout_box(
+            &mut layout,
+            style,
+            mode,
+            if mode == LayoutMode::Fixed {
+                viewport_block(viewport)
+            } else {
+                inherited_containing_block
+            },
+            font_size,
+        );
     }
+    let positioned_block = ContainingBlock {
+        x: layout.rect.x,
+        y: layout.rect.y,
+        width: layout.rect.width,
+        height: layout.rect.height,
+    };
+    append_positioned_nodes(
+        &mut layout.children,
+        positioned,
+        PositionedLayoutContext {
+            containing_block: if style.position == Position::Static {
+                inherited_containing_block
+            } else {
+                positioned_block
+            },
+            viewport: viewport_block(viewport),
+            viewport_size: viewport,
+            parent: child_parent,
+            ancestors: &child_ancestors,
+            stylesheet,
+            style_state,
+        },
+    );
+    layout
 }
 
 fn resolve_grid_tracks(
@@ -1349,5 +1806,102 @@ mod tests {
         assert!((grid.children[1].rect.x - 73.333).abs() < 0.01);
         assert_eq!(grid.children[2].rect.y, 40.0);
         assert_eq!(grid.children[3].rect.y, 40.0);
+    }
+
+    #[test]
+    fn positioned_children_leave_flow_and_use_relative_containing_blocks() {
+        let document = Document::parse(
+            "<style>#stage { position: relative; width: 200px; height: 100px; margin: 0; } #overlay { position: absolute; left: 30px; top: 20px; width: 40px; height: 20px; margin: 0; } #flow { width: 20px; height: 10px; margin: 0; }</style><div id='stage'><div id='overlay'></div><div id='flow'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 160.0,
+            },
+        );
+        let stage = &result.root.children[0];
+        assert_eq!(stage.children.len(), 2);
+        let flow = &stage.children[0];
+        let overlay = &stage.children[1];
+        assert_eq!(flow.path, vec![1, 1]);
+        assert_eq!(flow.rect.y, 0.0);
+        assert_eq!(overlay.path, vec![1, 0]);
+        assert_eq!(overlay.rect.x, 30.0);
+        assert_eq!(overlay.rect.y, 20.0);
+        assert_eq!(overlay.rect.width, 40.0);
+        assert_eq!(overlay.rect.height, 20.0);
+    }
+
+    #[test]
+    fn fixed_children_anchor_to_the_viewport() {
+        let document = Document::parse(
+            "<style>#fixed { position: fixed; right: 10px; bottom: 5px; width: 20px; height: 10px; margin: 0; }</style><div id='fixed'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        );
+        let fixed = &result.root.children[0];
+        assert_eq!(fixed.rect.x, 90.0);
+        assert_eq!(fixed.rect.y, 65.0);
+    }
+
+    #[test]
+    fn nested_absolute_children_use_the_nearest_positioned_ancestor() {
+        let document = Document::parse(
+            "<style>#stage { position: relative; width: 200px; height: 100px; margin: 0; } #wrapper { margin: 0; } #overlay { position: absolute; bottom: 10px; width: 40px; height: 10px; margin: 0; }</style><div id='stage'><div id='wrapper'><div id='overlay'></div></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 160.0,
+            },
+        );
+        let stage = &result.root.children[0];
+        let wrapper = &stage.children[0];
+        let overlay = &wrapper.children[0];
+        assert_eq!(overlay.path, vec![1, 0, 0]);
+        assert_eq!(overlay.rect.y, 80.0);
+    }
+
+    #[test]
+    fn hidden_overflow_clips_paint_and_hit_testing() {
+        let document = Document::parse(
+            "<style>#clip { width: 20px; height: 20px; overflow: hidden; margin: 0; } #child { width: 40px; height: 40px; margin: 0; background: #ff0000; }</style><div id='clip'><div id='child'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        assert_eq!(result.hit_test(10.0, 10.0), Some(vec![1, 0]));
+        assert_eq!(result.hit_test(30.0, 10.0), None);
+        let canvas = result.paint();
+        let inside = ((10 * canvas.width() + 10) * 4) as usize;
+        let outside = ((10 * canvas.width() + 30) * 4) as usize;
+        assert_eq!(&canvas.rgba_pixels()[inside..inside + 4], [255, 0, 0, 255]);
+        assert_ne!(
+            &canvas.rgba_pixels()[outside..outside + 4],
+            [255, 0, 0, 255]
+        );
     }
 }

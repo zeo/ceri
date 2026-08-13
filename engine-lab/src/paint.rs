@@ -1,4 +1,4 @@
-use crate::css::Color;
+use crate::css::{Color, Overflow};
 use crate::dom::NodePath;
 use crate::image::Image;
 use crate::layout::{ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun};
@@ -170,11 +170,57 @@ pub(crate) fn paint_with_commands(
         document.viewport.height.max(1.0) as u32,
         Color::opaque(245, 248, 250),
     );
-    paint_box(&mut canvas, &document.root, commands, &document.images);
+    paint_box(
+        &mut canvas,
+        &document.root,
+        commands,
+        &document.images,
+        None,
+    );
     canvas
 }
 
-fn paint_canvas_command(canvas: &mut Canvas, canvas_box: &LayoutBox, command: &CanvasCommand) {
+fn intersect_clip(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    let Some(parent) = parent else {
+        return Some(rect);
+    };
+    let left = parent.x.max(rect.x);
+    let top = parent.y.max(rect.y);
+    let right = (parent.x + parent.width).min(rect.x + rect.width);
+    let bottom = (parent.y + parent.height).min(rect.y + rect.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn fill_rect_optional(
+    canvas: &mut Canvas,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    color: Color,
+    clip: Option<Rect>,
+) {
+    if let Some(clip) = clip {
+        canvas.fill_rect_clipped(x, y, width, height, color, clip);
+    } else {
+        canvas.fill_rect(x, y, width, height, color);
+    }
+}
+
+fn paint_canvas_command(
+    canvas: &mut Canvas,
+    canvas_box: &LayoutBox,
+    command: &CanvasCommand,
+    clip: Option<Rect>,
+) {
     let (path, x, y, width, height) = match command {
         CanvasCommand::FillRect {
             path,
@@ -205,13 +251,16 @@ fn paint_canvas_command(canvas: &mut Canvas, canvas_box: &LayoutBox, command: &C
             }
         }
     };
+    let Some(command_clip) = intersect_clip(clip, canvas_box.rect) else {
+        return;
+    };
     canvas.fill_rect_clipped(
         canvas_box.rect.x + x,
         canvas_box.rect.y + y,
         width,
         height,
         color,
-        canvas_box.rect,
+        command_clip,
     );
 }
 
@@ -220,14 +269,22 @@ fn paint_box(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
+    clip: Option<Rect>,
 ) {
-    canvas.fill_rect(
+    fill_rect_optional(
+        canvas,
         layout_box.rect.x,
         layout_box.rect.y,
         layout_box.rect.width,
         layout_box.rect.height,
         layout_box.background,
+        clip,
     );
+    let content_clip = if layout_box.overflow == Overflow::Hidden {
+        intersect_clip(clip, layout_box.rect)
+    } else {
+        clip
+    };
     if layout_box.tag == "img"
         && let Some(layer) = images.iter().find(|layer| layer.path == layout_box.path)
     {
@@ -241,60 +298,75 @@ fn paint_box(
                 width: (layout_box.rect.width - inset * 2.0).max(0.0),
                 height: (layout_box.rect.height - inset * 2.0).max(0.0),
             },
+            content_clip,
         );
     }
     if layout_box.border_width > 0.0 {
         let border = layout_box.border_width;
-        canvas.fill_rect(
+        fill_rect_optional(
+            canvas,
             layout_box.rect.x,
             layout_box.rect.y,
             layout_box.rect.width,
             border,
             layout_box.border_color,
+            clip,
         );
-        canvas.fill_rect(
+        fill_rect_optional(
+            canvas,
             layout_box.rect.x,
             layout_box.rect.bottom() - border,
             layout_box.rect.width,
             border,
             layout_box.border_color,
+            clip,
         );
-        canvas.fill_rect(
+        fill_rect_optional(
+            canvas,
             layout_box.rect.x,
             layout_box.rect.y,
             border,
             layout_box.rect.height,
             layout_box.border_color,
+            clip,
         );
-        canvas.fill_rect(
+        fill_rect_optional(
+            canvas,
             layout_box.rect.x + layout_box.rect.width - border,
             layout_box.rect.y,
             border,
             layout_box.rect.height,
             layout_box.border_color,
+            clip,
         );
     }
     for run in &layout_box.text {
-        paint_text(canvas, run);
+        paint_text(canvas, run, content_clip);
     }
     for child in &layout_box.children {
-        paint_box(canvas, child, commands, images);
+        paint_box(canvas, child, commands, images, content_clip);
     }
     if layout_box.tag == "canvas" {
         for command in commands {
-            paint_canvas_command(canvas, layout_box, command);
+            paint_canvas_command(canvas, layout_box, command, content_clip);
         }
     }
 }
 
-fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect) {
+fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect, clip: Option<Rect>) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
-    let left = rect.x.floor().max(0.0) as u32;
-    let top = rect.y.floor().max(0.0) as u32;
-    let right = (rect.x + rect.width).ceil().max(0.0).min(canvas.width as f32) as u32;
-    let bottom = (rect.y + rect.height)
+    let Some(draw_rect) = intersect_clip(clip, rect) else {
+        return;
+    };
+    let left = draw_rect.x.floor().max(0.0) as u32;
+    let top = draw_rect.y.floor().max(0.0) as u32;
+    let right = (draw_rect.x + draw_rect.width)
+        .ceil()
+        .max(0.0)
+        .min(canvas.width as f32) as u32;
+    let bottom = (draw_rect.y + draw_rect.height)
         .ceil()
         .max(0.0)
         .min(canvas.height as f32) as u32;
@@ -311,7 +383,7 @@ fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect) {
     }
 }
 
-fn paint_text(canvas: &mut Canvas, run: &TextRun) {
+fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>) {
     let scale = (run.font_size / 9.0).round().max(1.0) as u32;
     let mut x = run.x;
     for character in run.text.chars() {
@@ -320,12 +392,14 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun) {
             for column in 0..5 {
                 if bits & (1 << (4 - column)) != 0 {
                     let width = if run.bold { scale + 1 } else { scale };
-                    canvas.fill_rect(
+                    fill_rect_optional(
+                        canvas,
                         x + column as f32 * scale as f32,
                         run.y + row as f32 * scale as f32,
                         width as f32,
                         scale as f32,
                         run.color,
+                        clip,
                     );
                 }
             }
@@ -494,6 +568,7 @@ mod tests {
                     bold: false,
                 }],
                 children: Vec::new(),
+                overflow: Overflow::Visible,
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -543,6 +618,7 @@ mod tests {
                         border_color: Color::transparent(),
                         text: Vec::new(),
                         children: Vec::new(),
+                        overflow: Overflow::Visible,
                         margin: Default::default(),
                     },
                     LayoutBox {
@@ -559,9 +635,11 @@ mod tests {
                         border_color: Color::transparent(),
                         text: Vec::new(),
                         children: Vec::new(),
+                        overflow: Overflow::Visible,
                         margin: Default::default(),
                     },
                 ],
+                overflow: Overflow::Visible,
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -576,6 +654,9 @@ mod tests {
         }];
 
         let canvas = paint_with_commands(&document, &commands);
-        assert_eq!(&canvas.rgba_pixels()[((5 * 20 + 5) * 4) as usize..][..4], [0, 0, 255, 255]);
+        assert_eq!(
+            &canvas.rgba_pixels()[((5 * 20 + 5) * 4) as usize..][..4],
+            [0, 0, 255, 255]
+        );
     }
 }

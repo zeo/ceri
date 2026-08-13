@@ -2977,6 +2977,46 @@ mod tests {
     }
 
     #[test]
+    fn browser_dispatches_coordinate_clicks_to_positioned_overlays() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #stage { position: relative; width: 200px; height: 100px; margin: 0; }
+                #overlay { position: absolute; left: 30px; top: 20px; width: 40px; height: 20px; margin: 0; }
+            </style>
+            <div id="stage"><button id="overlay">run</button><p id="status">idle</p></div>
+            <script>
+                document.getElementById("overlay").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "overlay clicked";
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(
+            browser
+                .click_at(
+                    Size {
+                        width: 320.0,
+                        height: 180.0,
+                    },
+                    35.0,
+                    25.0,
+                )
+                .expect("overlay click should dispatch")
+        );
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("overlay clicked")
+        );
+    }
+
+    #[test]
     fn browser_advances_page_tasks_deterministically() {
         let mut browser = Browser::new(bundle(
             r#"<p id="status">waiting</p><script>setTimeout(() => { document.getElementById("status").textContent = "ready"; }, 40);</script>"#,

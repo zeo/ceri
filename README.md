@@ -69,6 +69,8 @@ The isolated [engine-lab](engine-lab/README.md) crate is a from-scratch Rust ren
 
 See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.
 
+The custom renderer also has a bounded positioning and clipping slice: relative ancestors establish overlay containing blocks, absolute and fixed descendants stay out of normal flow, and hidden or clipped boxes constrain both software paint and pointer hit testing. Relative visual offsets, scrolling, stacking contexts, and automatic overflow remain outside this gate.
+
 FormData values expose ordered key, value, entry, `forEach()`, and symbol iteration methods in the custom runtime.
 
 The linked `URLSearchParams` surface now exposes ordered key, value, entry, `forEach()`, and symbol iteration methods while keeping URL query updates synchronized.

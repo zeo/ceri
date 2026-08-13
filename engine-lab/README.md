@@ -10,6 +10,7 @@ The current slice implements:
 - a deterministic cascade with selector specificity
 - document and subtree `querySelector` and `querySelectorAll` lookups using the same selector matcher
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
+- bounded CSS positioning for `relative` containing blocks, `absolute` descendants, viewport-anchored `fixed` descendants, and `inset` offsets
 - layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
 - a platform-neutral `EngineHost` frame and input boundary
@@ -50,10 +51,11 @@ The current slice implements:
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - viewport-aware `@media` rules for `screen`, `all`, and min/max width or height conditions
 - basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
+- `overflow: hidden` and `overflow: clip` clipping for software paint and coordinate hit testing
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 
-It is a headless laboratory, not a web-compatible browser. The default build keeps networking, media, full platform accessibility adapters, GPU APIs, and the operating-system window outside this slice. WebAssembly is limited to the bounded i32 module path listed above. The optional `native-http` feature adds a Rust-native HTTPS `ResourceProvider` with platform certificate verification, bounded redirects, connection reuse, proxy environment support, and a 30-second request timeout. Its API is blocking, so the native window adapter uses `EngineWorker` to keep browser state and provider calls off the UI event thread. The worker queue is bounded and drops new input when saturated instead of growing without limit.
+It is a headless laboratory, not a web-compatible browser. The default build keeps networking, media, full platform accessibility adapters, GPU APIs, and the operating-system window outside this slice. Positioning is bounded to `relative` containing-block markers, `absolute` and `fixed` layout, and pixel or percentage `inset` values. Relative visual offsets, inline-element positioned descendants, stacking contexts, scrolling, and `overflow: auto` remain separate gates. WebAssembly is limited to the bounded i32 module path listed above. The optional `native-http` feature adds a Rust-native HTTPS `ResourceProvider` with platform certificate verification, bounded redirects, connection reuse, proxy environment support, and a 30-second request timeout. Its API is blocking, so the native window adapter uses `EngineWorker` to keep browser state and provider calls off the UI event thread. The worker queue is bounded and drops new input when saturated instead of growing without limit.
 
 `Browser::with_resource_provider` keeps the renderer independent of transport. The engine resolves and validates the app-origin URL, checks the packaged bundle first, and asks the provider only when that bundle misses. The provider can read a signed package, a native HTTP/TLS client, or another host-owned source. It never needs to open a listener, and it cannot receive a cross-origin `AppUrl` because the URL parser rejects those references before the provider call. Extensionless document routes use the same `/index.html` shell fallback as packaged assets.
 
@@ -235,6 +237,8 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 ```
 
 Grid placement is currently row-major. Explicit `grid-column`, auto-placement modes, and subgrid remain separate compatibility work.
+
+Positioned overlays use the nearest `position: relative` ancestor as their bounded containing block. `position: fixed` uses the requested viewport. `overflow: hidden` and `overflow: clip` constrain both software paint and coordinate hit testing, which keeps a clipped child from receiving pointer input outside its visible box. The current slice does not implement relative visual offsets, stacking contexts, scrolling, or automatic overflow.
 
 The storage demo exercises app-owned `localStorage` and `sessionStorage` values without opening a listener:
 

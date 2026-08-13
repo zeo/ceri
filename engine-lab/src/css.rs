@@ -10,6 +10,26 @@ pub enum Display {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
+impl Position {
+    pub(crate) fn is_out_of_flow(self) -> bool {
+        matches!(self, Self::Absolute | Self::Fixed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Overflow {
+    Visible,
+    Hidden,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {
     pub red: u8,
@@ -106,6 +126,15 @@ impl Edges {
             right: Length::Px(0.0),
             bottom: Length::Px(0.0),
             left: Length::Px(0.0),
+        }
+    }
+
+    pub(crate) const fn auto() -> Self {
+        Self {
+            top: Length::Auto,
+            right: Length::Auto,
+            bottom: Length::Auto,
+            left: Length::Auto,
         }
     }
 }
@@ -214,6 +243,9 @@ impl GridTemplate {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Style {
     pub display: Display,
+    pub position: Position,
+    pub inset: Edges,
+    pub overflow: Overflow,
     pub width: Length,
     pub height: Length,
     pub margin: Edges,
@@ -244,6 +276,9 @@ impl Style {
     ) -> Self {
         let mut style = Self {
             display: default_display(name),
+            position: Position::Static,
+            inset: Edges::auto(),
+            overflow: Overflow::Visible,
             width: Length::Auto,
             height: Length::Auto,
             margin: Edges::zero(),
@@ -920,6 +955,25 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 _ => Display::Block,
             };
         }
+        "position" => {
+            style.position = match value.trim().to_ascii_lowercase().as_str() {
+                "relative" => Position::Relative,
+                "absolute" => Position::Absolute,
+                "fixed" => Position::Fixed,
+                _ => Position::Static,
+            };
+        }
+        "inset" => style.inset = parse_edges(value),
+        "top" => style.inset.top = parse_length(value).unwrap_or(style.inset.top),
+        "right" => style.inset.right = parse_length(value).unwrap_or(style.inset.right),
+        "bottom" => style.inset.bottom = parse_length(value).unwrap_or(style.inset.bottom),
+        "left" => style.inset.left = parse_length(value).unwrap_or(style.inset.left),
+        "overflow" | "overflow-x" | "overflow-y" => {
+            style.overflow = match value.trim().to_ascii_lowercase().as_str() {
+                "hidden" | "clip" => Overflow::Hidden,
+                _ => Overflow::Visible,
+            };
+        }
         "width" => style.width = parse_length(value).unwrap_or(Length::Auto),
         "height" => style.height = parse_length(value).unwrap_or(Length::Auto),
         "margin" => style.margin = parse_edges(value),
@@ -1247,6 +1301,31 @@ mod tests {
         assert_eq!(style.align_items, AlignItems::FlexEnd);
         assert_eq!(style.gap, Length::Px(12.0));
         assert_eq!(style.flex_grow, 2.0);
+    }
+
+    #[test]
+    fn parses_position_and_overflow_properties() {
+        let stylesheet = Stylesheet::parse(
+            ".overlay { position: absolute; inset: 10px 20px auto 30px; overflow: clip; }",
+        )
+        .expect("stylesheet should parse");
+        let mut element = Element::new("div");
+        element
+            .attrs
+            .insert("class".to_string(), "overlay".to_string());
+        let style = stylesheet.style_for_inherited_with_ancestors(
+            &element,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(style.position, Position::Absolute);
+        assert_eq!(style.inset.top, Length::Px(10.0));
+        assert_eq!(style.inset.right, Length::Px(20.0));
+        assert_eq!(style.inset.bottom, Length::Auto);
+        assert_eq!(style.inset.left, Length::Px(30.0));
+        assert_eq!(style.overflow, Overflow::Hidden);
     }
 
     #[test]
