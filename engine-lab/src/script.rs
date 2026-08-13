@@ -1,9 +1,9 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
-    is_http_redirect, is_javascript, is_json, AppUrl, NavigationError, Resource, ResourceBundle,
-    FilePicker, FilePickerRequest, ResourceCacheMode, normalize_headers, ResourceProvider,
-    ResourceRequest, ResourceResponse,
+    is_http_redirect, is_javascript, is_json, AppUrl, ClipboardProvider, FilePicker,
+    FilePickerRequest, NavigationError, Resource, ResourceBundle, ResourceCacheMode,
+    normalize_headers, ResourceProvider, ResourceRequest, ResourceResponse,
     APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
@@ -101,6 +101,8 @@ enum Value {
     Document,
     Window,
     Location(LocationHandle),
+    Navigator,
+    Clipboard,
     ModuleImport(AppUrl),
     History(HistoryHandle),
     Url(UrlHandle),
@@ -154,6 +156,8 @@ enum Builtin {
     WindowAddEventListener,
     WindowScrollTo,
     WindowScrollBy,
+    ClipboardReadText,
+    ClipboardWriteText,
     HistoryPushState,
     HistoryReplaceState,
     HistoryBack,
@@ -498,6 +502,7 @@ pub struct ScriptRuntime {
     selected_files: HashMap<NodePath, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodePath, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
+    clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     canvas_contexts: HashMap<NodePath, CanvasContextHandle>,
     canvas_commands: Vec<CanvasCommand>,
@@ -1127,6 +1132,9 @@ impl ScriptRuntime {
             values.values.insert("window".to_string(), Value::Window);
             values
                 .values
+                .insert("navigator".to_string(), Value::Navigator);
+            values
+                .values
                 .insert("location".to_string(), Value::Location(location.clone()));
             values.values.insert(
                 "history".to_string(),
@@ -1252,6 +1260,7 @@ impl ScriptRuntime {
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
+            clipboard_provider: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
             canvas_commands: Vec::new(),
@@ -1293,6 +1302,13 @@ impl ScriptRuntime {
 
     pub(crate) fn set_file_picker(&mut self, file_picker: Option<Rc<dyn FilePicker>>) {
         self.file_picker = file_picker;
+    }
+
+    pub(crate) fn set_clipboard_provider(
+        &mut self,
+        clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
+    ) {
+        self.clipboard_provider = clipboard_provider;
     }
 
     pub(crate) fn execute_module<L: ModuleSourceLoader>(
@@ -2392,6 +2408,7 @@ impl ScriptRuntime {
             },
             Value::Window => match property {
                 "document" => Ok(Value::Document),
+                "navigator" => Ok(Value::Navigator),
                 "location" => self
                     .global
                     .borrow()
@@ -2446,6 +2463,19 @@ impl ScriptRuntime {
                     .unwrap_or(Value::Undefined)),
                 "cefQuery" | "cefQueryCancel" => Ok(Value::Undefined),
                 _ => Err(runtime_error(format!("window has no property {property}"))),
+            },
+            Value::Navigator => match property {
+                "clipboard" => Ok(Value::Clipboard),
+                _ => Err(runtime_error(format!(
+                    "navigator has no property {property}"
+                ))),
+            },
+            Value::Clipboard => match property {
+                "readText" => Ok(Value::Builtin(Builtin::ClipboardReadText)),
+                "writeText" => Ok(Value::Builtin(Builtin::ClipboardWriteText)),
+                _ => Err(runtime_error(format!(
+                    "clipboard has no property {property}"
+                ))),
             },
             Value::Console if property == "log" => Ok(Value::Builtin(Builtin::ConsoleLog)),
             Value::Element(handle) => {
@@ -5395,6 +5425,34 @@ impl ScriptRuntime {
                 let value = arguments.first().cloned().unwrap_or(Value::Undefined);
                 serialize_json(&value).map(Value::String)
             }
+            Builtin::ClipboardReadText => {
+                let Some(provider) = self.clipboard_provider.as_ref() else {
+                    return Ok(Value::Promise(self.rejected_promise(
+                        "NotAllowedError: clipboard access is unavailable",
+                    )));
+                };
+                match provider.read_text() {
+                    Ok(text) => Ok(Value::Promise(
+                        self.fulfilled_promise(Value::String(text)),
+                    )),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.to_string()))),
+                }
+            }
+            Builtin::ClipboardWriteText => {
+                let text = arguments
+                    .first()
+                    .ok_or_else(|| runtime_error("Clipboard.writeText requires text"))?
+                    .string_value();
+                let Some(provider) = self.clipboard_provider.as_ref() else {
+                    return Ok(Value::Promise(self.rejected_promise(
+                        "NotAllowedError: clipboard access is unavailable",
+                    )));
+                };
+                match provider.write_text(&text) {
+                    Ok(()) => Ok(Value::Promise(self.fulfilled_promise(Value::Undefined))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.to_string()))),
+                }
+            }
             Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments))),
             Builtin::PromiseThen(promise) => {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
@@ -6669,6 +6727,8 @@ impl Value {
             Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
             Self::Window => "[window]".to_string(),
+            Self::Navigator => "[object Navigator]".to_string(),
+            Self::Clipboard => "[object Clipboard]".to_string(),
             Self::Location(value) => value.borrow().to_string(),
             Self::ModuleImport(_) => "[object Module]".to_string(),
             Self::History(_) => "[object History]".to_string(),
@@ -7656,6 +7716,8 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Promise(_)
         | Value::Document
         | Value::Window
+        | Value::Navigator
+        | Value::Clipboard
         | Value::Location(_)
         | Value::ModuleImport(_)
         | Value::History(_)
@@ -7733,6 +7795,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
+        (Value::Navigator, Value::Navigator) | (Value::Clipboard, Value::Clipboard) => true,
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),

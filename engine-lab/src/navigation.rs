@@ -422,6 +422,12 @@ pub trait FilePicker {
     ) -> Result<Option<Vec<FileSelection>>, NavigationError>;
 }
 
+pub trait ClipboardProvider {
+    fn read_text(&self) -> Result<String, NavigationError>;
+
+    fn write_text(&self, text: &str) -> Result<(), NavigationError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResourceBundle {
     resources: BTreeMap<String, Resource>,
@@ -548,6 +554,7 @@ pub enum NavigationError {
     ResourceNotFound(String),
     ResourceProvider(String),
     FilePicker(String),
+    Clipboard(String),
     UnsupportedMimeType { path: String, mime_type: String },
     InvalidUtf8(String),
     Script(String),
@@ -610,6 +617,7 @@ impl fmt::Display for NavigationError {
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
             Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
             Self::FilePicker(detail) => write!(formatter, "file picker failed: {detail}"),
+            Self::Clipboard(detail) => write!(formatter, "clipboard failed: {detail}"),
             Self::UnsupportedMimeType { path, mime_type } => {
                 write!(
                     formatter,
@@ -632,7 +640,9 @@ const MAX_NAVIGATION_REDIRECTS: usize = 16;
 fn recovery_status(error: &NavigationError) -> u16 {
     match error {
         NavigationError::HttpStatus { status, .. } => *status,
-        NavigationError::ResourceProvider(_) | NavigationError::FilePicker(_) => 503,
+        NavigationError::ResourceProvider(_)
+        | NavigationError::FilePicker(_)
+        | NavigationError::Clipboard(_) => 503,
         _ => 500,
     }
 }
@@ -728,6 +738,7 @@ pub struct Browser {
     resources: ResourceBundle,
     resource_provider: Option<Rc<dyn ResourceProvider>>,
     file_picker: Option<Rc<dyn FilePicker>>,
+    clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     last_navigation_failure: Option<NavigationFailure>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
@@ -749,6 +760,7 @@ impl Browser {
             resources,
             resource_provider: None,
             file_picker: None,
+            clipboard_provider: None,
             last_navigation_failure: None,
             page: None,
             current_url: None,
@@ -776,6 +788,14 @@ impl Browser {
 
     pub fn with_file_picker(mut self, file_picker: Rc<dyn FilePicker>) -> Self {
         self.file_picker = Some(file_picker);
+        self
+    }
+
+    pub fn with_clipboard_provider(
+        mut self,
+        clipboard_provider: Rc<dyn ClipboardProvider>,
+    ) -> Self {
+        self.clipboard_provider = Some(clipboard_provider);
         self
     }
 
@@ -969,6 +989,7 @@ impl Browser {
             self.host_runtime_info.clone(),
         );
         runtime.set_file_picker(self.file_picker.clone());
+        runtime.set_clipboard_provider(self.clipboard_provider.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -1551,12 +1572,17 @@ impl Browser {
         ));
         let stylesheet = document.borrow().style_text();
         self.page = Some(Page {
-            runtime: ScriptRuntime::with_storage_and_runtime_info(
-                document.clone(),
-                self.local_storage.clone(),
-                self.session_storage.clone(),
-                self.host_runtime_info.clone(),
-            ),
+            runtime: {
+                let mut runtime = ScriptRuntime::with_storage_and_runtime_info(
+                    document.clone(),
+                    self.local_storage.clone(),
+                    self.session_storage.clone(),
+                    self.host_runtime_info.clone(),
+                );
+                runtime.set_file_picker(self.file_picker.clone());
+                runtime.set_clipboard_provider(self.clipboard_provider.clone());
+                runtime
+            },
             document,
             stylesheet,
         });
@@ -2191,6 +2217,35 @@ mod tests {
         ) -> Result<Option<Vec<FileSelection>>, NavigationError> {
             self.requests.borrow_mut().push(request.clone());
             Ok(self.selection.clone())
+        }
+    }
+
+    struct MemoryClipboard {
+        text: Rc<RefCell<String>>,
+        writes: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ClipboardProvider for MemoryClipboard {
+        fn read_text(&self) -> Result<String, NavigationError> {
+            Ok(self.text.borrow().clone())
+        }
+
+        fn write_text(&self, text: &str) -> Result<(), NavigationError> {
+            self.writes.borrow_mut().push(text.to_string());
+            *self.text.borrow_mut() = text.to_string();
+            Ok(())
+        }
+    }
+
+    struct DeniedClipboard;
+
+    impl ClipboardProvider for DeniedClipboard {
+        fn read_text(&self) -> Result<String, NavigationError> {
+            Err(NavigationError::Clipboard("permission denied".to_string()))
+        }
+
+        fn write_text(&self, _text: &str) -> Result<(), NavigationError> {
+            Err(NavigationError::Clipboard("permission denied".to_string()))
         }
     }
 
@@ -3168,6 +3223,87 @@ mod tests {
             "Content-Disposition: form-data; name=\"upload\"; filename=\"report.txt\""
         ));
         assert!(body.contains("Content-Type: text/plain\r\n\r\nfile payload\r\n"));
+    }
+
+    #[test]
+    fn clipboard_provider_backing_navigator_clipboard_reads_and_writes_text() {
+        let text = Rc::new(RefCell::new("initial".to_string()));
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(MemoryClipboard {
+            text: text.clone(),
+            writes: writes.clone(),
+        });
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                const status = document.getElementById("status");
+                const same = navigator.clipboard === window.navigator.clipboard;
+                navigator.clipboard.writeText("copied").then(() => navigator.clipboard.readText()).then(value => {
+                    status.textContent = typeof navigator + "|" + same + "|" + value;
+                });
+            </script>"#,
+        ))
+        .with_clipboard_provider(provider);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("clipboard page should load");
+        let document = browser.document().expect("clipboard document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("clipboard status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("object|true|copied")
+        );
+        assert_eq!(writes.borrow().as_slice(), ["copied"]);
+        assert_eq!(text.borrow().as_str(), "copied");
+    }
+
+    #[test]
+    fn clipboard_without_a_host_provider_rejects_without_a_listener() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                navigator.clipboard.readText().catch(error => {
+                    document.getElementById("status").textContent = error;
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("clipboard page should load");
+        let document = browser.document().expect("clipboard document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("clipboard status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("NotAllowedError: clipboard access is unavailable")
+        );
+    }
+
+    #[test]
+    fn clipboard_provider_permission_errors_reach_the_script_promise() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                navigator.clipboard.readText().catch(error => {
+                    document.getElementById("status").textContent = error;
+                });
+            </script>"#,
+        ))
+        .with_clipboard_provider(Rc::new(DeniedClipboard));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("clipboard page should load");
+        let document = browser.document().expect("clipboard document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("clipboard status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("clipboard failed: permission denied")
+        );
     }
 
     #[test]

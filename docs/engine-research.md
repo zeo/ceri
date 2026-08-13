@@ -55,6 +55,8 @@ Form activation now carries `POST` submissions through the typed `ResourceProvid
 
 The same form path now accepts `enctype="multipart/form-data"` and reuses the deterministic multipart encoder already used by script-created `FormData` requests. Text fields preserve order, quoted parameter escaping, and collision-safe boundaries. A host-owned `FilePicker` supplies validated file names, MIME types, bytes, and modification times without exposing filesystem paths to the renderer. File controls expose `files`, `FileList.item()`, the standard fake path display value, input and change events, picker cancellation, and multipart `File` entries, including the empty-file entry when no file is selected.
 
+The clipboard boundary now follows the same host-owned pattern. `ClipboardProvider` backs secure-context `navigator.clipboard.readText()` and `writeText()` calls with fulfilled or rejected promises, so the renderer receives text values without a platform clipboard handle. A host can reject access for permission, user-activation, or unavailable-platform reasons without changing the script surface.
+
 The current fetch experiment includes shared single-use response bodies, `arrayBuffer()`, `blob()`, `formData()`, `clone()`, `follow`/`manual`/`error` redirect modes with final URL state, a bounded `Request` constructor with URL, method, headers, cache, redirect, signal, `bodyUsed`, body cloning, single-use text, blob, formData, or byte reads, and string, `ArrayBuffer`, `Blob`, `File`, `URLSearchParams`, or `FormData` bodies with inferred content types, a bounded `Response` constructor with status, status text, type, mutable script-created headers, `Response.json()`, `Response.error()`, same-origin `Response.redirect()`, and immutable fetched headers, mutable request `Headers` with constructor, `append()`, `set()`, `delete()`, `get()`, `has()`, key, value, and entry iterators, `forEach()`, and normalized response headers. Immutable `Blob` and `File` values support byte-part construction, MIME type normalization, file names and timestamps, slicing, text and `ArrayBuffer` reads, and request or response body integration. FormData bodies use deterministic multipart encoding with ordered text and File entries, filenames, per-file content types, and a collision-safe boundary. `formData()` parses `application/x-www-form-urlencoded` and deterministic `multipart/form-data` bodies into ordered text and File entries. It also has one stable response stream object, a bounded default `ReadableStream` reader with deterministic byte chunks, and `tee()` branches that lock the source body. Full stream backpressure, BYOB readers, and wiring native transport into a production navigation queue remain separate gates.
 
 An optional `native-http` feature now supplies a Rust-native HTTPS `ResourceProvider` with platform certificate verification, connection reuse, a 30-second timeout, and automatic redirect suppression so the engine retains redirect policy. Navigation follows a bounded chain of same-origin relative locations, rejects cross-origin locations, and consumes provider responses with their HTTP status, so upstream 404 and 503 failures reach the typed recovery page without extensionless shell fallback. Redirected modules resolve relative imports from their final URL. The new bounded `EngineWorker` owns `Browser` and `EngineHost` on a dedicated standard-library thread, and the native window adapter uses it for remote mode so blocking provider calls never run on the UI event thread. This proves a real transport adapter without making the renderer depend on CEF, Edge WebView2, or a loopback listener.
@@ -92,7 +94,7 @@ An experimental backend must pass these gates in order:
 
 - audio and video playback
 - MSE and WebRTC capability reporting
-- clipboard boundary and native file-picker UI adapter
+- native clipboard and file-picker UI adapters
 - accessibility tree delivery
 - popup, permission, fullscreen, download, and authentication decisions
 - crash, reload, and recovery behavior
@@ -119,6 +121,8 @@ The experiment is useful even when a gate fails. A failure at a named gate tells
 
 The file-input boundary now sits beside that headless form path. A host-owned `FilePicker` returns validated file metadata and bytes, while `input.files` exposes a bounded `FileList` view and multipart submission preserves the selected `File` entries. The renderer sees a fake path display value and never receives the host filesystem path.
 
+The clipboard boundary now sits beside it. A host-owned `ClipboardProvider` supplies text through `navigator.clipboard.readText()` and `writeText()` promises, while permission and platform failures remain typed at the embedder boundary. The renderer never receives a native clipboard object.
+
 The future-gate list treats full WebAssembly compatibility as unfinished. The bounded i32 module path above is a separate tested slice and does not change that boundary.
 
 ## Sources
@@ -134,6 +138,7 @@ The future-gate list treats full WebAssembly compatibility as unfinished. The bo
 - [WHATWG HTML Standard, forms](https://html.spec.whatwg.org/multipage/forms.html)
 - [WHATWG HTML Standard, form control infrastructure](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html)
 - [W3C File API](https://w3c.github.io/FileAPI/)
+- [W3C Clipboard API and events](https://w3c.github.io/clipboard-apis/)
 - [WPE FAQ](https://wpewebkit.org/about/faq.html)
 - [WebKit ports](https://docs.webkit.org/Ports/Introduction.html)
 - [SpiderMonkey](https://spidermonkey.dev/)
