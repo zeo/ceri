@@ -21,6 +21,8 @@ use std::thread;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
+type RangeHandle = Rc<RefCell<RangeData>>;
+type SelectionHandle = Rc<RefCell<SelectionData>>;
 type RequestHandle = Rc<RequestData>;
 type ResponseHandle = Rc<ResponseData>;
 type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
@@ -86,6 +88,8 @@ enum Value {
     Set(SetHandle),
     Iterator(IteratorHandle),
     Element(ElementHandle),
+    Range(RangeHandle),
+    Selection(SelectionHandle),
     Dataset(ElementHandle),
     Error(ErrorHandle),
     Style(ElementHandle),
@@ -149,6 +153,8 @@ enum Builtin {
     DocumentQuerySelector,
     DocumentQuerySelectorAll,
     DocumentCreateElement,
+    DocumentCreateRange,
+    DocumentGetSelection,
     ConsoleLog,
     EventPreventDefault(Rc<RefCell<EventState>>),
     LocationAssign,
@@ -156,6 +162,7 @@ enum Builtin {
     WindowAddEventListener,
     WindowScrollTo,
     WindowScrollBy,
+    WindowGetSelection,
     ClipboardReadText,
     ClipboardWriteText,
     HistoryPushState,
@@ -217,6 +224,18 @@ enum Builtin {
     ElementSelect(NodePath),
     ElementSetSelectionRange(NodePath),
     ElementSetRangeText(NodePath),
+    RangeSetStart(RangeHandle),
+    RangeSetEnd(RangeHandle),
+    RangeCollapse(RangeHandle),
+    RangeSelectNodeContents(RangeHandle),
+    RangeClone(RangeHandle),
+    RangeToString(RangeHandle),
+    RangeDetach,
+    SelectionAddRange(SelectionHandle),
+    SelectionRemoveAllRanges(SelectionHandle),
+    SelectionGetRangeAt(SelectionHandle),
+    SelectionCollapse(SelectionHandle),
+    SelectionToString(SelectionHandle),
     ElementSetAttribute(NodePath),
     ElementGetAttribute(NodePath),
     ElementQuerySelector(NodePath),
@@ -504,6 +523,7 @@ pub struct ScriptRuntime {
     control_checked: HashMap<NodePath, bool>,
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
+    selection: SelectionHandle,
     selected_files: HashMap<NodePath, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodePath, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -852,6 +872,23 @@ struct TextComposition {
     path: NodePath,
     start: usize,
     end: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RangeBoundary {
+    path: NodePath,
+    offset: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RangeData {
+    start: RangeBoundary,
+    end: RangeBoundary,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SelectionData {
+    range: Option<RangeHandle>,
 }
 
 struct HeadersData {
@@ -1296,6 +1333,7 @@ impl ScriptRuntime {
             control_checked: HashMap::new(),
             text_selections: HashMap::new(),
             composition: None,
+            selection: Rc::new(RefCell::new(SelectionData::default())),
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -2740,6 +2778,8 @@ impl ScriptRuntime {
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
                 "querySelectorAll" => Ok(Value::Builtin(Builtin::DocumentQuerySelectorAll)),
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
+                "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
+                "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "documentElement" => Ok(self
                     .document
                     .borrow()
@@ -2775,6 +2815,7 @@ impl ScriptRuntime {
                     .get("history")
                     .ok_or_else(|| runtime_error("window history is unavailable")),
                 "console" => Ok(Value::Console),
+                "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
@@ -2958,6 +2999,87 @@ impl ScriptRuntime {
                     _ => return Err(runtime_error(format!("element has no property {property}"))),
                 };
                 Ok(value)
+            }
+            Value::Range(range) => {
+                let range_data = range.borrow();
+                match property {
+                    "startContainer" => Ok(node_value(range_data.start.path.clone())),
+                    "startOffset" => Ok(Value::Number(range_data.start.offset as f64)),
+                    "endContainer" => Ok(node_value(range_data.end.path.clone())),
+                    "endOffset" => Ok(Value::Number(range_data.end.offset as f64)),
+                    "collapsed" => Ok(Value::Bool(range_data.start.path == range_data.end.path
+                        && range_data.start.offset == range_data.end.offset)),
+                    "commonAncestorContainer" => {
+                        let path = common_path(&range_data.start.path, &range_data.end.path);
+                        Ok(if path.is_empty() {
+                            Value::Document
+                        } else {
+                            Value::Element(attached_handle(path))
+                        })
+                    }
+                    "setStart" => Ok(Value::Builtin(Builtin::RangeSetStart(range.clone()))),
+                    "setEnd" => Ok(Value::Builtin(Builtin::RangeSetEnd(range.clone()))),
+                    "collapse" => Ok(Value::Builtin(Builtin::RangeCollapse(range.clone()))),
+                    "selectNodeContents" => Ok(Value::Builtin(
+                        Builtin::RangeSelectNodeContents(range.clone()),
+                    )),
+                    "cloneRange" => Ok(Value::Builtin(Builtin::RangeClone(range.clone()))),
+                    "toString" => Ok(Value::Builtin(Builtin::RangeToString(range.clone()))),
+                    "detach" => Ok(Value::Builtin(Builtin::RangeDetach)),
+                    _ => Err(runtime_error(format!("Range has no property {property}"))),
+                }
+            }
+            Value::Selection(selection) => {
+                let selection_data = selection.borrow();
+                let range = selection_data.range.clone();
+                match property {
+                    "rangeCount" => Ok(Value::Number(if range.is_some() { 1.0 } else { 0.0 })),
+                    "isCollapsed" => Ok(Value::Bool(
+                        range
+                            .as_ref()
+                            .is_none_or(|range| range_is_collapsed(&range.borrow())),
+                    )),
+                    "anchorNode" | "focusNode" => Ok(range
+                        .as_ref()
+                        .map(|range| {
+                            let range = range.borrow();
+                            let boundary = if property == "anchorNode" {
+                                &range.start
+                            } else {
+                                &range.end
+                            };
+                            node_value(boundary.path.clone())
+                        })
+                        .unwrap_or(Value::Null)),
+                    "anchorOffset" | "focusOffset" => Ok(range
+                        .as_ref()
+                        .map(|range| {
+                            let range = range.borrow();
+                            let boundary = if property == "anchorOffset" {
+                                &range.start
+                            } else {
+                                &range.end
+                            };
+                            Value::Number(boundary.offset as f64)
+                        })
+                        .unwrap_or(Value::Number(0.0))),
+                    "addRange" => Ok(Value::Builtin(Builtin::SelectionAddRange(
+                        selection.clone(),
+                    ))),
+                    "removeAllRanges" => Ok(Value::Builtin(Builtin::SelectionRemoveAllRanges(
+                        selection.clone(),
+                    ))),
+                    "getRangeAt" => Ok(Value::Builtin(Builtin::SelectionGetRangeAt(
+                        selection.clone(),
+                    ))),
+                    "collapse" => Ok(Value::Builtin(Builtin::SelectionCollapse(
+                        selection.clone(),
+                    ))),
+                    "toString" => Ok(Value::Builtin(Builtin::SelectionToString(
+                        selection.clone(),
+                    ))),
+                    _ => Err(runtime_error(format!("Selection has no property {property}"))),
+                }
             }
             Value::Style(handle) => Ok(self
                 .element_style_property(&handle, property)
@@ -4202,6 +4324,44 @@ impl ScriptRuntime {
         Ok(())
     }
 
+    fn range_boundary_from_arguments(
+        &self,
+        arguments: &[Value],
+    ) -> Result<RangeBoundary, ScriptError> {
+        let Some(Value::Element(handle)) = arguments.first().map(Value::resolve) else {
+            return Err(runtime_error("Range boundary requires an Element"));
+        };
+        let Some(path) = attached_path(&handle) else {
+            return Err(runtime_error("Range boundary requires an attached Element"));
+        };
+        let value = self
+            .document
+            .borrow()
+            .element_text_content(&path)
+            .ok_or_else(|| runtime_error("Range boundary element no longer exists"))?;
+        let offset = arguments
+            .get(1)
+            .map(Value::number)
+            .transpose()?
+            .map(selection_offset)
+            .unwrap_or_default()
+            .min(utf16_len(&value));
+        Ok(RangeBoundary { path, offset })
+    }
+
+    fn range_to_string(&self, range: &RangeHandle) -> String {
+        let range = range.borrow();
+        if range.start.path != range.end.path {
+            return String::new();
+        }
+        let value = self
+            .document
+            .borrow()
+            .element_text_content(&range.start.path)
+            .unwrap_or_default();
+        utf16_substring(&value, range.start.offset, range.end.offset)
+    }
+
     fn element_files(&self, handle: &ElementHandle) -> Value {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
@@ -5215,6 +5375,22 @@ impl ScriptRuntime {
                     ElementLocation::Detached(Element::new(&name)),
                 ))))
             }
+            Builtin::DocumentCreateRange => {
+                let path = self
+                    .document
+                    .borrow()
+                    .document_element_path()
+                    .unwrap_or_default();
+                let range = RangeData {
+                    start: RangeBoundary {
+                        path: path.clone(),
+                        offset: 0,
+                    },
+                    end: RangeBoundary { path, offset: 0 },
+                };
+                Ok(Value::Range(Rc::new(RefCell::new(range))))
+            }
+            Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
             Builtin::StringSlice(string) => {
                 let length = string.chars().count() as isize;
                 let start = arguments
@@ -5578,6 +5754,7 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
+            Builtin::WindowGetSelection => Ok(Value::Selection(self.selection.clone())),
             Builtin::ElementSelect(path) => {
                 self.set_text_selection(path, 0, usize::MAX, SelectionDirection::None)?;
                 Ok(Value::Undefined)
@@ -5610,6 +5787,134 @@ impl ScriptRuntime {
             Builtin::ElementSetRangeText(path) => {
                 self.set_range_text(&path, &arguments)?;
                 Ok(Value::Undefined)
+            }
+            Builtin::RangeSetStart(range) => {
+                let boundary = self.range_boundary_from_arguments(&arguments)?;
+                let mut range = range.borrow_mut();
+                range.start = boundary.clone();
+                if range.start.path == range.end.path && range.start.offset > range.end.offset {
+                    range.end = boundary;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::RangeSetEnd(range) => {
+                let boundary = self.range_boundary_from_arguments(&arguments)?;
+                let mut range = range.borrow_mut();
+                range.end = boundary.clone();
+                if range.start.path == range.end.path && range.end.offset < range.start.offset {
+                    range.start = boundary;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::RangeCollapse(range) => {
+                let to_start = arguments.first().map(Value::truthy).unwrap_or(false);
+                let mut range = range.borrow_mut();
+                if to_start {
+                    range.end = range.start.clone();
+                } else {
+                    range.start = range.end.clone();
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::RangeSelectNodeContents(range) => {
+                let boundary = self.range_boundary_from_arguments(&arguments)?;
+                let length = self
+                    .document
+                    .borrow()
+                    .element_text_content(&boundary.path)
+                    .map(|text| utf16_len(&text))
+                    .unwrap_or(0);
+                let mut range = range.borrow_mut();
+                range.start = RangeBoundary {
+                    path: boundary.path.clone(),
+                    offset: 0,
+                };
+                range.end = RangeBoundary {
+                    path: boundary.path,
+                    offset: length,
+                };
+                Ok(Value::Undefined)
+            }
+            Builtin::RangeClone(range) => Ok(Value::Range(Rc::new(RefCell::new(
+                range.borrow().clone(),
+            )))),
+            Builtin::RangeToString(range) => Ok(Value::String(self.range_to_string(&range))),
+            Builtin::RangeDetach => Ok(Value::Undefined),
+            Builtin::SelectionAddRange(selection) => {
+                let Some(Value::Range(range)) = arguments.first().map(Value::resolve) else {
+                    return Err(runtime_error("Selection.addRange expects a Range"));
+                };
+                selection.borrow_mut().range = Some(range);
+                Ok(Value::Undefined)
+            }
+            Builtin::SelectionRemoveAllRanges(selection) => {
+                selection.borrow_mut().range = None;
+                Ok(Value::Undefined)
+            }
+            Builtin::SelectionGetRangeAt(selection) => {
+                let index = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0);
+                if !index.is_finite() || index.fract() != 0.0 || index < 0.0 {
+                    return Err(runtime_error("Selection range index must be a non-negative integer"));
+                }
+                if index != 0.0 {
+                    return Err(runtime_error("Selection range index is out of bounds"));
+                }
+                selection
+                    .borrow()
+                    .range
+                    .clone()
+                    .map(Value::Range)
+                    .ok_or_else(|| runtime_error("Selection has no range at index 0"))
+            }
+            Builtin::SelectionCollapse(selection) => {
+                let Some(node) = arguments.first().map(Value::resolve) else {
+                    selection.borrow_mut().range = None;
+                    return Ok(Value::Undefined);
+                };
+                if matches!(node, Value::Null | Value::Undefined) {
+                    selection.borrow_mut().range = None;
+                    return Ok(Value::Undefined);
+                }
+                let Value::Element(handle) = node else {
+                    return Err(runtime_error("Selection.collapse expects an Element or null"));
+                };
+                let Some(path) = attached_path(&handle) else {
+                    return Err(runtime_error("Selection.collapse requires an attached Element"));
+                };
+                let value = self
+                    .document
+                    .borrow()
+                    .element_text_content(&path)
+                    .unwrap_or_default();
+                let offset = arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .map(selection_offset)
+                    .unwrap_or_default()
+                    .min(utf16_len(&value));
+                let range = RangeData {
+                    start: RangeBoundary {
+                        path: path.clone(),
+                        offset,
+                    },
+                    end: RangeBoundary { path, offset },
+                };
+                selection.borrow_mut().range = Some(Rc::new(RefCell::new(range)));
+                Ok(Value::Undefined)
+            }
+            Builtin::SelectionToString(selection) => {
+                let range = selection.borrow().range.clone();
+                Ok(Value::String(
+                    range
+                        .as_ref()
+                        .map(|range| self.range_to_string(range))
+                        .unwrap_or_default(),
+                ))
             }
             Builtin::ElementRequestSubmit(path) => {
                 self.request_submit(path)?;
@@ -7392,6 +7697,8 @@ impl Value {
             Self::Set(_) => "[object Set]".to_string(),
             Self::Iterator(_) => "[object Iterator]".to_string(),
             Self::Element(_) => "[element]".to_string(),
+            Self::Range(_) => "[object Range]".to_string(),
+            Self::Selection(_) => "[object Selection]".to_string(),
             Self::Dataset(_) => "[object DOMStringMap]".to_string(),
             Self::Error(error) => error.message.clone(),
             Self::Style(_) => "[style]".to_string(),
@@ -7950,6 +8257,13 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
+fn utf16_substring(value: &str, start: usize, end: usize) -> String {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    let start = start.min(units.len());
+    let end = end.min(units.len()).max(start);
+    String::from_utf16_lossy(&units[start..end])
+}
+
 fn replace_utf16_range(value: &str, start: usize, end: usize, replacement: &str) -> (String, usize) {
     let units = value.encode_utf16().collect::<Vec<_>>();
     let start = start.min(units.len());
@@ -7993,6 +8307,27 @@ fn selection_direction_name(direction: SelectionDirection) -> &'static str {
         SelectionDirection::None => "none",
         SelectionDirection::Forward => "forward",
         SelectionDirection::Backward => "backward",
+    }
+}
+
+fn range_is_collapsed(range: &RangeData) -> bool {
+    range.start.path == range.end.path && range.start.offset == range.end.offset
+}
+
+fn common_path(start: &[usize], end: &[usize]) -> NodePath {
+    start
+        .iter()
+        .zip(end)
+        .take_while(|(left, right)| left == right)
+        .map(|(value, _)| *value)
+        .collect()
+}
+
+fn node_value(path: NodePath) -> Value {
+    if path.is_empty() {
+        Value::Document
+    } else {
+        Value::Element(attached_handle(path))
     }
 }
 
@@ -8481,6 +8816,8 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Set(_)
         | Value::Iterator(_)
         | Value::Element(_)
+        | Value::Range(_)
+        | Value::Selection(_)
         | Value::Dataset(_)
         | Value::Style(_)
         | Value::ClassList(_)
@@ -8570,6 +8907,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         }
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
+        (Value::Range(left), Value::Range(right)) => Rc::ptr_eq(left, right),
+        (Value::Selection(left), Value::Selection(right)) => Rc::ptr_eq(left, right),
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
@@ -11547,6 +11886,39 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("3|3|none")
+        );
+    }
+
+    #[test]
+    fn document_range_and_selection_cover_bounded_element_text() {
+        let document = document(r#"<p id="copy">hello</p><p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const copy = document.getElementById("copy");
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.selectNodeContents(copy);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+                const clone = range.cloneRange();
+                clone.setStart(copy, 1);
+                clone.setEnd(copy, 4);
+                status.textContent = range.toString() + "|" + selection.toString() + "|" + clone.toString() + "|" + range.startOffset + ":" + range.endOffset + ":" + range.collapsed + ":" + range.commonAncestorContainer.id + "|" + selection.rangeCount + ":" + selection.anchorNode.id + ":" + selection.anchorOffset + ":" + selection.focusOffset;
+                selection.collapse(copy, 2);
+                status.textContent = status.textContent + "|" + selection.isCollapsed + ":" + selection.toString() + ":" + selection.rangeCount;
+                "#,
+            )
+            .expect("Range and Selection should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello|hello|ell|0:5:false:copy|1:copy:0:5|true::1")
         );
     }
 
