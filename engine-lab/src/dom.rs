@@ -191,6 +191,36 @@ impl Document {
         None
     }
 
+    pub fn label_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
+        let mut candidate = path.to_vec();
+        while !candidate.is_empty() {
+            candidate.pop();
+            if self
+                .element_at(&candidate)
+                .is_some_and(|element| element.name == "label")
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    pub fn label_control_path(&self, label_path: &[usize]) -> Option<NodePath> {
+        let label = self.element_at(label_path)?;
+        if label.name != "label" {
+            return None;
+        }
+        if let Some(id) = label.attr("for") {
+            let candidate = self.find_element_by_id(id)?;
+            return self
+                .element_at(&candidate)
+                .filter(|element| is_labelable(element))
+                .map(|_| candidate);
+        }
+        let mut path = label_path.to_vec();
+        find_first_labelable_descendant(label, &mut path)
+    }
+
     pub fn radio_group_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
         let radio = self.element_at(path)?;
         if radio.name != "input"
@@ -833,6 +863,33 @@ fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mu
     }
 }
 
+fn find_first_labelable_descendant(element: &Element, path: &mut NodePath) -> Option<NodePath> {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        if is_labelable(child) {
+            return Some(path.clone());
+        }
+        if let Some(found) = find_first_labelable_descendant(child, path) {
+            return Some(found);
+        }
+        path.pop();
+    }
+    None
+}
+
+fn is_labelable(element: &Element) -> bool {
+    match element.name.as_str() {
+        "button" | "meter" | "output" | "progress" | "select" | "textarea" => true,
+        "input" => !element
+            .attr("type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")),
+        _ => false,
+    }
+}
+
 fn find_element_by_selector<'a>(
     element: &'a Element,
     selectors: &[crate::css::Selector],
@@ -1386,6 +1443,36 @@ mod tests {
         assert_eq!(
             document.form_ancestor_path(&[0, 1, 0]),
             Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn resolves_explicit_and_wrapped_label_controls() {
+        let document = Document::parse(
+            "<label id='explicit' for='name'>Name</label><input id='name'><label id='wrapped'><span>Remember</span><input id='remember' type='checkbox'></label><label id='hidden' for='secret'>Secret</label><input id='secret' type='hidden'>",
+        )
+        .expect("labels should parse");
+        let explicit = document
+            .find_element_by_id("explicit")
+            .expect("explicit label should exist");
+        let wrapped = document
+            .find_element_by_id("wrapped")
+            .expect("wrapped label should exist");
+        let hidden = document
+            .find_element_by_id("hidden")
+            .expect("hidden label should exist");
+        assert_eq!(
+            document.label_control_path(&explicit),
+            Some(vec![1])
+        );
+        assert_eq!(
+            document.label_control_path(&wrapped),
+            Some(vec![2, 1])
+        );
+        assert!(document.label_control_path(&hidden).is_none());
+        assert_eq!(
+            document.label_ancestor_path(&[2, 0]),
+            Some(vec![2])
         );
     }
 

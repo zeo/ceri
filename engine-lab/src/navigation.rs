@@ -2847,6 +2847,33 @@ mod tests {
     }
 
     #[test]
+    fn label_click_activates_associated_control_without_a_loopback_server() {
+        let mut browser = Browser::new(bundle(
+            r#"<label id="name-label" for="name">Name</label><input id="name"><p id="status">idle</p><script>
+                const input = document.getElementById("name");
+                input.addEventListener("focus", () => {
+                    document.getElementById("status").textContent = "focused:" + document.activeElement.id;
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("label page should load");
+        assert!(browser
+            .click_id("name-label")
+            .expect("label click should activate the input"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("focused:name")
+        );
+    }
+
+    #[test]
     fn click_default_navigation_respects_prevent_default() {
         let mut browser = Browser::new(bundle(
             r#"<a id="go" href="/about.html"><span id="label">open</span></a><p id="status">home</p><script>

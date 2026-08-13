@@ -1578,6 +1578,13 @@ impl ScriptRuntime {
         let focused = self.focus_path(path.clone())?;
         let dispatch = self.dispatch_event(path.clone(), "click")?;
         self.drain_microtasks()?;
+        if !dispatch.default_prevented
+            && self.pending_navigation.is_none()
+            && let Some(control) = self.label_activation_control(&path)
+        {
+            let activated = self.click_path(control)?;
+            return Ok(dispatch.handled || focused || activated);
+        }
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
             self.apply_click_default(&path)?;
             if let Some(form) = self.submit_form_for_click(&path) {
@@ -1591,6 +1598,36 @@ impl ScriptRuntime {
             }
         }
         Ok(dispatch.handled || focused)
+    }
+
+    fn label_activation_control(&self, path: &[usize]) -> Option<NodePath> {
+        let document = self.document.borrow();
+        let label_path = if document
+            .element_clone(path)
+            .is_some_and(|element| element.name == "label")
+        {
+            path.to_vec()
+        } else {
+            document.label_ancestor_path(path)?
+        };
+        let control = document.label_control_path(&label_path)?;
+        if path.starts_with(&control) {
+            return None;
+        }
+        let start = label_path.len();
+        if path.len() > start
+            && (start + 1..=path.len()).any(|length| {
+                document.element_clone(&path[..length]).is_some_and(|element| {
+                    matches!(
+                        element.name.as_str(),
+                        "a" | "button" | "input" | "select" | "textarea"
+                    )
+                })
+            })
+        {
+            return None;
+        }
+        Some(control)
     }
 
     pub fn dispatch_path_event(
@@ -12582,6 +12619,75 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|true|true|true|true")
         );
+    }
+
+    #[test]
+    fn label_activation_focuses_and_clicks_associated_controls() {
+        let document = document(
+            r#"<label id="explicit" for="name">Name</label><input id="name"><label id="wrapped"><span id="caption">Remember</span><input id="remember" type="checkbox"></label><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const name = document.getElementById("name");
+                const remember = document.getElementById("remember");
+                const status = document.getElementById("status");
+                name.addEventListener("focus", () => { status.textContent = "focused:" + document.activeElement.id; });
+                remember.addEventListener("change", () => { status.textContent = "checked:" + remember.checked; });
+                "#,
+            )
+            .expect("label listeners should register");
+        assert!(runtime
+            .click_id("explicit")
+            .expect("explicit label should activate its control"));
+        assert_eq!(runtime.active_element(), Some(vec![1]));
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("focused:name")
+        );
+        assert!(runtime
+            .click_id("caption")
+            .expect("wrapped label should activate its control"));
+        assert_eq!(runtime.active_element(), Some(vec![2, 1]));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("checked:true")
+        );
+    }
+
+    #[test]
+    fn prevented_label_activation_does_not_trigger_the_control() {
+        let document = document(
+            r#"<label id="guarded" for="check">Check</label><input id="check" type="checkbox"><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                document.getElementById("guarded").addEventListener("click", (event) => event.preventDefault());
+                "#,
+            )
+            .expect("label listener should register");
+        assert!(runtime
+            .click_id("guarded")
+            .expect("prevented label click should be handled"));
+        assert_eq!(runtime.active_element(), None);
+        assert_eq!(
+            runtime
+                .execute("document.getElementById(\"status\").textContent = document.getElementById(\"check\").checked;")
+                .map(|_| ()),
+            Ok(())
+        );
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("false"));
     }
 
     #[test]
