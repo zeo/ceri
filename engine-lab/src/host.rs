@@ -33,6 +33,12 @@ pub enum InputEvent {
         x: f32,
         y: f32,
     },
+    Scroll {
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+    },
     KeyDown {
         key: String,
     },
@@ -330,6 +336,21 @@ impl EngineHost {
                 handled: self.browser.click_at(self.viewport, x, y)?,
                 ..InputResult::default()
             },
+            InputEvent::Scroll {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                let handled = self
+                    .browser
+                    .scroll_at(self.viewport, x, y, delta_x, delta_y)?;
+                InputResult {
+                    handled,
+                    frame_requested: handled,
+                    ..InputResult::default()
+                }
+            }
             InputEvent::KeyDown { key } => InputResult {
                 handled: self.browser.key_down(&key)?,
                 ..InputResult::default()
@@ -496,6 +517,48 @@ mod tests {
             .expect("resized frame should be present");
         assert_eq!(resized.viewport.width, 640.0);
         assert_eq!(resized.canvas.height(), 240);
+    }
+
+    #[test]
+    fn host_routes_wheel_input_to_element_scrolling_and_frame_invalidation() {
+        let browser = Browser::new(bundle(
+            r#"<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 40px; height: 80px; margin: 0; }</style><div id="viewport"><div id="content"></div></div>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 120.0,
+                height: 100.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        host.render()
+            .expect("initial frame should render")
+            .expect("initial frame should be present");
+        let scroll = host
+            .input(InputEvent::Scroll {
+                x: 10.0,
+                y: 10.0,
+                delta_x: 0.0,
+                delta_y: 30.0,
+            })
+            .expect("wheel input should be accepted");
+        assert!(scroll.handled);
+        assert!(scroll.frame_requested);
+        let frame = host
+            .render()
+            .expect("scroll should invalidate the frame")
+            .expect("scrolled frame should be present");
+        assert_eq!(frame.viewport.height, 100.0);
+        let layout = host
+            .browser()
+            .layout(Size {
+                width: 120.0,
+                height: 100.0,
+            })
+            .expect("scrolled host page should layout");
+        assert_eq!(layout.root.children[0].children[0].rect.y, -30.0);
     }
 
     #[test]

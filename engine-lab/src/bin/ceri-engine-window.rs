@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
 use winit::keyboard::Key;
 use winit::window::{Window, WindowId};
@@ -341,6 +341,24 @@ impl ApplicationHandler for App {
                     InputEvent::PointerMove {
                         x: self.cursor.0,
                         y: self.cursor.1,
+                    },
+                );
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (delta_x, delta_y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 40.0, -y * 40.0),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.x as f32, -position.y as f32)
+                    }
+                };
+                let (x, y) = self.cursor;
+                self.submit(
+                    event_loop,
+                    InputEvent::Scroll {
+                        x,
+                        y,
+                        delta_x,
+                        delta_y,
                     },
                 );
             }

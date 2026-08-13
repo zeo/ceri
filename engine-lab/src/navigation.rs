@@ -1,7 +1,9 @@
 use crate::css::Stylesheet;
 use crate::dom::{AccessibilityNode, Document, NodePath, ScriptSource, StylesheetSource};
 use crate::image::parse_svg;
-use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
+use crate::layout::{
+    ImageLayer, LayoutDocument, Size, layout_with_state as build_layout,
+};
 use crate::paint::Canvas;
 use crate::script::{
     HostRuntimeInfo, ModuleSourceLoader, NavigationRequest, ScriptRuntime, StorageHandle,
@@ -863,6 +865,45 @@ impl Browser {
             return Ok(false);
         };
         self.activate_path(path)
+    }
+
+    pub fn scroll_at(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> Result<bool, NavigationError> {
+        let Some(target) = self.layout(viewport)?.scroll_target_at(x, y) else {
+            return Ok(false);
+        };
+        let delta_x = if delta_x.is_finite() { delta_x } else { 0.0 };
+        let delta_y = if delta_y.is_finite() { delta_y } else { 0.0 };
+        let offset = (
+            (target.offset.0 + delta_x).clamp(0.0, target.max_x),
+            (target.offset.1 + delta_y).clamp(0.0, target.max_y),
+        );
+        if offset == target.offset {
+            return Ok(false);
+        }
+        let changed = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            let changed = page
+                .runtime
+                .set_scroll_offset(target.path.clone(), offset);
+            if changed {
+                page.runtime
+                    .dispatch_path_event(target.path, "scroll")
+                    .map_err(|error| NavigationError::Script(error.to_string()))?;
+            }
+            changed
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(changed)
+        }
     }
 
     pub fn dispatch_at(
@@ -3014,6 +3055,80 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("overlay clicked")
         );
+    }
+
+    #[test]
+    fn browser_scrolls_auto_overflow_and_dispatches_scroll_events() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #viewport { width: 40px; height: 20px; overflow: auto; margin: 0; }
+                #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }
+            </style>
+            <div id="viewport"><div id="content"></div></div>
+            <p id="status">idle</p>
+            <script>
+                const viewport = document.getElementById("viewport");
+                const status = document.getElementById("status");
+                viewport.addEventListener("scroll", () => {
+                    status.textContent = "scroll:" + viewport.scrollTop + ":" + viewport.scrollLeft;
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(browser
+            .scroll_at(
+                Size {
+                    width: 120.0,
+                    height: 100.0,
+                },
+                10.0,
+                10.0,
+                0.0,
+                30.0,
+            )
+            .expect("wheel scroll should dispatch"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("scroll:30:0")
+        );
+        let layout = browser
+            .layout(Size {
+                width: 120.0,
+                height: 100.0,
+            })
+            .expect("scrolled page should layout");
+        assert_eq!(layout.root.children[0].children[0].rect.y, -30.0);
+        assert!(browser
+            .scroll_at(
+                Size {
+                    width: 120.0,
+                    height: 100.0,
+                },
+                10.0,
+                10.0,
+                0.0,
+                100.0,
+            )
+            .expect("scroll should clamp to the content boundary"));
+        assert!(!browser
+            .scroll_at(
+                Size {
+                    width: 120.0,
+                    height: 100.0,
+                },
+                10.0,
+                10.0,
+                0.0,
+                100.0,
+            )
+            .expect("scroll at the boundary should be ignored"));
     }
 
     #[test]

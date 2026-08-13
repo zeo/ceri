@@ -489,6 +489,7 @@ pub struct ScriptRuntime {
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
+    scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     canvas_contexts: HashMap<NodePath, CanvasContextHandle>,
     canvas_commands: Vec<CanvasCommand>,
     logs: Vec<String>,
@@ -1224,6 +1225,7 @@ impl ScriptRuntime {
             focused_element: None,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
+            scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
             canvas_commands: Vec::new(),
             logs: Vec::new(),
@@ -1550,6 +1552,7 @@ impl ScriptRuntime {
         let mut state = StyleState {
             hovered_path,
             focused_path: self.focused_element.clone(),
+            scroll_offsets: self.scroll_offsets.clone(),
             ..StyleState::default()
         };
         for (path, checked) in &self.control_checked {
@@ -1560,6 +1563,57 @@ impl ScriptRuntime {
             }
         }
         state
+    }
+
+    pub(crate) fn scroll_offset(&self, path: &[usize]) -> (f32, f32) {
+        self.scroll_offsets.get(path).copied().unwrap_or_default()
+    }
+
+    pub(crate) fn set_scroll_offset(&mut self, path: NodePath, offset: (f32, f32)) -> bool {
+        let offset = (
+            if offset.0.is_finite() {
+                offset.0.max(0.0)
+            } else {
+                0.0
+            },
+            if offset.1.is_finite() {
+                offset.1.max(0.0)
+            } else {
+                0.0
+            },
+        );
+        let changed = self.scroll_offset(&path) != offset;
+        if changed {
+            self.scroll_offsets.insert(path, offset);
+        }
+        changed
+    }
+
+    fn set_scroll_offset_property(
+        &mut self,
+        handle: &ElementHandle,
+        axis: usize,
+        value: f64,
+    ) -> Result<bool, ScriptError> {
+        let Some(path) = attached_path(handle) else {
+            return Ok(false);
+        };
+        let mut offset = self.scroll_offset(&path);
+        let value = if value.is_finite() {
+            (value as f32).max(0.0)
+        } else {
+            0.0
+        };
+        if axis == 0 {
+            offset.0 = value;
+        } else {
+            offset.1 = value;
+        }
+        let changed = self.set_scroll_offset(path.clone(), offset);
+        if changed {
+            self.dispatch_path_event(path, "scroll")?;
+        }
+        Ok(changed)
     }
 
     pub fn document(&self) -> Rc<RefCell<Document>> {
@@ -2287,6 +2341,16 @@ impl ScriptRuntime {
                     "disabled" => Value::Bool(
                         self.element_attribute(&handle, "disabled").is_some(),
                     ),
+                    "scrollLeft" => Value::Number(
+                        path.as_ref()
+                            .map(|path| self.scroll_offset(path).0 as f64)
+                            .unwrap_or(0.0),
+                    ),
+                    "scrollTop" => Value::Number(
+                        path.as_ref()
+                            .map(|path| self.scroll_offset(path).1 as f64)
+                            .unwrap_or(0.0),
+                    ),
                     "dataset" => Value::Dataset(handle.clone()),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
@@ -2871,6 +2935,8 @@ impl ScriptRuntime {
                 "value" => self.set_element_value(&handle, value_string),
                 "checked" => self.set_element_checked(&handle, truthy),
                 "disabled" => self.set_element_disabled(&handle, truthy),
+                "scrollLeft" => self.set_scroll_offset_property(&handle, 0, value.number()?)?,
+                "scrollTop" => self.set_scroll_offset_property(&handle, 1, value.number()?)?,
                 _ => false,
             },
             Value::Dataset(handle) => {
@@ -10177,6 +10243,35 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some(":Rus|blur:null")
+        );
+    }
+
+    #[test]
+    fn element_scroll_offsets_are_readable_and_writable() {
+        let document = document(
+            "<div id='viewport'><p id='status'>idle</p></div>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const viewport = document.getElementById("viewport");
+                viewport.addEventListener("scroll", () => {
+                    document.getElementById("status").textContent = "event:" + viewport.scrollTop;
+                });
+                viewport.scrollLeft = 12;
+                viewport.scrollTop = 34;
+                document.getElementById("status").textContent = viewport.scrollLeft + ":" + viewport.scrollTop + ":" + document.getElementById("status").textContent;
+                "#,
+            )
+            .expect("scroll properties should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("12:34:event:34")
         );
     }
 

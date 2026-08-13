@@ -280,7 +280,7 @@ fn paint_box(
         layout_box.background,
         clip,
     );
-    let content_clip = if layout_box.overflow == Overflow::Hidden {
+    let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto) {
         intersect_clip(clip, layout_box.rect)
     } else {
         clip
@@ -568,7 +568,13 @@ mod tests {
                     bold: false,
                 }],
                 children: Vec::new(),
+                position: crate::css::Position::Static,
                 overflow: Overflow::Visible,
+                scroll_content: Size {
+                    width: 20.0,
+                    height: 10.0,
+                },
+                scroll_offset: (0.0, 0.0),
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -618,7 +624,13 @@ mod tests {
                         border_color: Color::transparent(),
                         text: Vec::new(),
                         children: Vec::new(),
+                        position: crate::css::Position::Static,
                         overflow: Overflow::Visible,
+                        scroll_content: Size {
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                        scroll_offset: (0.0, 0.0),
                         margin: Default::default(),
                     },
                     LayoutBox {
@@ -635,11 +647,23 @@ mod tests {
                         border_color: Color::transparent(),
                         text: Vec::new(),
                         children: Vec::new(),
+                        position: crate::css::Position::Static,
                         overflow: Overflow::Visible,
+                        scroll_content: Size {
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                        scroll_offset: (0.0, 0.0),
                         margin: Default::default(),
                     },
                 ],
+                position: crate::css::Position::Static,
                 overflow: Overflow::Visible,
+                scroll_content: Size {
+                    width: 20.0,
+                    height: 20.0,
+                },
+                scroll_offset: (0.0, 0.0),
                 margin: Default::default(),
             },
             images: Vec::new(),

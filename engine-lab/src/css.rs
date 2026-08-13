@@ -1,5 +1,5 @@
 use crate::dom::{Element, NodePath};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
@@ -28,6 +28,7 @@ impl Position {
 pub(crate) enum Overflow {
     Visible,
     Hidden,
+    Auto,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -180,6 +181,7 @@ pub(crate) struct StyleState {
     pub(crate) focused_path: Option<NodePath>,
     pub(crate) checked_paths: BTreeSet<NodePath>,
     pub(crate) unchecked_paths: BTreeSet<NodePath>,
+    pub(crate) scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
 }
@@ -971,6 +973,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "overflow" | "overflow-x" | "overflow-y" => {
             style.overflow = match value.trim().to_ascii_lowercase().as_str() {
                 "hidden" | "clip" => Overflow::Hidden,
+                "auto" | "scroll" | "overlay" => Overflow::Auto,
                 _ => Overflow::Visible,
             };
         }
@@ -1326,6 +1329,23 @@ mod tests {
         assert_eq!(style.inset.bottom, Length::Auto);
         assert_eq!(style.inset.left, Length::Px(30.0));
         assert_eq!(style.overflow, Overflow::Hidden);
+        let auto = Stylesheet::parse(".scroll { overflow: auto; }")
+            .expect("auto stylesheet should parse");
+        let mut scroll = Element::new("div");
+        scroll
+            .attrs
+            .insert("class".to_string(), "scroll".to_string());
+        assert_eq!(
+            auto.style_for_inherited_with_ancestors(
+                &scroll,
+                &[],
+                16.0,
+                Color::BLACK,
+                FontWeight::Normal,
+            )
+            .overflow,
+            Overflow::Auto
+        );
     }
 
     #[test]

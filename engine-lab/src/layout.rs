@@ -5,7 +5,7 @@ use crate::css::{
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::image::Image;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
     pub width: f32,
     pub height: f32,
@@ -46,7 +46,10 @@ pub struct LayoutBox {
     pub border_color: Color,
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
+    pub(crate) position: Position,
     pub(crate) overflow: Overflow,
+    pub(crate) scroll_content: Size,
+    pub(crate) scroll_offset: (f32, f32),
     pub(crate) margin: ResolvedEdges,
 }
 
@@ -260,7 +263,13 @@ pub fn layout_with_state(
         border_color: Color::transparent(),
         text: Vec::new(),
         children: Vec::new(),
+        position: Position::Static,
         overflow: Overflow::Visible,
+        scroll_content: Size {
+            width: viewport.width,
+            height: viewport.height,
+        },
+        scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
     };
     let mut cursor_y = 0.0;
@@ -326,6 +335,7 @@ pub fn layout_with_state(
             style_state,
         },
     );
+    finalize_scroll(&mut root, style_state);
     LayoutDocument {
         viewport,
         root,
@@ -347,6 +357,18 @@ impl LayoutDocument {
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodePath> {
         hit_test_box(&self.root, x, y, Some(self.root.rect))
     }
+
+    pub(crate) fn scroll_target_at(&self, x: f32, y: f32) -> Option<ScrollTarget> {
+        scroll_target_box(&self.root, x, y, Some(self.root.rect))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScrollTarget {
+    pub(crate) path: NodePath,
+    pub(crate) max_x: f32,
+    pub(crate) max_y: f32,
+    pub(crate) offset: (f32, f32),
 }
 
 fn viewport_block(viewport: Size) -> ContainingBlock {
@@ -467,7 +489,7 @@ fn hit_test_box(layout: &LayoutBox, x: f32, y: f32, clip: Option<Rect>) -> Optio
         return None;
     }
     let inside_layout = contains_point(layout.rect, x, y);
-    let child_clip = if layout.overflow == Overflow::Hidden {
+    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) {
         intersect_rect(clip, layout.rect)
     } else {
         clip
@@ -478,6 +500,43 @@ fn hit_test_box(layout: &LayoutBox, x: f32, y: f32, clip: Option<Rect>) -> Optio
         }
     }
     (inside_layout && !layout.path.is_empty()).then(|| layout.path.clone())
+}
+
+fn scroll_target_box(
+    layout: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+) -> Option<ScrollTarget> {
+    if let Some(clip) = clip
+        && !contains_point(clip, x, y)
+    {
+        return None;
+    }
+    let inside_layout = contains_point(layout.rect, x, y);
+    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) {
+        intersect_rect(clip, layout.rect)
+    } else {
+        clip
+    };
+    for child in layout.children.iter().rev() {
+        if let Some(target) = scroll_target_box(child, x, y, child_clip) {
+            return Some(target);
+        }
+    }
+    if inside_layout && layout.overflow == Overflow::Auto {
+        let max_x = (layout.scroll_content.width - layout.rect.width).max(0.0);
+        let max_y = (layout.scroll_content.height - layout.rect.height).max(0.0);
+        if max_x > 0.0 || max_y > 0.0 {
+            return Some(ScrollTarget {
+                path: layout.path.clone(),
+                max_x,
+                max_y,
+                offset: layout.scroll_offset,
+            });
+        }
+    }
+    None
 }
 
 fn contains_point(rect: Rect, x: f32, y: f32) -> bool {
@@ -780,7 +839,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         border_color: style.border_color,
         text,
         children,
+        position: style.position,
         overflow: style.overflow,
+        scroll_content: Size::default(),
+        scroll_offset: (0.0, 0.0),
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -813,6 +875,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             style_state,
         },
     );
+    finalize_scroll(&mut layout, style_state);
     Some(layout)
 }
 
@@ -1071,7 +1134,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         border_color: style.border_color,
         text: Vec::new(),
         children,
+        position: style.position,
         overflow: style.overflow,
+        scroll_content: Size::default(),
+        scroll_offset: (0.0, 0.0),
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -1110,6 +1176,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
+    finalize_scroll(&mut layout, style_state);
     layout
 }
 
@@ -1293,7 +1360,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         border_color: style.border_color,
         text: Vec::new(),
         children,
+        position: style.position,
         overflow: style.overflow,
+        scroll_content: Size::default(),
+        scroll_offset: (0.0, 0.0),
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -1332,6 +1402,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
+    finalize_scroll(&mut layout, style_state);
     layout
 }
 
@@ -1415,6 +1486,59 @@ fn align_offset(align: AlignItems, available: f32, item: f32) -> f32 {
         AlignItems::Center => ((available - item) / 2.0).max(0.0),
         AlignItems::FlexEnd => (available - item).max(0.0),
         AlignItems::FlexStart | AlignItems::Stretch => 0.0,
+    }
+}
+
+fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
+    layout.scroll_content = measure_scroll_content(layout);
+    if layout.overflow != Overflow::Auto {
+        return;
+    }
+    let max_x = (layout.scroll_content.width - layout.rect.width).max(0.0);
+    let max_y = (layout.scroll_content.height - layout.rect.height).max(0.0);
+    let requested = style_state
+        .scroll_offsets
+        .get(&layout.path)
+        .copied()
+        .unwrap_or_default();
+    let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
+    layout.scroll_offset = offset;
+    if offset == (0.0, 0.0) {
+        return;
+    }
+    for child in &mut layout.children {
+        translate_scroll_box(child, -offset.0, -offset.1);
+    }
+}
+
+fn measure_scroll_content(layout: &LayoutBox) -> Size {
+    let mut right = layout.rect.x + layout.rect.width;
+    let mut bottom = layout.rect.y + layout.rect.height;
+    for child in &layout.children {
+        if child.position == Position::Fixed {
+            continue;
+        }
+        right = right.max(child.rect.x + child.rect.width);
+        bottom = bottom.max(child.rect.y + child.rect.height);
+    }
+    Size {
+        width: (right - layout.rect.x).max(layout.rect.width),
+        height: (bottom - layout.rect.y).max(layout.rect.height),
+    }
+}
+
+fn translate_scroll_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
+    if layout.position == Position::Fixed {
+        return;
+    }
+    layout.rect.x += offset_x;
+    layout.rect.y += offset_y;
+    for text in &mut layout.text {
+        text.x += offset_x;
+        text.y += offset_y;
+    }
+    for child in &mut layout.children {
+        translate_scroll_box(child, offset_x, offset_y);
     }
 }
 
@@ -1903,5 +2027,73 @@ mod tests {
             &canvas.rgba_pixels()[outside..outside + 4],
             [255, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn auto_overflow_scrolls_paint_and_hit_testing_with_bounded_offsets() {
+        let document = Document::parse(
+            "<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='content'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state
+            .scroll_offsets
+            .insert(vec![1], (20.0, 30.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+            &state,
+        );
+        let viewport = &result.root.children[0];
+        let content = &viewport.children[0];
+        assert_eq!(viewport.scroll_content, Size { width: 80.0, height: 60.0 });
+        assert_eq!(viewport.scroll_offset, (20.0, 30.0));
+        assert_eq!(content.rect.x, -20.0);
+        assert_eq!(content.rect.y, -30.0);
+        assert_eq!(result.hit_test(10.0, 10.0), Some(vec![1, 0]));
+        assert_eq!(result.hit_test(50.0, 10.0), None);
+        let target = result
+            .scroll_target_at(10.0, 10.0)
+            .expect("point should resolve to the scroll container");
+        assert_eq!(target.path, vec![1]);
+        assert_eq!(target.max_x, 40.0);
+        assert_eq!(target.max_y, 40.0);
+        let canvas = result.paint();
+        let inside = ((10 * canvas.width() + 10) * 4) as usize;
+        let outside = ((10 * canvas.width() + 50) * 4) as usize;
+        assert_eq!(&canvas.rgba_pixels()[inside..inside + 4], [255, 0, 0, 255]);
+        assert_ne!(
+            &canvas.rgba_pixels()[outside..outside + 4],
+            [255, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn auto_overflow_keeps_fixed_descendants_at_the_viewport() {
+        let document = Document::parse(
+            "<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 40px; height: 80px; margin: 0; } #fixed { position: fixed; left: 70px; top: 12px; width: 8px; height: 8px; margin: 0; }</style><div id='viewport'><div id='content'></div><div id='fixed'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state.scroll_offsets.insert(vec![1], (0.0, 30.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 100.0,
+            },
+            &state,
+        );
+        let viewport = &result.root.children[0];
+        assert_eq!(viewport.children[0].rect.y, -30.0);
+        assert_eq!(viewport.children[1].rect.x, 70.0);
+        assert_eq!(viewport.children[1].rect.y, 12.0);
     }
 }
