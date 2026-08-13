@@ -113,6 +113,7 @@ The experiment is useful even when a gate fails. A failure at a named gate tells
 - [Servo LTS releases](https://book.servo.org/embedding/lts-release.html)
 - [Ladybird](https://ladybird.org/)
 - [WPE WebKit](https://webkit.org/wpe/)
+- [WHATWG HTML Standard, Web workers](https://html.spec.whatwg.org/multipage/workers.html)
 - [WPE FAQ](https://wpewebkit.org/about/faq.html)
 - [WebKit ports](https://docs.webkit.org/Ports/Introduction.html)
 - [SpiderMonkey](https://spidermonkey.dev/)
