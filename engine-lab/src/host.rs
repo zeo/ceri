@@ -45,6 +45,14 @@ pub enum InputEvent {
     TextInput {
         text: String,
     },
+    CompositionUpdate {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    CompositionCommit {
+        text: String,
+    },
+    CompositionCancel,
     Blur,
     AdvanceTime(u64),
 }
@@ -357,6 +365,18 @@ impl EngineHost {
             },
             InputEvent::TextInput { text } => InputResult {
                 handled: self.browser.insert_text(&text)?,
+                ..InputResult::default()
+            },
+            InputEvent::CompositionUpdate { text, cursor } => InputResult {
+                handled: self.browser.composition_update(&text, cursor)?,
+                ..InputResult::default()
+            },
+            InputEvent::CompositionCommit { text } => InputResult {
+                handled: self.browser.composition_commit(&text)?,
+                ..InputResult::default()
+            },
+            InputEvent::CompositionCancel => InputResult {
+                handled: self.browser.composition_cancel()?,
                 ..InputResult::default()
             },
             InputEvent::Blur => InputResult {
@@ -962,6 +982,55 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("Rus")
+        );
+    }
+
+    #[test]
+    fn host_routes_native_composition_updates_and_commits() {
+        let browser = Browser::new(bundle(
+            r#"<input id="name" value="ab" style="display: block; width: 180px; height: 32px"><p id="status">idle</p><script>
+                const input = document.getElementById("name");
+                const status = document.getElementById("status");
+                let events = "";
+                input.addEventListener("compositionstart", () => { events = events + "start|"; });
+                input.addEventListener("compositionupdate", () => { events = events + "update:" + input.value + "|"; });
+                input.addEventListener("input", () => { events = events + "input:" + input.value + "|"; });
+                input.addEventListener("compositionend", () => { status.textContent = events + "end:" + input.value; });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(host
+            .click_id("name")
+            .expect("click should focus the input"));
+        assert!(host
+            .input(InputEvent::CompositionUpdate {
+                text: "x".to_string(),
+                cursor: Some((1, 1)),
+            })
+            .expect("composition update should be handled")
+            .handled);
+        assert!(host
+            .input(InputEvent::CompositionCommit {
+                text: "安".to_string(),
+            })
+            .expect("composition commit should be handled")
+            .handled);
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("start|update:ab|input:abx|input:ab安|end:ab安")
         );
     }
 

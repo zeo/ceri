@@ -37,7 +37,7 @@ The current slice implements:
 - app-origin `URL` and `URLSearchParams` constructors with URL resolution, query parsing, mutation, sorting, and linked `searchParams` updates
 - `URLSearchParams` key, value, and entry iterators, `forEach()`, and `Symbol.iterator` preserve duplicate pairs and URL linkage
 - app-origin `localStorage` and `sessionStorage` key/value stores shared across full-document navigations in one browser session
-- focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
+- focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, UTF-16 selection APIs, and deterministic text composition updates and commits
 - named form controls with live checkbox and radio-group state, ordered `FormData` text and `File` entries, pair mutation, deterministic `requestSubmit()` events, and a host-owned file-picker boundary with `input.files`, `FileList.item()`, and picker cancellation
 - a host-owned `ClipboardProvider` boundary behind `navigator.clipboard.readText()` and `writeText()`, with promise results and host-controlled access failures
 - `FormData` key, value, and entry iterators, `forEach()`, and `Symbol.iterator` preserve insertion order and File values
@@ -231,9 +231,9 @@ The input demo exercises focus, active-element state, text insertion, and key ed
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/input-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-input-demo.bmp --click name --text rust --key Backspace
 ```
 
-The `--text` and `--key` switches feed the same `EngineHost` input boundary used by the optional native window adapter. The window adapter forwards winit keyboard and IME commit events through that boundary.
+The `--text` and `--key` switches feed the same `EngineHost` input boundary used by the optional native window adapter. The window adapter forwards winit keyboard and IME preedit, commit, and disable events through that boundary.
 
-Text controls also expose the bounded selection surface used by form editors. Text-like `input` elements and `textarea` support `select()`, `selectionStart`, `selectionEnd`, `selectionDirection`, `setSelectionRange()`, and `setRangeText()`. Host text insertion and Backspace, Delete, Home, End, and arrow keys replace or move through the live UTF-16 selection. Modifier-key extension, composition events, document selection ranges, and caret painting remain separate gates.
+Text controls also expose the bounded selection surface used by form editors. Text-like `input` elements and `textarea` support `select()`, `selectionStart`, `selectionEnd`, `selectionDirection`, `setSelectionRange()`, and `setRangeText()`. Host text insertion and Backspace, Delete, Home, End, and arrow keys replace or move through the live UTF-16 selection. The native window forwards winit preedit, commit, and disable events, which become `compositionstart`, `compositionupdate`, and `compositionend` lifecycle events with live preedit replacement. Modifier-key extension, candidate-window positioning, document selection ranges, and caret painting remain separate gates.
 
 The grid demo exercises fixed row tracks, fractional columns, repeat syntax, and gaps:
 

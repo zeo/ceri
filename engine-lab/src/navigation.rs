@@ -1182,6 +1182,52 @@ impl Browser {
         }
     }
 
+    pub fn composition_update(
+        &mut self,
+        text: &str,
+        cursor: Option<(usize, usize)>,
+    ) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .composition_update(text, cursor)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    pub fn composition_commit(&mut self, text: &str) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .composition_commit(text)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    pub fn composition_cancel(&mut self) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .composition_cancel()
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
     pub fn blur(&mut self) -> Result<bool, NavigationError> {
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;

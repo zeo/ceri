@@ -388,13 +388,25 @@ impl ApplicationHandler for App {
                 };
                 self.submit(event_loop, InputEvent::KeyDown { key });
             }
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                self.submit(
+                    event_loop,
+                    InputEvent::CompositionUpdate {
+                        text: text.to_string(),
+                        cursor,
+                    },
+                );
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.submit(
                     event_loop,
-                    InputEvent::TextInput {
+                    InputEvent::CompositionCommit {
                         text: text.to_string(),
                     },
                 );
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.submit(event_loop, InputEvent::CompositionCancel);
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}

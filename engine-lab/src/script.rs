@@ -503,6 +503,7 @@ pub struct ScriptRuntime {
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
     text_selections: HashMap<NodePath, TextSelection>,
+    composition: Option<TextComposition>,
     selected_files: HashMap<NodePath, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodePath, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -762,6 +763,7 @@ struct EventData {
     history_state: Rc<RefCell<Value>>,
     key: String,
     data: String,
+    is_composing: bool,
     data_value: Option<Box<Value>>,
     error_message: Option<String>,
 }
@@ -834,6 +836,13 @@ struct TextSelection {
     start: usize,
     end: usize,
     direction: SelectionDirection,
+}
+
+#[derive(Clone, Debug)]
+struct TextComposition {
+    path: NodePath,
+    start: usize,
+    end: usize,
 }
 
 struct HeadersData {
@@ -1277,6 +1286,7 @@ impl ScriptRuntime {
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
             text_selections: HashMap::new(),
+            composition: None,
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -1549,6 +1559,9 @@ impl ScriptRuntime {
         if !self.is_focusable_path(&path) || self.focused_element.as_ref() == Some(&path) {
             return Ok(false);
         }
+        if self.composition.is_some() {
+            self.composition_cancel()?;
+        }
         let previous = self.focused_element.replace(path.clone());
         if let Some(previous) = previous {
             self.dispatch_event(previous, "blur")?;
@@ -1572,8 +1585,9 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn blur_focused(&mut self) -> Result<bool, ScriptError> {
+        let composition_changed = self.composition_cancel()?;
         let Some(path) = self.focused_element.take() else {
-            return Ok(false);
+            return Ok(composition_changed);
         };
         self.dispatch_event(path, "blur")?;
         self.drain_microtasks()?;
@@ -1581,6 +1595,9 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn insert_text(&mut self, text: &str) -> Result<bool, ScriptError> {
+        if self.composition.is_some() {
+            return self.composition_commit(text);
+        }
         if text.is_empty() {
             return Ok(false);
         }
@@ -1627,12 +1644,174 @@ impl ScriptRuntime {
         Ok(dispatch.handled || !text.is_empty())
     }
 
+    fn begin_composition(&mut self) -> Result<Option<NodePath>, ScriptError> {
+        if let Some(composition) = &self.composition {
+            return Ok(Some(composition.path.clone()));
+        }
+        let Some(path) = self.focused_element.clone() else {
+            return Ok(None);
+        };
+        if !self.is_selection_control_path(&path) {
+            return Ok(None);
+        }
+        let value = self.control_value_path(&path).unwrap_or_default();
+        let mut selection = self.selection_for_path(&path, &value);
+        if !self.text_selections.contains_key(&path) {
+            let cursor = utf16_len(&value);
+            selection = TextSelection {
+                start: cursor,
+                end: cursor,
+                direction: SelectionDirection::None,
+            };
+        }
+        let dispatch = self.dispatch_event_with_details(
+            path.clone(),
+            "compositionstart",
+            "",
+            "",
+        )?;
+        self.drain_microtasks()?;
+        if dispatch.default_prevented {
+            return Ok(None);
+        }
+        self.composition = Some(TextComposition {
+            path: path.clone(),
+            start: selection.start,
+            end: selection.end,
+        });
+        Ok(Some(path))
+    }
+
+    pub(crate) fn composition_update(
+        &mut self,
+        text: &str,
+        _cursor: Option<(usize, usize)>,
+    ) -> Result<bool, ScriptError> {
+        let Some(path) = self.begin_composition()? else {
+            return Ok(false);
+        };
+        let Some(composition) = self.composition.clone() else {
+            return Ok(false);
+        };
+        let update = self.dispatch_event_with_details(
+            path.clone(),
+            "compositionupdate",
+            "",
+            text,
+        )?;
+        self.drain_microtasks()?;
+        let value = self.control_value_path(&path).unwrap_or_default();
+        let length = utf16_len(&value);
+        let start = composition.start.min(length);
+        let end = composition.end.min(length).max(start);
+        let (value, selection_end) = replace_utf16_range(&value, start, end, text);
+        self.control_values.insert(path.clone(), value);
+        self.composition = Some(TextComposition {
+            path: path.clone(),
+            start,
+            end: selection_end,
+        });
+        self.text_selections.insert(
+            path.clone(),
+            TextSelection {
+                start: selection_end,
+                end: selection_end,
+                direction: SelectionDirection::None,
+            },
+        );
+        let input = self.dispatch_event_with_details(path, "input", "", text)?;
+        self.drain_microtasks()?;
+        Ok(update.handled || input.handled || start != end || !text.is_empty())
+    }
+
+    pub(crate) fn composition_commit(&mut self, text: &str) -> Result<bool, ScriptError> {
+        let Some(composition) = self.composition.clone() else {
+            return self.insert_text(text);
+        };
+        let path = composition.path;
+        if !self.is_selection_control_path(&path) {
+            self.composition = None;
+            return Ok(false);
+        }
+        let value = self.control_value_path(&path).unwrap_or_default();
+        let length = utf16_len(&value);
+        let start = composition.start.min(length);
+        let end = composition.end.min(length).max(start);
+        let (value, cursor) = replace_utf16_range(&value, start, end, text);
+        self.control_values.insert(path.clone(), value);
+        self.text_selections.insert(
+            path.clone(),
+            TextSelection {
+                start: cursor,
+                end: cursor,
+                direction: SelectionDirection::None,
+            },
+        );
+        let input = self.dispatch_event_with_details(path.clone(), "input", "", text)?;
+        self.drain_microtasks()?;
+        self.composition = None;
+        let end_event = self.dispatch_event_with_details(
+            path,
+            "compositionend",
+            "",
+            text,
+        )?;
+        self.drain_microtasks()?;
+        Ok(input.handled || end_event.handled || start != end || !text.is_empty())
+    }
+
+    pub(crate) fn composition_cancel(&mut self) -> Result<bool, ScriptError> {
+        let Some(composition) = self.composition.clone() else {
+            return Ok(false);
+        };
+        let path = composition.path;
+        if !self.is_selection_control_path(&path) {
+            self.composition = None;
+            return Ok(false);
+        }
+        let update = self.dispatch_event_with_details(
+            path.clone(),
+            "compositionupdate",
+            "",
+            "",
+        )?;
+        self.drain_microtasks()?;
+        self.composition = None;
+        let value = self.control_value_path(&path).unwrap_or_default();
+        let length = utf16_len(&value);
+        let start = composition.start.min(length);
+        let end = composition.end.min(length).max(start);
+        let (value, cursor) = replace_utf16_range(&value, start, end, "");
+        self.control_values.insert(path.clone(), value);
+        self.text_selections.insert(
+            path.clone(),
+            TextSelection {
+                start: cursor,
+                end: cursor,
+                direction: SelectionDirection::None,
+            },
+        );
+        let input = if start != end {
+            let input = self.dispatch_event_with_details(path.clone(), "input", "", "")?;
+            self.drain_microtasks()?;
+            input.handled
+        } else {
+            false
+        };
+        let end_event = self.dispatch_event_with_details(path, "compositionend", "", "")?;
+        self.drain_microtasks()?;
+        Ok(update.handled || input || end_event.handled || start != end)
+    }
+
     pub(crate) fn key_down(&mut self, key: &str) -> Result<bool, ScriptError> {
         let Some(path) = self.focused_element.clone() else {
             return Ok(false);
         };
         let dispatch = self.dispatch_event_with_details(path.clone(), "keydown", key, "")?;
         self.drain_microtasks()?;
+        if self.composition.is_some() {
+            return Ok(dispatch.handled);
+        }
         if dispatch.default_prevented || !self.is_text_control_path(&path) {
             return Ok(dispatch.handled);
         }
@@ -1973,6 +2152,7 @@ impl ScriptRuntime {
             history_state: Rc::new(RefCell::new(Value::Null)),
             key: String::new(),
             data: String::new(),
+            is_composing: false,
             data_value: None,
             error_message: None,
         });
@@ -2017,6 +2197,7 @@ impl ScriptRuntime {
             history_state: Rc::new(RefCell::new(state)),
             key: String::new(),
             data: String::new(),
+            is_composing: false,
             data_value: None,
             error_message: None,
         });
@@ -2755,6 +2936,7 @@ impl ScriptRuntime {
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
                 "key" => Ok(Value::String(event.key.clone())),
+                "isComposing" => Ok(Value::Bool(event.is_composing)),
                 "data" => Ok(event
                     .data_value
                     .as_ref()
@@ -3512,6 +3694,7 @@ impl ScriptRuntime {
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
                             data: String::new(),
+                            is_composing: false,
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
@@ -3608,6 +3791,7 @@ impl ScriptRuntime {
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
                             data: String::new(),
+                            is_composing: false,
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
@@ -3638,6 +3822,7 @@ impl ScriptRuntime {
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
                             data: String::new(),
+                            is_composing: false,
                             data_value: None,
                             error_message: Some(message),
                         });
@@ -6627,6 +6812,7 @@ impl ScriptRuntime {
                 history_state: Rc::new(RefCell::new(Value::Null)),
                 key: key.to_string(),
                 data: data.to_string(),
+                is_composing: self.composition.is_some(),
                 data_value: None,
                 error_message: None,
             });
@@ -7698,6 +7884,26 @@ fn normalize_file_name(value: &str) -> String {
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+fn replace_utf16_range(value: &str, start: usize, end: usize, replacement: &str) -> (String, usize) {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    let start = start.min(units.len());
+    let end = end.min(units.len()).max(start);
+    let replacement_units = replacement.encode_utf16().collect::<Vec<_>>();
+    let mut next_units = Vec::with_capacity(
+        units
+            .len()
+            .saturating_sub(end.saturating_sub(start))
+            .saturating_add(replacement_units.len()),
+    );
+    next_units.extend_from_slice(&units[..start]);
+    next_units.extend_from_slice(&replacement_units);
+    next_units.extend_from_slice(&units[end..]);
+    (
+        String::from_utf16_lossy(&next_units),
+        start.saturating_add(replacement_units.len()),
+    )
 }
 
 fn selection_offset(value: f64) -> usize {
@@ -11220,6 +11426,79 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("AxB|1|2")
+        );
+    }
+
+    #[test]
+    fn text_composition_replaces_preedit_and_commits_or_cancels() {
+        let document = document(r#"<input id="name" value="ab"><p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const input = document.getElementById("name");
+                let events = "";
+                input.addEventListener("compositionstart", (event) => events = events + event.type + ":" + event.data + "|");
+                input.addEventListener("compositionupdate", (event) => events = events + event.type + ":" + event.data + ":" + input.value + ":" + event.isComposing + "|");
+                input.addEventListener("input", (event) => events = events + event.data + ":" + input.value + ":" + event.isComposing + "|");
+                input.addEventListener("compositionend", (event) => events = events + event.type + ":" + event.data + ":" + input.value + "|");
+                input.focus();
+                input.setSelectionRange(1, 1);
+                "#,
+            )
+            .expect("composition listeners should register");
+        assert!(runtime
+            .composition_update("x", Some((1, 1)))
+            .expect("preedit should update"));
+        assert!(runtime
+            .composition_update("xy", Some((2, 2)))
+            .expect("preedit should replace"));
+        assert!(runtime
+            .composition_commit("安")
+            .expect("composition should commit"));
+        runtime
+            .execute(
+                "document.getElementById(\"status\").textContent = document.getElementById(\"name\").value + \"|\" + document.getElementById(\"name\").selectionStart + \"|\" + events;",
+            )
+            .expect("composition result should be readable");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("a安b|2|compositionstart:|compositionupdate:x:ab:true|x:axb:true|compositionupdate:xy:axb:true|xy:axyb:true|安:a安b:true|compositionend:安:a安b|")
+        );
+
+        let cancel_document = Rc::new(RefCell::new(
+            Document::parse(r#"<input id="name" value="ab"><p id="status">idle</p>"#)
+                .expect("cancel document should parse"),
+        ));
+        let mut cancel_runtime = ScriptRuntime::new(cancel_document.clone());
+        cancel_runtime
+            .execute(
+                "const input = document.getElementById(\"name\"); input.focus(); input.setSelectionRange(1, 1);",
+            )
+            .expect("canceled composition should prepare");
+        assert!(cancel_runtime
+            .composition_update("z", Some((1, 1)))
+            .expect("second preedit should update"));
+        assert!(cancel_runtime
+            .composition_cancel()
+            .expect("composition should cancel"));
+        cancel_runtime
+            .execute("document.getElementById(\"status\").textContent = document.getElementById(\"name\").value;")
+            .expect("canceled composition should be readable");
+        let status_path = cancel_document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            cancel_document
+                .borrow()
+                .element_text_content(&status_path)
+                .as_deref(),
+            Some("ab")
         );
     }
 
