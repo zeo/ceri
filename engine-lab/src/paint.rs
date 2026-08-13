@@ -467,7 +467,7 @@ fn paint_control_selection(
     let Some(value) = &layout_box.control_value else {
         return;
     };
-    let Some((start, end)) = layout_box.control_selection else {
+    let Some((start, end, _)) = layout_box.control_selection else {
         return;
     };
     if layout_box.control_text_origin.is_none() || start == end {
@@ -516,7 +516,7 @@ fn paint_control_caret(
     }
     let caret = layout_box
         .control_selection
-        .map(|(_, end)| end)
+        .map(|(start, end, backward)| if backward { start } else { end })
         .unwrap_or_else(|| value.encode_utf16().count());
     let Some((x, y)) = control_text_position(layout_box, value, caret) else {
         return;
@@ -956,7 +956,7 @@ mod tests {
 
         let mut focused = document.clone();
         focused.root.control_value = Some("A".to_string());
-        focused.root.control_selection = Some((0, 1));
+        focused.root.control_selection = Some((0, 1, false));
         focused.root.control_focused = true;
         focused.root.control_text_origin = Some((4.0, 5.0));
         let focused_canvas = paint(&focused);
@@ -972,6 +972,13 @@ mod tests {
         assert_eq!(
             &focused_canvas.rgba_pixels()[selection_index..selection_index + 3],
             &[170, 205, 238]
+        );
+        focused.root.control_selection = Some((0, 1, true));
+        let backward_canvas = paint(&focused);
+        let backward_caret_index = ((5 * backward_canvas.width() + 4) * 4) as usize;
+        assert_eq!(
+            &backward_canvas.rgba_pixels()[backward_caret_index..backward_caret_index + 3],
+            &[0, 0, 0]
         );
 
         let path = std::env::temp_dir().join(format!("ceri-engine-lab-{}.bmp", std::process::id()));
@@ -1021,7 +1028,7 @@ mod tests {
                     },
                 ],
                 control_value: Some("ABCD".to_string()),
-                control_selection: Some((2, 3)),
+                control_selection: Some((2, 3, false)),
                 control_focused: true,
                 control_text_origin: Some((4.0, 5.0)),
                 children: Vec::new(),
@@ -1046,7 +1053,7 @@ mod tests {
         assert_eq!(&canvas.rgba_pixels()[selection_index..selection_index + 3], &[170, 205, 238]);
         let caret_index = ((20 * canvas.width() + 10) * 4) as usize;
         assert_eq!(&canvas.rgba_pixels()[caret_index..caret_index + 3], &[0, 0, 0]);
-        document.root.control_selection = Some((0, 0));
+        document.root.control_selection = Some((0, 0, false));
         assert_ne!(paint(&document).rgba_pixels(), canvas.rgba_pixels());
     }
 

@@ -195,7 +195,7 @@ pub(crate) struct StyleState {
     pub(crate) unchecked_paths: BTreeSet<NodePath>,
     pub(crate) scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     pub(crate) control_values: BTreeMap<NodePath, String>,
-    pub(crate) text_selections: BTreeMap<NodePath, (usize, usize)>,
+    pub(crate) text_selections: BTreeMap<NodePath, (usize, usize, bool)>,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
     pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,

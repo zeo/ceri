@@ -46,7 +46,7 @@ pub struct LayoutBox {
     pub border_color: Color,
     pub text: Vec<TextRun>,
     pub(crate) control_value: Option<String>,
-    pub(crate) control_selection: Option<(usize, usize)>,
+    pub(crate) control_selection: Option<(usize, usize, bool)>,
     pub(crate) control_focused: bool,
     pub(crate) control_text_origin: Option<(f32, f32)>,
     pub children: Vec<LayoutBox>,
@@ -2349,7 +2349,7 @@ mod tests {
             ..Default::default()
         };
         state.control_values.insert(vec![0], "live".to_string());
-        state.text_selections.insert(vec![0], (1, 3));
+        state.text_selections.insert(vec![0], (1, 3, true));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -2361,7 +2361,7 @@ mod tests {
         );
         let input = &result.root.children[0];
         assert_eq!(input.control_value.as_deref(), Some("live"));
-        assert_eq!(input.control_selection, Some((1, 3)));
+        assert_eq!(input.control_selection, Some((1, 3, true)));
         assert!(input.control_focused);
         assert_eq!(input.text[0].text, "live");
     }
@@ -2380,7 +2380,7 @@ mod tests {
         state
             .control_values
             .insert(vec![0], "live\nvalue".to_string());
-        state.text_selections.insert(vec![0], (1, 7));
+        state.text_selections.insert(vec![0], (1, 7, false));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -2392,7 +2392,7 @@ mod tests {
         );
         let textarea = &result.root.children[0];
         assert_eq!(textarea.control_value.as_deref(), Some("live\nvalue"));
-        assert_eq!(textarea.control_selection, Some((1, 7)));
+        assert_eq!(textarea.control_selection, Some((1, 7, false)));
         assert!(textarea.control_focused);
         assert_eq!(textarea.text.len(), 2);
         assert_eq!(textarea.text[0].text, "live");

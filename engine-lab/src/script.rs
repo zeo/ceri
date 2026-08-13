@@ -1988,7 +1988,16 @@ impl ScriptRuntime {
             text_selections: self
                 .text_selections
                 .iter()
-                .map(|(path, selection)| (path.clone(), (selection.start, selection.end)))
+                .map(|(path, selection)| {
+                    (
+                        path.clone(),
+                        (
+                            selection.start,
+                            selection.end,
+                            selection.direction == SelectionDirection::Backward,
+                        ),
+                    )
+                })
                 .collect(),
             ..StyleState::default()
         };
