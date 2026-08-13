@@ -1876,6 +1876,24 @@ impl ScriptRuntime {
         let value = self.control_value_path(&path).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
         let selection = self.selection_for_path(&path, &value);
+        if key == "Enter"
+            && self
+                .document
+                .borrow()
+                .element_clone(&path)
+                .is_some_and(|element| element.name == "textarea")
+        {
+            self.set_range_text(
+                &path,
+                &[
+                    Value::String("\n".to_string()),
+                    Value::Number(selection.start as f64),
+                    Value::Number(selection.end as f64),
+                    Value::String("end".to_string()),
+                ],
+            )?;
+            return Ok(true);
+        }
         if modifiers.shift {
             let (anchor, focus) = selection_anchor_focus(selection);
             let next_focus = match key {
@@ -1951,21 +1969,15 @@ impl ScriptRuntime {
             _ => return Ok(dispatch.handled),
         };
         if start != end {
-            let mut next_units = Vec::with_capacity(units.len() - (end - start));
-            next_units.extend_from_slice(&units[..start]);
-            next_units.extend_from_slice(&units[end..]);
-            self.control_values
-                .insert(path.clone(), String::from_utf16_lossy(&next_units));
-            self.text_selections.insert(
-                path.clone(),
-                TextSelection {
-                    start,
-                    end: start,
-                    direction: SelectionDirection::None,
-                },
-            );
-            self.dispatch_event_with_details(path, "input", key, "")?;
-            self.drain_microtasks()?;
+            self.set_range_text(
+                &path,
+                &[
+                    Value::String(String::new()),
+                    Value::Number(start as f64),
+                    Value::Number(end as f64),
+                    Value::String("start".to_string()),
+                ],
+            )?;
             return Ok(true);
         }
         Ok(dispatch.handled)
@@ -11931,6 +11943,32 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("!ho")
         );
+    }
+
+    #[test]
+    fn textarea_enter_and_delete_edit_the_live_selection() {
+        let document = document(r#"<textarea id="note">AB</textarea>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let note_path = document
+            .borrow()
+            .find_element_by_id("note")
+            .expect("textarea should exist");
+        assert!(runtime.focus_path(note_path).expect("textarea should focus"));
+        assert!(runtime
+            .key_down_with_modifiers("Enter", KeyModifiers::default())
+            .expect("Enter should insert a line break"));
+        assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("AB\n"));
+        assert!(runtime
+            .key_down_with_modifiers("Backspace", KeyModifiers::default())
+            .expect("Backspace should remove the line break"));
+        assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("AB"));
+        assert!(runtime
+            .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
+            .expect("ArrowLeft should move before the final character"));
+        assert!(runtime
+            .key_down_with_modifiers("Delete", KeyModifiers::default())
+            .expect("Delete should remove the final character"));
+        assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("A"));
     }
 
     #[test]
