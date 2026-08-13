@@ -100,6 +100,14 @@ pub(crate) enum Length {
     Px(f32),
     Em(f32),
     Percent(f32),
+    Calc(CalcLength),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CalcLength {
+    pub(crate) px: f32,
+    pub(crate) em: f32,
+    pub(crate) percent: f32,
 }
 
 impl Length {
@@ -109,6 +117,9 @@ impl Length {
             Self::Px(value) => Some(value),
             Self::Em(value) => Some(value * font_size),
             Self::Percent(value) => Some(containing * value / 100.0),
+            Self::Calc(value) => {
+                Some(value.px + value.em * font_size + value.percent * containing / 100.0)
+            }
         }
     }
 }
@@ -186,6 +197,7 @@ pub(crate) struct StyleState {
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
     pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
+    pub(crate) root_path: Option<NodePath>,
 }
 
 impl StyleState {
@@ -363,6 +375,33 @@ impl Stylesheet {
 
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
         state.custom_properties.clear();
+        state.root_path = document
+            .root
+            .children
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| match node {
+                Node::Element(element) if element.name == "html" => Some(vec![index]),
+                _ => None,
+            })
+            .or_else(|| {
+                document
+                    .root
+                    .children
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, node)| match node {
+                        Node::Element(element)
+                            if !matches!(
+                                element.name.as_str(),
+                                "head" | "style" | "script" | "link" | "meta" | "title"
+                            ) =>
+                        {
+                            Some(vec![index])
+                        }
+                        _ => None,
+                    })
+            });
         let inherited = BTreeMap::new();
         let ancestors = Vec::new();
         for (index, node) in document.root.children.iter().enumerate() {
@@ -594,6 +633,7 @@ enum AttributeSelector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PseudoClass {
+    Root,
     Hover,
     Focus,
     Checked,
@@ -759,6 +799,7 @@ impl CompoundSelector {
 impl PseudoClass {
     fn matches(self, element: &Element, path: &[usize], state: &StyleState) -> bool {
         match self {
+            Self::Root => state.root_path.as_deref() == Some(path),
             Self::Hover => state.is_hovered(path),
             Self::Focus => state.is_focused(path),
             Self::Checked => {
@@ -806,6 +847,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 *cursor += 1;
                 let name = parse_selector_name(source, cursor)?;
                 let pseudo = match name.as_str() {
+                    "root" => PseudoClass::Root,
                     "hover" => PseudoClass::Hover,
                     "focus" => PseudoClass::Focus,
                     "checked" => PseudoClass::Checked,
@@ -1207,6 +1249,74 @@ fn parse_length(value: &str) -> Option<Length> {
     if value == "auto" {
         return Some(Length::Auto);
     }
+    if value.starts_with("calc(") {
+        return parse_calc_length(&value).map(Length::Calc);
+    }
+    if let Some(value) = value.strip_suffix("px") {
+        return value.parse().ok().map(Length::Px);
+    }
+    if let Some(value) = value.strip_suffix("em") {
+        return value.parse().ok().map(Length::Em);
+    }
+    if let Some(value) = value.strip_suffix('%') {
+        return value.parse().ok().map(Length::Percent);
+    }
+    (value == "0").then_some(Length::Px(0.0))
+}
+
+fn parse_calc_length(value: &str) -> Option<CalcLength> {
+    let expression = value.strip_prefix("calc(")?.strip_suffix(')')?.trim();
+    if expression.is_empty() {
+        return None;
+    }
+    let bytes = expression.as_bytes();
+    let mut cursor = 0;
+    let mut terms = CalcLength {
+        px: 0.0,
+        em: 0.0,
+        percent: 0.0,
+    };
+    let mut saw_term = false;
+    let mut sign = 1.0;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+        if matches!(bytes[cursor], b'+' | b'-') {
+            sign = if bytes[cursor] == b'-' { -1.0 } else { 1.0 };
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+        }
+        let start = cursor;
+        while cursor < bytes.len() && !matches!(bytes[cursor], b'+' | b'-') {
+            cursor += 1;
+        }
+        let token = expression[start..cursor].trim();
+        if token.is_empty() {
+            return None;
+        }
+        let length = parse_simple_length(token)?;
+        match length {
+            Length::Px(value) => terms.px += sign * value,
+            Length::Em(value) => terms.em += sign * value,
+            Length::Percent(value) => terms.percent += sign * value,
+            Length::Auto | Length::Calc(_) => return None,
+        }
+        if !terms.px.is_finite() || !terms.em.is_finite() || !terms.percent.is_finite() {
+            return None;
+        }
+        saw_term = true;
+        sign = 1.0;
+    }
+    saw_term.then_some(terms)
+}
+
+fn parse_simple_length(value: &str) -> Option<Length> {
     if let Some(value) = value.strip_suffix("px") {
         return value.parse().ok().map(Length::Px);
     }
@@ -1426,6 +1536,20 @@ mod tests {
         assert_eq!(Color::parse("#abc"), Some(Color::opaque(170, 187, 204)));
         assert_eq!(parse_length("2em"), Some(Length::Em(2.0)));
         assert_eq!(parse_length("68%"), Some(Length::Percent(68.0)));
+        assert_eq!(
+            parse_length("calc(100% - 20px)"),
+            Some(Length::Calc(CalcLength {
+                px: -20.0,
+                em: 0.0,
+                percent: 100.0,
+            }))
+        );
+        assert_eq!(
+            parse_length("calc(100% - 20px)")
+                .expect("calc length should parse")
+                .resolve(200.0, 16.0),
+            Some(180.0)
+        );
     }
 
     #[test]
@@ -1493,6 +1617,37 @@ mod tests {
             ),
             Some("#123456".to_string())
         );
+    }
+
+    #[test]
+    fn matches_root_and_resolves_calc_using_custom_properties() {
+        let document =
+            Document::parse("<html><div id='card'></div></html>").expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            ":root { --accent: #00ff00; } #card { width: calc(100% - 20px); color: var(--accent); }",
+        )
+        .expect("stylesheet should parse");
+        let mut state = StyleState::default();
+        stylesheet.populate_custom_properties(&document, &mut state);
+        let html = match &document.root.children[0] {
+            Node::Element(element) => element,
+            Node::Text(_) => panic!("html should be an element"),
+        };
+        let card = match &html.children[0] {
+            Node::Element(element) => element,
+            Node::Text(_) => panic!("card should be an element"),
+        };
+        let style = stylesheet.style_for(StyleContext {
+            element: card,
+            path: &[0, 0],
+            ancestors: &[html],
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            state: &state,
+        });
+        assert_eq!(style.width.resolve(100.0, 16.0), Some(80.0));
+        assert_eq!(style.color, Color::opaque(0, 255, 0));
     }
 
     #[test]

@@ -3344,10 +3344,10 @@ mod tests {
     fn browser_applies_inherited_custom_properties_to_layout() {
         let mut browser = Browser::new(bundle(
             r##"<style>
-                #theme { --accent: #00ff00; --card-width: 40px; margin: 0; }
-                #card { width: var(--card-width); height: 20px; margin: 0; background: var(--accent); }
+                :root { --accent: #00ff00; --card-width: calc(50% - 10px); margin: 0; }
+                #card { width: var(--card-width); height: calc(10px + 10px); margin: 0; background: var(--accent); }
             </style>
-            <div id="theme"><div id="card">card</div></div>"##,
+            <html><div id="card">card</div></html>"##,
         ));
         browser
             .navigate("https://app.ceri.invalid/")

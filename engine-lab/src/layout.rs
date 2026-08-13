@@ -2557,7 +2557,7 @@ mod tests {
     #[test]
     fn layout_resolves_inherited_custom_properties_before_paint() {
         let document = Document::parse(
-            "<style>#theme { --accent: #00ff00; --card-width: 40px; margin: 0; } #card { width: var(--card-width); height: 20px; margin: 0; background: var(--accent); }</style><div id='theme'><div id='card'></div></div>",
+            "<style>:root { --accent: #00ff00; --card-width: calc(50% - 10px); margin: 0; } #card { width: var(--card-width); height: calc(10px + 10px); margin: 0; background: var(--accent); }</style><html><div id='card'></div></html>",
         )
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
