@@ -470,24 +470,31 @@ fn paint_control_selection(
     let Some((start, end)) = layout_box.control_selection else {
         return;
     };
-    let Some(origin) = layout_box.control_text_origin else {
-        return;
-    };
-    let start = utf16_char_offset(value, start);
-    let end = utf16_char_offset(value, end).max(start);
-    if start == end {
+    if layout_box.control_text_origin.is_none() || start == end {
         return;
     }
-    let advance = text_advance(layout_box.font_size);
-    fill_rect_optional(
-        canvas,
-        origin.0 + offset.0 + start as f32 * advance,
-        origin.1 + offset.1,
-        (end - start) as f32 * advance,
-        layout_box.font_size.max(1.0),
-        Color::opaque(170, 205, 238),
-        clip,
-    );
+    for (line_index, (line_start, line_end)) in control_line_ranges(value).iter().enumerate() {
+        let Some(run) = layout_box.text.get(line_index) else {
+            break;
+        };
+        let selected_start = start.max(*line_start);
+        let selected_end = end.min(*line_end);
+        if selected_start >= selected_end {
+            continue;
+        }
+        let selected_start_char = utf16_char_offset(&run.text, selected_start - line_start);
+        let selected_end_char = utf16_char_offset(&run.text, selected_end - line_start);
+        let advance = text_advance(run.font_size);
+        fill_rect_optional(
+            canvas,
+            run.x + offset.0 + selected_start_char as f32 * advance,
+            run.y + offset.1,
+            (selected_end_char - selected_start_char) as f32 * advance,
+            run.font_size.max(1.0),
+            Color::opaque(170, 205, 238),
+            clip,
+        );
+    }
 }
 
 fn paint_control_caret(
@@ -502,24 +509,59 @@ fn paint_control_caret(
     let Some(value) = &layout_box.control_value else {
         return;
     };
-    let Some(origin) = layout_box.control_text_origin else {
+    if layout_box.control_text_origin.is_none() {
         return;
-    };
+    }
     let caret = layout_box
         .control_selection
         .map(|(_, end)| end)
         .unwrap_or_else(|| value.encode_utf16().count());
-    let caret = utf16_char_offset(value, caret);
-    let advance = text_advance(layout_box.font_size);
+    let Some((x, y)) = control_text_position(layout_box, value, caret) else {
+        return;
+    };
     fill_rect_optional(
         canvas,
-        origin.0 + offset.0 + caret as f32 * advance,
-        origin.1 + offset.1,
+        x + offset.0,
+        y + offset.1,
         1.0,
         layout_box.font_size.max(1.0),
         Color::BLACK,
         clip,
     );
+}
+
+fn control_line_ranges(value: &str) -> Vec<(usize, usize)> {
+    let mut start = 0;
+    let mut ranges = Vec::new();
+    for line in value.split('\n') {
+        let end = start + line.encode_utf16().count();
+        ranges.push((start, end));
+        start = end + 1;
+    }
+    ranges
+}
+
+fn control_text_position(
+    layout_box: &LayoutBox,
+    value: &str,
+    offset: usize,
+) -> Option<(f32, f32)> {
+    let ranges = control_line_ranges(value);
+    let mut line_index = ranges.len().saturating_sub(1);
+    for (index, (_, line_end)) in ranges.iter().enumerate() {
+        if offset <= *line_end || index + 1 == ranges.len() {
+            line_index = index;
+            break;
+        }
+    }
+    let (line_start, line_end) = ranges.get(line_index).copied()?;
+    let run = layout_box.text.get(line_index)?;
+    let line_offset = offset.saturating_sub(line_start).min(line_end - line_start);
+    let character_offset = utf16_char_offset(&run.text, line_offset);
+    Some((
+        run.x + character_offset as f32 * text_advance(run.font_size),
+        run.y,
+    ))
 }
 
 fn text_advance(font_size: f32) -> f32 {
@@ -917,7 +959,7 @@ mod tests {
             canvas.rgba_pixels(),
             "focused controls should add a software caret"
         );
-        let caret_x = (4.0 + text_advance(16.0)) as u32;
+        let caret_x = (4.0 + text_advance(12.0)) as u32;
         let caret_index = ((5 * focused_canvas.width() + caret_x) * 4) as usize;
         assert_eq!(&focused_canvas.rgba_pixels()[caret_index..caret_index + 3], &[0, 0, 0]);
         let selection_index = ((5 * focused_canvas.width() + 4) * 4) as usize;
@@ -931,6 +973,75 @@ mod tests {
         let bytes = std::fs::read(&path).expect("bmp should be readable");
         assert_eq!(&bytes[..2], b"BM");
         std::fs::remove_file(path).expect("test bmp should be removable");
+    }
+
+    #[test]
+    fn painting_textarea_selection_and_caret_use_line_offsets() {
+        let mut document = LayoutDocument {
+            viewport: Size {
+                width: 40.0,
+                height: 40.0,
+            },
+            root: LayoutBox {
+                path: Vec::new(),
+                tag: "textarea".to_string(),
+                rect: Rect {
+                    x: 2.0,
+                    y: 3.0,
+                    width: 32.0,
+                    height: 28.0,
+                },
+                background: Color::opaque(10, 20, 30),
+                border_width: 0.0,
+                border_color: Color::transparent(),
+                text: vec![
+                    TextRun {
+                        text: "A".to_string(),
+                        x: 4.0,
+                        y: 5.0,
+                        width: 6.0,
+                        font_size: 12.0,
+                        color: Color::WHITE,
+                        bold: false,
+                    },
+                    TextRun {
+                        text: "B".to_string(),
+                        x: 4.0,
+                        y: 20.0,
+                        width: 6.0,
+                        font_size: 12.0,
+                        color: Color::WHITE,
+                        bold: false,
+                    },
+                ],
+                control_value: Some("A\nB".to_string()),
+                control_selection: Some((2, 3)),
+                control_focused: true,
+                control_text_origin: Some((4.0, 5.0)),
+                children: Vec::new(),
+                position: crate::css::Position::Static,
+                visual_offset: (0.0, 0.0),
+                z_index: 0,
+                creates_stacking_context: true,
+                sticky_inset: crate::css::Edges::auto(),
+                font_size: 12.0,
+                overflow: Overflow::Visible,
+                scroll_content: Size {
+                    width: 32.0,
+                    height: 28.0,
+                },
+                scroll_offset: (0.0, 0.0),
+                margin: Default::default(),
+            },
+            images: Vec::new(),
+        };
+        let canvas = paint(&document);
+        let selection_index = ((20 * canvas.width() + 9) * 4) as usize;
+        assert_eq!(&canvas.rgba_pixels()[selection_index..selection_index + 3], &[170, 205, 238]);
+        let caret_index = ((20 * canvas.width() + 10) * 4) as usize;
+        assert_eq!(&canvas.rgba_pixels()[caret_index..caret_index + 3], &[0, 0, 0]);
+        document.root.control_selection = Some((0, 0));
+        assert_ne!(paint(&document).rgba_pixels(), canvas.rgba_pixels());
     }
 
     #[test]

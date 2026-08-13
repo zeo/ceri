@@ -987,15 +987,18 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let control_value = text_control_value(element, &path, style_state);
     let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
     if let Some(value) = &control_value {
-        text.push(TextRun {
-            text: value.clone(),
-            x: content_x,
-            y: content_y,
-            width: measure_text(value, font_size),
-            font_size,
-            color: style.color,
-            bold: style.font_weight == FontWeight::Bold,
-        });
+        for (line_index, value_line) in value.split('\n').enumerate() {
+            text.push(TextRun {
+                text: value_line.to_string(),
+                x: content_x,
+                y: content_y + line_index as f32 * line_height,
+                width: measure_text(value_line, font_size),
+                font_size,
+                color: style.color,
+                bold: style.font_weight == FontWeight::Bold,
+            });
+        }
+        line.y = content_y + value.split('\n').count() as f32 * line_height;
     }
     let mut children = Vec::new();
     let mut positioned = Vec::new();
@@ -1012,7 +1015,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     child_ancestors.push(element);
     for (index, child) in element.children.iter().enumerate() {
         match child {
-            Node::Text(value) => append_inline_text(value, inline_context, &mut text, &mut line),
+            Node::Text(value) if element.name != "textarea" => {
+                append_inline_text(value, inline_context, &mut text, &mut line)
+            }
+            Node::Text(_) => {}
+            Node::Element(_) if element.name == "textarea" => {}
             Node::Element(child_element) => {
                 let mut child_path = path.clone();
                 child_path.push(index);
@@ -2175,6 +2182,15 @@ fn text_control_value(
     path: &[usize],
     style_state: &StyleState,
 ) -> Option<String> {
+    if element.name == "textarea" {
+        return Some(
+            style_state
+                .control_values
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| element_text_value(element)),
+        );
+    }
     if element.name != "input"
         || element.attr("type").is_some_and(|kind| {
             matches!(
@@ -2208,6 +2224,17 @@ fn text_control_value(
             .or_else(|| element.attr("value").map(str::to_string))
             .unwrap_or_default(),
     )
+}
+
+fn element_text_value(element: &Element) -> String {
+    let mut value = String::new();
+    for child in &element.children {
+        match child {
+            Node::Text(text) => value.push_str(text),
+            Node::Element(child) => value.push_str(&element_text_value(child)),
+        }
+    }
+    value
 }
 
 fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
@@ -2305,6 +2332,40 @@ mod tests {
         assert_eq!(input.control_selection, Some((1, 3)));
         assert!(input.control_focused);
         assert_eq!(input.text[0].text, "live");
+    }
+
+    #[test]
+    fn textarea_layout_carries_multiline_live_value_without_child_text_duplication() {
+        let document = Document::parse(
+            "<textarea id='note' style='display: block; width: 120px; height: 54px'>initial\ntext</textarea>",
+        )
+        .expect("textarea document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState {
+            focused_path: Some(vec![0]),
+            ..Default::default()
+        };
+        state
+            .control_values
+            .insert(vec![0], "live\nvalue".to_string());
+        state.text_selections.insert(vec![0], (1, 7));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &state,
+        );
+        let textarea = &result.root.children[0];
+        assert_eq!(textarea.control_value.as_deref(), Some("live\nvalue"));
+        assert_eq!(textarea.control_selection, Some((1, 7)));
+        assert!(textarea.control_focused);
+        assert_eq!(textarea.text.len(), 2);
+        assert_eq!(textarea.text[0].text, "live");
+        assert_eq!(textarea.text[1].text, "value");
+        assert!(textarea.text[1].y > textarea.text[0].y);
     }
 
     #[test]
