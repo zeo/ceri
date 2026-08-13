@@ -985,9 +985,18 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     let mut text = Vec::new();
     let control_value = text_control_value(element, &path, style_state);
+    let control_placeholder = control_value
+        .as_deref()
+        .filter(|value| value.is_empty())
+        .and_then(|_| text_control_placeholder(element));
     let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
-    if let Some(value) = &control_value {
+    if let Some(value) = control_placeholder.as_ref().or(control_value.as_ref()) {
         let value_lines = control_text_lines(element, value, content_width, font_size);
+        let color = if control_placeholder.is_some() {
+            Color::opaque(120, 145, 155)
+        } else {
+            style.color
+        };
         for (line_index, value_line) in value_lines.iter().enumerate() {
             text.push(TextRun {
                 text: value_line.clone(),
@@ -995,7 +1004,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 y: content_y + line_index as f32 * line_height,
                 width: measure_text(value_line, font_size),
                 font_size,
-                color: style.color,
+                color,
                 bold: style.font_weight == FontWeight::Bold,
             });
         }
@@ -2238,6 +2247,16 @@ fn element_text_value(element: &Element) -> String {
     value
 }
 
+fn text_control_placeholder(element: &Element) -> Option<String> {
+    if !matches!(element.name.as_str(), "input" | "textarea") {
+        return None;
+    }
+    element
+        .attr("placeholder")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
 fn control_text_lines(
     element: &Element,
     value: &str,
@@ -2364,6 +2383,46 @@ mod tests {
         assert_eq!(input.control_selection, Some((1, 3, true)));
         assert!(input.control_focused);
         assert_eq!(input.text[0].text, "live");
+    }
+
+    #[test]
+    fn empty_text_controls_paint_placeholder_without_changing_live_value() {
+        let document = Document::parse(
+            r#"<input id="name" placeholder="your name"><textarea id="note" placeholder="line one&#13;&#10;line two"></textarea>"#,
+        )
+        .expect("placeholder document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 120.0,
+            },
+            &StyleState::default(),
+        );
+        let input = &result.root.children[0];
+        let textarea = &result.root.children[1];
+        assert_eq!(input.control_value.as_deref(), Some(""));
+        assert_eq!(input.text[0].text, "your name");
+        assert_eq!(input.text[0].color, Color::opaque(120, 145, 155));
+        assert_eq!(textarea.control_value.as_deref(), Some(""));
+        assert_eq!(
+            textarea.text.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+            ["line one", "line two"]
+        );
+        let mut state = StyleState::default();
+        state.control_values.insert(vec![0], "live".to_string());
+        let live = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 120.0,
+            },
+            &state,
+        );
+        assert_eq!(live.root.children[0].text[0].text, "live");
     }
 
     #[test]
