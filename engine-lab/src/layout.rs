@@ -45,6 +45,10 @@ pub struct LayoutBox {
     pub border_width: f32,
     pub border_color: Color,
     pub text: Vec<TextRun>,
+    pub(crate) control_value: Option<String>,
+    pub(crate) control_selection: Option<(usize, usize)>,
+    pub(crate) control_focused: bool,
+    pub(crate) control_text_origin: Option<(f32, f32)>,
     pub children: Vec<LayoutBox>,
     pub(crate) position: Position,
     pub(crate) visual_offset: (f32, f32),
@@ -270,6 +274,10 @@ pub fn layout_with_state(
         border_width: 0.0,
         border_color: Color::transparent(),
         text: Vec::new(),
+        control_value: None,
+        control_selection: None,
+        control_focused: false,
+        control_text_origin: None,
         children: Vec::new(),
         position: Position::Static,
         visual_offset: (0.0, 0.0),
@@ -976,6 +984,19 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         fragments: Vec::new(),
     };
     let mut text = Vec::new();
+    let control_value = text_control_value(element, &path, style_state);
+    let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
+    if let Some(value) = &control_value {
+        text.push(TextRun {
+            text: value.clone(),
+            x: content_x,
+            y: content_y,
+            width: measure_text(value, font_size),
+            font_size,
+            color: style.color,
+            bold: style.font_weight == FontWeight::Bold,
+        });
+    }
     let mut children = Vec::new();
     let mut positioned = Vec::new();
     let inline_context = InlineContext {
@@ -1091,13 +1112,17 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         ..rect
     };
     let mut layout = LayoutBox {
-        path,
+        path: path.clone(),
         tag: element.name.clone(),
         rect,
         background: style.background,
         border_width: border,
         border_color: style.border_color,
         text,
+        control_selection: style_state.text_selections.get(&path).copied(),
+        control_focused: style_state.focused_path.as_deref() == Some(path.as_slice()),
+        control_text_origin,
+        control_value,
         children,
         position: style.position,
         visual_offset: (0.0, 0.0),
@@ -1400,6 +1425,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         border_width: border,
         border_color: style.border_color,
         text: Vec::new(),
+        control_value: None,
+        control_selection: None,
+        control_focused: false,
+        control_text_origin: None,
         children,
         position: style.position,
         visual_offset: (0.0, 0.0),
@@ -1633,6 +1662,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         border_width: border,
         border_color: style.border_color,
         text: Vec::new(),
+        control_value: None,
+        control_selection: None,
+        control_focused: false,
+        control_text_origin: None,
         children,
         position: style.position,
         visual_offset: (0.0, 0.0),
@@ -1918,6 +1951,10 @@ fn translate_scroll_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
         text.x += offset_x;
         text.y += offset_y;
     }
+    if let Some(origin) = &mut layout.control_text_origin {
+        origin.0 += offset_x;
+        origin.1 += offset_y;
+    }
     for child in &mut layout.children {
         translate_scroll_box(child, offset_x, offset_y);
     }
@@ -1929,6 +1966,10 @@ fn translate_layout_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
     for text in &mut layout.text {
         text.x += offset_x;
         text.y += offset_y;
+    }
+    if let Some(origin) = &mut layout.control_text_origin {
+        origin.0 += offset_x;
+        origin.1 += offset_y;
     }
     for child in &mut layout.children {
         translate_layout_box(child, offset_x, offset_y);
@@ -2129,6 +2170,46 @@ fn measure_text(text: &str, font_size: f32) -> f32 {
     text.chars().count() as f32 * glyph_advance
 }
 
+fn text_control_value(
+    element: &Element,
+    path: &[usize],
+    style_state: &StyleState,
+) -> Option<String> {
+    if element.name != "input"
+        || element.attr("type").is_some_and(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "button"
+                    | "checkbox"
+                    | "color"
+                    | "date"
+                    | "datetime-local"
+                    | "file"
+                    | "hidden"
+                    | "image"
+                    | "month"
+                    | "number"
+                    | "radio"
+                    | "range"
+                    | "reset"
+                    | "submit"
+                    | "time"
+                    | "week"
+            )
+        })
+    {
+        return None;
+    }
+    Some(
+        style_state
+            .control_values
+            .get(path)
+            .cloned()
+            .or_else(|| element.attr("value").map(str::to_string))
+            .unwrap_or_default(),
+    )
+}
+
 fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
     let indent = "  ".repeat(depth);
     lines.push(format!(
@@ -2195,6 +2276,35 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("one"));
         assert!(rendered.contains("six"));
+    }
+
+    #[test]
+    fn focused_input_layout_carries_live_value_and_selection_metadata() {
+        let document = Document::parse(
+            r#"<input id="name" value="initial" style="display: block; width: 120px; height: 28px">"#,
+        )
+        .expect("input document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState {
+            focused_path: Some(vec![0]),
+            ..Default::default()
+        };
+        state.control_values.insert(vec![0], "live".to_string());
+        state.text_selections.insert(vec![0], (1, 3));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 80.0,
+            },
+            &state,
+        );
+        let input = &result.root.children[0];
+        assert_eq!(input.control_value.as_deref(), Some("live"));
+        assert_eq!(input.control_selection, Some((1, 3)));
+        assert!(input.control_focused);
+        assert_eq!(input.text[0].text, "live");
     }
 
     #[test]

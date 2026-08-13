@@ -1983,6 +1983,12 @@ impl ScriptRuntime {
             hovered_path,
             focused_path: self.focused_element.clone(),
             scroll_offsets: self.scroll_offsets.clone(),
+            control_values: self.control_values.clone().into_iter().collect(),
+            text_selections: self
+                .text_selections
+                .iter()
+                .map(|(path, selection)| (path.clone(), (selection.start, selection.end)))
+                .collect(),
             ..StyleState::default()
         };
         for (path, checked) in &self.control_checked {

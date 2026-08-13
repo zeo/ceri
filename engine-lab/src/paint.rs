@@ -451,9 +451,93 @@ fn paint_box_text(
     clip: Option<Rect>,
     offset: (f32, f32),
 ) {
+    paint_control_selection(canvas, layout_box, clip, offset);
     for run in &layout_box.text {
         paint_text(canvas, run, clip, offset);
     }
+    paint_control_caret(canvas, layout_box, clip, offset);
+}
+
+fn paint_control_selection(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
+    let Some(value) = &layout_box.control_value else {
+        return;
+    };
+    let Some((start, end)) = layout_box.control_selection else {
+        return;
+    };
+    let Some(origin) = layout_box.control_text_origin else {
+        return;
+    };
+    let start = utf16_char_offset(value, start);
+    let end = utf16_char_offset(value, end).max(start);
+    if start == end {
+        return;
+    }
+    let advance = text_advance(layout_box.font_size);
+    fill_rect_optional(
+        canvas,
+        origin.0 + offset.0 + start as f32 * advance,
+        origin.1 + offset.1,
+        (end - start) as f32 * advance,
+        layout_box.font_size.max(1.0),
+        Color::opaque(170, 205, 238),
+        clip,
+    );
+}
+
+fn paint_control_caret(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
+    if !layout_box.control_focused {
+        return;
+    }
+    let Some(value) = &layout_box.control_value else {
+        return;
+    };
+    let Some(origin) = layout_box.control_text_origin else {
+        return;
+    };
+    let caret = layout_box
+        .control_selection
+        .map(|(_, end)| end)
+        .unwrap_or_else(|| value.encode_utf16().count());
+    let caret = utf16_char_offset(value, caret);
+    let advance = text_advance(layout_box.font_size);
+    fill_rect_optional(
+        canvas,
+        origin.0 + offset.0 + caret as f32 * advance,
+        origin.1 + offset.1,
+        1.0,
+        layout_box.font_size.max(1.0),
+        Color::BLACK,
+        clip,
+    );
+}
+
+fn text_advance(font_size: f32) -> f32 {
+    (font_size / 9.0).round().max(1.0) * 6.0
+}
+
+fn utf16_char_offset(value: &str, offset: usize) -> usize {
+    let mut units = 0;
+    let mut characters = 0;
+    for character in value.chars() {
+        let length = character.len_utf16();
+        if units + length > offset {
+            break;
+        }
+        units += length;
+        characters += 1;
+    }
+    characters
 }
 
 fn paint_canvas_commands(
@@ -798,6 +882,10 @@ mod tests {
                     color: Color::WHITE,
                     bold: false,
                 }],
+                control_value: None,
+                control_selection: None,
+                control_focused: false,
+                control_text_origin: None,
                 children: Vec::new(),
                 position: crate::css::Position::Static,
                 visual_offset: (0.0, 0.0),
@@ -817,6 +905,26 @@ mod tests {
         };
         let canvas = paint(&document);
         assert!(canvas.non_background_pixels() > 0);
+
+        let mut focused = document.clone();
+        focused.root.control_value = Some("A".to_string());
+        focused.root.control_selection = Some((0, 1));
+        focused.root.control_focused = true;
+        focused.root.control_text_origin = Some((4.0, 5.0));
+        let focused_canvas = paint(&focused);
+        assert_ne!(
+            focused_canvas.rgba_pixels(),
+            canvas.rgba_pixels(),
+            "focused controls should add a software caret"
+        );
+        let caret_x = (4.0 + text_advance(16.0)) as u32;
+        let caret_index = ((5 * focused_canvas.width() + caret_x) * 4) as usize;
+        assert_eq!(&focused_canvas.rgba_pixels()[caret_index..caret_index + 3], &[0, 0, 0]);
+        let selection_index = ((5 * focused_canvas.width() + 4) * 4) as usize;
+        assert_eq!(
+            &focused_canvas.rgba_pixels()[selection_index..selection_index + 3],
+            &[170, 205, 238]
+        );
 
         let path = std::env::temp_dir().join(format!("ceri-engine-lab-{}.bmp", std::process::id()));
         canvas.write_bmp(&path).expect("bmp should write");
@@ -845,6 +953,10 @@ mod tests {
                 border_width: 0.0,
                 border_color: Color::transparent(),
                 text: Vec::new(),
+                control_value: None,
+                control_selection: None,
+                control_focused: false,
+                control_text_origin: None,
                 children: vec![
                     LayoutBox {
                         path: vec![0],
@@ -859,6 +971,10 @@ mod tests {
                         border_width: 0.0,
                         border_color: Color::transparent(),
                         text: Vec::new(),
+                        control_value: None,
+                        control_selection: None,
+                        control_focused: false,
+                        control_text_origin: None,
                         children: Vec::new(),
                         position: crate::css::Position::Static,
                         visual_offset: (0.0, 0.0),
@@ -887,6 +1003,10 @@ mod tests {
                         border_width: 0.0,
                         border_color: Color::transparent(),
                         text: Vec::new(),
+                        control_value: None,
+                        control_selection: None,
+                        control_focused: false,
+                        control_text_origin: None,
                         children: Vec::new(),
                         position: crate::css::Position::Static,
                         visual_offset: (0.0, 0.0),
