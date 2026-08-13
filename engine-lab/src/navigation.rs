@@ -2936,6 +2936,36 @@ mod tests {
     }
 
     #[test]
+    fn maxlength_navigation_control_caps_host_text_without_a_loopback_server() {
+        let mut browser = Browser::new(bundle(
+            r#"<input id="name" maxlength="4" value="ab"><p id="status">idle</p><script>
+                const input = document.getElementById("name");
+                input.addEventListener("input", (event) => {
+                    document.getElementById("status").textContent = event.data + "|" + input.value;
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("maxlength page should load");
+        assert!(browser
+            .click_id("name")
+            .expect("maxlength control should focus"));
+        assert!(browser
+            .insert_text("😀x")
+            .expect("host text should stop at maxlength"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("😀|ab😀")
+        );
+    }
+
+    #[test]
     fn click_default_navigation_respects_prevent_default() {
         let mut browser = Browser::new(bundle(
             r#"<a id="go" href="/about.html"><span id="label">open</span></a><p id="status">home</p><script>

@@ -1758,7 +1758,19 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             };
         }
-        let replacement = text.encode_utf16().collect::<Vec<_>>();
+        let replacement_text = self
+            .user_input_max_length(&path)
+            .map(|maximum| {
+                let occupied = value_units
+                    .len()
+                    .saturating_sub(selection.end.saturating_sub(selection.start));
+                truncate_utf16(text, maximum.saturating_sub(occupied))
+            })
+            .unwrap_or_else(|| text.to_string());
+        if replacement_text.is_empty() {
+            return Ok(false);
+        }
+        let replacement = replacement_text.encode_utf16().collect::<Vec<_>>();
         let mut next_units = Vec::with_capacity(
             value_units
                 .len()
@@ -1779,9 +1791,9 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             },
         );
-        let dispatch = self.dispatch_event_with_details(path, "input", "", text)?;
+        let dispatch = self.dispatch_event_with_details(path, "input", "", &replacement_text)?;
         self.drain_microtasks()?;
-        Ok(dispatch.handled || !text.is_empty())
+        Ok(dispatch.handled || !replacement_text.is_empty())
     }
 
     fn begin_composition(&mut self) -> Result<Option<NodePath>, ScriptError> {
@@ -1847,7 +1859,15 @@ impl ScriptRuntime {
         let length = utf16_len(&value);
         let start = composition.start.min(length);
         let end = composition.end.min(length).max(start);
-        let (value, selection_end) = replace_utf16_range(&value, start, end, text);
+        let replacement_text = self
+            .user_input_max_length(&path)
+            .map(|maximum| {
+                let occupied = length.saturating_sub(end.saturating_sub(start));
+                truncate_utf16(text, maximum.saturating_sub(occupied))
+            })
+            .unwrap_or_else(|| text.to_string());
+        let (value, selection_end) =
+            replace_utf16_range(&value, start, end, &replacement_text);
         self.control_values.insert(path.clone(), value);
         self.composition = Some(TextComposition {
             path: path.clone(),
@@ -1862,9 +1882,9 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             },
         );
-        let input = self.dispatch_event_with_details(path, "input", "", text)?;
+        let input = self.dispatch_event_with_details(path, "input", "", &replacement_text)?;
         self.drain_microtasks()?;
-        Ok(update.handled || input.handled || start != end || !text.is_empty())
+        Ok(update.handled || input.handled || start != end || !replacement_text.is_empty())
     }
 
     pub(crate) fn composition_commit(&mut self, text: &str) -> Result<bool, ScriptError> {
@@ -1884,7 +1904,14 @@ impl ScriptRuntime {
         let length = utf16_len(&value);
         let start = composition.start.min(length);
         let end = composition.end.min(length).max(start);
-        let (value, cursor) = replace_utf16_range(&value, start, end, text);
+        let replacement_text = self
+            .user_input_max_length(&path)
+            .map(|maximum| {
+                let occupied = length.saturating_sub(end.saturating_sub(start));
+                truncate_utf16(text, maximum.saturating_sub(occupied))
+            })
+            .unwrap_or_else(|| text.to_string());
+        let (value, cursor) = replace_utf16_range(&value, start, end, &replacement_text);
         self.control_values.insert(path.clone(), value);
         self.text_selections.insert(
             path.clone(),
@@ -1894,17 +1921,22 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             },
         );
-        let input = self.dispatch_event_with_details(path.clone(), "input", "", text)?;
+        let input = self.dispatch_event_with_details(
+            path.clone(),
+            "input",
+            "",
+            &replacement_text,
+        )?;
         self.drain_microtasks()?;
         self.composition = None;
         let end_event = self.dispatch_event_with_details(
             path,
             "compositionend",
             "",
-            text,
+            &replacement_text,
         )?;
         self.drain_microtasks()?;
-        Ok(input.handled || end_event.handled || start != end || !text.is_empty())
+        Ok(input.handled || end_event.handled || start != end || !replacement_text.is_empty())
     }
 
     pub(crate) fn composition_cancel(&mut self) -> Result<bool, ScriptError> {
@@ -1992,6 +2024,14 @@ impl ScriptRuntime {
                 .element_clone(&path)
                 .is_some_and(|element| element.name == "textarea")
         {
+            if let Some(maximum) = self.user_input_max_length(&path) {
+                let occupied = units
+                    .len()
+                    .saturating_sub(selection.end.saturating_sub(selection.start));
+                if occupied >= maximum {
+                    return Ok(dispatch.handled);
+                }
+            }
             self.set_range_text(
                 &path,
                 &[
@@ -4205,6 +4245,16 @@ impl ScriptRuntime {
                 .borrow()
                 .element_clone(path)
                 .is_some_and(|element| element.attr("readonly").is_some())
+    }
+
+    fn user_input_max_length(&self, path: &[usize]) -> Option<usize> {
+        if !self.is_selection_control_path(path) {
+            return None;
+        }
+        self.document
+            .borrow()
+            .element_clone(path)
+            .and_then(|element| element.attr("maxlength").and_then(|value| value.trim().parse().ok()))
     }
 
     fn control_value_path(&self, path: &[usize]) -> Option<String> {
@@ -8544,6 +8594,20 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
+fn truncate_utf16(value: &str, maximum: usize) -> String {
+    let mut units = 0usize;
+    let mut output = String::new();
+    for character in value.chars() {
+        let length = character.len_utf16();
+        if units.saturating_add(length) > maximum {
+            break;
+        }
+        output.push(character);
+        units = units.saturating_add(length);
+    }
+    output
+}
+
 fn utf16_substring(value: &str, start: usize, end: usize) -> String {
     let units = value.encode_utf16().collect::<Vec<_>>();
     let start = start.min(units.len());
@@ -12148,6 +12212,70 @@ mod tests {
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").value;")
             .expect("script should read the updated value");
         assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("scr!ipt"));
+    }
+
+    #[test]
+    fn maxlength_caps_host_text_and_composition_by_utf16_units() {
+        let document = document(
+            r#"<input id="code" maxlength="4" value="ab"><input id="ime" maxlength="5" value="abc"><textarea id="note" maxlength="4">abc</textarea><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        runtime
+            .execute(
+                r#"
+                const code = document.getElementById("code");
+                const status = document.getElementById("status");
+                code.addEventListener("input", (event) => status.textContent = event.data + "|" + code.value);
+                code.focus();
+                "#,
+            )
+            .expect("maxlength listeners should register");
+        assert!(runtime
+            .insert_text("😀x")
+            .expect("host text should insert up to maxlength"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("😀|ab😀")
+        );
+        runtime
+            .execute("code.value = \"script-long\"; status.textContent = code.value;")
+            .expect("script value writes should remain unrestricted");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("script-long")
+        );
+
+        let ime_path = document
+            .borrow()
+            .find_element_by_id("ime")
+            .expect("IME input should exist");
+        assert!(runtime.focus_path(ime_path.clone()).expect("IME input should focus"));
+        assert!(runtime
+            .composition_update("😀x", None)
+            .expect("composition should fit whole UTF-16 characters"));
+        assert_eq!(runtime.control_value_path(&ime_path).as_deref(), Some("abc😀"));
+        assert!(runtime
+            .composition_commit("xy")
+            .expect("composition should commit within maxlength"));
+        assert_eq!(runtime.control_value_path(&ime_path).as_deref(), Some("abcxy"));
+
+        let note_path = document
+            .borrow()
+            .find_element_by_id("note")
+            .expect("textarea should exist");
+        assert!(runtime.focus_path(note_path.clone()).expect("textarea should focus"));
+        assert!(runtime
+            .key_down_with_modifiers("Enter", KeyModifiers::default())
+            .expect("Enter should use the last available UTF-16 unit"));
+        assert_eq!(runtime.control_value_path(&note_path).as_deref(), Some("abc\n"));
+        assert!(!runtime
+            .key_down_with_modifiers("Enter", KeyModifiers::default())
+            .expect("Enter should stop at maxlength"));
+        assert_eq!(runtime.control_value_path(&note_path).as_deref(), Some("abc\n"));
     }
 
     #[test]
