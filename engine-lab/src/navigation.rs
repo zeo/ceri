@@ -2027,6 +2027,73 @@ mod tests {
     }
 
     #[test]
+    fn provider_worker_loads_module_imports_and_fetches_subresources() {
+        let mut provider_resources = BTreeMap::new();
+        provider_resources.insert(
+            "/index.html".to_string(),
+            Resource::new(
+                "text/html",
+                br#"<p id='status'>idle</p><script>
+                  const status = document.getElementById("status");
+                  const worker = new Worker("/worker.js", { type: "module" });
+                  worker.addEventListener("message", (event) => { status.textContent = event.data; });
+                  worker.addEventListener("error", (event) => { status.textContent = "error:" + event.message; });
+                  worker.postMessage("provider");
+                </script>"#
+                .to_vec(),
+            ),
+        );
+        provider_resources.insert(
+            "/worker.js".to_string(),
+            Resource::new(
+                "text/javascript",
+                br#"import { suffix } from "./worker-child.js";
+                self.addEventListener("message", (event) => {
+                  fetch("./worker-data.txt")
+                    .then((response) => response.text())
+                    .then((body) => postMessage(suffix(event.data) + ":" + body));
+                });"#
+                .to_vec(),
+            ),
+        );
+        provider_resources.insert(
+            "/worker-child.js".to_string(),
+            Resource::new(
+                "text/javascript",
+                b"export function suffix(value) { return value + '!'; }".to_vec(),
+            ),
+        );
+        provider_resources.insert(
+            "/worker-data.txt".to_string(),
+            Resource::new("text/plain", b"remote".to_vec()),
+        );
+        let mut browser = Browser::with_resource_provider(
+            ResourceBundle::default(),
+            Rc::new(MemoryProvider {
+                resources: provider_resources,
+            }),
+        );
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("provider document should load");
+        for _ in 0..200 {
+            if browser.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("provider!:remote")
+        );
+    }
+
+    #[test]
     fn parses_app_urls_without_a_loopback_authority() {
         let url = AppUrl::parse("HTTPS://APP.CERI.INVALID/docs/intro%2Ehtml?q=rust#top")
             .expect("app URL should parse");

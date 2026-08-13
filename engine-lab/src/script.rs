@@ -1,8 +1,9 @@
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
-    is_http_redirect, is_javascript, is_json, AppUrl, Resource, ResourceBundle, ResourceCacheMode,
-    normalize_headers, ResourceProvider, ResourceRequest, ResourceResponse, APP_ORIGIN,
+    is_http_redirect, is_javascript, is_json, AppUrl, NavigationError, Resource, ResourceBundle,
+    ResourceCacheMode, normalize_headers, ResourceProvider, ResourceRequest, ResourceResponse,
+    APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
 use crate::Color;
@@ -496,6 +497,8 @@ pub struct ScriptRuntime {
     loading_modules: BTreeSet<String>,
     workers: Vec<WorkerHandle>,
     worker_sender: Option<SyncSender<WorkerEvent>>,
+    worker_resource_sender: Option<SyncSender<WorkerResourceRequest>>,
+    worker_resource_receiver: Option<Receiver<WorkerResourceRequest>>,
 }
 
 pub(crate) trait ModuleSourceLoader {
@@ -509,6 +512,65 @@ pub(crate) trait ModuleSourceLoader {
 struct RuntimeModuleLoader<'a> {
     resources: &'a ResourceBundle,
     provider: Option<&'a dyn ResourceProvider>,
+}
+
+struct WorkerResourceRequest {
+    request: ResourceRequest,
+    reply: SyncSender<Result<Option<ResourceResponse>, NavigationError>>,
+}
+
+struct WorkerResourceProvider {
+    sender: SyncSender<WorkerResourceRequest>,
+}
+
+impl WorkerResourceProvider {
+    fn request(
+        &self,
+        request: ResourceRequest,
+    ) -> Result<Option<ResourceResponse>, NavigationError> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(WorkerResourceRequest {
+                request,
+                reply: reply_sender,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => NavigationError::ResourceProvider(
+                    "worker resource request queue is full".to_string(),
+                ),
+                TrySendError::Disconnected(_) => NavigationError::ResourceProvider(
+                    "worker resource bridge is unavailable".to_string(),
+                ),
+            })?;
+        reply_receiver.recv().map_err(|_| {
+            NavigationError::ResourceProvider("worker resource bridge is unavailable".to_string())
+        })?
+    }
+}
+
+impl ResourceProvider for WorkerResourceProvider {
+    fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+        self.provide_request(&ResourceRequest::get(url.clone()))
+    }
+
+    fn provide_request(
+        &self,
+        request: &ResourceRequest,
+    ) -> Result<Option<Resource>, NavigationError> {
+        let response = self.request(request.clone())?;
+        Ok(response
+            .filter(|response| (200..300).contains(&response.status()))
+            .map(|response| {
+                Resource::new(response.mime_type().to_string(), response.body().to_vec())
+            }))
+    }
+
+    fn provide_response(
+        &self,
+        request: &ResourceRequest,
+    ) -> Result<Option<ResourceResponse>, NavigationError> {
+        self.request(request.clone())
+    }
 }
 
 fn resolve_runtime_resource(
@@ -1161,6 +1223,8 @@ impl ScriptRuntime {
             loading_modules: BTreeSet::new(),
             workers: Vec::new(),
             worker_sender: None,
+            worker_resource_sender: None,
+            worker_resource_receiver: None,
         }
     }
 
@@ -2913,6 +2977,19 @@ impl ScriptRuntime {
         let termination_flag = Arc::new(AtomicBool::new(false));
         let worker_termination_flag = termination_flag.clone();
         let worker_url = url.clone();
+        let worker_resource_sender = if self.resource_provider.is_some() {
+            match self.worker_resource_sender.clone() {
+                Some(sender) => Some(sender),
+                None => {
+                    let (sender, receiver) = mpsc::sync_channel(MAX_WORKER_MESSAGES);
+                    self.worker_resource_sender = Some(sender.clone());
+                    self.worker_resource_receiver = Some(receiver);
+                    Some(sender)
+                }
+            }
+        } else {
+            None
+        };
         thread::spawn(move || {
             let document = match Document::parse("<html><body></body></html>") {
                 Ok(document) => Rc::new(RefCell::new(document)),
@@ -2921,8 +2998,18 @@ impl ScriptRuntime {
                     return;
                 }
             };
-            let mut runtime =
-                ScriptRuntime::with_resources(document, resources, worker_url.clone());
+            let worker_provider = worker_resource_sender.map(|sender| {
+                Rc::new(WorkerResourceProvider { sender }) as Rc<dyn ResourceProvider>
+            });
+            let mut runtime = ScriptRuntime::with_context(
+                document,
+                Some(resources),
+                worker_provider,
+                Some(worker_url.clone()),
+                None,
+                None,
+                None,
+            );
             runtime.worker_sender = Some(event_sender.clone());
             runtime
                 .global
@@ -2946,9 +3033,10 @@ impl ScriptRuntime {
                 WorkerScriptType::Classic => runtime.execute(&source),
                 WorkerScriptType::Module => {
                     let loader_resources = runtime.resources.clone().unwrap_or_default();
+                    let loader_provider = runtime.resource_provider.clone();
                     let mut loader = RuntimeModuleLoader {
                         resources: &loader_resources,
-                        provider: None,
+                        provider: loader_provider.as_deref(),
                     };
                     runtime
                         .execute_module(&source, worker_url.clone(), &mut loader)
@@ -3039,7 +3127,26 @@ impl ScriptRuntime {
         Ok(processed)
     }
 
+    fn pump_worker_resource_requests(&mut self) -> Result<(), ScriptError> {
+        let Some(receiver) = self.worker_resource_receiver.as_ref() else {
+            return Ok(());
+        };
+        loop {
+            let request = match receiver.try_recv() {
+                Ok(request) => request,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let response = self
+                .resource_provider
+                .as_ref()
+                .map_or(Ok(None), |provider| provider.provide_response(&request.request));
+            let _ = request.reply.send(response);
+        }
+        Ok(())
+    }
+
     fn pump_workers(&mut self) -> Result<usize, ScriptError> {
+        self.pump_worker_resource_requests()?;
         let workers = self.workers.clone();
         let mut processed = 0;
         for worker in workers {
@@ -3114,6 +3221,7 @@ impl ScriptRuntime {
                 }
             }
         }
+        self.pump_worker_resource_requests()?;
         Ok(processed)
     }
 
