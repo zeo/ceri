@@ -1,4 +1,4 @@
-use crate::dom::{Element, NodePath};
+use crate::dom::{Document, Element, Node, NodePath};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +185,7 @@ pub(crate) struct StyleState {
     pub(crate) scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
+    pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
 }
 
 impl StyleState {
@@ -360,6 +361,68 @@ impl Stylesheet {
         Ok(Self { rules })
     }
 
+    pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
+        state.custom_properties.clear();
+        let inherited = BTreeMap::new();
+        let ancestors = Vec::new();
+        for (index, node) in document.root.children.iter().enumerate() {
+            let Node::Element(element) = node else {
+                continue;
+            };
+            self.populate_element_custom_properties(
+                element,
+                &[index],
+                &ancestors,
+                &inherited,
+                state,
+            );
+        }
+    }
+
+    fn populate_element_custom_properties(
+        &self,
+        element: &Element,
+        path: &[usize],
+        ancestors: &[&Element],
+        inherited: &BTreeMap<String, String>,
+        state: &mut StyleState,
+    ) {
+        let mut properties = inherited.clone();
+        for (property, (_, _, value)) in self.cascaded_values(element, path, ancestors, state) {
+            if !property.starts_with("--") {
+                continue;
+            }
+            match value.trim().to_ascii_lowercase().as_str() {
+                "initial" => {
+                    properties.remove(&property);
+                }
+                "inherit" | "unset" => {}
+                _ => {
+                    properties.insert(property, value);
+                }
+            }
+        }
+        state
+            .custom_properties
+            .insert(path.to_vec(), properties.clone());
+        let mut child_ancestors = ancestors.to_vec();
+        child_ancestors.push(element);
+        for (index, node) in element.children.iter().enumerate() {
+            let Node::Element(child) = node else {
+                continue;
+            };
+            let mut child_path = path.to_vec();
+            child_path.push(index);
+            self.populate_element_custom_properties(
+                child,
+                &child_path,
+                &child_ancestors,
+                &properties,
+                state,
+            );
+        }
+    }
+
     pub(crate) fn style_for(&self, context: StyleContext<'_>) -> Style {
         let StyleContext {
             element,
@@ -372,6 +435,31 @@ impl Stylesheet {
         } = context;
         let mut style =
             Style::default_for(&element.name, parent_font_size, parent_color, parent_weight);
+        let values = self.cascaded_values(element, path, ancestors, state);
+        let empty_properties = BTreeMap::new();
+        let custom_properties = state
+            .custom_properties
+            .get(path)
+            .unwrap_or(&empty_properties);
+        for (property, (_, _, value)) in values {
+            if property.starts_with("--") {
+                continue;
+            }
+            let Some(value) = resolve_custom_value(&value, custom_properties) else {
+                continue;
+            };
+            apply_declaration(&mut style, &property, &value);
+        }
+        style
+    }
+
+    fn cascaded_values(
+        &self,
+        element: &Element,
+        path: &[usize],
+        ancestors: &[&Element],
+        state: &StyleState,
+    ) -> HashMap<String, (Specificity, usize, String)> {
         let mut values: HashMap<String, (Specificity, usize, String)> = HashMap::new();
         for rule in &self.rules {
             if rule
@@ -410,10 +498,7 @@ impl Stylesheet {
                 );
             }
         }
-        for (property, (_, _, value)) in values {
-            apply_declaration(&mut style, &property, &value);
-        }
-        style
+        values
     }
 
     #[cfg(test)]
@@ -939,7 +1024,12 @@ fn parse_declarations(source: &str) -> Result<Vec<Declaration>, String> {
         let Some(colon) = chunk.find(':') else {
             return Err(format!("declaration has no colon: {chunk}"));
         };
-        let property = chunk[..colon].trim().to_ascii_lowercase();
+        let property_name = chunk[..colon].trim();
+        let property = if property_name.starts_with("--") {
+            property_name.to_string()
+        } else {
+            property_name.to_ascii_lowercase()
+        };
         let value = chunk[colon + 1..].trim().to_string();
         if property.is_empty() || value.is_empty() {
             return Err(format!("invalid declaration: {chunk}"));
@@ -1141,6 +1231,91 @@ fn parse_number(value: &str) -> Option<f32> {
     value.trim().parse().ok()
 }
 
+fn resolve_custom_value(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
+    resolve_custom_value_inner(value, properties, &mut Vec::new())
+}
+
+fn resolve_custom_value_inner(
+    value: &str,
+    properties: &BTreeMap<String, String>,
+    stack: &mut Vec<String>,
+) -> Option<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = find_var_function(&value[cursor..]) {
+        let start = cursor + relative_start;
+        output.push_str(&value[cursor..start]);
+        let open = start + 3;
+        let close = matching_parenthesis(value, open)?;
+        let (name, fallback) = parse_var_arguments(&value[open + 1..close])?;
+        let replacement = if stack.iter().any(|current| current == name) {
+            fallback.and_then(|fallback| resolve_custom_value_inner(fallback, properties, stack))
+        } else if let Some(raw) = properties.get(name) {
+            stack.push(name.to_string());
+            let resolved = resolve_custom_value_inner(raw, properties, stack);
+            stack.pop();
+            resolved.or_else(|| {
+                fallback
+                    .and_then(|fallback| resolve_custom_value_inner(fallback, properties, stack))
+            })
+        } else {
+            fallback.and_then(|fallback| resolve_custom_value_inner(fallback, properties, stack))
+        }?;
+        output.push_str(&replacement);
+        cursor = close + 1;
+    }
+    output.push_str(&value[cursor..]);
+    Some(output)
+}
+
+fn find_var_function(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    (0..bytes.len().saturating_sub(3))
+        .find(|index| bytes[*index..*index + 4].eq_ignore_ascii_case(b"var("))
+}
+
+fn matching_parenthesis(value: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (index, byte) in value.as_bytes().iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_var_arguments(value: &str) -> Option<(&str, Option<&str>)> {
+    let mut depth: usize = 0;
+    let mut comma = None;
+    for (index, byte) in value.as_bytes().iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                comma = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let name_end = comma.unwrap_or(value.len());
+    let name = value[..name_end].trim();
+    if !name.starts_with("--") || name.len() == 2 {
+        return None;
+    }
+    let fallback = comma
+        .map(|index| value[index + 1..].trim())
+        .filter(|fallback| !fallback.is_empty());
+    Some((name, fallback))
+}
+
 fn parse_z_index(value: &str) -> Option<i32> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("auto") {
@@ -1275,6 +1450,48 @@ mod tests {
                 )
                 .color,
             Color::opaque(66, 211, 180)
+        );
+    }
+
+    #[test]
+    fn inherits_custom_properties_and_resolves_fallbacks() {
+        let document = Document::parse(
+            "<div id='theme' style='--Accent: #00ff00'><div id='card' style='background: var(--Accent); color: var(--missing, #0000ff); padding: var(--gap, 4px); --gap: 8px; --loop: var(--loop, #123456)'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
+        let mut state = StyleState::default();
+        stylesheet.populate_custom_properties(&document, &mut state);
+        let theme = match &document.root.children[0] {
+            Node::Element(element) => element,
+            Node::Text(_) => panic!("theme should be an element"),
+        };
+        let card = match &theme.children[0] {
+            Node::Element(element) => element,
+            Node::Text(_) => panic!("card should be an element"),
+        };
+        let ancestors = [theme];
+        let style = stylesheet.style_for(StyleContext {
+            element: card,
+            path: &[0, 0],
+            ancestors: &ancestors,
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            state: &state,
+        });
+        assert_eq!(style.background, Color::opaque(0, 255, 0));
+        assert_eq!(style.color, Color::opaque(0, 0, 255));
+        assert_eq!(style.padding, Edges::all(Length::Px(8.0)));
+        assert_eq!(
+            resolve_custom_value(
+                "var(--loop, #abcdef)",
+                state
+                    .custom_properties
+                    .get(&vec![0, 0])
+                    .expect("card variables")
+            ),
+            Some("#123456".to_string())
         );
     }
 

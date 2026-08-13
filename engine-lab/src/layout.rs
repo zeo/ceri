@@ -248,6 +248,9 @@ pub fn layout_with_state(
     viewport: Size,
     style_state: &StyleState,
 ) -> LayoutDocument {
+    let mut computed_state = style_state.clone();
+    stylesheet.populate_custom_properties(document, &mut computed_state);
+    let style_state = &computed_state;
     let viewport_block = ContainingBlock {
         x: 0.0,
         y: 0.0,
@@ -2548,6 +2551,29 @@ mod tests {
         assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.path.clone()));
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn layout_resolves_inherited_custom_properties_before_paint() {
+        let document = Document::parse(
+            "<style>#theme { --accent: #00ff00; --card-width: 40px; margin: 0; } #card { width: var(--card-width); height: 20px; margin: 0; background: var(--accent); }</style><div id='theme'><div id='card'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 100.0,
+                height: 60.0,
+            },
+        );
+        let card = &result.root.children[0].children[0];
+        assert_eq!(card.rect.width, 40.0);
+        assert_eq!(card.rect.height, 20.0);
+        let canvas = result.paint();
+        let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 4) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
     }
 

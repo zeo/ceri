@@ -3341,6 +3341,35 @@ mod tests {
     }
 
     #[test]
+    fn browser_applies_inherited_custom_properties_to_layout() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #theme { --accent: #00ff00; --card-width: 40px; margin: 0; }
+                #card { width: var(--card-width); height: 20px; margin: 0; background: var(--accent); }
+            </style>
+            <div id="theme"><div id="card">card</div></div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("custom-property page should load");
+        let viewport = Size {
+            width: 100.0,
+            height: 60.0,
+        };
+        let layout = browser
+            .layout(viewport)
+            .expect("custom-property page should layout");
+        let card = &layout.root.children[0].children[0];
+        assert_eq!(card.rect.width, 40.0);
+        assert_eq!(card.rect.height, 20.0);
+        let canvas = browser
+            .paint(viewport)
+            .expect("custom-property page should paint");
+        let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 4) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
     fn browser_paints_scrollbars_and_scrolls_from_the_reserved_gutter() {
         let mut browser = Browser::new(bundle(
             r##"<style>
