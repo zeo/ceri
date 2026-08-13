@@ -803,6 +803,8 @@ mod tests {
                 visual_offset: (0.0, 0.0),
                 z_index: 0,
                 creates_stacking_context: true,
+                sticky_inset: crate::css::Edges::auto(),
+                font_size: 16.0,
                 overflow: Overflow::Visible,
                 scroll_content: Size {
                     width: 20.0,
@@ -862,6 +864,8 @@ mod tests {
                         visual_offset: (0.0, 0.0),
                         z_index: 0,
                         creates_stacking_context: false,
+                        sticky_inset: crate::css::Edges::auto(),
+                        font_size: 16.0,
                         overflow: Overflow::Visible,
                         scroll_content: Size {
                             width: 10.0,
@@ -888,6 +892,8 @@ mod tests {
                         visual_offset: (0.0, 0.0),
                         z_index: 0,
                         creates_stacking_context: false,
+                        sticky_inset: crate::css::Edges::auto(),
+                        font_size: 16.0,
                         overflow: Overflow::Visible,
                         scroll_content: Size {
                             width: 10.0,
@@ -901,6 +907,8 @@ mod tests {
                 visual_offset: (0.0, 0.0),
                 z_index: 0,
                 creates_stacking_context: true,
+                sticky_inset: crate::css::Edges::auto(),
+                font_size: 16.0,
                 overflow: Overflow::Visible,
                 scroll_content: Size {
                     width: 20.0,

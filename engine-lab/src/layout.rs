@@ -50,6 +50,8 @@ pub struct LayoutBox {
     pub(crate) visual_offset: (f32, f32),
     pub(crate) z_index: i32,
     pub(crate) creates_stacking_context: bool,
+    pub(crate) sticky_inset: Edges,
+    pub(crate) font_size: f32,
     pub(crate) overflow: Overflow,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
@@ -270,6 +272,8 @@ pub fn layout_with_state(
         visual_offset: (0.0, 0.0),
         z_index: 0,
         creates_stacking_context: true,
+        sticky_inset: Edges::auto(),
+        font_size: 16.0,
         overflow: Overflow::Visible,
         scroll_content: Size {
             width: viewport.width,
@@ -1096,6 +1100,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style),
+        sticky_inset: style.inset,
+        font_size,
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1396,6 +1402,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style),
+        sticky_inset: style.inset,
+        font_size,
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1627,6 +1635,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style),
+        sticky_inset: style.inset,
+        font_size,
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1758,7 +1768,9 @@ fn align_offset(align: AlignItems, available: f32, item: f32) -> f32 {
 }
 
 fn positioned_z_index(style: Style) -> i32 {
-    if style.position.is_out_of_flow() || style.position == Position::Relative {
+    if style.position.is_out_of_flow()
+        || matches!(style.position, Position::Relative | Position::Sticky)
+    {
         style.z_index.unwrap_or(0)
     } else {
         0
@@ -1766,7 +1778,7 @@ fn positioned_z_index(style: Style) -> i32 {
 }
 
 fn creates_stacking_context(style: Style) -> bool {
-    style.position == Position::Fixed
+    matches!(style.position, Position::Fixed | Position::Sticky)
         || (style.position != Position::Static && style.z_index.is_some())
 }
 
@@ -1808,11 +1820,68 @@ fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
         .unwrap_or_default();
     let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
     layout.scroll_offset = offset;
+    let scrollport = scrollbar_metrics(layout).scrollport;
     if offset == (0.0, 0.0) {
+        apply_sticky_descendants(
+            &mut layout.children,
+            scrollport,
+            layout.rect,
+            layout.visual_offset,
+        );
         return;
     }
     for child in &mut layout.children {
         translate_scroll_box(child, -offset.0, -offset.1);
+    }
+    apply_sticky_descendants(
+        &mut layout.children,
+        scrollport,
+        layout.rect,
+        layout.visual_offset,
+    );
+}
+
+fn apply_sticky_descendants(
+    children: &mut [LayoutBox],
+    scrollport: Rect,
+    containing_block: Rect,
+    ancestor_offset: (f32, f32),
+) {
+    for child in children {
+        let child_rect = visual_rect_for(child, ancestor_offset);
+        if child.position == Position::Sticky {
+            let top = child
+                .sticky_inset
+                .top
+                .resolve(scrollport.height, child.font_size)
+                .map(|value| value.max(0.0));
+            let bottom = child
+                .sticky_inset
+                .bottom
+                .resolve(scrollport.height, child.font_size)
+                .map(|value| value.max(0.0));
+            let mut shift: f32 = 0.0;
+            if let Some(top) = top {
+                shift = shift.max(scrollport.y + top - child_rect.y);
+            }
+            if let Some(bottom) = bottom {
+                shift = shift.min(scrollport.bottom() - bottom - child_rect.bottom());
+            }
+            let max_down = (containing_block.bottom() - child_rect.bottom()).max(0.0);
+            let max_up = (containing_block.y - child_rect.y).min(0.0);
+            child.visual_offset.1 += shift.clamp(max_up, max_down);
+        }
+        let child_offset = visual_offset_for(child, ancestor_offset);
+        let child_rect = visual_rect_for(child, ancestor_offset);
+        if child.overflow == Overflow::Auto {
+            continue;
+        }
+        apply_sticky_descendants(
+            &mut child.children,
+            scrollport,
+            child_rect,
+            child_offset,
+        );
     }
 }
 
@@ -2451,6 +2520,63 @@ mod tests {
         assert_eq!(viewport.children[0].rect.y, -30.0);
         assert_eq!(viewport.children[1].rect.x, 70.0);
         assert_eq!(viewport.children[1].rect.y, 12.0);
+    }
+
+    #[test]
+    fn sticky_children_hold_to_the_scrollport_during_element_scroll() {
+        let document = Document::parse(
+            "<style>#viewport { width: 80px; height: 40px; overflow: auto; margin: 0; } #sticky { position: sticky; top: 0; width: 80px; height: 10px; margin: 0; background: #00ff00; } #spacer { width: 80px; height: 80px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='sticky'></div><div id='spacer'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state.scroll_offsets.insert(vec![1], (0.0, 20.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+            &state,
+        );
+        let viewport = &result.root.children[0];
+        let sticky = &viewport.children[0];
+        assert_eq!(sticky.position, Position::Sticky);
+        assert_eq!(sticky.rect.y, -20.0);
+        assert_eq!(sticky.visual_offset, (0.0, 20.0));
+        assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.path.clone()));
+        let canvas = result.paint();
+        let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn sticky_children_hold_to_the_viewport_during_document_scroll() {
+        let document = Document::parse(
+            "<style>#sticky { position: sticky; top: 0; width: 120px; height: 10px; margin: 0; background: #00ff00; } #spacer { width: 120px; height: 160px; margin: 0; background: #ff0000; }</style><div id='sticky'></div><div id='spacer'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state.scroll_offsets.insert(Vec::new(), (0.0, 20.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+            &state,
+        );
+        let sticky = &result.root.children[0];
+        assert_eq!(sticky.position, Position::Sticky);
+        assert_eq!(sticky.rect.y, -20.0);
+        assert_eq!(sticky.visual_offset, (0.0, 20.0));
+        assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.path.clone()));
+        let canvas = result.paint();
+        let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
     }
 
     #[test]

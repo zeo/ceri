@@ -562,6 +562,66 @@ mod tests {
     }
 
     #[test]
+    fn host_keeps_sticky_content_at_the_scrollport_edge() {
+        let browser = Browser::new(bundle(
+            r#"<style>
+                #viewport { width: 80px; height: 40px; overflow: auto; margin: 0; }
+                #sticky { position: sticky; top: 0; width: 80px; height: 10px; margin: 0; }
+                #spacer { width: 80px; height: 80px; margin: 0; }
+            </style>
+            <div id="viewport"><div id="sticky">sticky</div><div id="spacer"></div></div>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("sticky").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "clicked";
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("sticky page should load");
+        let scroll = host
+            .input(InputEvent::Scroll {
+                x: 10.0,
+                y: 10.0,
+                delta_x: 0.0,
+                delta_y: 20.0,
+            })
+            .expect("sticky wheel input should be accepted");
+        assert!(scroll.handled);
+        assert!(scroll.frame_requested);
+        let layout = host
+            .browser()
+            .layout(Size {
+                width: 120.0,
+                height: 80.0,
+            })
+            .expect("sticky page should layout");
+        let sticky = &layout.root.children[0].children[0];
+        assert_eq!(sticky.rect.y, -20.0);
+        assert_eq!(sticky.visual_offset, (0.0, 20.0));
+        let click = host
+            .input(InputEvent::Click { x: 10.0, y: 4.0 })
+            .expect("sticky click should be accepted");
+        assert!(click.handled);
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("clicked")
+        );
+    }
+
+    #[test]
     fn host_keeps_scrollbar_gutter_out_of_content_hit_testing() {
         let browser = Browser::new(bundle(
             r#"<style>

@@ -3244,6 +3244,103 @@ mod tests {
     }
 
     #[test]
+    fn browser_keeps_sticky_content_at_the_scrollport_edge() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #viewport { width: 80px; height: 40px; overflow: auto; margin: 0; }
+                #sticky { position: sticky; top: 0; width: 80px; height: 10px; margin: 0; background: #00ff00; }
+                #spacer { width: 80px; height: 80px; margin: 0; background: #ff0000; }
+            </style>
+            <div id="viewport"><div id="sticky">sticky</div><div id="spacer"></div></div>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("sticky").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "sticky";
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("sticky page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 80.0,
+        };
+        assert!(browser
+            .scroll_at(viewport, 10.0, 10.0, 0.0, 20.0)
+            .expect("sticky wheel input should scroll"));
+        let layout = browser
+            .layout(viewport)
+            .expect("sticky page should layout");
+        let sticky = &layout.root.children[0].children[0];
+        assert_eq!(sticky.rect.y, -20.0);
+        assert_eq!(sticky.visual_offset, (0.0, 20.0));
+        let canvas = browser.paint(viewport).expect("sticky page should paint");
+        let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+        assert!(browser
+            .click_at(viewport, 10.0, 4.0)
+            .expect("sticky click should dispatch"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("sticky")
+        );
+    }
+
+    #[test]
+    fn browser_keeps_sticky_document_content_at_the_viewport_edge() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #sticky { position: sticky; top: 0; width: 120px; height: 10px; margin: 0; background: #00ff00; }
+                #spacer { width: 120px; height: 160px; margin: 0; background: #ff0000; }
+            </style>
+            <div id="sticky">sticky</div><div id="spacer"></div>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("sticky").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "sticky";
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("sticky page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 80.0,
+        };
+        assert!(browser
+            .scroll_at(viewport, 10.0, 70.0, 0.0, 20.0)
+            .expect("sticky wheel input should scroll"));
+        let layout = browser
+            .layout(viewport)
+            .expect("sticky page should layout");
+        let sticky = &layout.root.children[0];
+        assert_eq!(sticky.rect.y, -20.0);
+        assert_eq!(sticky.visual_offset, (0.0, 20.0));
+        let canvas = browser.paint(viewport).expect("sticky page should paint");
+        let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+        assert!(browser
+            .click_at(viewport, 10.0, 4.0)
+            .expect("sticky click should dispatch"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("sticky")
+        );
+    }
+
+    #[test]
     fn browser_paints_scrollbars_and_scrolls_from_the_reserved_gutter() {
         let mut browser = Browser::new(bundle(
             r##"<style>

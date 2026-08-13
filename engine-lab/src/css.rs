@@ -14,6 +14,7 @@ pub enum Display {
 pub(crate) enum Position {
     Static,
     Relative,
+    Sticky,
     Absolute,
     Fixed,
 }
@@ -962,6 +963,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "position" => {
             style.position = match value.trim().to_ascii_lowercase().as_str() {
                 "relative" => Position::Relative,
+                "sticky" => Position::Sticky,
                 "absolute" => Position::Absolute,
                 "fixed" => Position::Fixed,
                 _ => Position::Static,
@@ -1358,6 +1360,21 @@ mod tests {
             .overflow,
             Overflow::Auto
         );
+        let sticky = Stylesheet::parse(".sticky { position: sticky; top: 4px; }")
+            .expect("sticky stylesheet should parse");
+        let mut sticky_element = Element::new("div");
+        sticky_element
+            .attrs
+            .insert("class".to_string(), "sticky".to_string());
+        let sticky_style = sticky.style_for_inherited_with_ancestors(
+            &sticky_element,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(sticky_style.position, Position::Sticky);
+        assert_eq!(sticky_style.inset.top, Length::Px(4.0));
     }
 
     #[test]
