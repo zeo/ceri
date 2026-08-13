@@ -155,6 +155,7 @@ enum Builtin {
     DocumentCreateElement,
     DocumentCreateRange,
     DocumentGetSelection,
+    DocumentAddEventListener,
     ConsoleLog,
     EventPreventDefault(Rc<RefCell<EventState>>),
     LocationAssign,
@@ -874,13 +875,13 @@ struct TextComposition {
     end: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RangeBoundary {
     path: NodePath,
     offset: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RangeData {
     start: RangeBoundary,
     end: RangeBoundary,
@@ -2786,6 +2787,7 @@ impl ScriptRuntime {
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
+                "addEventListener" => Ok(Value::Builtin(Builtin::DocumentAddEventListener)),
                 "documentElement" => Ok(self
                     .document
                     .borrow()
@@ -3102,10 +3104,8 @@ impl ScriptRuntime {
             },
             Value::Event(event) => match property {
                 "type" => Ok(Value::String(event.event_type.clone())),
-                "target" => Ok(Value::Element(attached_handle(event.target.clone()))),
-                "currentTarget" => Ok(Value::Element(attached_handle(
-                    event.current_target.clone(),
-                ))),
+                "target" => Ok(node_value(event.target.clone())),
+                "currentTarget" => Ok(node_value(event.current_target.clone())),
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
                 "key" => Ok(Value::String(event.key.clone())),
@@ -4258,7 +4258,8 @@ impl ScriptRuntime {
             return Ok(false);
         }
         self.text_selections.insert(path.clone(), next);
-        self.dispatch_event(path, "select")?;
+        self.dispatch_event(path.clone(), "select")?;
+        self.dispatch_event(path, "selectionchange")?;
         self.drain_microtasks()?;
         Ok(true)
     }
@@ -5680,6 +5681,21 @@ impl ScriptRuntime {
                     .push(callback);
                 Ok(Value::Undefined)
             }
+            Builtin::DocumentAddEventListener => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback, Value::Function(_)) {
+                    return Err(runtime_error("document event listener must be a function"));
+                }
+                self.listeners
+                    .entry(Vec::new())
+                    .or_default()
+                    .push(EventListener { event, callback });
+                Ok(Value::Undefined)
+            }
             Builtin::WindowScrollTo => {
                 self.set_window_scroll(&arguments, false)?;
                 Ok(Value::Undefined)
@@ -5796,29 +5812,54 @@ impl ScriptRuntime {
             }
             Builtin::RangeSetStart(range) => {
                 let boundary = self.range_boundary_from_arguments(&arguments)?;
-                let mut range = range.borrow_mut();
-                range.start = boundary.clone();
-                if range.start.path == range.end.path && range.start.offset > range.end.offset {
-                    range.end = boundary;
+                let changed = {
+                    let mut range_data = range.borrow_mut();
+                    let previous = range_data.clone();
+                    range_data.start = boundary.clone();
+                    if range_data.start.path == range_data.end.path
+                        && range_data.start.offset > range_data.end.offset
+                    {
+                        range_data.end = boundary;
+                    }
+                    *range_data != previous
+                };
+                if changed && self.selection_uses_range(&range) {
+                    self.dispatch_document_selection_change()?;
                 }
                 Ok(Value::Undefined)
             }
             Builtin::RangeSetEnd(range) => {
                 let boundary = self.range_boundary_from_arguments(&arguments)?;
-                let mut range = range.borrow_mut();
-                range.end = boundary.clone();
-                if range.start.path == range.end.path && range.end.offset < range.start.offset {
-                    range.start = boundary;
+                let changed = {
+                    let mut range_data = range.borrow_mut();
+                    let previous = range_data.clone();
+                    range_data.end = boundary.clone();
+                    if range_data.start.path == range_data.end.path
+                        && range_data.end.offset < range_data.start.offset
+                    {
+                        range_data.start = boundary;
+                    }
+                    *range_data != previous
+                };
+                if changed && self.selection_uses_range(&range) {
+                    self.dispatch_document_selection_change()?;
                 }
                 Ok(Value::Undefined)
             }
             Builtin::RangeCollapse(range) => {
                 let to_start = arguments.first().map(Value::truthy).unwrap_or(false);
-                let mut range = range.borrow_mut();
-                if to_start {
-                    range.end = range.start.clone();
-                } else {
-                    range.start = range.end.clone();
+                let changed = {
+                    let mut range_data = range.borrow_mut();
+                    let previous = range_data.clone();
+                    if to_start {
+                        range_data.end = range_data.start.clone();
+                    } else {
+                        range_data.start = range_data.end.clone();
+                    }
+                    *range_data != previous
+                };
+                if changed && self.selection_uses_range(&range) {
+                    self.dispatch_document_selection_change()?;
                 }
                 Ok(Value::Undefined)
             }
@@ -5830,15 +5871,22 @@ impl ScriptRuntime {
                     .element_text_content(&boundary.path)
                     .map(|text| utf16_len(&text))
                     .unwrap_or(0);
-                let mut range = range.borrow_mut();
-                range.start = RangeBoundary {
-                    path: boundary.path.clone(),
-                    offset: 0,
+                let changed = {
+                    let mut range_data = range.borrow_mut();
+                    let previous = range_data.clone();
+                    range_data.start = RangeBoundary {
+                        path: boundary.path.clone(),
+                        offset: 0,
+                    };
+                    range_data.end = RangeBoundary {
+                        path: boundary.path,
+                        offset: length,
+                    };
+                    *range_data != previous
                 };
-                range.end = RangeBoundary {
-                    path: boundary.path,
-                    offset: length,
-                };
+                if changed && self.selection_uses_range(&range) {
+                    self.dispatch_document_selection_change()?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::RangeClone(range) => Ok(Value::Range(Rc::new(RefCell::new(
@@ -5850,11 +5898,23 @@ impl ScriptRuntime {
                 let Some(Value::Range(range)) = arguments.first().map(Value::resolve) else {
                     return Err(runtime_error("Selection.addRange expects a Range"));
                 };
+                let changed = selection
+                    .borrow()
+                    .range
+                    .as_ref()
+                    .is_none_or(|current| !Rc::ptr_eq(current, &range));
                 selection.borrow_mut().range = Some(range);
+                if changed && Rc::ptr_eq(&selection, &self.selection) {
+                    self.dispatch_document_selection_change()?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::SelectionRemoveAllRanges(selection) => {
+                let changed = selection.borrow().range.is_some();
                 selection.borrow_mut().range = None;
+                if changed && Rc::ptr_eq(&selection, &self.selection) {
+                    self.dispatch_document_selection_change()?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::SelectionGetRangeAt(selection) => {
@@ -5878,11 +5938,19 @@ impl ScriptRuntime {
             }
             Builtin::SelectionCollapse(selection) => {
                 let Some(node) = arguments.first().map(Value::resolve) else {
+                    let changed = selection.borrow().range.is_some();
                     selection.borrow_mut().range = None;
+                    if changed && Rc::ptr_eq(&selection, &self.selection) {
+                        self.dispatch_document_selection_change()?;
+                    }
                     return Ok(Value::Undefined);
                 };
                 if matches!(node, Value::Null | Value::Undefined) {
+                    let changed = selection.borrow().range.is_some();
                     selection.borrow_mut().range = None;
+                    if changed && Rc::ptr_eq(&selection, &self.selection) {
+                        self.dispatch_document_selection_change()?;
+                    }
                     return Ok(Value::Undefined);
                 }
                 let Value::Element(handle) = node else {
@@ -5910,7 +5978,15 @@ impl ScriptRuntime {
                     },
                     end: RangeBoundary { path, offset },
                 };
+                let changed = selection
+                    .borrow()
+                    .range
+                    .as_ref()
+                    .is_none_or(|current| *current.borrow() != range);
                 selection.borrow_mut().range = Some(Rc::new(RefCell::new(range)));
+                if changed && Rc::ptr_eq(&selection, &self.selection) {
+                    self.dispatch_document_selection_change()?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::SelectionToString(selection) => {
@@ -7144,6 +7220,20 @@ impl ScriptRuntime {
 
     fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<EventDispatch, ScriptError> {
         self.dispatch_event_with_details(path, event, "", "")
+    }
+
+    fn selection_uses_range(&self, range: &RangeHandle) -> bool {
+        self.selection
+            .borrow()
+            .range
+            .as_ref()
+            .is_some_and(|active| Rc::ptr_eq(active, range))
+    }
+
+    fn dispatch_document_selection_change(&mut self) -> Result<(), ScriptError> {
+        self.dispatch_event(Vec::new(), "selectionchange")?;
+        self.drain_microtasks()?;
+        Ok(())
     }
 
     fn dispatch_event_with_details(
@@ -11778,13 +11868,15 @@ mod tests {
                 const note = document.getElementById("note");
                 const amount = document.getElementById("amount");
                 let selects = 0;
+                let selectionChanges = 0;
                 input.addEventListener("select", () => selects = selects + 1);
+                input.addEventListener("selectionchange", () => selectionChanges = selectionChanges + 1);
                 input.setSelectionRange(1, 4, "backward");
                 const before = input.selectionStart + ":" + input.selectionEnd + ":" + input.selectionDirection;
                 input.setRangeText("i", input.selectionStart, input.selectionEnd, "end");
                 note.select();
                 note.setRangeText("hi", 0, 5, "select");
-                document.getElementById("status").textContent = before + "|" + input.value + ":" + input.selectionStart + ":" + input.selectionEnd + ":" + input.selectionDirection + "|" + note.value + ":" + note.selectionStart + ":" + note.selectionEnd + "|" + amount.selectionStart + "|" + selects;
+                document.getElementById("status").textContent = before + "|" + input.value + ":" + input.selectionStart + ":" + input.selectionEnd + ":" + input.selectionDirection + "|" + note.value + ":" + note.selectionStart + ":" + note.selectionEnd + "|" + amount.selectionStart + "|" + selects + ":" + selectionChanges;
                 "#,
             )
             .expect("selection APIs should execute");
@@ -11794,7 +11886,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("1:4:backward|hio:2:2:none|hi:0:2|null|2")
+            Some("1:4:backward|hio:2:2:none|hi:0:2|null|2:2")
         );
 
         let input_path = document
@@ -11905,6 +11997,8 @@ mod tests {
                 const copy = document.getElementById("copy");
                 const status = document.getElementById("status");
                 const range = document.createRange();
+                let changes = 0;
+                document.addEventListener("selectionchange", () => changes = changes + 1);
                 range.selectNodeContents(copy);
                 const selection = window.getSelection();
                 selection.removeAllRanges();
@@ -11914,7 +12008,7 @@ mod tests {
                 clone.setEnd(copy, 4);
                 status.textContent = range.toString() + "|" + selection.toString() + "|" + clone.toString() + "|" + range.startOffset + ":" + range.endOffset + ":" + range.collapsed + ":" + range.commonAncestorContainer.id + "|" + selection.rangeCount + ":" + selection.anchorNode.id + ":" + selection.anchorOffset + ":" + selection.focusOffset;
                 selection.collapse(copy, 2);
-                status.textContent = status.textContent + "|" + selection.isCollapsed + ":" + selection.toString() + ":" + selection.rangeCount;
+                status.textContent = status.textContent + "|" + selection.isCollapsed + ":" + selection.toString() + ":" + selection.rangeCount + ":" + changes;
                 "#,
             )
             .expect("Range and Selection should execute");
@@ -11924,7 +12018,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("hello|hello|ell|0:5:false:copy|1:copy:0:5|true::1")
+            Some("hello|hello|ell|0:5:false:copy|1:copy:0:5|true::1:2")
         );
     }
 
