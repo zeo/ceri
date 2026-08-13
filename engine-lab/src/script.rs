@@ -4158,6 +4158,10 @@ impl ScriptRuntime {
             .attr("method")
             .map(|method| method.trim().to_ascii_lowercase())
             .unwrap_or_else(|| "get".to_string());
+        let enctype = form
+            .attr("enctype")
+            .map(|enctype| enctype.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
         if !matches!(method.as_str(), "get" | "post") {
             return Err(runtime_error(
                 "only GET and POST form submission are available in the packaged engine",
@@ -4199,12 +4203,24 @@ impl ScriptRuntime {
             };
             self.request_location_navigation(url.to_string(), false);
         } else {
+            let (body, content_type) = match enctype.as_str() {
+                "application/x-www-form-urlencoded" => (
+                    encoded.into_bytes(),
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+                "multipart/form-data" => {
+                    let (body, content_type) = multipart_form_data_body(&form_data);
+                    (body, content_type)
+                }
+                _ => {
+                    return Err(runtime_error(format!(
+                        "unsupported form enctype {enctype}"
+                    )))
+                }
+            };
             let mut headers = BTreeMap::new();
-            headers.insert(
-                "content-type".to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            );
-            let request = ResourceRequest::new(url, "POST", headers, encoded.into_bytes())
+            headers.insert("content-type".to_string(), content_type);
+            let request = ResourceRequest::new(url, "POST", headers, body)
                 .map_err(|error| runtime_error(error.to_string()))?;
             self.queue_navigation(NavigationRequest::Submit { request });
         }
@@ -10575,6 +10591,19 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("Updated|one|3|true|false|3|ok")
         );
+    }
+
+    #[test]
+    fn form_submission_rejects_unsupported_enctype() {
+        let document = document(
+            r#"<form id="profile" method="post" enctype="application/json"><input name="name" value="Ceri"></form>"#,
+        );
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document, ResourceBundle::default(), base);
+        let error = runtime
+            .execute("document.getElementById(\"profile\").requestSubmit();")
+            .expect_err("unsupported form encodings should fail explicitly");
+        assert_eq!(error.message, "unsupported form enctype application/json");
     }
 
     #[test]

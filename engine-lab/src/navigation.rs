@@ -2021,6 +2021,7 @@ mod tests {
 
     struct FormProvider {
         requests: Rc<RefCell<Vec<ResourceRequest>>>,
+        multipart: bool,
     }
 
     impl ResourceProvider for FormProvider {
@@ -2034,14 +2035,33 @@ mod tests {
         ) -> Result<Option<ResourceResponse>, NavigationError> {
             self.requests.borrow_mut().push(request.clone());
             match (request.method(), request.url().path()) {
-                ("GET", "/") => ResourceResponse::new(
-                    200,
-                    "text/html",
-                    BTreeMap::new(),
-                    br#"<form action="/submit" method="post"><input name="q" value="rust browser"><button id="submit" type="submit">send</button></form>"#.to_vec(),
-                )
-                .map(Some),
+                ("GET", "/") => {
+                    let enctype = if self.multipart {
+                        " enctype=\"multipart/form-data\""
+                    } else {
+                        ""
+                    };
+                    ResourceResponse::new(
+                        200,
+                        "text/html",
+                        BTreeMap::new(),
+                        format!(
+                            "<form action=\"/submit\" method=\"post\"{enctype}><input name=\"q\" value=\"rust browser\"><button id=\"submit\" type=\"submit\">send</button></form>"
+                        )
+                        .into_bytes(),
+                    )
+                    .map(Some)
+                }
                 ("POST", "/submit") => {
+                    if self.multipart {
+                        return ResourceResponse::new(
+                            200,
+                            "text/html",
+                            BTreeMap::new(),
+                            br#"<p id="status">multipart posted</p>"#.to_vec(),
+                        )
+                        .map(Some);
+                    }
                     let mut headers = BTreeMap::new();
                     headers.insert("Location".to_string(), "/result.html".to_string());
                     ResourceResponse::new(303, "text/html", headers, Vec::new()).map(Some)
@@ -2844,6 +2864,7 @@ mod tests {
         let requests = Rc::new(RefCell::new(Vec::new()));
         let provider = Rc::new(FormProvider {
             requests: requests.clone(),
+            multipart: false,
         });
         let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
         browser
@@ -2872,6 +2893,46 @@ mod tests {
         assert_eq!(requests[1].body(), b"q=rust+browser");
         assert_eq!(requests[2].method(), "GET");
         assert!(requests[2].body().is_empty());
+    }
+
+    #[test]
+    fn multipart_form_submission_reuses_the_deterministic_form_data_encoder() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(FormProvider {
+            requests: requests.clone(),
+            multipart: true,
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("multipart form page should load");
+        assert!(browser.click_id("submit").expect("multipart submit should dispatch"));
+        let document = browser.document().expect("multipart result should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("multipart status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("multipart posted")
+        );
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method(), "POST");
+        let content_type = requests[1]
+            .headers()
+            .get("content-type")
+            .expect("multipart content type should be present");
+        assert_eq!(
+            content_type,
+            "multipart/form-data; boundary=----ceri-form-data-boundary"
+        );
+        let body = String::from_utf8(requests[1].body().to_vec())
+            .expect("deterministic multipart body should be UTF-8 for text fields");
+        assert!(body.contains("Content-Disposition: form-data; name=\"q\""));
+        assert!(body.contains("\r\n\r\nrust browser\r\n"));
+        assert!(body.ends_with("------ceri-form-data-boundary--\r\n"));
     }
 
     #[test]
