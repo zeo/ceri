@@ -524,7 +524,7 @@ fn scroll_target_box(
             return Some(target);
         }
     }
-    if inside_layout && layout.overflow == Overflow::Auto {
+    if inside_layout && (layout.overflow == Overflow::Auto || layout.path.is_empty()) {
         let max_x = (layout.scroll_content.width - layout.rect.width).max(0.0);
         let max_y = (layout.scroll_content.height - layout.rect.height).max(0.0);
         if max_x > 0.0 || max_y > 0.0 {
@@ -1491,7 +1491,8 @@ fn align_offset(align: AlignItems, available: f32, item: f32) -> f32 {
 
 fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
     layout.scroll_content = measure_scroll_content(layout);
-    if layout.overflow != Overflow::Auto {
+    let is_document = layout.path.is_empty();
+    if layout.overflow != Overflow::Auto && !is_document {
         return;
     }
     let max_x = (layout.scroll_content.width - layout.rect.width).max(0.0);
@@ -1518,8 +1519,8 @@ fn measure_scroll_content(layout: &LayoutBox) -> Size {
         if child.position == Position::Fixed {
             continue;
         }
-        right = right.max(child.rect.x + child.rect.width);
-        bottom = bottom.max(child.rect.y + child.rect.height);
+        right = right.max(child.rect.x + child.rect.width + child.margin.right);
+        bottom = bottom.max(child.rect.y + child.rect.height + child.margin.bottom);
     }
     Size {
         width: (right - layout.rect.x).max(layout.rect.width),
@@ -2095,5 +2096,35 @@ mod tests {
         assert_eq!(viewport.children[0].rect.y, -30.0);
         assert_eq!(viewport.children[1].rect.x, 70.0);
         assert_eq!(viewport.children[1].rect.y, 12.0);
+    }
+
+    #[test]
+    fn document_scroll_moves_flow_content_and_keeps_fixed_chrome_in_place() {
+        let document = Document::parse(
+            "<style>#content { width: 60px; height: 160px; margin: 0; background: #ff0000; } #fixed { position: fixed; left: 70px; top: 12px; width: 8px; height: 8px; margin: 0; background: #0000ff; }</style><div id='content'></div><div id='fixed'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state.scroll_offsets.insert(Vec::new(), (0.0, 30.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 100.0,
+            },
+            &state,
+        );
+        assert_eq!(result.root.scroll_content.height, 160.0);
+        assert_eq!(result.root.scroll_offset, (0.0, 30.0));
+        assert_eq!(result.root.children[0].rect.y, -30.0);
+        assert_eq!(result.root.children[1].rect.x, 70.0);
+        assert_eq!(result.root.children[1].rect.y, 12.0);
+        let target = result
+            .scroll_target_at(10.0, 10.0)
+            .expect("viewport should expose the document scroll target");
+        assert_eq!(target.path, Vec::<usize>::new());
+        assert_eq!(target.max_y, 60.0);
     }
 }

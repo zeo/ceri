@@ -893,9 +893,15 @@ impl Browser {
                 .runtime
                 .set_scroll_offset(target.path.clone(), offset);
             if changed {
-                page.runtime
-                    .dispatch_path_event(target.path, "scroll")
-                    .map_err(|error| NavigationError::Script(error.to_string()))?;
+                if target.path.is_empty() {
+                    page.runtime
+                        .dispatch_window_event("scroll")
+                        .map_err(|error| NavigationError::Script(error.to_string()))?;
+                } else {
+                    page.runtime
+                        .dispatch_path_event(target.path, "scroll")
+                        .map_err(|error| NavigationError::Script(error.to_string()))?;
+                }
             }
             changed
         };
@@ -3129,6 +3135,80 @@ mod tests {
                 100.0,
             )
             .expect("scroll at the boundary should be ignored"));
+    }
+
+    #[test]
+    fn browser_scrolls_the_document_and_preserves_fixed_viewport_chrome() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #content { width: 60px; height: 160px; margin: 0; background: #ff0000; }
+                #status { position: fixed; left: 0; top: 0; width: 60px; height: 12px; margin: 0; }
+            </style>
+            <div id="content"></div>
+            <div id="status">idle</div>
+            <script>
+                const status = document.getElementById("status");
+                window.addEventListener("scroll", () => {
+                    status.textContent = "window:" + window.scrollY + ":" + window.pageYOffset;
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(browser
+            .scroll_at(
+                Size {
+                    width: 120.0,
+                    height: 100.0,
+                },
+                10.0,
+                10.0,
+                0.0,
+                30.0,
+            )
+            .expect("document wheel scroll should dispatch"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("window:30:30")
+        );
+        let layout = browser
+            .layout(Size {
+                width: 120.0,
+                height: 100.0,
+            })
+            .expect("scrolled document should layout");
+        assert_eq!(layout.root.children[0].rect.y, -30.0);
+        assert_eq!(layout.root.children[1].rect.y, 0.0);
+        assert!(browser
+            .scroll_at(
+                Size {
+                    width: 120.0,
+                    height: 100.0,
+                },
+                10.0,
+                10.0,
+                0.0,
+                100.0,
+            )
+            .expect("document scroll should clamp to the page boundary"));
+        assert!(!browser
+            .scroll_at(
+                Size {
+                    width: 120.0,
+                    height: 100.0,
+                },
+                10.0,
+                10.0,
+                0.0,
+                100.0,
+            )
+            .expect("document scroll at the boundary should be ignored"));
     }
 
     #[test]

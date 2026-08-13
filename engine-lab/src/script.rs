@@ -149,6 +149,8 @@ enum Builtin {
     LocationAssign,
     LocationReplace,
     WindowAddEventListener,
+    WindowScrollTo,
+    WindowScrollBy,
     HistoryPushState,
     HistoryReplaceState,
     HistoryBack,
@@ -1211,6 +1213,18 @@ impl ScriptRuntime {
                 "cancelAnimationFrame".to_string(),
                 Value::Builtin(Builtin::CancelAnimationFrame),
             );
+            values.values.insert(
+                "scrollTo".to_string(),
+                Value::Builtin(Builtin::WindowScrollTo),
+            );
+            values.values.insert(
+                "scroll".to_string(),
+                Value::Builtin(Builtin::WindowScrollTo),
+            );
+            values.values.insert(
+                "scrollBy".to_string(),
+                Value::Builtin(Builtin::WindowScrollBy),
+            );
         }
         Self {
             document,
@@ -1569,6 +1583,10 @@ impl ScriptRuntime {
         self.scroll_offsets.get(path).copied().unwrap_or_default()
     }
 
+    pub(crate) fn document_scroll_offset(&self) -> (f32, f32) {
+        self.scroll_offset(&[])
+    }
+
     pub(crate) fn set_scroll_offset(&mut self, path: NodePath, offset: (f32, f32)) -> bool {
         let offset = (
             if offset.0.is_finite() {
@@ -1587,6 +1605,10 @@ impl ScriptRuntime {
             self.scroll_offsets.insert(path, offset);
         }
         changed
+    }
+
+    pub(crate) fn set_document_scroll_offset(&mut self, offset: (f32, f32)) -> bool {
+        self.set_scroll_offset(Vec::new(), offset)
     }
 
     fn set_scroll_offset_property(
@@ -1719,6 +1741,33 @@ impl ScriptRuntime {
 
     pub(crate) fn active_element(&self) -> Option<NodePath> {
         self.focused_element.clone()
+    }
+
+    pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
+        let callbacks = self
+            .window_listeners
+            .get(event_type)
+            .cloned()
+            .unwrap_or_default();
+        let event = Value::Event(EventData {
+            event_type: event_type.to_string(),
+            target: Vec::new(),
+            current_target: Vec::new(),
+            state: Rc::new(RefCell::new(EventState::default())),
+            history_state: Rc::new(RefCell::new(Value::Null)),
+            key: String::new(),
+            data: String::new(),
+            data_value: None,
+            error_message: None,
+        });
+        for callback in callbacks {
+            self.call(callback, vec![event.clone()])?;
+        }
+        self.drain_microtasks()?;
+        Ok(self
+            .window_listeners
+            .get(event_type)
+            .is_some_and(|listeners| !listeners.is_empty()))
     }
 
     fn apply_history_state_locally(
@@ -2271,6 +2320,12 @@ impl ScriptRuntime {
                     .borrow()
                     .get("location")
                     .ok_or_else(|| runtime_error("window location is unavailable")),
+                "scrollX" | "pageXOffset" => {
+                    Ok(Value::Number(self.document_scroll_offset().0 as f64))
+                }
+                "scrollY" | "pageYOffset" => {
+                    Ok(Value::Number(self.document_scroll_offset().1 as f64))
+                }
                 "history" => self
                     .global
                     .borrow()
@@ -2279,6 +2334,8 @@ impl ScriptRuntime {
                 "console" => Ok(Value::Console),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
+                "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
+                "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "JSON" => Ok(Value::Json),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
@@ -4196,6 +4253,50 @@ impl ScriptRuntime {
         url.borrow_mut().url = current.with_query_fragment(query, current.fragment().to_string());
     }
 
+    fn set_window_scroll(
+        &mut self,
+        arguments: &[Value],
+        relative: bool,
+    ) -> Result<(), ScriptError> {
+        let current = self.document_scroll_offset();
+        let (x, y) = match arguments.first().map(Value::resolve) {
+            Some(Value::Object(options)) => {
+                let options = options.borrow();
+                let x = options
+                    .get("left")
+                    .or_else(|| options.get("x"))
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0) as f32;
+                let y = options
+                    .get("top")
+                    .or_else(|| options.get("y"))
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0) as f32;
+                (x, y)
+            }
+            Some(value) => (
+                value.number()? as f32,
+                arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0) as f32,
+            ),
+            None => (0.0, 0.0),
+        };
+        let offset = if relative {
+            (current.0 + x, current.1 + y)
+        } else {
+            (x, y)
+        };
+        if self.set_document_scroll_offset(offset) {
+            self.dispatch_window_event("scroll")?;
+        }
+        Ok(())
+    }
+
     fn call_builtin(
         &mut self,
         builtin: Builtin,
@@ -4536,6 +4637,14 @@ impl ScriptRuntime {
                     .entry(event)
                     .or_default()
                     .push(callback);
+                Ok(Value::Undefined)
+            }
+            Builtin::WindowScrollTo => {
+                self.set_window_scroll(&arguments, false)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::WindowScrollBy => {
+                self.set_window_scroll(&arguments, true)?;
                 Ok(Value::Undefined)
             }
             Builtin::LocationAssign => {
@@ -10272,6 +10381,34 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("12:34:event:34")
+        );
+    }
+
+    #[test]
+    fn window_scroll_apis_update_offsets_and_dispatch_scroll_events() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                window.addEventListener("scroll", () => {
+                    status.textContent = "event:" + window.scrollY;
+                });
+                window.scrollTo(12, 34);
+                const first = window.scrollX + ":" + window.scrollY;
+                window.scrollBy({ left: 3, top: 4 });
+                status.textContent = first + "|" + window.pageXOffset + ":" + window.pageYOffset + "|" + status.textContent;
+                "#,
+            )
+            .expect("window scroll APIs should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("12:34|15:38|event:38")
         );
     }
 

@@ -69,7 +69,7 @@ The isolated [engine-lab](engine-lab/README.md) crate is a from-scratch Rust ren
 
 See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.
 
-The custom renderer also has a bounded positioning, clipping, and element-scrolling slice: relative ancestors establish overlay containing blocks, absolute and fixed descendants stay out of normal flow, and hidden, clipped, or automatic-overflow boxes constrain both software paint and pointer hit testing. Automatic-overflow boxes track bounded `scrollTop` and `scrollLeft` offsets, accept host wheel input, and dispatch `scroll` events. Relative visual offsets, document scrolling, stacking contexts, scrollbars, smooth scrolling, and scroll snapping remain outside this gate.
+The custom renderer also has a bounded positioning, clipping, and scrolling slice: relative ancestors establish overlay containing blocks, absolute and fixed descendants stay out of normal flow, and hidden, clipped, or automatic-overflow boxes constrain both software paint and pointer hit testing. Automatic-overflow boxes track bounded `scrollTop` and `scrollLeft` offsets, while the document exposes `window.scrollX`, `window.scrollY`, `scrollTo()`, and `scrollBy()`. Both paths accept host wheel input and dispatch `scroll` events. Relative visual offsets, stacking contexts, scrollbars, smooth scrolling, and scroll snapping remain outside this gate.
 
 FormData values expose ordered key, value, entry, `forEach()`, and symbol iteration methods in the custom runtime.
 

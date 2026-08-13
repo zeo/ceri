@@ -562,6 +562,42 @@ mod tests {
     }
 
     #[test]
+    fn host_routes_wheel_input_to_document_scrolling() {
+        let browser = Browser::new(bundle(
+            r#"<div id="content" style="width: 40px; height: 180px; margin: 0"></div>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 120.0,
+                height: 100.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        host.render()
+            .expect("initial frame should render")
+            .expect("initial frame should be present");
+        let scroll = host
+            .input(InputEvent::Scroll {
+                x: 10.0,
+                y: 10.0,
+                delta_x: 0.0,
+                delta_y: 30.0,
+            })
+            .expect("document wheel input should be accepted");
+        assert!(scroll.handled);
+        let layout = host
+            .browser()
+            .layout(Size {
+                width: 120.0,
+                height: 100.0,
+            })
+            .expect("scrolled document should layout");
+        assert_eq!(layout.root.children[0].rect.y, -30.0);
+    }
+
+    #[test]
     fn host_render_pumps_packaged_worker_callbacks() {
         let mut resources = bundle(
             r#"<p id='status'>idle</p><script>
