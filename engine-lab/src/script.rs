@@ -265,6 +265,7 @@ enum Builtin {
     AbortSignalThrowIfAborted(AbortSignalHandle),
     WorkerPostMessage(WorkerHandle),
     WorkerTerminate(WorkerHandle),
+    WorkerAddEventListener(WorkerHandle),
     WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
 }
 
@@ -785,6 +786,12 @@ enum WorkerCommand {
     Terminate,
 }
 
+#[derive(Clone, Copy)]
+enum WorkerScriptType {
+    Classic,
+    Module,
+}
+
 enum WorkerEvent {
     Message(String),
     Error(String),
@@ -797,6 +804,7 @@ struct WorkerData {
     event_receiver: Receiver<WorkerEvent>,
     onmessage: Option<Value>,
     onerror: Option<Value>,
+    listeners: Vec<EventListener>,
     terminated: bool,
     termination_flag: Arc<AtomicBool>,
 }
@@ -2416,6 +2424,9 @@ impl ScriptRuntime {
                         handle.clone(),
                     ))),
                     "terminate" => Ok(Value::Builtin(Builtin::WorkerTerminate(handle))),
+                    "addEventListener" => Ok(Value::Builtin(Builtin::WorkerAddEventListener(
+                        handle,
+                    ))),
                     "onmessage" => Ok(worker.onmessage.clone().unwrap_or(Value::Null)),
                     "onerror" => Ok(worker.onerror.clone().unwrap_or(Value::Null)),
                     "url" => Ok(Value::String(worker.url.to_string())),
@@ -2850,6 +2861,7 @@ impl ScriptRuntime {
             .resolve(&reference)
             .map_err(|error| runtime_error(error.to_string()))?;
         let mut name = String::new();
+        let mut worker_type = WorkerScriptType::Classic;
         if let Some(options) = arguments.get(1).map(Value::resolve) {
             match options {
                 Value::Undefined | Value::Null => {}
@@ -2861,13 +2873,17 @@ impl ScriptRuntime {
                             )));
                         }
                     }
-                    if let Some(worker_type) = options.borrow().get("type") {
-                        let worker_type = worker_type.string_value();
-                        if !worker_type.eq_ignore_ascii_case("classic") {
-                            return Err(runtime_error(
-                                "only classic Worker scripts are supported",
-                            ));
-                        }
+                    if let Some(type_value) = options.borrow().get("type") {
+                        let type_name = type_value.string_value();
+                        worker_type = match type_name.to_ascii_lowercase().as_str() {
+                            "classic" => WorkerScriptType::Classic,
+                            "module" => WorkerScriptType::Module,
+                            _ => {
+                                return Err(runtime_error(format!(
+                                    "unsupported Worker script type {type_name}"
+                                )))
+                            }
+                        };
                     }
                     if let Some(worker_name) = options.borrow().get("name") {
                         name = worker_name.string_value();
@@ -2876,13 +2892,9 @@ impl ScriptRuntime {
                 _ => return Err(runtime_error("Worker options must be an object")),
             }
         }
-        let resources = self
-            .resources
-            .clone()
-            .ok_or_else(|| runtime_error("Worker scripts must be packaged in this slice"))?;
-        let resource = resources
-            .resource(url.path())
-            .cloned()
+        let resources = self.resources.clone().unwrap_or_default();
+        let provider = self.resource_provider.clone();
+        let resource = resolve_runtime_resource(&resources, provider.as_deref(), &url)?
             .ok_or_else(|| runtime_error(format!("worker script {} was not found", url.path())))?;
         if !is_javascript(&resource) {
             return Err(runtime_error(format!(
@@ -2909,7 +2921,8 @@ impl ScriptRuntime {
                     return;
                 }
             };
-            let mut runtime = ScriptRuntime::with_resources(document, resources, worker_url);
+            let mut runtime =
+                ScriptRuntime::with_resources(document, resources, worker_url.clone());
             runtime.worker_sender = Some(event_sender.clone());
             runtime
                 .global
@@ -2929,7 +2942,20 @@ impl ScriptRuntime {
                 .borrow_mut()
                 .values
                 .insert("globalThis".to_string(), Value::Window);
-            if let Err(error) = runtime.execute(&source) {
+            let startup = match worker_type {
+                WorkerScriptType::Classic => runtime.execute(&source),
+                WorkerScriptType::Module => {
+                    let loader_resources = runtime.resources.clone().unwrap_or_default();
+                    let mut loader = RuntimeModuleLoader {
+                        resources: &loader_resources,
+                        provider: None,
+                    };
+                    runtime
+                        .execute_module(&source, worker_url.clone(), &mut loader)
+                        .map(|_| ())
+                }
+            };
+            if let Err(error) = startup {
                 let _ = event_sender.try_send(WorkerEvent::Error(error.message));
                 return;
             }
@@ -2950,9 +2976,17 @@ impl ScriptRuntime {
                                 continue;
                             }
                         };
-                        let callback = runtime.global.borrow().get("onmessage");
-                        if !matches!(callback.as_ref().map(Value::resolve), Some(Value::Function(_)))
+                        let mut callbacks = runtime
+                            .window_listeners
+                            .get("message")
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(callback) = runtime.global.borrow().get("onmessage")
+                            && matches!(callback.resolve(), Value::Function(_))
                         {
+                            callbacks.push(callback);
+                        }
+                        if callbacks.is_empty() {
                             continue;
                         }
                         let event = Value::Event(EventData {
@@ -2966,11 +3000,15 @@ impl ScriptRuntime {
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
-                        if let Err(error) = runtime.call(
-                            callback.expect("function checked above"),
-                            vec![event],
-                        ) {
-                            let _ = event_sender.try_send(WorkerEvent::Error(error.message));
+                        let mut callback_failed = false;
+                        for callback in callbacks {
+                            if let Err(error) = runtime.call(callback, vec![event.clone()]) {
+                                let _ = event_sender.try_send(WorkerEvent::Error(error.message));
+                                callback_failed = true;
+                                break;
+                            }
+                        }
+                        if callback_failed {
                             continue;
                         }
                         if let Err(error) = runtime.drain_microtasks() {
@@ -2987,6 +3025,7 @@ impl ScriptRuntime {
             event_receiver,
             onmessage: None,
             onerror: None,
+            listeners: Vec::new(),
             terminated: false,
             termination_flag,
         }));
@@ -3013,37 +3052,63 @@ impl ScriptRuntime {
                 match event {
                     WorkerEvent::Message(message) => {
                         let data = self.parse_json(&message)?;
-                        let callback = worker.borrow().onmessage.clone();
-                        if let Some(callback) = callback {
-                            let event = Value::Event(EventData {
-                                event_type: "message".to_string(),
-                                target: Vec::new(),
-                                current_target: Vec::new(),
-                                state: Rc::new(RefCell::new(EventState::default())),
-                                history_state: Rc::new(RefCell::new(Value::Null)),
-                                key: String::new(),
-                                data: String::new(),
-                                data_value: Some(Box::new(data)),
-                                error_message: None,
-                            });
-                            self.call(callback, vec![event])?;
+                        let worker_data = worker.borrow();
+                        let mut callbacks = worker_data
+                            .listeners
+                            .iter()
+                            .filter(|listener| listener.event == "message")
+                            .map(|listener| listener.callback.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(callback) = worker_data.onmessage.clone() {
+                            callbacks.push(callback);
+                        }
+                        drop(worker_data);
+                        if callbacks.is_empty() {
+                            continue;
+                        }
+                        let event = Value::Event(EventData {
+                            event_type: "message".to_string(),
+                            target: Vec::new(),
+                            current_target: Vec::new(),
+                            state: Rc::new(RefCell::new(EventState::default())),
+                            history_state: Rc::new(RefCell::new(Value::Null)),
+                            key: String::new(),
+                            data: String::new(),
+                            data_value: Some(Box::new(data)),
+                            error_message: None,
+                        });
+                        for callback in callbacks {
+                            self.call(callback, vec![event.clone()])?;
                         }
                     }
                     WorkerEvent::Error(message) => {
-                        let callback = worker.borrow().onerror.clone();
-                        if let Some(callback) = callback {
-                            let event = Value::Event(EventData {
-                                event_type: "error".to_string(),
-                                target: Vec::new(),
-                                current_target: Vec::new(),
-                                state: Rc::new(RefCell::new(EventState::default())),
-                                history_state: Rc::new(RefCell::new(Value::Null)),
-                                key: String::new(),
-                                data: String::new(),
-                                data_value: None,
-                                error_message: Some(message),
-                            });
-                            self.call(callback, vec![event])?;
+                        let worker_data = worker.borrow();
+                        let mut callbacks = worker_data
+                            .listeners
+                            .iter()
+                            .filter(|listener| listener.event == "error")
+                            .map(|listener| listener.callback.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(callback) = worker_data.onerror.clone() {
+                            callbacks.push(callback);
+                        }
+                        drop(worker_data);
+                        if callbacks.is_empty() {
+                            continue;
+                        }
+                        let event = Value::Event(EventData {
+                            event_type: "error".to_string(),
+                            target: Vec::new(),
+                            current_target: Vec::new(),
+                            state: Rc::new(RefCell::new(EventState::default())),
+                            history_state: Rc::new(RefCell::new(Value::Null)),
+                            key: String::new(),
+                            data: String::new(),
+                            data_value: None,
+                            error_message: Some(message),
+                        });
+                        for callback in callbacks {
+                            self.call(callback, vec![event.clone()])?;
                         }
                     }
                 }
@@ -4064,6 +4129,18 @@ impl ScriptRuntime {
             }
             Builtin::EventPreventDefault(state) => {
                 state.borrow_mut().default_prevented = true;
+                Ok(Value::Undefined)
+            }
+            Builtin::WorkerAddEventListener(worker) => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback.resolve(), Value::Function(_)) {
+                    return Err(runtime_error("Worker event listener must be a function"));
+                }
+                worker.borrow_mut().listeners.push(EventListener { event, callback });
                 Ok(Value::Undefined)
             }
             Builtin::WorkerPostMessage(worker) => {
@@ -8873,6 +8950,23 @@ mod tests {
         }
     }
 
+    struct WorkerScriptProvider {
+        requests: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ResourceProvider for WorkerScriptProvider {
+        fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            self.requests.borrow_mut().push(url.path().to_string());
+            Ok((url.path() == "/worker.js").then(|| {
+                Resource::new(
+                    "text/javascript",
+                    br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
+                        .to_vec(),
+                )
+            }))
+        }
+    }
+
     #[test]
     fn executes_a_static_module_graph_with_named_and_namespace_imports() {
         let document = document("<p id='status'>idle</p>");
@@ -11778,7 +11872,51 @@ mod tests {
     }
 
     #[test]
-    fn worker_rejects_module_scripts_and_unavailable_resources() {
+    fn worker_loads_its_entry_script_through_the_resource_provider() {
+        let document = document("<p id='status'>idle</p>");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(WorkerScriptProvider {
+            requests: requests.clone(),
+        });
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            None,
+            Some(provider),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const worker = new Worker("/worker.js");
+                worker.onmessage = (event) => { status.textContent = event.data; };
+                worker.postMessage("remote");
+                "#,
+            )
+            .expect("provider-backed worker construction should execute");
+        for _ in 0..100 {
+            if runtime.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("remote!")
+        );
+        assert_eq!(requests.borrow().as_slice(), ["/worker.js"]);
+    }
+
+    #[test]
+    fn worker_rejects_unknown_script_types_and_unavailable_resources() {
         let document = document("<p>worker</p>");
         let mut resources = ResourceBundle::default();
         resources
@@ -11786,14 +11924,64 @@ mod tests {
             .expect("worker resource should be accepted");
         let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
         let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
-        let module_error = runtime
-            .execute(r#"new Worker("/worker.js", { type: "module" });"#)
-            .expect_err("module workers should be rejected in the classic slice");
-        assert!(module_error.message.contains("only classic Worker scripts"));
+        let type_error = runtime
+            .execute(r#"new Worker("/worker.js", { type: "shared" });"#)
+            .expect_err("unknown worker types should be rejected");
+        assert!(type_error
+            .message
+            .contains("unsupported Worker script type shared"));
         let missing_error = runtime
             .execute(r#"new Worker("/missing.js");"#)
             .expect_err("missing packaged workers should be rejected");
         assert!(missing_error.message.contains("worker script /missing.js was not found"));
+    }
+
+    #[test]
+    fn module_worker_loads_packaged_same_origin_imports() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/worker-module.js",
+                "text/javascript",
+                br#"import { suffix } from "./worker-module-child.js";
+                self.addEventListener("message", (event) => { postMessage(suffix(event.data)); });"#
+                    .to_vec(),
+            )
+            .expect("module worker resource should be accepted");
+        resources
+            .insert(
+                "/worker-module-child.js",
+                "text/javascript",
+                b"export function suffix(value) { return value + '!'; }".to_vec(),
+            )
+            .expect("module worker child should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const worker = new Worker("/worker-module.js", { type: "module" });
+                worker.addEventListener("message", (event) => { status.textContent = event.data; });
+                worker.postMessage("module");
+                "#,
+            )
+            .expect("module worker construction should execute");
+        for _ in 0..100 {
+            if runtime.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("module!")
+        );
     }
 
     #[test]

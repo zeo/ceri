@@ -57,7 +57,7 @@ FormData values expose ordered key, value, and entry iterators, `forEach()`, and
 
 URLSearchParams now exposes the matching ordered key, value, entry, `forEach()`, and `Symbol.iterator` surface, with mutations still synchronized to its owning URL.
 
-The page runtime now has a bounded classic `Worker` boundary. A packaged same-origin script runs on a dedicated standard-library thread, receives JSON-cloned messages through `self.onmessage`, and replies through `postMessage()`. The page receives `onmessage` and `onerror` events and can call `terminate()`, while `Browser::pump()` and `EngineHost` input or render work keep delivery explicit and independent from a loopback listener. Module workers, transfer lists, provider-only scripts, nested workers, and non-JSON structured-clone values remain separate compatibility gates.
+The page runtime now has a bounded `Worker` boundary for classic and module entry scripts. A same-origin entry script from packaged assets or the embedder-owned `ResourceProvider` runs on a dedicated standard-library thread, and packaged module entries can use the existing same-origin module loader. The worker receives JSON-cloned messages through `self.addEventListener()` or `self.onmessage` and replies through `postMessage()`. The page receives `addEventListener()`, `onmessage`, and `onerror` events and can call `terminate()`, while `Browser::pump()` and `EngineHost` input or render work keep delivery explicit and independent from a loopback listener. Worker subresources, transfer lists, nested workers, and non-JSON structured-clone values remain separate compatibility gates.
 
 An experimental backend must pass these gates in order:
 

@@ -1977,6 +1977,56 @@ mod tests {
     }
 
     #[test]
+    fn browser_pumps_a_provider_worker_without_a_loopback_server() {
+        let mut provider_resources = BTreeMap::new();
+        provider_resources.insert(
+            "/index.html".to_string(),
+            Resource::new(
+                "text/html",
+                br#"<p id='status'>idle</p><script>
+                  const status = document.getElementById("status");
+                  const worker = new Worker("/worker.js");
+                  worker.onmessage = (event) => { status.textContent = event.data; };
+                  worker.postMessage("provider");
+                </script>"#
+                .to_vec(),
+            ),
+        );
+        provider_resources.insert(
+            "/worker.js".to_string(),
+            Resource::new(
+                "text/javascript",
+                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
+                    .to_vec(),
+            ),
+        );
+        let mut browser = Browser::with_resource_provider(
+            ResourceBundle::default(),
+            Rc::new(MemoryProvider {
+                resources: provider_resources,
+            }),
+        );
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("provider document should load");
+        for _ in 0..100 {
+            if browser.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("provider!")
+        );
+    }
+
+    #[test]
     fn parses_app_urls_without_a_loopback_authority() {
         let url = AppUrl::parse("HTTPS://APP.CERI.INVALID/docs/intro%2Ehtml?q=rust#top")
             .expect("app URL should parse");
