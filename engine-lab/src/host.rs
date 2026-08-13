@@ -725,6 +725,39 @@ mod tests {
     }
 
     #[test]
+    fn host_routes_pointer_input_to_relative_visual_coordinates() {
+        let browser = Browser::new(bundle(
+            r#"<button id="go" style="position: relative; left: 30px; top: 10px; display: block; width: 80px; height: 24px; margin: 0">run</button><p id="status">idle</p><script>
+                document.getElementById("go").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "clicked";
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 160.0,
+                height: 100.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(host
+            .input(InputEvent::Click { x: 35.0, y: 15.0 })
+            .expect("visual click should dispatch")
+            .handled);
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("clicked")
+        );
+    }
+
+    #[test]
     fn host_routes_text_input_to_the_focused_control() {
         let browser = Browser::new(bundle(
             r#"<input id="name" value="R" style="display: block; width: 180px; height: 32px"><p id="status">idle</p><script>

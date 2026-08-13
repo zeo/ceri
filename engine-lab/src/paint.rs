@@ -1,7 +1,10 @@
 use crate::css::{Color, Overflow};
 use crate::dom::NodePath;
 use crate::image::Image;
-use crate::layout::{ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun};
+use crate::layout::{
+    ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun, paint_order, visual_offset_for,
+    visual_rect_for,
+};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -176,6 +179,7 @@ pub(crate) fn paint_with_commands(
         commands,
         &document.images,
         None,
+        (0.0, 0.0),
     );
     canvas
 }
@@ -220,6 +224,7 @@ fn paint_canvas_command(
     canvas_box: &LayoutBox,
     command: &CanvasCommand,
     clip: Option<Rect>,
+    rect: Rect,
 ) {
     let (path, x, y, width, height) = match command {
         CanvasCommand::FillRect {
@@ -251,12 +256,12 @@ fn paint_canvas_command(
             }
         }
     };
-    let Some(command_clip) = intersect_clip(clip, canvas_box.rect) else {
+    let Some(command_clip) = intersect_clip(clip, rect) else {
         return;
     };
     canvas.fill_rect_clipped(
-        canvas_box.rect.x + x,
-        canvas_box.rect.y + y,
+        rect.x + x,
+        rect.y + y,
         width,
         height,
         color,
@@ -270,18 +275,21 @@ fn paint_box(
     commands: &[CanvasCommand],
     images: &[ImageLayer],
     clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
 ) {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
     fill_rect_optional(
         canvas,
-        layout_box.rect.x,
-        layout_box.rect.y,
-        layout_box.rect.width,
-        layout_box.rect.height,
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
         layout_box.background,
         clip,
     );
     let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto) {
-        intersect_clip(clip, layout_box.rect)
+        intersect_clip(clip, rect)
     } else {
         clip
     };
@@ -293,10 +301,10 @@ fn paint_box(
             canvas,
             &layer.image,
             Rect {
-                x: layout_box.rect.x + inset,
-                y: layout_box.rect.y + inset,
-                width: (layout_box.rect.width - inset * 2.0).max(0.0),
-                height: (layout_box.rect.height - inset * 2.0).max(0.0),
+                x: rect.x + inset,
+                y: rect.y + inset,
+                width: (rect.width - inset * 2.0).max(0.0),
+                height: (rect.height - inset * 2.0).max(0.0),
             },
             content_clip,
         );
@@ -305,50 +313,57 @@ fn paint_box(
         let border = layout_box.border_width;
         fill_rect_optional(
             canvas,
-            layout_box.rect.x,
-            layout_box.rect.y,
-            layout_box.rect.width,
+            rect.x,
+            rect.y,
+            rect.width,
             border,
             layout_box.border_color,
             clip,
         );
         fill_rect_optional(
             canvas,
-            layout_box.rect.x,
-            layout_box.rect.bottom() - border,
-            layout_box.rect.width,
+            rect.x,
+            rect.bottom() - border,
+            rect.width,
             border,
             layout_box.border_color,
             clip,
         );
         fill_rect_optional(
             canvas,
-            layout_box.rect.x,
-            layout_box.rect.y,
+            rect.x,
+            rect.y,
             border,
-            layout_box.rect.height,
+            rect.height,
             layout_box.border_color,
             clip,
         );
         fill_rect_optional(
             canvas,
-            layout_box.rect.x + layout_box.rect.width - border,
-            layout_box.rect.y,
+            rect.x + rect.width - border,
+            rect.y,
             border,
-            layout_box.rect.height,
+            rect.height,
             layout_box.border_color,
             clip,
         );
     }
     for run in &layout_box.text {
-        paint_text(canvas, run, content_clip);
+        paint_text(canvas, run, content_clip, offset);
     }
-    for child in &layout_box.children {
-        paint_box(canvas, child, commands, images, content_clip);
+    for index in paint_order(&layout_box.children) {
+        paint_box(
+            canvas,
+            &layout_box.children[index],
+            commands,
+            images,
+            content_clip,
+            offset,
+        );
     }
     if layout_box.tag == "canvas" {
         for command in commands {
-            paint_canvas_command(canvas, layout_box, command, content_clip);
+            paint_canvas_command(canvas, layout_box, command, content_clip, rect);
         }
     }
 }
@@ -383,7 +398,7 @@ fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect, clip: Option<Rect
     }
 }
 
-fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>) {
+fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
     let scale = (run.font_size / 9.0).round().max(1.0) as u32;
     let mut x = run.x;
     for character in run.text.chars() {
@@ -394,8 +409,8 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>) {
                     let width = if run.bold { scale + 1 } else { scale };
                     fill_rect_optional(
                         canvas,
-                        x + column as f32 * scale as f32,
-                        run.y + row as f32 * scale as f32,
+                        x + column as f32 * scale as f32 + offset.0,
+                        run.y + row as f32 * scale as f32 + offset.1,
                         width as f32,
                         scale as f32,
                         run.color,
@@ -569,6 +584,8 @@ mod tests {
                 }],
                 children: Vec::new(),
                 position: crate::css::Position::Static,
+                visual_offset: (0.0, 0.0),
+                z_index: 0,
                 overflow: Overflow::Visible,
                 scroll_content: Size {
                     width: 20.0,
@@ -625,6 +642,8 @@ mod tests {
                         text: Vec::new(),
                         children: Vec::new(),
                         position: crate::css::Position::Static,
+                        visual_offset: (0.0, 0.0),
+                        z_index: 0,
                         overflow: Overflow::Visible,
                         scroll_content: Size {
                             width: 10.0,
@@ -648,6 +667,8 @@ mod tests {
                         text: Vec::new(),
                         children: Vec::new(),
                         position: crate::css::Position::Static,
+                        visual_offset: (0.0, 0.0),
+                        z_index: 0,
                         overflow: Overflow::Visible,
                         scroll_content: Size {
                             width: 10.0,
@@ -658,6 +679,8 @@ mod tests {
                     },
                 ],
                 position: crate::css::Position::Static,
+                visual_offset: (0.0, 0.0),
+                z_index: 0,
                 overflow: Overflow::Visible,
                 scroll_content: Size {
                     width: 20.0,

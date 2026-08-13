@@ -10,7 +10,7 @@ The current slice implements:
 - a deterministic cascade with selector specificity
 - document and subtree `querySelector` and `querySelectorAll` lookups using the same selector matcher
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
-- bounded CSS positioning for `relative` containing blocks, `absolute` descendants, viewport-anchored `fixed` descendants, and `inset` offsets
+- bounded CSS positioning for flow-preserving relative visual offsets, `relative` containing blocks, `absolute` descendants, viewport-anchored `fixed` descendants, `inset` offsets, and integer `z-index` ordering within layout parents
 - layout boxes retain DOM paths for coordinate hit testing
 - a software paint step with a small built-in bitmap font
 - a platform-neutral `EngineHost` frame and input boundary
@@ -239,7 +239,7 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 
 Grid placement is currently row-major. Explicit `grid-column`, auto-placement modes, and subgrid remain separate compatibility work.
 
-Positioned overlays use the nearest `position: relative` ancestor as their bounded containing block. `position: fixed` uses the requested viewport. `overflow: hidden`, `overflow: clip`, and `overflow: auto` constrain both software paint and coordinate hit testing, which keeps a clipped child from receiving pointer input outside its visible box. Element containers expose `scrollTop` and `scrollLeft`; the document exposes `window.scrollX`, `window.scrollY`, `pageXOffset`, `pageYOffset`, `scrollTo()`, and `scrollBy()`. Both paths accept host wheel input and dispatch `scroll` when the offset changes. The current slice does not implement relative visual offsets, stacking contexts, scrollbars, smooth scrolling, or scroll snapping.
+Positioned overlays use the nearest `position: relative` ancestor as their bounded containing block. Relative boxes keep their flow geometry while their visual offset moves paint and coordinate hit testing together. Positioned siblings use bounded integer `z-index` ordering within each layout parent. `position: fixed` uses the requested viewport. `overflow: hidden`, `overflow: clip`, and `overflow: auto` constrain both software paint and coordinate hit testing, which keeps a clipped child from receiving pointer input outside its visible box. Element containers expose `scrollTop` and `scrollLeft`; the document exposes `window.scrollX`, `window.scrollY`, `pageXOffset`, `pageYOffset`, `scrollTo()`, and `scrollBy()`. Both paths accept host wheel input and dispatch `scroll` when the offset changes. Full stacking-context isolation, scrollbars, smooth scrolling, and scroll snapping remain separate gates.
 
 The storage demo exercises app-owned `localStorage` and `sessionStorage` values without opening a listener:
 

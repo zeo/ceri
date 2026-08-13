@@ -3064,6 +3064,68 @@ mod tests {
     }
 
     #[test]
+    fn browser_hits_relative_offsets_and_z_order_at_visual_coordinates() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #relative { position: relative; left: 30px; top: 10px; display: block; width: 40px; height: 20px; margin: 0; z-index: 1; }
+                #low { position: absolute; left: 100px; top: 20px; width: 40px; height: 20px; margin: 0; z-index: 1; background: #ff0000; }
+                #high { position: absolute; left: 100px; top: 20px; width: 40px; height: 20px; margin: 0; z-index: 2; background: #0000ff; }
+            </style>
+            <button id="relative">relative</button>
+            <div id="low"></div>
+            <button id="high">high</button>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("relative").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "relative";
+                });
+                document.getElementById("low").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "low";
+                });
+                document.getElementById("high").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "high";
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(browser
+            .click_at(
+                Size {
+                    width: 240.0,
+                    height: 120.0,
+                },
+                35.0,
+                15.0,
+            )
+            .expect("relative visual click should dispatch"));
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("relative")
+        );
+        assert!(browser
+            .click_at(
+                Size {
+                    width: 240.0,
+                    height: 120.0,
+                },
+                110.0,
+                25.0,
+            )
+            .expect("top z-index click should dispatch"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn browser_scrolls_auto_overflow_and_dispatches_scroll_events() {
         let mut browser = Browser::new(bundle(
             r##"<style>

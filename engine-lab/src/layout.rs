@@ -47,6 +47,8 @@ pub struct LayoutBox {
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
     pub(crate) position: Position,
+    pub(crate) visual_offset: (f32, f32),
+    pub(crate) z_index: i32,
     pub(crate) overflow: Overflow,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
@@ -264,6 +266,8 @@ pub fn layout_with_state(
         text: Vec::new(),
         children: Vec::new(),
         position: Position::Static,
+        visual_offset: (0.0, 0.0),
+        z_index: 0,
         overflow: Overflow::Visible,
         scroll_content: Size {
             width: viewport.width,
@@ -355,11 +359,11 @@ impl LayoutDocument {
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodePath> {
-        hit_test_box(&self.root, x, y, Some(self.root.rect))
+        hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
 
     pub(crate) fn scroll_target_at(&self, x: f32, y: f32) -> Option<ScrollTarget> {
-        scroll_target_box(&self.root, x, y, Some(self.root.rect))
+        scroll_target_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
 }
 
@@ -482,24 +486,68 @@ fn append_positioned_nodes(
     }
 }
 
-fn hit_test_box(layout: &LayoutBox, x: f32, y: f32, clip: Option<Rect>) -> Option<NodePath> {
+fn hit_test_box(
+    layout: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) -> Option<NodePath> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
         return None;
     }
-    let inside_layout = contains_point(layout.rect, x, y);
+    let visual_offset = visual_offset_for(layout, ancestor_offset);
+    let rect = visual_rect_for(layout, ancestor_offset);
+    let inside_layout = contains_point(rect, x, y);
     let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) {
-        intersect_rect(clip, layout.rect)
+        intersect_rect(clip, rect)
     } else {
         clip
     };
-    for child in layout.children.iter().rev() {
-        if let Some(path) = hit_test_box(child, x, y, child_clip) {
+    for index in paint_order(&layout.children).into_iter().rev() {
+        if let Some(path) = hit_test_box(
+            &layout.children[index],
+            x,
+            y,
+            child_clip,
+            visual_offset,
+        ) {
             return Some(path);
         }
     }
     (inside_layout && !layout.path.is_empty()).then(|| layout.path.clone())
+}
+
+pub(crate) fn paint_order(children: &[LayoutBox]) -> Vec<usize> {
+    let mut order = (0..children.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| (children[*index].z_index, *index));
+    order
+}
+
+pub(crate) fn visual_offset_for(
+    layout: &LayoutBox,
+    ancestor_offset: (f32, f32),
+) -> (f32, f32) {
+    if layout.position == Position::Fixed {
+        layout.visual_offset
+    } else {
+        (
+            ancestor_offset.0 + layout.visual_offset.0,
+            ancestor_offset.1 + layout.visual_offset.1,
+        )
+    }
+}
+
+pub(crate) fn visual_rect_for(layout: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
+    let offset = visual_offset_for(layout, ancestor_offset);
+    Rect {
+        x: layout.rect.x + offset.0,
+        y: layout.rect.y + offset.1,
+        width: layout.rect.width,
+        height: layout.rect.height,
+    }
 }
 
 fn scroll_target_box(
@@ -507,20 +555,29 @@ fn scroll_target_box(
     x: f32,
     y: f32,
     clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
 ) -> Option<ScrollTarget> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
         return None;
     }
-    let inside_layout = contains_point(layout.rect, x, y);
+    let visual_offset = visual_offset_for(layout, ancestor_offset);
+    let rect = visual_rect_for(layout, ancestor_offset);
+    let inside_layout = contains_point(rect, x, y);
     let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) {
-        intersect_rect(clip, layout.rect)
+        intersect_rect(clip, rect)
     } else {
         clip
     };
-    for child in layout.children.iter().rev() {
-        if let Some(target) = scroll_target_box(child, x, y, child_clip) {
+    for index in paint_order(&layout.children).into_iter().rev() {
+        if let Some(target) = scroll_target_box(
+            &layout.children[index],
+            x,
+            y,
+            child_clip,
+            visual_offset,
+        ) {
             return Some(target);
         }
     }
@@ -840,6 +897,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         text,
         children,
         position: style.position,
+        visual_offset: (0.0, 0.0),
+        z_index: positioned_z_index(style),
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -847,6 +906,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     if mode != LayoutMode::Flow {
         position_layout_box(&mut layout, style, mode, position_block, font_size);
+    } else {
+        apply_relative_offset(&mut layout, style, containing_block, font_size);
     }
     let positioned_block = ContainingBlock {
         x: layout.rect.x,
@@ -1135,6 +1196,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         text: Vec::new(),
         children,
         position: style.position,
+        visual_offset: (0.0, 0.0),
+        z_index: positioned_z_index(style),
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1152,6 +1215,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             },
             font_size,
         );
+    } else {
+        apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     }
     let positioned_block = ContainingBlock {
         x: layout.rect.x,
@@ -1361,6 +1426,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         text: Vec::new(),
         children,
         position: style.position,
+        visual_offset: (0.0, 0.0),
+        z_index: positioned_z_index(style),
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1378,6 +1445,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             },
             font_size,
         );
+    } else {
+        apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     }
     let positioned_block = ContainingBlock {
         x: layout.rect.x,
@@ -1489,6 +1558,36 @@ fn align_offset(align: AlignItems, available: f32, item: f32) -> f32 {
     }
 }
 
+fn positioned_z_index(style: Style) -> i32 {
+    if style.position.is_out_of_flow() || style.position == Position::Relative {
+        style.z_index.unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn apply_relative_offset(
+    layout: &mut LayoutBox,
+    style: Style,
+    containing: ContainingBlock,
+    font_size: f32,
+) {
+    if style.position != Position::Relative {
+        return;
+    }
+    let inset = resolve_insets(style.inset, containing, font_size);
+    layout.visual_offset = (
+        inset
+            .left
+            .or_else(|| inset.right.map(|value| -value))
+            .unwrap_or(0.0),
+        inset
+            .top
+            .or_else(|| inset.bottom.map(|value| -value))
+            .unwrap_or(0.0),
+    );
+}
+
 fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
     layout.scroll_content = measure_scroll_content(layout);
     let is_document = layout.path.is_empty();
@@ -1519,8 +1618,12 @@ fn measure_scroll_content(layout: &LayoutBox) -> Size {
         if child.position == Position::Fixed {
             continue;
         }
-        right = right.max(child.rect.x + child.rect.width + child.margin.right);
-        bottom = bottom.max(child.rect.y + child.rect.height + child.margin.bottom);
+        right = right.max(
+            child.rect.x + child.visual_offset.0 + child.rect.width + child.margin.right,
+        );
+        bottom = bottom.max(
+            child.rect.y + child.visual_offset.1 + child.rect.height + child.margin.bottom,
+        );
     }
     Size {
         width: (right - layout.rect.x).max(layout.rect.width),
@@ -2126,5 +2229,55 @@ mod tests {
             .expect("viewport should expose the document scroll target");
         assert_eq!(target.path, Vec::<usize>::new());
         assert_eq!(target.max_y, 60.0);
+    }
+
+    #[test]
+    fn relative_offsets_move_visual_boxes_without_changing_flow() {
+        let document = Document::parse(
+            "<style>#first { position: relative; left: 10px; top: 5px; width: 20px; height: 20px; margin: 0; background: #ff0000; } #second { width: 20px; height: 20px; margin: 0; background: #0000ff; }</style><div id='first'></div><div id='second'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 100.0,
+            },
+        );
+        let first = &result.root.children[0];
+        let second = &result.root.children[1];
+        assert_eq!(first.rect.x, 0.0);
+        assert_eq!(first.rect.y, 0.0);
+        assert_eq!(first.visual_offset, (10.0, 5.0));
+        assert_eq!(second.rect.y, 20.0);
+        assert_eq!(result.hit_test(10.0, 5.0), Some(first.path.clone()));
+        assert_eq!(result.hit_test(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn z_index_orders_overlapping_paint_and_hit_testing() {
+        let document = Document::parse(
+            "<style>#low { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 1; background: #ff0000; } #high { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 2; background: #0000ff; }</style><div id='low'></div><div id='high'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        );
+        let low = &result.root.children[0];
+        let high = &result.root.children[1];
+        assert_eq!(low.z_index, 1);
+        assert_eq!(high.z_index, 2);
+        assert_eq!(result.hit_test(10.0, 10.0), Some(high.path.clone()));
+        let canvas = result.paint();
+        let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 0, 255, 255]);
     }
 }

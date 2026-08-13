@@ -246,6 +246,7 @@ impl GridTemplate {
 pub(crate) struct Style {
     pub display: Display,
     pub position: Position,
+    pub z_index: Option<i32>,
     pub inset: Edges,
     pub overflow: Overflow,
     pub width: Length,
@@ -279,6 +280,7 @@ impl Style {
         let mut style = Self {
             display: default_display(name),
             position: Position::Static,
+            z_index: None,
             inset: Edges::auto(),
             overflow: Overflow::Visible,
             width: Length::Auto,
@@ -965,6 +967,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 _ => Position::Static,
             };
         }
+        "z-index" => style.z_index = parse_z_index(value),
         "inset" => style.inset = parse_edges(value),
         "top" => style.inset.top = parse_length(value).unwrap_or(style.inset.top),
         "right" => style.inset.right = parse_length(value).unwrap_or(style.inset.right),
@@ -1134,6 +1137,14 @@ fn parse_line_height(value: &str) -> Option<Length> {
 
 fn parse_number(value: &str) -> Option<f32> {
     value.trim().parse().ok()
+}
+
+fn parse_z_index(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn parse_grid_template(value: &str) -> GridTemplate {
@@ -1309,7 +1320,7 @@ mod tests {
     #[test]
     fn parses_position_and_overflow_properties() {
         let stylesheet = Stylesheet::parse(
-            ".overlay { position: absolute; inset: 10px 20px auto 30px; overflow: clip; }",
+            ".overlay { position: absolute; z-index: -2; inset: 10px 20px auto 30px; overflow: clip; }",
         )
         .expect("stylesheet should parse");
         let mut element = Element::new("div");
@@ -1324,6 +1335,7 @@ mod tests {
             FontWeight::Normal,
         );
         assert_eq!(style.position, Position::Absolute);
+        assert_eq!(style.z_index, Some(-2));
         assert_eq!(style.inset.top, Length::Px(10.0));
         assert_eq!(style.inset.right, Length::Px(20.0));
         assert_eq!(style.inset.bottom, Length::Auto);
