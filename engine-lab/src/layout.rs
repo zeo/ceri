@@ -375,6 +375,67 @@ pub(crate) struct ScrollTarget {
     pub(crate) offset: (f32, f32),
 }
 
+pub(crate) const SCROLLBAR_THICKNESS: f32 = 12.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScrollbarMetrics {
+    pub(crate) scrollport: Rect,
+    pub(crate) vertical_track: Option<Rect>,
+    pub(crate) horizontal_track: Option<Rect>,
+}
+
+pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
+    let rect = layout.rect;
+    let scroll_container = layout.path.is_empty() || layout.overflow == Overflow::Auto;
+    if !scroll_container {
+        return ScrollbarMetrics {
+            scrollport: rect,
+            vertical_track: None,
+            horizontal_track: None,
+        };
+    }
+    let mut vertical = layout.scroll_content.height > rect.height;
+    let mut horizontal = layout.scroll_content.width
+        > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+    vertical = layout.scroll_content.height
+        > (rect.height - if horizontal { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+    horizontal = layout.scroll_content.width
+        > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+    let vertical_width = if vertical {
+        SCROLLBAR_THICKNESS.min(rect.width)
+    } else {
+        0.0
+    };
+    let horizontal_height = if horizontal {
+        SCROLLBAR_THICKNESS.min(rect.height)
+    } else {
+        0.0
+    };
+    let scrollport = Rect {
+        x: rect.x,
+        y: rect.y,
+        width: (rect.width - vertical_width).max(0.0),
+        height: (rect.height - horizontal_height).max(0.0),
+    };
+    let vertical_track = vertical.then_some(Rect {
+        x: scrollport.x + scrollport.width,
+        y: scrollport.y,
+        width: vertical_width,
+        height: scrollport.height,
+    });
+    let horizontal_track = horizontal.then_some(Rect {
+        x: scrollport.x,
+        y: scrollport.y + scrollport.height,
+        width: scrollport.width,
+        height: horizontal_height,
+    });
+    ScrollbarMetrics {
+        scrollport,
+        vertical_track,
+        horizontal_track,
+    }
+}
+
 fn viewport_block(viewport: Size) -> ContainingBlock {
     ContainingBlock {
         x: 0.0,
@@ -501,8 +562,10 @@ fn hit_test_box(
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
-    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) {
-        intersect_rect(clip, rect)
+    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto)
+        || layout.path.is_empty()
+    {
+        intersect_rect(clip, translate_rect(scrollbar_metrics(layout).scrollport, visual_offset))
     } else {
         clip
     };
@@ -542,11 +605,14 @@ pub(crate) fn visual_offset_for(
 
 pub(crate) fn visual_rect_for(layout: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
     let offset = visual_offset_for(layout, ancestor_offset);
+    translate_rect(layout.rect, offset)
+}
+
+pub(crate) fn translate_rect(rect: Rect, offset: (f32, f32)) -> Rect {
     Rect {
-        x: layout.rect.x + offset.0,
-        y: layout.rect.y + offset.1,
-        width: layout.rect.width,
-        height: layout.rect.height,
+        x: rect.x + offset.0,
+        y: rect.y + offset.1,
+        ..rect
     }
 }
 
@@ -565,8 +631,10 @@ fn scroll_target_box(
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
-    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) {
-        intersect_rect(clip, rect)
+    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto)
+        || layout.path.is_empty()
+    {
+        intersect_rect(clip, translate_rect(scrollbar_metrics(layout).scrollport, visual_offset))
     } else {
         clip
     };
@@ -582,8 +650,9 @@ fn scroll_target_box(
         }
     }
     if inside_layout && (layout.overflow == Overflow::Auto || layout.path.is_empty()) {
-        let max_x = (layout.scroll_content.width - layout.rect.width).max(0.0);
-        let max_y = (layout.scroll_content.height - layout.rect.height).max(0.0);
+        let scrollport = scrollbar_metrics(layout).scrollport;
+        let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
+        let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
         if max_x > 0.0 || max_y > 0.0 {
             return Some(ScrollTarget {
                 path: layout.path.clone(),
@@ -1594,8 +1663,9 @@ fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
     if layout.overflow != Overflow::Auto && !is_document {
         return;
     }
-    let max_x = (layout.scroll_content.width - layout.rect.width).max(0.0);
-    let max_y = (layout.scroll_content.height - layout.rect.height).max(0.0);
+    let scrollport = scrollbar_metrics(layout).scrollport;
+    let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
+    let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
     let requested = style_state
         .scroll_offsets
         .get(&layout.path)
@@ -2159,21 +2229,68 @@ mod tests {
         assert_eq!(viewport.scroll_offset, (20.0, 30.0));
         assert_eq!(content.rect.x, -20.0);
         assert_eq!(content.rect.y, -30.0);
-        assert_eq!(result.hit_test(10.0, 10.0), Some(vec![1, 0]));
-        assert_eq!(result.hit_test(50.0, 10.0), None);
+        assert_eq!(result.hit_test(10.0, 4.0), Some(vec![1, 0]));
+        assert_eq!(result.hit_test(50.0, 4.0), None);
+        assert_eq!(result.hit_test(10.0, 15.0), Some(vec![1]));
         let target = result
             .scroll_target_at(10.0, 10.0)
             .expect("point should resolve to the scroll container");
         assert_eq!(target.path, vec![1]);
-        assert_eq!(target.max_x, 40.0);
-        assert_eq!(target.max_y, 40.0);
+        assert_eq!(target.max_x, 52.0);
+        assert_eq!(target.max_y, 52.0);
         let canvas = result.paint();
-        let inside = ((10 * canvas.width() + 10) * 4) as usize;
-        let outside = ((10 * canvas.width() + 50) * 4) as usize;
+        let inside = ((4 * canvas.width() + 10) * 4) as usize;
+        let outside = ((4 * canvas.width() + 50) * 4) as usize;
         assert_eq!(&canvas.rgba_pixels()[inside..inside + 4], [255, 0, 0, 255]);
         assert_ne!(
             &canvas.rgba_pixels()[outside..outside + 4],
             [255, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn scrollbars_reserve_the_scrollport_and_paint_overflow_tracks() {
+        let document = Document::parse(
+            "<style>#viewport { width: 40px; height: 40px; overflow: auto; margin: 0; } #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='content'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        let viewport = &result.root.children[0];
+        let metrics = scrollbar_metrics(viewport);
+        assert_eq!(metrics.scrollport.width, 28.0);
+        assert_eq!(metrics.scrollport.height, 28.0);
+        assert_eq!(metrics.vertical_track.unwrap().width, SCROLLBAR_THICKNESS);
+        assert_eq!(metrics.horizontal_track.unwrap().height, SCROLLBAR_THICKNESS);
+        let canvas = result.paint();
+        let content = ((4 * canvas.width() + 10) * 4) as usize;
+        let vertical_thumb = ((4 * canvas.width() + 35) * 4) as usize;
+        let horizontal_thumb = ((34 * canvas.width() + 4) * 4) as usize;
+        let vertical_track = ((20 * canvas.width() + 35) * 4) as usize;
+        let horizontal_track = ((34 * canvas.width() + 20) * 4) as usize;
+        assert_eq!(&canvas.rgba_pixels()[content..content + 4], [255, 0, 0, 255]);
+        assert_eq!(
+            &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
+            [126, 138, 150, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[horizontal_thumb..horizontal_thumb + 4],
+            [126, 138, 150, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[vertical_track..vertical_track + 4],
+            [232, 236, 240, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[horizontal_track..horizontal_track + 4],
+            [232, 236, 240, 255]
         );
     }
 
@@ -2224,11 +2341,14 @@ mod tests {
         assert_eq!(result.root.children[0].rect.y, -30.0);
         assert_eq!(result.root.children[1].rect.x, 70.0);
         assert_eq!(result.root.children[1].rect.y, 12.0);
+        let metrics = scrollbar_metrics(&result.root);
+        assert_eq!(metrics.scrollport.height, 88.0);
+        assert_eq!(metrics.vertical_track.unwrap().width, SCROLLBAR_THICKNESS);
         let target = result
             .scroll_target_at(10.0, 10.0)
             .expect("viewport should expose the document scroll target");
         assert_eq!(target.path, Vec::<usize>::new());
-        assert_eq!(target.max_y, 60.0);
+        assert_eq!(target.max_y, 72.0);
     }
 
     #[test]

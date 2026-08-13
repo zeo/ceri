@@ -2,8 +2,8 @@ use crate::css::{Color, Overflow};
 use crate::dom::NodePath;
 use crate::image::Image;
 use crate::layout::{
-    ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun, paint_order, visual_offset_for,
-    visual_rect_for,
+    ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun, paint_order, scrollbar_metrics,
+    translate_rect, visual_offset_for, visual_rect_for,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -288,8 +288,13 @@ fn paint_box(
         layout_box.background,
         clip,
     );
-    let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto) {
-        intersect_clip(clip, rect)
+    let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
+        || layout_box.path.is_empty()
+    {
+        intersect_clip(
+            clip,
+            translate_rect(scrollbar_metrics(layout_box).scrollport, offset),
+        )
     } else {
         clip
     };
@@ -364,6 +369,120 @@ fn paint_box(
     if layout_box.tag == "canvas" {
         for command in commands {
             paint_canvas_command(canvas, layout_box, command, content_clip, rect);
+        }
+    }
+    paint_scrollbars(canvas, layout_box, offset, clip);
+}
+
+fn paint_scrollbars(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    offset: (f32, f32),
+    clip: Option<Rect>,
+) {
+    let metrics = scrollbar_metrics(layout_box);
+    let track_color = Color::opaque(232, 236, 240);
+    let thumb_color = Color::opaque(126, 138, 150);
+    if let Some(track) = metrics.vertical_track {
+        let track = translate_rect(track, offset);
+        fill_rect_optional(
+            canvas,
+            track.x,
+            track.y,
+            track.width,
+            track.height,
+            track_color,
+            clip,
+        );
+        let thumb = scrollbar_thumb(
+            track,
+            metrics.scrollport.height,
+            layout_box.scroll_content.height,
+            layout_box.scroll_offset.1,
+            (layout_box.scroll_content.height - metrics.scrollport.height).max(0.0),
+            true,
+        );
+        fill_rect_optional(canvas, thumb.x, thumb.y, thumb.width, thumb.height, thumb_color, clip);
+    }
+    if let Some(track) = metrics.horizontal_track {
+        let track = translate_rect(track, offset);
+        fill_rect_optional(
+            canvas,
+            track.x,
+            track.y,
+            track.width,
+            track.height,
+            track_color,
+            clip,
+        );
+        let thumb = scrollbar_thumb(
+            track,
+            metrics.scrollport.width,
+            layout_box.scroll_content.width,
+            layout_box.scroll_offset.0,
+            (layout_box.scroll_content.width - metrics.scrollport.width).max(0.0),
+            false,
+        );
+        fill_rect_optional(canvas, thumb.x, thumb.y, thumb.width, thumb.height, thumb_color, clip);
+    }
+    if let (Some(vertical), Some(horizontal)) = (metrics.vertical_track, metrics.horizontal_track) {
+        let corner = translate_rect(
+            Rect {
+                x: vertical.x,
+                y: horizontal.y,
+                width: vertical.width,
+                height: horizontal.height,
+            },
+            offset,
+        );
+        fill_rect_optional(
+            canvas,
+            corner.x,
+            corner.y,
+            corner.width,
+            corner.height,
+            track_color,
+            clip,
+        );
+    }
+}
+
+fn scrollbar_thumb(
+    track: Rect,
+    viewport_extent: f32,
+    content_extent: f32,
+    offset: f32,
+    max_offset: f32,
+    vertical: bool,
+) -> Rect {
+    let track_extent = if vertical { track.height } else { track.width };
+    let minimum = 8.0_f32.min(track_extent);
+    let thumb_extent = if content_extent > 0.0 {
+        (track_extent * (viewport_extent / content_extent).clamp(0.0, 1.0))
+            .max(minimum)
+            .min(track_extent)
+    } else {
+        track_extent
+    };
+    let travel = (track_extent - thumb_extent).max(0.0);
+    let progress = if max_offset > 0.0 {
+        (offset / max_offset).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if vertical {
+        Rect {
+            x: track.x,
+            y: track.y + travel * progress,
+            width: track.width,
+            height: thumb_extent,
+        }
+    } else {
+        Rect {
+            x: track.x + travel * progress,
+            y: track.y,
+            width: thumb_extent,
+            height: track.height,
         }
     }
 }

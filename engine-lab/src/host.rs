@@ -562,6 +562,66 @@ mod tests {
     }
 
     #[test]
+    fn host_keeps_scrollbar_gutter_out_of_content_hit_testing() {
+        let browser = Browser::new(bundle(
+            r#"<style>
+                #viewport { width: 40px; height: 40px; overflow: auto; margin: 0; }
+                #content { width: 80px; height: 60px; margin: 0; }
+            </style>
+            <div id="viewport"><div id="content">run</div></div>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("content").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "clicked";
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("scrollbar page should load");
+        host.render()
+            .expect("initial scrollbar frame should render")
+            .expect("initial scrollbar frame should be present");
+        let click = host
+            .input(InputEvent::Click { x: 35.0, y: 20.0 })
+            .expect("gutter click should be accepted");
+        assert!(!click.handled);
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("idle")
+        );
+        let scroll = host
+            .input(InputEvent::Scroll {
+                x: 35.0,
+                y: 20.0,
+                delta_x: 0.0,
+                delta_y: 10.0,
+            })
+            .expect("gutter wheel input should be accepted");
+        assert!(scroll.handled);
+        assert!(scroll.frame_requested);
+        let layout = host
+            .browser()
+            .layout(Size {
+                width: 80.0,
+                height: 80.0,
+            })
+            .expect("scrolled scrollbar page should layout");
+        assert_eq!(layout.root.children[0].scroll_offset, (0.0, 10.0));
+    }
+
+    #[test]
     fn host_routes_wheel_input_to_document_scrolling() {
         let browser = Browser::new(bundle(
             r#"<div id="content" style="width: 40px; height: 180px; margin: 0"></div>"#,

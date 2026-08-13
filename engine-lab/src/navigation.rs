@@ -3200,6 +3200,55 @@ mod tests {
     }
 
     #[test]
+    fn browser_paints_scrollbars_and_scrolls_from_the_reserved_gutter() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #viewport { width: 40px; height: 40px; overflow: auto; margin: 0; }
+                #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }
+            </style>
+            <div id="viewport"><div id="content"></div></div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("scrollbar page should load");
+        let viewport = Size {
+            width: 80.0,
+            height: 80.0,
+        };
+        let canvas = browser.paint(viewport).expect("scrollbar page should paint");
+        let content = ((4 * canvas.width() + 10) * 4) as usize;
+        let vertical_thumb = ((4 * canvas.width() + 35) * 4) as usize;
+        let horizontal_thumb = ((34 * canvas.width() + 4) * 4) as usize;
+        let vertical_track = ((20 * canvas.width() + 35) * 4) as usize;
+        let horizontal_track = ((34 * canvas.width() + 20) * 4) as usize;
+        assert_eq!(&canvas.rgba_pixels()[content..content + 4], [255, 0, 0, 255]);
+        assert_eq!(
+            &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
+            [126, 138, 150, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[horizontal_thumb..horizontal_thumb + 4],
+            [126, 138, 150, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[vertical_track..vertical_track + 4],
+            [232, 236, 240, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[horizontal_track..horizontal_track + 4],
+            [232, 236, 240, 255]
+        );
+        assert!(browser
+            .scroll_at(viewport, 35.0, 20.0, 0.0, 10.0)
+            .expect("wheel input over the scrollbar should scroll"));
+        let layout = browser
+            .layout(viewport)
+            .expect("scrolled scrollbar page should layout");
+        assert_eq!(layout.root.children[0].scroll_offset, (0.0, 10.0));
+        assert_eq!(layout.root.children[0].children[0].rect.y, -10.0);
+    }
+
+    #[test]
     fn browser_scrolls_the_document_and_preserves_fixed_viewport_chrome() {
         let mut browser = Browser::new(bundle(
             r##"<style>
@@ -3218,17 +3267,25 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 100.0,
+        };
+        let canvas = browser
+            .paint(viewport)
+            .expect("document scrollbar page should paint");
+        let vertical_track = ((80 * canvas.width() + 115) * 4) as usize;
+        let vertical_thumb = ((20 * canvas.width() + 115) * 4) as usize;
+        assert_eq!(
+            &canvas.rgba_pixels()[vertical_track..vertical_track + 4],
+            [232, 236, 240, 255]
+        );
+        assert_eq!(
+            &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
+            [126, 138, 150, 255]
+        );
         assert!(browser
-            .scroll_at(
-                Size {
-                    width: 120.0,
-                    height: 100.0,
-                },
-                10.0,
-                10.0,
-                0.0,
-                30.0,
-            )
+            .scroll_at(viewport, 10.0, 10.0, 0.0, 30.0)
             .expect("document wheel scroll should dispatch"));
         let document = browser.document().expect("document should exist");
         let status = document
@@ -3240,36 +3297,15 @@ mod tests {
             Some("window:30:30")
         );
         let layout = browser
-            .layout(Size {
-                width: 120.0,
-                height: 100.0,
-            })
+            .layout(viewport)
             .expect("scrolled document should layout");
         assert_eq!(layout.root.children[0].rect.y, -30.0);
         assert_eq!(layout.root.children[1].rect.y, 0.0);
         assert!(browser
-            .scroll_at(
-                Size {
-                    width: 120.0,
-                    height: 100.0,
-                },
-                10.0,
-                10.0,
-                0.0,
-                100.0,
-            )
+            .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
             .expect("document scroll should clamp to the page boundary"));
         assert!(!browser
-            .scroll_at(
-                Size {
-                    width: 120.0,
-                    height: 100.0,
-                },
-                10.0,
-                10.0,
-                0.0,
-                100.0,
-            )
+            .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
             .expect("document scroll at the boundary should be ignored"));
     }
 
