@@ -1,6 +1,6 @@
 use ceri_engine_lab::{
     APP_ORIGIN, Browser, EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent,
-    PointerButton, ResourceBundle, Size,
+    KeyModifiers, PointerButton, ResourceBundle, Size,
 };
 #[cfg(feature = "native-http")]
 use ceri_engine_lab::NativeHttpProvider;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
-use winit::keyboard::Key;
+use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowId};
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
@@ -23,6 +23,7 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<WindowSurface>,
     cursor: (f32, f32),
+    modifiers: ModifiersState,
     last_tick: Instant,
 }
 
@@ -49,6 +50,7 @@ impl App {
             window: None,
             surface: None,
             cursor: (0.0, 0.0),
+            modifiers: ModifiersState::empty(),
             last_tick: Instant::now(),
         }
     }
@@ -378,6 +380,9 @@ impl ApplicationHandler for App {
                     self.submit(event_loop, InputEvent::Click { x, y });
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed =>
             {
@@ -386,7 +391,18 @@ impl ApplicationHandler for App {
                     Key::Named(named) => format!("{named:?}"),
                     other => format!("{other:?}"),
                 };
-                self.submit(event_loop, InputEvent::KeyDown { key });
+                self.submit(
+                    event_loop,
+                    InputEvent::KeyDownWithModifiers {
+                        key,
+                        modifiers: KeyModifiers {
+                            shift: self.modifiers.shift_key(),
+                            control: self.modifiers.control_key(),
+                            alt: self.modifiers.alt_key(),
+                            meta: self.modifiers.super_key(),
+                        },
+                    },
+                );
             }
             WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
                 self.submit(

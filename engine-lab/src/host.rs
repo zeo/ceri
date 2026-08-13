@@ -1,7 +1,8 @@
+use crate::AccessibilityNode;
 use crate::layout::Size;
 use crate::navigation::{Browser, NavigationError, NavigationFailure, NavigationStatus};
 use crate::paint::Canvas;
-use crate::AccessibilityNode;
+pub use crate::script::KeyModifiers;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
 
@@ -41,6 +42,10 @@ pub enum InputEvent {
     },
     KeyDown {
         key: String,
+    },
+    KeyDownWithModifiers {
+        key: String,
+        modifiers: KeyModifiers,
     },
     TextInput {
         text: String,
@@ -361,6 +366,10 @@ impl EngineHost {
             }
             InputEvent::KeyDown { key } => InputResult {
                 handled: self.browser.key_down(&key)?,
+                ..InputResult::default()
+            },
+            InputEvent::KeyDownWithModifiers { key, modifiers } => InputResult {
+                handled: self.browser.key_down_with_modifiers(&key, modifiers)?,
                 ..InputResult::default()
             },
             InputEvent::TextInput { text } => InputResult {
@@ -982,6 +991,55 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("Rus")
+        );
+    }
+
+    #[test]
+    fn host_routes_modifier_key_selection_to_the_focused_control() {
+        let browser = Browser::new(bundle(
+            r#"<input id="name" value="abcd" style="display: block; width: 180px; height: 32px"><p id="status">idle</p><script>
+                const input = document.getElementById("name");
+                const status = document.getElementById("status");
+                let flags = "";
+                input.addEventListener("keydown", (event) => {
+                    flags = event.shiftKey + ":" + event.ctrlKey + ":" + event.altKey + ":" + event.metaKey;
+                });
+                input.addEventListener("select", () => {
+                    status.textContent = input.selectionStart + "|" + input.selectionEnd + "|" + input.selectionDirection + "|" + flags;
+                });
+                input.focus();
+                input.setSelectionRange(3, 3);
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = host.browser().document().expect("document should exist");
+        assert!(host
+            .input(InputEvent::KeyDownWithModifiers {
+                key: "ArrowLeft".to_string(),
+                modifiers: KeyModifiers {
+                    shift: true,
+                    control: true,
+                    alt: false,
+                    meta: true,
+                },
+            })
+            .expect("shift arrow should be handled")
+            .handled);
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("2|3|backward|true:true:false:true")
         );
     }
 

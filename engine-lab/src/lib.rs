@@ -16,7 +16,8 @@ pub use dom::{
     StylesheetSource,
 };
 pub use host::{
-    EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, PointerButton,
+    EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, KeyModifiers,
+    PointerButton,
 };
 pub use layout::{LayoutDocument, Rect, Size, layout};
 pub use navigation::{

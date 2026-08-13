@@ -6,8 +6,8 @@ use crate::layout::{
 };
 use crate::paint::Canvas;
 use crate::script::{
-    HostRuntimeInfo, ModuleSourceLoader, NavigationRequest, ScriptRuntime, StorageHandle,
-    runtime_error,
+    HostRuntimeInfo, KeyModifiers, ModuleSourceLoader, NavigationRequest, ScriptRuntime,
+    StorageHandle, runtime_error,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -1155,10 +1155,18 @@ impl Browser {
     }
 
     pub fn key_down(&mut self, key: &str) -> Result<bool, NavigationError> {
+        self.key_down_with_modifiers(key, KeyModifiers::default())
+    }
+
+    pub fn key_down_with_modifiers(
+        &mut self,
+        key: &str,
+        modifiers: KeyModifiers,
+    ) -> Result<bool, NavigationError> {
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             page.runtime
-                .key_down(key)
+                .key_down_with_modifiers(key, modifiers)
                 .map_err(|error| NavigationError::Script(error.to_string()))?
         };
         if self.process_pending_navigation()?.is_some() {

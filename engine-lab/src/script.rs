@@ -763,9 +763,18 @@ struct EventData {
     history_state: Rc<RefCell<Value>>,
     key: String,
     data: String,
+    modifiers: KeyModifiers,
     is_composing: bool,
     data_value: Option<Box<Value>>,
     error_message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyModifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub meta: bool,
 }
 
 #[derive(Default)]
@@ -1803,11 +1812,21 @@ impl ScriptRuntime {
         Ok(update.handled || input || end_event.handled || start != end)
     }
 
-    pub(crate) fn key_down(&mut self, key: &str) -> Result<bool, ScriptError> {
+    pub(crate) fn key_down_with_modifiers(
+        &mut self,
+        key: &str,
+        modifiers: KeyModifiers,
+    ) -> Result<bool, ScriptError> {
         let Some(path) = self.focused_element.clone() else {
             return Ok(false);
         };
-        let dispatch = self.dispatch_event_with_details(path.clone(), "keydown", key, "")?;
+        let dispatch = self.dispatch_event_with_modifiers(
+            path.clone(),
+            "keydown",
+            key,
+            "",
+            modifiers,
+        )?;
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
@@ -1818,6 +1837,30 @@ impl ScriptRuntime {
         let value = self.control_value_path(&path).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
         let selection = self.selection_for_path(&path, &value);
+        if modifiers.shift {
+            let (anchor, focus) = selection_anchor_focus(selection);
+            let next_focus = match key {
+                "ArrowLeft" if focus > 0 => previous_utf16_boundary(&units, focus),
+                "ArrowRight" if focus < units.len() => next_utf16_boundary(&units, focus),
+                "Home" => 0,
+                "End" => units.len(),
+                _ => return Ok(dispatch.handled),
+            };
+            let direction = if next_focus < anchor {
+                SelectionDirection::Backward
+            } else if next_focus > anchor {
+                SelectionDirection::Forward
+            } else {
+                SelectionDirection::None
+            };
+            self.set_text_selection(
+                path,
+                anchor.min(next_focus),
+                anchor.max(next_focus),
+                direction,
+            )?;
+            return Ok(true);
+        }
         let (start, end) = match key {
             "Backspace" if selection.start != selection.end => (selection.start, selection.end),
             "Backspace" if selection.start > 0 => (
@@ -2152,6 +2195,7 @@ impl ScriptRuntime {
             history_state: Rc::new(RefCell::new(Value::Null)),
             key: String::new(),
             data: String::new(),
+            modifiers: KeyModifiers::default(),
             is_composing: false,
             data_value: None,
             error_message: None,
@@ -2197,6 +2241,7 @@ impl ScriptRuntime {
             history_state: Rc::new(RefCell::new(state)),
             key: String::new(),
             data: String::new(),
+            modifiers: KeyModifiers::default(),
             is_composing: false,
             data_value: None,
             error_message: None,
@@ -2936,6 +2981,10 @@ impl ScriptRuntime {
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
                 "key" => Ok(Value::String(event.key.clone())),
+                "shiftKey" => Ok(Value::Bool(event.modifiers.shift)),
+                "ctrlKey" => Ok(Value::Bool(event.modifiers.control)),
+                "altKey" => Ok(Value::Bool(event.modifiers.alt)),
+                "metaKey" => Ok(Value::Bool(event.modifiers.meta)),
                 "isComposing" => Ok(Value::Bool(event.is_composing)),
                 "data" => Ok(event
                     .data_value
@@ -3694,6 +3743,7 @@ impl ScriptRuntime {
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
                             data: String::new(),
+                            modifiers: KeyModifiers::default(),
                             is_composing: false,
                             data_value: Some(Box::new(data)),
                             error_message: None,
@@ -3791,6 +3841,7 @@ impl ScriptRuntime {
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
                             data: String::new(),
+                            modifiers: KeyModifiers::default(),
                             is_composing: false,
                             data_value: Some(Box::new(data)),
                             error_message: None,
@@ -3822,6 +3873,7 @@ impl ScriptRuntime {
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
                             data: String::new(),
+                            modifiers: KeyModifiers::default(),
                             is_composing: false,
                             data_value: None,
                             error_message: Some(message),
@@ -6790,6 +6842,17 @@ impl ScriptRuntime {
         key: &str,
         data: &str,
     ) -> Result<EventDispatch, ScriptError> {
+        self.dispatch_event_with_modifiers(path, event, key, data, KeyModifiers::default())
+    }
+
+    fn dispatch_event_with_modifiers(
+        &mut self,
+        path: NodePath,
+        event: &str,
+        key: &str,
+        data: &str,
+        modifiers: KeyModifiers,
+    ) -> Result<EventDispatch, ScriptError> {
         let target = path.clone();
         let mut current = path;
         let mut had_callbacks = false;
@@ -6812,6 +6875,7 @@ impl ScriptRuntime {
                 history_state: Rc::new(RefCell::new(Value::Null)),
                 key: key.to_string(),
                 data: data.to_string(),
+                modifiers,
                 is_composing: self.composition.is_some(),
                 data_value: None,
                 error_message: None,
@@ -7929,6 +7993,15 @@ fn selection_direction_name(direction: SelectionDirection) -> &'static str {
         SelectionDirection::None => "none",
         SelectionDirection::Forward => "forward",
         SelectionDirection::Backward => "backward",
+    }
+}
+
+fn selection_anchor_focus(selection: TextSelection) -> (usize, usize) {
+    match selection.direction {
+        SelectionDirection::Backward => (selection.end, selection.start),
+        SelectionDirection::Forward | SelectionDirection::None => {
+            (selection.start, selection.end)
+        }
     }
 }
 
@@ -11334,7 +11407,7 @@ mod tests {
             .expect("input should focus"));
         assert!(runtime.insert_text("ust").expect("text should insert"));
         assert!(runtime
-            .key_down("Backspace")
+            .key_down_with_modifiers("Backspace", KeyModifiers::default())
             .expect("backspace should edit the value"));
         assert!(runtime.blur_focused().expect("input should blur"));
         let status = document
@@ -11390,9 +11463,18 @@ mod tests {
             .execute("document.getElementById(\"name\").setSelectionRange(1, 2);")
             .expect("selection should update");
         assert!(runtime.insert_text("X").expect("selection should be replaced"));
-        assert_eq!(runtime.key_down("ArrowLeft"), Ok(true));
-        assert_eq!(runtime.key_down("Delete"), Ok(true));
-        assert_eq!(runtime.key_down("Home"), Ok(true));
+        assert_eq!(
+            runtime.key_down_with_modifiers("ArrowLeft", KeyModifiers::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime.key_down_with_modifiers("Delete", KeyModifiers::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime.key_down_with_modifiers("Home", KeyModifiers::default()),
+            Ok(true)
+        );
         assert!(runtime.insert_text("!").expect("text should insert at home"));
         assert_eq!(runtime.execute("document.getElementById(\"status\").textContent = document.getElementById(\"name\").value;"), Ok(()));
         status = document
@@ -11402,6 +11484,69 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("!ho")
+        );
+    }
+
+    #[test]
+    fn text_control_shift_navigation_extends_utf16_selection_and_exposes_modifiers() {
+        let document = document(r#"<input id="name" value="A😀B"><p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const input = document.getElementById("name");
+                const status = document.getElementById("status");
+                let flags = "";
+                input.addEventListener("keydown", (event) => {
+                    flags = event.shiftKey + ":" + event.ctrlKey + ":" + event.altKey + ":" + event.metaKey;
+                });
+                input.focus();
+                input.setSelectionRange(3, 3);
+                "#,
+            )
+            .expect("modifier listener should register");
+        assert!(runtime
+            .key_down_with_modifiers(
+                "ArrowLeft",
+                KeyModifiers {
+                    shift: true,
+                    control: true,
+                    alt: false,
+                    meta: true,
+                },
+            )
+            .expect("shift arrow should extend selection"));
+        runtime
+            .execute(
+                "status.textContent = input.selectionStart + \"|\" + input.selectionEnd + \"|\" + input.selectionDirection + \"|\" + flags;",
+            )
+            .expect("selection should be readable");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|3|backward|true:true:false:true")
+        );
+        assert!(runtime
+            .key_down_with_modifiers(
+                "ArrowRight",
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .expect("shift arrow should contract selection"));
+        assert_eq!(
+            runtime.execute(
+                "status.textContent = input.selectionStart + \"|\" + input.selectionEnd + \"|\" + input.selectionDirection;",
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("3|3|none")
         );
     }
 
