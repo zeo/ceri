@@ -6,7 +6,7 @@ The current slice implements:
 
 - HTML tokenization and a small DOM tree
 - HTML entity decoding for common named and numeric entities
-- CSS rules with compound tag, class, id, and attribute selectors, descendant matching, and direct-child matching
+- CSS rules with compound tag, class, id, and attribute selectors, top-level selector lists, bounded `:not(...)`, descendant matching, and direct-child matching
 - a deterministic cascade with selector specificity
 - inherited CSS custom properties with `:root` matching, bounded `var()` substitution, fallbacks, cycle rejection, and `calc()` lengths
 - document and subtree `querySelector` and `querySelectorAll` lookups using the same selector matcher

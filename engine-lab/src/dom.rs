@@ -244,11 +244,11 @@ impl Document {
         parent: &[usize],
         selector: &str,
     ) -> Option<NodePath> {
-        let selector = crate::css::Selector::parse(selector).ok()?;
+        let selectors = crate::css::Selector::parse_list(selector).ok()?;
         let parent_element = self.element_at(parent)?;
         let mut ancestors = self.ancestors_for_path(parent)?;
         let mut path = parent.to_vec();
-        find_element_by_selector(parent_element, &selector, &mut ancestors, &mut path)
+        find_element_by_selector(parent_element, &selectors, &mut ancestors, &mut path)
     }
 
     pub fn find_elements_by_selector_within(
@@ -256,14 +256,14 @@ impl Document {
         parent: &[usize],
         selector: &str,
     ) -> Option<Vec<NodePath>> {
-        let selector = crate::css::Selector::parse(selector).ok()?;
+        let selectors = crate::css::Selector::parse_list(selector).ok()?;
         let parent_element = self.element_at(parent)?;
         let mut ancestors = self.ancestors_for_path(parent)?;
         let mut path = parent.to_vec();
         let mut matches = Vec::new();
         collect_elements_by_selector(
             parent_element,
-            &selector,
+            &selectors,
             &mut ancestors,
             &mut path,
             &mut matches,
@@ -835,7 +835,7 @@ fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mu
 
 fn find_element_by_selector<'a>(
     element: &'a Element,
-    selector: &crate::css::Selector,
+    selectors: &[crate::css::Selector],
     ancestors: &mut Vec<&'a Element>,
     path: &mut NodePath,
 ) -> Option<NodePath> {
@@ -844,11 +844,13 @@ fn find_element_by_selector<'a>(
             continue;
         };
         path.push(index);
-        if selector.matches(child, path, ancestors, &crate::css::StyleState::default()) {
+        if selectors.iter().any(|selector| {
+            selector.matches(child, path, ancestors, &crate::css::StyleState::default())
+        }) {
             return Some(path.clone());
         }
         ancestors.push(child);
-        if let Some(found) = find_element_by_selector(child, selector, ancestors, path) {
+        if let Some(found) = find_element_by_selector(child, selectors, ancestors, path) {
             return Some(found);
         }
         ancestors.pop();
@@ -859,7 +861,7 @@ fn find_element_by_selector<'a>(
 
 fn collect_elements_by_selector<'a>(
     element: &'a Element,
-    selector: &crate::css::Selector,
+    selectors: &[crate::css::Selector],
     ancestors: &mut Vec<&'a Element>,
     path: &mut NodePath,
     matches: &mut Vec<NodePath>,
@@ -869,11 +871,13 @@ fn collect_elements_by_selector<'a>(
             continue;
         };
         path.push(index);
-        if selector.matches(child, path, ancestors, &crate::css::StyleState::default()) {
+        if selectors.iter().any(|selector| {
+            selector.matches(child, path, ancestors, &crate::css::StyleState::default())
+        }) {
             matches.push(path.clone());
         }
         ancestors.push(child);
-        collect_elements_by_selector(child, selector, ancestors, path, matches);
+        collect_elements_by_selector(child, selectors, ancestors, path, matches);
         ancestors.pop();
         path.pop();
     }
@@ -1452,6 +1456,26 @@ mod tests {
                 .find_element_by_selector_within(&shell, ".card")
                 .and_then(|path| document.element_text_content(&path)),
             Some("nested".to_string())
+        );
+    }
+
+    #[test]
+    fn queries_selector_lists_and_not_pseudo_classes() {
+        let document = Document::parse(
+            "<main><p class='muted'>skip</p><p class='card'>first</p><section data-label='a,b'>second</section></main>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            document.find_element_by_selector(".muted, .card:not(.muted)"),
+            Some(vec![0, 0])
+        );
+        assert_eq!(
+            document.find_element_by_selector(".card:not(.muted)"),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            document.find_elements_by_selector("[data-label='a,b'], .card:not(.muted)"),
+            Some(vec![vec![0, 1], vec![0, 2]])
         );
     }
 }

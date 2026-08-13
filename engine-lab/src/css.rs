@@ -631,7 +631,7 @@ enum AttributeSelector {
     Equals(String, String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum PseudoClass {
     Root,
     Hover,
@@ -639,6 +639,7 @@ enum PseudoClass {
     Checked,
     Disabled,
     Enabled,
+    Not(Vec<Selector>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -689,6 +690,13 @@ impl Selector {
         Ok(Self { parts })
     }
 
+    pub(crate) fn parse_list(source: &str) -> Result<Vec<Self>, String> {
+        split_selector_list(source)?
+            .into_iter()
+            .map(Self::parse)
+            .collect()
+    }
+
     pub(crate) fn matches(
         &self,
         element: &Element,
@@ -718,7 +726,7 @@ impl Selector {
         ancestors: &[&Element],
         state: &StyleState,
     ) -> bool {
-        if !compound.matches(element, path, state) {
+        if !compound.matches(element, path, ancestors, state) {
             return false;
         }
         if index == 0 {
@@ -770,7 +778,13 @@ impl Selector {
 }
 
 impl CompoundSelector {
-    fn matches(&self, element: &Element, path: &[usize], state: &StyleState) -> bool {
+    fn matches(
+        &self,
+        element: &Element,
+        path: &[usize],
+        ancestors: &[&Element],
+        state: &StyleState,
+    ) -> bool {
         self.tag.as_deref().is_none_or(|tag| tag == element.name)
             && self
                 .id
@@ -784,20 +798,37 @@ impl CompoundSelector {
             && self
                 .pseudo_classes
                 .iter()
-                .all(|pseudo| pseudo.matches(element, path, state))
+                .all(|pseudo| pseudo.matches(element, path, ancestors, state))
     }
 
     fn specificity(&self) -> Specificity {
+        let pseudo_specificity =
+            self.pseudo_classes
+                .iter()
+                .fold(Specificity(0, 0, 0), |specificity, pseudo| {
+                    let pseudo_specificity = pseudo.specificity();
+                    Specificity(
+                        specificity.0 + pseudo_specificity.0,
+                        specificity.1 + pseudo_specificity.1,
+                        specificity.2 + pseudo_specificity.2,
+                    )
+                });
         Specificity(
-            u32::from(self.id.is_some()),
-            (self.classes.len() + self.attributes.len() + self.pseudo_classes.len()) as u32,
-            u32::from(self.tag.is_some()),
+            u32::from(self.id.is_some()) + pseudo_specificity.0,
+            (self.classes.len() + self.attributes.len()) as u32 + pseudo_specificity.1,
+            u32::from(self.tag.is_some()) + pseudo_specificity.2,
         )
     }
 }
 
 impl PseudoClass {
-    fn matches(self, element: &Element, path: &[usize], state: &StyleState) -> bool {
+    fn matches(
+        &self,
+        element: &Element,
+        path: &[usize],
+        ancestors: &[&Element],
+        state: &StyleState,
+    ) -> bool {
         match self {
             Self::Root => state.root_path.as_deref() == Some(path),
             Self::Hover => state.is_hovered(path),
@@ -812,6 +843,20 @@ impl PseudoClass {
             }
             Self::Disabled => element.attrs.contains_key("disabled"),
             Self::Enabled => !element.attrs.contains_key("disabled"),
+            Self::Not(selectors) => !selectors
+                .iter()
+                .any(|selector| selector.matches(element, path, ancestors, state)),
+        }
+    }
+
+    fn specificity(&self) -> Specificity {
+        match self {
+            Self::Not(selectors) => selectors
+                .iter()
+                .map(Selector::specificity)
+                .max()
+                .unwrap_or(Specificity(0, 0, 0)),
+            _ => Specificity(0, 1, 0),
         }
     }
 }
@@ -846,14 +891,19 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
             b':' => {
                 *cursor += 1;
                 let name = parse_selector_name(source, cursor)?;
-                let pseudo = match name.as_str() {
-                    "root" => PseudoClass::Root,
-                    "hover" => PseudoClass::Hover,
-                    "focus" => PseudoClass::Focus,
-                    "checked" => PseudoClass::Checked,
-                    "disabled" => PseudoClass::Disabled,
-                    "enabled" => PseudoClass::Enabled,
-                    _ => return Err(format!("unsupported pseudo-class: :{name}")),
+                let pseudo = if name == "not" {
+                    let argument = parse_function_argument(source, cursor)?;
+                    PseudoClass::Not(Selector::parse_list(&argument)?)
+                } else {
+                    match name.as_str() {
+                        "root" => PseudoClass::Root,
+                        "hover" => PseudoClass::Hover,
+                        "focus" => PseudoClass::Focus,
+                        "checked" => PseudoClass::Checked,
+                        "disabled" => PseudoClass::Disabled,
+                        "enabled" => PseudoClass::Enabled,
+                        _ => return Err(format!("unsupported pseudo-class: :{name}")),
+                    }
                 };
                 selector.pseudo_classes.push(pseudo);
             }
@@ -979,10 +1029,7 @@ fn parse_rules(
         } else if header.starts_with('@') {
             return Err(format!("unsupported at-rule: {header}"));
         } else {
-            let selectors = header
-                .split(',')
-                .map(Selector::parse)
-                .collect::<Result<Vec<_>, _>>()?;
+            let selectors = Selector::parse_list(header)?;
             let declarations = parse_declarations(body)?;
             rules.push(Rule {
                 selectors,
@@ -1262,6 +1309,86 @@ fn parse_length(value: &str) -> Option<Length> {
         return value.parse().ok().map(Length::Percent);
     }
     (value == "0").then_some(Length::Px(0.0))
+}
+
+fn parse_function_argument(source: &str, cursor: &mut usize) -> Result<String, String> {
+    if *cursor >= source.len() || source.as_bytes()[*cursor] != b'(' {
+        return Err(format!("functional pseudo-class has no argument: {source}"));
+    }
+    let open = *cursor;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = open;
+    while index < source.len() {
+        let byte = source.as_bytes()[index];
+        if let Some(expected) = quote {
+            if byte == expected {
+                quote = None;
+            } else if byte == b'\\' {
+                index += 1;
+            }
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                *cursor = index + 1;
+                return Ok(source[open + 1..index].to_string());
+            }
+        }
+        index += 1;
+    }
+    Err(format!("unterminated functional pseudo-class: {source}"))
+}
+
+fn split_selector_list(source: &str) -> Result<Vec<&str>, String> {
+    let mut selectors = Vec::new();
+    let mut start = 0;
+    let mut bracket_depth = 0usize;
+    let mut parenthesis_depth = 0usize;
+    let mut quote = None;
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(expected) = quote {
+            if byte == expected {
+                quote = None;
+            } else if byte == b'\\' {
+                index += 1;
+            }
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else {
+            match byte {
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                b'(' => parenthesis_depth += 1,
+                b')' => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+                b',' if bracket_depth == 0 && parenthesis_depth == 0 => {
+                    let selector = source[start..index].trim();
+                    if selector.is_empty() {
+                        return Err(format!("selector list has an empty entry: {source}"));
+                    }
+                    selectors.push(selector);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() || bracket_depth != 0 || parenthesis_depth != 0 {
+        return Err(format!("unterminated selector list: {source}"));
+    }
+    let selector = source[start..].trim();
+    if selector.is_empty() {
+        return Err(format!("selector list has an empty entry: {source}"));
+    }
+    selectors.push(selector);
+    Ok(selectors)
 }
 
 fn parse_calc_length(value: &str) -> Option<CalcLength> {
@@ -1803,6 +1930,54 @@ mod tests {
         );
         assert_eq!(card_style.color, Color::opaque(255, 0, 0));
         assert_eq!(direct_style.color, Color::opaque(0, 0, 255));
+    }
+
+    #[test]
+    fn matches_selector_lists_and_not_with_argument_specificity() {
+        let stylesheet = Stylesheet::parse(
+            ".card, .panel { color: red; } .card:not(.muted) { color: blue; } .panel:not(.active, [aria-hidden='true']) { background: green; }",
+        )
+        .expect("selector list should parse");
+        let mut card = Element::new("div");
+        card.attrs.insert("class".to_string(), "card".to_string());
+        let card_style = stylesheet.style_for_inherited_with_ancestors(
+            &card,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(card_style.color, Color::opaque(0, 0, 255));
+
+        let mut muted = Element::new("div");
+        muted
+            .attrs
+            .insert("class".to_string(), "card muted".to_string());
+        let muted_style = stylesheet.style_for_inherited_with_ancestors(
+            &muted,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(muted_style.color, Color::opaque(255, 0, 0));
+
+        let mut panel = Element::new("section");
+        panel.attrs.insert("class".to_string(), "panel".to_string());
+        let panel_style = stylesheet.style_for_inherited_with_ancestors(
+            &panel,
+            &[],
+            16.0,
+            Color::BLACK,
+            FontWeight::Normal,
+        );
+        assert_eq!(panel_style.background, Color::opaque(0, 128, 0));
+
+        let selectors = Selector::parse_list("[data-label='a,b'], .card:not(.muted)")
+            .expect("nested selector commas should stay inside their arguments");
+        assert_eq!(selectors.len(), 2);
+        assert!(Selector::parse_list(".card,").is_err());
+        assert!(Stylesheet::parse(".card, { color: red; }").is_err());
     }
 
     #[test]
