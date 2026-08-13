@@ -267,6 +267,7 @@ enum Builtin {
     WorkerPostMessage(WorkerHandle),
     WorkerTerminate(WorkerHandle),
     WorkerAddEventListener(WorkerHandle),
+    WorkerGlobalImportScripts,
     WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
 }
 
@@ -497,6 +498,7 @@ pub struct ScriptRuntime {
     loading_modules: BTreeSet<String>,
     workers: Vec<WorkerHandle>,
     worker_sender: Option<SyncSender<WorkerEvent>>,
+    worker_script_type: Option<WorkerScriptType>,
     worker_resource_sender: Option<SyncSender<WorkerResourceRequest>>,
     worker_resource_receiver: Option<Receiver<WorkerResourceRequest>>,
 }
@@ -1223,6 +1225,7 @@ impl ScriptRuntime {
             loading_modules: BTreeSet::new(),
             workers: Vec::new(),
             worker_sender: None,
+            worker_script_type: None,
             worker_resource_sender: None,
             worker_resource_receiver: None,
         }
@@ -2216,6 +2219,12 @@ impl ScriptRuntime {
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
                 "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
                 "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
+                "importScripts"
+                    if self.worker_sender.is_some()
+                        && matches!(self.worker_script_type, Some(WorkerScriptType::Classic)) =>
+                {
+                    Ok(Value::Builtin(Builtin::WorkerGlobalImportScripts))
+                }
                 "postMessage" if self.worker_sender.is_some() => Ok(Value::Builtin(
                     Builtin::WorkerGlobalPostMessage(
                         self.worker_sender
@@ -3011,6 +3020,7 @@ impl ScriptRuntime {
                 None,
             );
             runtime.worker_sender = Some(event_sender.clone());
+            runtime.worker_script_type = Some(worker_type);
             runtime
                 .global
                 .borrow_mut()
@@ -3029,6 +3039,12 @@ impl ScriptRuntime {
                 .borrow_mut()
                 .values
                 .insert("globalThis".to_string(), Value::Window);
+            if matches!(worker_type, WorkerScriptType::Classic) {
+                runtime.global.borrow_mut().values.insert(
+                    "importScripts".to_string(),
+                    Value::Builtin(Builtin::WorkerGlobalImportScripts),
+                );
+            }
             let startup = match worker_type {
                 WorkerScriptType::Classic => runtime.execute(&source),
                 WorkerScriptType::Module => {
@@ -4237,6 +4253,48 @@ impl ScriptRuntime {
             }
             Builtin::EventPreventDefault(state) => {
                 state.borrow_mut().default_prevented = true;
+                Ok(Value::Undefined)
+            }
+            Builtin::WorkerGlobalImportScripts => {
+                if !matches!(self.worker_script_type, Some(WorkerScriptType::Classic)) {
+                    return Err(runtime_error(
+                        "importScripts is only available in classic Workers",
+                    ));
+                }
+                let base_url = self
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| self.location.borrow().clone());
+                for argument in arguments {
+                    let url = base_url
+                        .resolve(&argument.string_value())
+                        .map_err(|error| runtime_error(error.to_string()))?;
+                    let resources = self.resources.clone().unwrap_or_default();
+                    let provider = self.resource_provider.clone();
+                    let resource = resolve_runtime_resource(&resources, provider.as_deref(), &url)?
+                        .ok_or_else(|| {
+                            runtime_error(format!("imported worker script {} was not found", url.path()))
+                        })?;
+                    if !is_javascript(&resource) {
+                        return Err(runtime_error(format!(
+                            "imported worker script {} has unsupported MIME type {}",
+                            url.path(),
+                            resource.mime_type()
+                        )));
+                    }
+                    if resource.body().len() > MAX_WORKER_SOURCE_BYTES {
+                        return Err(runtime_error(
+                            "imported worker script exceeds the 1 MiB limit",
+                        ));
+                    }
+                    let source = String::from_utf8(resource.body().to_vec()).map_err(|_| {
+                        runtime_error(format!(
+                            "imported worker script {} is not UTF-8",
+                            url.path()
+                        ))
+                    })?;
+                    self.execute(&source)?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::WorkerAddEventListener(worker) => {
