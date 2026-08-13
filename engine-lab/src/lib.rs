@@ -8,6 +8,7 @@ mod navigation;
 mod native_http;
 mod paint;
 mod script;
+mod wasm;
 
 pub use css::{Color, Display, Stylesheet};
 pub use dom::{

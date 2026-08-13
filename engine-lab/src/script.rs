@@ -7,6 +7,7 @@ use crate::navigation::{
 };
 use crate::paint::CanvasCommand;
 use crate::Color;
+use crate::wasm;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -47,6 +48,7 @@ type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
 type BytesHandle = Rc<Vec<u8>>;
 type WorkerHandle = Rc<RefCell<WorkerData>>;
+type WasmFunctionHandle = Rc<WasmFunctionData>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -111,6 +113,7 @@ enum Value {
     Worker(WorkerHandle),
     Console,
     Json,
+    WebAssemblyNamespace,
     Request(RequestHandle),
     HeadersConstructor,
     RequestConstructor,
@@ -269,6 +272,8 @@ enum Builtin {
     WorkerAddEventListener(WorkerHandle),
     WorkerGlobalImportScripts,
     WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
+    WebAssemblyInstantiate,
+    WebAssemblyFunction(WasmFunctionHandle),
 }
 
 struct Function {
@@ -873,6 +878,11 @@ struct WorkerData {
     termination_flag: Arc<AtomicBool>,
 }
 
+struct WasmFunctionData {
+    module: Rc<wasm::Module>,
+    function_index: u32,
+}
+
 impl Drop for WorkerData {
     fn drop(&mut self) {
         self.termination_flag.store(true, Ordering::Release);
@@ -1111,6 +1121,9 @@ impl ScriptRuntime {
             );
             values.values.insert("console".to_string(), Value::Console);
             values.values.insert("JSON".to_string(), Value::Json);
+            values
+                .values
+                .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
             values
                 .values
                 .insert("Number".to_string(), Value::NumberNamespace);
@@ -2210,6 +2223,7 @@ impl ScriptRuntime {
                     .get("history")
                     .ok_or_else(|| runtime_error("window history is unavailable")),
                 "console" => Ok(Value::Console),
+                "WebAssembly" => Ok(Value::WebAssemblyNamespace),
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
                 "JSON" => Ok(Value::Json),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
@@ -2760,6 +2774,12 @@ impl ScriptRuntime {
                 "parse" => Ok(Value::Builtin(Builtin::JsonParse)),
                 "stringify" => Ok(Value::Builtin(Builtin::JsonStringify)),
                 _ => Err(runtime_error(format!("JSON has no property {property}"))),
+            },
+            Value::WebAssemblyNamespace => match property {
+                "instantiate" => Ok(Value::Builtin(Builtin::WebAssemblyInstantiate)),
+                _ => Err(runtime_error(format!(
+                    "WebAssembly has no property {property}"
+                ))),
             },
             Value::Promise(promise) => match property {
                 "then" => Ok(Value::Builtin(Builtin::PromiseThen(promise))),
@@ -4241,6 +4261,78 @@ impl ScriptRuntime {
                 arguments.first().is_some_and(|value| matches!(value, Value::Array(_))),
             )),
             Builtin::ObjectFreeze => Ok(arguments.first().cloned().unwrap_or(Value::Undefined)),
+            Builtin::WebAssemblyInstantiate => {
+                let bytes = match arguments.first().map(Value::resolve) {
+                    Some(Value::Bytes(bytes)) => bytes.as_ref().clone(),
+                    Some(_) => {
+                        return Err(runtime_error(
+                            "WebAssembly.instantiate expects an ArrayBuffer",
+                        ))
+                    }
+                    None => {
+                        return Err(runtime_error(
+                            "WebAssembly.instantiate requires module bytes",
+                        ))
+                    }
+                };
+                if let Some(imports) = arguments.get(1).map(Value::resolve)
+                    && !matches!(imports, Value::Undefined | Value::Object(_))
+                {
+                    return Err(runtime_error(
+                        "WebAssembly.instantiate imports must be an object",
+                    ));
+                }
+                let module = Rc::new(
+                    wasm::Module::instantiate(&bytes)
+                        .map_err(|error| runtime_error(format!("WebAssembly module error: {error}")))?,
+                );
+                let mut exports = BTreeMap::new();
+                for (name, function_index) in module.exported_functions() {
+                    exports.insert(
+                        name.to_string(),
+                        Value::Builtin(Builtin::WebAssemblyFunction(Rc::new(
+                            WasmFunctionData {
+                                module: module.clone(),
+                                function_index,
+                            },
+                        ))),
+                    );
+                }
+                let instance = Value::Object(Rc::new(RefCell::new(BTreeMap::from([(
+                    "exports".to_string(),
+                    Value::Object(Rc::new(RefCell::new(exports))),
+                )]))));
+                let source = Value::Object(Rc::new(RefCell::new(BTreeMap::from([
+                    ("module".to_string(), Value::Object(Rc::new(RefCell::new(BTreeMap::new())))),
+                    ("instance".to_string(), instance),
+                ]))));
+                Ok(Value::Promise(self.fulfilled_promise(source)))
+            }
+            Builtin::WebAssemblyFunction(function) => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        let number = argument.number()?;
+                        if !number.is_finite()
+                            || number.fract() != 0.0
+                            || number < i32::MIN as f64
+                            || number > i32::MAX as f64
+                        {
+                            return Err(runtime_error(
+                                "WebAssembly i32 argument must be a finite integer",
+                            ));
+                        }
+                        Ok(number as i32)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = function
+                    .module
+                    .invoke(function.function_index, &arguments)
+                    .map_err(|error| runtime_error(format!("WebAssembly function error: {error}")))?;
+                Ok(result
+                    .map(|value| Value::Number(value as f64))
+                    .unwrap_or(Value::Undefined))
+            }
             Builtin::ConsoleLog => {
                 self.logs.push(
                     arguments
@@ -6206,6 +6298,7 @@ impl Value {
             Self::Worker(_) => "[object Worker]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
+            Self::WebAssemblyNamespace => "[object WebAssembly]".to_string(),
             Self::ResponseConstructor => "[function Response]".to_string(),
             Self::RequestConstructor => "[function Request]".to_string(),
             Self::HeadersConstructor => "[function Headers]".to_string(),
@@ -7181,6 +7274,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Worker(_)
         | Value::Console
         | Value::Json
+        | Value::WebAssemblyNamespace
         | Value::Error(_) => "object",
         Value::Bool(_) => "boolean",
         Value::Number(_) => "number",

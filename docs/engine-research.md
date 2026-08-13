@@ -59,6 +59,8 @@ URLSearchParams now exposes the matching ordered key, value, entry, `forEach()`,
 
 The page runtime now has a bounded `Worker` boundary for classic and module entry scripts. A same-origin entry script from packaged assets or the embedder-owned `ResourceProvider` runs on a dedicated standard-library thread. Classic Workers can call sequential `importScripts()`, while module imports or `fetch()` calls inside either Worker type use the same packaged-first policy. Provider requests cross a bounded channel and are serviced by `Browser::pump()` or `EngineHost` on the engine thread, so the worker resource path stays independent from a loopback listener. The worker receives JSON-cloned messages through `self.addEventListener()` or `self.onmessage` and replies through `postMessage()`. The page receives `addEventListener()`, `onmessage`, and `onerror` events and can call `terminate()`. Transfer lists, nested workers, and non-JSON structured-clone values remain separate compatibility gates.
 
+The custom runtime now has a bounded WebAssembly path that consumes fetched `ArrayBuffer` bytes through `WebAssembly.instantiate()`. It parses version 1 modules with defined i32 functions, named function exports, calls, locals, arithmetic, comparisons, and bitwise operations, and returns a promise with `module` and `instance.exports` objects. Imports, memory, tables, globals, floating-point values, SIMD, threads, streaming compilation, and unsupported control flow are rejected before execution. This is a narrow execution slice, not general WebAssembly compatibility.
+
 An experimental backend must pass these gates in order:
 
 ### Boot and origin
@@ -104,6 +106,8 @@ The default custom renderer remains headless and does not open a loopback listen
 
 The experiment is useful even when a gate fails. A failure at a named gate tells us whether Ceri's stable contract is missing an abstraction. A passing slice gives us a measured basis for deciding whether to grow the custom engine or use Servo for that layer.
 
+The future-gate list treats full WebAssembly compatibility as unfinished. The bounded i32 module path above is a separate tested slice and does not change that boundary.
+
 ## Sources
 
 - [CEF documentation](https://chromiumembedded.github.io/cef/general_usage.html)
@@ -122,3 +126,4 @@ The experiment is useful even when a gate fails. A failure at a named gate tells
 - [softbuffer 0.4.8](https://docs.rs/softbuffer/0.4.8/softbuffer/)
 - [WHATWG Fetch Standard](https://fetch.spec.whatwg.org/)
 - [WHATWG URL Standard](https://url.spec.whatwg.org/)
+- [WebAssembly JavaScript Interface](https://webassembly.github.io/spec/js-api/)

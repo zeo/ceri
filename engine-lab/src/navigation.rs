@@ -2147,6 +2147,65 @@ mod tests {
     }
 
     #[test]
+    fn browser_instantiates_provider_wasm_without_a_loopback_server() {
+        let wasm = vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02,
+            0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61,
+            0x64, 0x64, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01,
+            0x6a, 0x0b,
+        ];
+        let mut provider_resources = BTreeMap::new();
+        provider_resources.insert(
+            "/index.html".to_string(),
+            Resource::new(
+                "text/html",
+                br#"<p id='status'>idle</p><script>
+                  const status = document.getElementById("status");
+                  fetch("/add.wasm")
+                    .then((response) => response.arrayBuffer())
+                    .then((bytes) => WebAssembly.instantiate(bytes))
+                    .then((result) => { status.textContent = result.instance.exports.add(2, 3); });
+                </script>"#
+                    .to_vec(),
+            ),
+        );
+        provider_resources.insert(
+            "/add.wasm".to_string(),
+            Resource::new("application/wasm", wasm),
+        );
+        let mut browser = Browser::with_resource_provider(
+            ResourceBundle::default(),
+            Rc::new(MemoryProvider {
+                resources: provider_resources,
+            }),
+        );
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("provider document should load");
+        for _ in 0..300 {
+            browser.pump().expect("Wasm page task should execute");
+            let ready = browser.document().ok().and_then(|document| {
+                let document = document.borrow();
+                let status = document.find_element_by_id("status")?;
+                (document.element_text_content(&status).as_deref() == Some("5")).then_some(())
+            });
+            if ready.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("5")
+        );
+    }
+
+    #[test]
     fn parses_app_urls_without_a_loopback_authority() {
         let url = AppUrl::parse("HTTPS://APP.CERI.INVALID/docs/intro%2Ehtml?q=rust#top")
             .expect("app URL should parse");
