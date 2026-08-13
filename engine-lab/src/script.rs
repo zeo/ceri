@@ -1,4 +1,4 @@
-use crate::dom::{Document, Element, Node, NodePath};
+use crate::dom::{AccessibilityNode, Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
     is_http_redirect, is_javascript, is_json, AppUrl, ClipboardProvider, FilePicker,
@@ -1642,6 +1642,45 @@ impl ScriptRuntime {
         Ok(true)
     }
 
+    fn move_focus_sequential(&mut self, backwards: bool) -> Result<bool, ScriptError> {
+        let mut entries = Vec::new();
+        let mut order = 0usize;
+        let tree = self.document.borrow().accessibility_tree();
+        collect_sequential_focus_nodes(
+            &tree,
+            &mut order,
+            &mut entries,
+            &self.document,
+        );
+        entries.sort_by_key(|(tabindex, order, _)| {
+            if *tabindex > 0 {
+                (0, *tabindex, *order)
+            } else {
+                (1, 0, *order)
+            }
+        });
+        let paths = entries
+            .into_iter()
+            .map(|(_, _, path)| path)
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let next = match self
+            .focused_element
+            .as_ref()
+            .and_then(|focused| paths.iter().position(|path| path == focused))
+        {
+            Some(index) if backwards => {
+                paths[(index + paths.len() - 1) % paths.len()].clone()
+            }
+            Some(index) => paths[(index + 1) % paths.len()].clone(),
+            None if backwards => paths.last().cloned().unwrap_or_default(),
+            None => paths.first().cloned().unwrap_or_default(),
+        };
+        self.focus_path(next)
+    }
+
     pub(crate) fn insert_text(&mut self, text: &str) -> Result<bool, ScriptError> {
         if self.composition.is_some() {
             return self.composition_commit(text);
@@ -1869,6 +1908,13 @@ impl ScriptRuntime {
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
+        }
+        if key == "Tab" && !modifiers.control && !modifiers.alt && !modifiers.meta {
+            if dispatch.default_prevented {
+                return Ok(dispatch.handled);
+            }
+            let moved = self.move_focus_sequential(modifiers.shift)?;
+            return Ok(dispatch.handled || moved);
         }
         if dispatch.default_prevented || !self.is_text_control_path(&path) {
             return Ok(dispatch.handled);
@@ -7687,6 +7733,26 @@ fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
     }
 }
 
+fn collect_sequential_focus_nodes(
+    node: &AccessibilityNode,
+    order: &mut usize,
+    entries: &mut Vec<(i32, usize, NodePath)>,
+    document: &Rc<RefCell<Document>>,
+) {
+    if node.focusable {
+        let tabindex = document
+            .borrow()
+            .element_clone(&node.path)
+            .and_then(|element| element.attr("tabindex").and_then(|value| value.parse().ok()))
+            .unwrap_or(0);
+        entries.push((tabindex, *order, node.path.clone()));
+        *order += 1;
+    }
+    for child in &node.children {
+        collect_sequential_focus_nodes(child, order, entries, document);
+    }
+}
+
 fn collect_element_text(element: &Element, output: &mut String) {
     for child in &element.children {
         match child {
@@ -11874,6 +11940,79 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some(":Rus|blur:null")
         );
+    }
+
+    #[test]
+    fn tab_navigation_moves_focus_in_document_order_and_honors_positive_tabindex() {
+        let document = document(
+            r#"<input id="first"><button id="second">second</button><textarea id="third"></textarea><input id="priority" tabindex="2"><input id="earlier" tabindex="1"><input id="skip" tabindex="-1"><p id="status"></p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const second = document.getElementById("second");
+                let events = "";
+                first.addEventListener("blur", () => events = events + "first-blur|");
+                second.addEventListener("focus", () => events = events + "second-focus|");
+                "#,
+            )
+            .expect("focus listeners should register");
+        let first_path = document
+            .borrow()
+            .find_element_by_id("first")
+            .expect("first input should exist");
+        assert!(runtime.focus_path(first_path).expect("first input should focus"));
+        assert!(runtime
+            .key_down_with_modifiers("Tab", KeyModifiers::default())
+            .expect("Tab should move focus"));
+        assert_eq!(runtime.active_element(), Some(vec![1]));
+        assert_eq!(
+            runtime
+                .execute("document.getElementById(\"status\").textContent = events;"),
+            Ok(())
+        );
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("first-blur|second-focus|"));
+        assert!(runtime
+            .key_down_with_modifiers(
+                "Tab",
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .expect("Shift+Tab should move focus backward"));
+        assert_eq!(runtime.active_element(), Some(vec![0]));
+        assert!(runtime
+            .key_down_with_modifiers(
+                "Tab",
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .expect("Shift+Tab should reach positive tabindex entries"));
+        assert_eq!(runtime.active_element(), Some(vec![3]));
+        assert!(runtime
+            .key_down_with_modifiers(
+                "Tab",
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                },
+            )
+            .expect("Shift+Tab should follow positive tabindex ordering"));
+        assert_eq!(runtime.active_element(), Some(vec![4]));
+        let skipped_path = document
+            .borrow()
+            .find_element_by_id("skip")
+            .expect("negative tabindex input should exist");
+        assert_ne!(runtime.active_element(), Some(skipped_path));
     }
 
     #[test]
