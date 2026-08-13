@@ -301,6 +301,7 @@ impl EngineHost {
     }
 
     pub fn input(&mut self, event: InputEvent) -> Result<InputResult, NavigationError> {
+        self.pump_workers()?;
         let result = match event {
             InputEvent::Resize(viewport) => {
                 self.viewport = viewport;
@@ -346,6 +347,7 @@ impl EngineHost {
                 ..InputResult::default()
             },
         };
+        self.pump_workers()?;
         self.dirty |= result.frame_requested || result.handled || result.tasks_run > 0;
         Ok(InputResult {
             frame_requested: self.dirty,
@@ -354,6 +356,7 @@ impl EngineHost {
     }
 
     pub fn render(&mut self) -> Result<Option<Frame>, NavigationError> {
+        self.pump_workers()?;
         if !self.dirty {
             return Ok(None);
         }
@@ -366,6 +369,13 @@ impl EngineHost {
         self.next_frame = self.next_frame.saturating_add(1);
         self.dirty = false;
         Ok(Some(frame))
+    }
+
+    fn pump_workers(&mut self) -> Result<(), NavigationError> {
+        if self.browser.current_url().is_some() {
+            self.dirty |= self.browser.pump()? > 0;
+        }
+        Ok(())
     }
 }
 
@@ -486,6 +496,48 @@ mod tests {
             .expect("resized frame should be present");
         assert_eq!(resized.viewport.width, 640.0);
         assert_eq!(resized.canvas.height(), 240);
+    }
+
+    #[test]
+    fn host_render_pumps_packaged_worker_callbacks() {
+        let mut resources = bundle(
+            r#"<p id='status'>idle</p><script>
+              const status = document.getElementById("status");
+              const worker = new Worker("/worker.js");
+              worker.onmessage = (event) => { status.textContent = event.data; };
+              worker.postMessage("ready");
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/worker.js",
+                "text/javascript",
+                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
+                    .to_vec(),
+            )
+            .expect("worker resource should be accepted");
+        let mut host = EngineHost::new(
+            Browser::new(resources),
+            Size {
+                width: 320.0,
+                height: 200.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        for _ in 0..100 {
+            let _ = host.render().expect("worker frame should render");
+            let document = host.browser().document().expect("document should exist");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status should exist");
+            if document.borrow().element_text_content(&status).as_deref() == Some("ready!") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("host render loop did not deliver the worker callback");
     }
 
     #[test]

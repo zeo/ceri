@@ -14,6 +14,7 @@ The current slice implements:
 - a software paint step with a small built-in bitmap font
 - a platform-neutral `EngineHost` frame and input boundary
 - a bounded standard-library `EngineWorker` queue that owns browser state off the native event thread
+- page-visible classic `Worker` objects with packaged same-origin scripts, dedicated threads, structured JSON-cloned messages, `postMessage()`, `onmessage`, `onerror`, `terminate()`, and an explicit host `pump()` boundary
 - a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths
 - a small JavaScript-like runtime with DOM mutation, console logging, and click events
 - bubbling DOM events with `type`, `target`, `currentTarget`, `defaultPrevented`, and `preventDefault()`
@@ -36,6 +37,7 @@ The current slice implements:
 - focusable controls with `document.activeElement`, `value` state, focus and blur events, keyboard events, text input, and deterministic backspace editing
 - named form controls with live checkbox and radio-group state, ordered `FormData` text and `File` entries, pair mutation, and deterministic `requestSubmit()` events
 - `FormData` key, value, and entry iterators, `forEach()`, and `Symbol.iterator` preserve insertion order and File values
+- `Worker` scripts are loaded from the packaged bundle, run on a dedicated standard-library thread, and exchange bounded structured messages without a loopback listener; module workers, transfer lists, provider-only worker scripts, and nested workers remain outside this slice
 - canvas 2D contexts with `fillStyle`, `fillRect`, `clearRect`, and deterministic software painting
 - app-owned SVG `<img>` resources with bounded rect, circle, and line rasterization
 - static and dynamic ES module graphs with same-origin packaged imports, default and named exports, live named and namespace bindings, named re-exports, and namespace imports
@@ -63,6 +65,8 @@ Hosts can inspect `Browser::last_navigation_failure()` or `EngineHost::last_navi
 FormData bodies use deterministic multipart encoding with ordered text and File entries, filenames, per-file content types, and a collision-safe boundary. `FormData` exposes ordered `keys()`, `values()`, `entries()`, `forEach()`, and `Symbol.iterator` views over those entries.
 
 `URLSearchParams` exposes the same ordered key, value, entry, `forEach()`, and `Symbol.iterator` views, including duplicate pairs and updates back to its owning `URL`.
+
+`new Worker(url, { name })` resolves a same-origin classic script from the packaged resource bundle. The worker has `self.onmessage`, `postMessage()`, and `globalThis`, while the page has `worker.postMessage()`, `worker.onmessage`, `worker.onerror`, `worker.name`, `worker.url`, and `worker.terminate()`. Messages cross the thread boundary as JSON-cloned values through a bounded queue. Hosts can call `Browser::pump()` or `ScriptRuntime::pump()` from their event loop, and `EngineHost` pumps before input and render work. This slice has no module workers, transfer-list ownership, network-loaded worker scripts, nested workers, or browser-compatible structured-clone types beyond JSON values.
 
 Run the deterministic demo from the repository root:
 

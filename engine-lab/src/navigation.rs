@@ -957,6 +957,17 @@ impl Browser {
         Ok(executed)
     }
 
+    pub fn pump(&mut self) -> Result<usize, NavigationError> {
+        let processed = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .pump()
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        self.process_pending_navigation()?;
+        Ok(processed)
+    }
+
     pub fn console_logs(&self) -> &[String] {
         self.page
             .as_ref()
@@ -1924,6 +1935,45 @@ mod tests {
             "text/javascript"
         );
         assert!(resources.resource("/target/debug/engine-lab.exe").is_none());
+    }
+
+    #[test]
+    fn browser_pumps_a_packaged_worker_without_a_loopback_server() {
+        let mut resources = bundle(
+            r#"<p id='status'>idle</p><script>
+              const status = document.getElementById("status");
+              const worker = new Worker("/worker.js");
+              worker.onmessage = (event) => { status.textContent = event.data; };
+              worker.postMessage("ready");
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/worker.js",
+                "text/javascript",
+                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
+                    .to_vec(),
+            )
+            .expect("worker resource should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        for _ in 0..100 {
+            if browser.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ready!")
+        );
     }
 
     #[test]

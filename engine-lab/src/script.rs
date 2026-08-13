@@ -11,6 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 use std::rc::Weak;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
@@ -41,6 +45,7 @@ type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
 type BytesHandle = Rc<Vec<u8>>;
+type WorkerHandle = Rc<RefCell<WorkerData>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
@@ -102,6 +107,7 @@ enum Value {
     CanvasContext(CanvasContextHandle),
     AbortController(AbortControllerHandle),
     AbortSignal(AbortSignalHandle),
+    Worker(WorkerHandle),
     Console,
     Json,
     Request(RequestHandle),
@@ -117,6 +123,7 @@ enum Value {
     ErrorConstructor,
     PromiseConstructor,
     AbortControllerConstructor,
+    WorkerConstructor,
     NumberNamespace,
     ArrayNamespace,
     ObjectNamespace,
@@ -256,6 +263,9 @@ enum Builtin {
     AbortControllerAbort(AbortControllerHandle),
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
+    WorkerPostMessage(WorkerHandle),
+    WorkerTerminate(WorkerHandle),
+    WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
 }
 
 struct Function {
@@ -483,6 +493,8 @@ pub struct ScriptRuntime {
     host_runtime_info: Option<HostRuntimeInfo>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     loading_modules: BTreeSet<String>,
+    workers: Vec<WorkerHandle>,
+    worker_sender: Option<SyncSender<WorkerEvent>>,
 }
 
 pub(crate) trait ModuleSourceLoader {
@@ -661,6 +673,8 @@ struct EventData {
     history_state: Rc<RefCell<Value>>,
     key: String,
     data: String,
+    data_value: Option<Box<Value>>,
+    error_message: Option<String>,
 }
 
 #[derive(Default)]
@@ -761,6 +775,37 @@ struct AbortSignalData {
 
 struct AbortControllerData {
     signal: AbortSignalHandle,
+}
+
+const MAX_WORKER_MESSAGES: usize = 256;
+const MAX_WORKER_SOURCE_BYTES: usize = 1024 * 1024;
+
+enum WorkerCommand {
+    Message(String),
+    Terminate,
+}
+
+enum WorkerEvent {
+    Message(String),
+    Error(String),
+}
+
+struct WorkerData {
+    url: AppUrl,
+    name: String,
+    command_sender: SyncSender<WorkerCommand>,
+    event_receiver: Receiver<WorkerEvent>,
+    onmessage: Option<Value>,
+    onerror: Option<Value>,
+    terminated: bool,
+    termination_flag: Arc<AtomicBool>,
+}
+
+impl Drop for WorkerData {
+    fn drop(&mut self) {
+        self.termination_flag.store(true, Ordering::Release);
+        let _ = self.command_sender.try_send(WorkerCommand::Terminate);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1040,6 +1085,9 @@ impl ScriptRuntime {
                 .insert("File".to_string(), Value::FileConstructor);
             values
                 .values
+                .insert("Worker".to_string(), Value::WorkerConstructor);
+            values
+                .values
                 .insert("Request".to_string(), Value::RequestConstructor);
             values
                 .values
@@ -1103,6 +1151,8 @@ impl ScriptRuntime {
             host_runtime_info,
             module_cache: BTreeMap::new(),
             loading_modules: BTreeSet::new(),
+            workers: Vec::new(),
+            worker_sender: None,
         }
     }
 
@@ -1117,7 +1167,10 @@ impl ScriptRuntime {
     pub fn execute(&mut self, source: &str) -> Result<(), ScriptError> {
         let program = Parser::new(source)?.parse_program()?;
         match self.execute_statements(&program, self.global.clone())? {
-            Completion::Normal | Completion::Return(_) => self.drain_microtasks(),
+            Completion::Normal | Completion::Return(_) => {
+                self.drain_microtasks()?;
+                self.pump_workers().map(|_| ())
+            }
         }
     }
 
@@ -1557,6 +1610,8 @@ impl ScriptRuntime {
             history_state: Rc::new(RefCell::new(state)),
             key: String::new(),
             data: String::new(),
+            data_value: None,
+            error_message: None,
         });
         for callback in callbacks {
             self.call(callback, vec![event.clone()])?;
@@ -1597,6 +1652,7 @@ impl ScriptRuntime {
             executed += 1;
         }
         self.drain_microtasks()?;
+        self.pump_workers()?;
         Ok(executed)
     }
 
@@ -2082,11 +2138,24 @@ impl ScriptRuntime {
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
                 "JSON" => Ok(Value::Json),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
+                "Worker" => Ok(Value::WorkerConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
                 "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
                 "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
+                "postMessage" if self.worker_sender.is_some() => Ok(Value::Builtin(
+                    Builtin::WorkerGlobalPostMessage(
+                        self.worker_sender
+                            .clone()
+                            .expect("worker sender checked above"),
+                    ),
+                )),
+                "onmessage" | "onerror" if self.worker_sender.is_some() => Ok(self
+                    .global
+                    .borrow()
+                    .get(property)
+                    .unwrap_or(Value::Null)),
                 "ceriQuery" => Ok(self
                     .host_runtime_info
                     .as_ref()
@@ -2223,7 +2292,16 @@ impl ScriptRuntime {
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
                 "key" => Ok(Value::String(event.key.clone())),
-                "data" => Ok(Value::String(event.data.clone())),
+                "data" => Ok(event
+                    .data_value
+                    .as_ref()
+                    .map(|value| (**value).clone())
+                    .unwrap_or_else(|| Value::String(event.data.clone()))),
+                "message" => Ok(event
+                    .error_message
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)),
                 "preventDefault" => Ok(Value::Builtin(Builtin::EventPreventDefault(
                     event.state.clone(),
                 ))),
@@ -2330,6 +2408,21 @@ impl ScriptRuntime {
                 "forEach" => Ok(Value::Builtin(Builtin::FormDataForEach(form_data))),
                 _ => Err(runtime_error(format!("FormData has no property {property}"))),
             },
+            Value::Worker(worker) => {
+                let handle = worker.clone();
+                let worker = worker.borrow();
+                match property {
+                    "postMessage" => Ok(Value::Builtin(Builtin::WorkerPostMessage(
+                        handle.clone(),
+                    ))),
+                    "terminate" => Ok(Value::Builtin(Builtin::WorkerTerminate(handle))),
+                    "onmessage" => Ok(worker.onmessage.clone().unwrap_or(Value::Null)),
+                    "onerror" => Ok(worker.onerror.clone().unwrap_or(Value::Null)),
+                    "url" => Ok(Value::String(worker.url.to_string())),
+                    "name" => Ok(Value::String(worker.name.clone())),
+                    _ => Err(runtime_error(format!("Worker has no property {property}"))),
+                }
+            }
             Value::Blob(blob) => match property {
                 "size" => Ok(Value::Number(blob.bytes.len() as f64)),
                 "type" => Ok(Value::String(blob.mime_type.clone())),
@@ -2664,39 +2757,299 @@ impl ScriptRuntime {
         value: Value,
     ) -> Result<(), ScriptError> {
         let truthy = value.truthy();
-        let value = value.string_value();
+        let value_string = value.string_value();
         let updated = match object.resolve() {
             Value::Element(handle) => match property {
-                "textContent" => self.set_element_text_content(&handle, value),
-                "className" => self.set_element_attribute(&handle, "class", value),
-                "id" => self.set_element_attribute(&handle, "id", value),
-                "innerHTML" => self.set_element_inner_html(&handle, value)?,
-                "value" => self.set_element_value(&handle, value),
+                "textContent" => self.set_element_text_content(&handle, value_string),
+                "className" => self.set_element_attribute(&handle, "class", value_string),
+                "id" => self.set_element_attribute(&handle, "id", value_string),
+                "innerHTML" => self.set_element_inner_html(&handle, value_string)?,
+                "value" => self.set_element_value(&handle, value_string),
                 "checked" => self.set_element_checked(&handle, truthy),
                 "disabled" => self.set_element_disabled(&handle, truthy),
                 _ => false,
             },
             Value::Dataset(handle) => {
-                self.set_element_attribute(&handle, &dataset_attribute_name(property), value)
+                self.set_element_attribute(&handle, &dataset_attribute_name(property), value_string)
             }
-            Value::Style(handle) => self.set_element_style_property(&handle, property, value),
+            Value::Style(handle) => self.set_element_style_property(&handle, property, value_string),
             Value::CanvasContext(context) if property == "fillStyle" => {
-                self.set_canvas_fill_style(&context, &value)
+                self.set_canvas_fill_style(&context, &value_string)
             }
             Value::Window if property == "location" => {
-                self.request_location_navigation(value, false);
+                self.request_location_navigation(value_string, false);
+                true
+            }
+            Value::Window if self.worker_sender.is_some() && matches!(property, "onmessage" | "onerror") => {
+                self.assign_worker_global_callback(property, value)?;
                 true
             }
             Value::Location(_) if property == "href" => {
-                self.request_location_navigation(value, false);
+                self.request_location_navigation(value_string, false);
                 true
             }
-            Value::Url(url) => self.assign_url_property(&url, property, &value)?,
+            Value::Url(url) => self.assign_url_property(&url, property, &value_string)?,
+            Value::Worker(worker) if matches!(property, "onmessage" | "onerror") => {
+                self.assign_worker_callback(&worker, property, value)?;
+                true
+            }
             _ => false,
         };
         updated
             .then_some(())
             .ok_or_else(|| runtime_error(format!("property {property} is not writable")))
+    }
+
+    fn assign_worker_global_callback(
+        &mut self,
+        property: &str,
+        value: Value,
+    ) -> Result<(), ScriptError> {
+        let callback = match value.resolve() {
+            Value::Function(_) => value,
+            Value::Null | Value::Undefined => Value::Null,
+            _ => return Err(runtime_error(format!("Worker {property} must be a function or null"))),
+        };
+        self.global
+            .borrow_mut()
+            .values
+            .insert(property.to_string(), callback);
+        Ok(())
+    }
+
+    fn assign_worker_callback(
+        &mut self,
+        worker: &WorkerHandle,
+        property: &str,
+        value: Value,
+    ) -> Result<(), ScriptError> {
+        let callback = match value.resolve() {
+            Value::Function(_) => Some(value),
+            Value::Null | Value::Undefined => None,
+            _ => return Err(runtime_error(format!("Worker {property} must be a function or null"))),
+        };
+        let mut worker = worker.borrow_mut();
+        match property {
+            "onmessage" => worker.onmessage = callback,
+            "onerror" => worker.onerror = callback,
+            _ => return Err(runtime_error(format!("Worker has no writable property {property}"))),
+        }
+        Ok(())
+    }
+
+    fn construct_worker(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let reference = arguments
+            .first()
+            .ok_or_else(|| runtime_error("Worker requires a script URL"))?
+            .string_value();
+        let base_url = self
+            .base_url
+            .clone()
+            .unwrap_or_else(|| self.location.borrow().clone());
+        let url = base_url
+            .resolve(&reference)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let mut name = String::new();
+        if let Some(options) = arguments.get(1).map(Value::resolve) {
+            match options {
+                Value::Undefined | Value::Null => {}
+                Value::Object(options) => {
+                    for property in options.borrow().keys() {
+                        if !matches!(property.as_str(), "name" | "type") {
+                            return Err(runtime_error(format!(
+                                "Worker option {property} is not supported"
+                            )));
+                        }
+                    }
+                    if let Some(worker_type) = options.borrow().get("type") {
+                        let worker_type = worker_type.string_value();
+                        if !worker_type.eq_ignore_ascii_case("classic") {
+                            return Err(runtime_error(
+                                "only classic Worker scripts are supported",
+                            ));
+                        }
+                    }
+                    if let Some(worker_name) = options.borrow().get("name") {
+                        name = worker_name.string_value();
+                    }
+                }
+                _ => return Err(runtime_error("Worker options must be an object")),
+            }
+        }
+        let resources = self
+            .resources
+            .clone()
+            .ok_or_else(|| runtime_error("Worker scripts must be packaged in this slice"))?;
+        let resource = resources
+            .resource(url.path())
+            .cloned()
+            .ok_or_else(|| runtime_error(format!("worker script {} was not found", url.path())))?;
+        if !is_javascript(&resource) {
+            return Err(runtime_error(format!(
+                "worker script {} has unsupported MIME type {}",
+                url.path(),
+                resource.mime_type()
+            )));
+        }
+        if resource.body().len() > MAX_WORKER_SOURCE_BYTES {
+            return Err(runtime_error("worker script exceeds the 1 MiB limit"));
+        }
+        let source = String::from_utf8(resource.body().to_vec())
+            .map_err(|_| runtime_error(format!("worker script {} is not UTF-8", url.path())))?;
+        let (command_sender, command_receiver) = mpsc::sync_channel(MAX_WORKER_MESSAGES);
+        let (event_sender, event_receiver) = mpsc::sync_channel(MAX_WORKER_MESSAGES);
+        let termination_flag = Arc::new(AtomicBool::new(false));
+        let worker_termination_flag = termination_flag.clone();
+        let worker_url = url.clone();
+        thread::spawn(move || {
+            let document = match Document::parse("<html><body></body></html>") {
+                Ok(document) => Rc::new(RefCell::new(document)),
+                Err(error) => {
+                    let _ = event_sender.try_send(WorkerEvent::Error(error.to_string()));
+                    return;
+                }
+            };
+            let mut runtime = ScriptRuntime::with_resources(document, resources, worker_url);
+            runtime.worker_sender = Some(event_sender.clone());
+            runtime
+                .global
+                .borrow_mut()
+                .values
+                .insert("self".to_string(), Value::Window);
+            runtime
+                .global
+                .borrow_mut()
+                .values
+                .insert(
+                    "postMessage".to_string(),
+                    Value::Builtin(Builtin::WorkerGlobalPostMessage(event_sender.clone())),
+                );
+            runtime
+                .global
+                .borrow_mut()
+                .values
+                .insert("globalThis".to_string(), Value::Window);
+            if let Err(error) = runtime.execute(&source) {
+                let _ = event_sender.try_send(WorkerEvent::Error(error.message));
+                return;
+            }
+            while !worker_termination_flag.load(Ordering::Acquire) {
+                let Ok(command) = command_receiver.recv() else {
+                    break;
+                };
+                match command {
+                    WorkerCommand::Terminate => break,
+                    WorkerCommand::Message(message) => {
+                        if worker_termination_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let data = match runtime.parse_json(&message) {
+                            Ok(data) => data,
+                            Err(error) => {
+                                let _ = event_sender.try_send(WorkerEvent::Error(error.message));
+                                continue;
+                            }
+                        };
+                        let callback = runtime.global.borrow().get("onmessage");
+                        if !matches!(callback.as_ref().map(Value::resolve), Some(Value::Function(_)))
+                        {
+                            continue;
+                        }
+                        let event = Value::Event(EventData {
+                            event_type: "message".to_string(),
+                            target: Vec::new(),
+                            current_target: Vec::new(),
+                            state: Rc::new(RefCell::new(EventState::default())),
+                            history_state: Rc::new(RefCell::new(Value::Null)),
+                            key: String::new(),
+                            data: String::new(),
+                            data_value: Some(Box::new(data)),
+                            error_message: None,
+                        });
+                        if let Err(error) = runtime.call(
+                            callback.expect("function checked above"),
+                            vec![event],
+                        ) {
+                            let _ = event_sender.try_send(WorkerEvent::Error(error.message));
+                            continue;
+                        }
+                        if let Err(error) = runtime.drain_microtasks() {
+                            let _ = event_sender.try_send(WorkerEvent::Error(error.message));
+                        }
+                    }
+                }
+            }
+        });
+        let worker = Rc::new(RefCell::new(WorkerData {
+            url,
+            name,
+            command_sender,
+            event_receiver,
+            onmessage: None,
+            onerror: None,
+            terminated: false,
+            termination_flag,
+        }));
+        self.workers.push(worker.clone());
+        Ok(Value::Worker(worker))
+    }
+
+    pub fn pump(&mut self) -> Result<usize, ScriptError> {
+        let processed = self.pump_workers()?;
+        self.drain_microtasks()?;
+        Ok(processed)
+    }
+
+    fn pump_workers(&mut self) -> Result<usize, ScriptError> {
+        let workers = self.workers.clone();
+        let mut processed = 0;
+        for worker in workers {
+            loop {
+                let event = match worker.borrow_mut().event_receiver.try_recv() {
+                    Ok(event) => event,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                };
+                processed += 1;
+                match event {
+                    WorkerEvent::Message(message) => {
+                        let data = self.parse_json(&message)?;
+                        let callback = worker.borrow().onmessage.clone();
+                        if let Some(callback) = callback {
+                            let event = Value::Event(EventData {
+                                event_type: "message".to_string(),
+                                target: Vec::new(),
+                                current_target: Vec::new(),
+                                state: Rc::new(RefCell::new(EventState::default())),
+                                history_state: Rc::new(RefCell::new(Value::Null)),
+                                key: String::new(),
+                                data: String::new(),
+                                data_value: Some(Box::new(data)),
+                                error_message: None,
+                            });
+                            self.call(callback, vec![event])?;
+                        }
+                    }
+                    WorkerEvent::Error(message) => {
+                        let callback = worker.borrow().onerror.clone();
+                        if let Some(callback) = callback {
+                            let event = Value::Event(EventData {
+                                event_type: "error".to_string(),
+                                target: Vec::new(),
+                                current_target: Vec::new(),
+                                state: Rc::new(RefCell::new(EventState::default())),
+                                history_state: Rc::new(RefCell::new(Value::Null)),
+                                key: String::new(),
+                                data: String::new(),
+                                data_value: None,
+                                error_message: Some(message),
+                            });
+                            self.call(callback, vec![event])?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(processed)
     }
 
     fn element_text_content(&self, handle: &ElementHandle) -> Option<String> {
@@ -2960,6 +3313,7 @@ impl ScriptRuntime {
             Value::ErrorConstructor => Ok(self.construct_error(arguments)),
             Value::PromiseConstructor => self.construct_promise(arguments),
             Value::AbortControllerConstructor => Ok(self.construct_abort_controller()),
+            Value::WorkerConstructor => self.construct_worker(arguments),
             Value::StringConstructor => Ok(Value::String(
                 arguments
                     .first()
@@ -3710,6 +4064,62 @@ impl ScriptRuntime {
             }
             Builtin::EventPreventDefault(state) => {
                 state.borrow_mut().default_prevented = true;
+                Ok(Value::Undefined)
+            }
+            Builtin::WorkerPostMessage(worker) => {
+                if arguments.len() > 1
+                    && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
+                {
+                    return Err(runtime_error(
+                        "Worker transfer lists are not supported in this slice",
+                    ));
+                }
+                let message = serialize_json(
+                    arguments
+                        .first()
+                        .unwrap_or(&Value::Undefined),
+                )?;
+                let worker = worker.borrow();
+                if worker.terminated {
+                    return Err(runtime_error("Worker has been terminated"));
+                }
+                worker
+                    .command_sender
+                    .try_send(WorkerCommand::Message(message))
+                    .map_err(|error| match error {
+                        TrySendError::Full(_) => runtime_error("Worker message queue is full"),
+                        TrySendError::Disconnected(_) => runtime_error("Worker is unavailable"),
+                    })?;
+                Ok(Value::Undefined)
+            }
+            Builtin::WorkerTerminate(worker) => {
+                let mut worker = worker.borrow_mut();
+                if !worker.terminated {
+                    worker.termination_flag.store(true, Ordering::Release);
+                    let _ = worker.command_sender.try_send(WorkerCommand::Terminate);
+                    worker.terminated = true;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::WorkerGlobalPostMessage(sender) => {
+                if arguments.len() > 1
+                    && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
+                {
+                    return Err(runtime_error(
+                        "Worker transfer lists are not supported in this slice",
+                    ));
+                }
+                let message = serialize_json(
+                    arguments
+                        .first()
+                        .unwrap_or(&Value::Undefined),
+                )?;
+                sender
+                    .try_send(WorkerEvent::Message(message))
+                    .map_err(|error| match error {
+                        TrySendError::Full(_) => runtime_error("Worker message queue is full"),
+                        TrySendError::Disconnected(_) => runtime_error("Worker is unavailable"),
+                    })?;
                 Ok(Value::Undefined)
             }
             Builtin::WindowAddEventListener => {
@@ -5009,6 +5419,8 @@ impl ScriptRuntime {
                 history_state: Rc::new(RefCell::new(Value::Null)),
                 key: key.to_string(),
                 data: data.to_string(),
+                data_value: None,
+                error_message: None,
             });
             for callback in callbacks {
                 self.call(callback, vec![event_value.clone()])?;
@@ -5548,6 +5960,7 @@ impl Value {
             Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
             Self::AbortController(_) => "[object AbortController]".to_string(),
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
+            Self::Worker(_) => "[object Worker]".to_string(),
             Self::Console => "[console]".to_string(),
             Self::Json => "[object JSON]".to_string(),
             Self::ResponseConstructor => "[function Response]".to_string(),
@@ -5564,6 +5977,7 @@ impl Value {
             Self::ErrorConstructor => "[function Error]".to_string(),
             Self::PromiseConstructor => "[function Promise]".to_string(),
             Self::AbortControllerConstructor => "[function AbortController]".to_string(),
+            Self::WorkerConstructor => "[function Worker]".to_string(),
             Self::NumberNamespace => "[function Number]".to_string(),
             Self::ArrayNamespace => "[function Array]".to_string(),
             Self::ObjectNamespace => "[function Object]".to_string(),
@@ -6473,6 +6887,7 @@ fn evaluate_binary(
             (Value::Error(_), Value::ErrorConstructor) => true,
             (Value::Blob(_), Value::BlobConstructor) => true,
             (Value::File(_), Value::FileConstructor | Value::BlobConstructor) => true,
+            (Value::Worker(_), Value::WorkerConstructor) => true,
             (Value::Error(error), Value::Class(class)) => {
                 error.class_name == class.name
                     || (class.name == "Error" && error.class_name == "Error")
@@ -6520,6 +6935,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::CanvasContext(_)
         | Value::AbortController(_)
         | Value::AbortSignal(_)
+        | Value::Worker(_)
         | Value::Console
         | Value::Json
         | Value::Error(_) => "object",
@@ -6543,6 +6959,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::ErrorConstructor
         | Value::PromiseConstructor
         | Value::AbortControllerConstructor
+        | Value::WorkerConstructor
         | Value::NumberNamespace
         | Value::ArrayNamespace
         | Value::ObjectNamespace
@@ -6587,6 +7004,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
+        (Value::Worker(left), Value::Worker(right)) => Rc::ptr_eq(left, right),
         (Value::Bytes(left), Value::Bytes(right)) => Rc::ptr_eq(left, right),
         (Value::Request(left), Value::Request(right)) => Rc::ptr_eq(left, right),
         (Value::Headers(left), Value::Headers(right)) => Rc::ptr_eq(left, right),
@@ -11312,6 +11730,144 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready|2|{\"count\":2,\"ok\":true}")
+        );
+    }
+
+    #[test]
+    fn worker_dispatches_structured_messages_without_a_loopback_server() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/worker.js",
+                "text/javascript",
+                br#"self.onmessage = (event) => {
+                  postMessage({ kind: event.data.kind, text: event.data.text + "!" });
+                };"#
+                .to_vec(),
+            )
+            .expect("worker resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const worker = new Worker("/worker.js", { name: "echo" });
+                worker.onmessage = (event) => {
+                  status.textContent = worker.name + "|" + event.data.kind + "|" + event.data.text;
+                };
+                worker.postMessage({ kind: "greeting", text: "hello" });
+                "#,
+            )
+            .expect("worker construction and message send should execute");
+        for _ in 0..100 {
+            if runtime.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("echo|greeting|hello!")
+        );
+    }
+
+    #[test]
+    fn worker_rejects_module_scripts_and_unavailable_resources() {
+        let document = document("<p>worker</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/worker.js", "text/javascript", b"postMessage(1);".to_vec())
+            .expect("worker resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        let module_error = runtime
+            .execute(r#"new Worker("/worker.js", { type: "module" });"#)
+            .expect_err("module workers should be rejected in the classic slice");
+        assert!(module_error.message.contains("only classic Worker scripts"));
+        let missing_error = runtime
+            .execute(r#"new Worker("/missing.js");"#)
+            .expect_err("missing packaged workers should be rejected");
+        assert!(missing_error.message.contains("worker script /missing.js was not found"));
+    }
+
+    #[test]
+    fn worker_reports_startup_errors_to_onerror() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/broken-worker.js",
+                "text/javascript",
+                b"missingWorkerGlobal;".to_vec(),
+            )
+            .expect("worker resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const worker = new Worker("/broken-worker.js");
+                worker.onerror = (event) => { status.textContent = event.message; };
+                "#,
+            )
+            .expect("worker construction should queue startup errors");
+        for _ in 0..100 {
+            if runtime.pump().expect("worker pump should execute") > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("unknown identifier missingWorkerGlobal")
+        );
+    }
+
+    #[test]
+    fn worker_terminate_closes_the_page_message_endpoint() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/idle-worker.js",
+                "text/javascript",
+                b"self.onmessage = (event) => { postMessage(event.data); };".to_vec(),
+            )
+            .expect("worker resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const worker = new Worker("/idle-worker.js");
+                worker.terminate();
+                try {
+                  worker.postMessage("ignored");
+                } catch (error) {
+                  status.textContent = error;
+                }
+                "#,
+            )
+            .expect("terminated worker should report a synchronous send error");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("Worker has been terminated")
         );
     }
 
