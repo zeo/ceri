@@ -989,8 +989,14 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .as_deref()
         .filter(|value| value.is_empty())
         .and_then(|_| text_control_placeholder(element));
+    let control_display_value = control_value
+        .as_ref()
+        .map(|value| text_control_display_value(element, value));
     let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
-    if let Some(value) = control_placeholder.as_ref().or(control_value.as_ref()) {
+    if let Some(value) = control_placeholder
+        .as_ref()
+        .or(control_display_value.as_ref())
+    {
         let value_lines = control_text_lines(element, value, content_width, font_size);
         let color = if control_placeholder.is_some() {
             Color::opaque(120, 145, 155)
@@ -2257,6 +2263,17 @@ fn text_control_placeholder(element: &Element) -> Option<String> {
         .map(|value| value.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
+fn text_control_display_value(element: &Element, value: &str) -> String {
+    if element.name == "input"
+        && element
+            .attr("type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+    {
+        return "*".repeat(value.encode_utf16().count());
+    }
+    value.to_string()
+}
+
 fn control_text_lines(
     element: &Element,
     value: &str,
@@ -2423,6 +2440,34 @@ mod tests {
             &state,
         );
         assert_eq!(live.root.children[0].text[0].text, "live");
+    }
+
+    #[test]
+    fn password_controls_mask_display_text_without_changing_live_value() {
+        let document = Document::parse(
+            r#"<input id="secret" type="password" value="s😀cret" style="display: block; width: 120px; height: 28px">"#,
+        )
+        .expect("password document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState {
+            focused_path: Some(vec![0]),
+            ..Default::default()
+        };
+        state.text_selections.insert(vec![0], (1, 3, false));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 80.0,
+            },
+            &state,
+        );
+        let input = &result.root.children[0];
+        assert_eq!(input.control_value.as_deref(), Some("s😀cret"));
+        assert_eq!(input.text[0].text, "*******");
+        assert_eq!(input.control_selection, Some((1, 3, false)));
+        assert!(input.control_focused);
     }
 
     #[test]
