@@ -2966,6 +2966,48 @@ mod tests {
     }
 
     #[test]
+    fn invalid_form_submission_stays_on_packaged_page_without_a_loopback_server() {
+        let mut resources = bundle(
+            r#"<form action="/done.html"><input id="name" required><button id="submit" type="submit">send</button></form><p id="status">idle</p><script>
+                const form = document.querySelector("form");
+                const name = document.getElementById("name");
+                name.addEventListener("invalid", () => { document.getElementById("status").textContent = "invalid"; });
+                form.addEventListener("submit", () => { document.getElementById("status").textContent = "submitted"; });
+            </script>"#,
+        );
+        resources
+            .insert("/done.html", "text/html", br#"<p id="status">done</p>"#.to_vec())
+            .expect("destination page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("validation page should load");
+        assert!(browser
+            .click_id("submit")
+            .expect("invalid submit click should dispatch"));
+        assert_eq!(browser.current_url().unwrap().path(), "/");
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("invalid")
+        );
+        assert!(browser
+            .click_id("name")
+            .expect("name input should focus"));
+        assert!(browser
+            .insert_text("Ceri")
+            .expect("required value should accept host text"));
+        assert!(browser
+            .click_id("submit")
+            .expect("valid submit click should navigate"));
+        assert_eq!(browser.current_url().unwrap().path(), "/done.html");
+    }
+
+    #[test]
     fn click_default_navigation_respects_prevent_default() {
         let mut browser = Browser::new(bundle(
             r#"<a id="go" href="/about.html"><span id="label">open</span></a><p id="status">home</p><script>

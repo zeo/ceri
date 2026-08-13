@@ -21,6 +21,7 @@ use std::thread;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
+type ValidityHandle = Rc<NodePath>;
 type RangeHandle = Rc<RefCell<RangeData>>;
 type SelectionHandle = Rc<RefCell<SelectionData>>;
 type RequestHandle = Rc<RequestData>;
@@ -88,6 +89,7 @@ enum Value {
     Set(SetHandle),
     Iterator(IteratorHandle),
     Element(ElementHandle),
+    Validity(ValidityHandle),
     Range(RangeHandle),
     Selection(SelectionHandle),
     Dataset(ElementHandle),
@@ -174,6 +176,9 @@ enum Builtin {
     ElementFocus(NodePath),
     ElementBlur(NodePath),
     ElementRequestSubmit(NodePath),
+    ElementCheckValidity(NodePath),
+    ElementReportValidity(NodePath),
+    ElementSetCustomValidity(NodePath),
     CanvasGetContext(NodePath),
     CanvasFillRect(CanvasContextHandle),
     CanvasClearRect(CanvasContextHandle),
@@ -522,6 +527,8 @@ pub struct ScriptRuntime {
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
+    dirty_controls: BTreeSet<NodePath>,
+    custom_validity: BTreeMap<NodePath, String>,
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
     selection: SelectionHandle,
@@ -873,6 +880,35 @@ struct TextComposition {
     path: NodePath,
     start: usize,
     end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ConstraintFlags {
+    value_missing: bool,
+    type_mismatch: bool,
+    pattern_mismatch: bool,
+    too_long: bool,
+    too_short: bool,
+    range_underflow: bool,
+    range_overflow: bool,
+    step_mismatch: bool,
+    bad_input: bool,
+    custom_error: bool,
+}
+
+impl ConstraintFlags {
+    fn valid(self) -> bool {
+        !self.value_missing
+            && !self.type_mismatch
+            && !self.pattern_mismatch
+            && !self.too_long
+            && !self.too_short
+            && !self.range_underflow
+            && !self.range_overflow
+            && !self.step_mismatch
+            && !self.bad_input
+            && !self.custom_error
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1332,6 +1368,8 @@ impl ScriptRuntime {
             focused_element: None,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
+            dirty_controls: BTreeSet::new(),
+            custom_validity: BTreeMap::new(),
             text_selections: HashMap::new(),
             composition: None,
             selection: Rc::new(RefCell::new(SelectionData::default())),
@@ -1783,6 +1821,7 @@ impl ScriptRuntime {
         let value = String::from_utf16_lossy(&next_units);
         let cursor = selection.start.saturating_add(replacement.len());
         self.control_values.insert(path.clone(), value);
+        self.mark_user_edit(&path);
         self.text_selections.insert(
             path.clone(),
             TextSelection {
@@ -1869,6 +1908,9 @@ impl ScriptRuntime {
         let (value, selection_end) =
             replace_utf16_range(&value, start, end, &replacement_text);
         self.control_values.insert(path.clone(), value);
+        if start != end || !replacement_text.is_empty() {
+            self.mark_user_edit(&path);
+        }
         self.composition = Some(TextComposition {
             path: path.clone(),
             start,
@@ -1913,6 +1955,9 @@ impl ScriptRuntime {
             .unwrap_or_else(|| text.to_string());
         let (value, cursor) = replace_utf16_range(&value, start, end, &replacement_text);
         self.control_values.insert(path.clone(), value);
+        if start != end || !replacement_text.is_empty() {
+            self.mark_user_edit(&path);
+        }
         self.text_selections.insert(
             path.clone(),
             TextSelection {
@@ -2032,6 +2077,7 @@ impl ScriptRuntime {
                     return Ok(dispatch.handled);
                 }
             }
+            self.mark_user_edit(&path);
             self.set_range_text(
                 &path,
                 &[
@@ -2118,6 +2164,7 @@ impl ScriptRuntime {
             _ => return Ok(dispatch.handled),
         };
         if start != end {
+            self.mark_user_edit(&path);
             self.set_range_text(
                 &path,
                 &[
@@ -2356,6 +2403,14 @@ impl ScriptRuntime {
     }
 
     fn request_submit(&mut self, path: NodePath) -> Result<(), ScriptError> {
+        let bypass_validation = self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_some_and(|form| form.attr("novalidate").is_some());
+        if !bypass_validation && !self.check_validity_path(&path)? {
+            return Ok(());
+        }
         let dispatch = self.dispatch_event(path.clone(), "submit")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented {
@@ -3070,6 +3125,31 @@ impl ScriptRuntime {
                         .element_value(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "validity" => self.element_validity(&handle),
+                    "willValidate" => Value::Bool(
+                        path.as_ref()
+                            .is_some_and(|path| self.is_validation_candidate(path)),
+                    ),
+                    "validationMessage" => Value::String(
+                        path.as_ref()
+                            .map(|path| self.validation_message(path))
+                            .unwrap_or_default(),
+                    ),
+                    "required" => Value::Bool(
+                        self.element_attribute(&handle, "required").is_some(),
+                    ),
+                    "maxLength" => Value::Number(
+                        path.as_ref()
+                            .and_then(|path| self.control_length_attribute(path, "maxlength"))
+                            .map(|length| length as f64)
+                            .unwrap_or(-1.0),
+                    ),
+                    "minLength" => Value::Number(
+                        path.as_ref()
+                            .and_then(|path| self.control_length_attribute(path, "minlength"))
+                            .map(|length| length as f64)
+                            .unwrap_or(-1.0),
+                    ),
                     "selectionStart" => self.element_selection_start(&handle)?,
                     "selectionEnd" => self.element_selection_end(&handle)?,
                     "selectionDirection" => self.element_selection_direction(&handle)?,
@@ -3146,6 +3226,21 @@ impl ScriptRuntime {
                         }
                         Value::Builtin(Builtin::ElementRequestSubmit(path))
                     }
+                    "checkValidity" => Value::Builtin(Builtin::ElementCheckValidity(
+                        path.ok_or_else(|| {
+                            runtime_error("detached element cannot validate constraints")
+                        })?,
+                    )),
+                    "reportValidity" => Value::Builtin(Builtin::ElementReportValidity(
+                        path.ok_or_else(|| {
+                            runtime_error("detached element cannot validate constraints")
+                        })?,
+                    )),
+                    "setCustomValidity" => Value::Builtin(Builtin::ElementSetCustomValidity(
+                        path.ok_or_else(|| {
+                            runtime_error("detached element cannot set custom validity")
+                        })?,
+                    )),
                     "getContext" => {
                         let path = path.ok_or_else(|| {
                             runtime_error("detached element cannot create a canvas context")
@@ -3180,6 +3275,25 @@ impl ScriptRuntime {
                     _ => return Err(runtime_error(format!("element has no property {property}"))),
                 };
                 Ok(value)
+            }
+            Value::Validity(path) => {
+                let flags = self.constraint_flags(path.as_slice());
+                match property {
+                    "badInput" => Ok(Value::Bool(flags.bad_input)),
+                    "customError" => Ok(Value::Bool(flags.custom_error)),
+                    "patternMismatch" => Ok(Value::Bool(flags.pattern_mismatch)),
+                    "rangeOverflow" => Ok(Value::Bool(flags.range_overflow)),
+                    "rangeUnderflow" => Ok(Value::Bool(flags.range_underflow)),
+                    "stepMismatch" => Ok(Value::Bool(flags.step_mismatch)),
+                    "tooLong" => Ok(Value::Bool(flags.too_long)),
+                    "tooShort" => Ok(Value::Bool(flags.too_short)),
+                    "typeMismatch" => Ok(Value::Bool(flags.type_mismatch)),
+                    "valid" => Ok(Value::Bool(flags.valid())),
+                    "valueMissing" => Ok(Value::Bool(flags.value_missing)),
+                    _ => Err(runtime_error(format!(
+                        "ValidityState has no property {property}"
+                    ))),
+                }
             }
             Value::Range(range) => {
                 let range_data = range.borrow();
@@ -3793,6 +3907,11 @@ impl ScriptRuntime {
                 "checked" => self.set_element_checked(&handle, truthy),
                 "disabled" => self.set_element_disabled(&handle, truthy),
                 "readOnly" => self.set_element_readonly(&handle, truthy),
+                "required" => self.set_element_required(&handle, truthy),
+                "maxLength" => self
+                    .set_element_length_attribute(&handle, "maxlength", value.number()?)?,
+                "minLength" => self
+                    .set_element_length_attribute(&handle, "minlength", value.number()?)?,
                 "scrollLeft" => self.set_scroll_offset_property(&handle, 0, value.number()?)?,
                 "scrollTop" => self.set_scroll_offset_property(&handle, 1, value.number()?)?,
                 _ => false,
@@ -4251,10 +4370,162 @@ impl ScriptRuntime {
         if !self.is_selection_control_path(path) {
             return None;
         }
+        self.control_length_attribute(path, "maxlength")
+    }
+
+    fn control_length_attribute(&self, path: &[usize], name: &str) -> Option<usize> {
         self.document
             .borrow()
             .element_clone(path)
-            .and_then(|element| element.attr("maxlength").and_then(|value| value.trim().parse().ok()))
+            .and_then(|element| element.attr(name).and_then(|value| value.trim().parse().ok()))
+    }
+
+    fn mark_user_edit(&mut self, path: &[usize]) {
+        self.dirty_controls.insert(path.to_vec());
+    }
+
+    fn is_validation_candidate(&self, path: &[usize]) -> bool {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return false;
+        };
+        if element.attr("disabled").is_some() {
+            return false;
+        }
+        match element.name.as_str() {
+            "textarea" => !self.is_readonly_path(path),
+            "input" => {
+                let kind = element
+                    .attr("type")
+                    .map(|kind| kind.to_ascii_lowercase())
+                    .unwrap_or_else(|| "text".to_string());
+                !(matches!(kind.as_str(), "button" | "hidden" | "image" | "reset" | "submit")
+                    || element.attr("readonly").is_some()
+                        && self.is_selection_control_path(path))
+            }
+            _ => false,
+        }
+    }
+
+    fn constraint_flags(&self, path: &[usize]) -> ConstraintFlags {
+        if !self.is_validation_candidate(path) {
+            return ConstraintFlags::default();
+        }
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return ConstraintFlags::default();
+        };
+        let kind = element
+            .attr("type")
+            .map(|kind| kind.to_ascii_lowercase())
+            .unwrap_or_else(|| "text".to_string());
+        let value = self.control_value_path(path).unwrap_or_default();
+        let empty = match kind.as_str() {
+            "checkbox" => !self.control_checked_path(path),
+            "radio" => self
+                .document
+                .borrow()
+                .radio_group_paths(path)
+                .map(|group| {
+                    group
+                        .iter()
+                        .all(|candidate| !self.control_checked_path(candidate))
+                })
+                .unwrap_or_else(|| !self.control_checked_path(path)),
+            "file" => self
+                .selected_files
+                .get(path)
+                .is_none_or(Vec::is_empty),
+            _ => value.is_empty(),
+        };
+        let dirty = self.dirty_controls.contains(path);
+        let length = utf16_len(&value);
+        let too_long = dirty
+            && self.is_selection_control_path(path)
+            && self
+                .control_length_attribute(path, "maxlength")
+                .is_some_and(|maximum| length > maximum);
+        let too_short = dirty
+            && !empty
+            && self.is_selection_control_path(path)
+            && self
+                .control_length_attribute(path, "minlength")
+                .is_some_and(|minimum| length < minimum);
+        let value_missing = element.attr("required").is_some() && empty;
+        ConstraintFlags {
+            value_missing,
+            too_long,
+            too_short,
+            custom_error: self
+                .custom_validity
+                .get(path)
+                .is_some_and(|message| !message.is_empty()),
+            ..ConstraintFlags::default()
+        }
+    }
+
+    fn element_validity(&self, handle: &ElementHandle) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return validity_object(ConstraintFlags::default());
+        };
+        Value::Validity(Rc::new(path))
+    }
+
+    fn validation_message(&self, path: &[usize]) -> String {
+        let flags = self.constraint_flags(path);
+        if flags.custom_error {
+            let message = self
+                .custom_validity
+                .get(path)
+                .expect("custom validity flag has a message");
+            return message.clone();
+        }
+        if flags.value_missing {
+            return "value missing".to_string();
+        }
+        if flags.too_long {
+            return "value too long".to_string();
+        }
+        if flags.too_short {
+            return "value too short".to_string();
+        }
+        String::new()
+    }
+
+    fn check_validity_path(&mut self, path: &[usize]) -> Result<bool, ScriptError> {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return Ok(true);
+        };
+        if element.name == "form" {
+            let controls = self
+                .document
+                .borrow()
+                .form_control_paths(path)
+                .unwrap_or_default();
+            let mut valid = true;
+            for control in controls {
+                if !self.check_validity_path(&control)? {
+                    valid = false;
+                }
+            }
+            return Ok(valid);
+        }
+        if !self.is_validation_candidate(path) {
+            return Ok(true);
+        }
+        let flags = self.constraint_flags(path);
+        if flags.valid() {
+            return Ok(true);
+        }
+        self.dispatch_non_bubbling_event(path.to_vec(), "invalid")?;
+        self.drain_microtasks()?;
+        Ok(false)
+    }
+
+    fn set_custom_validity(&mut self, path: NodePath, message: String) {
+        if message.is_empty() {
+            self.custom_validity.remove(&path);
+        } else {
+            self.custom_validity.insert(path, message);
+        }
     }
 
     fn control_value_path(&self, path: &[usize]) -> Option<String> {
@@ -4932,6 +5203,51 @@ impl ScriptRuntime {
                 true
             }
         }
+    }
+
+    fn set_element_required(&mut self, handle: &ElementHandle, required: bool) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                if required {
+                    self.document
+                        .borrow_mut()
+                        .set_element_attribute(&path, "required", String::new())
+                } else {
+                    self.document
+                        .borrow_mut()
+                        .remove_element_attribute(&path, "required")
+                }
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                if required {
+                    element.attrs.insert("required".to_string(), String::new());
+                } else {
+                    element.attrs.remove("required");
+                }
+                true
+            }
+        }
+    }
+
+    fn set_element_length_attribute(
+        &mut self,
+        handle: &ElementHandle,
+        name: &str,
+        value: f64,
+    ) -> Result<bool, ScriptError> {
+        if !value.is_finite()
+            || value.fract() != 0.0
+            || value < 0.0
+            || value > usize::MAX as f64
+        {
+            return Err(runtime_error(format!("{name} must be a non-negative integer")));
+        }
+        let value = value as usize;
+        Ok(self.set_element_attribute(handle, name, value.to_string()))
     }
 
     fn control_checked_path(&self, path: &[usize]) -> bool {
@@ -6223,6 +6539,17 @@ impl ScriptRuntime {
                 self.request_submit(path)?;
                 Ok(Value::Undefined)
             }
+            Builtin::ElementCheckValidity(path) | Builtin::ElementReportValidity(path) => {
+                Ok(Value::Bool(self.check_validity_path(&path)?))
+            }
+            Builtin::ElementSetCustomValidity(path) => {
+                let message = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.set_custom_validity(path, message);
+                Ok(Value::Undefined)
+            }
             Builtin::CanvasGetContext(path) => {
                 let kind = arguments
                     .first()
@@ -7443,6 +7770,42 @@ impl ScriptRuntime {
         self.dispatch_event_with_details(path, event, "", "")
     }
 
+    fn dispatch_non_bubbling_event(
+        &mut self,
+        path: NodePath,
+        event: &str,
+    ) -> Result<EventDispatch, ScriptError> {
+        let callbacks = self
+            .listeners
+            .get(&path)
+            .into_iter()
+            .flatten()
+            .filter(|listener| listener.event == event)
+            .map(|listener| listener.callback.clone())
+            .collect::<Vec<_>>();
+        let state = Rc::new(RefCell::new(EventState::default()));
+        let event_value = Value::Event(EventData {
+            event_type: event.to_string(),
+            target: path.clone(),
+            current_target: path,
+            state: state.clone(),
+            history_state: Rc::new(RefCell::new(Value::Null)),
+            key: String::new(),
+            data: String::new(),
+            modifiers: KeyModifiers::default(),
+            is_composing: self.composition.is_some(),
+            data_value: None,
+            error_message: None,
+        });
+        for callback in callbacks.iter().cloned() {
+            self.call(callback, vec![event_value.clone()])?;
+        }
+        Ok(EventDispatch {
+            handled: !callbacks.is_empty(),
+            default_prevented: state.borrow().default_prevented,
+        })
+    }
+
     fn selection_uses_range(&self, range: &RangeHandle) -> bool {
         self.selection
             .borrow()
@@ -8034,6 +8397,7 @@ impl Value {
             Self::Set(_) => "[object Set]".to_string(),
             Self::Iterator(_) => "[object Iterator]".to_string(),
             Self::Element(_) => "[element]".to_string(),
+            Self::Validity(_) => "[object ValidityState]".to_string(),
             Self::Range(_) => "[object Range]".to_string(),
             Self::Selection(_) => "[object Selection]".to_string(),
             Self::Dataset(_) => "[object DOMStringMap]".to_string(),
@@ -8592,6 +8956,31 @@ fn normalize_file_name(value: &str) -> String {
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+fn validity_object(flags: ConstraintFlags) -> Value {
+    let mut values = BTreeMap::new();
+    values.insert("badInput".to_string(), Value::Bool(flags.bad_input));
+    values.insert("customError".to_string(), Value::Bool(flags.custom_error));
+    values.insert(
+        "patternMismatch".to_string(),
+        Value::Bool(flags.pattern_mismatch),
+    );
+    values.insert(
+        "rangeOverflow".to_string(),
+        Value::Bool(flags.range_overflow),
+    );
+    values.insert(
+        "rangeUnderflow".to_string(),
+        Value::Bool(flags.range_underflow),
+    );
+    values.insert("stepMismatch".to_string(), Value::Bool(flags.step_mismatch));
+    values.insert("tooLong".to_string(), Value::Bool(flags.too_long));
+    values.insert("tooShort".to_string(), Value::Bool(flags.too_short));
+    values.insert("typeMismatch".to_string(), Value::Bool(flags.type_mismatch));
+    values.insert("valid".to_string(), Value::Bool(flags.valid()));
+    values.insert("valueMissing".to_string(), Value::Bool(flags.value_missing));
+    Value::Object(Rc::new(RefCell::new(values)))
 }
 
 fn truncate_utf16(value: &str, maximum: usize) -> String {
@@ -9167,6 +9556,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Set(_)
         | Value::Iterator(_)
         | Value::Element(_)
+        | Value::Validity(_)
         | Value::Range(_)
         | Value::Selection(_)
         | Value::Dataset(_)
@@ -9258,6 +9648,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         }
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
+        (Value::Validity(left), Value::Validity(right)) => Rc::ptr_eq(left, right),
         (Value::Range(left), Value::Range(right)) => Rc::ptr_eq(left, right),
         (Value::Selection(left), Value::Selection(right)) => Rc::ptr_eq(left, right),
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
@@ -12276,6 +12667,60 @@ mod tests {
             .key_down_with_modifiers("Enter", KeyModifiers::default())
             .expect("Enter should stop at maxlength"));
         assert_eq!(runtime.control_value_path(&note_path).as_deref(), Some("abc\n"));
+    }
+
+    #[test]
+    fn constraint_validation_tracks_user_lengths_and_gates_form_submission() {
+        let document = document(
+            r#"<form id="signup"><input id="name" required minlength="3"><button id="submit" type="submit">send</button></form><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const form = document.getElementById("signup");
+                const name = document.getElementById("name");
+                const status = document.getElementById("status");
+                const validity = name.validity;
+                let invalid = 0;
+                let submits = 0;
+                name.addEventListener("invalid", () => invalid = invalid + 1);
+                form.addEventListener("submit", (event) => { submits = submits + 1; event.preventDefault(); });
+                status.textContent = name.willValidate + ":" + name.validity.valueMissing + ":" + name.checkValidity() + ":" + name.validationMessage + ":" + form.checkValidity() + ":" + invalid;
+                form.requestSubmit();
+                "#,
+            )
+            .expect("constraint validation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true:true:false:value missing:false:2")
+        );
+
+        let name_path = document
+            .borrow()
+            .find_element_by_id("name")
+            .expect("name input should exist");
+        assert!(runtime.focus_path(name_path).expect("name input should focus"));
+        assert!(runtime.insert_text("x").expect("short user value should insert"));
+        runtime
+            .execute("status.textContent = name.value + \"|\" + validity.tooShort + \"|\" + name.checkValidity() + \"|\" + form.checkValidity() + \"|\" + submits;")
+            .expect("short value validity should be readable");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("x|true|false|false|0")
+        );
+        assert!(runtime.insert_text("yz").expect("valid user value should insert"));
+        runtime
+            .execute("name.setCustomValidity(\"custom\"); status.textContent = validity.customError + \"|\" + name.validationMessage + \"|\" + name.checkValidity() + \"|\" + submits; name.setCustomValidity(\"\"); form.requestSubmit(); status.textContent = name.value + \"|\" + validity.valid + \"|\" + submits;")
+            .expect("custom validity and valid submission should execute");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("xyz|true|1")
+        );
     }
 
     #[test]
