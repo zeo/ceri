@@ -987,9 +987,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let control_value = text_control_value(element, &path, style_state);
     let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
     if let Some(value) = &control_value {
-        for (line_index, value_line) in value.split('\n').enumerate() {
+        let value_lines = control_text_lines(element, value, content_width, font_size);
+        for (line_index, value_line) in value_lines.iter().enumerate() {
             text.push(TextRun {
-                text: value_line.to_string(),
+                text: value_line.clone(),
                 x: content_x,
                 y: content_y + line_index as f32 * line_height,
                 width: measure_text(value_line, font_size),
@@ -998,7 +999,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 bold: style.font_weight == FontWeight::Bold,
             });
         }
-        line.y = content_y + value.split('\n').count() as f32 * line_height;
+        line.y = content_y + value_lines.len() as f32 * line_height;
     }
     let mut children = Vec::new();
     let mut positioned = Vec::new();
@@ -2237,6 +2238,37 @@ fn element_text_value(element: &Element) -> String {
     value
 }
 
+fn control_text_lines(
+    element: &Element,
+    value: &str,
+    content_width: f32,
+    font_size: f32,
+) -> Vec<String> {
+    let max_characters = (content_width / measure_text("X", font_size).max(1.0))
+        .floor()
+        .max(1.0) as usize;
+    let mut lines = Vec::new();
+    for value_line in value.split('\n') {
+        if element.name != "textarea"
+            || element
+                .attr("wrap")
+                .is_some_and(|wrap| wrap.eq_ignore_ascii_case("off"))
+        {
+            lines.push(value_line.to_string());
+            continue;
+        }
+        let characters = value_line.chars().collect::<Vec<_>>();
+        if characters.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        for chunk in characters.chunks(max_characters) {
+            lines.push(chunk.iter().collect());
+        }
+    }
+    lines
+}
+
 fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
     let indent = "  ".repeat(depth);
     lines.push(format!(
@@ -2366,6 +2398,39 @@ mod tests {
         assert_eq!(textarea.text[0].text, "live");
         assert_eq!(textarea.text[1].text, "value");
         assert!(textarea.text[1].y > textarea.text[0].y);
+    }
+
+    #[test]
+    fn textarea_layout_wraps_to_content_width_and_honors_wrap_off() {
+        let document = Document::parse(
+            "<textarea id='wrapped' style='display: block; width: 24px; height: 80px'>old</textarea><textarea id='off' wrap='off' style='display: block; width: 24px; height: 80px'>old</textarea>",
+        )
+        .expect("textarea document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state
+            .control_values
+            .insert(vec![0], "abcdef".to_string());
+        state
+            .control_values
+            .insert(vec![1], "abcdef".to_string());
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 120.0,
+                height: 200.0,
+            },
+            &state,
+        );
+        let wrapped = &result.root.children[0];
+        let no_wrap = &result.root.children[1];
+        assert_eq!(
+            wrapped.text.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+            ["ab", "cd", "ef"]
+        );
+        assert_eq!(no_wrap.text.len(), 1);
+        assert_eq!(no_wrap.text[0].text, "abcdef");
     }
 
     #[test]

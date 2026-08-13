@@ -473,7 +473,9 @@ fn paint_control_selection(
     if layout_box.control_text_origin.is_none() || start == end {
         return;
     }
-    for (line_index, (line_start, line_end)) in control_line_ranges(value).iter().enumerate() {
+    for (line_index, (line_start, line_end)) in
+        control_line_ranges(value, &layout_box.text).iter().enumerate()
+    {
         let Some(run) = layout_box.text.get(line_index) else {
             break;
         };
@@ -530,13 +532,17 @@ fn paint_control_caret(
     );
 }
 
-fn control_line_ranges(value: &str) -> Vec<(usize, usize)> {
+fn control_line_ranges(value: &str, lines: &[TextRun]) -> Vec<(usize, usize)> {
+    let units = value.encode_utf16().collect::<Vec<_>>();
     let mut start = 0;
     let mut ranges = Vec::new();
-    for line in value.split('\n') {
-        let end = start + line.encode_utf16().count();
+    for line in lines {
+        let end = (start + line.text.encode_utf16().count()).min(units.len());
         ranges.push((start, end));
-        start = end + 1;
+        start = end;
+        if units.get(start) == Some(&(b'\n' as u16)) {
+            start += 1;
+        }
     }
     ranges
 }
@@ -546,7 +552,7 @@ fn control_text_position(
     value: &str,
     offset: usize,
 ) -> Option<(f32, f32)> {
-    let ranges = control_line_ranges(value);
+    let ranges = control_line_ranges(value, &layout_box.text);
     let mut line_index = ranges.len().saturating_sub(1);
     for (index, (_, line_end)) in ranges.iter().enumerate() {
         if offset <= *line_end || index + 1 == ranges.len() {
@@ -996,7 +1002,7 @@ mod tests {
                 border_color: Color::transparent(),
                 text: vec![
                     TextRun {
-                        text: "A".to_string(),
+                        text: "AB".to_string(),
                         x: 4.0,
                         y: 5.0,
                         width: 6.0,
@@ -1005,7 +1011,7 @@ mod tests {
                         bold: false,
                     },
                     TextRun {
-                        text: "B".to_string(),
+                        text: "CD".to_string(),
                         x: 4.0,
                         y: 20.0,
                         width: 6.0,
@@ -1014,7 +1020,7 @@ mod tests {
                         bold: false,
                     },
                 ],
-                control_value: Some("A\nB".to_string()),
+                control_value: Some("ABCD".to_string()),
                 control_selection: Some((2, 3)),
                 control_focused: true,
                 control_text_origin: Some((4.0, 5.0)),
