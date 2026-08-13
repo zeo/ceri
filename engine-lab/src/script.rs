@@ -1744,6 +1744,9 @@ impl ScriptRuntime {
         if !self.is_text_control_path(&path) {
             return Ok(false);
         }
+        if self.is_readonly_path(&path) {
+            return Ok(false);
+        }
         let value = self.control_value_path(&path).unwrap_or_default();
         let value_units = value.encode_utf16().collect::<Vec<_>>();
         let mut selection = self.selection_for_path(&path, &value);
@@ -1789,6 +1792,9 @@ impl ScriptRuntime {
             return Ok(None);
         };
         if !self.is_selection_control_path(&path) {
+            return Ok(None);
+        }
+        if self.is_readonly_path(&path) {
             return Ok(None);
         }
         let value = self.control_value_path(&path).unwrap_or_default();
@@ -1867,6 +1873,10 @@ impl ScriptRuntime {
         };
         let path = composition.path;
         if !self.is_selection_control_path(&path) {
+            self.composition = None;
+            return Ok(false);
+        }
+        if self.is_readonly_path(&path) {
             self.composition = None;
             return Ok(false);
         }
@@ -1972,6 +1982,9 @@ impl ScriptRuntime {
         let value = self.control_value_path(&path).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
         let selection = self.selection_for_path(&path, &value);
+        if self.is_readonly_path(&path) && matches!(key, "Backspace" | "Delete" | "Enter") {
+            return Ok(dispatch.handled);
+        }
         if key == "Enter"
             && self
                 .document
@@ -3024,6 +3037,9 @@ impl ScriptRuntime {
                     "disabled" => Value::Bool(
                         self.element_attribute(&handle, "disabled").is_some(),
                     ),
+                    "readOnly" => Value::Bool(
+                        self.element_attribute(&handle, "readonly").is_some(),
+                    ),
                     "scrollLeft" => Value::Number(
                         path.as_ref()
                             .map(|path| self.scroll_offset(path).0 as f64)
@@ -3736,6 +3752,7 @@ impl ScriptRuntime {
                 }
                 "checked" => self.set_element_checked(&handle, truthy),
                 "disabled" => self.set_element_disabled(&handle, truthy),
+                "readOnly" => self.set_element_readonly(&handle, truthy),
                 "scrollLeft" => self.set_scroll_offset_property(&handle, 0, value.number()?)?,
                 "scrollTop" => self.set_scroll_offset_property(&handle, 1, value.number()?)?,
                 _ => false,
@@ -4179,6 +4196,15 @@ impl ScriptRuntime {
             }),
             _ => false,
         }
+    }
+
+    fn is_readonly_path(&self, path: &[usize]) -> bool {
+        self.is_selection_control_path(path)
+            && self
+                .document
+                .borrow()
+                .element_clone(path)
+                .is_some_and(|element| element.attr("readonly").is_some())
     }
 
     fn control_value_path(&self, path: &[usize]) -> Option<String> {
@@ -4824,6 +4850,34 @@ impl ScriptRuntime {
                     element.attrs.insert("disabled".to_string(), String::new());
                 } else {
                     element.attrs.remove("disabled");
+                }
+                true
+            }
+        }
+    }
+
+    fn set_element_readonly(&mut self, handle: &ElementHandle, readonly: bool) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => {
+                if readonly {
+                    self.document
+                        .borrow_mut()
+                        .set_element_attribute(&path, "readonly", String::new())
+                } else {
+                    self.document
+                        .borrow_mut()
+                        .remove_element_attribute(&path, "readonly")
+                }
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                if readonly {
+                    element.attrs.insert("readonly".to_string(), String::new());
+                } else {
+                    element.attrs.remove("readonly");
                 }
                 true
             }
@@ -12018,6 +12072,82 @@ mod tests {
             .apply_autofocus()
             .expect("autofocus should preserve script focus"));
         assert_eq!(manual_runtime.active_element(), Some(vec![1]));
+    }
+
+    #[test]
+    fn readonly_text_controls_keep_focus_and_selection_but_block_user_edits() {
+        let document = document(
+            r#"<input id="code" value="rust" readonly><textarea id="note" readonly>draft</textarea><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const code = document.getElementById("code");
+                document.getElementById("status").textContent = code.readOnly + "|" + code.value;
+                "#,
+            )
+            .expect("readonly property should be readable");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|rust")
+        );
+        let code_path = document
+            .borrow()
+            .find_element_by_id("code")
+            .expect("code input should exist");
+        assert!(runtime
+            .focus_path(code_path.clone())
+            .expect("readonly input should remain focusable"));
+        assert!(!runtime
+            .insert_text("!")
+            .expect("readonly input should reject host text"));
+        assert!(!runtime
+            .key_down_with_modifiers("Backspace", KeyModifiers::default())
+            .expect("readonly input should reject deletion"));
+        assert!(runtime
+            .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
+            .expect("readonly input should allow selection movement"));
+        assert_eq!(runtime.active_element(), Some(vec![0]));
+        runtime
+            .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").selectionStart + \"|\" + document.getElementById(\"code\").selectionEnd;")
+            .expect("readonly selection should remain script-visible");
+        assert!(!runtime
+            .composition_update("x", None)
+            .expect("readonly input should reject composition"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("3|3")
+        );
+        let note_path = document
+            .borrow()
+            .find_element_by_id("note")
+            .expect("readonly textarea should exist");
+        assert!(runtime
+            .focus_path(note_path)
+            .expect("readonly textarea should remain focusable"));
+        assert!(!runtime
+            .key_down_with_modifiers("Enter", KeyModifiers::default())
+            .expect("readonly textarea should reject Enter editing"));
+        runtime
+            .execute("document.getElementById(\"status\").textContent = document.getElementById(\"note\").value;")
+            .expect("readonly textarea value should remain script-visible");
+        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("draft"));
+        assert!(runtime
+            .focus_path(code_path)
+            .expect("code input should regain focus"));
+        runtime
+            .execute("document.getElementById(\"code\").readOnly = false; document.getElementById(\"code\").value = \"script\";")
+            .expect("script should be able to change readonly state and value");
+        assert!(runtime.insert_text("!").expect("editable value should accept text"));
+        runtime
+            .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").value;")
+            .expect("script should read the updated value");
+        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("scr!ipt"));
     }
 
     #[test]

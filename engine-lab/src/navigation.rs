@@ -2904,6 +2904,38 @@ mod tests {
     }
 
     #[test]
+    fn readonly_navigation_control_rejects_host_edits_without_a_loopback_server() {
+        let mut browser = Browser::new(bundle(
+            r#"<input id="name" value="rust" readonly><p id="status">idle</p><script>
+                const input = document.getElementById("name");
+                input.addEventListener("focus", () => { document.getElementById("status").textContent = "focused"; });
+                input.addEventListener("input", () => { document.getElementById("status").textContent = "edited"; });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("readonly page should load");
+        assert!(browser
+            .click_id("name")
+            .expect("readonly control should focus"));
+        assert!(!browser
+            .insert_text("!")
+            .expect("readonly control should reject host text"));
+        assert!(!browser
+            .key_down("Backspace")
+            .expect("readonly control should reject deletion"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("focused")
+        );
+    }
+
+    #[test]
     fn click_default_navigation_respects_prevent_default() {
         let mut browser = Browser::new(bundle(
             r#"<a id="go" href="/about.html"><span id="label">open</span></a><p id="status">home</p><script>
