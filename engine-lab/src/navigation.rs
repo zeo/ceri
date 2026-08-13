@@ -3126,6 +3126,50 @@ mod tests {
     }
 
     #[test]
+    fn browser_keeps_nested_stacking_contexts_atomic_for_paint_and_input() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #low { position: relative; z-index: 1; width: 30px; height: 30px; margin: 0; background: #ff0000; }
+                #low-child { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 100; background: #0000ff; }
+                #high { position: relative; z-index: 2; top: -30px; width: 30px; height: 30px; margin: 0; background: #00ff00; }
+            </style>
+            <div id="low"><div id="low-child"></div></div>
+            <button id="high">high</button>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("low-child").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "low";
+                });
+                document.getElementById("high").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "high";
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("stacking page should load");
+        let viewport = Size {
+            width: 80.0,
+            height: 80.0,
+        };
+        let canvas = browser.paint(viewport).expect("stacking page should paint");
+        let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+        assert!(browser
+            .click_at(viewport, 10.0, 10.0)
+            .expect("stacking click should dispatch"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn browser_scrolls_auto_overflow_and_dispatches_scroll_events() {
         let mut browser = Browser::new(bundle(
             r##"<style>

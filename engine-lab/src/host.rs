@@ -818,6 +818,50 @@ mod tests {
     }
 
     #[test]
+    fn host_routes_clicks_through_atomic_stacking_contexts() {
+        let browser = Browser::new(bundle(
+            r#"<style>
+                #low { position: relative; z-index: 1; width: 30px; height: 30px; margin: 0; }
+                #low-child { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 100; }
+                #high { position: relative; z-index: 2; top: -30px; width: 30px; height: 30px; margin: 0; }
+            </style>
+            <div id="low"><div id="low-child">low</div></div>
+            <button id="high">high</button>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("low-child").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "low";
+                });
+                document.getElementById("high").addEventListener("click", () => {
+                    document.getElementById("status").textContent = "high";
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("stacking page should load");
+        let click = host
+            .input(InputEvent::Click { x: 10.0, y: 10.0 })
+            .expect("stacking click should be accepted");
+        assert!(click.handled);
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn host_routes_text_input_to_the_focused_control() {
         let browser = Browser::new(bundle(
             r#"<input id="name" value="R" style="display: block; width: 180px; height: 32px"><p id="status">idle</p><script>

@@ -3,7 +3,7 @@ use crate::dom::NodePath;
 use crate::image::Image;
 use crate::layout::{
     ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun, paint_order, scrollbar_metrics,
-    translate_rect, visual_offset_for, visual_rect_for,
+    stacking_context_entries, translate_rect, visual_offset_for, visual_rect_for,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -277,8 +277,97 @@ fn paint_box(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
+    paint_context(
+        canvas,
+        layout_box,
+        commands,
+        images,
+        clip,
+        ancestor_offset,
+    );
+}
+
+fn paint_context(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    commands: &[CanvasCommand],
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) {
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
+    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect);
+    let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
+    contexts.sort_by_key(|entry| (entry.z_index, entry.order));
+    for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
+        paint_context(
+            canvas,
+            entry.layout,
+            commands,
+            images,
+            entry.clip,
+            entry.ancestor_offset,
+        );
+    }
+    paint_box_text(canvas, layout_box, content_clip, offset);
+    paint_non_context_children(canvas, layout_box, commands, images, content_clip, offset);
+    paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
+    for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
+        paint_context(
+            canvas,
+            entry.layout,
+            commands,
+            images,
+            entry.clip,
+            entry.ancestor_offset,
+        );
+    }
+    paint_scrollbars(canvas, layout_box, offset, clip);
+}
+
+fn paint_non_context_children(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    commands: &[CanvasCommand],
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) {
+    for index in paint_order(&layout_box.children) {
+        let child = &layout_box.children[index];
+        if child.creates_stacking_context {
+            continue;
+        }
+        paint_non_context_subtree(canvas, child, commands, images, clip, ancestor_offset);
+    }
+}
+
+fn paint_non_context_subtree(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    commands: &[CanvasCommand],
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect);
+    paint_box_text(canvas, layout_box, content_clip, offset);
+    paint_non_context_children(canvas, layout_box, commands, images, content_clip, offset);
+    paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
+    paint_scrollbars(canvas, layout_box, offset, clip);
+}
+
+fn paint_box_surface(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+    offset: (f32, f32),
+    rect: Rect,
+) -> Option<Rect> {
     fill_rect_optional(
         canvas,
         rect.x,
@@ -353,25 +442,33 @@ fn paint_box(
             clip,
         );
     }
+    content_clip
+}
+
+fn paint_box_text(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
     for run in &layout_box.text {
-        paint_text(canvas, run, content_clip, offset);
+        paint_text(canvas, run, clip, offset);
     }
-    for index in paint_order(&layout_box.children) {
-        paint_box(
-            canvas,
-            &layout_box.children[index],
-            commands,
-            images,
-            content_clip,
-            offset,
-        );
+}
+
+fn paint_canvas_commands(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    commands: &[CanvasCommand],
+    clip: Option<Rect>,
+    rect: Rect,
+) {
+    if layout_box.tag != "canvas" {
+        return;
     }
-    if layout_box.tag == "canvas" {
-        for command in commands {
-            paint_canvas_command(canvas, layout_box, command, content_clip, rect);
-        }
+    for command in commands {
+        paint_canvas_command(canvas, layout_box, command, clip, rect);
     }
-    paint_scrollbars(canvas, layout_box, offset, clip);
 }
 
 fn paint_scrollbars(
@@ -705,6 +802,7 @@ mod tests {
                 position: crate::css::Position::Static,
                 visual_offset: (0.0, 0.0),
                 z_index: 0,
+                creates_stacking_context: true,
                 overflow: Overflow::Visible,
                 scroll_content: Size {
                     width: 20.0,
@@ -763,6 +861,7 @@ mod tests {
                         position: crate::css::Position::Static,
                         visual_offset: (0.0, 0.0),
                         z_index: 0,
+                        creates_stacking_context: false,
                         overflow: Overflow::Visible,
                         scroll_content: Size {
                             width: 10.0,
@@ -788,6 +887,7 @@ mod tests {
                         position: crate::css::Position::Static,
                         visual_offset: (0.0, 0.0),
                         z_index: 0,
+                        creates_stacking_context: false,
                         overflow: Overflow::Visible,
                         scroll_content: Size {
                             width: 10.0,
@@ -800,6 +900,7 @@ mod tests {
                 position: crate::css::Position::Static,
                 visual_offset: (0.0, 0.0),
                 z_index: 0,
+                creates_stacking_context: true,
                 overflow: Overflow::Visible,
                 scroll_content: Size {
                     width: 20.0,

@@ -49,6 +49,7 @@ pub struct LayoutBox {
     pub(crate) position: Position,
     pub(crate) visual_offset: (f32, f32),
     pub(crate) z_index: i32,
+    pub(crate) creates_stacking_context: bool,
     pub(crate) overflow: Overflow,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
@@ -268,6 +269,7 @@ pub fn layout_with_state(
         position: Position::Static,
         visual_offset: (0.0, 0.0),
         z_index: 0,
+        creates_stacking_context: true,
         overflow: Overflow::Visible,
         scroll_content: Size {
             width: viewport.width,
@@ -554,6 +556,16 @@ fn hit_test_box(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) -> Option<NodePath> {
+    hit_test_context(layout, x, y, clip, ancestor_offset)
+}
+
+fn hit_test_context(
+    layout: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) -> Option<NodePath> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
@@ -562,25 +574,140 @@ fn hit_test_box(
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
-    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto)
-        || layout.path.is_empty()
-    {
-        intersect_rect(clip, translate_rect(scrollbar_metrics(layout).scrollport, visual_offset))
-    } else {
-        clip
-    };
-    for index in paint_order(&layout.children).into_iter().rev() {
-        if let Some(path) = hit_test_box(
-            &layout.children[index],
+    let mut contexts = stacking_context_entries(layout, clip, ancestor_offset);
+    contexts.sort_by_key(|entry| (entry.z_index, entry.order));
+    for entry in contexts.iter().rev().filter(|entry| entry.z_index >= 0) {
+        if let Some(path) = hit_test_context(
+            entry.layout,
             x,
             y,
-            child_clip,
-            visual_offset,
+            entry.clip,
+            entry.ancestor_offset,
+        ) {
+            return Some(path);
+        }
+    }
+    if let Some(path) = hit_test_non_context_children(layout, x, y, clip, visual_offset) {
+        return Some(path);
+    }
+    for entry in contexts.iter().rev().filter(|entry| entry.z_index < 0) {
+        if let Some(path) = hit_test_context(
+            entry.layout,
+            x,
+            y,
+            entry.clip,
+            entry.ancestor_offset,
         ) {
             return Some(path);
         }
     }
     (inside_layout && !layout.path.is_empty()).then(|| layout.path.clone())
+}
+
+fn hit_test_non_context_children(
+    layout: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+    visual_offset: (f32, f32),
+) -> Option<NodePath> {
+    let child_clip = stacking_child_clip(layout, clip, visual_offset);
+    for index in paint_order(&layout.children).into_iter().rev() {
+        let child = &layout.children[index];
+        if child.creates_stacking_context {
+            continue;
+        }
+        if let Some(path) = hit_test_non_context(child, x, y, child_clip, visual_offset) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn hit_test_non_context(
+    layout: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) -> Option<NodePath> {
+    if let Some(clip) = clip
+        && !contains_point(clip, x, y)
+    {
+        return None;
+    }
+    let visual_offset = visual_offset_for(layout, ancestor_offset);
+    let rect = visual_rect_for(layout, ancestor_offset);
+    if let Some(path) = hit_test_non_context_children(layout, x, y, clip, visual_offset) {
+        return Some(path);
+    }
+    contains_point(rect, x, y)
+        .then(|| (!layout.path.is_empty()).then(|| layout.path.clone()))
+        .flatten()
+}
+
+pub(crate) struct StackingContextEntry<'a> {
+    pub(crate) layout: &'a LayoutBox,
+    pub(crate) clip: Option<Rect>,
+    pub(crate) ancestor_offset: (f32, f32),
+    pub(crate) z_index: i32,
+    pub(crate) order: usize,
+}
+
+pub(crate) fn stacking_context_entries(
+    layout: &LayoutBox,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) -> Vec<StackingContextEntry<'_>> {
+    let mut entries = Vec::new();
+    let mut order = 0;
+    collect_stacking_contexts(
+        layout,
+        clip,
+        ancestor_offset,
+        &mut order,
+        &mut entries,
+    );
+    entries
+}
+
+fn collect_stacking_contexts<'a>(
+    layout: &'a LayoutBox,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+    order: &mut usize,
+    entries: &mut Vec<StackingContextEntry<'a>>,
+) {
+    let visual_offset = visual_offset_for(layout, ancestor_offset);
+    let child_clip = stacking_child_clip(layout, clip, visual_offset);
+    for index in paint_order(&layout.children) {
+        let child = &layout.children[index];
+        let child_order = *order;
+        *order += 1;
+        if child.creates_stacking_context {
+            entries.push(StackingContextEntry {
+                layout: child,
+                clip: child_clip,
+                ancestor_offset: visual_offset,
+                z_index: child.z_index,
+                order: child_order,
+            });
+        } else {
+            collect_stacking_contexts(child, child_clip, visual_offset, order, entries);
+        }
+    }
+}
+
+fn stacking_child_clip(
+    layout: &LayoutBox,
+    clip: Option<Rect>,
+    visual_offset: (f32, f32),
+) -> Option<Rect> {
+    if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.path.is_empty() {
+        intersect_rect(clip, translate_rect(scrollbar_metrics(layout).scrollport, visual_offset))
+    } else {
+        clip
+    }
 }
 
 pub(crate) fn paint_order(children: &[LayoutBox]) -> Vec<usize> {
@@ -968,6 +1095,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
+        creates_stacking_context: creates_stacking_context(style),
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1267,6 +1395,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
+        creates_stacking_context: creates_stacking_context(style),
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1497,6 +1626,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
+        creates_stacking_context: creates_stacking_context(style),
         overflow: style.overflow,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
@@ -1633,6 +1763,11 @@ fn positioned_z_index(style: Style) -> i32 {
     } else {
         0
     }
+}
+
+fn creates_stacking_context(style: Style) -> bool {
+    style.position == Position::Fixed
+        || (style.position != Position::Static && style.z_index.is_some())
 }
 
 fn apply_relative_offset(
@@ -2399,5 +2534,49 @@ mod tests {
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn nested_stacking_contexts_paint_and_hit_test_as_atomic_layers() {
+        let document = Document::parse(
+            "<style>#low { position: relative; z-index: 1; width: 30px; height: 30px; margin: 0; background: #ff0000; } #low-child { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 100; background: #0000ff; } #high { position: relative; z-index: 2; top: -30px; width: 30px; height: 30px; margin: 0; background: #00ff00; }</style><div id='low'><div id='low-child'></div></div><div id='high'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        );
+        let high = &result.root.children[1];
+        assert_eq!(result.hit_test(10.0, 10.0), Some(high.path.clone()));
+        let canvas = result.paint();
+        let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn negative_stacking_layers_stay_behind_in_flow_content() {
+        let document = Document::parse(
+            "<style>#negative { position: absolute; z-index: -1; left: 0; top: 0; width: 30px; height: 30px; margin: 0; background: #0000ff; } #flow { width: 30px; height: 30px; margin: 0; background: #ff0000; }</style><div id='negative'></div><div id='flow'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        );
+        let flow = &result.root.children[0];
+        assert_eq!(result.hit_test(10.0, 10.0), Some(flow.path.clone()));
+        let canvas = result.paint();
+        let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
+        assert_eq!(&pixel[..4], &[255, 0, 0, 255]);
     }
 }
