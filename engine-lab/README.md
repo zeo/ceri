@@ -233,6 +233,8 @@ cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input
 
 The `--text` and `--key` switches feed the same `EngineHost` input boundary used by the optional native window adapter. The window adapter forwards winit keyboard and IME commit events through that boundary.
 
+Text controls also expose the bounded selection surface used by form editors. Text-like `input` elements and `textarea` support `select()`, `selectionStart`, `selectionEnd`, `selectionDirection`, `setSelectionRange()`, and `setRangeText()`. Host text insertion and Backspace, Delete, Home, End, and arrow keys replace or move through the live UTF-16 selection. Modifier-key extension, composition events, document selection ranges, and caret painting remain separate gates.
+
 The grid demo exercises fixed row tracks, fractional columns, repeat syntax, and gaps:
 
 ```powershell
