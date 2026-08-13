@@ -162,6 +162,13 @@ impl Document {
         find_element_by_id(&self.root, id, &mut Vec::new())
     }
 
+    pub fn autofocus_paths(&self) -> Vec<NodePath> {
+        let mut paths = Vec::new();
+        let mut path = Vec::new();
+        collect_autofocus_paths(&self.root, &mut path, &mut paths);
+        paths
+    }
+
     pub fn document_element_path(&self) -> Option<NodePath> {
         self.root
             .children
@@ -849,6 +856,20 @@ fn find_element_by_id(element: &Element, id: &str, path: &mut NodePath) -> Optio
     None
 }
 
+fn collect_autofocus_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        if child.attrs.contains_key("autofocus") {
+            paths.push(path.clone());
+        }
+        collect_autofocus_paths(child, path, paths);
+        path.pop();
+    }
+}
+
 fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
     for (index, child) in element.children.iter().enumerate() {
         let Node::Element(child) = child else {
@@ -1473,6 +1494,18 @@ mod tests {
         assert_eq!(
             document.label_ancestor_path(&[2, 0]),
             Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn collects_autofocus_candidates_in_document_order() {
+        let document = Document::parse(
+            "<main autofocus><input id='first' autofocus><section><button id='second' autofocus>go</button></section></main>",
+        )
+        .expect("autofocus document should parse");
+        assert_eq!(
+            document.autofocus_paths(),
+            vec![vec![0], vec![0, 0], vec![0, 1, 0]]
         );
     }
 

@@ -1679,6 +1679,19 @@ impl ScriptRuntime {
         Ok(true)
     }
 
+    pub(crate) fn apply_autofocus(&mut self) -> Result<bool, ScriptError> {
+        if self.focused_element.is_some() {
+            return Ok(false);
+        }
+        let candidates = self.document.borrow().autofocus_paths();
+        for path in candidates {
+            if self.focus_path(path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn move_focus_sequential(&mut self, backwards: bool) -> Result<bool, ScriptError> {
         let mut entries = Vec::new();
         let mut order = 0usize;
@@ -11977,6 +11990,34 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some(":Rus|blur:null")
         );
+    }
+
+    #[test]
+    fn autofocus_skips_invalid_candidates_and_preserves_existing_focus() {
+        let first_document = document(
+            r#"<div autofocus>ignored</div><input id="disabled" autofocus disabled><input id="first" autofocus><button id="second" autofocus>second</button>"#,
+        );
+        let mut runtime = ScriptRuntime::new(first_document.clone());
+        assert!(runtime
+            .apply_autofocus()
+            .expect("autofocus should focus the first valid candidate"));
+        assert_eq!(runtime.active_element(), Some(vec![2]));
+        assert!(!runtime
+            .apply_autofocus()
+            .expect("autofocus should not replace existing focus"));
+
+        let manual_document = document(
+            r#"<input id="first" autofocus><button id="second">second</button>"#,
+        );
+        let mut manual_runtime = ScriptRuntime::new(manual_document.clone());
+        manual_runtime
+            .execute("document.getElementById(\"second\").focus();")
+            .expect("script focus should execute");
+        assert_eq!(manual_runtime.active_element(), Some(vec![1]));
+        assert!(!manual_runtime
+            .apply_autofocus()
+            .expect("autofocus should preserve script focus"));
+        assert_eq!(manual_runtime.active_element(), Some(vec![1]));
     }
 
     #[test]

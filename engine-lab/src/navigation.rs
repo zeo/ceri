@@ -996,6 +996,13 @@ impl Browser {
             self.commit_new_document(url, commit);
             return Ok(NavigationStatus::ErrorPage { status });
         }
+        if let Err(error) = runtime.apply_autofocus() {
+            let error = NavigationError::Script(error.to_string());
+            let status = recovery_status(&error);
+            self.install_error_page(&url, status, &error.to_string());
+            self.commit_new_document(url, commit);
+            return Ok(NavigationStatus::ErrorPage { status });
+        }
 
         let pending_navigation = runtime.take_navigation_request();
         self.page = Some(Page {
@@ -2862,6 +2869,29 @@ mod tests {
         assert!(browser
             .click_id("name-label")
             .expect("label click should activate the input"));
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("focused:name")
+        );
+    }
+
+    #[test]
+    fn navigation_applies_autofocus_after_script_startup_without_a_loopback_server() {
+        let mut browser = Browser::new(bundle(
+            r#"<div autofocus>ignored</div><input id="name" autofocus><p id="status">idle</p><script>
+                document.getElementById("name").addEventListener("focus", () => {
+                    document.getElementById("status").textContent = "focused:" + document.activeElement.id;
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("autofocus page should load");
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
