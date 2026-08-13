@@ -323,6 +323,105 @@ pub trait ResourceProvider {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePickerRequest {
+    name: String,
+    multiple: bool,
+    accept: Option<String>,
+}
+
+impl FilePickerRequest {
+    pub fn new(
+        name: impl Into<String>,
+        multiple: bool,
+        accept: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            multiple,
+            accept,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn multiple(&self) -> bool {
+        self.multiple
+    }
+
+    pub fn accept(&self) -> Option<&str> {
+        self.accept.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSelection {
+    name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    last_modified: i64,
+}
+
+impl FileSelection {
+    pub fn new(
+        name: impl Into<String>,
+        mime_type: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+        last_modified: i64,
+    ) -> Result<Self, NavigationError> {
+        let name = name.into();
+        if name.is_empty()
+            || matches!(name.as_str(), "." | "..")
+            || name
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        {
+            return Err(NavigationError::InvalidFileName(name));
+        }
+        if last_modified < 0 {
+            return Err(NavigationError::InvalidFileMetadata);
+        }
+        let mime_type = mime_type.into();
+        if !mime_type
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return Err(NavigationError::InvalidFileMimeType);
+        }
+        Ok(Self {
+            name,
+            mime_type: mime_type.to_ascii_lowercase(),
+            bytes: bytes.into(),
+            last_modified,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn last_modified(&self) -> i64 {
+        self.last_modified
+    }
+}
+
+pub trait FilePicker {
+    fn pick_files(
+        &self,
+        request: &FilePickerRequest,
+    ) -> Result<Option<Vec<FileSelection>>, NavigationError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResourceBundle {
     resources: BTreeMap<String, Resource>,
@@ -434,6 +533,9 @@ pub enum NavigationError {
     Colon,
     UnsafeCharacter,
     UnsafeWindowsName,
+    InvalidFileName(String),
+    InvalidFileMimeType,
+    InvalidFileMetadata,
     DotSegment,
     EmptySegment,
     InvalidResourcePath(String),
@@ -445,6 +547,7 @@ pub enum NavigationError {
     HttpStatus { path: String, status: u16 },
     ResourceNotFound(String),
     ResourceProvider(String),
+    FilePicker(String),
     UnsupportedMimeType { path: String, mime_type: String },
     InvalidUtf8(String),
     Script(String),
@@ -474,6 +577,15 @@ impl fmt::Display for NavigationError {
             Self::UnsafeWindowsName => {
                 formatter.write_str("unsafe Windows path names are not allowed")
             }
+            Self::InvalidFileName(name) => {
+                write!(formatter, "invalid selected file name: {name}")
+            }
+            Self::InvalidFileMimeType => {
+                formatter.write_str("selected file MIME type contains invalid bytes")
+            }
+            Self::InvalidFileMetadata => {
+                formatter.write_str("selected file metadata is invalid")
+            }
             Self::DotSegment => formatter.write_str("dot segments are not allowed in app paths"),
             Self::EmptySegment => formatter.write_str("empty path segments are not allowed"),
             Self::InvalidResourcePath(path) => write!(formatter, "invalid resource path: {path}"),
@@ -497,6 +609,7 @@ impl fmt::Display for NavigationError {
             }
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
             Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
+            Self::FilePicker(detail) => write!(formatter, "file picker failed: {detail}"),
             Self::UnsupportedMimeType { path, mime_type } => {
                 write!(
                     formatter,
@@ -519,7 +632,7 @@ const MAX_NAVIGATION_REDIRECTS: usize = 16;
 fn recovery_status(error: &NavigationError) -> u16 {
     match error {
         NavigationError::HttpStatus { status, .. } => *status,
-        NavigationError::ResourceProvider(_) => 503,
+        NavigationError::ResourceProvider(_) | NavigationError::FilePicker(_) => 503,
         _ => 500,
     }
 }
@@ -614,6 +727,7 @@ enum HistoryCommit {
 pub struct Browser {
     resources: ResourceBundle,
     resource_provider: Option<Rc<dyn ResourceProvider>>,
+    file_picker: Option<Rc<dyn FilePicker>>,
     last_navigation_failure: Option<NavigationFailure>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
@@ -634,6 +748,7 @@ impl Browser {
         Self {
             resources,
             resource_provider: None,
+            file_picker: None,
             last_navigation_failure: None,
             page: None,
             current_url: None,
@@ -657,6 +772,11 @@ impl Browser {
         let mut browser = Self::new(resources);
         browser.resource_provider = Some(resource_provider);
         browser
+    }
+
+    pub fn with_file_picker(mut self, file_picker: Rc<dyn FilePicker>) -> Self {
+        self.file_picker = Some(file_picker);
+        self
     }
 
     pub fn with_host_runtime_info(mut self, info: HostRuntimeInfo) -> Self {
@@ -848,6 +968,7 @@ impl Browser {
             self.session_storage.clone(),
             self.host_runtime_info.clone(),
         );
+        runtime.set_file_picker(self.file_picker.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -2024,6 +2145,55 @@ mod tests {
         multipart: bool,
     }
 
+    struct UploadProvider {
+        requests: Rc<RefCell<Vec<ResourceRequest>>>,
+    }
+
+    impl ResourceProvider for UploadProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            self.requests.borrow_mut().push(request.clone());
+            match (request.method(), request.url().path()) {
+                ("GET", "/") => ResourceResponse::new(
+                    200,
+                    "text/html",
+                    BTreeMap::new(),
+                    br#"<form action="/upload" method="post" enctype="multipart/form-data"><input id="file" name="upload" type="file" accept="text/plain"><button id="submit" type="submit">send</button></form><p id="status">idle</p><script>const input = document.getElementById("file"); const status = document.getElementById("status"); input.addEventListener("change", () => { const file = input.files.item(0); status.textContent = input.files.length + "|" + file.name + "|" + file.type + "|" + file.lastModified; });</script>"#.to_vec(),
+                )
+                .map(Some),
+                ("POST", "/upload") => ResourceResponse::new(
+                    200,
+                    "text/html",
+                    BTreeMap::new(),
+                    br#"<p id="status">uploaded</p>"#.to_vec(),
+                )
+                .map(Some),
+                _ => Ok(None),
+            }
+        }
+    }
+
+    struct StaticFilePicker {
+        requests: Rc<RefCell<Vec<FilePickerRequest>>>,
+        selection: Option<Vec<FileSelection>>,
+    }
+
+    impl FilePicker for StaticFilePicker {
+        fn pick_files(
+            &self,
+            request: &FilePickerRequest,
+        ) -> Result<Option<Vec<FileSelection>>, NavigationError> {
+            self.requests.borrow_mut().push(request.clone());
+            Ok(self.selection.clone())
+        }
+    }
+
     impl ResourceProvider for FormProvider {
         fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
             Ok(None)
@@ -2933,6 +3103,71 @@ mod tests {
         assert!(body.contains("Content-Disposition: form-data; name=\"q\""));
         assert!(body.contains("\r\n\r\nrust browser\r\n"));
         assert!(body.ends_with("------ceri-form-data-boundary--\r\n"));
+    }
+
+    #[test]
+    fn file_picker_selection_reaches_file_list_and_multipart_submission() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let picker_requests = Rc::new(RefCell::new(Vec::new()));
+        let selection = FileSelection::new(
+            "report.txt",
+            "text/plain",
+            b"file payload".to_vec(),
+            123,
+        )
+        .expect("file selection should be valid");
+        let picker = Rc::new(StaticFilePicker {
+            requests: picker_requests.clone(),
+            selection: Some(vec![selection]),
+        });
+        let provider = Rc::new(UploadProvider {
+            requests: requests.clone(),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider)
+            .with_file_picker(picker);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("upload page should load");
+        assert!(browser.click_id("file").expect("file picker should activate"));
+        let document = browser.document().expect("upload document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|report.txt|text/plain|123")
+        );
+        let picker_requests = picker_requests.borrow();
+        assert_eq!(picker_requests.len(), 1);
+        assert_eq!(picker_requests[0].name(), "upload");
+        assert!(!picker_requests[0].multiple());
+        assert_eq!(picker_requests[0].accept(), Some("text/plain"));
+        drop(picker_requests);
+
+        assert!(browser.click_id("submit").expect("upload should submit"));
+        let document = browser.document().expect("upload result should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("upload result status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("uploaded")
+        );
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method(), "POST");
+        assert_eq!(
+            requests[1].headers().get("content-type"),
+            Some(&"multipart/form-data; boundary=----ceri-form-data-boundary".to_string())
+        );
+        let body = String::from_utf8(requests[1].body().to_vec())
+            .expect("text upload body should be UTF-8");
+        assert!(body.contains(
+            "Content-Disposition: form-data; name=\"upload\"; filename=\"report.txt\""
+        ));
+        assert!(body.contains("Content-Type: text/plain\r\n\r\nfile payload\r\n"));
     }
 
     #[test]

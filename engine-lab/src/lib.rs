@@ -21,7 +21,8 @@ pub use host::{
 pub use layout::{LayoutDocument, Rect, Size, layout};
 pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, NavigationError, NavigationFailure, NavigationStatus, Resource,
-    ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
+    FilePicker, FilePickerRequest, FileSelection, ResourceBundle, ResourceCacheMode,
+    ResourceProvider, ResourceRequest, ResourceResponse,
 };
 #[cfg(feature = "native-http")]
 pub use native_http::NativeHttpProvider;

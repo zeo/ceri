@@ -2,7 +2,8 @@ use crate::dom::{Document, Element, Node, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
     is_http_redirect, is_javascript, is_json, AppUrl, NavigationError, Resource, ResourceBundle,
-    ResourceCacheMode, normalize_headers, ResourceProvider, ResourceRequest, ResourceResponse,
+    FilePicker, FilePickerRequest, ResourceCacheMode, normalize_headers, ResourceProvider,
+    ResourceRequest, ResourceResponse,
     APP_ORIGIN,
 };
 use crate::paint::CanvasCommand;
@@ -43,6 +44,7 @@ pub(crate) type StorageHandle = Rc<RefCell<StorageData>>;
 type FormDataHandle = Rc<RefCell<FormDataData>>;
 type BlobHandle = Rc<BlobData>;
 type FileHandle = Rc<FileData>;
+type FileListHandle = Rc<Vec<FileHandle>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
@@ -107,6 +109,7 @@ enum Value {
     FormData(FormDataHandle),
     Blob(BlobHandle),
     File(FileHandle),
+    FileList(FileListHandle),
     CanvasContext(CanvasContextHandle),
     AbortController(AbortControllerHandle),
     AbortSignal(AbortSignalHandle),
@@ -196,6 +199,7 @@ enum Builtin {
     FileSlice(FileHandle),
     FileText(FileHandle),
     FileBytes(FileHandle),
+    FileListItem(FileListHandle),
     JsonParse,
     JsonStringify,
     SetTimeout,
@@ -491,6 +495,9 @@ pub struct ScriptRuntime {
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
+    selected_files: HashMap<NodePath, Vec<FileHandle>>,
+    file_lists: RefCell<HashMap<NodePath, FileListHandle>>,
+    file_picker: Option<Rc<dyn FilePicker>>,
     scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     canvas_contexts: HashMap<NodePath, CanvasContextHandle>,
     canvas_commands: Vec<CanvasCommand>,
@@ -1242,6 +1249,9 @@ impl ScriptRuntime {
             focused_element: None,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
+            selected_files: HashMap::new(),
+            file_lists: RefCell::new(HashMap::new()),
+            file_picker: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
             canvas_commands: Vec::new(),
@@ -1279,6 +1289,10 @@ impl ScriptRuntime {
                 self.pump_workers().map(|_| ())
             }
         }
+    }
+
+    pub(crate) fn set_file_picker(&mut self, file_picker: Option<Rc<dyn FilePicker>>) {
+        self.file_picker = file_picker;
     }
 
     pub(crate) fn execute_module<L: ModuleSourceLoader>(
@@ -1661,6 +1675,7 @@ impl ScriptRuntime {
             .map(|kind| kind.to_ascii_lowercase())
             .unwrap_or_default();
         let changed = match input_type.as_str() {
+            "file" => self.apply_file_picker(path, &element)?,
             "checkbox" => {
                 let checked = self.control_checked_path(path);
                 self.control_checked.insert(path.to_vec(), !checked);
@@ -1687,6 +1702,65 @@ impl ScriptRuntime {
             self.drain_microtasks()?;
         }
         Ok(())
+    }
+
+    fn apply_file_picker(
+        &mut self,
+        path: &[usize],
+        element: &Element,
+    ) -> Result<bool, ScriptError> {
+        let Some(file_picker) = self.file_picker.clone() else {
+            return Ok(false);
+        };
+        let request = FilePickerRequest::new(
+            element.attr("name").unwrap_or_default(),
+            element.attr("multiple").is_some(),
+            element.attr("accept").map(str::to_string),
+        );
+        let Some(selected) = file_picker
+            .pick_files(&request)
+            .map_err(|error| runtime_error(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        if !request.multiple() && selected.len() > 1 {
+            return Err(runtime_error(
+                "file picker returned multiple files for a single-file control",
+            ));
+        }
+        let files = selected
+            .into_iter()
+            .map(|file| {
+                Rc::new(FileData {
+                    bytes: file.bytes().to_vec(),
+                    mime_type: file.mime_type().to_string(),
+                    name: file.name().to_string(),
+                    last_modified: file.last_modified(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let changed = match self.selected_files.get(path) {
+            Some(current) => !file_lists_equal(current, &files),
+            None => !files.is_empty(),
+        };
+        if !changed {
+            return Ok(false);
+        }
+        let value = files
+            .first()
+            .map(|file| format!("C:\\fakepath\\{}", file.name))
+            .unwrap_or_default();
+        self.selected_files.insert(path.to_vec(), files);
+        let files = self
+            .selected_files
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        self.file_lists
+            .borrow_mut()
+            .insert(path.to_vec(), Rc::new(files));
+        self.control_values.insert(path.to_vec(), value);
+        Ok(true)
     }
 
     fn submit_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
@@ -2393,6 +2467,7 @@ impl ScriptRuntime {
                         .element_inner_html(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "files" => self.element_files(&handle),
                     "value" => self
                         .element_value(&handle)
                         .map(Value::String)
@@ -2626,6 +2701,11 @@ impl ScriptRuntime {
                 }
                 "forEach" => Ok(Value::Builtin(Builtin::FormDataForEach(form_data))),
                 _ => Err(runtime_error(format!("FormData has no property {property}"))),
+            },
+            Value::FileList(files) => match property {
+                "length" => Ok(Value::Number(files.len() as f64)),
+                "item" => Ok(Value::Builtin(Builtin::FileListItem(files))),
+                _ => Err(runtime_error(format!("FileList has no property {property}"))),
             },
             Value::Worker(worker) => {
                 let handle = worker.clone();
@@ -2944,6 +3024,17 @@ impl ScriptRuntime {
                     .get(index as usize)
                     .cloned()
                     .map(Value::Element)
+                    .unwrap_or(Value::Undefined))
+            }
+            Value::FileList(files) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(files
+                    .get(index as usize)
+                    .cloned()
+                    .map(Value::File)
                     .unwrap_or(Value::Undefined))
             }
             Value::String(string) => {
@@ -3455,6 +3546,38 @@ impl ScriptRuntime {
         }
     }
 
+    fn element_files(&self, handle: &ElementHandle) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::Null;
+        };
+        let is_file = self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_some_and(|element| {
+                element.name == "input"
+                    && element
+                        .attr("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
+            });
+        if !is_file {
+            return Value::Null;
+        }
+        let mut file_lists = self.file_lists.borrow_mut();
+        let files = file_lists
+            .entry(path.clone())
+            .or_insert_with(|| {
+                Rc::new(
+                    self.selected_files
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .clone();
+        Value::FileList(files)
+    }
+
     fn element_checked(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => self.control_checked_path(&path),
@@ -3465,6 +3588,25 @@ impl ScriptRuntime {
     fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => {
+                let is_file = self
+                    .document
+                    .borrow()
+                    .element_clone(&path)
+                    .is_some_and(|element| {
+                        element.name == "input"
+                            && element
+                                .attr("type")
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
+                    });
+                if is_file {
+                    if !value.is_empty() {
+                        return false;
+                    }
+                    self.selected_files.remove(&path);
+                    self.file_lists
+                        .borrow_mut()
+                        .insert(path.clone(), Rc::new(Vec::new()));
+                }
                 self.control_values.insert(path, value);
                 true
             }
@@ -3819,6 +3961,28 @@ impl ScriptRuntime {
                 .map(|kind| kind.to_ascii_lowercase())
                 .unwrap_or_default();
             if matches!(input_type.as_str(), "button" | "file" | "reset" | "submit") {
+                if input_type == "file" {
+                    let files = self
+                        .selected_files
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_default();
+                    if files.is_empty() {
+                        pairs.push((
+                            name.to_string(),
+                            FormDataEntry::File(Rc::new(FileData {
+                                bytes: Vec::new(),
+                                mime_type: "application/octet-stream".to_string(),
+                                name: String::new(),
+                                last_modified: 0,
+                            })),
+                        ));
+                    } else {
+                        for file in files {
+                            pairs.push((name.to_string(), FormDataEntry::File(file)));
+                        }
+                    }
+                }
                 continue;
             }
             if matches!(input_type.as_str(), "checkbox" | "radio")
@@ -5205,6 +5369,21 @@ impl ScriptRuntime {
             Builtin::FileBytes(file) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
                 Rc::new(file.bytes.clone()),
             )))),
+            Builtin::FileListItem(files) => {
+                let index = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(-1.0);
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Null);
+                }
+                Ok(files
+                    .get(index as usize)
+                    .cloned()
+                    .map(Value::File)
+                    .unwrap_or(Value::Null))
+            }
             Builtin::JsonParse => {
                 let source = arguments
                     .first()
@@ -6499,6 +6678,7 @@ impl Value {
             Self::FormData(_) => "[object FormData]".to_string(),
             Self::Blob(_) => "[object Blob]".to_string(),
             Self::File(_) => "[object File]".to_string(),
+            Self::FileList(_) => "[object FileList]".to_string(),
             Self::CanvasContext(_) => "[object CanvasRenderingContext2D]".to_string(),
             Self::AbortController(_) => "[object AbortController]".to_string(),
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
@@ -7027,6 +7207,16 @@ fn normalize_file_name(value: &str) -> String {
         .to_string()
 }
 
+fn file_lists_equal(left: &[FileHandle], right: &[FileHandle]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name
+                && left.mime_type == right.mime_type
+                && left.last_modified == right.last_modified
+                && left.bytes == right.bytes
+        })
+}
+
 fn form_data_filename(value: Option<&Value>) -> Option<String> {
     value
         .map(Value::resolve)
@@ -7475,6 +7665,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::FormData(_)
         | Value::Blob(_)
         | Value::File(_)
+        | Value::FileList(_)
         | Value::CanvasContext(_)
         | Value::AbortController(_)
         | Value::AbortSignal(_)
@@ -7545,6 +7736,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),
+        (Value::FileList(left), Value::FileList(right)) => Rc::ptr_eq(left, right),
         (Value::CanvasContext(left), Value::CanvasContext(right)) => Rc::ptr_eq(left, right),
         (Value::AbortController(left), Value::AbortController(right)) => Rc::ptr_eq(left, right),
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
@@ -10604,6 +10796,35 @@ mod tests {
             .execute("document.getElementById(\"profile\").requestSubmit();")
             .expect_err("unsupported form encodings should fail explicitly");
         assert_eq!(error.message, "unsupported form enctype application/json");
+    }
+
+    #[test]
+    fn form_data_includes_an_empty_file_entry_without_a_selection() {
+        let document = document(
+            r#"<form id="profile"><input id="file" name="upload" type="file"></form><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const file = new FormData(document.getElementById("profile")).get("upload");
+                document.getElementById("status").textContent = file.name + "|" + file.type + "|" + file.size;
+                "#,
+            )
+            .expect("empty file entry should be available");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("|application/octet-stream|0")
+        );
+
+        let error = runtime
+            .execute("document.getElementById(\"file\").value = \"chosen.txt\";")
+            .expect_err("file input values cannot be assigned a path");
+        assert_eq!(error.message, "property value is not writable");
     }
 
     #[test]

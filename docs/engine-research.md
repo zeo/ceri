@@ -53,7 +53,7 @@ The selector slice now accepts top-level selector lists in stylesheets and DOM q
 
 Form activation now carries `POST` submissions through the typed `ResourceProvider` seam. The engine serializes named controls as `application/x-www-form-urlencoded`, keeps the request off any loopback listener, follows bounded same-origin redirects with the standard 301, 302, 303, 307, and 308 method rules, and parses the final HTML as a new history document. Packaged-only POST actions resolve to an engine-owned 503 recovery page because there is no transport boundary to receive them.
 
-The same form path now accepts `enctype="multipart/form-data"` and reuses the deterministic multipart encoder already used by script-created `FormData` requests. Text fields preserve order, quoted parameter escaping, and collision-safe boundaries. File picker state and native file selection remain separate platform work.
+The same form path now accepts `enctype="multipart/form-data"` and reuses the deterministic multipart encoder already used by script-created `FormData` requests. Text fields preserve order, quoted parameter escaping, and collision-safe boundaries. A host-owned `FilePicker` supplies validated file names, MIME types, bytes, and modification times without exposing filesystem paths to the renderer. File controls expose `files`, `FileList.item()`, the standard fake path display value, input and change events, picker cancellation, and multipart `File` entries, including the empty-file entry when no file is selected.
 
 The current fetch experiment includes shared single-use response bodies, `arrayBuffer()`, `blob()`, `formData()`, `clone()`, `follow`/`manual`/`error` redirect modes with final URL state, a bounded `Request` constructor with URL, method, headers, cache, redirect, signal, `bodyUsed`, body cloning, single-use text, blob, formData, or byte reads, and string, `ArrayBuffer`, `Blob`, `File`, `URLSearchParams`, or `FormData` bodies with inferred content types, a bounded `Response` constructor with status, status text, type, mutable script-created headers, `Response.json()`, `Response.error()`, same-origin `Response.redirect()`, and immutable fetched headers, mutable request `Headers` with constructor, `append()`, `set()`, `delete()`, `get()`, `has()`, key, value, and entry iterators, `forEach()`, and normalized response headers. Immutable `Blob` and `File` values support byte-part construction, MIME type normalization, file names and timestamps, slicing, text and `ArrayBuffer` reads, and request or response body integration. FormData bodies use deterministic multipart encoding with ordered text and File entries, filenames, per-file content types, and a collision-safe boundary. `formData()` parses `application/x-www-form-urlencoded` and deterministic `multipart/form-data` bodies into ordered text and File entries. It also has one stable response stream object, a bounded default `ReadableStream` reader with deterministic byte chunks, and `tee()` branches that lock the source body. Full stream backpressure, BYOB readers, and wiring native transport into a production navigation queue remain separate gates.
 
@@ -92,7 +92,7 @@ An experimental backend must pass these gates in order:
 
 - audio and video playback
 - MSE and WebRTC capability reporting
-- clipboard and file-pick boundaries
+- clipboard boundary and native file-picker UI adapter
 - accessibility tree delivery
 - popup, permission, fullscreen, download, and authentication decisions
 - crash, reload, and recovery behavior
@@ -117,6 +117,8 @@ The default custom renderer remains headless and does not open a loopback listen
 
 The experiment is useful even when a gate fails. A failure at a named gate tells us whether Ceri's stable contract is missing an abstraction. A passing slice gives us a measured basis for deciding whether to grow the custom engine or use Servo for that layer.
 
+The file-input boundary now sits beside that headless form path. A host-owned `FilePicker` returns validated file metadata and bytes, while `input.files` exposes a bounded `FileList` view and multipart submission preserves the selected `File` entries. The renderer sees a fake path display value and never receives the host filesystem path.
+
 The future-gate list treats full WebAssembly compatibility as unfinished. The bounded i32 module path above is a separate tested slice and does not change that boundary.
 
 ## Sources
@@ -130,6 +132,8 @@ The future-gate list treats full WebAssembly compatibility as unfinished. The bo
 - [WPE WebKit](https://webkit.org/wpe/)
 - [WHATWG HTML Standard, Web workers](https://html.spec.whatwg.org/multipage/workers.html)
 - [WHATWG HTML Standard, forms](https://html.spec.whatwg.org/multipage/forms.html)
+- [WHATWG HTML Standard, form control infrastructure](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html)
+- [W3C File API](https://w3c.github.io/FileAPI/)
 - [WPE FAQ](https://wpewebkit.org/about/faq.html)
 - [WebKit ports](https://docs.webkit.org/Ports/Introduction.html)
 - [SpiderMonkey](https://spidermonkey.dev/)
