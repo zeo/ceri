@@ -899,6 +899,9 @@ pub(crate) enum NavigationRequest {
         reference: String,
         replace_history: bool,
     },
+    Submit {
+        request: ResourceRequest,
+    },
     PushState {
         reference: String,
         state: String,
@@ -4153,11 +4156,11 @@ impl ScriptRuntime {
             .ok_or_else(|| runtime_error("form is no longer in the document"))?;
         let method = form
             .attr("method")
-            .map(|method| method.to_ascii_lowercase())
+            .map(|method| method.trim().to_ascii_lowercase())
             .unwrap_or_else(|| "get".to_string());
-        if method != "get" {
+        if !matches!(method.as_str(), "get" | "post") {
             return Err(runtime_error(
-                "only GET form submission is available in the packaged engine",
+                "only GET and POST form submission are available in the packaged engine",
             ));
         }
         let Value::FormData(form_data) = self.construct_form_data(vec![Value::Element(
@@ -4170,7 +4173,7 @@ impl ScriptRuntime {
             .clone()
             .ok_or_else(|| runtime_error("form submission requires a document URL"))?;
         let action = form.attr("action").unwrap_or("");
-        let mut url = base
+        let url = base
             .resolve(action)
             .map_err(|error| runtime_error(error.to_string()))?;
         let pairs = form_data
@@ -4183,15 +4186,28 @@ impl ScriptRuntime {
             })
             .collect::<Vec<_>>();
         let encoded = serialize_form_urlencoded(&pairs);
-        if !encoded.is_empty() {
-            let query = if url.query().is_empty() {
-                encoded
+        if method == "get" {
+            let url = if encoded.is_empty() {
+                url
             } else {
-                format!("{}&{encoded}", url.query())
+                let query = if url.query().is_empty() {
+                    encoded
+                } else {
+                    format!("{}&{encoded}", url.query())
+                };
+                url.with_query_fragment(query, url.fragment().to_string())
             };
-            url = url.with_query_fragment(query, url.fragment().to_string());
+            self.request_location_navigation(url.to_string(), false);
+        } else {
+            let mut headers = BTreeMap::new();
+            headers.insert(
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            );
+            let request = ResourceRequest::new(url, "POST", headers, encoded.into_bytes())
+                .map_err(|error| runtime_error(error.to_string()))?;
+            self.queue_navigation(NavigationRequest::Submit { request });
         }
-        self.request_location_navigation(url.to_string(), false);
         Ok(())
     }
 

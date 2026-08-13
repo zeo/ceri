@@ -256,7 +256,7 @@ The form demo exercises named controls, `FormData`, and a cancellable submit eve
 cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/form-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-form-demo.bmp --click submit
 ```
 
-The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, applies cancellable checkbox click defaults, and resolves a GET action back into the packaged app origin with URL-encoded pairs. POST bodies and external network transport remain outside this slice.
+The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, applies cancellable checkbox click defaults, and resolves GET actions back into the packaged app origin with URL-encoded query pairs. POST actions encode the same controls as `application/x-www-form-urlencoded` through the host-owned `ResourceProvider`, then follow bounded same-origin redirects before parsing the returned HTML. A POST action requires a provider, so the default packaged bundle never opens a listener or silently invents a transport.
 
 The canvas demo exercises the first drawing surface without a GPU or webview:
 

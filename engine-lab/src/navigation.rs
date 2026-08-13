@@ -528,15 +528,15 @@ fn load_provider_resource(
     provider: &dyn ResourceProvider,
     url: &AppUrl,
 ) -> Result<Option<(AppUrl, Resource)>, NavigationError> {
-    load_provider_resource_at(provider, url, 0)
+    load_provider_request_at(provider, &ResourceRequest::get(url.clone()), 0)
 }
 
-fn load_provider_resource_at(
+fn load_provider_request_at(
     provider: &dyn ResourceProvider,
-    url: &AppUrl,
+    request: &ResourceRequest,
     redirect_depth: usize,
 ) -> Result<Option<(AppUrl, Resource)>, NavigationError> {
-    let Some(response) = provider.provide_response(&ResourceRequest::get(url.clone()))? else {
+    let Some(response) = provider.provide_response(request)? else {
         return Ok(None);
     };
     if is_http_redirect(response.status()) {
@@ -545,23 +545,49 @@ fn load_provider_resource_at(
         }
         let Some(location) = response.headers().get("location") else {
             return Err(NavigationError::HttpStatus {
-                path: url.path().to_string(),
+                path: request.url().path().to_string(),
                 status: response.status(),
             });
         };
-        let target = url.resolve(location)?;
-        return load_provider_resource_at(provider, &target, redirect_depth + 1);
+        let target = request.url().resolve(location)?;
+        let request = redirect_navigation_request(request, target, response.status())?;
+        return load_provider_request_at(provider, &request, redirect_depth + 1);
     }
     if !(200..300).contains(&response.status()) {
         return Err(NavigationError::HttpStatus {
-            path: url.path().to_string(),
+            path: request.url().path().to_string(),
             status: response.status(),
         });
     }
     Ok(Some((
-        url.clone(),
+        request.url().clone(),
         Resource::new(response.mime_type().to_string(), response.body().to_vec()),
     )))
+}
+
+fn redirect_navigation_request(
+    request: &ResourceRequest,
+    target: AppUrl,
+    status: u16,
+) -> Result<ResourceRequest, NavigationError> {
+    let rewrite_to_get = match status {
+        303 => !matches!(request.method(), "GET" | "HEAD"),
+        301 | 302 => request.method() == "POST",
+        _ => false,
+    };
+    let (method, body) = if rewrite_to_get {
+        ("GET", Vec::new())
+    } else {
+        (request.method(), request.body().to_vec())
+    };
+    let mut headers = request.headers().clone();
+    if rewrite_to_get {
+        headers.remove("content-length");
+        headers.remove("content-type");
+    }
+    let cache_mode = request.cache_mode().clone();
+    ResourceRequest::new(target, method, headers, body)
+        .map(|request| request.with_cache_mode(cache_mode))
 }
 
 pub(crate) fn is_http_redirect(status: u16) -> bool {
@@ -673,6 +699,27 @@ impl Browser {
         }
     }
 
+    fn load_navigation_request(
+        &self,
+        request: &ResourceRequest,
+    ) -> Result<LoadedResource, NavigationError> {
+        if request.method() == "GET" {
+            return self.load_resource(request.url());
+        }
+        let Some(provider) = &self.resource_provider else {
+            return Err(NavigationError::ResourceProvider(
+                "non-GET navigation requires a resource provider".to_string(),
+            ));
+        };
+        let Some((url, resource)) = load_provider_request_at(provider.as_ref(), request, 0)?
+        else {
+            return Err(NavigationError::ResourceNotFound(
+                request.url().path().to_string(),
+            ));
+        };
+        Ok(LoadedResource { url, resource })
+    }
+
     fn load_subresource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
         self.load_subresource_with_url(url)
             .map(|loaded| loaded.resource)
@@ -717,25 +764,39 @@ impl Browser {
         commit: HistoryCommit,
         redirect_depth: usize,
     ) -> Result<NavigationStatus, NavigationError> {
+        self.navigate_request(ResourceRequest::get(url), commit, redirect_depth)
+    }
+
+    fn navigate_request(
+        &mut self,
+        request: ResourceRequest,
+        commit: HistoryCommit,
+        redirect_depth: usize,
+    ) -> Result<NavigationStatus, NavigationError> {
+        let requested_url = request.url().clone();
         let LoadedResource {
             url,
             resource,
-        } = match self.load_resource(&url) {
+        } = match self.load_navigation_request(&request) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
-                self.install_error_page(&url, 404, &format!("resource not found: {path}"));
-                self.commit_new_document(url, commit);
+                self.install_error_page(
+                    &requested_url,
+                    404,
+                    &format!("resource not found: {path}"),
+                );
+                self.commit_new_document(requested_url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 404 });
             }
             Err(error @ NavigationError::HttpStatus { .. }) => {
                 let status = recovery_status(&error);
-                self.install_error_page(&url, status, &error.to_string());
-                self.commit_new_document(url, commit);
+                self.install_error_page(&requested_url, status, &error.to_string());
+                self.commit_new_document(requested_url, commit);
                 return Ok(NavigationStatus::ErrorPage { status });
             }
             Err(error @ NavigationError::ResourceProvider(_)) => {
-                self.install_error_page(&url, 503, &error.to_string());
-                self.commit_new_document(url, commit);
+                self.install_error_page(&requested_url, 503, &error.to_string());
+                self.commit_new_document(requested_url, commit);
                 return Ok(NavigationStatus::ErrorPage { status: 503 });
             }
             Err(error) => return Err(error),
@@ -1135,6 +1196,13 @@ impl Browser {
                 };
                 self.navigate_url(url, commit, redirect_depth + 1)
             }
+            NavigationRequest::Submit { request } => self.navigate_request(
+                request,
+                HistoryCommit::Push {
+                    state: "null".to_string(),
+                },
+                redirect_depth + 1,
+            ),
             NavigationRequest::PushState { reference, state } => {
                 self.apply_state_navigation(reference, state, false)?;
                 Ok(NavigationStatus::Loaded)
@@ -1951,6 +2019,45 @@ mod tests {
         }
     }
 
+    struct FormProvider {
+        requests: Rc<RefCell<Vec<ResourceRequest>>>,
+    }
+
+    impl ResourceProvider for FormProvider {
+        fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+            Ok(None)
+        }
+
+        fn provide_response(
+            &self,
+            request: &ResourceRequest,
+        ) -> Result<Option<ResourceResponse>, NavigationError> {
+            self.requests.borrow_mut().push(request.clone());
+            match (request.method(), request.url().path()) {
+                ("GET", "/") => ResourceResponse::new(
+                    200,
+                    "text/html",
+                    BTreeMap::new(),
+                    br#"<form action="/submit" method="post"><input name="q" value="rust browser"><button id="submit" type="submit">send</button></form>"#.to_vec(),
+                )
+                .map(Some),
+                ("POST", "/submit") => {
+                    let mut headers = BTreeMap::new();
+                    headers.insert("Location".to_string(), "/result.html".to_string());
+                    ResourceResponse::new(303, "text/html", headers, Vec::new()).map(Some)
+                }
+                ("GET", "/result.html") => ResourceResponse::new(
+                    200,
+                    "text/html",
+                    BTreeMap::new(),
+                    br#"<p id="status">posted</p>"#.to_vec(),
+                )
+                .map(Some),
+                _ => Ok(None),
+            }
+        }
+    }
+
     fn bundle(shell: &str) -> ResourceBundle {
         let mut resources = ResourceBundle::default();
         resources
@@ -2729,6 +2836,71 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("?q=rust+browser")
+        );
+    }
+
+    #[test]
+    fn form_post_submission_uses_provider_body_and_follows_a_same_origin_redirect() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(FormProvider {
+            requests: requests.clone(),
+        });
+        let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("form page should load");
+        assert!(browser.click_id("submit").expect("submit click should dispatch"));
+        assert_eq!(browser.current_url().unwrap().path(), "/result.html");
+        let document = browser.document().expect("result document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("posted")
+        );
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].method(), "GET");
+        assert_eq!(requests[1].method(), "POST");
+        assert_eq!(
+            requests[1].headers().get("content-type"),
+            Some(&"application/x-www-form-urlencoded".to_string())
+        );
+        assert_eq!(requests[1].body(), b"q=rust+browser");
+        assert_eq!(requests[2].method(), "GET");
+        assert!(requests[2].body().is_empty());
+    }
+
+    #[test]
+    fn packaged_post_submission_uses_an_explicit_recovery_page_without_a_provider() {
+        let mut browser = Browser::new(bundle(
+            r#"<form action="/submit" method="post"><button id="submit" type="submit">send</button></form>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("form page should load");
+        assert!(browser.click_id("submit").expect("submit click should dispatch"));
+        assert_eq!(
+            browser
+                .last_navigation_failure()
+                .expect("provider boundary failure should be recorded")
+                .status,
+            503
+        );
+        let document = browser.document().expect("recovery document should exist");
+        let recovery = document
+            .borrow()
+            .find_element_by_id("recovery")
+            .expect("recovery element should exist");
+        assert_eq!(
+            document
+                .borrow()
+                .element_attribute(&recovery, "data-status")
+                .as_deref(),
+            Some("503")
         );
     }
 
