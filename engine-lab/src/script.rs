@@ -528,6 +528,7 @@ pub struct ScriptRuntime {
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
     dirty_controls: BTreeSet<NodePath>,
+    last_user_edit: BTreeSet<NodePath>,
     custom_validity: BTreeMap<NodePath, String>,
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
@@ -1369,6 +1370,7 @@ impl ScriptRuntime {
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
             dirty_controls: BTreeSet::new(),
+            last_user_edit: BTreeSet::new(),
             custom_validity: BTreeMap::new(),
             text_selections: HashMap::new(),
             composition: None,
@@ -4382,6 +4384,7 @@ impl ScriptRuntime {
 
     fn mark_user_edit(&mut self, path: &[usize]) {
         self.dirty_controls.insert(path.to_vec());
+        self.last_user_edit.insert(path.to_vec());
     }
 
     fn is_validation_candidate(&self, path: &[usize]) -> bool {
@@ -4439,19 +4442,34 @@ impl ScriptRuntime {
         let dirty = self.dirty_controls.contains(path);
         let length = utf16_len(&value);
         let too_long = dirty
+            && self.last_user_edit.contains(path)
             && self.is_selection_control_path(path)
             && self
                 .control_length_attribute(path, "maxlength")
                 .is_some_and(|maximum| length > maximum);
         let too_short = dirty
+            && self.last_user_edit.contains(path)
             && !empty
             && self.is_selection_control_path(path)
             && self
                 .control_length_attribute(path, "minlength")
                 .is_some_and(|minimum| length < minimum);
         let value_missing = element.attr("required").is_some() && empty;
+        let type_mismatch = !empty
+            && match kind.as_str() {
+                "email" => !valid_email_value(&value, element.attr("multiple").is_some()),
+                "url" => !valid_url_value(&value),
+                _ => false,
+            };
+        let pattern_mismatch = !empty
+            && element
+                .attr("pattern")
+                .and_then(|pattern| pattern_matches(pattern, &value))
+                .is_some_and(|matches| !matches);
         ConstraintFlags {
             value_missing,
+            type_mismatch,
+            pattern_mismatch,
             too_long,
             too_short,
             custom_error: self
@@ -4480,6 +4498,12 @@ impl ScriptRuntime {
         }
         if flags.value_missing {
             return "value missing".to_string();
+        }
+        if flags.type_mismatch {
+            return "type mismatch".to_string();
+        }
+        if flags.pattern_mismatch {
+            return "pattern mismatch".to_string();
         }
         if flags.too_long {
             return "value too long".to_string();
@@ -4896,6 +4920,8 @@ impl ScriptRuntime {
                 }
                 let value_length = utf16_len(&value);
                 self.control_values.insert(path.clone(), value);
+                self.dirty_controls.insert(path.clone());
+                self.last_user_edit.remove(&path);
                 if self.is_selection_control_path(&path)
                     && let Some(selection) = self.text_selections.get_mut(&path)
                 {
@@ -8983,6 +9009,299 @@ fn validity_object(flags: ConstraintFlags) -> Value {
     Value::Object(Rc::new(RefCell::new(values)))
 }
 
+fn valid_email_value(value: &str, multiple: bool) -> bool {
+    let values = if multiple {
+        value.split(',').map(str::trim).collect::<Vec<_>>()
+    } else {
+        vec![value]
+    };
+    !values.is_empty() && values.into_iter().all(valid_email_address)
+}
+
+fn valid_email_address(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || local.chars().any(|character| {
+            character.is_ascii_whitespace()
+                || !character.is_ascii()
+                || matches!(character, '"' | '(' | ')' | ',' | ':' | ';' | '<' | '>' | '[' | ']')
+        })
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+    {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
+fn valid_url_value(value: &str) -> bool {
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .enumerate()
+            .all(|(index, character)| {
+                if index == 0 {
+                    character.is_ascii_alphabetic()
+                } else {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+                }
+            })
+        && !authority.is_empty()
+        && !authority.chars().any(|character| character.is_ascii_whitespace())
+}
+
+#[derive(Clone)]
+enum PatternAtom {
+    Literal(char),
+    Any,
+    Class(Vec<(char, char)>, bool),
+}
+
+#[derive(Clone)]
+struct PatternToken {
+    atom: PatternAtom,
+    minimum: usize,
+    maximum: Option<usize>,
+}
+
+fn pattern_matches(pattern: &str, value: &str) -> Option<bool> {
+    let tokens = parse_pattern_tokens(pattern)?;
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut memo = HashMap::new();
+    Some(pattern_match_from(&tokens, &characters, 0, 0, &mut memo))
+}
+
+fn parse_pattern_tokens(pattern: &str) -> Option<Vec<PatternToken>> {
+    if pattern.len() > 256 {
+        return None;
+    }
+    let characters = pattern.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < characters.len() {
+        let atom = match characters[cursor] {
+            '.' => {
+                cursor += 1;
+                PatternAtom::Any
+            }
+            '[' => {
+                let (atom, next) = parse_pattern_class(&characters, cursor)?;
+                cursor = next;
+                atom
+            }
+            '\\' => {
+                let (atom, next) = parse_pattern_escape(&characters, cursor)?;
+                cursor = next;
+                atom
+            }
+            '(' | ')' | '|' | '^' | '$' => return None,
+            character => {
+                cursor += 1;
+                PatternAtom::Literal(character)
+            }
+        };
+        let (minimum, maximum, next) = parse_pattern_quantifier(&characters, cursor)?;
+        cursor = next;
+        tokens.push(PatternToken {
+            atom,
+            minimum,
+            maximum,
+        });
+    }
+    Some(tokens)
+}
+
+fn parse_pattern_escape(characters: &[char], cursor: usize) -> Option<(PatternAtom, usize)> {
+    let escaped = *characters.get(cursor + 1)?;
+    let atom = match escaped {
+        'd' => PatternAtom::Class(vec![('0', '9')], false),
+        'D' => PatternAtom::Class(vec![('0', '9')], true),
+        'w' => PatternAtom::Class(
+            vec![('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')],
+            false,
+        ),
+        'W' => PatternAtom::Class(
+            vec![('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')],
+            true,
+        ),
+        's' => PatternAtom::Class(
+            vec![('\t', '\t'), ('\n', '\n'), ('\r', '\r'), (' ', ' ')],
+            false,
+        ),
+        'S' => PatternAtom::Class(
+            vec![('\t', '\t'), ('\n', '\n'), ('\r', '\r'), (' ', ' ')],
+            true,
+        ),
+        character => PatternAtom::Literal(character),
+    };
+    Some((atom, cursor + 2))
+}
+
+fn parse_pattern_class(characters: &[char], cursor: usize) -> Option<(PatternAtom, usize)> {
+    let mut cursor = cursor + 1;
+    let negated = characters.get(cursor) == Some(&'^');
+    if negated {
+        cursor += 1;
+    }
+    let mut ranges = Vec::new();
+    while let Some(&character) = characters.get(cursor) {
+        if character == ']' {
+            return (!ranges.is_empty()).then_some((PatternAtom::Class(ranges, negated), cursor + 1));
+        }
+        let first = if character == '\\' {
+            let escaped = *characters.get(cursor + 1)?;
+            cursor += 2;
+            match escaped {
+                'd' => {
+                    ranges.push(('0', '9'));
+                    continue;
+                }
+                'w' => {
+                    ranges.extend([('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')]);
+                    continue;
+                }
+                's' => {
+                    ranges.extend([('\t', '\t'), ('\n', '\n'), ('\r', '\r'), (' ', ' ')]);
+                    continue;
+                }
+                escaped => escaped,
+            }
+        } else {
+            cursor += 1;
+            character
+        };
+        if characters.get(cursor) == Some(&'-') && characters.get(cursor + 1).is_some_and(|value| *value != ']') {
+            let last = characters[cursor + 1];
+            ranges.push((first.min(last), first.max(last)));
+            cursor += 2;
+        } else {
+            ranges.push((first, first));
+        }
+    }
+    None
+}
+
+fn parse_pattern_quantifier(
+    characters: &[char],
+    cursor: usize,
+) -> Option<(usize, Option<usize>, usize)> {
+    let Some(&quantifier) = characters.get(cursor) else {
+        return Some((1, Some(1), cursor));
+    };
+    match quantifier {
+        '*' => Some((0, None, cursor + 1)),
+        '+' => Some((1, None, cursor + 1)),
+        '?' => Some((0, Some(1), cursor + 1)),
+        '{' => {
+            let mut end = cursor + 1;
+            while characters.get(end).is_some_and(|character| character.is_ascii_digit()) {
+                end += 1;
+            }
+            if end == cursor + 1 {
+                return None;
+            }
+            let minimum = characters[cursor + 1..end]
+                .iter()
+                .collect::<String>()
+                .parse::<usize>()
+                .ok()?;
+            if characters.get(end) == Some(&'}') {
+                return Some((minimum, Some(minimum), end + 1));
+            }
+            if characters.get(end) != Some(&',') {
+                return None;
+            }
+            end += 1;
+            let limit_start = end;
+            while characters.get(end).is_some_and(|character| character.is_ascii_digit()) {
+                end += 1;
+            }
+            let maximum = if end == limit_start {
+                None
+            } else {
+                Some(
+                    characters[limit_start..end]
+                        .iter()
+                        .collect::<String>()
+                        .parse::<usize>()
+                        .ok()?,
+                )
+            };
+            if characters.get(end) != Some(&'}') || maximum.is_some_and(|maximum| maximum < minimum) {
+                return None;
+            }
+            Some((minimum, maximum, end + 1))
+        }
+        _ => Some((1, Some(1), cursor)),
+    }
+}
+
+fn pattern_match_from(
+    tokens: &[PatternToken],
+    characters: &[char],
+    token_index: usize,
+    character_index: usize,
+    memo: &mut HashMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(matched) = memo.get(&(token_index, character_index)) {
+        return *matched;
+    }
+    if token_index == tokens.len() {
+        return character_index == characters.len();
+    }
+    let token = &tokens[token_index];
+    let maximum = token
+        .maximum
+        .unwrap_or(characters.len().saturating_sub(character_index))
+        .min(characters.len().saturating_sub(character_index));
+    let mut positions = vec![character_index];
+    for count in 1..=maximum {
+        let position = character_index + count - 1;
+        if !pattern_atom_matches(&token.atom, characters[position]) {
+            break;
+        }
+        positions.push(character_index + count);
+    }
+    let matched = positions
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(count, _)| *count >= token.minimum)
+        .any(|(_, next)| pattern_match_from(tokens, characters, token_index + 1, *next, memo));
+    memo.insert((token_index, character_index), matched);
+    matched
+}
+
+fn pattern_atom_matches(atom: &PatternAtom, character: char) -> bool {
+    match atom {
+        PatternAtom::Literal(expected) => character == *expected,
+        PatternAtom::Any => true,
+        PatternAtom::Class(ranges, negated) => {
+            let matched = ranges.iter().any(|(start, end)| (*start..=*end).contains(&character));
+            if *negated {
+                !matched
+            } else {
+                matched
+            }
+        }
+    }
+}
+
 fn truncate_utf16(value: &str, maximum: usize) -> String {
     let mut units = 0usize;
     let mut output = String::new();
@@ -12639,6 +12958,13 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("script-long")
         );
+        runtime
+            .execute("status.textContent = code.value + \"|\" + code.validity.tooLong;")
+            .expect("script value validity should remain separate from user edits");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("script-long|false")
+        );
 
         let ime_path = document
             .borrow()
@@ -12720,6 +13046,44 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("xyz|true|1")
+        );
+    }
+
+    #[test]
+    fn email_url_and_bounded_pattern_constraints_report_type_mismatches() {
+        let document = document(
+            r#"<input id="email" type="email" value="bad address"><input id="url" type="url" value="example"><input id="code" pattern="[0-9]{4}" value="12"><input id="ignored" pattern="(" value="x"><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const email = document.getElementById("email");
+                const url = document.getElementById("url");
+                const code = document.getElementById("code");
+                const ignored = document.getElementById("ignored");
+                document.getElementById("status").textContent = email.validity.typeMismatch + "|" + url.validity.typeMismatch + "|" + code.validity.patternMismatch + "|" + ignored.validity.valid + "|" + email.validationMessage;
+                "#,
+            )
+            .expect("typed constraints should execute");
+        let mut status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|true|true|true|type mismatch")
+        );
+        runtime
+            .execute("email.value = \"person@example.com\"; url.value = \"https://example.com/account\"; code.value = \"1234\"; document.getElementById(\"status\").textContent = email.validity.valid + \"|\" + url.validity.valid + \"|\" + code.validity.valid;")
+            .expect("valid typed values should execute");
+        status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|true|true")
         );
     }
 
