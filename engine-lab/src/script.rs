@@ -1639,12 +1639,7 @@ impl ScriptRuntime {
     }
 
     pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
-        if self
-            .document
-            .borrow()
-            .element_clone(&path)
-            .is_some_and(|element| element.attrs.contains_key("disabled"))
-        {
+        if self.is_disabled_path(&path) {
             return Ok(false);
         }
         let focused = self.focus_path(path.clone())?;
@@ -3250,6 +3245,8 @@ impl ScriptRuntime {
                         .element_value(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "form" => self.element_form(&handle),
+                    "elements" => self.element_form_elements(&handle),
                     "defaultValue" => self.element_default_value(&handle),
                     "selected" => Value::Bool(self.element_selected(&handle)),
                     "defaultSelected" => {
@@ -4503,7 +4500,7 @@ impl ScriptRuntime {
         let Some(element) = self.document.borrow().element_clone(path) else {
             return false;
         };
-        if element.attr("disabled").is_some() {
+        if self.is_disabled_path(path) {
             return false;
         }
         if element.attr("tabindex").is_some() {
@@ -4533,6 +4530,52 @@ impl ScriptRuntime {
             }),
             _ => false,
         }
+    }
+
+    fn is_disabled_path(&self, path: &[usize]) -> bool {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return false;
+        };
+        if element.name == "option" {
+            return self.option_disabled_path(path);
+        }
+        if !matches!(
+            element.name.as_str(),
+            "button" | "input" | "select" | "textarea"
+        ) {
+            return element.attr("disabled").is_some();
+        }
+        if element.attr("disabled").is_some() {
+            return true;
+        }
+        let mut ancestor = path.to_vec();
+        while !ancestor.is_empty() {
+            ancestor.pop();
+            let Some(ancestor_element) = self.document.borrow().element_clone(&ancestor) else {
+                continue;
+            };
+            if ancestor_element.name == "fieldset"
+                && ancestor_element.attr("disabled").is_some()
+                && !self.is_inside_first_legend(&ancestor, path)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_inside_first_legend(&self, fieldset_path: &[usize], path: &[usize]) -> bool {
+        let Some(fieldset) = self.document.borrow().element_clone(fieldset_path) else {
+            return false;
+        };
+        for (index, child) in fieldset.children.iter().enumerate() {
+            if matches!(child, Node::Element(element) if element.name == "legend") {
+                let mut legend_path = fieldset_path.to_vec();
+                legend_path.push(index);
+                return path.starts_with(&legend_path);
+            }
+        }
+        false
     }
 
     fn is_readonly_path(&self, path: &[usize]) -> bool {
@@ -4567,7 +4610,7 @@ impl ScriptRuntime {
         let Some(element) = self.document.borrow().element_clone(path) else {
             return false;
         };
-        if element.attr("disabled").is_some() {
+        if self.is_disabled_path(path) {
             return false;
         }
         match element.name.as_str() {
@@ -4921,6 +4964,29 @@ impl ScriptRuntime {
             .option_paths(&path)
             .into_iter()
             .filter(|option| !selected || self.option_selected_path(option))
+            .map(attached_handle)
+            .collect();
+        Value::NodeList(Rc::new(nodes))
+    }
+
+    fn element_form(&self, handle: &ElementHandle) -> Value {
+        attached_path(handle)
+            .and_then(|path| self.document.borrow().form_owner_path(&path))
+            .map(attached_handle)
+            .map(Value::Element)
+            .unwrap_or(Value::Null)
+    }
+
+    fn element_form_elements(&self, handle: &ElementHandle) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::NodeList(Rc::new(Vec::new()));
+        };
+        let nodes = self
+            .document
+            .borrow()
+            .form_control_paths(&path)
+            .unwrap_or_default()
+            .into_iter()
             .map(attached_handle)
             .collect();
         Value::NodeList(Rc::new(nodes))
@@ -6156,7 +6222,7 @@ impl ScriptRuntime {
             let Some(name) = element.attr("name").filter(|name| !name.is_empty()) else {
                 continue;
             };
-            if element.attr("disabled").is_some() {
+            if self.is_disabled_path(&path) {
                 continue;
             }
             let input_type = element
@@ -14045,6 +14111,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("changed|later|false|false|edited")
+        );
+    }
+
+    #[test]
+    fn form_owners_and_fieldset_disabled_state_share_submission_paths() {
+        let document = document(
+            r#"<form id="main"><input id="inside" name="inside" value="a"><fieldset id="locked" disabled><legend><input id="legend" name="legend" value="l" required></legend><input id="blocked" name="blocked" value="" required></fieldset></form><form id="external-form"></form><input id="external" name="external" value="e" form="external-form"><input id="orphan" name="orphan" value="o" form="missing"><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const main = document.getElementById("main");
+                const secondary = document.getElementById("external-form");
+                const external = document.getElementById("external");
+                const orphan = document.getElementById("orphan");
+                const blocked = document.getElementById("blocked");
+                const legend = document.getElementById("legend");
+                const mainData = new FormData(main);
+                const secondaryData = new FormData(secondary);
+                let clicks = 0;
+                blocked.addEventListener("click", () => clicks = clicks + 1);
+                blocked.click();
+                legend.focus();
+                document.getElementById("status").textContent = main.elements.length + "|" + mainData.has("inside") + "|" + mainData.has("legend") + "|" + mainData.has("blocked") + "|" + main.checkValidity() + "|" + secondary.elements.length + "|" + secondaryData.get("external") + "|" + external.form.id + "|" + (orphan.form === null) + "|" + blocked.willValidate + "|" + legend.willValidate + "|" + clicks + "|" + document.activeElement.id;
+                "#,
+            )
+            .expect("form owner and fieldset state should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("3|true|true|false|true|1|e|external-form|true|false|true|0|legend")
         );
     }
 

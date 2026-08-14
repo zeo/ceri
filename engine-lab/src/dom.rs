@@ -181,10 +181,27 @@ impl Document {
         let form = self.element_at(form_path)?;
         (form.name == "form").then(|| {
             let mut paths = Vec::new();
-            let mut path = form_path.to_vec();
-            collect_form_control_paths(form, &mut path, &mut paths);
+            collect_form_control_paths(&self.root, &mut Vec::new(), &mut paths);
             paths
+                .into_iter()
+                .filter(|path| self.form_owner_path(path).as_deref() == Some(form_path))
+                .collect()
         })
+    }
+
+    pub fn form_owner_path(&self, path: &[usize]) -> Option<NodePath> {
+        let element = self.element_at(path)?;
+        if !matches!(element.name.as_str(), "button" | "input" | "select" | "textarea") {
+            return None;
+        }
+        if let Some(form_id) = element.attr("form") {
+            let candidate = self.find_element_by_id(form_id)?;
+            return self
+                .element_at(&candidate)
+                .is_some_and(|element| element.name == "form")
+                .then_some(candidate);
+        }
+        self.form_ancestor_path(path)
     }
 
     pub fn form_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
@@ -262,7 +279,7 @@ impl Document {
             return None;
         }
         let name = radio.attr("name")?;
-        let form = self.form_ancestor_path(path)?;
+        let form = self.form_owner_path(path)?;
         Some(
             self.form_control_paths(&form)?
                 .into_iter()
