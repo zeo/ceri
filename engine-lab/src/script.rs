@@ -176,6 +176,7 @@ enum Builtin {
     ElementFocus(NodePath),
     ElementBlur(NodePath),
     ElementRequestSubmit(NodePath),
+    ElementReset(NodePath),
     ElementCheckValidity(NodePath),
     ElementReportValidity(NodePath),
     ElementSetCustomValidity(NodePath),
@@ -527,8 +528,10 @@ pub struct ScriptRuntime {
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
+    dirty_checked_controls: BTreeSet<NodePath>,
     dirty_controls: BTreeSet<NodePath>,
     last_user_edit: BTreeSet<NodePath>,
+    resetting_forms: BTreeSet<NodePath>,
     custom_validity: BTreeMap<NodePath, String>,
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
@@ -1369,8 +1372,10 @@ impl ScriptRuntime {
             focused_element: None,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
+            dirty_checked_controls: BTreeSet::new(),
             dirty_controls: BTreeSet::new(),
             last_user_edit: BTreeSet::new(),
+            resetting_forms: BTreeSet::new(),
             custom_validity: BTreeMap::new(),
             text_selections: HashMap::new(),
             composition: None,
@@ -1627,7 +1632,9 @@ impl ScriptRuntime {
         }
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
             self.apply_click_default(&path)?;
-            if let Some(form) = self.submit_form_for_click(&path) {
+            if let Some(form) = self.reset_form_for_click(&path) {
+                self.reset_form(form)?;
+            } else if let Some(form) = self.submit_form_for_click(&path) {
                 self.request_submit(form)?;
             }
             let reference = self.document.borrow().link_reference(&path);
@@ -2304,18 +2311,23 @@ impl ScriptRuntime {
             "checkbox" => {
                 let checked = self.control_checked_path(path);
                 self.control_checked.insert(path.to_vec(), !checked);
+                self.dirty_checked_controls.insert(path.to_vec());
                 true
             }
             "radio" => {
                 let was_checked = self.control_checked_path(path);
                 if let Some(group) = self.document.borrow().radio_group_paths(path) {
                     for candidate in group {
-                        if candidate != path {
-                            self.control_checked.insert(candidate, false);
+                        if candidate != path && self.control_checked_path(&candidate) {
+                            self.control_checked.insert(candidate.clone(), false);
+                            self.dirty_checked_controls.insert(candidate);
                         }
                     }
                 }
                 self.control_checked.insert(path.to_vec(), true);
+                if !was_checked {
+                    self.dirty_checked_controls.insert(path.to_vec());
+                }
                 !was_checked
             }
             _ => false,
@@ -2404,6 +2416,19 @@ impl ScriptRuntime {
             .flatten()
     }
 
+    fn reset_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
+        let element = self.document.borrow().element_clone(path)?;
+        let input_type = element
+            .attr("type")
+            .map(|kind| kind.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_reset = (element.name == "button" || element.name == "input")
+            && input_type == "reset";
+        is_reset
+            .then(|| self.document.borrow().form_ancestor_path(path))
+            .flatten()
+    }
+
     fn request_submit(&mut self, path: NodePath) -> Result<(), ScriptError> {
         let bypass_validation = self
             .document
@@ -2419,6 +2444,64 @@ impl ScriptRuntime {
             self.submit_form(path)?;
         }
         Ok(())
+    }
+
+    fn reset_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
+        if !self.resetting_forms.insert(path.clone()) {
+            return Ok(());
+        }
+        let outcome = self.reset_form_contents(&path);
+        self.resetting_forms.remove(&path);
+        outcome
+    }
+
+    fn reset_form_contents(&mut self, path: &[usize]) -> Result<(), ScriptError> {
+        let is_form = self
+            .document
+            .borrow()
+            .element_clone(path)
+            .is_some_and(|element| element.name == "form");
+        if !is_form {
+            return Err(runtime_error("reset is only available on form elements"));
+        }
+        let dispatch = self.dispatch_event(path.to_vec(), "reset")?;
+        self.drain_microtasks()?;
+        if dispatch.default_prevented {
+            return Ok(());
+        }
+        let controls = self
+            .document
+            .borrow()
+            .form_control_paths(path)
+            .unwrap_or_default();
+        if self
+            .composition
+            .as_ref()
+            .is_some_and(|composition| controls.iter().any(|control| control == &composition.path))
+        {
+            self.composition = None;
+        }
+        for control in controls {
+            self.reset_form_control(&control);
+        }
+        Ok(())
+    }
+
+    fn reset_form_control(&mut self, path: &[usize]) {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return;
+        };
+        if !matches!(element.name.as_str(), "input" | "select" | "textarea") {
+            return;
+        }
+        self.control_values.remove(path);
+        self.control_checked.remove(path);
+        self.dirty_controls.remove(path);
+        self.last_user_edit.remove(path);
+        self.dirty_checked_controls.remove(path);
+        self.text_selections.remove(path);
+        self.selected_files.remove(path);
+        self.file_lists.borrow_mut().remove(path);
     }
 
     pub fn pending_task_count(&self) -> usize {
@@ -3127,6 +3210,7 @@ impl ScriptRuntime {
                         .element_value(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "defaultValue" => self.element_default_value(&handle),
                     "validity" => self.element_validity(&handle),
                     "willValidate" => Value::Bool(
                         path.as_ref()
@@ -3156,6 +3240,7 @@ impl ScriptRuntime {
                     "selectionEnd" => self.element_selection_end(&handle)?,
                     "selectionDirection" => self.element_selection_direction(&handle)?,
                     "checked" => Value::Bool(self.element_checked(&handle)),
+                    "defaultChecked" => Value::Bool(self.element_default_checked(&handle)),
                     "disabled" => Value::Bool(
                         self.element_attribute(&handle, "disabled").is_some(),
                     ),
@@ -3227,6 +3312,19 @@ impl ScriptRuntime {
                             ));
                         }
                         Value::Builtin(Builtin::ElementRequestSubmit(path))
+                    }
+                    "reset" => {
+                        let path = path
+                            .ok_or_else(|| runtime_error("detached element cannot reset"))?;
+                        let is_form = self
+                            .document
+                            .borrow()
+                            .element_clone(&path)
+                            .is_some_and(|element| element.name == "form");
+                        if !is_form {
+                            return Err(runtime_error("reset is only available on form elements"));
+                        }
+                        Value::Builtin(Builtin::ElementReset(path))
                     }
                     "checkValidity" => Value::Builtin(Builtin::ElementCheckValidity(
                         path.ok_or_else(|| {
@@ -3901,12 +3999,14 @@ impl ScriptRuntime {
                 "id" => self.set_element_attribute(&handle, "id", value_string),
                 "innerHTML" => self.set_element_inner_html(&handle, value_string)?,
                 "value" => self.set_element_value(&handle, value_string),
+                "defaultValue" => self.set_element_default_value(&handle, value_string)?,
                 "selectionStart" => self.set_element_selection_start(&handle, value.number()?)?,
                 "selectionEnd" => self.set_element_selection_end(&handle, value.number()?)?,
                 "selectionDirection" => {
                     self.set_element_selection_direction(&handle, &value_string)?
                 }
                 "checked" => self.set_element_checked(&handle, truthy),
+                "defaultChecked" => self.set_element_default_checked(&handle, truthy),
                 "disabled" => self.set_element_disabled(&handle, truthy),
                 "readOnly" => self.set_element_readonly(&handle, truthy),
                 "required" => self.set_element_required(&handle, truthy),
@@ -4573,6 +4673,115 @@ impl ScriptRuntime {
         }
     }
 
+    fn element_default_value(&self, handle: &ElementHandle) -> Value {
+        let value = match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow()
+                .element_clone(&path)
+                .and_then(|element| default_value_for_element(&element)),
+            ElementLocation::Detached(element) => default_value_for_element(&element),
+        };
+        Value::String(value.unwrap_or_default())
+    }
+
+    fn element_default_checked(&self, handle: &ElementHandle) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow()
+                .element_clone(&path)
+                .is_some_and(|element| {
+                    element.name == "input" && element.attr("checked").is_some()
+                }),
+            ElementLocation::Detached(element) => {
+                element.name == "input" && element.attr("checked").is_some()
+            }
+        }
+    }
+
+    fn set_element_default_value(
+        &mut self,
+        handle: &ElementHandle,
+        value: String,
+    ) -> Result<bool, ScriptError> {
+        let Some(path) = attached_path(handle) else {
+            let mut location = handle.borrow_mut();
+            let ElementLocation::Detached(element) = &mut *location else {
+                return Ok(false);
+            };
+            return Ok(match element.name.as_str() {
+                "input" => {
+                    element.attrs.insert("value".to_string(), value);
+                    true
+                }
+                "textarea" => {
+                    element.children = vec![Node::Text(value)];
+                    true
+                }
+                _ => false,
+            });
+        };
+        let Some(element) = self.document.borrow().element_clone(&path) else {
+            return Ok(false);
+        };
+        let dirty = self.dirty_controls.contains(&path);
+        let changed = match element.name.as_str() {
+            "input" => self
+                .document
+                .borrow_mut()
+                .set_element_attribute(&path, "value", value),
+            "textarea" => self
+                .document
+                .borrow_mut()
+                .set_element_text_content(&path, value),
+            _ => false,
+        };
+        if changed && !dirty {
+            self.control_values.remove(&path);
+            self.text_selections.remove(&path);
+        }
+        Ok(changed)
+    }
+
+    fn set_element_default_checked(
+        &mut self,
+        handle: &ElementHandle,
+        checked: bool,
+    ) -> bool {
+        let Some(path) = attached_path(handle) else {
+            let mut location = handle.borrow_mut();
+            let ElementLocation::Detached(element) = &mut *location else {
+                return false;
+            };
+            if checked {
+                element.attrs.insert("checked".to_string(), String::new());
+            } else {
+                element.attrs.remove("checked");
+            }
+            return true;
+        };
+        let Some(element) = self.document.borrow().element_clone(&path) else {
+            return false;
+        };
+        if element.name != "input" {
+            return false;
+        }
+        if checked {
+            self.document
+                .borrow_mut()
+                .set_element_attribute(&path, "checked", String::new());
+        } else {
+            self.document
+                .borrow_mut()
+                .remove_element_attribute(&path, "checked");
+        }
+        if !self.dirty_checked_controls.contains(&path) {
+            self.control_checked.insert(path, checked);
+        }
+        true
+    }
+
     fn is_selection_control_path(&self, path: &[usize]) -> bool {
         let Some(element) = self.document.borrow().element_clone(path) else {
             return false;
@@ -4992,8 +5201,18 @@ impl ScriptRuntime {
                     .document
                     .borrow_mut()
                     .set_element_attribute(&path, name, value);
-                if changed && name.eq_ignore_ascii_case("checked") {
-                    self.control_checked.insert(path, true);
+                if changed
+                    && name.eq_ignore_ascii_case("checked")
+                    && !self.dirty_checked_controls.contains(&path)
+                {
+                    self.control_checked.insert(path.clone(), true);
+                }
+                if changed
+                    && name.eq_ignore_ascii_case("value")
+                    && !self.dirty_controls.contains(&path)
+                {
+                    self.control_values.remove(&path);
+                    self.text_selections.remove(&path);
                 }
                 changed
             }
@@ -5157,7 +5376,28 @@ impl ScriptRuntime {
     fn set_element_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => {
-                self.control_checked.insert(path, checked);
+                let is_radio = self
+                    .document
+                    .borrow()
+                    .element_clone(&path)
+                    .is_some_and(|element| {
+                        element.name == "input"
+                            && element
+                                .attr("type")
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
+                    });
+                if checked && is_radio
+                    && let Some(group) = self.document.borrow().radio_group_paths(&path)
+                {
+                    for candidate in group {
+                        if candidate != path && self.control_checked_path(&candidate) {
+                            self.control_checked.insert(candidate.clone(), false);
+                            self.dirty_checked_controls.insert(candidate);
+                        }
+                    }
+                }
+                self.control_checked.insert(path.clone(), checked);
+                self.dirty_checked_controls.insert(path);
                 true
             }
             ElementLocation::Detached(_) => {
@@ -6563,6 +6803,10 @@ impl ScriptRuntime {
             }
             Builtin::ElementRequestSubmit(path) => {
                 self.request_submit(path)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementReset(path) => {
+                self.reset_form(path)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementCheckValidity(path) | Builtin::ElementReportValidity(path) => {
@@ -8302,6 +8546,18 @@ fn collect_element_text(element: &Element, output: &mut String) {
             Node::Element(child) => collect_element_text(child, output),
             Node::Text(text) => output.push_str(text),
         }
+    }
+}
+
+fn default_value_for_element(element: &Element) -> Option<String> {
+    match element.name.as_str() {
+        "input" => Some(element.attr("value").unwrap_or_default().to_string()),
+        "textarea" => {
+            let mut value = String::new();
+            collect_element_text(element, &mut value);
+            Some(value)
+        }
+        _ => None,
     }
 }
 
@@ -13084,6 +13340,91 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|true|true")
+        );
+    }
+
+    #[test]
+    fn form_reset_restores_values_checkedness_and_defaults() {
+        let document = document(
+            r#"<form id="profile"><input id="name" value="initial"><input id="remember" type="checkbox" checked><textarea id="note">draft</textarea><button id="reset" type="reset">Reset</button></form><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const form = document.getElementById("profile");
+                const name = document.getElementById("name");
+                const remember = document.getElementById("remember");
+                const note = document.getElementById("note");
+                const status = document.getElementById("status");
+                let resets = 0;
+                form.addEventListener("reset", (event) => {
+                    resets = resets + 1;
+                    status.textContent = event.type + ":" + event.target.id + ":" + event.currentTarget.id;
+                    form.reset();
+                });
+                name.defaultValue = "updated";
+                remember.defaultChecked = false;
+                name.value = "typed";
+                remember.checked = true;
+                note.value = "changed";
+                status.textContent = name.value + "|" + name.defaultValue + "|" + remember.checked + "|" + remember.defaultChecked + "|" + note.value;
+                form.reset();
+                status.textContent = name.value + "|" + name.defaultValue + "|" + remember.checked + "|" + remember.defaultChecked + "|" + note.value + "|" + resets;
+                "#,
+            )
+            .expect("form reset script should execute");
+        let mut status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("updated|updated|false|false|draft|1")
+        );
+        assert!(runtime.click_id("reset").expect("reset button should activate"));
+        status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should remain attached");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("reset:profile:profile")
+        );
+    }
+
+    #[test]
+    fn form_reset_event_can_cancel_and_default_state_tracks_dirty_controls() {
+        let document = document(
+            r#"<form id="profile"><input id="name" value="initial"><input id="remember" type="checkbox" checked><textarea id="note">draft</textarea></form><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const form = document.getElementById("profile");
+                const name = document.getElementById("name");
+                const remember = document.getElementById("remember");
+                const note = document.getElementById("note");
+                const status = document.getElementById("status");
+                form.addEventListener("reset", (event) => event.preventDefault());
+                name.value = "changed";
+                remember.checked = false;
+                note.value = "edited";
+                name.defaultValue = "later";
+                remember.defaultChecked = false;
+                form.reset();
+                status.textContent = name.value + "|" + name.defaultValue + "|" + remember.checked + "|" + remember.defaultChecked + "|" + note.value;
+                "#,
+            )
+            .expect("cancelable reset should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("changed|later|false|false|edited")
         );
     }
 
