@@ -228,6 +228,7 @@ enum Builtin {
     ElementAddEventListener(NodePath),
     ElementClick(NodePath),
     ElementAppendChild(NodePath),
+    ElementRemoveChild(NodePath),
     ElementSelect(NodePath),
     ElementSetSelectionRange(NodePath),
     ElementSetRangeText(NodePath),
@@ -1518,6 +1519,97 @@ impl ScriptRuntime {
             self.dirty_options.remove(&option);
         }
         self.normalize_select_selection(&select, false);
+    }
+
+    fn refresh_select_state_after_remove(&mut self, parent: &[usize]) {
+        let select = {
+            let document = self.document.borrow();
+            document
+                .element_clone(parent)
+                .is_some_and(|element| element.name == "select")
+                .then(|| parent.to_vec())
+                .or_else(|| document.select_ancestor_path(parent))
+        };
+        if let Some(select) = select {
+            self.normalize_select_selection(&select, false);
+        }
+    }
+
+    fn clear_runtime_state_for_removed_subtree(&mut self, path: &[usize]) {
+        self.listeners.retain(|candidate, _| !candidate.starts_with(path));
+        self.control_values.retain(|candidate, _| !candidate.starts_with(path));
+        self.control_checked.retain(|candidate, _| !candidate.starts_with(path));
+        self.dirty_checked_controls
+            .retain(|candidate| !candidate.starts_with(path));
+        self.option_selected
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.dirty_options
+            .retain(|candidate| !candidate.starts_with(path));
+        self.dirty_controls
+            .retain(|candidate| !candidate.starts_with(path));
+        self.last_user_edit
+            .retain(|candidate| !candidate.starts_with(path));
+        self.resetting_forms
+            .retain(|candidate| !candidate.starts_with(path));
+        self.custom_validity
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.text_selections
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.selected_files
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.file_lists
+            .borrow_mut()
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.scroll_offsets
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.canvas_contexts
+            .retain(|candidate, _| !candidate.starts_with(path));
+        if self
+            .composition
+            .as_ref()
+            .is_some_and(|composition| composition.path.starts_with(path))
+        {
+            self.composition = None;
+        }
+    }
+
+    fn detach_child(
+        &mut self,
+        parent: &[usize],
+        child: &ElementHandle,
+    ) -> Result<(), ScriptError> {
+        let location = child.borrow().clone();
+        let ElementLocation::Attached(child_path) = location else {
+            return Err(runtime_error("removeChild expects an attached child"));
+        };
+        if child_path.len() != parent.len().saturating_add(1)
+            || child_path[..parent.len()] != *parent
+        {
+            return Err(runtime_error("removeChild child is not a direct child"));
+        }
+        if self
+            .composition
+            .as_ref()
+            .is_some_and(|composition| composition.path.starts_with(&child_path))
+        {
+            self.composition_cancel()?;
+        }
+        if self
+            .focused_element
+            .as_ref()
+            .is_some_and(|focused| focused.starts_with(&child_path))
+        {
+            self.blur_focused()?;
+        }
+        let removed = self
+            .document
+            .borrow_mut()
+            .remove_child(parent, &child_path)
+            .ok_or_else(|| runtime_error("removeChild child is no longer in the document"))?;
+        self.clear_runtime_state_for_removed_subtree(&child_path);
+        self.refresh_select_state_after_remove(parent);
+        *child.borrow_mut() = ElementLocation::Detached(removed);
+        Ok(())
     }
 
     pub fn execute_scripts(&mut self) -> Result<(), ScriptError> {
@@ -3522,6 +3614,11 @@ impl ScriptRuntime {
                     "appendChild" => {
                         Value::Builtin(Builtin::ElementAppendChild(path.ok_or_else(|| {
                             runtime_error("detached element cannot receive children")
+                        })?))
+                    }
+                    "removeChild" => {
+                        Value::Builtin(Builtin::ElementRemoveChild(path.ok_or_else(|| {
+                            runtime_error("detached element cannot remove children")
                         })?))
                     }
                     "setAttribute" => {
@@ -8590,6 +8687,14 @@ impl ScriptRuntime {
                     })?;
                 self.refresh_select_state_after_append(&path, &child_path);
                 *child.borrow_mut() = ElementLocation::Attached(child_path);
+                Ok(Value::Element(child))
+            }
+            Builtin::ElementRemoveChild(path) => {
+                let child = match arguments.first() {
+                    Some(Value::Element(handle)) => handle.clone(),
+                    _ => return Err(runtime_error("removeChild expects an element")),
+                };
+                self.detach_child(&path, &child)?;
                 Ok(Value::Element(child))
             }
             Builtin::ElementSetAttribute(path) => {
@@ -14397,6 +14502,64 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("1|2|v|true")
+        );
+    }
+
+    #[test]
+    fn remove_child_preserves_survivor_paths_and_allows_end_reattach() {
+        let document = document(
+            r#"<main id="mount"><p id="first">first</p><p id="gone">gone</p><p id="last">last</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const gone = document.getElementById("gone");
+                const last = document.getElementById("last");
+                mount.removeChild(gone);
+                const afterRemoval = (document.getElementById("gone") === null) + "|" + last.textContent;
+                mount.appendChild(gone);
+                document.getElementById("status").textContent = afterRemoval + "|" + document.getElementById("gone").textContent + "|" + last.textContent;
+                "#,
+            )
+            .expect("removeChild should preserve survivor handles");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|last|gone|last")
+        );
+    }
+
+    #[test]
+    fn removing_a_selected_option_reselects_the_remaining_option() {
+        let document = document(
+            r#"<select id="plan"><option value="a">Alpha</option><option value="b">Beta</option></select><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const plan = document.getElementById("plan");
+                const option = plan.options[1];
+                plan.value = "b";
+                plan.removeChild(option);
+                const afterRemoval = plan.value + "|" + plan.selectedIndex + "|" + plan.options.length;
+                plan.appendChild(option);
+                document.getElementById("status").textContent = afterRemoval + "|" + plan.value + "|" + plan.selectedIndex + "|" + plan.options.length;
+                "#,
+            )
+            .expect("select removal should normalize selectedness");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("a|0|1|a|0|2")
         );
     }
 

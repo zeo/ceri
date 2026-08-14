@@ -390,6 +390,24 @@ impl Document {
         Some(path)
     }
 
+    pub fn remove_child(&mut self, parent: &[usize], child: &[usize]) -> Option<Element> {
+        if child.len() != parent.len().saturating_add(1)
+            || child[..parent.len()] != *parent
+        {
+            return None;
+        }
+        let index = *child.last()?;
+        let parent = self.element_at_mut(parent)?;
+        let node = parent.children.get_mut(index)?;
+        match std::mem::replace(node, Node::Text(String::new())) {
+            Node::Element(element) => Some(element),
+            Node::Text(text) => {
+                *node = Node::Text(text);
+                None
+            }
+        }
+    }
+
     pub fn element_clone(&self, path: &[usize]) -> Option<Element> {
         self.element_at(path).cloned()
     }
@@ -1604,6 +1622,33 @@ mod tests {
             document.element_clone(&path).map(|element| element.name),
             Some("section".to_string())
         );
+    }
+
+    #[test]
+    fn removes_a_direct_child_without_reindexing_survivors() {
+        let mut document = Document::parse(
+            "<main><p id='first'>first</p><p id='gone'>gone</p><p id='last'>last</p></main>",
+        )
+        .expect("document should parse");
+        let main = document
+            .find_element_by_selector("main")
+            .expect("main should exist");
+        let gone = document
+            .find_element_by_id("gone")
+            .expect("removed child should exist");
+        let last = document
+            .find_element_by_id("last")
+            .expect("survivor should exist");
+        assert_eq!(document.remove_child(&main, &gone).map(|element| element.name), Some("p".to_string()));
+        assert!(document.find_element_by_id("gone").is_none());
+        assert_eq!(
+            document.element_text_content(&last).as_deref(),
+            Some("last")
+        );
+        let reattached = document
+            .append_element(&main, Element::new("aside"))
+            .expect("append should keep the removed slot behind the new child");
+        assert_eq!(reattached, vec![0, 3]);
     }
 
     #[test]
