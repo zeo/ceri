@@ -797,12 +797,20 @@ struct EventListener {
     event: String,
     callback: Value,
     once: bool,
+    signal: Option<AbortSignalHandle>,
 }
 
 #[derive(Clone)]
 struct WindowListener {
     callback: Value,
     once: bool,
+    signal: Option<AbortSignalHandle>,
+}
+
+#[derive(Default)]
+struct ListenerOptions {
+    once: bool,
+    signal: Option<AbortSignalHandle>,
 }
 
 #[derive(Clone)]
@@ -1602,6 +1610,31 @@ impl ScriptRuntime {
     fn prune_detached_listeners(&mut self) {
         self.detached_listeners
             .retain(|(handle, _)| handle.strong_count() > 0);
+    }
+
+    fn remove_event_listeners_for_signal(&mut self, signal: &AbortSignalHandle) {
+        self.listeners.retain(|_, listeners| {
+            listeners.retain(|listener| !listener_uses_signal(listener, signal));
+            !listeners.is_empty()
+        });
+        self.window_listeners.retain(|_, listeners| {
+            listeners.retain(|listener| !window_listener_uses_signal(listener, signal));
+            !listeners.is_empty()
+        });
+        for (_, listeners) in &mut self.detached_listeners {
+            for (_, listener_set) in listeners.iter_mut() {
+                listener_set.retain(|listener| !listener_uses_signal(listener, signal));
+            }
+            listeners.retain(|(_, listener_set)| !listener_set.is_empty());
+        }
+        self.detached_listeners
+            .retain(|(_, listeners)| !listeners.is_empty());
+        for worker in &self.workers {
+            worker
+                .borrow_mut()
+                .listeners
+                .retain(|listener| !listener_uses_signal(listener, signal));
+        }
     }
 
     fn clear_runtime_state_for_removed_subtree(&mut self, path: &[usize]) {
@@ -7338,9 +7371,16 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let once = listener_once(&arguments);
+                let options = listener_options(&arguments)?;
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("Worker event listener must be a function"));
+                }
+                if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.borrow().aborted)
+                {
+                    return Ok(Value::Undefined);
                 }
                 let mut worker = worker.borrow_mut();
                 if !worker
@@ -7351,7 +7391,8 @@ impl ScriptRuntime {
                     worker.listeners.push(EventListener {
                         event,
                         callback,
-                        once,
+                        once: options.once,
+                        signal: options.signal,
                     });
                 }
                 Ok(Value::Undefined)
@@ -7433,16 +7474,27 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let once = listener_once(&arguments);
+                let options = listener_options(&arguments)?;
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("window event listener must be a function"));
+                }
+                if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.borrow().aborted)
+                {
+                    return Ok(Value::Undefined);
                 }
                 let listeners = self.window_listeners.entry(event).or_default();
                 if !listeners
                     .iter()
                     .any(|listener| values_equal(&listener.callback, &callback))
                 {
-                    listeners.push(WindowListener { callback, once });
+                    listeners.push(WindowListener {
+                        callback,
+                        once: options.once,
+                        signal: options.signal,
+                    });
                 }
                 Ok(Value::Undefined)
             }
@@ -7466,9 +7518,16 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let once = listener_once(&arguments);
+                let options = listener_options(&arguments)?;
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("document event listener must be a function"));
+                }
+                if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.borrow().aborted)
+                {
+                    return Ok(Value::Undefined);
                 }
                 let listeners = self.listeners.entry(Vec::new()).or_default();
                 if !listeners
@@ -7478,7 +7537,8 @@ impl ScriptRuntime {
                     listeners.push(EventListener {
                         event,
                         callback,
-                        once,
+                        once: options.once,
+                        signal: options.signal,
                     });
                 }
                 Ok(Value::Undefined)
@@ -8719,6 +8779,7 @@ impl ScriptRuntime {
                     signal.reason = Some(reason);
                     std::mem::take(&mut signal.listeners)
                 };
+                self.remove_event_listeners_for_signal(&signal);
                 for listener in listeners {
                     self.call(listener, vec![abort_event_value()])?;
                 }
@@ -8803,9 +8864,16 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let once = listener_once(&arguments);
+                let options = listener_options(&arguments)?;
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("event listener must be a function"));
+                }
+                if options
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.borrow().aborted)
+                {
+                    return Ok(Value::Undefined);
                 }
                 let listeners = self.listeners.entry(path).or_default();
                 if !listeners
@@ -8815,7 +8883,8 @@ impl ScriptRuntime {
                     listeners.push(EventListener {
                         event,
                         callback,
-                        once,
+                        once: options.once,
+                        signal: options.signal,
                     });
                 }
                 Ok(Value::Undefined)
@@ -11319,14 +11388,42 @@ fn event_listener_matches(listener: &EventListener, event: &str, callback: &Valu
     listener.event == event && values_equal(&listener.callback, callback)
 }
 
-fn listener_once(arguments: &[Value]) -> bool {
-    let Some(Value::Object(options)) = arguments.get(2).map(Value::resolve) else {
-        return false;
+fn listener_options(arguments: &[Value]) -> Result<ListenerOptions, ScriptError> {
+    let Some(options) = arguments.get(2).map(Value::resolve) else {
+        return Ok(ListenerOptions::default());
     };
-    options
-        .borrow()
-        .get("once")
-        .is_some_and(Value::truthy)
+    match options {
+        Value::Undefined | Value::Null | Value::Bool(_) => Ok(ListenerOptions::default()),
+        Value::Object(options) => {
+            let options = options.borrow();
+            let signal = match options.get("signal").map(Value::resolve) {
+                None | Some(Value::Undefined) | Some(Value::Null) => None,
+                Some(Value::AbortSignal(signal)) => Some(signal),
+                Some(_) => return Err(runtime_error("event listener signal must be an AbortSignal")),
+            };
+            Ok(ListenerOptions {
+                once: options.get("once").is_some_and(Value::truthy),
+                signal,
+            })
+        }
+        _ => Err(runtime_error(
+            "event listener options must be an object or boolean",
+        )),
+    }
+}
+
+fn listener_uses_signal(listener: &EventListener, signal: &AbortSignalHandle) -> bool {
+    listener
+        .signal
+        .as_ref()
+        .is_some_and(|candidate| Rc::ptr_eq(candidate, signal))
+}
+
+fn window_listener_uses_signal(listener: &WindowListener, signal: &AbortSignalHandle) -> bool {
+    listener
+        .signal
+        .as_ref()
+        .is_some_and(|candidate| Rc::ptr_eq(candidate, signal))
 }
 
 fn iterator_value(values: Vec<Value>) -> Value {
@@ -14133,6 +14230,106 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn abort_signal_removes_live_and_detached_listeners_before_abort_callbacks() {
+        let document = document(
+            "<main id='mount'><button id='gone'>gone</button><button id='live'>live</button><p id='status'>idle</p></main>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const gone = document.getElementById("gone");
+                const live = document.getElementById("live");
+                const status = document.getElementById("status");
+                const controller = new AbortController();
+                let clicks = 0;
+                let observedDuringAbort = -1;
+                const onClick = () => clicks = clicks + 1;
+                gone.addEventListener("click", onClick, { signal: controller.signal });
+                live.addEventListener("click", onClick, { signal: controller.signal });
+                controller.signal.addEventListener("abort", () => {
+                    live.click();
+                    observedDuringAbort = clicks;
+                });
+                mount.removeChild(gone);
+                controller.abort("closed");
+                mount.appendChild(gone);
+                gone.click();
+                live.click();
+                status.textContent = clicks + "|" + observedDuringAbort;
+                "#,
+            )
+            .expect("abort signal listener removal should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("0|0")
+        );
+    }
+
+    #[test]
+    fn pre_aborted_signal_does_not_register_a_listener() {
+        let document = document("<button id='go'>before</button><p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const button = document.getElementById("go");
+                const status = document.getElementById("status");
+                const controller = new AbortController();
+                let clicks = 0;
+                controller.abort();
+                button.addEventListener("click", () => clicks = clicks + 1, { signal: controller.signal });
+                button.click();
+                status.textContent = clicks;
+                "#,
+            )
+            .expect("pre-aborted listener signal should be accepted");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn abort_signal_removes_window_listeners() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const controller = new AbortController();
+                let resizeEvents = 0;
+                window.addEventListener("resize", () => resizeEvents = resizeEvents + 1, { signal: controller.signal });
+                controller.abort();
+                "#,
+            )
+            .expect("window listener signal should register");
+        assert!(!runtime
+            .dispatch_window_event("resize")
+            .expect("window event should dispatch"));
+        runtime
+            .execute("document.getElementById(\"status\").textContent = resizeEvents;")
+            .expect("window signal result should serialize");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("0")
         );
     }
 
@@ -17428,6 +17625,11 @@ mod tests {
                 r#"
                 const status = document.getElementById("status");
                 const worker = new Worker("/worker.js", { name: "echo" });
+                const blockedController = new AbortController();
+                worker.addEventListener("message", () => { status.textContent = "blocked"; }, {
+                  signal: blockedController.signal
+                });
+                blockedController.abort();
                 let messages = 0;
                 worker.addEventListener("message", (event) => {
                   messages = messages + 1;
