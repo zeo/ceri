@@ -160,11 +160,13 @@ enum Builtin {
     DocumentCreateRange,
     DocumentGetSelection,
     DocumentAddEventListener,
+    DocumentRemoveEventListener,
     ConsoleLog,
     EventPreventDefault(Rc<RefCell<EventState>>),
     LocationAssign,
     LocationReplace,
     WindowAddEventListener,
+    WindowRemoveEventListener,
     WindowScrollTo,
     WindowScrollBy,
     WindowGetSelection,
@@ -228,6 +230,7 @@ enum Builtin {
     CancelAnimationFrame,
     CeriQuery,
     ElementAddEventListener(NodePath),
+    ElementRemoveEventListener(NodePath),
     ElementClick(NodePath),
     ElementAppendChild(NodePath),
     ElementRemoveChild(NodePath),
@@ -314,6 +317,7 @@ enum Builtin {
     WorkerPostMessage(WorkerHandle),
     WorkerTerminate(WorkerHandle),
     WorkerAddEventListener(WorkerHandle),
+    WorkerRemoveEventListener(WorkerHandle),
     WorkerGlobalImportScripts,
     WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
     WebAssemblyInstantiate,
@@ -3384,6 +3388,9 @@ impl ScriptRuntime {
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "addEventListener" => Ok(Value::Builtin(Builtin::DocumentAddEventListener)),
+                "removeEventListener" => {
+                    Ok(Value::Builtin(Builtin::DocumentRemoveEventListener))
+                }
                 "documentElement" => Ok(self
                     .document
                     .borrow()
@@ -3422,6 +3429,7 @@ impl ScriptRuntime {
                 "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
+                "removeEventListener" => Ok(Value::Builtin(Builtin::WindowRemoveEventListener)),
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "JSON" => Ok(Value::Json),
@@ -3594,6 +3602,11 @@ impl ScriptRuntime {
                             runtime_error("detached element cannot receive events")
                         })?))
                     }
+                    "removeEventListener" => Value::Builtin(
+                        Builtin::ElementRemoveEventListener(path.ok_or_else(|| {
+                            runtime_error("detached element cannot remove event listeners")
+                        })?),
+                    ),
                     "click" => Value::Builtin(Builtin::ElementClick(
                         path.ok_or_else(|| runtime_error("detached element cannot be clicked"))?,
                     )),
@@ -3963,6 +3976,9 @@ impl ScriptRuntime {
                     "addEventListener" => Ok(Value::Builtin(Builtin::WorkerAddEventListener(
                         handle,
                     ))),
+                    "removeEventListener" => Ok(Value::Builtin(
+                        Builtin::WorkerRemoveEventListener(handle),
+                    )),
                     "onmessage" => Ok(worker.onmessage.clone().unwrap_or(Value::Null)),
                     "onerror" => Ok(worker.onerror.clone().unwrap_or(Value::Null)),
                     "url" => Ok(Value::String(worker.url.to_string())),
@@ -7328,7 +7344,29 @@ impl ScriptRuntime {
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("Worker event listener must be a function"));
                 }
-                worker.borrow_mut().listeners.push(EventListener { event, callback });
+                let mut worker = worker.borrow_mut();
+                if !worker
+                    .listeners
+                    .iter()
+                    .any(|listener| event_listener_matches(listener, &event, &callback))
+                {
+                    worker.listeners.push(EventListener { event, callback });
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::WorkerRemoveEventListener(worker) => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback.resolve(), Value::Function(_)) {
+                    return Err(runtime_error("Worker event listener must be a function"));
+                }
+                worker
+                    .borrow_mut()
+                    .listeners
+                    .retain(|listener| !event_listener_matches(listener, &event, &callback));
                 Ok(Value::Undefined)
             }
             Builtin::WorkerPostMessage(worker) => {
@@ -7393,13 +7431,27 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("window event listener must be a function"));
                 }
-                self.window_listeners
-                    .entry(event)
-                    .or_default()
-                    .push(callback);
+                let listeners = self.window_listeners.entry(event).or_default();
+                if !listeners.iter().any(|listener| values_equal(listener, &callback)) {
+                    listeners.push(callback);
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::WindowRemoveEventListener => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback.resolve(), Value::Function(_)) {
+                    return Err(runtime_error("window event listener must be a function"));
+                }
+                if let Some(listeners) = self.window_listeners.get_mut(&event) {
+                    listeners.retain(|listener| !values_equal(listener, &callback));
+                }
                 Ok(Value::Undefined)
             }
             Builtin::DocumentAddEventListener => {
@@ -7408,13 +7460,30 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("document event listener must be a function"));
                 }
-                self.listeners
-                    .entry(Vec::new())
-                    .or_default()
-                    .push(EventListener { event, callback });
+                let listeners = self.listeners.entry(Vec::new()).or_default();
+                if !listeners
+                    .iter()
+                    .any(|listener| event_listener_matches(listener, &event, &callback))
+                {
+                    listeners.push(EventListener { event, callback });
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::DocumentRemoveEventListener => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback.resolve(), Value::Function(_)) {
+                    return Err(runtime_error("document event listener must be a function"));
+                }
+                if let Some(listeners) = self.listeners.get_mut(&Vec::new()) {
+                    listeners.retain(|listener| !event_listener_matches(listener, &event, &callback));
+                }
                 Ok(Value::Undefined)
             }
             Builtin::WindowScrollTo => {
@@ -8723,13 +8792,30 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("event listener must be a function"));
                 }
-                self.listeners
-                    .entry(path)
-                    .or_default()
-                    .push(EventListener { event, callback });
+                let listeners = self.listeners.entry(path).or_default();
+                if !listeners
+                    .iter()
+                    .any(|listener| event_listener_matches(listener, &event, &callback))
+                {
+                    listeners.push(EventListener { event, callback });
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementRemoveEventListener(path) => {
+                let event = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                if !matches!(callback.resolve(), Value::Function(_)) {
+                    return Err(runtime_error("event listener must be a function"));
+                }
+                if let Some(listeners) = self.listeners.get_mut(&path) {
+                    listeners.retain(|listener| !event_listener_matches(listener, &event, &callback));
+                }
                 Ok(Value::Undefined)
             }
             Builtin::ElementClick(path) => {
@@ -11175,6 +11261,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         }
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
+        (Value::Function(left), Value::Function(right)) => Rc::ptr_eq(left, right),
         (Value::Validity(left), Value::Validity(right)) => Rc::ptr_eq(left, right),
         (Value::Range(left), Value::Range(right)) => Rc::ptr_eq(left, right),
         (Value::Selection(left), Value::Selection(right)) => Rc::ptr_eq(left, right),
@@ -11199,6 +11286,10 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn event_listener_matches(listener: &EventListener, event: &str, callback: &Value) -> bool {
+    listener.event == event && values_equal(&listener.callback, callback)
 }
 
 fn iterator_value(values: Vec<Value>) -> Value {
@@ -13873,6 +13964,73 @@ mod tests {
                 .style_property(&status, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn removes_element_and_document_listeners_by_callback_identity() {
+        let document = document("<button id='go'>before</button><p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const button = document.getElementById("go");
+                const status = document.getElementById("status");
+                let elementClicks = 0;
+                let documentClicks = 0;
+                const onElementClick = () => elementClicks = elementClicks + 1;
+                const onDocumentClick = () => documentClicks = documentClicks + 1;
+                button.addEventListener("click", onElementClick);
+                button.addEventListener("click", onElementClick);
+                document.addEventListener("click", onDocumentClick);
+                button.removeEventListener("click", () => elementClicks = elementClicks + 1);
+                document.removeEventListener("click", onDocumentClick);
+                button.click();
+                button.removeEventListener("click", onElementClick);
+                button.click();
+                status.textContent = elementClicks + "|" + documentClicks;
+                "#,
+            )
+            .expect("element and document listener removal should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|0")
+        );
+    }
+
+    #[test]
+    fn removes_window_listeners_by_callback_identity() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                let resizeEvents = 0;
+                const onResize = () => resizeEvents = resizeEvents + 1;
+                window.addEventListener("resize", onResize);
+                window.addEventListener("resize", onResize);
+                window.removeEventListener("resize", () => resizeEvents = resizeEvents + 1);
+                window.removeEventListener("resize", onResize);
+                "#,
+            )
+            .expect("window listener removal should execute");
+        runtime
+            .dispatch_window_event("resize")
+            .expect("window event should dispatch");
+        runtime
+            .execute("document.getElementById(\"status\").textContent = resizeEvents;")
+            .expect("window listener result should serialize");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("0")
         );
     }
 
@@ -17283,6 +17441,9 @@ mod tests {
                 r#"
                 const status = document.getElementById("status");
                 const worker = new Worker("/worker-module.js", { type: "module" });
+                const stale = () => { status.textContent = "stale"; };
+                worker.addEventListener("message", stale);
+                worker.removeEventListener("message", stale);
                 worker.addEventListener("message", (event) => { status.textContent = event.data; });
                 worker.postMessage("module");
                 "#,

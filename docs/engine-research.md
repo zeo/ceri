@@ -77,6 +77,8 @@ Direct-child `removeChild` now detaches a subtree without shifting the vector pa
 
 Attached elements also expose `parentNode`, `parentElement`, and `remove()`. Detached handles return `null` for both parent properties, so scripts can observe the transition after removal without opening a transport or listener.
 
+Element, document, window, and worker targets now ignore duplicate callback registrations and support callback-identity `removeEventListener`. The bounded listener surface does not yet model capture, passive, once, or signal options.
+
 The same form path now accepts `enctype="multipart/form-data"` and reuses the deterministic multipart encoder already used by script-created `FormData` requests. Text fields preserve order, quoted parameter escaping, and collision-safe boundaries. A host-owned `FilePicker` supplies validated file names, MIME types, bytes, and modification times without exposing filesystem paths to the renderer. File controls expose `files`, `FileList.item()`, the standard fake path display value, input and change events, picker cancellation, and multipart `File` entries, including the empty-file entry when no file is selected.
 
 The clipboard boundary now follows the same host-owned pattern. `ClipboardProvider` backs secure-context `navigator.clipboard.readText()` and `writeText()` calls with fulfilled or rejected promises, so the renderer receives text values without a platform clipboard handle. A host can reject access for permission, user-activation, or unavailable-platform reasons without changing the script surface.
