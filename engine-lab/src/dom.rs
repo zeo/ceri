@@ -383,6 +383,28 @@ impl Document {
         Some(text)
     }
 
+    pub fn text_content(&self) -> String {
+        let mut text = String::new();
+        collect_text_nodes(&self.root, &mut text);
+        text
+    }
+
+    pub fn element_text_offset(&self, path: &[usize]) -> Option<usize> {
+        let mut element = &self.root;
+        let mut offset = 0;
+        for &index in path {
+            let child = element.children.get(index)?;
+            for preceding in element.children.iter().take(index) {
+                offset += text_utf16_len(preceding);
+            }
+            element = match child {
+                Node::Element(child) => child,
+                Node::Text(_) => return None,
+            };
+        }
+        Some(offset)
+    }
+
     pub fn element_inner_html(&self, path: &[usize]) -> Option<String> {
         self.element_at(path).map(Element::inner_html)
     }
@@ -1288,6 +1310,17 @@ fn collect_text_nodes(element: &Element, output: &mut String) {
             Node::Element(child) => collect_text_nodes(child, output),
             Node::Text(text) => output.push_str(text),
         }
+    }
+}
+
+fn text_utf16_len(node: &Node) -> usize {
+    match node {
+        Node::Element(element) => element
+            .children
+            .iter()
+            .map(text_utf16_len)
+            .sum(),
+        Node::Text(text) => text.encode_utf16().count(),
     }
 }
 

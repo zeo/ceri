@@ -958,19 +958,25 @@ impl ConstraintFlags {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 struct RangeBoundary {
-    path: NodePath,
+    node: ElementHandle,
     offset: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl PartialEq for RangeBoundary {
+    fn eq(&self, other: &Self) -> bool {
+        self.offset == other.offset && *self.node.borrow() == *other.node.borrow()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 struct RangeData {
     start: RangeBoundary,
     end: RangeBoundary,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct SelectionData {
     range: Option<RangeHandle>,
 }
@@ -1603,11 +1609,6 @@ impl ScriptRuntime {
         if let Some(composition) = &mut self.composition {
             shift_path_for_insert(&mut composition.path, parent, index);
         }
-        if let Some(range) = self.selection.borrow().range.clone() {
-            let mut range = range.borrow_mut();
-            shift_path_for_insert(&mut range.start.path, parent, index);
-            shift_path_for_insert(&mut range.end.path, parent, index);
-        }
     }
 
     fn relocate_runtime_paths_for_move(&mut self, source: &[usize], destination: &[usize]) {
@@ -1780,27 +1781,6 @@ impl ScriptRuntime {
         if let Some(composition) = &mut self.composition {
             composition.path = relocate_path_for_move(
                 &composition.path,
-                source,
-                &source_parent,
-                source_index,
-                &destination_parent,
-                destination_index,
-                destination,
-            );
-        }
-        if let Some(range) = self.selection.borrow().range.clone() {
-            let mut range = range.borrow_mut();
-            range.start.path = relocate_path_for_move(
-                &range.start.path,
-                source,
-                &source_parent,
-                source_index,
-                &destination_parent,
-                destination_index,
-                destination,
-            );
-            range.end.path = relocate_path_for_move(
-                &range.end.path,
                 source,
                 &source_parent,
                 source_index,
@@ -4093,20 +4073,27 @@ impl ScriptRuntime {
             Value::Range(range) => {
                 let range_data = range.borrow();
                 match property {
-                    "startContainer" => Ok(node_value(
-                        range_data.start.path.clone(),
-                        &self.document,
-                    )),
+                    "startContainer" => Ok(if attached_path(&range_data.start.node).is_some() {
+                        Value::Element(range_data.start.node.clone())
+                    } else {
+                        Value::Null
+                    }),
                     "startOffset" => Ok(Value::Number(range_data.start.offset as f64)),
-                    "endContainer" => Ok(node_value(
-                        range_data.end.path.clone(),
-                        &self.document,
-                    )),
+                    "endContainer" => Ok(if attached_path(&range_data.end.node).is_some() {
+                        Value::Element(range_data.end.node.clone())
+                    } else {
+                        Value::Null
+                    }),
                     "endOffset" => Ok(Value::Number(range_data.end.offset as f64)),
-                    "collapsed" => Ok(Value::Bool(range_data.start.path == range_data.end.path
-                        && range_data.start.offset == range_data.end.offset)),
+                    "collapsed" => Ok(Value::Bool(self.range_is_collapsed(&range_data))),
                     "commonAncestorContainer" => {
-                        let path = common_path(&range_data.start.path, &range_data.end.path);
+                        let Some(start_path) = attached_path(&range_data.start.node) else {
+                            return Ok(Value::Null);
+                        };
+                        let Some(end_path) = attached_path(&range_data.end.node) else {
+                            return Ok(Value::Null);
+                        };
+                        let path = common_path(&start_path, &end_path);
                         Ok(if path.is_empty() {
                             Value::Document
                         } else {
@@ -4137,7 +4124,7 @@ impl ScriptRuntime {
                     "isCollapsed" => Ok(Value::Bool(
                         range
                             .as_ref()
-                            .is_none_or(|range| range_is_collapsed(&range.borrow())),
+                            .is_none_or(|range| self.range_is_collapsed(&range.borrow())),
                     )),
                     "anchorNode" | "focusNode" => Ok(range
                         .as_ref()
@@ -4148,7 +4135,11 @@ impl ScriptRuntime {
                             } else {
                                 &range.end
                             };
-                            node_value(boundary.path.clone(), &self.document)
+                            if attached_path(&boundary.node).is_some() {
+                                Value::Element(boundary.node.clone())
+                            } else {
+                                Value::Null
+                            }
                         })
                         .unwrap_or(Value::Null)),
                     "anchorOffset" | "focusOffset" => Ok(range
@@ -6255,20 +6246,39 @@ impl ScriptRuntime {
             .map(selection_offset)
             .unwrap_or_default()
             .min(utf16_len(&value));
-        Ok(RangeBoundary { path, offset })
+        Ok(RangeBoundary {
+            node: handle,
+            offset,
+        })
+    }
+
+    fn range_boundary_position(&self, boundary: &RangeBoundary) -> Option<usize> {
+        let path = attached_path(&boundary.node)?;
+        let document = self.document.borrow();
+        let content = document.element_text_content(&path)?;
+        let prefix = document.element_text_offset(&path)?;
+        Some(prefix.saturating_add(boundary.offset.min(utf16_len(&content))))
+    }
+
+    fn range_is_collapsed(&self, range: &RangeData) -> bool {
+        self.range_boundary_position(&range.start)
+            .zip(self.range_boundary_position(&range.end))
+            .is_some_and(|(start, end)| start == end)
     }
 
     fn range_to_string(&self, range: &RangeHandle) -> String {
         let range = range.borrow();
-        if range.start.path != range.end.path {
+        let Some(start) = self.range_boundary_position(&range.start) else {
+            return String::new();
+        };
+        let Some(end) = self.range_boundary_position(&range.end) else {
+            return String::new();
+        };
+        if start > end {
             return String::new();
         }
-        let value = self
-            .document
-            .borrow()
-            .element_text_content(&range.start.path)
-            .unwrap_or_default();
-        utf16_substring(&value, range.start.offset, range.end.offset)
+        let value = self.document.borrow().text_content();
+        utf16_substring(&value, start, end)
     }
 
     fn element_files(&self, handle: &ElementHandle) -> Value {
@@ -7516,12 +7526,14 @@ impl ScriptRuntime {
                     .borrow()
                     .document_element_path()
                     .unwrap_or_default();
+                let node = attached_handle(path, &self.document)
+                    .ok_or_else(|| runtime_error("document has no range boundary element"))?;
                 let range = RangeData {
                     start: RangeBoundary {
-                        path: path.clone(),
+                        node: node.clone(),
                         offset: 0,
                     },
-                    end: RangeBoundary { path, offset: 0 },
+                    end: RangeBoundary { node, offset: 0 },
                 };
                 Ok(Value::Range(Rc::new(RefCell::new(range))))
             }
@@ -8050,8 +8062,10 @@ impl ScriptRuntime {
                     let mut range_data = range.borrow_mut();
                     let previous = range_data.clone();
                     range_data.start = boundary.clone();
-                    if range_data.start.path == range_data.end.path
-                        && range_data.start.offset > range_data.end.offset
+                    if self
+                        .range_boundary_position(&range_data.start)
+                        .zip(self.range_boundary_position(&range_data.end))
+                        .is_some_and(|(start, end)| start > end)
                     {
                         range_data.end = boundary;
                     }
@@ -8068,8 +8082,10 @@ impl ScriptRuntime {
                     let mut range_data = range.borrow_mut();
                     let previous = range_data.clone();
                     range_data.end = boundary.clone();
-                    if range_data.start.path == range_data.end.path
-                        && range_data.end.offset < range_data.start.offset
+                    if self
+                        .range_boundary_position(&range_data.start)
+                        .zip(self.range_boundary_position(&range_data.end))
+                        .is_some_and(|(start, end)| end < start)
                     {
                         range_data.start = boundary;
                     }
@@ -8102,18 +8118,21 @@ impl ScriptRuntime {
                 let length = self
                     .document
                     .borrow()
-                    .element_text_content(&boundary.path)
+                    .element_text_content(
+                        &attached_path(&boundary.node)
+                            .ok_or_else(|| runtime_error("Range boundary is no longer attached"))?,
+                    )
                     .map(|text| utf16_len(&text))
                     .unwrap_or(0);
                 let changed = {
                     let mut range_data = range.borrow_mut();
                     let previous = range_data.clone();
                     range_data.start = RangeBoundary {
-                        path: boundary.path.clone(),
+                        node: boundary.node.clone(),
                         offset: 0,
                     };
                     range_data.end = RangeBoundary {
-                        path: boundary.path,
+                        node: boundary.node,
                         offset: length,
                     };
                     *range_data != previous
@@ -8207,10 +8226,10 @@ impl ScriptRuntime {
                     .min(utf16_len(&value));
                 let range = RangeData {
                     start: RangeBoundary {
-                        path: path.clone(),
+                        node: handle.clone(),
                         offset,
                     },
-                    end: RangeBoundary { path, offset },
+                    end: RangeBoundary { node: handle, offset },
                 };
                 let changed = selection
                     .borrow()
@@ -11261,10 +11280,6 @@ fn selection_direction_name(direction: SelectionDirection) -> &'static str {
         SelectionDirection::Forward => "forward",
         SelectionDirection::Backward => "backward",
     }
-}
-
-fn range_is_collapsed(range: &RangeData) -> bool {
-    range.start.path == range.end.path && range.start.offset == range.end.offset
 }
 
 fn common_path(start: &[usize], end: &[usize]) -> NodePath {
@@ -15981,7 +15996,6 @@ mod tests {
         runtime
             .execute(
                 r#"
-                const first = document.getElementById("first");
                 const second = document.getElementById("second");
                 let events = "";
                 first.addEventListener("blur", () => events = events + "first-blur|");
@@ -16235,6 +16249,116 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("hello|hello|ell|0:5:false:copy|1:copy:0:5|true::1:2")
+        );
+    }
+
+    #[test]
+    fn document_range_spans_sibling_elements_and_keeps_live_boundaries() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const second = document.getElementById("second");
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.setStart(first, 2);
+                range.setEnd(second, 3);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+                status.textContent = range.toString() + "|" + selection.toString() + "|" +
+                    range.startContainer.id + ":" + range.startOffset + "|" +
+                    range.endContainer.id + ":" + range.endOffset + "|" +
+                    range.commonAncestorContainer.id;
+                "#,
+            )
+            .expect("cross-node Range should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("llowor|llowor|first:2|second:3|root")
+        );
+    }
+
+    #[test]
+    fn document_range_boundaries_follow_attached_node_moves() {
+        let document = document(
+            r#"<main id="source"><p id="first">hello</p><p id="stay">stay</p></main><main id="target"><p id="second">world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const second = document.getElementById("second");
+                const target = document.getElementById("target");
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.setStart(first, 1);
+                range.setEnd(second, 4);
+                target.insertBefore(first, second);
+                status.textContent = range.toString() + "|" + range.startContainer.id + "|" +
+                    range.commonAncestorContainer.id;
+                "#,
+            )
+            .expect("Range should follow a moved node");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("elloworl|first|target")
+        );
+    }
+
+    #[test]
+    fn document_range_boundaries_survive_sibling_insertion_and_clamp_after_text_replacement() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const second = document.getElementById("second");
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.selectNodeContents(second);
+                const inserted = document.createElement("aside");
+                inserted.textContent = "ignored";
+                root.insertBefore(inserted, second);
+                status.textContent = range.toString() + "|" + range.startContainer.id + "|" +
+                    range.endContainer.id;
+                second.textContent = "x";
+                status.textContent = status.textContent + "|" + range.toString() + "|" +
+                    range.endOffset;
+                "#,
+            )
+            .expect("Range should follow insertion and replacement");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("world|second|second|x|5")
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("second"),
+            Some(vec![0, 2])
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("first"),
+            Some(vec![0, 0])
         );
     }
 
