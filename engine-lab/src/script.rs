@@ -1362,7 +1362,7 @@ impl ScriptRuntime {
                 Value::Builtin(Builtin::WindowScrollBy),
             );
         }
-        Self {
+        let mut runtime = Self {
             document,
             resources,
             resource_provider,
@@ -1407,6 +1407,28 @@ impl ScriptRuntime {
             worker_script_type: None,
             worker_resource_sender: None,
             worker_resource_receiver: None,
+        };
+        runtime.initialize_select_state();
+        runtime
+    }
+
+    fn initialize_select_state(&mut self) {
+        let selects = self
+            .document
+            .borrow()
+            .find_elements_by_selector("select")
+            .unwrap_or_default();
+        for select in selects {
+            let options = self.option_paths(&select);
+            for option in &options {
+                let selected = self
+                    .document
+                    .borrow()
+                    .element_clone(option)
+                    .is_some_and(|element| element.attr("selected").is_some());
+                self.option_selected.insert(option.clone(), selected);
+            }
+            self.normalize_select_selection(&select, false);
         }
     }
 
@@ -4576,23 +4598,36 @@ impl ScriptRuntime {
             .map(|kind| kind.to_ascii_lowercase())
             .unwrap_or_else(|| "text".to_string());
         let value = self.control_value_path(path).unwrap_or_default();
-        let empty = match kind.as_str() {
-            "checkbox" => !self.control_checked_path(path),
-            "radio" => self
-                .document
-                .borrow()
-                .radio_group_paths(path)
-                .map(|group| {
-                    group
-                        .iter()
-                        .all(|candidate| !self.control_checked_path(candidate))
-                })
-                .unwrap_or_else(|| !self.control_checked_path(path)),
-            "file" => self
-                .selected_files
-                .get(path)
-                .is_none_or(Vec::is_empty),
-            _ => value.is_empty(),
+        let empty = if element.name == "select" {
+            let selected = self
+                .option_paths(path)
+                .into_iter()
+                .filter(|option| self.option_selected_path(option))
+                .collect::<Vec<_>>();
+            selected.is_empty()
+                || (selected.len() == 1
+                    && self
+                        .select_placeholder_path(path)
+                        .is_some_and(|placeholder| selected[0] == placeholder))
+        } else {
+            match kind.as_str() {
+                "checkbox" => !self.control_checked_path(path),
+                "radio" => self
+                    .document
+                    .borrow()
+                    .radio_group_paths(path)
+                    .map(|group| {
+                        group
+                            .iter()
+                            .all(|candidate| !self.control_checked_path(candidate))
+                    })
+                    .unwrap_or_else(|| !self.control_checked_path(path)),
+                "file" => self
+                    .selected_files
+                    .get(path)
+                    .is_none_or(Vec::is_empty),
+                _ => value.is_empty(),
+            }
         };
         let dirty = self.dirty_controls.contains(path);
         let length = utf16_len(&value);
@@ -4735,10 +4770,48 @@ impl ScriptRuntime {
     }
 
     fn option_disabled_path(&self, path: &[usize]) -> bool {
-        self.document
-            .borrow()
-            .element_clone(path)
-            .is_some_and(|element| element.attr("disabled").is_some())
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return false;
+        };
+        if element.name != "option" {
+            return false;
+        }
+        if element.attr("disabled").is_some() {
+            return true;
+        }
+        let mut ancestor = path.to_vec();
+        while !ancestor.is_empty() {
+            ancestor.pop();
+            let Some(element) = self.document.borrow().element_clone(&ancestor) else {
+                continue;
+            };
+            match element.name.as_str() {
+                "select" => return false,
+                "optgroup" => return element.attr("disabled").is_some(),
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn select_placeholder_path(&self, path: &[usize]) -> Option<NodePath> {
+        let element = self.document.borrow().element_clone(path)?;
+        if element.name != "select"
+            || element.attr("multiple").is_some()
+            || element
+                .attr("size")
+                .and_then(|size| size.trim().parse::<usize>().ok())
+                .is_some_and(|size| size > 1)
+        {
+            return None;
+        }
+        let option = self.option_paths(path).into_iter().next()?;
+        let parent = option[..option.len().saturating_sub(1)].to_vec();
+        (parent == path)
+            .then(|| self.document.borrow().element_clone(&option))
+            .flatten()
+            .filter(|option| option_value(option).is_empty())
+            .map(|_| option)
     }
 
     fn option_selected_path(&self, path: &[usize]) -> bool {
@@ -13823,6 +13896,36 @@ mod tests {
     }
 
     #[test]
+    fn required_selects_validate_placeholders_and_skip_disabled_optgroups() {
+        let document = document(
+            r#"<form id="filters"><select id="plan" name="plan" required><option value="" selected>Choose</option><optgroup label="blocked" disabled><option value="blocked">Blocked</option></optgroup><option value="live">Live</option></select><p id="status">idle</p></form>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const form = document.getElementById("filters");
+                const plan = document.getElementById("plan");
+                const status = document.getElementById("status");
+                let snapshot = plan.validity.valueMissing + "|" + plan.checkValidity() + "|" + new FormData(form).has("plan");
+                plan.selectedIndex = 1;
+                snapshot = snapshot + "|" + plan.value + "|" + plan.validity.valueMissing + "|" + plan.checkValidity() + "|" + new FormData(form).has("plan");
+                plan.selectedIndex = 2;
+                status.textContent = snapshot + "|" + plan.value + "|" + plan.validity.valueMissing + "|" + plan.checkValidity() + "|" + new FormData(form).get("plan");
+                "#,
+            )
+            .expect("required select validation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|false|true|blocked|false|true|false|live|false|true|live")
+        );
+    }
+
+    #[test]
     fn email_url_and_bounded_pattern_constraints_report_type_mismatches() {
         let document = document(
             r#"<input id="email" type="email" value="bad address"><input id="url" type="url" value="example"><input id="code" pattern="[0-9]{4}" value="12"><input id="ignored" pattern="(" value="x"><p id="status">idle</p>"#,
@@ -13984,6 +14087,30 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("|0|3|1|false|1|Pro|1|0|pro|1|a|2|true|pro|a,b|pro|1|a|1|true|true")
+        );
+    }
+
+    #[test]
+    fn single_select_initial_selected_attributes_keep_the_last_option() {
+        let document = document(
+            r#"<select id="plan"><option value="a" selected>Alpha</option><option value="b" selected>Beta</option><option value="c">Gamma</option></select><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const plan = document.getElementById("plan");
+                document.getElementById("status").textContent = plan.value + "|" + plan.selectedIndex + "|" + plan.options[0].selected + "|" + plan.options[1].selected + "|" + plan.selectedOptions.length;
+                "#,
+            )
+            .expect("initial selectedness should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("b|1|false|true|1")
         );
     }
 
