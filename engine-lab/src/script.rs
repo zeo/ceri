@@ -1432,6 +1432,94 @@ impl ScriptRuntime {
         }
     }
 
+    fn rehydrate_select_state(&mut self, select_path: &[usize]) {
+        self.option_selected
+            .retain(|path, _| !path.starts_with(select_path));
+        self.dirty_options
+            .retain(|path| !path.starts_with(select_path));
+        let options = self.option_paths(select_path);
+        for option in &options {
+            let selected = self
+                .document
+                .borrow()
+                .element_clone(option)
+                .is_some_and(|element| element.attr("selected").is_some());
+            self.option_selected.insert(option.clone(), selected);
+        }
+        self.normalize_select_selection(select_path, false);
+    }
+
+    fn select_paths_for_inner_html(&self, path: &[usize]) -> Vec<NodePath> {
+        let document = self.document.borrow();
+        let mut selects = Vec::new();
+        if document
+            .element_clone(path)
+            .is_some_and(|element| element.name == "select")
+        {
+            selects.push(path.to_vec());
+        }
+        if let Some(nested) = document.find_elements_by_selector_within(path, "select") {
+            selects.extend(nested);
+        }
+        if let Some(ancestor) = document.select_ancestor_path(path) {
+            selects.push(ancestor);
+        }
+        selects.sort_by_key(Vec::len);
+        selects.dedup();
+        selects
+    }
+
+    fn refresh_select_state_after_inner_html(&mut self, path: &[usize]) {
+        for select in self.select_paths_for_inner_html(path) {
+            self.rehydrate_select_state(&select);
+        }
+    }
+
+    fn refresh_select_state_after_append(&mut self, parent: &[usize], child: &[usize]) {
+        let (new_selects, ancestor) = {
+            let document = self.document.borrow();
+            let mut new_selects = Vec::new();
+            if document
+                .element_clone(child)
+                .is_some_and(|element| element.name == "select")
+            {
+                new_selects.push(child.to_vec());
+            }
+            if let Some(nested) = document.find_elements_by_selector_within(child, "select") {
+                new_selects.extend(nested);
+            }
+            let ancestor = document
+                .element_clone(parent)
+                .is_some_and(|element| element.name == "select")
+                .then(|| parent.to_vec())
+                .or_else(|| document.select_ancestor_path(parent));
+            new_selects.sort_by_key(Vec::len);
+            new_selects.dedup();
+            (new_selects, ancestor)
+        };
+        for select in new_selects {
+            self.rehydrate_select_state(&select);
+        }
+        let Some(select) = ancestor else {
+            return;
+        };
+        let options = self
+            .option_paths(&select)
+            .into_iter()
+            .filter(|option| option.starts_with(child))
+            .collect::<Vec<_>>();
+        for option in options {
+            let selected = self
+                .document
+                .borrow()
+                .element_clone(&option)
+                .is_some_and(|element| element.attr("selected").is_some());
+            self.option_selected.insert(option.clone(), selected);
+            self.dirty_options.remove(&option);
+        }
+        self.normalize_select_selection(&select, false);
+    }
+
     pub fn execute_scripts(&mut self) -> Result<(), ScriptError> {
         let scripts = self.document.borrow().script_text();
         for script in scripts {
@@ -5680,7 +5768,8 @@ impl ScriptRuntime {
     }
 
     fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
-        match handle.borrow().clone() {
+        let location = handle.borrow().clone();
+        match location {
             ElementLocation::Attached(path) => {
                 let Some(element) = self.document.borrow().element_clone(&path) else {
                     return false;
@@ -5830,11 +5919,17 @@ impl ScriptRuntime {
     ) -> Result<bool, ScriptError> {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow_mut()
-                .set_element_inner_html(&path, &source)
-                .map_err(|error| runtime_error(error.to_string())),
+            ElementLocation::Attached(path) => {
+                let changed = self
+                    .document
+                    .borrow_mut()
+                    .set_element_inner_html(&path, &source)
+                    .map_err(|error| runtime_error(error.to_string()))?;
+                if changed {
+                    self.refresh_select_state_after_inner_html(&path);
+                }
+                Ok(changed)
+            }
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
                 let ElementLocation::Detached(element) = &mut *location else {
@@ -8493,6 +8588,7 @@ impl ScriptRuntime {
                     .ok_or_else(|| {
                         runtime_error("appendChild parent is no longer in the document")
                     })?;
+                self.refresh_select_state_after_append(&path, &child_path);
                 *child.borrow_mut() = ElementLocation::Attached(child_path);
                 Ok(Value::Element(child))
             }
@@ -14235,6 +14331,72 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("b|1|false|true|1")
+        );
+    }
+
+    #[test]
+    fn select_state_rehydrates_after_appending_options_and_replacing_inner_html() {
+        let document = document(
+            r#"<select id="plan"><option value="a">Alpha</option></select><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const plan = document.getElementById("plan");
+                const status = document.getElementById("status");
+                const option = document.createElement("option");
+                option.value = "b";
+                option.text = "Beta";
+                option.selected = true;
+                plan.appendChild(option);
+                let snapshot = plan.value + "|" + plan.selectedIndex + "|" + plan.options.length + "|" + plan.options[0].selected + "|" + plan.options[1].selected;
+                plan.innerHTML = "<option value='c'>Gamma</option><option value='d' selected>Delta</option>";
+                status.textContent = snapshot + "|" + plan.value + "|" + plan.selectedIndex + "|" + plan.options.length + "|" + plan.options[0].selected + "|" + plan.options[1].selected;
+                "#,
+            )
+            .expect("select state should follow live DOM mutation");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("b|1|2|false|true|d|1|2|false|true")
+        );
+    }
+
+    #[test]
+    fn appended_controls_resolve_explicit_form_owners_at_query_time() {
+        let document = document(
+            r#"<main id="mount"><form id="main"><input name="inside" value="a"></form><form id="external-form"><input name="existing" value="e"></form><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const main = document.getElementById("main");
+                const secondary = document.getElementById("external-form");
+                const section = document.createElement("section");
+                const late = document.createElement("input");
+                late.value = "v";
+                mount.appendChild(section);
+                section.appendChild(late);
+                late.setAttribute("name", "late");
+                late.setAttribute("form", "external-form");
+                const data = new FormData(secondary);
+                document.getElementById("status").textContent = main.elements.length + "|" + secondary.elements.length + "|" + data.get("late") + "|" + (late.form === secondary);
+                "#,
+            )
+            .expect("late form ownership should resolve after append");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|2|v|true")
         );
     }
 
