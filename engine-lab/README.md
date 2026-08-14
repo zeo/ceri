@@ -2,7 +2,7 @@
 
 Effective disabled state reaches form submission, validation, interaction, and CSS `:disabled` or `:enabled` matching, including the first `legend` exemption inside a disabled `fieldset`.
 
-Live DOM mutations rehydrate select option state after `appendChild`, detached `insertBefore`, and `innerHTML` replacement, while form ownership follows controls appended after startup. `parentNode`, `parentElement`, and `remove()` expose the bounded tree relationship. Direct-child `removeChild` preserves survivor paths and permits end-only reattachment of the returned detached element, including its event listeners; detached `innerHTML` replacement discards descendant listeners. Element, document, window, and worker targets support callback-identity `removeEventListener`, duplicate registrations are ignored, `{ once: true }` listeners are removed before their callback runs, and `{ signal }` listeners are removed before abort callbacks run. Attached element handles resolve through document node IDs, so sibling insertion keeps existing handles and stored element methods attached to the same node. Moving an already attached node remains outside this bounded path model.
+Live DOM mutations rehydrate select option state after `appendChild`, `insertBefore`, and `innerHTML` replacement, while form ownership follows controls appended after startup. `appendChild` and `insertBefore` move already attached nodes without replacing their node IDs, so stored handles, methods, listeners, focus state, selection state, and control state follow the moved node. `parentNode`, `parentElement`, and `remove()` expose the bounded tree relationship. Direct-child `removeChild` preserves survivor paths and permits end-only reattachment of the returned detached element, including its event listeners; detached `innerHTML` replacement discards descendant listeners. Element, document, window, and worker targets support callback-identity `removeEventListener`, duplicate registrations are ignored, `{ once: true }` listeners are removed before their callback runs, and `{ signal }` listeners are removed before abort callbacks run. Attached element handles resolve through document node IDs, so sibling insertion and attached movement keep existing handles and stored element methods attached to the same node. Cross-node Range identity remains outside this bounded path model.
 
 This crate is a deliberately small browser-engine experiment written with the Rust standard library. Its default build has no CEF, WebKit, Servo, third-party JavaScript engine, or GUI dependency.
 
@@ -27,7 +27,7 @@ The current slice implements:
 - callback-identity `removeEventListener`, `{ once: true }`, and `{ signal }` listeners on element, document, window, and worker targets
 - element attributes, inline styles, and `classList` state mutation
 - stable detached and attached element handles with `document.createElement` and `appendChild`
-- direct-child `removeChild` with survivor-path preservation, listener retention, end-only detached reattachment, and detached `insertBefore`
+- direct-child `removeChild` with survivor-path preservation, listener retention, end-only detached reattachment, and `insertBefore` moves for detached or attached nodes
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation

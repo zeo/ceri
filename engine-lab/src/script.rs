@@ -1610,6 +1610,231 @@ impl ScriptRuntime {
         }
     }
 
+    fn relocate_runtime_paths_for_move(&mut self, source: &[usize], destination: &[usize]) {
+        let source_parent = source[..source.len().saturating_sub(1)].to_vec();
+        let source_index = *source.last().expect("move source path is non-empty");
+        let destination_parent = destination[..destination.len().saturating_sub(1)].to_vec();
+        let destination_index = *destination.last().expect("move destination path is non-empty");
+        relocate_hash_map_paths(
+            &mut self.listeners,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_hash_map_paths(
+            &mut self.control_values,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_hash_map_paths(
+            &mut self.control_checked,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_set_paths(
+            &mut self.dirty_checked_controls,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_hash_map_paths(
+            &mut self.option_selected,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_set_paths(
+            &mut self.dirty_options,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_set_paths(
+            &mut self.dirty_controls,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_set_paths(
+            &mut self.last_user_edit,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_set_paths(
+            &mut self.resetting_forms,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_map_paths(
+            &mut self.custom_validity,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_hash_map_paths(
+            &mut self.text_selections,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_hash_map_paths(
+            &mut self.selected_files,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_btree_map_paths(
+            &mut self.scroll_offsets,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        relocate_hash_map_paths(
+            &mut self.canvas_contexts,
+            source,
+            &source_parent,
+            source_index,
+            &destination_parent,
+            destination_index,
+            destination,
+        );
+        {
+            let mut file_lists = self.file_lists.borrow_mut();
+            relocate_hash_map_paths(
+                &mut file_lists,
+                source,
+                &source_parent,
+                source_index,
+                &destination_parent,
+                destination_index,
+                destination,
+            );
+        }
+        for context in self.canvas_contexts.values() {
+            let path = context.borrow().path.clone();
+            let path = relocate_path_for_move(
+                &path,
+                source,
+                &source_parent,
+                source_index,
+                &destination_parent,
+                destination_index,
+                destination,
+            );
+            context.borrow_mut().path = path;
+        }
+        if let Some(path) = &mut self.focused_element {
+            *path = relocate_path_for_move(
+                path,
+                source,
+                &source_parent,
+                source_index,
+                &destination_parent,
+                destination_index,
+                destination,
+            );
+        }
+        if let Some(composition) = &mut self.composition {
+            composition.path = relocate_path_for_move(
+                &composition.path,
+                source,
+                &source_parent,
+                source_index,
+                &destination_parent,
+                destination_index,
+                destination,
+            );
+        }
+        if let Some(range) = self.selection.borrow().range.clone() {
+            let mut range = range.borrow_mut();
+            range.start.path = relocate_path_for_move(
+                &range.start.path,
+                source,
+                &source_parent,
+                source_index,
+                &destination_parent,
+                destination_index,
+                destination,
+            );
+            range.end.path = relocate_path_for_move(
+                &range.end.path,
+                source,
+                &source_parent,
+                source_index,
+                &destination_parent,
+                destination_index,
+                destination,
+            );
+        }
+    }
+
+    fn refresh_select_state_after_move(&mut self, source_parent: &[usize], child: &[usize]) {
+        let selects = {
+            let document = self.document.borrow();
+            let mut selects = Vec::new();
+            for path in [source_parent.to_vec(), child.to_vec()] {
+                if document
+                    .element_clone(&path)
+                    .is_some_and(|element| element.name == "select")
+                {
+                    selects.push(path.clone());
+                }
+                if let Some(ancestor) = document.select_ancestor_path(&path) {
+                    selects.push(ancestor);
+                }
+            }
+            selects.sort_by_key(Vec::len);
+            selects.dedup();
+            selects
+        };
+        for select in selects {
+            self.normalize_select_selection(&select, false);
+        }
+    }
+
     fn capture_detached_listeners(&mut self, handle: &ElementHandle, path: &[usize]) {
         let mut detached = Vec::new();
         let mut retained = HashMap::new();
@@ -9083,13 +9308,30 @@ impl ScriptRuntime {
                     Some(Value::Element(handle)) => handle.clone(),
                     _ => return Err(runtime_error("appendChild expects an element")),
                 };
+                if let Some(source_path) = attached_path(&child) {
+                    let source_parent =
+                        source_path[..source_path.len().saturating_sub(1)].to_vec();
+                    let child_path = self
+                        .document
+                        .borrow_mut()
+                        .move_element_before(&source_path, &parent_path, None)
+                        .ok_or_else(|| {
+                            runtime_error("appendChild cannot move the element into the parent")
+                        })?;
+                    if child_path != source_path {
+                        self.relocate_runtime_paths_for_move(&source_path, &child_path);
+                        self.refresh_select_state_after_move(&source_parent, &child_path);
+                    }
+                    let attached = attached_handle(child_path, &self.document)
+                        .ok_or_else(|| runtime_error("appendChild failed to preserve node identity"))?;
+                    *child.borrow_mut() = attached.borrow().clone();
+                    return Ok(Value::Element(child));
+                }
                 let location = child.borrow().clone();
                 let element = match location {
                     ElementLocation::Detached(element) => element,
                     ElementLocation::Attached { .. } => {
-                        return Err(runtime_error(
-                            "appendChild currently accepts detached elements only",
-                        ));
+                        return Err(runtime_error("appendChild child handle is unavailable"));
                     }
                 };
                 let child_path = self
@@ -9121,32 +9363,48 @@ impl ScriptRuntime {
                     Some(_) => return Err(runtime_error("insertBefore reference must be an element or null")),
                 };
                 let reference_index = reference_path.as_ref().and_then(|path| path.last()).copied();
-                let location = child.borrow().clone();
-                let element = match location {
-                    ElementLocation::Detached(element) => element,
-                    ElementLocation::Attached { .. } => {
-                        return Err(runtime_error(
-                            "insertBefore currently accepts detached elements only",
-                        ));
+                let child_path = if let Some(source_path) = attached_path(&child) {
+                    let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
+                    let child_path = self
+                        .document
+                        .borrow_mut()
+                        .move_element_before(&source_path, &parent_path, reference_path.as_deref())
+                        .ok_or_else(|| {
+                            runtime_error(
+                                "insertBefore cannot move the element into the requested parent",
+                            )
+                        })?;
+                    if child_path != source_path {
+                        self.relocate_runtime_paths_for_move(&source_path, &child_path);
+                        self.refresh_select_state_after_move(&source_parent, &child_path);
                     }
-                };
-                let child_path = if let Some(reference_path) = reference_path {
-                    self.document
-                        .borrow_mut()
-                        .insert_element_before(&parent_path, element, &reference_path)
+                    child_path
                 } else {
-                    self.document
-                        .borrow_mut()
-                        .append_element(&parent_path, element)
-                }
-                .ok_or_else(|| {
-                    runtime_error("insertBefore parent or reference is no longer in the document")
-                })?;
-                if let Some(index) = reference_index {
-                    self.shift_runtime_paths_for_insert(&parent_path, index);
-                }
-                self.restore_detached_listeners(&child, &child_path);
-                self.refresh_select_state_after_append(&parent_path, &child_path);
+                    let location = child.borrow().clone();
+                    let ElementLocation::Detached(element) = location else {
+                        return Err(runtime_error("insertBefore child handle is unavailable"));
+                    };
+                    let child_path = if let Some(reference_path) = reference_path {
+                        self.document
+                            .borrow_mut()
+                            .insert_element_before(&parent_path, element, &reference_path)
+                    } else {
+                        self.document
+                            .borrow_mut()
+                            .append_element(&parent_path, element)
+                    }
+                    .ok_or_else(|| {
+                        runtime_error(
+                            "insertBefore parent or reference is no longer in the document",
+                        )
+                    })?;
+                    if let Some(index) = reference_index {
+                        self.shift_runtime_paths_for_insert(&parent_path, index);
+                    }
+                    self.restore_detached_listeners(&child, &child_path);
+                    self.refresh_select_state_after_append(&parent_path, &child_path);
+                    child_path
+                };
                 let attached = attached_handle(child_path, &self.document)
                     .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
                 *child.borrow_mut() = attached.borrow().clone();
@@ -11074,6 +11332,119 @@ fn shift_btree_set_paths(paths: &mut BTreeSet<NodePath>, parent: &[usize], index
         .map(|mut path| {
             shift_path_for_insert(&mut path, parent, index);
             path
+        })
+        .collect();
+}
+
+fn relocate_path_for_move(
+    path: &NodePath,
+    source: &[usize],
+    source_parent: &[usize],
+    source_index: usize,
+    destination_parent: &[usize],
+    destination_index: usize,
+    destination: &[usize],
+) -> NodePath {
+    if path.starts_with(source) {
+        let mut relocated = destination.to_vec();
+        relocated.extend_from_slice(&path[source.len()..]);
+        return relocated;
+    }
+    let mut relocated = path.clone();
+    shift_path_for_remove(&mut relocated, source_parent, source_index);
+    shift_path_for_insert(&mut relocated, destination_parent, destination_index);
+    relocated
+}
+
+fn shift_path_for_remove(path: &mut NodePath, parent: &[usize], index: usize) {
+    if path.len() > parent.len()
+        && path.starts_with(parent)
+        && path[parent.len()] > index
+    {
+        path[parent.len()] -= 1;
+    }
+}
+
+fn relocate_hash_map_paths<V>(
+    paths: &mut HashMap<NodePath, V>,
+    source: &[usize],
+    source_parent: &[usize],
+    source_index: usize,
+    destination_parent: &[usize],
+    destination_index: usize,
+    destination: &[usize],
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|(path, value)| {
+            (
+                relocate_path_for_move(
+                    &path,
+                    source,
+                    source_parent,
+                    source_index,
+                    destination_parent,
+                    destination_index,
+                    destination,
+                ),
+                value,
+            )
+        })
+        .collect();
+}
+
+fn relocate_btree_map_paths<V>(
+    paths: &mut BTreeMap<NodePath, V>,
+    source: &[usize],
+    source_parent: &[usize],
+    source_index: usize,
+    destination_parent: &[usize],
+    destination_index: usize,
+    destination: &[usize],
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|(path, value)| {
+            (
+                relocate_path_for_move(
+                    &path,
+                    source,
+                    source_parent,
+                    source_index,
+                    destination_parent,
+                    destination_index,
+                    destination,
+                ),
+                value,
+            )
+        })
+        .collect();
+}
+
+fn relocate_btree_set_paths(
+    paths: &mut BTreeSet<NodePath>,
+    source: &[usize],
+    source_parent: &[usize],
+    source_index: usize,
+    destination_parent: &[usize],
+    destination_index: usize,
+    destination: &[usize],
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|path| {
+            relocate_path_for_move(
+                &path,
+                source,
+                source_parent,
+                source_index,
+                destination_parent,
+                destination_index,
+                destination,
+            )
         })
         .collect();
 }
@@ -15424,6 +15795,91 @@ mod tests {
         assert_eq!(
             document.borrow().find_element_by_id("last"),
             Some(vec![0, 3])
+        );
+    }
+
+    #[test]
+    fn insert_before_moves_attached_nodes_and_keeps_runtime_state_with_them() {
+        let document = document(
+            r#"<main id="source"><button id="move">move</button><p id="stay">stay</p></main><main id="target"><p id="reference">reference</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const move = document.getElementById("move");
+                const stay = document.getElementById("stay");
+                const target = document.getElementById("target");
+                const reference = document.getElementById("reference");
+                let clicks = 0;
+                move.addEventListener("click", () => clicks = clicks + 1);
+                target.insertBefore(move, reference);
+                stay.textContent = "stay shifted";
+                reference.textContent = "reference shifted";
+                move.textContent = move.parentNode.id;
+                move.click();
+                document.getElementById("status").textContent =
+                    move.textContent + "|" + stay.textContent + "|" + reference.textContent + "|" + clicks;
+                "#,
+            )
+            .expect("insertBefore should move attached nodes");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("target|stay shifted|reference shifted|1")
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("move"),
+            Some(vec![1, 0])
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("stay"),
+            Some(vec![0, 0])
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("reference"),
+            Some(vec![1, 1])
+        );
+    }
+
+    #[test]
+    fn append_child_moves_an_attached_node_to_the_end() {
+        let document = document(
+            r#"<main id="source"><button id="move">move</button><p id="stay">stay</p></main><main id="target"><p id="existing">existing</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const move = document.getElementById("move");
+                const target = document.getElementById("target");
+                let clicks = 0;
+                move.addEventListener("click", () => clicks = clicks + 1);
+                target.appendChild(move);
+                move.click();
+                document.getElementById("status").textContent =
+                    move.parentNode.id + "|" + move.textContent + "|" + clicks;
+                "#,
+            )
+            .expect("appendChild should move attached nodes");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("target|move|1")
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("move"),
+            Some(vec![1, 2])
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("stay"),
+            Some(vec![0, 0])
         );
     }
 

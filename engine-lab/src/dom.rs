@@ -443,6 +443,81 @@ impl Document {
         Some(path)
     }
 
+    pub fn move_element_before(
+        &mut self,
+        source: &[usize],
+        parent: &[usize],
+        reference: Option<&[usize]>,
+    ) -> Option<NodePath> {
+        if source.is_empty() || source == parent || parent.starts_with(source) {
+            return None;
+        }
+        let source_parent = source[..source.len() - 1].to_vec();
+        let source_index = *source.last()?;
+        self.element_at(source)?;
+        if let Some(reference) = reference {
+            if reference.len() != parent.len().saturating_add(1)
+                || reference[..parent.len()] != *parent
+                || self.element_at(reference).is_none()
+            {
+                return None;
+            }
+            if reference == source {
+                return Some(source.to_vec());
+            }
+            if reference.starts_with(source) {
+                return None;
+            }
+        }
+        let moved_ids = self
+            .paths
+            .iter()
+            .filter(|(_, path)| path.starts_with(source))
+            .map(|(id, path)| (*id, path[source.len()..].to_vec()))
+            .collect::<Vec<_>>();
+        let element = {
+            let source_parent_element = self.element_at_mut(&source_parent)?;
+            match source_parent_element.children.get(source_index)? {
+                Node::Element(_) => match source_parent_element.children.remove(source_index) {
+                    Node::Element(element) => element,
+                    Node::Text(_) => return None,
+                },
+                Node::Text(_) => return None,
+            }
+        };
+        self.paths
+            .retain(|_, path| !path.starts_with(source));
+        self.shift_paths_for_remove(&source_parent, source_index);
+        let parent = path_after_remove(parent, &source_parent, source_index)?;
+        let reference = if let Some(reference) = reference {
+            Some(path_after_remove(reference, &source_parent, source_index)?)
+        } else {
+            None
+        };
+        let index = reference
+            .as_ref()
+            .map(|reference| *reference.last().expect("reference path is non-empty"))
+            .unwrap_or_else(|| self.element_at(&parent).map_or(0, |element| element.children.len()));
+        if index > self.element_at(&parent)?.children.len() {
+            return None;
+        }
+        self.shift_paths_for_insert(&parent, index);
+        let mut path = parent.clone();
+        let parent_element = self.element_at_mut(&parent)?;
+        if index > parent_element.children.len() {
+            return None;
+        }
+        parent_element.children.insert(index, Node::Element(element));
+        path.push(index);
+        for (id, relative) in moved_ids {
+            let mut moved_path = path.clone();
+            moved_path.extend(relative);
+            self.paths.insert(id, moved_path);
+        }
+        self.rebuild_path_index();
+        Some(path)
+    }
+
     pub fn remove_child(&mut self, parent: &[usize], child: &[usize]) -> Option<Element> {
         if child.len() != parent.len().saturating_add(1)
             || child[..parent.len()] != *parent
@@ -615,6 +690,18 @@ impl Document {
         self.rebuild_path_index();
     }
 
+    fn shift_paths_for_remove(&mut self, parent: &[usize], index: usize) {
+        for path in self.paths.values_mut() {
+            if path.len() > parent.len()
+                && path.starts_with(parent)
+                && path[parent.len()] > index
+            {
+                path[parent.len()] -= 1;
+            }
+        }
+        self.rebuild_path_index();
+    }
+
     fn rebuild_path_index(&mut self) {
         self.node_ids = self
             .paths
@@ -752,6 +839,21 @@ fn collect_element_paths(element: &Element, path: &mut NodePath, paths: &mut Vec
             path.pop();
         }
     }
+}
+
+fn path_after_remove(path: &[usize], parent: &[usize], index: usize) -> Option<NodePath> {
+    if path.len() <= parent.len() || !path.starts_with(parent) {
+        return Some(path.to_vec());
+    }
+    let child_index = path[parent.len()];
+    if child_index == index {
+        return None;
+    }
+    let mut adjusted = path.to_vec();
+    if child_index > index {
+        adjusted[parent.len()] -= 1;
+    }
+    Some(adjusted)
 }
 
 fn accessibility_node(element: &Element, path: NodePath) -> Option<AccessibilityNode> {
@@ -1824,6 +1926,84 @@ mod tests {
         assert!(document.remove_child(&main, &[0, 2]).is_some());
         assert!(document.path_for_id(middle_id).is_none());
         assert_eq!(document.path_for_id(last_id), Some(vec![0, 3]));
+    }
+
+    #[test]
+    fn moves_an_attached_element_between_parents_without_replacing_its_id() {
+        let mut document = Document::parse(
+            "<main id='source'><p id='move'>move</p><p id='stay'>stay</p></main><main id='target'><p id='reference'>reference</p></main>",
+        )
+        .expect("document should parse");
+        let source = document
+            .find_element_by_id("source")
+            .expect("source should exist");
+        let target = document
+            .find_element_by_id("target")
+            .expect("target should exist");
+        let moved = document
+            .find_element_by_id("move")
+            .expect("moved element should exist");
+        let reference = document
+            .find_element_by_id("reference")
+            .expect("reference should exist");
+        let moved_id = document.node_id(&moved).expect("moved element should have an id");
+        let stay_id = document
+            .node_id(&[0, 1])
+            .expect("surviving sibling should have an id");
+        let new_path = document
+            .move_element_before(&moved, &target, Some(&reference))
+            .expect("attached element should move before the reference");
+
+        assert_eq!(new_path, vec![1, 0]);
+        assert_eq!(document.path_for_id(moved_id), Some(new_path));
+        assert_eq!(document.path_for_id(stay_id), Some(vec![0, 0]));
+        assert_eq!(document.find_element_by_id("reference"), Some(vec![1, 1]));
+        assert_eq!(document.find_element_by_id("move"), Some(vec![1, 0]));
+        assert_eq!(document.find_element_by_id("stay"), Some(vec![0, 0]));
+        assert_eq!(
+            document.element_text_content(&[1, 0]).as_deref(),
+            Some("move")
+        );
+        assert_eq!(
+            document.element_text_content(&[0, 0]).as_deref(),
+            Some("stay")
+        );
+        assert_ne!(source, target);
+    }
+
+    #[test]
+    fn moves_an_attached_element_within_one_parent_and_keeps_ordered_ids() {
+        let mut document = Document::parse(
+            "<main><p id='first'>first</p><p id='middle'>middle</p><p id='last'>last</p></main>",
+        )
+        .expect("document should parse");
+        let main = document
+            .find_element_by_selector("main")
+            .expect("main should exist");
+        let first = document
+            .find_element_by_id("first")
+            .expect("first should exist");
+        let middle = document
+            .find_element_by_id("middle")
+            .expect("middle should exist");
+        let last = document
+            .find_element_by_id("last")
+            .expect("last should exist");
+        let first_id = document.node_id(&first).expect("first should have an id");
+        let middle_id = document.node_id(&middle).expect("middle should have an id");
+        let last_id = document.node_id(&last).expect("last should have an id");
+
+        assert_eq!(
+            document.move_element_before(&last, &main, Some(&first)),
+            Some(vec![0, 0])
+        );
+        assert_eq!(document.path_for_id(last_id), Some(vec![0, 0]));
+        assert_eq!(document.path_for_id(first_id), Some(vec![0, 1]));
+        assert_eq!(document.path_for_id(middle_id), Some(vec![0, 2]));
+        assert_eq!(
+            document.move_element_before(&[0, 0], &main, Some(&[0, 0])),
+            Some(vec![0, 0])
+        );
     }
 
     #[test]
