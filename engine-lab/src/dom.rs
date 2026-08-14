@@ -198,6 +198,30 @@ impl Document {
         None
     }
 
+    pub fn option_paths(&self, select_path: &[usize]) -> Option<Vec<NodePath>> {
+        let select = self.element_at(select_path)?;
+        (select.name == "select").then(|| {
+            let mut paths = Vec::new();
+            let mut path = select_path.to_vec();
+            collect_option_paths(select, &mut path, &mut paths);
+            paths
+        })
+    }
+
+    pub fn select_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
+        let mut candidate = path.to_vec();
+        while !candidate.is_empty() {
+            candidate.pop();
+            if self
+                .element_at(&candidate)
+                .is_some_and(|element| element.name == "select")
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     pub fn label_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
         let mut candidate = path.to_vec();
         while !candidate.is_empty() {
@@ -880,6 +904,21 @@ fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mu
             paths.push(path.clone());
         }
         collect_form_control_paths(child, path, paths);
+        path.pop();
+    }
+}
+
+fn collect_option_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
+    for (index, child) in element.children.iter().enumerate() {
+        let Node::Element(child) = child else {
+            continue;
+        };
+        path.push(index);
+        if child.name == "option" {
+            paths.push(path.clone());
+        } else if child.name != "select" {
+            collect_option_paths(child, path, paths);
+        }
         path.pop();
     }
 }

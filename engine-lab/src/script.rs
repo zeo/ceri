@@ -244,6 +244,7 @@ enum Builtin {
     SelectionCollapse(SelectionHandle),
     SelectionToString(SelectionHandle),
     ElementSetAttribute(NodePath),
+    ElementRemoveAttribute(NodePath),
     ElementGetAttribute(NodePath),
     ElementQuerySelector(NodePath),
     ElementQuerySelectorAll(NodePath),
@@ -529,6 +530,8 @@ pub struct ScriptRuntime {
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
     dirty_checked_controls: BTreeSet<NodePath>,
+    option_selected: HashMap<NodePath, bool>,
+    dirty_options: BTreeSet<NodePath>,
     dirty_controls: BTreeSet<NodePath>,
     last_user_edit: BTreeSet<NodePath>,
     resetting_forms: BTreeSet<NodePath>,
@@ -1373,6 +1376,8 @@ impl ScriptRuntime {
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
             dirty_checked_controls: BTreeSet::new(),
+            option_selected: HashMap::new(),
+            dirty_options: BTreeSet::new(),
             dirty_controls: BTreeSet::new(),
             last_user_edit: BTreeSet::new(),
             resetting_forms: BTreeSet::new(),
@@ -2494,6 +2499,19 @@ impl ScriptRuntime {
         if !matches!(element.name.as_str(), "input" | "select" | "textarea") {
             return;
         }
+        if element.name == "select" {
+            let options = self.option_paths(path);
+            for option in &options {
+                let selected = self
+                    .document
+                    .borrow()
+                    .element_clone(option)
+                    .is_some_and(|element| element.attr("selected").is_some());
+                self.option_selected.insert(option.clone(), selected);
+                self.dirty_options.remove(option);
+            }
+            self.normalize_select_selection(path, false);
+        }
         self.control_values.remove(path);
         self.control_checked.remove(path);
         self.dirty_controls.remove(path);
@@ -3211,6 +3229,31 @@ impl ScriptRuntime {
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
                     "defaultValue" => self.element_default_value(&handle),
+                    "selected" => Value::Bool(self.element_selected(&handle)),
+                    "defaultSelected" => {
+                        Value::Bool(self.element_default_selected(&handle))
+                    },
+                    "selectedIndex" => Value::Number(
+                        path.as_ref()
+                            .map(|path| self.select_selected_index(path) as f64)
+                            .unwrap_or(-1.0),
+                    ),
+                    "multiple" => Value::Bool(
+                        self.element_attribute(&handle, "multiple").is_some(),
+                    ),
+                    "options" => self.element_options(&handle, false),
+                    "selectedOptions" => self.element_options(&handle, true),
+                    "index" => Value::Number(
+                        path.as_ref()
+                            .and_then(|path| self.option_index(path))
+                            .map(|index| index as f64)
+                            .unwrap_or(-1.0),
+                    ),
+                    "text" => Value::String(
+                        path.as_ref()
+                            .and_then(|path| self.document.borrow().element_text_content(path))
+                            .unwrap_or_default(),
+                    ),
                     "validity" => self.element_validity(&handle),
                     "willValidate" => Value::Bool(
                         path.as_ref()
@@ -3364,6 +3407,11 @@ impl ScriptRuntime {
                     }
                     "setAttribute" => {
                         Value::Builtin(Builtin::ElementSetAttribute(path.ok_or_else(|| {
+                            runtime_error("detached element has no document attributes")
+                        })?))
+                    }
+                    "removeAttribute" => {
+                        Value::Builtin(Builtin::ElementRemoveAttribute(path.ok_or_else(|| {
                             runtime_error("detached element has no document attributes")
                         })?))
                     }
@@ -4000,6 +4048,12 @@ impl ScriptRuntime {
                 "innerHTML" => self.set_element_inner_html(&handle, value_string)?,
                 "value" => self.set_element_value(&handle, value_string),
                 "defaultValue" => self.set_element_default_value(&handle, value_string)?,
+                "selected" => self.set_element_selected(&handle, truthy),
+                "defaultSelected" => self.set_element_default_selected(&handle, truthy),
+                "selectedIndex" => self
+                    .set_element_selected_index(&handle, value.number()?)?,
+                "multiple" => self.set_element_multiple(&handle, truthy),
+                "text" => self.set_element_option_text(&handle, value_string),
                 "selectionStart" => self.set_element_selection_start(&handle, value.number()?)?,
                 "selectionEnd" => self.set_element_selection_end(&handle, value.number()?)?,
                 "selectionDirection" => {
@@ -4496,6 +4550,7 @@ impl ScriptRuntime {
         }
         match element.name.as_str() {
             "textarea" => !self.is_readonly_path(path),
+            "select" => true,
             "input" => {
                 let kind = element
                     .attr("type")
@@ -4657,6 +4712,12 @@ impl ScriptRuntime {
             return Some(value.clone());
         }
         let element = self.document.borrow().element_clone(path)?;
+        if element.name == "select" {
+            return Some(self.select_value_path(path));
+        }
+        if element.name == "option" {
+            return Some(option_value(&element));
+        }
         element.attr("value").map(str::to_string).or_else(|| {
             (element.name == "textarea").then(|| {
                 let mut text = String::new();
@@ -4666,10 +4727,372 @@ impl ScriptRuntime {
         })
     }
 
+    fn option_paths(&self, select_path: &[usize]) -> Vec<NodePath> {
+        self.document
+            .borrow()
+            .option_paths(select_path)
+            .unwrap_or_default()
+    }
+
+    fn option_disabled_path(&self, path: &[usize]) -> bool {
+        self.document
+            .borrow()
+            .element_clone(path)
+            .is_some_and(|element| element.attr("disabled").is_some())
+    }
+
+    fn option_selected_path(&self, path: &[usize]) -> bool {
+        let Some(element) = self.document.borrow().element_clone(path) else {
+            return false;
+        };
+        if element.name != "option" {
+            return false;
+        }
+        if let Some(selected) = self.option_selected.get(path) {
+            return *selected;
+        }
+        if element.attr("selected").is_some() {
+            return true;
+        }
+        let Some(select_path) = self.document.borrow().select_ancestor_path(path) else {
+            return false;
+        };
+        if self
+            .document
+            .borrow()
+            .element_attribute(&select_path, "multiple")
+            .is_some()
+        {
+            return false;
+        }
+        self.option_paths(&select_path)
+            .into_iter()
+            .find(|candidate| !self.option_disabled_path(candidate))
+            .is_some_and(|candidate| candidate == path)
+    }
+
+    fn select_multiple_path(&self, path: &[usize]) -> bool {
+        self.document
+            .borrow()
+            .element_clone(path)
+            .is_some_and(|element| element.name == "select" && element.attr("multiple").is_some())
+    }
+
+    fn select_selected_index(&self, path: &[usize]) -> i32 {
+        self.option_paths(path)
+            .into_iter()
+            .enumerate()
+            .find(|(_, option)| self.option_selected_path(option))
+            .map(|(index, _)| index as i32)
+            .unwrap_or(-1)
+    }
+
+    fn select_value_path(&self, path: &[usize]) -> String {
+        self.option_paths(path)
+            .into_iter()
+            .find(|option| self.option_selected_path(option))
+            .and_then(|option| self.document.borrow().element_clone(&option))
+            .map(|option| option_value(&option))
+            .unwrap_or_default()
+    }
+
+    fn select_selected_values(&self, path: &[usize]) -> Vec<String> {
+        self.option_paths(path)
+            .into_iter()
+            .filter(|option| {
+                self.option_selected_path(option) && !self.option_disabled_path(option)
+            })
+            .filter_map(|option| {
+                self.document
+                    .borrow()
+                    .element_clone(&option)
+                    .map(|element| option_value(&element))
+            })
+            .collect()
+    }
+
+    fn option_index(&self, path: &[usize]) -> Option<usize> {
+        let select_path = self.document.borrow().select_ancestor_path(path)?;
+        self.option_paths(&select_path)
+            .into_iter()
+            .position(|option| option == path)
+    }
+
+    fn element_selected(&self, handle: &ElementHandle) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self.option_selected_path(&path),
+            ElementLocation::Detached(element) => {
+                element.name == "option" && element.attr("selected").is_some()
+            }
+        }
+    }
+
+    fn element_default_selected(&self, handle: &ElementHandle) -> bool {
+        match handle.borrow().clone() {
+            ElementLocation::Attached(path) => self
+                .document
+                .borrow()
+                .element_clone(&path)
+                .is_some_and(|element| element.name == "option" && element.attr("selected").is_some()),
+            ElementLocation::Detached(element) => {
+                element.name == "option" && element.attr("selected").is_some()
+            }
+        }
+    }
+
+    fn element_options(&self, handle: &ElementHandle, selected: bool) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::NodeList(Rc::new(Vec::new()));
+        };
+        let nodes = self
+            .option_paths(&path)
+            .into_iter()
+            .filter(|option| !selected || self.option_selected_path(option))
+            .map(attached_handle)
+            .collect();
+        Value::NodeList(Rc::new(nodes))
+    }
+
+    fn set_option_selected_state(&mut self, path: &[usize], selected: bool, dirty: bool) {
+        let Some(select_path) = self.document.borrow().select_ancestor_path(path) else {
+            return;
+        };
+        let options = self.option_paths(&select_path);
+        let multiple = self.select_multiple_path(&select_path);
+        if selected && !multiple {
+            for option in &options {
+                if option != path && self.option_selected_path(option) {
+                    self.set_option_selected_raw(option, false, dirty);
+                }
+            }
+        }
+        self.set_option_selected_raw(path, selected, dirty);
+        if !selected
+            && !multiple
+            && !options
+                .iter()
+                .any(|option| self.option_selected_path(option))
+            && let Some(first) = options
+                .iter()
+                .find(|option| !self.option_disabled_path(option))
+        {
+            self.set_option_selected_state(first, true, dirty);
+        }
+    }
+
+    fn set_option_selected_raw(&mut self, path: &[usize], selected: bool, dirty: bool) {
+        let changed = self.option_selected_path(path) != selected;
+        self.option_selected.insert(path.to_vec(), selected);
+        if dirty && changed {
+            self.dirty_options.insert(path.to_vec());
+        }
+    }
+
+    fn normalize_select_selection(&mut self, path: &[usize], dirty: bool) {
+        if self.select_multiple_path(path) {
+            return;
+        }
+        let options = self.option_paths(path);
+        let selected = options
+            .iter()
+            .filter(|option| self.option_selected_path(option))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(last) = selected.last() {
+            for option in &selected[..selected.len().saturating_sub(1)] {
+                self.set_option_selected_raw(option, false, dirty);
+            }
+            self.set_option_selected_raw(last, true, dirty);
+        } else if let Some(first) = options
+            .iter()
+            .find(|option| !self.option_disabled_path(option))
+        {
+            self.set_option_selected_raw(first, true, dirty);
+        }
+    }
+
+    fn set_select_selected_index(&mut self, path: &[usize], index: i32) -> bool {
+        if self
+            .document
+            .borrow()
+            .element_clone(path)
+            .is_none_or(|element| element.name != "select")
+        {
+            return false;
+        }
+        let options = self.option_paths(path);
+        let selected = if index >= 0 {
+            options.get(index as usize).cloned()
+        } else {
+            None
+        };
+        for option in &options {
+            self.set_option_selected_raw(option, Some(option) == selected.as_ref(), true);
+        }
+        true
+    }
+
+    fn set_select_value(&mut self, path: &[usize], value: &str) -> bool {
+        if self
+            .document
+            .borrow()
+            .element_clone(path)
+            .is_none_or(|element| element.name != "select")
+        {
+            return false;
+        }
+        let options = self.option_paths(path);
+        let matching = options.iter().find(|option| {
+            self.document
+                .borrow()
+                .element_clone(option)
+                .is_some_and(|element| option_value(&element) == value)
+        }).cloned();
+        for option in &options {
+            let selected = matching.as_ref().is_some_and(|matching| matching == option);
+            self.set_option_selected_raw(option, selected, true);
+        }
+        true
+    }
+
+    fn set_element_selected(&mut self, handle: &ElementHandle, selected: bool) -> bool {
+        let Some(path) = attached_path(handle) else {
+            let mut location = handle.borrow_mut();
+            let ElementLocation::Detached(element) = &mut *location else {
+                return false;
+            };
+            if element.name != "option" {
+                return false;
+            }
+            if selected {
+                element.attrs.insert("selected".to_string(), String::new());
+            } else {
+                element.attrs.remove("selected");
+            }
+            return true;
+        };
+        if self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_none_or(|element| element.name != "option")
+        {
+            return false;
+        }
+        self.set_option_selected_state(&path, selected, true);
+        true
+    }
+
+    fn set_element_default_selected(&mut self, handle: &ElementHandle, selected: bool) -> bool {
+        let Some(path) = attached_path(handle) else {
+            let mut location = handle.borrow_mut();
+            let ElementLocation::Detached(element) = &mut *location else {
+                return false;
+            };
+            if element.name != "option" {
+                return false;
+            }
+            if selected {
+                element.attrs.insert("selected".to_string(), String::new());
+            } else {
+                element.attrs.remove("selected");
+            }
+            return true;
+        };
+        if self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_none_or(|element| element.name != "option")
+        {
+            return false;
+        }
+        if selected {
+            self.document
+                .borrow_mut()
+                .set_element_attribute(&path, "selected", String::new());
+        } else {
+            self.document
+                .borrow_mut()
+                .remove_element_attribute(&path, "selected");
+        }
+        if !self.dirty_options.contains(&path) {
+            self.set_option_selected_state(&path, selected, false);
+        }
+        true
+    }
+
+    fn set_element_selected_index(
+        &mut self,
+        handle: &ElementHandle,
+        index: f64,
+    ) -> Result<bool, ScriptError> {
+        if !index.is_finite() || index.fract() != 0.0 {
+            return Ok(false);
+        }
+        Ok(self.set_select_selected_index(
+            &attached_path(handle).unwrap_or_default(),
+            index as i32,
+        ))
+    }
+
+    fn set_element_multiple(&mut self, handle: &ElementHandle, multiple: bool) -> bool {
+        let Some(path) = attached_path(handle) else {
+            return false;
+        };
+        if self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_none_or(|element| element.name != "select")
+        {
+            return false;
+        }
+        if multiple {
+            self.document
+                .borrow_mut()
+                .set_element_attribute(&path, "multiple", String::new());
+        } else {
+            self.document
+                .borrow_mut()
+                .remove_element_attribute(&path, "multiple");
+            self.normalize_select_selection(&path, false);
+        }
+        true
+    }
+
+    fn set_element_option_text(&mut self, handle: &ElementHandle, text: String) -> bool {
+        let Some(path) = attached_path(handle) else {
+            let mut location = handle.borrow_mut();
+            let ElementLocation::Detached(element) = &mut *location else {
+                return false;
+            };
+            if element.name != "option" {
+                return false;
+            }
+            element.children = vec![Node::Text(text)];
+            return true;
+        };
+        if self
+            .document
+            .borrow()
+            .element_clone(&path)
+            .is_none_or(|element| element.name != "option")
+        {
+            return false;
+        }
+        self.document
+            .borrow_mut()
+            .set_element_text_content(&path, text)
+    }
+
     fn element_value(&self, handle: &ElementHandle) -> Option<String> {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => self.control_value_path(&path),
-            ElementLocation::Detached(element) => element.attr("value").map(str::to_string),
+            ElementLocation::Detached(element) => match element.name.as_str() {
+                "option" => Some(option_value(&element)),
+                _ => element.attr("value").map(str::to_string),
+            },
         }
     }
 
@@ -5108,16 +5531,22 @@ impl ScriptRuntime {
     fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => {
-                let is_file = self
-                    .document
-                    .borrow()
-                    .element_clone(&path)
-                    .is_some_and(|element| {
-                        element.name == "input"
-                            && element
-                                .attr("type")
-                                .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
-                    });
+                let Some(element) = self.document.borrow().element_clone(&path) else {
+                    return false;
+                };
+                if element.name == "select" {
+                    return self.set_select_value(&path, &value);
+                }
+                if element.name == "option" {
+                    return self
+                        .document
+                        .borrow_mut()
+                        .set_element_attribute(&path, "value", value);
+                }
+                let is_file = element.name == "input"
+                    && element
+                        .attr("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("file"));
                 if is_file {
                     if !value.is_empty() {
                         return false;
@@ -5213,6 +5642,22 @@ impl ScriptRuntime {
                 {
                     self.control_values.remove(&path);
                     self.text_selections.remove(&path);
+                }
+                if changed
+                    && name.eq_ignore_ascii_case("selected")
+                    && !self.dirty_options.contains(&path)
+                {
+                    self.set_option_selected_state(&path, true, false);
+                }
+                if changed
+                    && name.eq_ignore_ascii_case("multiple")
+                    && self
+                        .document
+                        .borrow()
+                        .element_clone(&path)
+                        .is_some_and(|element| element.name == "select")
+                {
+                    self.normalize_select_selection(&path, false);
                 }
                 changed
             }
@@ -5471,6 +5916,58 @@ impl ScriptRuntime {
         }
     }
 
+    fn remove_element_attribute(&mut self, handle: &ElementHandle, name: &str) -> bool {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Attached(path) => {
+                let changed = self
+                    .document
+                    .borrow_mut()
+                    .remove_element_attribute(&path, name);
+                if changed
+                    && name.eq_ignore_ascii_case("checked")
+                    && !self.dirty_checked_controls.contains(&path)
+                {
+                    self.control_checked.insert(path.clone(), false);
+                }
+                if changed
+                    && name.eq_ignore_ascii_case("value")
+                    && !self.dirty_controls.contains(&path)
+                {
+                    self.control_values.remove(&path);
+                    self.text_selections.remove(&path);
+                }
+                if changed
+                    && name.eq_ignore_ascii_case("selected")
+                    && !self.dirty_options.contains(&path)
+                {
+                    self.set_option_selected_state(&path, false, false);
+                }
+                if changed
+                    && name.eq_ignore_ascii_case("multiple")
+                    && self
+                        .document
+                        .borrow()
+                        .element_clone(&path)
+                        .is_some_and(|element| element.name == "select")
+                {
+                    self.normalize_select_selection(&path, false);
+                }
+                changed
+            }
+            ElementLocation::Detached(_) => {
+                let mut location = handle.borrow_mut();
+                let ElementLocation::Detached(element) = &mut *location else {
+                    return false;
+                };
+                element
+                    .attrs
+                    .remove(&name.to_ascii_lowercase())
+                    .is_some()
+            }
+        }
+    }
+
     fn set_element_required(&mut self, handle: &ElementHandle, required: bool) -> bool {
         match handle.borrow().clone() {
             ElementLocation::Attached(path) => {
@@ -5621,6 +6118,12 @@ impl ScriptRuntime {
             if matches!(input_type.as_str(), "checkbox" | "radio")
                 && !self.control_checked_path(&path)
             {
+                continue;
+            }
+            if element.name == "select" {
+                for value in self.select_selected_values(&path) {
+                    pairs.push((name.to_string(), FormDataEntry::Text(value)));
+                }
                 continue;
             }
             let value = self
@@ -7851,9 +8354,15 @@ impl ScriptRuntime {
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.document
-                    .borrow_mut()
-                    .set_element_attribute(&path, &name, value);
+                self.set_element_attribute(&attached_handle(path), &name, value);
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementRemoveAttribute(path) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.remove_element_attribute(&attached_handle(path), &name);
                 Ok(Value::Undefined)
             }
             Builtin::ElementGetAttribute(path) => {
@@ -8559,6 +9068,14 @@ fn default_value_for_element(element: &Element) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn option_value(element: &Element) -> String {
+    element.attr("value").map(str::to_string).unwrap_or_else(|| {
+        let mut value = String::new();
+        collect_element_text(element, &mut value);
+        value
+    })
 }
 
 fn delay_milliseconds(value: f64) -> u64 {
@@ -13425,6 +13942,48 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("changed|later|false|false|edited")
+        );
+    }
+
+    #[test]
+    fn select_options_track_values_form_entries_and_reset_defaults() {
+        let document = document(
+            r#"<form id="filters"><select id="plan" name="plan"><option value="">Choose</option><option value="pro">Pro</option><option>Basic</option></select><select id="tags" name="tag" multiple><option value="a" selected>A</option><option value="b">B</option></select><p id="status">idle</p></form>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const form = document.getElementById("filters");
+                const plan = document.getElementById("plan");
+                const tags = document.getElementById("tags");
+                const status = document.getElementById("status");
+                let snapshot = plan.value + "|" + plan.selectedIndex + "|" + plan.options.length + "|" + plan.selectedOptions.length + "|" + plan.options[1].selected + "|" + plan.options[1].index + "|" + plan.options[1].text;
+                plan.options[1].setAttribute("selected", "");
+                snapshot = snapshot + "|" + plan.selectedIndex;
+                plan.options[1].removeAttribute("selected");
+                snapshot = snapshot + "|" + plan.selectedIndex;
+                plan.value = "pro";
+                plan.options[1].setAttribute("selected", "");
+                plan.options[1].removeAttribute("selected");
+                tags.value = "b";
+                tags.options[0].selected = true;
+                plan.options[1].defaultSelected = true;
+                snapshot = snapshot + "|" + plan.value + "|" + plan.selectedIndex + "|" + tags.value + "|" + tags.selectedOptions.length + "|" + plan.options[1].defaultSelected + "|" + new FormData(form).get("plan") + "|" + new FormData(form).getAll("tag").join(",");
+                plan.selectedIndex = 2;
+                plan.options[2].text = "Basic updated";
+                form.reset();
+                status.textContent = snapshot + "|" + plan.value + "|" + plan.selectedIndex + "|" + tags.value + "|" + tags.selectedOptions.length + "|" + plan.options[1].selected + "|" + plan.options[1].defaultSelected;
+                "#,
+            )
+            .expect("select option APIs should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("|0|3|1|false|1|Pro|1|0|pro|1|a|2|true|pro|a,b|pro|1|a|1|true|true")
         );
     }
 
