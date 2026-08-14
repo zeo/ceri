@@ -534,7 +534,7 @@ pub struct ScriptRuntime {
     history: HistoryHandle,
     listeners: HashMap<NodePath, Vec<EventListener>>,
     detached_listeners: Vec<DetachedListenerState>,
-    window_listeners: HashMap<String, Vec<Value>>,
+    window_listeners: HashMap<String, Vec<WindowListener>>,
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
     control_checked: HashMap<NodePath, bool>,
@@ -796,6 +796,13 @@ pub(crate) struct ModuleNamespace {
 struct EventListener {
     event: String,
     callback: Value,
+    once: bool,
+}
+
+#[derive(Clone)]
+struct WindowListener {
+    callback: Value,
+    once: bool,
 }
 
 #[derive(Clone)]
@@ -2827,11 +2834,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
-        let callbacks = self
-            .window_listeners
-            .get(event_type)
-            .cloned()
-            .unwrap_or_default();
+        let callbacks = self.take_window_callbacks(event_type);
         let event = Value::Event(EventData {
             event_type: event_type.to_string(),
             target: Vec::new(),
@@ -2845,14 +2848,12 @@ impl ScriptRuntime {
             data_value: None,
             error_message: None,
         });
+        let had_callbacks = !callbacks.is_empty();
         for callback in callbacks {
             self.call(callback, vec![event.clone()])?;
         }
         self.drain_microtasks()?;
-        Ok(self
-            .window_listeners
-            .get(event_type)
-            .is_some_and(|listeners| !listeners.is_empty()))
+        Ok(had_callbacks)
     }
 
     fn apply_history_state_locally(
@@ -2873,11 +2874,7 @@ impl ScriptRuntime {
 
     pub(crate) fn dispatch_popstate(&mut self, serialized: &str) -> Result<bool, ScriptError> {
         let state = self.parse_json(serialized)?;
-        let callbacks = self
-            .window_listeners
-            .get("popstate")
-            .cloned()
-            .unwrap_or_default();
+        let callbacks = self.take_window_callbacks("popstate");
         let event = Value::Event(EventData {
             event_type: "popstate".to_string(),
             target: Vec::new(),
@@ -2891,14 +2888,12 @@ impl ScriptRuntime {
             data_value: None,
             error_message: None,
         });
+        let had_callbacks = !callbacks.is_empty();
         for callback in callbacks {
             self.call(callback, vec![event.clone()])?;
         }
         self.drain_microtasks()?;
-        Ok(self
-            .window_listeners
-            .get("popstate")
-            .is_some_and(|listeners| !listeners.is_empty()))
+        Ok(had_callbacks)
     }
 
     fn request_location_navigation(&mut self, reference: String, replace_history: bool) {
@@ -4597,11 +4592,7 @@ impl ScriptRuntime {
                                 continue;
                             }
                         };
-                        let mut callbacks = runtime
-                            .window_listeners
-                            .get("message")
-                            .cloned()
-                            .unwrap_or_default();
+                        let mut callbacks = runtime.take_window_callbacks("message");
                         if let Some(callback) = runtime.global.borrow().get("onmessage")
                             && matches!(callback.resolve(), Value::Function(_))
                         {
@@ -4694,13 +4685,16 @@ impl ScriptRuntime {
                 match event {
                     WorkerEvent::Message(message) => {
                         let data = self.parse_json(&message)?;
-                        let worker_data = worker.borrow();
+                        let mut worker_data = worker.borrow_mut();
                         let mut callbacks = worker_data
                             .listeners
                             .iter()
                             .filter(|listener| listener.event == "message")
                             .map(|listener| listener.callback.clone())
                             .collect::<Vec<_>>();
+                        worker_data
+                            .listeners
+                            .retain(|listener| !(listener.event == "message" && listener.once));
                         if let Some(callback) = worker_data.onmessage.clone() {
                             callbacks.push(callback);
                         }
@@ -4726,13 +4720,16 @@ impl ScriptRuntime {
                         }
                     }
                     WorkerEvent::Error(message) => {
-                        let worker_data = worker.borrow();
+                        let mut worker_data = worker.borrow_mut();
                         let mut callbacks = worker_data
                             .listeners
                             .iter()
                             .filter(|listener| listener.event == "error")
                             .map(|listener| listener.callback.clone())
                             .collect::<Vec<_>>();
+                        worker_data
+                            .listeners
+                            .retain(|listener| !(listener.event == "error" && listener.once));
                         if let Some(callback) = worker_data.onerror.clone() {
                             callbacks.push(callback);
                         }
@@ -7341,6 +7338,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let once = listener_once(&arguments);
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("Worker event listener must be a function"));
                 }
@@ -7350,7 +7348,11 @@ impl ScriptRuntime {
                     .iter()
                     .any(|listener| event_listener_matches(listener, &event, &callback))
                 {
-                    worker.listeners.push(EventListener { event, callback });
+                    worker.listeners.push(EventListener {
+                        event,
+                        callback,
+                        once,
+                    });
                 }
                 Ok(Value::Undefined)
             }
@@ -7431,12 +7433,16 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let once = listener_once(&arguments);
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("window event listener must be a function"));
                 }
                 let listeners = self.window_listeners.entry(event).or_default();
-                if !listeners.iter().any(|listener| values_equal(listener, &callback)) {
-                    listeners.push(callback);
+                if !listeners
+                    .iter()
+                    .any(|listener| values_equal(&listener.callback, &callback))
+                {
+                    listeners.push(WindowListener { callback, once });
                 }
                 Ok(Value::Undefined)
             }
@@ -7450,7 +7456,7 @@ impl ScriptRuntime {
                     return Err(runtime_error("window event listener must be a function"));
                 }
                 if let Some(listeners) = self.window_listeners.get_mut(&event) {
-                    listeners.retain(|listener| !values_equal(listener, &callback));
+                    listeners.retain(|listener| !values_equal(&listener.callback, &callback));
                 }
                 Ok(Value::Undefined)
             }
@@ -7460,6 +7466,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let once = listener_once(&arguments);
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("document event listener must be a function"));
                 }
@@ -7468,7 +7475,11 @@ impl ScriptRuntime {
                     .iter()
                     .any(|listener| event_listener_matches(listener, &event, &callback))
                 {
-                    listeners.push(EventListener { event, callback });
+                    listeners.push(EventListener {
+                        event,
+                        callback,
+                        once,
+                    });
                 }
                 Ok(Value::Undefined)
             }
@@ -8792,6 +8803,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let once = listener_once(&arguments);
                 if !matches!(callback.resolve(), Value::Function(_)) {
                     return Err(runtime_error("event listener must be a function"));
                 }
@@ -8800,7 +8812,11 @@ impl ScriptRuntime {
                     .iter()
                     .any(|listener| event_listener_matches(listener, &event, &callback))
                 {
-                    listeners.push(EventListener { event, callback });
+                    listeners.push(EventListener {
+                        event,
+                        callback,
+                        once,
+                    });
                 }
                 Ok(Value::Undefined)
             }
@@ -9066,6 +9082,31 @@ impl ScriptRuntime {
         }
     }
 
+    fn take_event_callbacks(&mut self, path: &[usize], event: &str) -> Vec<Value> {
+        let Some(listeners) = self.listeners.get_mut(path) else {
+            return Vec::new();
+        };
+        let callbacks = listeners
+            .iter()
+            .filter(|listener| listener.event == event)
+            .map(|listener| listener.callback.clone())
+            .collect::<Vec<_>>();
+        listeners.retain(|listener| !(listener.event == event && listener.once));
+        callbacks
+    }
+
+    fn take_window_callbacks(&mut self, event: &str) -> Vec<Value> {
+        let Some(listeners) = self.window_listeners.get_mut(event) else {
+            return Vec::new();
+        };
+        let callbacks = listeners
+            .iter()
+            .map(|listener| listener.callback.clone())
+            .collect::<Vec<_>>();
+        listeners.retain(|listener| !listener.once);
+        callbacks
+    }
+
     fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<EventDispatch, ScriptError> {
         self.dispatch_event_with_details(path, event, "", "")
     }
@@ -9075,14 +9116,7 @@ impl ScriptRuntime {
         path: NodePath,
         event: &str,
     ) -> Result<EventDispatch, ScriptError> {
-        let callbacks = self
-            .listeners
-            .get(&path)
-            .into_iter()
-            .flatten()
-            .filter(|listener| listener.event == event)
-            .map(|listener| listener.callback.clone())
-            .collect::<Vec<_>>();
+        let callbacks = self.take_event_callbacks(&path, event);
         let state = Rc::new(RefCell::new(EventState::default()));
         let event_value = Value::Event(EventData {
             event_type: event.to_string(),
@@ -9143,14 +9177,7 @@ impl ScriptRuntime {
         let mut had_callbacks = false;
         let state = Rc::new(RefCell::new(EventState::default()));
         loop {
-            let callbacks = self
-                .listeners
-                .get(&current)
-                .into_iter()
-                .flatten()
-                .filter(|listener| listener.event == event)
-                .map(|listener| listener.callback.clone())
-                .collect::<Vec<_>>();
+            let callbacks = self.take_event_callbacks(&current, event);
             had_callbacks |= !callbacks.is_empty();
             let event_value = Value::Event(EventData {
                 event_type: event.to_string(),
@@ -11290,6 +11317,16 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 
 fn event_listener_matches(listener: &EventListener, event: &str, callback: &Value) -> bool {
     listener.event == event && values_equal(&listener.callback, callback)
+}
+
+fn listener_once(arguments: &[Value]) -> bool {
+    let Some(Value::Object(options)) = arguments.get(2).map(Value::resolve) else {
+        return false;
+    };
+    options
+        .borrow()
+        .get("once")
+        .is_some_and(Value::truthy)
 }
 
 fn iterator_value(values: Vec<Value>) -> Value {
@@ -14031,6 +14068,71 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("0")
+        );
+    }
+
+    #[test]
+    fn one_shot_element_and_document_listeners_are_removed_before_callback() {
+        let document = document("<button id='go'>before</button><p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const button = document.getElementById("go");
+                const status = document.getElementById("status");
+                let elementClicks = 0;
+                let documentClicks = 0;
+                const onElementClick = () => {
+                    elementClicks = elementClicks + 1;
+                    button.addEventListener("click", onElementClick, { once: true });
+                };
+                const onDocumentClick = () => documentClicks = documentClicks + 1;
+                button.addEventListener("click", onElementClick, { once: true });
+                document.addEventListener("click", onDocumentClick, { once: true });
+                button.click();
+                button.click();
+                status.textContent = elementClicks + "|" + documentClicks;
+                "#,
+            )
+            .expect("one-shot element and document listeners should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("2|1")
+        );
+    }
+
+    #[test]
+    fn one_shot_window_listeners_are_removed_before_the_next_dispatch() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                let resizeEvents = 0;
+                window.addEventListener("resize", () => resizeEvents = resizeEvents + 1, { once: true });
+                "#,
+            )
+            .expect("one-shot window listener should register");
+        assert!(runtime
+            .dispatch_window_event("resize")
+            .expect("first window event should dispatch"));
+        assert!(!runtime
+            .dispatch_window_event("resize")
+            .expect("second window event should dispatch"));
+        runtime
+            .execute("document.getElementById(\"status\").textContent = resizeEvents;")
+            .expect("window listener result should serialize");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1")
         );
     }
 
@@ -17326,15 +17428,20 @@ mod tests {
                 r#"
                 const status = document.getElementById("status");
                 const worker = new Worker("/worker.js", { name: "echo" });
-                worker.onmessage = (event) => {
-                  status.textContent = worker.name + "|" + event.data.kind + "|" + event.data.text;
-                };
+                let messages = 0;
+                worker.addEventListener("message", (event) => {
+                  messages = messages + 1;
+                  status.textContent = worker.name + "|" + event.data.kind + "|" + event.data.text + "|" + messages;
+                }, { once: true });
                 worker.postMessage({ kind: "greeting", text: "hello" });
+                worker.postMessage({ kind: "second", text: "again" });
                 "#,
             )
             .expect("worker construction and message send should execute");
+        let mut processed = 0;
         for _ in 0..100 {
-            if runtime.pump().expect("worker pump should execute") > 0 {
+            processed += runtime.pump().expect("worker pump should execute");
+            if processed >= 2 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -17345,7 +17452,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("echo|greeting|hello!")
+            Some("echo|greeting|hello!|1")
         );
     }
 
