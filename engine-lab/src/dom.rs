@@ -225,6 +225,14 @@ impl Document {
         })
     }
 
+    pub fn parent_path(&self, path: &[usize]) -> Option<NodePath> {
+        if path.is_empty() {
+            return None;
+        }
+        let parent = path[..path.len() - 1].to_vec();
+        self.element_at(path).is_some().then_some(parent)
+    }
+
     pub fn select_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
         let mut candidate = path.to_vec();
         while !candidate.is_empty() {

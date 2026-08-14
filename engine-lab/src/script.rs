@@ -229,6 +229,7 @@ enum Builtin {
     ElementClick(NodePath),
     ElementAppendChild(NodePath),
     ElementRemoveChild(NodePath),
+    ElementRemove(ElementHandle),
     ElementSelect(NodePath),
     ElementSetSelectionRange(NodePath),
     ElementSetRangeText(NodePath),
@@ -3432,6 +3433,12 @@ impl ScriptRuntime {
                         .element_inner_html(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "parentNode" | "parentElement" => path
+                        .as_ref()
+                        .and_then(|path| self.document.borrow().parent_path(path))
+                        .map(attached_handle)
+                        .map(Value::Element)
+                        .unwrap_or(Value::Null),
                     "files" => self.element_files(&handle),
                     "value" => self
                         .element_value(&handle)
@@ -3621,6 +3628,7 @@ impl ScriptRuntime {
                             runtime_error("detached element cannot remove children")
                         })?))
                     }
+                    "remove" => Value::Builtin(Builtin::ElementRemove(handle.clone())),
                     "setAttribute" => {
                         Value::Builtin(Builtin::ElementSetAttribute(path.ok_or_else(|| {
                             runtime_error("detached element has no document attributes")
@@ -8696,6 +8704,16 @@ impl ScriptRuntime {
                 };
                 self.detach_child(&path, &child)?;
                 Ok(Value::Element(child))
+            }
+            Builtin::ElementRemove(handle) => {
+                let Some(child_path) = attached_path(&handle) else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(parent) = self.document.borrow().parent_path(&child_path) else {
+                    return Ok(Value::Undefined);
+                };
+                self.detach_child(&parent, &handle)?;
+                Ok(Value::Undefined)
             }
             Builtin::ElementSetAttribute(path) => {
                 let name = arguments
@@ -14560,6 +14578,32 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("a|0|1|a|0|2")
+        );
+    }
+
+    #[test]
+    fn parent_node_and_remove_update_a_detached_handle() {
+        let document = document(
+            r#"<main id="mount"><p id="gone">gone</p><p id="last">last</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const gone = document.getElementById("gone");
+                const parentId = gone.parentNode.id + ":" + gone.parentElement.id;
+                gone.remove();
+                document.getElementById("status").textContent = parentId + "|" + (gone.parentNode === null) + "|" + document.getElementById("last").textContent;
+                "#,
+            )
+            .expect("parentNode and remove should update the handle");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("mount:mount|true|last")
         );
     }
 
