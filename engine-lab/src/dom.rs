@@ -429,6 +429,32 @@ impl Document {
         true
     }
 
+    pub fn split_text_node(&mut self, path: &[usize], offset: usize) -> Option<NodePath> {
+        if path.is_empty() {
+            return None;
+        }
+        let parent = path[..path.len() - 1].to_vec();
+        let index = *path.last()?;
+        let text = match self.node_at(path)? {
+            Node::Text(text) => text.clone(),
+            Node::Element(_) => return None,
+        };
+        let (left, right) = split_utf16(&text, offset);
+        self.shift_paths_for_insert(&parent, index.saturating_add(1));
+        let parent_element = self.element_at_mut(&parent)?;
+        let Node::Text(current) = parent_element.children.get_mut(index)? else {
+            return None;
+        };
+        *current = left;
+        parent_element
+            .children
+            .insert(index.saturating_add(1), Node::Text(right));
+        let mut new_path = path.to_vec();
+        *new_path.last_mut()? = index.saturating_add(1);
+        self.assign_ids_below(&new_path);
+        Some(new_path)
+    }
+
     pub fn child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
         match self.node_at(path)? {
             Node::Element(element) => Some(
@@ -1404,6 +1430,15 @@ fn text_utf16_len(node: &Node) -> usize {
             .sum(),
         Node::Text(text) => text.encode_utf16().count(),
     }
+}
+
+fn split_utf16(value: &str, offset: usize) -> (String, String) {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    let offset = offset.min(units.len());
+    (
+        String::from_utf16_lossy(&units[..offset]),
+        String::from_utf16_lossy(&units[offset..]),
+    )
 }
 
 fn serialize_nodes(nodes: &[Node], output: &mut String) {

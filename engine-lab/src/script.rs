@@ -240,6 +240,7 @@ enum Builtin {
     ElementSelect(ElementHandle),
     ElementSetSelectionRange(ElementHandle),
     ElementSetRangeText(ElementHandle),
+    ElementSplitText(ElementHandle),
     RangeSetStart(RangeHandle),
     RangeSetEnd(RangeHandle),
     RangeCollapse(RangeHandle),
@@ -3791,6 +3792,9 @@ impl ScriptRuntime {
                     }),
                     "nodeName" => Value::String(self.element_node_name(&handle)),
                     "nodeValue" | "data" => self.element_node_value(&handle),
+                    "splitText" if attached_is_text(&handle) => {
+                        Value::Builtin(Builtin::ElementSplitText(handle.clone()))
+                    }
                     "textContent" => self
                         .element_text_content(&handle)
                         .map(Value::String)
@@ -6573,6 +6577,39 @@ impl ScriptRuntime {
         selection_changed
     }
 
+    fn adjust_ranges_for_split_text(
+        &mut self,
+        target: &[usize],
+        offset: usize,
+        right: &ElementHandle,
+    ) -> bool {
+        let selected = self.selection.borrow().range.clone();
+        let mut selection_changed = false;
+        let mut active = Vec::with_capacity(self.ranges.len());
+        for weak in self.ranges.drain(..) {
+            let Some(range) = weak.upgrade() else {
+                continue;
+            };
+            let changed = {
+                let mut range_data = range.borrow_mut();
+                let previous = range_data.clone();
+                adjust_range_boundary_for_split_text(&mut range_data.start, target, offset, right);
+                adjust_range_boundary_for_split_text(&mut range_data.end, target, offset, right);
+                *range_data != previous
+            };
+            if changed
+                && selected
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &range))
+            {
+                selection_changed = true;
+            }
+            active.push(Rc::downgrade(&range));
+        }
+        self.ranges = active;
+        selection_changed
+    }
+
     fn element_files(&self, handle: &ElementHandle) -> Value {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
@@ -8425,6 +8462,42 @@ impl ScriptRuntime {
                 };
                 self.set_range_text(&path, &arguments)?;
                 Ok(Value::Undefined)
+            }
+            Builtin::ElementSplitText(handle) => {
+                let Some(path) = attached_path(&handle) else {
+                    return Err(runtime_error("text node is no longer in the document"));
+                };
+                if !attached_is_text(&handle) {
+                    return Err(runtime_error("splitText requires a text node"));
+                }
+                let length = self
+                    .document
+                    .borrow()
+                    .node_text_content(&path)
+                    .map(|text| utf16_len(&text))
+                    .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
+                let offset = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .map(selection_offset)
+                    .unwrap_or_default()
+                    .min(length);
+                let parent = path[..path.len().saturating_sub(1)].to_vec();
+                let index = *path.last().expect("text node path is non-empty");
+                let new_path = self
+                    .document
+                    .borrow_mut()
+                    .split_text_node(&path, offset)
+                    .ok_or_else(|| runtime_error("text node could not be split"))?;
+                self.shift_runtime_paths_for_insert(&parent, index.saturating_add(1));
+                let right = attached_handle(new_path, &self.document)
+                    .ok_or_else(|| runtime_error("splitText failed to assign node identity"))?;
+                let selection_changed = self.adjust_ranges_for_split_text(&path, offset, &right);
+                if selection_changed {
+                    self.dispatch_document_selection_change()?;
+                }
+                Ok(Value::Element(right))
             }
             Builtin::RangeSetStart(range) => {
                 let boundary = self.range_boundary_from_arguments(&arguments)?;
@@ -11785,6 +11858,18 @@ fn adjust_range_boundary_for_character_data_replacement(
         old_length,
         new_length,
     );
+}
+
+fn adjust_range_boundary_for_split_text(
+    boundary: &mut RangeBoundary,
+    target: &[usize],
+    offset: usize,
+    right: &ElementHandle,
+) {
+    if attached_path(&boundary.node).as_deref() == Some(target) && boundary.offset > offset {
+        boundary.node = right.clone();
+        boundary.offset -= offset;
+    }
 }
 
 fn remap_range_offset(
@@ -17023,6 +17108,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true:new|0:0:|6:14:newafter|1|true:longer|0:0:|6:17:longerafter|3")
+        );
+    }
+
+    #[test]
+    fn split_text_moves_live_boundaries_to_the_new_text_node() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.setStart(text, 1);
+                range.setEnd(text, 4);
+                const selection = window.getSelection();
+                selection.addRange(range);
+                let changes = 0;
+                document.addEventListener("selectionchange", () => changes = changes + 1);
+                const right = text.splitText(2);
+                status.textContent = text.data + ":" + right.data + ":" +
+                    (first.childNodes[0] === text) + ":" + (first.childNodes[1] === right) + "|" +
+                    range.startContainer.data + ":" + range.startOffset + ":" +
+                    range.endContainer.data + ":" + range.endOffset + ":" + range.toString() + "|" + changes;
+                "#,
+            )
+            .expect("splitText should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("he:llo:true:true|he:1:llo:2:ell|1")
         );
     }
 
