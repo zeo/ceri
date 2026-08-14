@@ -421,6 +421,14 @@ impl Document {
         }
     }
 
+    pub fn set_text_node_data(&mut self, path: &[usize], text: String) -> bool {
+        let Some(Node::Text(current)) = self.node_at_mut(path) else {
+            return false;
+        };
+        *current = text;
+        true
+    }
+
     pub fn child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
         match self.node_at(path)? {
             Node::Element(element) => Some(
@@ -447,6 +455,24 @@ impl Document {
         let mut element = &self.root;
         for (depth, &index) in path.iter().enumerate() {
             let child = element.children.get(index)?;
+            if depth + 1 == path.len() {
+                return Some(child);
+            }
+            element = match child {
+                Node::Element(child) => child,
+                Node::Text(_) => return None,
+            };
+        }
+        None
+    }
+
+    fn node_at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
+        if path.is_empty() {
+            return None;
+        }
+        let mut element = &mut self.root;
+        for (depth, &index) in path.iter().enumerate() {
+            let child = element.children.get_mut(index)?;
             if depth + 1 == path.len() {
                 return Some(child);
             }

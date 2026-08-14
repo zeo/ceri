@@ -4720,6 +4720,12 @@ impl ScriptRuntime {
         let value_string = value.string_value();
         let updated = match object.resolve() {
             Value::Element(handle) => match property {
+                "nodeValue" | "data" if attached_is_text(&handle) => {
+                    self.set_text_node_data(&handle, value_string)?
+                }
+                "textContent" if attached_is_text(&handle) => {
+                    self.set_text_node_data(&handle, value_string)?
+                }
                 "textContent" => self.set_element_text_content(&handle, value_string)?,
                 "className" => self.set_element_attribute(&handle, "class", value_string),
                 "id" => self.set_element_attribute(&handle, "id", value_string),
@@ -6504,6 +6510,69 @@ impl ScriptRuntime {
         selection_changed
     }
 
+    fn adjust_ranges_for_character_data_replacement(
+        &mut self,
+        target: &[usize],
+        new_length: usize,
+    ) -> bool {
+        if attached_handle(target.to_vec(), &self.document).is_none() {
+            return false;
+        }
+        let (target_start, old_length) = {
+            let document = self.document.borrow();
+            let Some(target_start) = document.node_text_offset(target) else {
+                return false;
+            };
+            let Some(old_length) = document
+                .node_text_content(target)
+                .map(|text| utf16_len(&text))
+            else {
+                return false;
+            };
+            (target_start, old_length)
+        };
+        let document = self.document.clone();
+        let selected = self.selection.borrow().range.clone();
+        let mut selection_changed = false;
+        let mut active = Vec::with_capacity(self.ranges.len());
+        for weak in self.ranges.drain(..) {
+            let Some(range) = weak.upgrade() else {
+                continue;
+            };
+            let changed = {
+                let mut range_data = range.borrow_mut();
+                let previous = range_data.clone();
+                adjust_range_boundary_for_character_data_replacement(
+                    &mut range_data.start,
+                    target,
+                    target_start,
+                    old_length,
+                    new_length,
+                    &document,
+                );
+                adjust_range_boundary_for_character_data_replacement(
+                    &mut range_data.end,
+                    target,
+                    target_start,
+                    old_length,
+                    new_length,
+                    &document,
+                );
+                *range_data != previous
+            };
+            if changed
+                && selected
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &range))
+            {
+                selection_changed = true;
+            }
+            active.push(Rc::downgrade(&range));
+        }
+        self.ranges = active;
+        selection_changed
+    }
+
     fn element_files(&self, handle: &ElementHandle) -> Value {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
@@ -6640,6 +6709,45 @@ impl ScriptRuntime {
             self.dispatch_document_selection_change()?;
         }
         Ok(changed)
+    }
+
+    fn replace_text_node_data_at(
+        &mut self,
+        path: &NodePath,
+        text: String,
+    ) -> Result<bool, ScriptError> {
+        if !self
+            .document
+            .borrow()
+            .node_is_text(path)
+            .is_some_and(|is_text| is_text)
+        {
+            return Ok(false);
+        }
+        let selection_changed = self
+            .adjust_ranges_for_character_data_replacement(path, utf16_len(&text));
+        let changed = self
+            .document
+            .borrow_mut()
+            .set_text_node_data(path, text);
+        if changed && selection_changed {
+            self.dispatch_document_selection_change()?;
+        }
+        Ok(changed)
+    }
+
+    fn set_text_node_data(
+        &mut self,
+        handle: &ElementHandle,
+        text: String,
+    ) -> Result<bool, ScriptError> {
+        let Some(path) = attached_path(handle) else {
+            return Ok(false);
+        };
+        if !attached_is_text(handle) {
+            return Ok(false);
+        }
+        self.replace_text_node_data_at(&path, text)
     }
 
     fn set_element_text_content(
@@ -11633,8 +11741,59 @@ fn adjust_range_boundary_for_replacement(
         return;
     };
     let replacement_start = target_start.saturating_sub(ancestor_start);
-    let offset = boundary.offset;
-    boundary.offset = if old_length == 0 {
+    boundary.offset = remap_range_offset(
+        boundary.offset,
+        replacement_start,
+        old_length,
+        new_length,
+    );
+}
+
+fn adjust_range_boundary_for_character_data_replacement(
+    boundary: &mut RangeBoundary,
+    target: &[usize],
+    target_start: usize,
+    old_length: usize,
+    new_length: usize,
+    document: &Rc<RefCell<Document>>,
+) {
+    let Some(path) = attached_path(&boundary.node) else {
+        return;
+    };
+    if path == target {
+        boundary.offset = if boundary.offset <= old_length {
+            0
+        } else {
+            boundary
+                .offset
+                .saturating_sub(old_length)
+                .saturating_add(new_length)
+        };
+        return;
+    }
+    if !target.starts_with(&path) {
+        return;
+    }
+    let document = document.borrow();
+    let Some(ancestor_start) = document.node_text_offset(&path) else {
+        return;
+    };
+    let replacement_start = target_start.saturating_sub(ancestor_start);
+    boundary.offset = remap_range_offset(
+        boundary.offset,
+        replacement_start,
+        old_length,
+        new_length,
+    );
+}
+
+fn remap_range_offset(
+    offset: usize,
+    replacement_start: usize,
+    old_length: usize,
+    new_length: usize,
+) -> usize {
+    if old_length == 0 {
         if offset > replacement_start {
             offset.saturating_add(new_length)
         } else {
@@ -11651,7 +11810,7 @@ fn adjust_range_boundary_for_replacement(
         } else {
             replacement_start
         }
-    };
+    }
 }
 
 fn node_value(path: NodePath, document: &Rc<RefCell<Document>>) -> Value {
@@ -16815,6 +16974,55 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("first:0|first:0||6:14:newafter|1|first:0|first:0||6:18:longer!after|3")
+        );
+    }
+
+    #[test]
+    fn text_node_data_mutation_keeps_identity_and_adjusts_live_ranges() {
+        let document = document(
+            r#"<main id="root"><p id="before">before</p><p id="first">hello</p><p id="after">after</p></main><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.setStart(text, 1);
+                range.setEnd(text, 4);
+                const ancestor = document.createRange();
+                ancestor.setStart(root, 6);
+                ancestor.setEnd(root, 16);
+                const selection = window.getSelection();
+                selection.addRange(range);
+                let changes = 0;
+                document.addEventListener("selectionchange", () => changes = changes + 1);
+                text.data = "new";
+                status.textContent = (text === first.firstChild) + ":" + text.data + "|" +
+                    range.startOffset + ":" + range.endOffset + ":" + range.toString() + "|" +
+                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
+                const second = document.createRange();
+                second.setStart(text, 1);
+                second.setEnd(text, 2);
+                selection.addRange(second);
+                text.textContent = "longer";
+                status.textContent = status.textContent + "|" +
+                    (text === first.firstChild) + ":" + text.textContent + "|" +
+                    second.startOffset + ":" + second.endOffset + ":" + second.toString() + "|" +
+                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
+                "#,
+            )
+            .expect("text-node data mutation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true:new|0:0:|6:14:newafter|1|true:longer|0:0:|6:17:longerafter|3")
         );
     }
 
