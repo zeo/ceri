@@ -25,6 +25,7 @@ type DetachedListener = (NodePath, Vec<EventListener>);
 type DetachedListenerState = (Weak<RefCell<ElementLocation>>, Vec<DetachedListener>);
 type ValidityHandle = Rc<NodePath>;
 type RangeHandle = Rc<RefCell<RangeData>>;
+type WeakRangeHandle = Weak<RefCell<RangeData>>;
 type SelectionHandle = Rc<RefCell<SelectionData>>;
 type RequestHandle = Rc<RequestData>;
 type ResponseHandle = Rc<ResponseData>;
@@ -564,6 +565,7 @@ pub struct ScriptRuntime {
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
     selection: SelectionHandle,
+    ranges: Vec<WeakRangeHandle>,
     selected_files: HashMap<NodePath, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodePath, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1432,6 +1434,7 @@ impl ScriptRuntime {
             text_selections: HashMap::new(),
             composition: None,
             selection: Rc::new(RefCell::new(SelectionData::default())),
+            ranges: Vec::new(),
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -1958,6 +1961,7 @@ impl ScriptRuntime {
         {
             self.blur_focused()?;
         }
+        let selection_changed = self.adjust_ranges_for_remove(parent, &child_path);
         let removed = self
             .document
             .borrow_mut()
@@ -1967,6 +1971,9 @@ impl ScriptRuntime {
         self.clear_runtime_state_for_removed_subtree(&child_path);
         self.refresh_select_state_after_remove(parent);
         *child.borrow_mut() = ElementLocation::Detached(removed);
+        if selection_changed {
+            self.dispatch_document_selection_change()?;
+        }
         Ok(())
     }
 
@@ -6281,6 +6288,81 @@ impl ScriptRuntime {
         utf16_substring(&value, start, end)
     }
 
+    fn track_range(&mut self, range: &RangeHandle) {
+        self.ranges.retain(|weak| weak.strong_count() != 0);
+        if self
+            .ranges
+            .iter()
+            .filter_map(Weak::upgrade)
+            .all(|current| !Rc::ptr_eq(&current, range))
+        {
+            self.ranges.push(Rc::downgrade(range));
+        }
+    }
+
+    fn adjust_ranges_for_remove(&mut self, parent: &[usize], child: &[usize]) -> bool {
+        let Some(parent_handle) = attached_handle(parent.to_vec(), &self.document) else {
+            return false;
+        };
+        let (parent_prefix, child_prefix, removed_length) = {
+            let document = self.document.borrow();
+            let Some(parent_prefix) = document.element_text_offset(parent) else {
+                return false;
+            };
+            let Some(child_prefix) = document.element_text_offset(child) else {
+                return false;
+            };
+            let removed_length = document
+                .element_text_content(child)
+                .map(|text| utf16_len(&text))
+                .unwrap_or_default();
+            (parent_prefix, child_prefix, removed_length)
+        };
+        let child_start = child_prefix.saturating_sub(parent_prefix);
+        let document = self.document.clone();
+        let selected = self.selection.borrow().range.clone();
+        let mut selection_changed = false;
+        let mut active = Vec::with_capacity(self.ranges.len());
+        for weak in self.ranges.drain(..) {
+            let Some(range) = weak.upgrade() else {
+                continue;
+            };
+            let changed = {
+                let mut range_data = range.borrow_mut();
+                let previous = range_data.clone();
+                adjust_range_boundary_for_remove(
+                    &mut range_data.start,
+                    parent,
+                    child,
+                    child_start,
+                    removed_length,
+                    &parent_handle,
+                    &document,
+                );
+                adjust_range_boundary_for_remove(
+                    &mut range_data.end,
+                    parent,
+                    child,
+                    child_start,
+                    removed_length,
+                    &parent_handle,
+                    &document,
+                );
+                *range_data != previous
+            };
+            if changed
+                && selected
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &range))
+            {
+                selection_changed = true;
+            }
+            active.push(Rc::downgrade(&range));
+        }
+        self.ranges = active;
+        selection_changed
+    }
+
     fn element_files(&self, handle: &ElementHandle) -> Value {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
@@ -7535,7 +7617,9 @@ impl ScriptRuntime {
                     },
                     end: RangeBoundary { node, offset: 0 },
                 };
-                Ok(Value::Range(Rc::new(RefCell::new(range))))
+                let range = Rc::new(RefCell::new(range));
+                self.track_range(&range);
+                Ok(Value::Range(range))
             }
             Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
             Builtin::StringSlice(string) => {
@@ -8142,9 +8226,11 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
-            Builtin::RangeClone(range) => Ok(Value::Range(Rc::new(RefCell::new(
-                range.borrow().clone(),
-            )))),
+            Builtin::RangeClone(range) => {
+                let clone = Rc::new(RefCell::new(range.borrow().clone()));
+                self.track_range(&clone);
+                Ok(Value::Range(clone))
+            }
             Builtin::RangeToString(range) => Ok(Value::String(self.range_to_string(&range))),
             Builtin::RangeDetach => Ok(Value::Undefined),
             Builtin::SelectionAddRange(selection) => {
@@ -8156,6 +8242,7 @@ impl ScriptRuntime {
                     .range
                     .as_ref()
                     .is_none_or(|current| !Rc::ptr_eq(current, &range));
+                self.track_range(&range);
                 selection.borrow_mut().range = Some(range);
                 if changed && Rc::ptr_eq(&selection, &self.selection) {
                     self.dispatch_document_selection_change()?;
@@ -8236,7 +8323,9 @@ impl ScriptRuntime {
                     .range
                     .as_ref()
                     .is_none_or(|current| *current.borrow() != range);
-                selection.borrow_mut().range = Some(Rc::new(RefCell::new(range)));
+                let range = Rc::new(RefCell::new(range));
+                self.track_range(&range);
+                selection.borrow_mut().range = Some(range);
                 if changed && Rc::ptr_eq(&selection, &self.selection) {
                     self.dispatch_document_selection_change()?;
                 }
@@ -11289,6 +11378,45 @@ fn common_path(start: &[usize], end: &[usize]) -> NodePath {
         .take_while(|(left, right)| left == right)
         .map(|(value, _)| *value)
         .collect()
+}
+
+fn adjust_range_boundary_for_remove(
+    boundary: &mut RangeBoundary,
+    _parent: &[usize],
+    child: &[usize],
+    child_start: usize,
+    removed_length: usize,
+    parent_handle: &ElementHandle,
+    document: &Rc<RefCell<Document>>,
+) {
+    let Some(path) = attached_path(&boundary.node) else {
+        return;
+    };
+    if path.starts_with(child) {
+        boundary.node = parent_handle.clone();
+        boundary.offset = child_start;
+        return;
+    }
+    if !child.starts_with(&path) {
+        return;
+    }
+    let document = document.borrow();
+    let Some(ancestor_start) = document.element_text_offset(&path) else {
+        return;
+    };
+    let Some(removed_start) = document.element_text_offset(child) else {
+        return;
+    };
+    let removed_start = removed_start.saturating_sub(ancestor_start);
+    let removed_end = removed_start.saturating_add(removed_length);
+    let offset = boundary.offset;
+    boundary.offset = if offset <= removed_start {
+        offset
+    } else if offset >= removed_end {
+        offset.saturating_sub(removed_length)
+    } else {
+        removed_start
+    };
 }
 
 fn node_value(path: NodePath, document: &Rc<RefCell<Document>>) -> Value {
@@ -15996,6 +16124,7 @@ mod tests {
         runtime
             .execute(
                 r#"
+                const first = document.getElementById("first");
                 const second = document.getElementById("second");
                 let events = "";
                 first.addEventListener("blur", () => events = events + "first-blur|");
@@ -16359,6 +16488,45 @@ mod tests {
         assert_eq!(
             document.borrow().find_element_by_id("first"),
             Some(vec![0, 0])
+        );
+    }
+
+    #[test]
+    fn document_range_retargets_removed_subtrees_and_shifts_ancestor_offsets() {
+        let document = document(
+            r#"<main id="root"><p id="before">before</p><p id="gone">hello</p><p id="after">after</p></main><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const gone = document.getElementById("gone");
+                const status = document.getElementById("status");
+                const removed = document.createRange();
+                removed.setStart(gone, 1);
+                removed.setEnd(gone, 4);
+                const ancestor = document.createRange();
+                ancestor.setStart(root, 6);
+                ancestor.setEnd(root, 16);
+                const selection = window.getSelection();
+                selection.addRange(removed);
+                let changes = 0;
+                document.addEventListener("selectionchange", () => changes = changes + 1);
+                root.removeChild(gone);
+                status.textContent = removed.startContainer.id + ":" + removed.startOffset + "|" +
+                    removed.endContainer.id + ":" + removed.endOffset + "|" + removed.toString() + "|" +
+                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
+                "#,
+            )
+            .expect("Range removal retargeting should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("root:6|root:6||6:11:after|1")
         );
     }
 
