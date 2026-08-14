@@ -1,4 +1,4 @@
-use crate::dom::{AccessibilityNode, Document, Element, Node, NodePath};
+use crate::dom::{AccessibilityNode, Document, Element, Node, NodeId, NodePath};
 use crate::css::StyleState;
 use crate::navigation::{
     is_http_redirect, is_javascript, is_json, AppUrl, ClipboardProvider, FilePicker,
@@ -177,14 +177,14 @@ enum Builtin {
     HistoryBack,
     HistoryForward,
     HistoryGo,
-    ElementFocus(NodePath),
-    ElementBlur(NodePath),
-    ElementRequestSubmit(NodePath),
-    ElementReset(NodePath),
-    ElementCheckValidity(NodePath),
-    ElementReportValidity(NodePath),
-    ElementSetCustomValidity(NodePath),
-    CanvasGetContext(NodePath),
+    ElementFocus(ElementHandle),
+    ElementBlur(ElementHandle),
+    ElementRequestSubmit(ElementHandle),
+    ElementReset(ElementHandle),
+    ElementCheckValidity(ElementHandle),
+    ElementReportValidity(ElementHandle),
+    ElementSetCustomValidity(ElementHandle),
+    CanvasGetContext(ElementHandle),
     CanvasFillRect(CanvasContextHandle),
     CanvasClearRect(CanvasContextHandle),
     UrlSearchParamsAppend(UrlSearchParamsHandle),
@@ -229,15 +229,16 @@ enum Builtin {
     RequestAnimationFrame,
     CancelAnimationFrame,
     CeriQuery,
-    ElementAddEventListener(NodePath),
-    ElementRemoveEventListener(NodePath),
-    ElementClick(NodePath),
-    ElementAppendChild(NodePath),
-    ElementRemoveChild(NodePath),
+    ElementAddEventListener(ElementHandle),
+    ElementRemoveEventListener(ElementHandle),
+    ElementClick(ElementHandle),
+    ElementAppendChild(ElementHandle),
+    ElementRemoveChild(ElementHandle),
+    ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
-    ElementSelect(NodePath),
-    ElementSetSelectionRange(NodePath),
-    ElementSetRangeText(NodePath),
+    ElementSelect(ElementHandle),
+    ElementSetSelectionRange(ElementHandle),
+    ElementSetRangeText(ElementHandle),
     RangeSetStart(RangeHandle),
     RangeSetEnd(RangeHandle),
     RangeCollapse(RangeHandle),
@@ -250,11 +251,11 @@ enum Builtin {
     SelectionGetRangeAt(SelectionHandle),
     SelectionCollapse(SelectionHandle),
     SelectionToString(SelectionHandle),
-    ElementSetAttribute(NodePath),
-    ElementRemoveAttribute(NodePath),
-    ElementGetAttribute(NodePath),
-    ElementQuerySelector(NodePath),
-    ElementQuerySelectorAll(NodePath),
+    ElementSetAttribute(ElementHandle),
+    ElementRemoveAttribute(ElementHandle),
+    ElementGetAttribute(ElementHandle),
+    ElementQuerySelector(ElementHandle),
+    ElementQuerySelectorAll(ElementHandle),
     ArrayMap(ArrayHandle),
     ArrayJoin(ArrayHandle),
     StringSlice(String),
@@ -331,10 +332,25 @@ struct Function {
     is_async: bool,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 enum ElementLocation {
-    Attached(NodePath),
+    Attached {
+        id: NodeId,
+        document: Weak<RefCell<Document>>,
+    },
     Detached(Element),
+}
+
+impl PartialEq for ElementLocation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Attached { id: left, .. }, Self::Attached { id: right, .. }) => {
+                left == right
+            }
+            (Self::Detached(left), Self::Detached(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1559,6 +1575,41 @@ impl ScriptRuntime {
         }
     }
 
+    fn shift_runtime_paths_for_insert(&mut self, parent: &[usize], index: usize) {
+        shift_hash_map_paths(&mut self.listeners, parent, index);
+        shift_hash_map_paths(&mut self.control_values, parent, index);
+        shift_hash_map_paths(&mut self.control_checked, parent, index);
+        shift_btree_set_paths(&mut self.dirty_checked_controls, parent, index);
+        shift_hash_map_paths(&mut self.option_selected, parent, index);
+        shift_btree_set_paths(&mut self.dirty_options, parent, index);
+        shift_btree_set_paths(&mut self.dirty_controls, parent, index);
+        shift_btree_set_paths(&mut self.last_user_edit, parent, index);
+        shift_btree_set_paths(&mut self.resetting_forms, parent, index);
+        shift_btree_map_paths(&mut self.custom_validity, parent, index);
+        shift_hash_map_paths(&mut self.text_selections, parent, index);
+        shift_hash_map_paths(&mut self.selected_files, parent, index);
+        shift_btree_map_paths(&mut self.scroll_offsets, parent, index);
+        shift_hash_map_paths(&mut self.canvas_contexts, parent, index);
+        for context in self.canvas_contexts.values() {
+            shift_path_for_insert(&mut context.borrow_mut().path, parent, index);
+        }
+        {
+            let mut file_lists = self.file_lists.borrow_mut();
+            shift_hash_map_paths(&mut file_lists, parent, index);
+        }
+        if let Some(path) = &mut self.focused_element {
+            shift_path_for_insert(path, parent, index);
+        }
+        if let Some(composition) = &mut self.composition {
+            shift_path_for_insert(&mut composition.path, parent, index);
+        }
+        if let Some(range) = self.selection.borrow().range.clone() {
+            let mut range = range.borrow_mut();
+            shift_path_for_insert(&mut range.start.path, parent, index);
+            shift_path_for_insert(&mut range.end.path, parent, index);
+        }
+    }
+
     fn capture_detached_listeners(&mut self, handle: &ElementHandle, path: &[usize]) {
         let mut detached = Vec::new();
         let mut retained = HashMap::new();
@@ -1680,8 +1731,7 @@ impl ScriptRuntime {
         parent: &[usize],
         child: &ElementHandle,
     ) -> Result<(), ScriptError> {
-        let location = child.borrow().clone();
-        let ElementLocation::Attached(child_path) = location else {
+        let Some(child_path) = attached_path(child) else {
             return Err(runtime_error("removeChild expects an attached child"));
         };
         if child_path.len() != parent.len().saturating_add(1)
@@ -3423,11 +3473,12 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .document_element_path()
-                    .map(|path| Value::Element(attached_handle(path)))
+                    .and_then(|path| attached_handle(path, &self.document))
+                    .map(Value::Element)
                     .unwrap_or(Value::Null)),
                 "activeElement" => Ok(self
                     .active_element()
-                    .map(attached_handle)
+                    .and_then(|path| attached_handle(path, &self.document))
                     .map(Value::Element)
                     .unwrap_or(Value::Null)),
                 _ => Err(runtime_error(format!(
@@ -3530,7 +3581,7 @@ impl ScriptRuntime {
                     "parentNode" | "parentElement" => path
                         .as_ref()
                         .and_then(|path| self.document.borrow().parent_path(path))
-                        .map(attached_handle)
+                        .and_then(|path| attached_handle(path, &self.document))
                         .map(Value::Element)
                         .unwrap_or(Value::Null),
                     "files" => self.element_files(&handle),
@@ -3616,47 +3667,69 @@ impl ScriptRuntime {
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
                     "querySelector" => {
-                        Value::Builtin(Builtin::ElementQuerySelector(path.ok_or_else(|| {
-                            runtime_error("detached element cannot query descendants")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot query descendants"));
+                        }
+                        Value::Builtin(Builtin::ElementQuerySelector(handle.clone()))
                     }
-                    "querySelectorAll" => Value::Builtin(Builtin::ElementQuerySelectorAll(
-                        path.ok_or_else(|| {
-                            runtime_error("detached element cannot query descendants")
-                        })?,
-                    )),
+                    "querySelectorAll" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot query descendants"));
+                        }
+                        Value::Builtin(Builtin::ElementQuerySelectorAll(handle.clone()))
+                    }
                     "addEventListener" => {
-                        Value::Builtin(Builtin::ElementAddEventListener(path.ok_or_else(|| {
-                            runtime_error("detached element cannot receive events")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot receive events"));
+                        }
+                        Value::Builtin(Builtin::ElementAddEventListener(handle.clone()))
                     }
-                    "removeEventListener" => Value::Builtin(
-                        Builtin::ElementRemoveEventListener(path.ok_or_else(|| {
-                            runtime_error("detached element cannot remove event listeners")
-                        })?),
-                    ),
-                    "click" => Value::Builtin(Builtin::ElementClick(
-                        path.ok_or_else(|| runtime_error("detached element cannot be clicked"))?,
-                    )),
-                    "focus" => Value::Builtin(Builtin::ElementFocus(
-                        path.ok_or_else(|| runtime_error("detached element cannot receive focus"))?,
-                    )),
-                    "blur" => Value::Builtin(Builtin::ElementBlur(
-                        path.ok_or_else(|| runtime_error("detached element cannot lose focus"))?,
-                    )),
-                    "select" => Value::Builtin(Builtin::ElementSelect(
-                        path.ok_or_else(|| runtime_error("detached element cannot be selected"))?,
-                    )),
-                    "setSelectionRange" => Value::Builtin(Builtin::ElementSetSelectionRange(
-                        path.ok_or_else(|| {
-                            runtime_error("detached element cannot set a selection range")
-                        })?,
-                    )),
-                    "setRangeText" => Value::Builtin(Builtin::ElementSetRangeText(
-                        path.ok_or_else(|| {
-                            runtime_error("detached element cannot replace selected text")
-                        })?,
-                    )),
+                    "removeEventListener" => {
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element cannot remove event listeners",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementRemoveEventListener(handle.clone()))
+                    }
+                    "click" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot be clicked"));
+                        }
+                        Value::Builtin(Builtin::ElementClick(handle.clone()))
+                    }
+                    "focus" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot receive focus"));
+                        }
+                        Value::Builtin(Builtin::ElementFocus(handle.clone()))
+                    }
+                    "blur" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot lose focus"));
+                        }
+                        Value::Builtin(Builtin::ElementBlur(handle.clone()))
+                    }
+                    "select" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot be selected"));
+                        }
+                        Value::Builtin(Builtin::ElementSelect(handle.clone()))
+                    }
+                    "setSelectionRange" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot set a selection range"));
+                        }
+                        Value::Builtin(Builtin::ElementSetSelectionRange(handle.clone()))
+                    }
+                    "setRangeText" => {
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element cannot replace selected text",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementSetRangeText(handle.clone()))
+                    }
                     "requestSubmit" => {
                         let path = path.ok_or_else(|| {
                             runtime_error("detached element cannot submit")
@@ -3671,7 +3744,7 @@ impl ScriptRuntime {
                                 "requestSubmit is only available on form elements",
                             ));
                         }
-                        Value::Builtin(Builtin::ElementRequestSubmit(path))
+                        Value::Builtin(Builtin::ElementRequestSubmit(handle.clone()))
                     }
                     "reset" => {
                         let path = path
@@ -3684,23 +3757,32 @@ impl ScriptRuntime {
                         if !is_form {
                             return Err(runtime_error("reset is only available on form elements"));
                         }
-                        Value::Builtin(Builtin::ElementReset(path))
+                        Value::Builtin(Builtin::ElementReset(handle.clone()))
                     }
-                    "checkValidity" => Value::Builtin(Builtin::ElementCheckValidity(
-                        path.ok_or_else(|| {
-                            runtime_error("detached element cannot validate constraints")
-                        })?,
-                    )),
-                    "reportValidity" => Value::Builtin(Builtin::ElementReportValidity(
-                        path.ok_or_else(|| {
-                            runtime_error("detached element cannot validate constraints")
-                        })?,
-                    )),
-                    "setCustomValidity" => Value::Builtin(Builtin::ElementSetCustomValidity(
-                        path.ok_or_else(|| {
-                            runtime_error("detached element cannot set custom validity")
-                        })?,
-                    )),
+                    "checkValidity" => {
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element cannot validate constraints",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementCheckValidity(handle.clone()))
+                    }
+                    "reportValidity" => {
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element cannot validate constraints",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementReportValidity(handle.clone()))
+                    }
+                    "setCustomValidity" => {
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element cannot set custom validity",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementSetCustomValidity(handle.clone()))
+                    }
                     "getContext" => {
                         let path = path.ok_or_else(|| {
                             runtime_error("detached element cannot create a canvas context")
@@ -3715,33 +3797,50 @@ impl ScriptRuntime {
                                 "getContext is only available on canvas elements",
                             ));
                         }
-                        Value::Builtin(Builtin::CanvasGetContext(path))
+                        Value::Builtin(Builtin::CanvasGetContext(handle.clone()))
                     }
                     "appendChild" => {
-                        Value::Builtin(Builtin::ElementAppendChild(path.ok_or_else(|| {
-                            runtime_error("detached element cannot receive children")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot receive children"));
+                        }
+                        Value::Builtin(Builtin::ElementAppendChild(handle.clone()))
                     }
                     "removeChild" => {
-                        Value::Builtin(Builtin::ElementRemoveChild(path.ok_or_else(|| {
-                            runtime_error("detached element cannot remove children")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot remove children"));
+                        }
+                        Value::Builtin(Builtin::ElementRemoveChild(handle.clone()))
+                    }
+                    "insertBefore" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot insert children"));
+                        }
+                        Value::Builtin(Builtin::ElementInsertBefore(handle.clone()))
                     }
                     "remove" => Value::Builtin(Builtin::ElementRemove(handle.clone())),
                     "setAttribute" => {
-                        Value::Builtin(Builtin::ElementSetAttribute(path.ok_or_else(|| {
-                            runtime_error("detached element has no document attributes")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element has no document attributes",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementSetAttribute(handle.clone()))
                     }
                     "removeAttribute" => {
-                        Value::Builtin(Builtin::ElementRemoveAttribute(path.ok_or_else(|| {
-                            runtime_error("detached element has no document attributes")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element has no document attributes",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementRemoveAttribute(handle.clone()))
                     }
                     "getAttribute" => {
-                        Value::Builtin(Builtin::ElementGetAttribute(path.ok_or_else(|| {
-                            runtime_error("detached element has no document attributes")
-                        })?))
+                        if path.is_none() {
+                            return Err(runtime_error(
+                                "detached element has no document attributes",
+                            ));
+                        }
+                        Value::Builtin(Builtin::ElementGetAttribute(handle.clone()))
                     }
                     _ => return Err(runtime_error(format!("element has no property {property}"))),
                 };
@@ -3769,9 +3868,15 @@ impl ScriptRuntime {
             Value::Range(range) => {
                 let range_data = range.borrow();
                 match property {
-                    "startContainer" => Ok(node_value(range_data.start.path.clone())),
+                    "startContainer" => Ok(node_value(
+                        range_data.start.path.clone(),
+                        &self.document,
+                    )),
                     "startOffset" => Ok(Value::Number(range_data.start.offset as f64)),
-                    "endContainer" => Ok(node_value(range_data.end.path.clone())),
+                    "endContainer" => Ok(node_value(
+                        range_data.end.path.clone(),
+                        &self.document,
+                    )),
                     "endOffset" => Ok(Value::Number(range_data.end.offset as f64)),
                     "collapsed" => Ok(Value::Bool(range_data.start.path == range_data.end.path
                         && range_data.start.offset == range_data.end.offset)),
@@ -3780,7 +3885,11 @@ impl ScriptRuntime {
                         Ok(if path.is_empty() {
                             Value::Document
                         } else {
-                            Value::Element(attached_handle(path))
+                            Value::Element(
+                                attached_handle(path, &self.document).ok_or_else(|| {
+                                    runtime_error("range ancestor is no longer in the document")
+                                })?,
+                            )
                         })
                     }
                     "setStart" => Ok(Value::Builtin(Builtin::RangeSetStart(range.clone()))),
@@ -3814,7 +3923,7 @@ impl ScriptRuntime {
                             } else {
                                 &range.end
                             };
-                            node_value(boundary.path.clone())
+                            node_value(boundary.path.clone(), &self.document)
                         })
                         .unwrap_or(Value::Null)),
                     "anchorOffset" | "focusOffset" => Ok(range
@@ -3862,8 +3971,8 @@ impl ScriptRuntime {
             },
             Value::Event(event) => match property {
                 "type" => Ok(Value::String(event.event_type.clone())),
-                "target" => Ok(node_value(event.target.clone())),
-                "currentTarget" => Ok(node_value(event.current_target.clone())),
+                "target" => Ok(node_value(event.target.clone(), &self.document)),
+                "currentTarget" => Ok(node_value(event.current_target.clone(), &self.document)),
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
                 "key" => Ok(Value::String(event.key.clone())),
@@ -4796,7 +4905,8 @@ impl ScriptRuntime {
 
     fn element_text_content(&self, handle: &ElementHandle) -> Option<String> {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self.document.borrow().element_text_content(&path),
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_text_content(&path)),
             ElementLocation::Detached(element) => {
                 let mut text = String::new();
                 collect_element_text(&element, &mut text);
@@ -5245,7 +5355,8 @@ impl ScriptRuntime {
 
     fn element_selected(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self.option_selected_path(&path),
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .is_some_and(|path| self.option_selected_path(&path)),
             ElementLocation::Detached(element) => {
                 element.name == "option" && element.attr("selected").is_some()
             }
@@ -5254,11 +5365,11 @@ impl ScriptRuntime {
 
     fn element_default_selected(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow()
-                .element_clone(&path)
-                .is_some_and(|element| element.name == "option" && element.attr("selected").is_some()),
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_clone(&path))
+                .is_some_and(|element| {
+                    element.name == "option" && element.attr("selected").is_some()
+                }),
             ElementLocation::Detached(element) => {
                 element.name == "option" && element.attr("selected").is_some()
             }
@@ -5273,7 +5384,7 @@ impl ScriptRuntime {
             .option_paths(&path)
             .into_iter()
             .filter(|option| !selected || self.option_selected_path(option))
-            .map(attached_handle)
+            .filter_map(|option| attached_handle(option, &self.document))
             .collect();
         Value::NodeList(Rc::new(nodes))
     }
@@ -5281,7 +5392,7 @@ impl ScriptRuntime {
     fn element_form(&self, handle: &ElementHandle) -> Value {
         attached_path(handle)
             .and_then(|path| self.document.borrow().form_owner_path(&path))
-            .map(attached_handle)
+            .and_then(|path| attached_handle(path, &self.document))
             .map(Value::Element)
             .unwrap_or(Value::Null)
     }
@@ -5296,7 +5407,7 @@ impl ScriptRuntime {
             .form_control_paths(&path)
             .unwrap_or_default()
             .into_iter()
-            .map(attached_handle)
+            .filter_map(|path| attached_handle(path, &self.document))
             .collect();
         Value::NodeList(Rc::new(nodes))
     }
@@ -5536,7 +5647,9 @@ impl ScriptRuntime {
 
     fn element_value(&self, handle: &ElementHandle) -> Option<String> {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self.control_value_path(&path),
+            ElementLocation::Attached { .. } => {
+                attached_path(handle).and_then(|path| self.control_value_path(&path))
+            }
             ElementLocation::Detached(element) => match element.name.as_str() {
                 "option" => Some(option_value(&element)),
                 _ => element.attr("value").map(str::to_string),
@@ -5546,10 +5659,8 @@ impl ScriptRuntime {
 
     fn element_default_value(&self, handle: &ElementHandle) -> Value {
         let value = match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow()
-                .element_clone(&path)
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_clone(&path))
                 .and_then(|element| default_value_for_element(&element)),
             ElementLocation::Detached(element) => default_value_for_element(&element),
         };
@@ -5558,10 +5669,8 @@ impl ScriptRuntime {
 
     fn element_default_checked(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow()
-                .element_clone(&path)
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_clone(&path))
                 .is_some_and(|element| {
                     element.name == "input" && element.attr("checked").is_some()
                 }),
@@ -5971,7 +6080,8 @@ impl ScriptRuntime {
 
     fn element_checked(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self.control_checked_path(&path),
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .is_some_and(|path| self.control_checked_path(&path)),
             ElementLocation::Detached(element) => element.attr("checked").is_some(),
         }
     }
@@ -5979,7 +6089,10 @@ impl ScriptRuntime {
     fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 let Some(element) = self.document.borrow().element_clone(&path) else {
                     return false;
                 };
@@ -6030,25 +6143,24 @@ impl ScriptRuntime {
 
     fn element_attribute(&self, handle: &ElementHandle, name: &str) -> Option<String> {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
-                self.document.borrow().element_attribute(&path, name)
-            }
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_attribute(&path, name)),
             ElementLocation::Detached(element) => element.attr(name).map(str::to_string),
         }
     }
 
     fn element_inner_html(&self, handle: &ElementHandle) -> Option<String> {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => self.document.borrow().element_inner_html(&path),
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_inner_html(&path)),
             ElementLocation::Detached(element) => Some(element.inner_html()),
         }
     }
 
     fn element_style_property(&self, handle: &ElementHandle, property: &str) -> Option<String> {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
-                self.document.borrow().style_property(&path, property)
-            }
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().style_property(&path, property)),
             ElementLocation::Detached(element) => element.style_property(property),
         }
     }
@@ -6056,10 +6168,11 @@ impl ScriptRuntime {
     fn set_element_text_content(&mut self, handle: &ElementHandle, text: String) -> bool {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow_mut()
-                .set_element_text_content(&path, text),
+            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
+                self.document
+                    .borrow_mut()
+                    .set_element_text_content(&path, text)
+            }),
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
                 let ElementLocation::Detached(element) = &mut *location else {
@@ -6074,7 +6187,10 @@ impl ScriptRuntime {
     fn set_element_attribute(&mut self, handle: &ElementHandle, name: &str, value: String) -> bool {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 let changed = self
                     .document
                     .borrow_mut()
@@ -6128,7 +6244,10 @@ impl ScriptRuntime {
     ) -> Result<bool, ScriptError> {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return Err(runtime_error("element handle is no longer in the document"));
+                };
                 let changed = self
                     .document
                     .borrow_mut()
@@ -6168,10 +6287,11 @@ impl ScriptRuntime {
     ) -> bool {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow_mut()
-                .set_style_property(&path, property, value),
+            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
+                self.document
+                    .borrow_mut()
+                    .set_style_property(&path, property, value)
+            }),
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
                 let ElementLocation::Detached(element) = &mut *location else {
@@ -6281,7 +6401,10 @@ impl ScriptRuntime {
 
     fn set_element_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 let is_radio = self
                     .document
                     .borrow()
@@ -6323,7 +6446,10 @@ impl ScriptRuntime {
 
     fn set_element_disabled(&mut self, handle: &ElementHandle, disabled: bool) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 if disabled {
                     self.document
                         .borrow_mut()
@@ -6351,7 +6477,10 @@ impl ScriptRuntime {
 
     fn set_element_readonly(&mut self, handle: &ElementHandle, readonly: bool) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 if readonly {
                     self.document
                         .borrow_mut()
@@ -6380,7 +6509,10 @@ impl ScriptRuntime {
     fn remove_element_attribute(&mut self, handle: &ElementHandle, name: &str) -> bool {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 let changed = self
                     .document
                     .borrow_mut()
@@ -6431,7 +6563,10 @@ impl ScriptRuntime {
 
     fn set_element_required(&mut self, handle: &ElementHandle, required: bool) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return false;
+                };
                 if required {
                     self.document
                         .borrow_mut()
@@ -6929,7 +7064,8 @@ impl ScriptRuntime {
             ));
         }
         let Value::FormData(form_data) = self.construct_form_data(vec![Value::Element(
-            attached_handle(path),
+            attached_handle(path, &self.document)
+                .ok_or_else(|| runtime_error("form is no longer in the document"))?,
         )])? else {
             unreachable!("form data constructor returns form data");
         };
@@ -7105,7 +7241,7 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .find_element_by_id(&id)
-                    .map(attached_handle)
+                    .and_then(|path| attached_handle(path, &self.document))
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
             }
@@ -7118,7 +7254,7 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .find_element_by_selector(&selector)
-                    .map(attached_handle)
+                    .and_then(|path| attached_handle(path, &self.document))
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
             }
@@ -7133,7 +7269,7 @@ impl ScriptRuntime {
                     .find_elements_by_selector(&selector)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(attached_handle)
+                    .filter_map(|path| attached_handle(path, &self.document))
                     .collect();
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
@@ -7627,22 +7763,31 @@ impl ScriptRuntime {
                 self.queue_navigation(NavigationRequest::Traverse { delta });
                 Ok(Value::Undefined)
             }
-            Builtin::ElementFocus(path) => {
-                self.focus_path(path)?;
+            Builtin::ElementFocus(handle) => {
+                if let Some(path) = attached_path(&handle) {
+                    self.focus_path(path)?;
+                }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementBlur(path) => {
-                if self.focused_element.as_ref() == Some(&path) {
+            Builtin::ElementBlur(handle) => {
+                if let Some(path) = attached_path(&handle)
+                    && self.focused_element.as_ref() == Some(&path)
+                {
                     self.blur_focused()?;
                 }
                 Ok(Value::Undefined)
             }
             Builtin::WindowGetSelection => Ok(Value::Selection(self.selection.clone())),
-            Builtin::ElementSelect(path) => {
-                self.set_text_selection(path, 0, usize::MAX, SelectionDirection::None)?;
+            Builtin::ElementSelect(handle) => {
+                if let Some(path) = attached_path(&handle) {
+                    self.set_text_selection(path, 0, usize::MAX, SelectionDirection::None)?;
+                }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementSetSelectionRange(path) => {
+            Builtin::ElementSetSelectionRange(handle) => {
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::Undefined);
+                };
                 let start = arguments
                     .first()
                     .map(Value::number)
@@ -7667,7 +7812,10 @@ impl ScriptRuntime {
                 )?;
                 Ok(Value::Undefined)
             }
-            Builtin::ElementSetRangeText(path) => {
+            Builtin::ElementSetRangeText(handle) => {
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::Undefined);
+                };
                 self.set_range_text(&path, &arguments)?;
                 Ok(Value::Undefined)
             }
@@ -7859,26 +8007,39 @@ impl ScriptRuntime {
                         .unwrap_or_default(),
                 ))
             }
-            Builtin::ElementRequestSubmit(path) => {
-                self.request_submit(path)?;
+            Builtin::ElementRequestSubmit(handle) => {
+                if let Some(path) = attached_path(&handle) {
+                    self.request_submit(path)?;
+                }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementReset(path) => {
-                self.reset_form(path)?;
+            Builtin::ElementReset(handle) => {
+                if let Some(path) = attached_path(&handle) {
+                    self.reset_form(path)?;
+                }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementCheckValidity(path) | Builtin::ElementReportValidity(path) => {
-                Ok(Value::Bool(self.check_validity_path(&path)?))
+            Builtin::ElementCheckValidity(handle) | Builtin::ElementReportValidity(handle) => {
+                let valid = attached_path(&handle)
+                    .map(|path| self.check_validity_path(&path))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(Value::Bool(valid))
             }
-            Builtin::ElementSetCustomValidity(path) => {
+            Builtin::ElementSetCustomValidity(handle) => {
                 let message = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.set_custom_validity(path, message);
+                if let Some(path) = attached_path(&handle) {
+                    self.set_custom_validity(path, message);
+                }
                 Ok(Value::Undefined)
             }
-            Builtin::CanvasGetContext(path) => {
+            Builtin::CanvasGetContext(handle) => {
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::Null);
+                };
                 let kind = arguments
                     .first()
                     .map(Value::string_value)
@@ -8858,7 +9019,10 @@ impl ScriptRuntime {
                     self.fulfilled_promise(Value::String(response)),
                 ))
             }
-            Builtin::ElementAddEventListener(path) => {
+            Builtin::ElementAddEventListener(handle) => {
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::Undefined);
+                };
                 let event = arguments
                     .first()
                     .map(Value::string_value)
@@ -8889,7 +9053,10 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementRemoveEventListener(path) => {
+            Builtin::ElementRemoveEventListener(handle) => {
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::Undefined);
+                };
                 let event = arguments
                     .first()
                     .map(Value::string_value)
@@ -8903,11 +9070,15 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementClick(path) => {
-                self.click_path(path)?;
+            Builtin::ElementClick(handle) => {
+                if let Some(path) = attached_path(&handle) {
+                    self.click_path(path)?;
+                }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementAppendChild(path) => {
+            Builtin::ElementAppendChild(parent) => {
+                let parent_path = attached_path(&parent)
+                    .ok_or_else(|| runtime_error("appendChild parent is no longer in the document"))?;
                 let child = match arguments.first() {
                     Some(Value::Element(handle)) => handle.clone(),
                     _ => return Err(runtime_error("appendChild expects an element")),
@@ -8915,7 +9086,7 @@ impl ScriptRuntime {
                 let location = child.borrow().clone();
                 let element = match location {
                     ElementLocation::Detached(element) => element,
-                    ElementLocation::Attached(_) => {
+                    ElementLocation::Attached { .. } => {
                         return Err(runtime_error(
                             "appendChild currently accepts detached elements only",
                         ));
@@ -8924,21 +9095,71 @@ impl ScriptRuntime {
                 let child_path = self
                     .document
                     .borrow_mut()
-                    .append_element(&path, element)
+                    .append_element(&parent_path, element)
                     .ok_or_else(|| {
                         runtime_error("appendChild parent is no longer in the document")
                     })?;
                 self.restore_detached_listeners(&child, &child_path);
-                self.refresh_select_state_after_append(&path, &child_path);
-                *child.borrow_mut() = ElementLocation::Attached(child_path);
+                self.refresh_select_state_after_append(&parent_path, &child_path);
+                let attached = attached_handle(child_path, &self.document)
+                    .ok_or_else(|| runtime_error("appendChild failed to assign node identity"))?;
+                *child.borrow_mut() = attached.borrow().clone();
                 Ok(Value::Element(child))
             }
-            Builtin::ElementRemoveChild(path) => {
+            Builtin::ElementInsertBefore(parent) => {
+                let parent_path = attached_path(&parent)
+                    .ok_or_else(|| runtime_error("insertBefore parent is no longer in the document"))?;
+                let child = match arguments.first() {
+                    Some(Value::Element(handle)) => handle.clone(),
+                    _ => return Err(runtime_error("insertBefore expects an element")),
+                };
+                let reference_path = match arguments.get(1).map(Value::resolve) {
+                    None | Some(Value::Null) | Some(Value::Undefined) => None,
+                    Some(Value::Element(reference)) => Some(attached_path(&reference).ok_or_else(
+                        || runtime_error("insertBefore reference is no longer in the document"),
+                    )?),
+                    Some(_) => return Err(runtime_error("insertBefore reference must be an element or null")),
+                };
+                let reference_index = reference_path.as_ref().and_then(|path| path.last()).copied();
+                let location = child.borrow().clone();
+                let element = match location {
+                    ElementLocation::Detached(element) => element,
+                    ElementLocation::Attached { .. } => {
+                        return Err(runtime_error(
+                            "insertBefore currently accepts detached elements only",
+                        ));
+                    }
+                };
+                let child_path = if let Some(reference_path) = reference_path {
+                    self.document
+                        .borrow_mut()
+                        .insert_element_before(&parent_path, element, &reference_path)
+                } else {
+                    self.document
+                        .borrow_mut()
+                        .append_element(&parent_path, element)
+                }
+                .ok_or_else(|| {
+                    runtime_error("insertBefore parent or reference is no longer in the document")
+                })?;
+                if let Some(index) = reference_index {
+                    self.shift_runtime_paths_for_insert(&parent_path, index);
+                }
+                self.restore_detached_listeners(&child, &child_path);
+                self.refresh_select_state_after_append(&parent_path, &child_path);
+                let attached = attached_handle(child_path, &self.document)
+                    .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
+                *child.borrow_mut() = attached.borrow().clone();
+                Ok(Value::Element(child))
+            }
+            Builtin::ElementRemoveChild(parent) => {
                 let child = match arguments.first() {
                     Some(Value::Element(handle)) => handle.clone(),
                     _ => return Err(runtime_error("removeChild expects an element")),
                 };
-                self.detach_child(&path, &child)?;
+                let parent_path = attached_path(&parent)
+                    .ok_or_else(|| runtime_error("removeChild parent is no longer in the document"))?;
+                self.detach_child(&parent_path, &child)?;
                 Ok(Value::Element(child))
             }
             Builtin::ElementRemove(handle) => {
@@ -8951,7 +9172,7 @@ impl ScriptRuntime {
                 self.detach_child(&parent, &handle)?;
                 Ok(Value::Undefined)
             }
-            Builtin::ElementSetAttribute(path) => {
+            Builtin::ElementSetAttribute(handle) => {
                 let name = arguments
                     .first()
                     .map(Value::string_value)
@@ -8960,54 +9181,64 @@ impl ScriptRuntime {
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.set_element_attribute(&attached_handle(path), &name, value);
+                if attached_path(&handle).is_none() {
+                    return Err(runtime_error("element is no longer in the document"));
+                }
+                self.set_element_attribute(&handle, &name, value);
                 Ok(Value::Undefined)
             }
-            Builtin::ElementRemoveAttribute(path) => {
+            Builtin::ElementRemoveAttribute(handle) => {
                 let name = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.remove_element_attribute(&attached_handle(path), &name);
+                if attached_path(&handle).is_none() {
+                    return Err(runtime_error("element is no longer in the document"));
+                }
+                self.remove_element_attribute(&handle, &name);
                 Ok(Value::Undefined)
             }
-            Builtin::ElementGetAttribute(path) => {
+            Builtin::ElementGetAttribute(handle) => {
                 let name = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                Ok(self
-                    .document
-                    .borrow()
-                    .element_attribute(&path, &name)
+                Ok(attached_path(&handle)
+                    .and_then(|path| self.document.borrow().element_attribute(&path, &name))
                     .map(Value::String)
                     .unwrap_or(Value::Null))
             }
-            Builtin::ElementQuerySelector(path) => {
+            Builtin::ElementQuerySelector(handle) => {
                 let selector = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::Null);
+                };
                 Ok(self
                     .document
                     .borrow()
                     .find_element_by_selector_within(&path, &selector)
-                    .map(attached_handle)
+                    .and_then(|path| attached_handle(path, &self.document))
                     .map(Value::Element)
                     .unwrap_or(Value::Null))
             }
-            Builtin::ElementQuerySelectorAll(path) => {
+            Builtin::ElementQuerySelectorAll(handle) => {
                 let selector = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
+                let Some(path) = attached_path(&handle) else {
+                    return Ok(Value::NodeList(Rc::new(Vec::new())));
+                };
                 let nodes = self
                     .document
                     .borrow()
                     .find_elements_by_selector_within(&path, &selector)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(attached_handle)
+                    .filter_map(|path| attached_handle(path, &self.document))
                     .collect();
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
@@ -9564,9 +9795,8 @@ impl ScriptRuntime {
 
     fn has_class(&self, handle: &ElementHandle, class: &str) -> Result<bool, ScriptError> {
         match handle.borrow().clone() {
-            ElementLocation::Attached(path) => {
-                Ok(self.document.borrow().element_has_class(&path, class))
-            }
+            ElementLocation::Attached { .. } => Ok(attached_path(handle)
+                .is_some_and(|path| self.document.borrow().element_has_class(&path, class))),
             ElementLocation::Detached(element) => Ok(element.has_class(class)),
         }
     }
@@ -9574,8 +9804,10 @@ impl ScriptRuntime {
     fn add_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => {
-                self.document.borrow_mut().add_element_class(&path, class);
+            ElementLocation::Attached { .. } => {
+                if let Some(path) = attached_path(handle) {
+                    self.document.borrow_mut().add_element_class(&path, class);
+                }
             }
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
@@ -9591,10 +9823,12 @@ impl ScriptRuntime {
     fn remove_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
         let location = handle.borrow().clone();
         match location {
-            ElementLocation::Attached(path) => {
-                self.document
-                    .borrow_mut()
-                    .remove_element_class(&path, class);
+            ElementLocation::Attached { .. } => {
+                if let Some(path) = attached_path(handle) {
+                    self.document
+                        .borrow_mut()
+                        .remove_element_class(&path, class);
+                }
             }
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
@@ -9617,11 +9851,14 @@ impl ScriptRuntime {
     ) -> Result<bool, ScriptError> {
         let location = handle.borrow().clone();
         Ok(match location {
-            ElementLocation::Attached(path) => self
-                .document
-                .borrow_mut()
-                .toggle_element_class(&path, class, force)
-                .ok_or_else(|| runtime_error("element handle is no longer in the document"))?,
+            ElementLocation::Attached { .. } => {
+                let path = attached_path(handle)
+                    .ok_or_else(|| runtime_error("element handle is no longer in the document"))?;
+                self.document
+                    .borrow_mut()
+                    .toggle_element_class(&path, class, force)
+                    .ok_or_else(|| runtime_error("element handle is no longer in the document"))?
+            }
             ElementLocation::Detached(_) => {
                 let mut location = handle.borrow_mut();
                 let ElementLocation::Detached(element) = &mut *location else {
@@ -9635,13 +9872,22 @@ impl ScriptRuntime {
     }
 }
 
-fn attached_handle(path: NodePath) -> ElementHandle {
-    Rc::new(RefCell::new(ElementLocation::Attached(path)))
+fn attached_handle(
+    path: NodePath,
+    document: &Rc<RefCell<Document>>,
+) -> Option<ElementHandle> {
+    let id = document.borrow().node_id(&path)?;
+    Some(Rc::new(RefCell::new(ElementLocation::Attached {
+        id,
+        document: Rc::downgrade(document),
+    })))
 }
 
 fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
     match &*handle.borrow() {
-        ElementLocation::Attached(path) => Some(path.clone()),
+        ElementLocation::Attached {
+            id, document, ..
+        } => document.upgrade()?.borrow().path_for_id(*id),
         ElementLocation::Detached(_) => None,
     }
 }
@@ -10772,12 +11018,64 @@ fn common_path(start: &[usize], end: &[usize]) -> NodePath {
         .collect()
 }
 
-fn node_value(path: NodePath) -> Value {
+fn node_value(path: NodePath, document: &Rc<RefCell<Document>>) -> Value {
     if path.is_empty() {
         Value::Document
     } else {
-        Value::Element(attached_handle(path))
+        attached_handle(path, document)
+            .map(Value::Element)
+            .unwrap_or(Value::Null)
     }
+}
+
+fn shift_path_for_insert(path: &mut NodePath, parent: &[usize], index: usize) {
+    if path.len() > parent.len()
+        && path.starts_with(parent)
+        && path[parent.len()] >= index
+    {
+        path[parent.len()] += 1;
+    }
+}
+
+fn shift_hash_map_paths<V>(
+    paths: &mut HashMap<NodePath, V>,
+    parent: &[usize],
+    index: usize,
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|(mut path, value)| {
+            shift_path_for_insert(&mut path, parent, index);
+            (path, value)
+        })
+        .collect();
+}
+
+fn shift_btree_map_paths<V>(
+    paths: &mut BTreeMap<NodePath, V>,
+    parent: &[usize],
+    index: usize,
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|(mut path, value)| {
+            shift_path_for_insert(&mut path, parent, index);
+            (path, value)
+        })
+        .collect();
+}
+
+fn shift_btree_set_paths(paths: &mut BTreeSet<NodePath>, parent: &[usize], index: usize) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|mut path| {
+            shift_path_for_insert(&mut path, parent, index);
+            path
+        })
+        .collect();
 }
 
 fn selection_anchor_focus(selection: TextSelection) -> (usize, usize) {
@@ -15074,6 +15372,58 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|last|gone|last|1")
+        );
+    }
+
+    #[test]
+    fn insert_before_preserves_existing_element_handles() {
+        let document = document(
+            r#"<main id="mount"><p id="first">first</p><p id="middle">middle</p><p id="last">last</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const middle = document.getElementById("middle");
+                const last = document.getElementById("last");
+                let events = "";
+                last.addEventListener("click", () => events = events + "last");
+                const activate = last.click;
+                const setAttribute = last.setAttribute;
+                const getAttribute = last.getAttribute;
+                const inserted = document.createElement("p");
+                inserted.id = "inserted";
+                inserted.textContent = "inserted";
+                mount.insertBefore(inserted, middle);
+                middle.textContent = "middle shifted";
+                last.textContent = "last shifted";
+                activate();
+                setAttribute("data-state", "survived");
+                document.getElementById("status").textContent =
+                    inserted.textContent + "|" + middle.textContent + "|" + last.textContent + "|" + last.parentNode.id + "|" + events + "|" + getAttribute("data-state");
+                "#,
+            )
+            .expect("insertBefore should preserve survivor handles");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("inserted|middle shifted|last shifted|mount|last|survived")
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("inserted"),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("middle"),
+            Some(vec![0, 2])
+        );
+        assert_eq!(
+            document.borrow().find_element_by_id("last"),
+            Some(vec![0, 3])
         );
     }
 

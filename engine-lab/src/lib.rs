@@ -12,7 +12,7 @@ mod wasm;
 
 pub use css::{Color, Display, Stylesheet};
 pub use dom::{
-    AccessibilityNode, Document, Element, Node, NodePath, ParseError, ScriptSource,
+    AccessibilityNode, Document, Element, Node, NodeId, NodePath, ParseError, ScriptSource,
     StylesheetSource,
 };
 pub use host::{

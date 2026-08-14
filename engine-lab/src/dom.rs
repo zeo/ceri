@@ -4,6 +4,9 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     pub root: Element,
+    node_ids: BTreeMap<NodePath, NodeId>,
+    paths: BTreeMap<NodeId, NodePath>,
+    next_node_id: NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +48,7 @@ pub enum StylesheetSource {
 }
 
 pub type NodePath = Vec<usize>;
+pub type NodeId = u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
@@ -109,7 +113,22 @@ impl Document {
         while let Some(element) = stack.pop() {
             append_node(&mut root, &mut stack, Node::Element(element));
         }
-        Ok(Self { root })
+        let mut document = Self {
+            root,
+            node_ids: BTreeMap::new(),
+            paths: BTreeMap::new(),
+            next_node_id: 1,
+        };
+        document.assign_ids_for_document();
+        Ok(document)
+    }
+
+    pub fn node_id(&self, path: &[usize]) -> Option<NodeId> {
+        self.node_ids.get(path).copied()
+    }
+
+    pub fn path_for_id(&self, id: NodeId) -> Option<NodePath> {
+        self.paths.get(&id).cloned()
     }
 
     pub fn style_text(&self) -> String {
@@ -374,14 +393,17 @@ impl Document {
         source: &str,
     ) -> Result<bool, ParseError> {
         let fragment = Self::parse(source)?;
+        self.remove_descendant_ids(path);
         let Some(element) = self.element_at_mut(path) else {
             return Ok(false);
         };
         element.children = fragment.root.children;
+        self.assign_ids_below(path);
         Ok(true)
     }
 
     pub fn set_element_text_content(&mut self, path: &[usize], text: String) -> bool {
+        self.remove_descendant_ids(path);
         let Some(element) = self.element_at_mut(path) else {
             return false;
         };
@@ -395,6 +417,29 @@ impl Document {
         let index = parent.children.len();
         parent.children.push(Node::Element(element));
         path.push(index);
+        self.assign_ids_below(&path);
+        Some(path)
+    }
+
+    pub fn insert_element_before(
+        &mut self,
+        parent: &[usize],
+        element: Element,
+        reference: &[usize],
+    ) -> Option<NodePath> {
+        if reference.len() != parent.len().saturating_add(1)
+            || reference[..parent.len()] != *parent
+        {
+            return None;
+        }
+        let index = *reference.last()?;
+        self.element_at(parent)?.children.get(index)?;
+        self.shift_paths_for_insert(parent, index);
+        let mut path = parent.to_vec();
+        let parent = self.element_at_mut(parent)?;
+        parent.children.insert(index, Node::Element(element));
+        path.push(index);
+        self.assign_ids_below(&path);
         Some(path)
     }
 
@@ -405,14 +450,18 @@ impl Document {
             return None;
         }
         let index = *child.last()?;
-        let parent = self.element_at_mut(parent)?;
-        let node = parent.children.get_mut(index)?;
-        match std::mem::replace(node, Node::Text(String::new())) {
-            Node::Element(element) => Some(element),
-            Node::Text(text) => {
-                *node = Node::Text(text);
-                None
+        self.element_at(child)?;
+        let removed = {
+            let parent = self.element_at_mut(parent)?;
+            let node = parent.children.get_mut(index)?;
+            std::mem::replace(node, Node::Text(String::new()))
+        };
+        match removed {
+            Node::Element(element) => {
+                self.remove_ids_at_or_below(child);
+                Some(element)
             }
+            Node::Text(_) => None,
         }
     }
 
@@ -508,6 +557,70 @@ impl Document {
             ancestors.push(element);
         }
         Some(ancestors)
+    }
+
+    fn assign_ids_for_document(&mut self) {
+        let paths = self
+            .root
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| matches!(node, Node::Element(_)).then_some(vec![index]))
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.assign_ids_below(&path);
+        }
+    }
+
+    fn assign_ids_below(&mut self, path: &[usize]) {
+        let mut paths = Vec::new();
+        let Some(element) = self.element_at(path) else {
+            return;
+        };
+        let mut current = path.to_vec();
+        collect_element_paths(element, &mut current, &mut paths);
+        for path in paths {
+            if self.node_ids.contains_key(&path) {
+                continue;
+            }
+            let id = self.next_node_id;
+            self.next_node_id = self.next_node_id.saturating_add(1);
+            self.node_ids.insert(path.clone(), id);
+            self.paths.insert(id, path);
+        }
+    }
+
+    fn remove_descendant_ids(&mut self, path: &[usize]) {
+        self.paths.retain(|_, candidate| {
+            !(candidate.starts_with(path) && candidate.len() > path.len())
+        });
+        self.rebuild_path_index();
+    }
+
+    fn remove_ids_at_or_below(&mut self, path: &[usize]) {
+        self.paths
+            .retain(|_, candidate| !candidate.starts_with(path));
+        self.rebuild_path_index();
+    }
+
+    fn shift_paths_for_insert(&mut self, parent: &[usize], index: usize) {
+        for path in self.paths.values_mut() {
+            if path.len() > parent.len()
+                && path.starts_with(parent)
+                && path[parent.len()] >= index
+            {
+                path[parent.len()] += 1;
+            }
+        }
+        self.rebuild_path_index();
+    }
+
+    fn rebuild_path_index(&mut self) {
+        self.node_ids = self
+            .paths
+            .iter()
+            .map(|(id, path)| (path.clone(), *id))
+            .collect();
     }
 }
 
@@ -627,6 +740,17 @@ impl Element {
             .join("; ");
         self.attrs.insert("style".to_string(), style);
         true
+    }
+}
+
+fn collect_element_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
+    paths.push(path.clone());
+    for (index, child) in element.children.iter().enumerate() {
+        if let Node::Element(child) = child {
+            path.push(index);
+            collect_element_paths(child, path, paths);
+            path.pop();
+        }
     }
 }
 
@@ -1657,6 +1781,49 @@ mod tests {
             .append_element(&main, Element::new("aside"))
             .expect("append should keep the removed slot behind the new child");
         assert_eq!(reattached, vec![0, 3]);
+    }
+
+    #[test]
+    fn preserves_node_identity_when_inserting_before_a_survivor() {
+        let mut document = Document::parse(
+            "<main><p id='first'>first</p><p id='middle'>middle</p><p id='last'>last</p></main>",
+        )
+        .expect("document should parse");
+        let main = document
+            .find_element_by_selector("main")
+            .expect("main should exist");
+        let middle = document
+            .find_element_by_id("middle")
+            .expect("middle should exist");
+        let last = document
+            .find_element_by_id("last")
+            .expect("last should exist");
+        let middle_id = document.node_id(&middle).expect("middle should have an id");
+        let last_id = document.node_id(&last).expect("last should have an id");
+
+        let inserted = document
+            .insert_element_before(&main, Element::new("aside"), &middle)
+            .expect("element should insert before the reference");
+        assert_eq!(inserted, vec![0, 1]);
+        let inserted_id = document
+            .node_id(&inserted)
+            .expect("inserted element should have an id");
+        assert_ne!(inserted_id, middle_id);
+        assert_ne!(inserted_id, last_id);
+        assert_eq!(document.path_for_id(middle_id), Some(vec![0, 2]));
+        assert_eq!(document.path_for_id(last_id), Some(vec![0, 3]));
+        assert_eq!(
+            document.element_attribute(&[0, 2], "id").as_deref(),
+            Some("middle")
+        );
+        assert_eq!(
+            document.element_attribute(&[0, 3], "id").as_deref(),
+            Some("last")
+        );
+
+        assert!(document.remove_child(&main, &[0, 2]).is_some());
+        assert!(document.path_for_id(middle_id).is_none());
+        assert_eq!(document.path_for_id(last_id), Some(vec![0, 3]));
     }
 
     #[test]
