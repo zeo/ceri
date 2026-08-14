@@ -2247,6 +2247,18 @@ impl ScriptRuntime {
                 state.unchecked_paths.insert(path.clone());
             }
         }
+        let disabled_paths = self
+            .document
+            .borrow()
+            .find_elements_by_selector(
+                "button, input, select, textarea, optgroup, option, fieldset",
+            )
+            .unwrap_or_default();
+        for path in disabled_paths {
+            if self.is_disabled_path(&path) {
+                state.disabled_paths.insert(path);
+            }
+        }
         state
     }
 
@@ -14147,6 +14159,17 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("3|true|true|false|true|1|e|external-form|true|false|true|0|legend")
         );
+        let blocked_path = document
+            .borrow()
+            .find_element_by_id("blocked")
+            .expect("blocked control should exist");
+        let legend_path = document
+            .borrow()
+            .find_element_by_id("legend")
+            .expect("legend control should exist");
+        let style_state = runtime.style_state(None);
+        assert!(style_state.disabled_paths.contains(&blocked_path));
+        assert!(!style_state.disabled_paths.contains(&legend_path));
     }
 
     #[test]

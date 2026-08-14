@@ -49,6 +49,8 @@ The provider seam is now exercised by host-backed integration tests covering the
 
 ## Compatibility gates
 
+The runtime now carries effective disabled paths into CSS matching, so `:disabled` and `:enabled` agree with form submission, validation, focus, click suppression, disabled `optgroup` state, and the first `legend` exemption inside a disabled `fieldset`.
+
 The selector slice now accepts top-level selector lists in stylesheets and DOM queries, preserves commas inside attribute values and functional pseudo-class arguments, and matches bounded `:not(...)` arguments with their selector specificity. Selector lists with invalid entries remain rejected as one rule, matching the current parser's fail-closed policy.
 
 Form activation now carries `POST` submissions through the typed `ResourceProvider` seam. The engine serializes named controls as `application/x-www-form-urlencoded`, keeps the request off any loopback listener, follows bounded same-origin redirects with the standard 301, 302, 303, 307, and 308 method rules, and parses the final HTML as a new history document. Packaged-only POST actions resolve to an engine-owned 503 recovery page because there is no transport boundary to receive them.

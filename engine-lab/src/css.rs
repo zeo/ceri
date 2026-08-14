@@ -193,6 +193,7 @@ pub(crate) struct StyleState {
     pub(crate) focused_path: Option<NodePath>,
     pub(crate) checked_paths: BTreeSet<NodePath>,
     pub(crate) unchecked_paths: BTreeSet<NodePath>,
+    pub(crate) disabled_paths: BTreeSet<NodePath>,
     pub(crate) scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
     pub(crate) control_values: BTreeMap<NodePath, String>,
     pub(crate) text_selections: BTreeMap<NodePath, (usize, usize, bool)>,
@@ -222,6 +223,10 @@ impl StyleState {
         } else {
             element.attr("checked").is_some()
         }
+    }
+
+    fn is_disabled(&self, element: &Element, path: &[usize]) -> bool {
+        self.disabled_paths.contains(path) || element.attrs.contains_key("disabled")
     }
 }
 
@@ -843,8 +848,8 @@ impl PseudoClass {
                     })
                     && state.is_checked(element, path)
             }
-            Self::Disabled => element.attrs.contains_key("disabled"),
-            Self::Enabled => !element.attrs.contains_key("disabled"),
+            Self::Disabled => state.is_disabled(element, path),
+            Self::Enabled => !state.is_disabled(element, path),
             Self::Not(selectors) => !selectors
                 .iter()
                 .any(|selector| selector.matches(element, path, ancestors, state)),
@@ -1985,7 +1990,7 @@ mod tests {
     #[test]
     fn matches_dynamic_pseudo_classes_from_style_state() {
         let stylesheet = Stylesheet::parse(
-            "button:hover { color: red; } input:checked { color: blue; } input:disabled { color: yellow; }",
+            "button:hover { color: red; } button:disabled { color: yellow; } button:enabled { background-color: green; } input:checked { color: blue; } input:disabled { color: yellow; }",
         )
         .expect("stylesheet should parse");
         let button = Element::new("button");
@@ -1998,6 +2003,8 @@ mod tests {
             hovered_path: Some(vec![0]),
             ..StyleState::default()
         };
+        let disabled_button = Element::new("button");
+        state.disabled_paths.insert(vec![2]);
         assert_eq!(
             stylesheet
                 .style_for(StyleContext {
@@ -2025,6 +2032,34 @@ mod tests {
                 })
                 .color,
             Color::opaque(0, 0, 255)
+        );
+        assert_eq!(
+            stylesheet
+                .style_for(StyleContext {
+                    element: &disabled_button,
+                    path: &[2],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    state: &state,
+                })
+                .color,
+            Color::opaque(255, 255, 0)
+        );
+        assert_eq!(
+            stylesheet
+                .style_for(StyleContext {
+                    element: &button,
+                    path: &[3],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    state: &state,
+                })
+                .background,
+            Color::opaque(0, 128, 0)
         );
         state.unchecked_paths.insert(vec![1]);
         assert_eq!(

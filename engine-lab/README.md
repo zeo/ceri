@@ -1,5 +1,7 @@
 # Ceri engine laboratory
 
+Effective disabled state reaches form submission, validation, interaction, and CSS `:disabled` or `:enabled` matching, including the first `legend` exemption inside a disabled `fieldset`.
+
 This crate is a deliberately small browser-engine experiment written with the Rust standard library. Its default build has no CEF, WebKit, Servo, third-party JavaScript engine, or GUI dependency.
 
 The current slice implements:
