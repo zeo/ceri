@@ -249,7 +249,7 @@ impl Document {
             return None;
         }
         let parent = path[..path.len() - 1].to_vec();
-        self.element_at(path).is_some().then_some(parent)
+        self.node_at(path).is_some().then_some(parent)
     }
 
     pub fn select_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
@@ -390,19 +390,72 @@ impl Document {
     }
 
     pub fn element_text_offset(&self, path: &[usize]) -> Option<usize> {
+        self.node_text_offset(path)
+    }
+
+    pub fn node_text_offset(&self, path: &[usize]) -> Option<usize> {
         let mut element = &self.root;
         let mut offset = 0;
-        for &index in path {
+        for (depth, &index) in path.iter().enumerate() {
             let child = element.children.get(index)?;
             for preceding in element.children.iter().take(index) {
                 offset += text_utf16_len(preceding);
             }
             element = match child {
                 Node::Element(child) => child,
+                Node::Text(_) if depth + 1 == path.len() => return Some(offset),
                 Node::Text(_) => return None,
             };
         }
         Some(offset)
+    }
+
+    pub fn node_text_content(&self, path: &[usize]) -> Option<String> {
+        match self.node_at(path)? {
+            Node::Element(element) => {
+                let mut text = String::new();
+                collect_text_nodes(element, &mut text);
+                Some(text)
+            }
+            Node::Text(text) => Some(text.clone()),
+        }
+    }
+
+    pub fn child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
+        match self.node_at(path)? {
+            Node::Element(element) => Some(
+                (0..element.children.len())
+                    .map(|index| {
+                        let mut child = path.to_vec();
+                        child.push(index);
+                        child
+                    })
+                    .collect(),
+            ),
+            Node::Text(_) => Some(Vec::new()),
+        }
+    }
+
+    pub fn node_is_text(&self, path: &[usize]) -> Option<bool> {
+        self.node_at(path).map(|node| matches!(node, Node::Text(_)))
+    }
+
+    pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
+        if path.is_empty() {
+            return None;
+        }
+        let mut element = &self.root;
+        for (depth, &index) in path.iter().enumerate() {
+            let child = element.children.get(index)?;
+            if depth + 1 == path.len() {
+                return Some(child);
+            }
+            element = match child {
+                Node::Element(child) => child,
+                Node::Text(_) => return None,
+            };
+        }
+        None
     }
 
     pub fn element_inner_html(&self, path: &[usize]) -> Option<String> {
@@ -426,10 +479,13 @@ impl Document {
 
     pub fn set_element_text_content(&mut self, path: &[usize], text: String) -> bool {
         self.remove_descendant_ids(path);
-        let Some(element) = self.element_at_mut(path) else {
-            return false;
-        };
-        element.children = vec![Node::Text(text)];
+        {
+            let Some(element) = self.element_at_mut(path) else {
+                return false;
+            };
+            element.children = vec![Node::Text(text)];
+        }
+        self.assign_ids_below(path);
         true
     }
 
@@ -662,7 +718,7 @@ impl Document {
             .children
             .iter()
             .enumerate()
-            .filter_map(|(index, node)| matches!(node, Node::Element(_)).then_some(vec![index]))
+            .map(|(index, _)| vec![index])
             .collect::<Vec<_>>();
         for path in paths {
             self.assign_ids_below(&path);
@@ -671,11 +727,11 @@ impl Document {
 
     fn assign_ids_below(&mut self, path: &[usize]) {
         let mut paths = Vec::new();
-        let Some(element) = self.element_at(path) else {
+        let Some(node) = self.node_at(path) else {
             return;
         };
         let mut current = path.to_vec();
-        collect_element_paths(element, &mut current, &mut paths);
+        collect_node_paths(node, &mut current, &mut paths);
         for path in paths {
             if self.node_ids.contains_key(&path) {
                 continue;
@@ -852,12 +908,12 @@ impl Element {
     }
 }
 
-fn collect_element_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
+fn collect_node_paths(node: &Node, path: &mut NodePath, paths: &mut Vec<NodePath>) {
     paths.push(path.clone());
-    for (index, child) in element.children.iter().enumerate() {
-        if let Node::Element(child) = child {
+    if let Node::Element(element) = node {
+        for (index, child) in element.children.iter().enumerate() {
             path.push(index);
-            collect_element_paths(child, path, paths);
+            collect_node_paths(child, path, paths);
             path.pop();
         }
     }

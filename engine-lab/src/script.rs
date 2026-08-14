@@ -338,6 +338,7 @@ enum ElementLocation {
     Attached {
         id: NodeId,
         document: Weak<RefCell<Document>>,
+        is_text: bool,
     },
     Detached(Element),
 }
@@ -345,9 +346,18 @@ enum ElementLocation {
 impl PartialEq for ElementLocation {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Attached { id: left, .. }, Self::Attached { id: right, .. }) => {
-                left == right
-            }
+            (
+                Self::Attached {
+                    id: left,
+                    is_text: left_is_text,
+                    ..
+                },
+                Self::Attached {
+                    id: right,
+                    is_text: right_is_text,
+                    ..
+                },
+            ) => left == right && left_is_text == right_is_text,
             (Self::Detached(left), Self::Detached(right)) => left == right,
             _ => false,
         }
@@ -3774,6 +3784,13 @@ impl ScriptRuntime {
             Value::Element(handle) => {
                 let path = attached_path(&handle);
                 let value = match property {
+                    "nodeType" => Value::Number(if attached_is_text(&handle) {
+                        3.0
+                    } else {
+                        1.0
+                    }),
+                    "nodeName" => Value::String(self.element_node_name(&handle)),
+                    "nodeValue" | "data" => self.element_node_value(&handle),
                     "textContent" => self
                         .element_text_content(&handle)
                         .map(Value::String)
@@ -3790,6 +3807,9 @@ impl ScriptRuntime {
                         .element_inner_html(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "childNodes" => self.element_child_nodes(&handle),
+                    "firstChild" => self.element_child(&handle, true),
+                    "lastChild" => self.element_child(&handle, false),
                     "parentNode" | "parentElement" => path
                         .as_ref()
                         .and_then(|path| self.document.borrow().parent_path(path))
@@ -5129,13 +5149,74 @@ impl ScriptRuntime {
     fn element_text_content(&self, handle: &ElementHandle) -> Option<String> {
         match handle.borrow().clone() {
             ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_text_content(&path)),
+                .and_then(|path| self.document.borrow().node_text_content(&path)),
             ElementLocation::Detached(element) => {
                 let mut text = String::new();
                 collect_element_text(&element, &mut text);
                 Some(text)
             }
         }
+    }
+
+    fn element_node_name(&self, handle: &ElementHandle) -> String {
+        if attached_is_text(handle) {
+            return "#text".to_string();
+        }
+        match handle.borrow().clone() {
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_clone(&path))
+                .map(|element| element.name.to_ascii_uppercase())
+                .unwrap_or_default(),
+            ElementLocation::Detached(element) => element.name.to_ascii_uppercase(),
+        }
+    }
+
+    fn element_node_value(&self, handle: &ElementHandle) -> Value {
+        if !attached_is_text(handle) {
+            return Value::Null;
+        }
+        attached_path(handle)
+            .and_then(|path| self.document.borrow().node_text_content(&path))
+            .map(Value::String)
+            .unwrap_or(Value::Null)
+    }
+
+    fn element_child_nodes(&self, handle: &ElementHandle) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::NodeList(Rc::new(Vec::new()));
+        };
+        let nodes = self
+            .document
+            .borrow()
+            .child_paths(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|path| attached_handle(path, &self.document))
+            .collect();
+        Value::NodeList(Rc::new(nodes))
+    }
+
+    fn element_child(&self, handle: &ElementHandle, first: bool) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::Null;
+        };
+        let Some(child_path) = self
+            .document
+            .borrow()
+            .child_paths(&path)
+            .and_then(|paths| {
+                if first {
+                    paths.into_iter().next()
+                } else {
+                    paths.into_iter().next_back()
+                }
+            })
+        else {
+            return Value::Null;
+        };
+        attached_handle(child_path, &self.document)
+            .map(Value::Element)
+            .unwrap_or(Value::Null)
     }
 
     fn is_focusable_path(&self, path: &[usize]) -> bool {
@@ -6244,8 +6325,8 @@ impl ScriptRuntime {
         let value = self
             .document
             .borrow()
-            .element_text_content(&path)
-            .ok_or_else(|| runtime_error("Range boundary element no longer exists"))?;
+            .node_text_content(&path)
+            .ok_or_else(|| runtime_error("Range boundary node no longer exists"))?;
         let offset = arguments
             .get(1)
             .map(Value::number)
@@ -6262,8 +6343,8 @@ impl ScriptRuntime {
     fn range_boundary_position(&self, boundary: &RangeBoundary) -> Option<usize> {
         let path = attached_path(&boundary.node)?;
         let document = self.document.borrow();
-        let content = document.element_text_content(&path)?;
-        let prefix = document.element_text_offset(&path)?;
+        let content = document.node_text_content(&path)?;
+        let prefix = document.node_text_offset(&path)?;
         Some(prefix.saturating_add(boundary.offset.min(utf16_len(&content))))
     }
 
@@ -8202,7 +8283,7 @@ impl ScriptRuntime {
                 let length = self
                     .document
                     .borrow()
-                    .element_text_content(
+                    .node_text_content(
                         &attached_path(&boundary.node)
                             .ok_or_else(|| runtime_error("Range boundary is no longer attached"))?,
                     )
@@ -8302,7 +8383,7 @@ impl ScriptRuntime {
                 let value = self
                     .document
                     .borrow()
-                    .element_text_content(&path)
+                    .node_text_content(&path)
                     .unwrap_or_default();
                 let offset = arguments
                     .get(1)
@@ -10242,10 +10323,14 @@ fn attached_handle(
     path: NodePath,
     document: &Rc<RefCell<Document>>,
 ) -> Option<ElementHandle> {
-    let id = document.borrow().node_id(&path)?;
+    let document_ref = document.borrow();
+    let id = document_ref.node_id(&path)?;
+    let is_text = document_ref.node_is_text(&path)?;
+    drop(document_ref);
     Some(Rc::new(RefCell::new(ElementLocation::Attached {
         id,
         document: Rc::downgrade(document),
+        is_text,
     })))
 }
 
@@ -10256,6 +10341,13 @@ fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
         } => document.upgrade()?.borrow().path_for_id(*id),
         ElementLocation::Detached(_) => None,
     }
+}
+
+fn attached_is_text(handle: &ElementHandle) -> bool {
+    matches!(
+        &*handle.borrow(),
+        ElementLocation::Attached { is_text: true, .. }
+    )
 }
 
 fn collect_sequential_focus_nodes(
@@ -16413,6 +16505,50 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("llowor|llowor|first:2|second:3|root")
+        );
+    }
+
+    #[test]
+    fn document_range_accepts_text_node_boundaries_and_child_nodes() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const second = document.getElementById("second");
+                const firstText = first.firstChild;
+                const secondText = second.childNodes[0];
+                const status = document.getElementById("status");
+                const range = document.createRange();
+                range.setStart(firstText, 1);
+                range.setEnd(secondText, 3);
+                const inserted = document.createElement("aside");
+                inserted.textContent = "ignored";
+                first.parentNode.insertBefore(inserted, second);
+                const target = document.createElement("section");
+                target.id = "target";
+                first.parentNode.insertBefore(target, inserted);
+                target.appendChild(first);
+                status.textContent = firstText.nodeType + ":" + firstText.nodeName + ":" +
+                    firstText.data + ":" + firstText.parentNode.id + ":" +
+                    firstText.parentNode.parentNode.id + ":" +
+                    first.childNodes.length + ":" + (first.childNodes[0] === firstText) + "|" +
+                    (second.firstChild === secondText) + "|" + range.toString() + "|" + range.startContainer.nodeName + ":" +
+                    range.startOffset + ":" + range.endContainer.nodeName + ":" +
+                    range.endOffset + ":" + range.commonAncestorContainer.id;
+                "#,
+            )
+            .expect("text-node Range boundaries should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("3:#text:hello:first:target:1:true|true|elloignoredwor|#text:1:#text:3:root")
         );
     }
 
