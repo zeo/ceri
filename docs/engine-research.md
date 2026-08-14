@@ -73,7 +73,7 @@ Select controls now keep option selectedness separate from content attributes. T
 
 The same select state now follows live DOM changes. Appending detached options or option groups initializes only the new options and preserves existing script-selected state, while `innerHTML` replacement rebuilds affected selects from current default attributes and drops stale option paths. Form ownership remains query-driven, so controls appended under one subtree can resolve an explicit owner form elsewhere in the document.
 
-Direct-child `removeChild` now detaches a subtree without shifting the vector paths of surviving siblings. The returned element handle becomes detached and can be appended at the end of another parent, with select normalization rerun after option removal. Arbitrary `insertBefore`, general node movement, and cross-node handle identity remain separate gates until the runtime moves beyond path-only handles.
+Direct-child `removeChild` now detaches a subtree without shifting the vector paths of surviving siblings. The returned element handle becomes detached and can be appended at the end of another parent, with select normalization rerun after option removal. Event listeners stay associated with that same detached handle through reattachment, while a detached `innerHTML` replacement discards listeners registered on replaced descendants. Arbitrary `insertBefore`, general node movement, and cross-node handle identity remain separate gates until the runtime moves beyond path-only handles.
 
 Attached elements also expose `parentNode`, `parentElement`, and `remove()`. Detached handles return `null` for both parent properties, so scripts can observe the transition after removal without opening a transport or listener.
 

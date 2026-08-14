@@ -21,6 +21,8 @@ use std::thread;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
+type DetachedListener = (NodePath, Vec<EventListener>);
+type DetachedListenerState = (Weak<RefCell<ElementLocation>>, Vec<DetachedListener>);
 type ValidityHandle = Rc<NodePath>;
 type RangeHandle = Rc<RefCell<RangeData>>;
 type SelectionHandle = Rc<RefCell<SelectionData>>;
@@ -527,6 +529,7 @@ pub struct ScriptRuntime {
     location: LocationHandle,
     history: HistoryHandle,
     listeners: HashMap<NodePath, Vec<EventListener>>,
+    detached_listeners: Vec<DetachedListenerState>,
     window_listeners: HashMap<String, Vec<Value>>,
     focused_element: Option<NodePath>,
     control_values: HashMap<NodePath, String>,
@@ -1373,6 +1376,7 @@ impl ScriptRuntime {
             location,
             history,
             listeners: HashMap::new(),
+            detached_listeners: Vec::new(),
             window_listeners: HashMap::new(),
             focused_element: None,
             control_values: HashMap::new(),
@@ -1536,6 +1540,59 @@ impl ScriptRuntime {
         }
     }
 
+    fn capture_detached_listeners(&mut self, handle: &ElementHandle, path: &[usize]) {
+        let mut detached = Vec::new();
+        let mut retained = HashMap::new();
+        for (candidate, listeners) in self.listeners.drain() {
+            if candidate.starts_with(path) {
+                detached.push((candidate[path.len()..].to_vec(), listeners));
+            } else {
+                retained.insert(candidate, listeners);
+            }
+        }
+        self.listeners = retained;
+        self.prune_detached_listeners();
+        let weak = Rc::downgrade(handle);
+        self.detached_listeners
+            .retain(|(candidate, _)| !Weak::ptr_eq(candidate, &weak));
+        self.detached_listeners.push((weak, detached));
+    }
+
+    fn restore_detached_listeners(&mut self, handle: &ElementHandle, path: &[usize]) {
+        self.prune_detached_listeners();
+        let weak = Rc::downgrade(handle);
+        let Some(index) = self
+            .detached_listeners
+            .iter()
+            .position(|(candidate, _)| Weak::ptr_eq(candidate, &weak))
+        else {
+            return;
+        };
+        let (_, detached) = self.detached_listeners.remove(index);
+        for (relative, listeners) in detached {
+            let mut attached = path.to_vec();
+            attached.extend(relative);
+            self.listeners.insert(attached, listeners);
+        }
+    }
+
+    fn discard_detached_descendant_listeners(&mut self, handle: &ElementHandle) {
+        self.prune_detached_listeners();
+        let weak = Rc::downgrade(handle);
+        if let Some((_, listeners)) = self
+            .detached_listeners
+            .iter_mut()
+            .find(|(candidate, _)| Weak::ptr_eq(candidate, &weak))
+        {
+            listeners.retain(|(path, _)| path.is_empty());
+        }
+    }
+
+    fn prune_detached_listeners(&mut self) {
+        self.detached_listeners
+            .retain(|(handle, _)| handle.strong_count() > 0);
+    }
+
     fn clear_runtime_state_for_removed_subtree(&mut self, path: &[usize]) {
         self.listeners.retain(|candidate, _| !candidate.starts_with(path));
         self.control_values.retain(|candidate, _| !candidate.starts_with(path));
@@ -1607,6 +1664,7 @@ impl ScriptRuntime {
             .borrow_mut()
             .remove_child(parent, &child_path)
             .ok_or_else(|| runtime_error("removeChild child is no longer in the document"))?;
+        self.capture_detached_listeners(child, &child_path);
         self.clear_runtime_state_for_removed_subtree(&child_path);
         self.refresh_select_state_after_remove(parent);
         *child.borrow_mut() = ElementLocation::Detached(removed);
@@ -6036,16 +6094,22 @@ impl ScriptRuntime {
                 Ok(changed)
             }
             ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return Err(runtime_error(
-                        "element handle changed during innerHTML update",
-                    ));
+                let changed = {
+                    let mut location = handle.borrow_mut();
+                    let ElementLocation::Detached(element) = &mut *location else {
+                        return Err(runtime_error(
+                            "element handle changed during innerHTML update",
+                        ));
+                    };
+                    element
+                        .set_inner_html(&source)
+                        .map(|()| true)
+                        .map_err(|error| runtime_error(error.to_string()))?
                 };
-                element
-                    .set_inner_html(&source)
-                    .map(|()| true)
-                    .map_err(|error| runtime_error(error.to_string()))
+                if changed {
+                    self.discard_detached_descendant_listeners(handle);
+                }
+                Ok(changed)
             }
         }
     }
@@ -8693,6 +8757,7 @@ impl ScriptRuntime {
                     .ok_or_else(|| {
                         runtime_error("appendChild parent is no longer in the document")
                     })?;
+                self.restore_detached_listeners(&child, &child_path);
                 self.refresh_select_state_after_append(&path, &child_path);
                 *child.borrow_mut() = ElementLocation::Attached(child_path);
                 Ok(Value::Element(child))
@@ -14535,10 +14600,13 @@ mod tests {
                 const mount = document.getElementById("mount");
                 const gone = document.getElementById("gone");
                 const last = document.getElementById("last");
+                let clicks = 0;
+                gone.addEventListener("click", () => clicks = clicks + 1);
                 mount.removeChild(gone);
                 const afterRemoval = (document.getElementById("gone") === null) + "|" + last.textContent;
                 mount.appendChild(gone);
-                document.getElementById("status").textContent = afterRemoval + "|" + document.getElementById("gone").textContent + "|" + last.textContent;
+                gone.click();
+                document.getElementById("status").textContent = afterRemoval + "|" + document.getElementById("gone").textContent + "|" + last.textContent + "|" + clicks;
                 "#,
             )
             .expect("removeChild should preserve survivor handles");
@@ -14548,7 +14616,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("true|last|gone|last")
+            Some("true|last|gone|last|1")
         );
     }
 
@@ -14578,6 +14646,40 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("a|0|1|a|0|2")
+        );
+    }
+
+    #[test]
+    fn detached_inner_html_keeps_root_listeners_and_drops_replaced_descendants() {
+        let document = document(
+            r#"<main id="mount"><section id="gone"><button id="old">old</button></section><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const gone = document.getElementById("gone");
+                const old = document.getElementById("old");
+                let rootClicks = 0;
+                let oldClicks = 0;
+                gone.addEventListener("click", () => rootClicks = rootClicks + 1);
+                old.addEventListener("click", () => oldClicks = oldClicks + 1);
+                mount.removeChild(gone);
+                gone.innerHTML = "<button id='replacement'>replacement</button>";
+                mount.appendChild(gone);
+                document.getElementById("replacement").click();
+                document.getElementById("status").textContent = rootClicks + "|" + oldClicks;
+                "#,
+            )
+            .expect("detached innerHTML should update listener state");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|0")
         );
     }
 

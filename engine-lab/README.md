@@ -2,7 +2,7 @@
 
 Effective disabled state reaches form submission, validation, interaction, and CSS `:disabled` or `:enabled` matching, including the first `legend` exemption inside a disabled `fieldset`.
 
-Live DOM mutations rehydrate select option state after `appendChild` and `innerHTML` replacement, while form ownership follows controls appended after startup. `parentNode`, `parentElement`, and `remove()` expose the bounded tree relationship. Direct-child `removeChild` preserves survivor paths and permits end-only reattachment of the returned detached element; arbitrary sibling insertion remains outside this bounded path model.
+Live DOM mutations rehydrate select option state after `appendChild` and `innerHTML` replacement, while form ownership follows controls appended after startup. `parentNode`, `parentElement`, and `remove()` expose the bounded tree relationship. Direct-child `removeChild` preserves survivor paths and permits end-only reattachment of the returned detached element, including its event listeners; detached `innerHTML` replacement discards descendant listeners. Arbitrary sibling insertion remains outside this bounded path model.
 
 This crate is a deliberately small browser-engine experiment written with the Rust standard library. Its default build has no CEF, WebKit, Servo, third-party JavaScript engine, or GUI dependency.
 
@@ -26,7 +26,7 @@ The current slice implements:
 - bubbling DOM events with `type`, `target`, `currentTarget`, `defaultPrevented`, and `preventDefault()`
 - element attributes, inline styles, and `classList` state mutation
 - stable detached and attached element handles with `document.createElement` and `appendChild`
-- direct-child `removeChild` with survivor-path preservation and end-only detached reattachment
+- direct-child `removeChild` with survivor-path preservation, listener retention, and end-only detached reattachment
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
