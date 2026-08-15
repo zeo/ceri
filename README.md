@@ -65,6 +65,8 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 ## Custom engine laboratory
 
+The lab's DOM mutation slice also supports writable `outerHTML` replacement for attached elements with an element parent. The old handle remains reusable after replacement, while direct document children and detached elements follow the standard no-parent rejection.
+
 Effective disabled state now reaches form submission, validation, interaction, and CSS `:disabled` or `:enabled` matching, including the first `legend` exemption inside a disabled `fieldset`.
 
 Live DOM mutations now rehydrate select option state after `appendChild`, `insertBefore`, and `innerHTML` replacement, while form ownership is resolved again from the current tree for controls appended after startup. `parentNode`, `parentElement`, and `remove()` expose the bounded tree relationship, while `removeChild` can detach a direct child without reindexing survivor handles and append it again at the end of its new parent. Listeners on that detached subtree follow the same handle through reattachment, while detached `innerHTML` replacement discards descendant listeners. Element, document, window, and worker targets support callback-identity `removeEventListener`, duplicate registrations are ignored, `{ once: true }` listeners are removed before their callback runs, and `{ signal }` listeners are removed before an `AbortController` dispatches its abort callbacks. Attached element and text-node movement now uses stable node identity beyond vector paths, and element-only child and sibling navigation skips intervening text nodes.

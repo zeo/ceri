@@ -2047,6 +2047,52 @@ impl ScriptRuntime {
         Ok(())
     }
 
+    fn insert_detached_before(
+        &mut self,
+        parent: &[usize],
+        child: &ElementHandle,
+        reference: Option<&[usize]>,
+    ) -> Result<NodePath, ScriptError> {
+        let reference_index = reference.and_then(|path| path.last()).copied();
+        let location = child.borrow().clone();
+        let child_path = match location {
+            ElementLocation::Detached(element) if is_detached_text_element(&element) => {
+                let text = detached_text_data(&element).unwrap_or_default();
+                if let Some(reference) = reference {
+                    self.document
+                        .borrow_mut()
+                        .insert_text_node_before(parent, text, reference)
+                } else {
+                    self.document.borrow_mut().append_text_node(parent, text)
+                }
+            }
+            ElementLocation::Detached(element) => {
+                if let Some(reference) = reference {
+                    self.document
+                        .borrow_mut()
+                        .insert_element_before(parent, element, reference)
+                } else {
+                    self.document.borrow_mut().append_element(parent, element)
+                }
+            }
+            ElementLocation::Attached { .. } => {
+                return Err(runtime_error("insertBefore child handle is unavailable"));
+            }
+        }
+        .ok_or_else(|| {
+            runtime_error("insertBefore parent or reference is no longer in the document")
+        })?;
+        if let Some(index) = reference_index {
+            self.shift_runtime_paths_for_insert(parent, index);
+        }
+        self.restore_detached_listeners(child, &child_path);
+        self.refresh_select_state_after_append(parent, &child_path);
+        let attached = attached_handle(child_path.clone(), &self.document)
+            .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
+        *child.borrow_mut() = attached.borrow().clone();
+        Ok(child_path)
+    }
+
     pub fn execute_scripts(&mut self) -> Result<(), ScriptError> {
         let scripts = self.document.borrow().script_text();
         for script in scripts {
@@ -4871,6 +4917,7 @@ impl ScriptRuntime {
                 "className" => self.set_element_attribute(&handle, "class", value_string),
                 "id" => self.set_element_attribute(&handle, "id", value_string),
                 "innerHTML" => self.set_element_inner_html(&handle, value_string)?,
+                "outerHTML" => self.set_element_outer_html(&handle, value_string)?,
                 "value" => self.set_element_value(&handle, value_string),
                 "defaultValue" => self.set_element_default_value(&handle, value_string)?,
                 "selected" => self.set_element_selected(&handle, truthy),
@@ -7362,6 +7409,38 @@ impl ScriptRuntime {
                 Ok(changed)
             }
         }
+    }
+
+    fn set_element_outer_html(
+        &mut self,
+        handle: &ElementHandle,
+        source: String,
+    ) -> Result<bool, ScriptError> {
+        if attached_is_text(handle) {
+            return Ok(false);
+        }
+        let path = attached_path(handle)
+            .ok_or_else(|| runtime_error("outerHTML element has no parent node"))?;
+        let parent = self
+            .document
+            .borrow()
+            .parent_path(&path)
+            .ok_or_else(|| runtime_error("outerHTML element has no parent node"))?;
+        if parent.is_empty() {
+            return Err(runtime_error(
+                "outerHTML cannot replace a direct child of the document",
+            ));
+        }
+        let fragment = Document::parse(&source)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        for node in fragment.root.children {
+            let child = detached_handle_from_node(node);
+            let reference = attached_path(handle)
+                .ok_or_else(|| runtime_error("outerHTML element is no longer in the document"))?;
+            self.insert_detached_before(&parent, &child, Some(&reference))?;
+        }
+        self.detach_child(&parent, handle)?;
+        Ok(true)
     }
 
     fn set_element_style_property(
@@ -10570,7 +10649,6 @@ impl ScriptRuntime {
                     )?),
                     Some(_) => return Err(runtime_error("insertBefore reference must be an element or null")),
                 };
-                let reference_index = reference_path.as_ref().and_then(|path| path.last()).copied();
                 let child_path = if let Some(source_path) = attached_path(&child) {
                     let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
                     let child_path = self
@@ -10588,50 +10666,11 @@ impl ScriptRuntime {
                     }
                     child_path
                 } else {
-                    let location = child.borrow().clone();
-                    let child_path = match location {
-                        ElementLocation::Detached(element)
-                            if is_detached_text_element(&element) =>
-                        {
-                            let text = detached_text_data(&element).unwrap_or_default();
-                            if let Some(reference_path) = reference_path {
-                                self.document.borrow_mut().insert_text_node_before(
-                                    &parent_path,
-                                    text,
-                                    &reference_path,
-                                )
-                            } else {
-                                self.document
-                                    .borrow_mut()
-                                    .append_text_node(&parent_path, text)
-                            }
-                        }
-                        ElementLocation::Detached(element) => {
-                            if let Some(reference_path) = reference_path {
-                                self.document
-                                    .borrow_mut()
-                                    .insert_element_before(&parent_path, element, &reference_path)
-                            } else {
-                                self.document
-                                    .borrow_mut()
-                                    .append_element(&parent_path, element)
-                            }
-                        }
-                        ElementLocation::Attached { .. } => {
-                            return Err(runtime_error("insertBefore child handle is unavailable"));
-                        }
-                    }
-                    .ok_or_else(|| {
-                        runtime_error(
-                            "insertBefore parent or reference is no longer in the document",
-                        )
-                    })?;
-                    if let Some(index) = reference_index {
-                        self.shift_runtime_paths_for_insert(&parent_path, index);
-                    }
-                    self.restore_detached_listeners(&child, &child_path);
-                    self.refresh_select_state_after_append(&parent_path, &child_path);
-                    child_path
+                    self.insert_detached_before(
+                        &parent_path,
+                        &child,
+                        reference_path.as_deref(),
+                    )?
                 };
                 let attached = attached_handle(child_path, &self.document)
                     .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
@@ -18385,6 +18424,79 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined")
+        );
+    }
+
+    #[test]
+    fn outer_html_replaces_an_element_and_keeps_the_old_handle_reusable() {
+        let document = document(
+            r#"<main id="root"><div id="mount"><button id="old">old</button><span id="tail">tail</span></div><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const old = document.getElementById("old");
+                const tail = document.getElementById("tail");
+                let clicks = 0;
+                old.addEventListener("click", () => clicks = clicks + 1);
+                old.outerHTML = "<strong id='fresh'>new</strong>!";
+                const fresh = document.getElementById("fresh");
+                const before = mount.textContent + ":" + (old.parentNode === null) + ":" +
+                    (tail.previousElementSibling === fresh) + ":" + (fresh.nextSibling.data === "!");
+                mount.appendChild(old);
+                old.click();
+                const status = document.getElementById("status");
+                status.textContent = before + "|" + mount.textContent + ":" + clicks + ":" +
+                    (old.parentNode === mount) + ":" + (old.previousElementSibling === tail);
+                "#,
+            )
+            .expect("outerHTML replacement should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("new!tail:true:true:true|new!tailold:1:true:true")
+        );
+    }
+
+    #[test]
+    fn outer_html_empty_fragments_detach_and_no_parent_replacements_fail() {
+        let document = document(
+            r#"<div id="top">top</div><main id="mount"><p id="gone">gone</p><span id="keep">keep</span></main><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const gone = document.getElementById("gone");
+                const keep = document.getElementById("keep");
+                gone.outerHTML = "";
+                const detached = document.createElement("em");
+                let detachedError = "";
+                let documentError = "";
+                try { detached.outerHTML = "<strong>no</strong>"; }
+                catch (error) { detachedError = error.message; }
+                try { document.getElementById("top").outerHTML = "<strong>no</strong>"; }
+                catch (error) { documentError = error.message; }
+                const status = document.getElementById("status");
+                status.textContent = mount.textContent + "|" + (gone.parentNode === null) + ":" +
+                    (keep.previousElementSibling === null) + ":" + (gone.isConnected === false) + "|" +
+                    detachedError + "|" + documentError;
+                "#,
+            )
+            .expect("empty outerHTML replacement should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("keep|true:true:true|outerHTML element has no parent node|outerHTML cannot replace a direct child of the document")
         );
     }
 

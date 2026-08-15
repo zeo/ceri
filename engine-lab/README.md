@@ -33,7 +33,7 @@ The current slice implements:
 - `previousSibling`, `nextSibling`, `previousElementSibling`, `nextElementSibling`, `hasChildNodes()`, `children`, `firstElementChild`, `lastElementChild`, `childElementCount`, and `isConnected` lookups that follow stable node identity across removal
 - `document.createTextNode()` with detached text data, UTF-16 CharacterData methods, `splitText()`, attachment through `appendChild()` or `insertBefore()`, and movement of existing text nodes
 - `cloneNode()` for shallow or deep element copies and text-node copies, with listeners kept on the original handle
-- `innerHTML` and read-only `outerHTML` serialization for attached and detached elements, with escaped text and attributes
+- `innerHTML` and `outerHTML` serialization for attached and detached elements, plus writable replacement for attached elements with an element parent, with escaped text and attributes
 - `append()` and `prepend()` mixed string or node insertion with argument-order preservation and stable attached handles
 - `replaceChildren()` direct-child replacement that keeps passed handles and listeners reattachable
 - `before()` and `after()` mixed sibling insertion through the same stable-node movement path
