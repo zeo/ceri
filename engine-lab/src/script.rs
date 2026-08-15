@@ -3880,14 +3880,29 @@ impl ScriptRuntime {
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
                     "childNodes" => self.element_child_nodes(&handle),
+                    "children" => self.element_children(&handle),
                     "firstChild" => self.element_child(&handle, true),
                     "lastChild" => self.element_child(&handle, false),
+                    "firstElementChild" => self.element_element_child(&handle, true),
+                    "lastElementChild" => self.element_element_child(&handle, false),
+                    "childElementCount" => self.element_child_element_count(&handle),
                     "previousSibling" | "nextSibling" => path
                         .as_ref()
                         .and_then(|path| {
                             self.document
                                 .borrow()
                                 .sibling_path(path, property == "nextSibling")
+                        })
+                        .and_then(|path| attached_handle(path, &self.document))
+                        .map(Value::Element)
+                        .unwrap_or(Value::Null),
+                    "previousElementSibling" | "nextElementSibling" => path
+                        .as_ref()
+                        .and_then(|path| {
+                            self.document.borrow().element_sibling_path(
+                                path,
+                                property == "nextElementSibling",
+                            )
                         })
                         .and_then(|path| attached_handle(path, &self.document))
                         .map(Value::Element)
@@ -5296,6 +5311,21 @@ impl ScriptRuntime {
         Value::NodeList(Rc::new(nodes))
     }
 
+    fn element_children(&self, handle: &ElementHandle) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::NodeList(Rc::new(Vec::new()));
+        };
+        let nodes = self
+            .document
+            .borrow()
+            .element_child_paths(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|path| attached_handle(path, &self.document))
+            .collect();
+        Value::NodeList(Rc::new(nodes))
+    }
+
     fn element_child(&self, handle: &ElementHandle, first: bool) -> Value {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
@@ -5317,6 +5347,41 @@ impl ScriptRuntime {
         attached_handle(child_path, &self.document)
             .map(Value::Element)
             .unwrap_or(Value::Null)
+    }
+
+    fn element_element_child(&self, handle: &ElementHandle, first: bool) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::Null;
+        };
+        let Some(child_path) = self
+            .document
+            .borrow()
+            .element_child_paths(&path)
+            .and_then(|paths| {
+                if first {
+                    paths.into_iter().next()
+                } else {
+                    paths.into_iter().next_back()
+                }
+            })
+        else {
+            return Value::Null;
+        };
+        attached_handle(child_path, &self.document)
+            .map(Value::Element)
+            .unwrap_or(Value::Null)
+    }
+
+    fn element_child_element_count(&self, handle: &ElementHandle) -> Value {
+        let Some(path) = attached_path(handle) else {
+            return Value::Number(0.0);
+        };
+        Value::Number(
+            self.document
+                .borrow()
+                .element_child_paths(&path)
+                .map_or(0, |children| children.len()) as f64,
+        )
     }
 
     fn is_focusable_path(&self, path: &[usize]) -> bool {
@@ -17923,6 +17988,45 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true:true:true:true:true:true:false:true|true:true:true")
+        );
+    }
+
+    #[test]
+    fn element_navigation_skips_text_nodes_and_tracks_removal() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello<span id="marker">!</span><b id="tail">tail</b>world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const marker = document.getElementById("marker");
+                const tail = document.getElementById("tail");
+                const initial = first.children.length + ":" + first.childElementCount + ":" +
+                    (first.firstElementChild === marker) + ":" + (first.lastElementChild === tail) +
+                    "|" + (text.previousElementSibling === null) + ":" +
+                    (text.nextElementSibling === marker) + ":" +
+                    (marker.previousElementSibling === null) + ":" +
+                    (marker.nextElementSibling === tail) + ":" +
+                    (tail.previousElementSibling === marker) + ":" +
+                    (tail.nextElementSibling === null);
+                marker.remove();
+                const status = document.getElementById("status");
+                status.textContent = initial + "|" + first.children.length + ":" +
+                    (first.firstElementChild === tail) + ":" +
+                    (text.nextElementSibling === tail) + ":" + (tail.previousElementSibling === null);
+                "#,
+            )
+            .expect("element navigation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("2:2:true:true|true:true:true:true:true:true|1:true:true:true")
         );
     }
 

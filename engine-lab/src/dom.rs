@@ -602,6 +602,15 @@ impl Document {
         }
     }
 
+    pub fn element_child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
+        self.child_paths(path).map(|children| {
+            children
+                .into_iter()
+                .filter(|child| matches!(self.node_at(child), Some(Node::Element(_))))
+                .collect()
+        })
+    }
+
     pub fn node_is_text(&self, path: &[usize]) -> Option<bool> {
         self.node_at(path).map(|node| matches!(node, Node::Text(_)))
     }
@@ -617,6 +626,25 @@ impl Document {
             };
             let sibling = child_path(&parent, sibling_index);
             if self.node_id(&sibling).is_some() {
+                return Some(sibling);
+            }
+            self.node_at(&sibling)?;
+        }
+    }
+
+    pub fn element_sibling_path(&self, path: &[usize], next: bool) -> Option<NodePath> {
+        let mut sibling_index = *path.last()?;
+        let parent = path[..path.len().saturating_sub(1)].to_vec();
+        loop {
+            sibling_index = if next {
+                sibling_index.checked_add(1)?
+            } else {
+                sibling_index.checked_sub(1)?
+            };
+            let sibling = child_path(&parent, sibling_index);
+            if self.node_id(&sibling).is_some()
+                && matches!(self.node_at(&sibling), Some(Node::Element(_)))
+            {
                 return Some(sibling);
             }
             self.node_at(&sibling)?;
