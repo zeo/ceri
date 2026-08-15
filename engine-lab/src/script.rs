@@ -13929,6 +13929,7 @@ const MAX_CACHE_ENTRIES: usize = 1024;
 const MAX_CACHED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const STORAGE_FILE_NAME: &str = "storage.bin";
 const STORAGE_MAGIC: &[u8] = b"CERI-STORAGE\0";
+const LEGACY_STORAGE_FORMAT_VERSION: u32 = 1;
 const STORAGE_FORMAT_VERSION: u32 = 2;
 const MAX_STORAGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STORAGE_VALUES: usize = 4096;
@@ -14528,7 +14529,11 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
     if reader.take(STORAGE_MAGIC.len())? != STORAGE_MAGIC {
         return Err(storage_invalid("storage file magic is invalid"));
     }
-    if reader.read_u32()? != STORAGE_FORMAT_VERSION {
+    let format_version = reader.read_u32()?;
+    if !matches!(
+        format_version,
+        LEGACY_STORAGE_FORMAT_VERSION | STORAGE_FORMAT_VERSION
+    ) {
         return Err(storage_invalid("storage file version is unsupported"));
     }
 
@@ -14632,6 +14637,9 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         storage.database_order.push(name);
     }
     let database_count = reader.read_count(MAX_IDB_DATABASES, "databases")?;
+    let mut legacy_value_runtime = (format_version == LEGACY_STORAGE_FORMAT_VERSION)
+        .then(storage_json_runtime)
+        .transpose()?;
     for _ in 0..database_count {
         let name = reader.read_string(MAX_IDB_NAME_BYTES, "database name")?;
         let version = reader.read_u64()?;
@@ -14667,10 +14675,17 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
             let mut records = BTreeMap::new();
             for _ in 0..record_count {
                 let token = reader.read_string(MAX_STORAGE_TEXT_BYTES, "record key token")?;
-                let mut key_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
-                let key = read_clone_value(&mut reader, &mut key_context, 0)?
-                    .into_value()
-                    .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?;
+                let key = if let Some(runtime) = legacy_value_runtime.as_mut() {
+                    let source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB key")?;
+                    runtime
+                        .parse_json(&source)
+                        .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?
+                } else {
+                    let mut key_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
+                    read_clone_value(&mut reader, &mut key_context, 0)?
+                        .into_value()
+                        .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?
+                };
                 indexed_db_key_token(&key)
                     .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))
                     .and_then(|computed| {
@@ -14680,10 +14695,17 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
                             Err(storage_invalid("IndexedDB key token does not match key"))
                         }
                     })?;
-                let mut value_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
-                let value = read_clone_value(&mut reader, &mut value_context, 0)?
-                    .into_value()
-                    .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?;
+                let value = if let Some(runtime) = legacy_value_runtime.as_mut() {
+                    let source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB value")?;
+                    runtime
+                        .parse_json(&source)
+                        .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?
+                } else {
+                    let mut value_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
+                    read_clone_value(&mut reader, &mut value_context, 0)?
+                        .into_value()
+                        .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?
+                };
                 if records.insert(token, IndexedDbRecord { key, value }).is_some() {
                     return Err(storage_invalid("duplicate IndexedDB record in storage file"));
                 }
@@ -14762,6 +14784,12 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         return Err(storage_invalid("storage file has trailing bytes"));
     }
     Ok(storage)
+}
+
+fn storage_json_runtime() -> io::Result<ScriptRuntime> {
+    let document = Document::parse("<html><body></body></html>")
+        .map_err(|error| storage_invalid(format!("could not create storage parser: {error}")))?;
+    Ok(ScriptRuntime::new(Rc::new(RefCell::new(document))))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
