@@ -14,6 +14,9 @@ use crate::wasm;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::rc::Weak;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -964,6 +967,7 @@ pub(crate) struct StorageData {
     cache_order: Vec<String>,
     databases: BTreeMap<String, IndexedDbDatabaseHandle>,
     database_order: Vec<String>,
+    persistence_path: Option<PathBuf>,
 }
 
 impl StorageData {
@@ -974,7 +978,43 @@ impl StorageData {
             cache_order: Vec::new(),
             databases: BTreeMap::new(),
             database_order: Vec::new(),
+            persistence_path: None,
         }
+    }
+
+    pub(crate) fn load_from_directory(directory: impl AsRef<Path>) -> io::Result<Self> {
+        let directory = directory.as_ref();
+        fs::create_dir_all(directory)?;
+        let directory = fs::canonicalize(directory)?;
+        if !fs::metadata(&directory)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "storage root is not a directory",
+            ));
+        }
+        let path = directory.join(STORAGE_FILE_NAME);
+        let mut storage = if path.exists() {
+            if !fs::metadata(&path)?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage file path is not a regular file",
+                ));
+            }
+            let bytes = fs::read(&path)?;
+            decode_storage(&bytes)?
+        } else {
+            Self::new()
+        };
+        storage.persistence_path = Some(path);
+        Ok(storage)
+    }
+
+    pub(crate) fn persist(&self) -> io::Result<()> {
+        let Some(path) = self.persistence_path.as_deref() else {
+            return Ok(());
+        };
+        let bytes = encode_storage(self)?;
+        atomic_write(path, &bytes)
     }
 }
 
@@ -10133,7 +10173,19 @@ impl ScriptRuntime {
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_else(|| "undefined".to_string());
-                storage.borrow_mut().values.insert(key, value);
+                if key.len() > MAX_STORAGE_TEXT_BYTES {
+                    return Err(runtime_error("Storage key exceeds the deterministic limit"));
+                }
+                if value.len() > MAX_STORAGE_VALUE_BYTES {
+                    return Err(runtime_error("Storage value exceeds the deterministic limit"));
+                }
+                let mut storage = storage.borrow_mut();
+                if !storage.values.contains_key(&key)
+                    && storage.values.len() >= MAX_STORAGE_VALUES
+                {
+                    return Err(runtime_error("Storage entry limit exceeded"));
+                }
+                storage.values.insert(key, value);
                 Ok(Value::Undefined)
             }
             Builtin::StorageRemoveItem(storage) => {
@@ -13533,12 +13585,611 @@ fn abort_event_value() -> Value {
 const MAX_CACHE_NAME_BYTES: usize = 256;
 const MAX_CACHE_ENTRIES: usize = 1024;
 const MAX_CACHED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const STORAGE_FILE_NAME: &str = "storage.bin";
+const STORAGE_MAGIC: &[u8] = b"CERI-STORAGE\0";
+const STORAGE_FORMAT_VERSION: u32 = 1;
+const MAX_STORAGE_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STORAGE_VALUES: usize = 4096;
+const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_STORAGE_HEADER_BYTES: usize = 256;
+const MAX_STORAGE_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDB_DATABASES: usize = 32;
 const MAX_IDB_STORES: usize = 128;
 const MAX_IDB_RECORDS: usize = 4096;
 const MAX_IDB_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_IDB_NAME_BYTES: usize = 256;
 const MAX_IDB_VERSION: u64 = 1_000_000;
+
+fn storage_invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+struct StorageWriter {
+    bytes: Vec<u8>,
+}
+
+impl StorageWriter {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn write_bool(&mut self, value: bool) {
+        self.write_u8(u8::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_count(&mut self, count: usize, limit: usize, label: &str) -> io::Result<()> {
+        if count > limit || count > u32::MAX as usize {
+            return Err(storage_invalid(format!("{label} limit exceeded")));
+        }
+        self.write_u32(count as u32);
+        Ok(())
+    }
+
+    fn write_string(&mut self, value: &str, limit: usize, label: &str) -> io::Result<()> {
+        if value.len() > limit || value.len() > u32::MAX as usize {
+            return Err(storage_invalid(format!("{label} is too large")));
+        }
+        self.write_u32(value.len() as u32);
+        self.bytes.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, value: &[u8], limit: usize, label: &str) -> io::Result<()> {
+        if value.len() > limit || value.len() > u32::MAX as usize {
+            return Err(storage_invalid(format!("{label} is too large")));
+        }
+        self.write_u32(value.len() as u32);
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn write_optional_string(
+        &mut self,
+        value: Option<&str>,
+        limit: usize,
+        label: &str,
+    ) -> io::Result<()> {
+        match value {
+            Some(value) => {
+                self.write_bool(true);
+                self.write_string(value, limit, label)?;
+            }
+            None => self.write_bool(false),
+        }
+        Ok(())
+    }
+}
+
+struct StorageReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> StorageReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| storage_invalid("storage record length overflow"))?;
+        if end > self.bytes.len() {
+            return Err(storage_invalid("storage record is truncated"));
+        }
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn read_bool(&mut self) -> io::Result<bool> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(storage_invalid("storage boolean is invalid")),
+        }
+    }
+
+    fn read_u16(&mut self) -> io::Result<u16> {
+        let mut bytes = [0; 2];
+        bytes.copy_from_slice(self.take(2)?);
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        let mut bytes = [0; 4];
+        bytes.copy_from_slice(self.take(4)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> io::Result<u64> {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_count(&mut self, limit: usize, label: &str) -> io::Result<usize> {
+        let count = self.read_u32()? as usize;
+        if count > limit {
+            return Err(storage_invalid(format!("{label} limit exceeded")));
+        }
+        Ok(count)
+    }
+
+    fn read_string(&mut self, limit: usize, label: &str) -> io::Result<String> {
+        let length = self.read_u32()? as usize;
+        if length > limit {
+            return Err(storage_invalid(format!("{label} is too large")));
+        }
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| storage_invalid(format!("{label} is not UTF-8")))
+    }
+
+    fn read_bytes(&mut self, limit: usize, label: &str) -> io::Result<Vec<u8>> {
+        let length = self.read_u32()? as usize;
+        if length > limit {
+            return Err(storage_invalid(format!("{label} is too large")));
+        }
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn read_optional_string(&mut self, limit: usize, label: &str) -> io::Result<Option<String>> {
+        if self.read_bool()? {
+            Ok(Some(self.read_string(limit, label)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn encode_storage(storage: &StorageData) -> io::Result<Vec<u8>> {
+    let mut writer = StorageWriter::new();
+    writer.bytes.extend_from_slice(STORAGE_MAGIC);
+    writer.write_u32(STORAGE_FORMAT_VERSION);
+
+    writer.write_count(storage.values.len(), MAX_STORAGE_VALUES, "localStorage entries")?;
+    for (key, value) in &storage.values {
+        writer.write_string(key, MAX_STORAGE_TEXT_BYTES, "localStorage key")?;
+        writer.write_string(value, MAX_STORAGE_VALUE_BYTES, "localStorage value")?;
+    }
+
+    writer.write_count(storage.cache_order.len(), MAX_CACHE_ENTRIES, "cache names")?;
+    for name in &storage.cache_order {
+        writer.write_string(name, MAX_CACHE_NAME_BYTES, "cache name")?;
+    }
+    writer.write_count(storage.caches.len(), MAX_CACHE_ENTRIES, "caches")?;
+    for (name, cache) in &storage.caches {
+        writer.write_string(name, MAX_CACHE_NAME_BYTES, "cache name")?;
+        let cache = cache.borrow();
+        writer.write_count(cache.order.len(), MAX_CACHE_ENTRIES, "cache entry order")?;
+        for key in &cache.order {
+            writer.write_string(key, MAX_STORAGE_TEXT_BYTES, "cache entry key")?;
+        }
+        writer.write_count(cache.entries.len(), MAX_CACHE_ENTRIES, "cache entries")?;
+        for (key, entry) in &cache.entries {
+            writer.write_string(key, MAX_STORAGE_TEXT_BYTES, "cache entry key")?;
+            writer.write_string(&entry.request_url, MAX_STORAGE_TEXT_BYTES, "cache request URL")?;
+            writer.write_string(&entry.request_method, MAX_STORAGE_HEADER_BYTES, "cache request method")?;
+            write_headers(&mut writer, &entry.request_headers)?;
+            writer.write_string(&entry.response.url, MAX_STORAGE_TEXT_BYTES, "cached response URL")?;
+            writer.write_u16(entry.response.status);
+            writer.write_string(
+                &entry.response.status_text,
+                MAX_STORAGE_HEADER_BYTES,
+                "cached response status text",
+            )?;
+            writer.write_string(
+                &entry.response.mime_type,
+                MAX_STORAGE_HEADER_BYTES,
+                "cached response MIME type",
+            )?;
+            write_headers(&mut writer, &entry.response.headers)?;
+            writer.write_bytes(
+                &entry.response.body,
+                MAX_CACHED_RESPONSE_BYTES,
+                "cached response body",
+            )?;
+            writer.write_bool(entry.response.redirected);
+            writer.write_string(
+                &entry.response.response_type,
+                MAX_STORAGE_HEADER_BYTES,
+                "cached response type",
+            )?;
+        }
+    }
+
+    writer.write_count(
+        storage.database_order.len(),
+        MAX_IDB_DATABASES,
+        "database names",
+    )?;
+    for name in &storage.database_order {
+        writer.write_string(name, MAX_IDB_NAME_BYTES, "database name")?;
+    }
+    writer.write_count(storage.databases.len(), MAX_IDB_DATABASES, "databases")?;
+    for (name, database) in &storage.databases {
+        writer.write_string(name, MAX_IDB_NAME_BYTES, "database name")?;
+        let database = database.borrow();
+        writer.write_u64(database.version);
+        writer.write_count(
+            database.store_order.len(),
+            MAX_IDB_STORES,
+            "object store order",
+        )?;
+        for store_name in &database.store_order {
+            writer.write_string(store_name, MAX_IDB_NAME_BYTES, "object store name")?;
+        }
+        writer.write_count(database.stores.len(), MAX_IDB_STORES, "object stores")?;
+        for (store_name, store) in &database.stores {
+            writer.write_string(store_name, MAX_IDB_NAME_BYTES, "object store name")?;
+            writer.write_optional_string(
+                store.key_path.as_deref(),
+                MAX_IDB_NAME_BYTES,
+                "object store key path",
+            )?;
+            writer.write_bool(store.auto_increment);
+            writer.write_u64(store.next_key);
+            writer.write_count(store.order.len(), MAX_IDB_RECORDS, "record order")?;
+            for token in &store.order {
+                writer.write_string(token, MAX_STORAGE_TEXT_BYTES, "record key token")?;
+            }
+            writer.write_count(store.records.len(), MAX_IDB_RECORDS, "records")?;
+            for (token, record) in &store.records {
+                writer.write_string(token, MAX_STORAGE_TEXT_BYTES, "record key token")?;
+                let key = serialize_json(&record.key).map_err(|error| {
+                    storage_invalid(format!("could not serialize IndexedDB key: {error}"))
+                })?;
+                writer.write_string(&key, MAX_STORAGE_VALUE_BYTES, "IndexedDB key")?;
+                let value = serialize_json(&record.value).map_err(|error| {
+                    storage_invalid(format!("could not serialize IndexedDB value: {error}"))
+                })?;
+                writer.write_string(&value, MAX_STORAGE_VALUE_BYTES, "IndexedDB value")?;
+            }
+        }
+    }
+
+    if writer.bytes.len() > MAX_STORAGE_FILE_BYTES {
+        return Err(storage_invalid("storage file limit exceeded"));
+    }
+    Ok(writer.bytes)
+}
+
+fn write_headers(writer: &mut StorageWriter, headers: &BTreeMap<String, String>) -> io::Result<()> {
+    writer.write_count(headers.len(), MAX_STORAGE_VALUES, "header entries")?;
+    for (name, value) in headers {
+        writer.write_string(name, MAX_STORAGE_HEADER_BYTES, "header name")?;
+        writer.write_string(value, MAX_STORAGE_VALUE_BYTES, "header value")?;
+    }
+    Ok(())
+}
+
+fn read_headers(reader: &mut StorageReader<'_>) -> io::Result<BTreeMap<String, String>> {
+    let count = reader.read_count(MAX_STORAGE_VALUES, "header entries")?;
+    let mut headers = BTreeMap::new();
+    for _ in 0..count {
+        let name = reader.read_string(MAX_STORAGE_HEADER_BYTES, "header name")?;
+        let value = reader.read_string(MAX_STORAGE_VALUE_BYTES, "header value")?;
+        if headers.insert(name, value).is_some() {
+            return Err(storage_invalid("duplicate header name in storage file"));
+        }
+    }
+    Ok(headers)
+}
+
+fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
+    if bytes.len() > MAX_STORAGE_FILE_BYTES {
+        return Err(storage_invalid("storage file limit exceeded"));
+    }
+    let mut reader = StorageReader::new(bytes);
+    if reader.take(STORAGE_MAGIC.len())? != STORAGE_MAGIC {
+        return Err(storage_invalid("storage file magic is invalid"));
+    }
+    if reader.read_u32()? != STORAGE_FORMAT_VERSION {
+        return Err(storage_invalid("storage file version is unsupported"));
+    }
+
+    let mut storage = StorageData::new();
+    let value_count = reader.read_count(MAX_STORAGE_VALUES, "localStorage entries")?;
+    for _ in 0..value_count {
+        let key = reader.read_string(MAX_STORAGE_TEXT_BYTES, "localStorage key")?;
+        let value = reader.read_string(MAX_STORAGE_VALUE_BYTES, "localStorage value")?;
+        if storage.values.insert(key, value).is_some() {
+            return Err(storage_invalid("duplicate localStorage key in storage file"));
+        }
+    }
+
+    let cache_order_count = reader.read_count(MAX_CACHE_ENTRIES, "cache names")?;
+    for _ in 0..cache_order_count {
+        let name = reader.read_string(MAX_CACHE_NAME_BYTES, "cache name")?;
+        if storage.cache_order.contains(&name) {
+            return Err(storage_invalid("duplicate cache name in storage file"));
+        }
+        storage.cache_order.push(name);
+    }
+    let cache_count = reader.read_count(MAX_CACHE_ENTRIES, "caches")?;
+    for _ in 0..cache_count {
+        let name = reader.read_string(MAX_CACHE_NAME_BYTES, "cache name")?;
+        let order_count = reader.read_count(MAX_CACHE_ENTRIES, "cache entry order")?;
+        let mut order = Vec::with_capacity(order_count);
+        for _ in 0..order_count {
+            order.push(reader.read_string(MAX_STORAGE_TEXT_BYTES, "cache entry key")?);
+        }
+        let entry_count = reader.read_count(MAX_CACHE_ENTRIES, "cache entries")?;
+        let mut entries = BTreeMap::new();
+        for _ in 0..entry_count {
+            let key = reader.read_string(MAX_STORAGE_TEXT_BYTES, "cache entry key")?;
+            let request_url = reader.read_string(MAX_STORAGE_TEXT_BYTES, "cache request URL")?;
+            let request_method = reader.read_string(MAX_STORAGE_HEADER_BYTES, "cache request method")?;
+            let request_headers = read_headers(&mut reader)?;
+            let response_url = reader.read_string(MAX_STORAGE_TEXT_BYTES, "cached response URL")?;
+            let status = reader.read_u16()?;
+            let status_text = reader.read_string(
+                MAX_STORAGE_HEADER_BYTES,
+                "cached response status text",
+            )?;
+            let mime_type = reader.read_string(
+                MAX_STORAGE_HEADER_BYTES,
+                "cached response MIME type",
+            )?;
+            let headers = read_headers(&mut reader)?;
+            let body = reader.read_bytes(MAX_CACHED_RESPONSE_BYTES, "cached response body")?;
+            let redirected = reader.read_bool()?;
+            let response_type = reader.read_string(
+                MAX_STORAGE_HEADER_BYTES,
+                "cached response type",
+            )?;
+            if entries
+                .insert(
+                    key,
+                    CacheEntry {
+                        request_url,
+                        request_method,
+                        request_headers,
+                        response: CachedResponse {
+                            url: response_url,
+                            status,
+                            status_text,
+                            mime_type,
+                            headers,
+                            body,
+                            redirected,
+                            response_type,
+                        },
+                    },
+                )
+                .is_some()
+            {
+                return Err(storage_invalid("duplicate cache entry in storage file"));
+            }
+        }
+        if storage.caches.contains_key(&name) {
+            return Err(storage_invalid("duplicate cache name in storage file"));
+        }
+        storage.caches.insert(
+            name,
+            Rc::new(RefCell::new(CacheData { entries, order })),
+        );
+    }
+    if storage
+        .cache_order
+        .iter()
+        .any(|name| !storage.caches.contains_key(name))
+        || storage.caches.keys().any(|name| !storage.cache_order.contains(name))
+    {
+        return Err(storage_invalid("cache order does not match cache records"));
+    }
+
+    let database_order_count = reader.read_count(MAX_IDB_DATABASES, "database names")?;
+    for _ in 0..database_order_count {
+        let name = reader.read_string(MAX_IDB_NAME_BYTES, "database name")?;
+        if storage.database_order.contains(&name) {
+            return Err(storage_invalid("duplicate database name in storage file"));
+        }
+        storage.database_order.push(name);
+    }
+    let database_count = reader.read_count(MAX_IDB_DATABASES, "databases")?;
+    let mut value_runtime = storage_json_runtime()?;
+    for _ in 0..database_count {
+        let name = reader.read_string(MAX_IDB_NAME_BYTES, "database name")?;
+        let version = reader.read_u64()?;
+        if version > MAX_IDB_VERSION {
+            return Err(storage_invalid("database version exceeds the deterministic limit"));
+        }
+        let store_order_count = reader.read_count(MAX_IDB_STORES, "object store order")?;
+        let mut store_order = Vec::with_capacity(store_order_count);
+        for _ in 0..store_order_count {
+            let store_name = reader.read_string(MAX_IDB_NAME_BYTES, "object store name")?;
+            if store_order.contains(&store_name) {
+                return Err(storage_invalid("duplicate object store name in storage file"));
+            }
+            store_order.push(store_name);
+        }
+        let store_count = reader.read_count(MAX_IDB_STORES, "object stores")?;
+        let mut stores = BTreeMap::new();
+        for _ in 0..store_count {
+            let store_name = reader.read_string(MAX_IDB_NAME_BYTES, "object store name")?;
+            let key_path = reader.read_optional_string(MAX_IDB_NAME_BYTES, "object store key path")?;
+            let auto_increment = reader.read_bool()?;
+            let next_key = reader.read_u64()?.max(1);
+            let order_count = reader.read_count(MAX_IDB_RECORDS, "record order")?;
+            let mut order = Vec::with_capacity(order_count);
+            for _ in 0..order_count {
+                let token = reader.read_string(MAX_STORAGE_TEXT_BYTES, "record key token")?;
+                if order.contains(&token) {
+                    return Err(storage_invalid("duplicate record token in storage file"));
+                }
+                order.push(token);
+            }
+            let record_count = reader.read_count(MAX_IDB_RECORDS, "records")?;
+            let mut records = BTreeMap::new();
+            for _ in 0..record_count {
+                let token = reader.read_string(MAX_STORAGE_TEXT_BYTES, "record key token")?;
+                let key_source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB key")?;
+                let key = value_runtime
+                    .parse_json(&key_source)
+                    .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?;
+                indexed_db_key_token(&key)
+                    .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))
+                    .and_then(|computed| {
+                        if computed == token {
+                            Ok(())
+                        } else {
+                            Err(storage_invalid("IndexedDB key token does not match key"))
+                        }
+                    })?;
+                let value_source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB value")?;
+                let value = value_runtime
+                    .parse_json(&value_source)
+                    .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?;
+                if records.insert(token, IndexedDbRecord { key, value }).is_some() {
+                    return Err(storage_invalid("duplicate IndexedDB record in storage file"));
+                }
+            }
+            if stores
+                .insert(
+                    store_name,
+                    IndexedDbStoreData {
+                        key_path,
+                        auto_increment,
+                        records,
+                        order,
+                        next_key,
+                    },
+                )
+                .is_some()
+            {
+                return Err(storage_invalid("duplicate object store in storage file"));
+            }
+        }
+        if store_order
+            .iter()
+            .any(|store_name| !stores.contains_key(store_name))
+            || stores
+                .keys()
+                .any(|store_name| !store_order.contains(store_name))
+        {
+            return Err(storage_invalid(
+                "object store order does not match object store records",
+            ));
+        }
+        for store in stores.values() {
+            if store
+                .order
+                .iter()
+                .any(|token| !store.records.contains_key(token))
+                || store
+                    .records
+                    .keys()
+                    .any(|token| !store.order.contains(token))
+            {
+                return Err(storage_invalid(
+                    "record order does not match record records",
+                ));
+            }
+        }
+        if storage.databases.contains_key(&name) {
+            return Err(storage_invalid("duplicate database in storage file"));
+        }
+        storage.databases.insert(
+            name.clone(),
+            Rc::new(RefCell::new(IndexedDbDatabaseData {
+                name,
+                version,
+                stores,
+                store_order,
+                upgrade_active: false,
+                upgrade_transaction: None,
+                closed: false,
+                on_version_change: None,
+            })),
+        );
+    }
+    if storage
+        .database_order
+        .iter()
+        .any(|name| !storage.databases.contains_key(name))
+        || storage
+            .databases
+            .keys()
+            .any(|name| !storage.database_order.contains(name))
+    {
+        return Err(storage_invalid("database order does not match database records"));
+    }
+    if !reader.is_exhausted() {
+        return Err(storage_invalid("storage file has trailing bytes"));
+    }
+    Ok(storage)
+}
+
+fn storage_json_runtime() -> io::Result<ScriptRuntime> {
+    let document = Document::parse("<html><body></body></html>")
+        .map_err(|error| storage_invalid(format!("could not create storage parser: {error}")))?;
+    Ok(ScriptRuntime::new(Rc::new(RefCell::new(document))))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "storage path is invalid"))?;
+    let suffix = format!("{}-{}", std::process::id(), STORAGE_FORMAT_VERSION);
+    let temporary = parent.join(format!(".{file_name}.{suffix}.tmp"));
+    let backup = parent.join(format!(".{file_name}.{suffix}.bak"));
+    fs::write(&temporary, bytes)?;
+    if path.exists() {
+        if backup.exists() {
+            let _ = fs::remove_file(&temporary);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "storage backup path already exists",
+            ));
+        }
+        fs::rename(path, &backup)?;
+        match fs::rename(&temporary, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(backup);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::rename(&backup, path);
+                let _ = fs::remove_file(&temporary);
+                Err(error)
+            }
+        }
+    } else {
+        fs::rename(&temporary, path)
+    }
+}
 
 fn indexed_db_error(name: &str, message: &str) -> Value {
     Value::Error(Rc::new(ErrorData {

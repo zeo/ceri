@@ -7,7 +7,7 @@ use crate::layout::{
 use crate::paint::Canvas;
 use crate::script::{
     HostRuntimeInfo, KeyModifiers, ModuleSourceLoader, NavigationRequest, ScriptRuntime,
-    StorageHandle, runtime_error,
+    StorageData, StorageHandle, runtime_error,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -555,6 +555,7 @@ pub enum NavigationError {
     ResourceProvider(String),
     FilePicker(String),
     Clipboard(String),
+    Storage(String),
     UnsupportedMimeType { path: String, mime_type: String },
     InvalidUtf8(String),
     Script(String),
@@ -618,6 +619,7 @@ impl fmt::Display for NavigationError {
             Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
             Self::FilePicker(detail) => write!(formatter, "file picker failed: {detail}"),
             Self::Clipboard(detail) => write!(formatter, "clipboard failed: {detail}"),
+            Self::Storage(detail) => write!(formatter, "storage failed: {detail}"),
             Self::UnsupportedMimeType { path, mime_type } => {
                 write!(
                     formatter,
@@ -642,7 +644,8 @@ fn recovery_status(error: &NavigationError) -> u16 {
         NavigationError::HttpStatus { status, .. } => *status,
         NavigationError::ResourceProvider(_)
         | NavigationError::FilePicker(_)
-        | NavigationError::Clipboard(_) => 503,
+        | NavigationError::Clipboard(_)
+        | NavigationError::Storage(_) => 503,
         _ => 500,
     }
 }
@@ -784,6 +787,14 @@ impl Browser {
         let mut browser = Self::new(resources);
         browser.resource_provider = Some(resource_provider);
         browser
+    }
+
+    pub fn with_storage_directory(
+        mut self,
+        directory: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        self.local_storage = Rc::new(RefCell::new(StorageData::load_from_directory(directory)?));
+        Ok(self)
     }
 
     pub fn with_file_picker(mut self, file_picker: Rc<dyn FilePicker>) -> Self {
@@ -1003,6 +1014,7 @@ impl Browser {
             self.commit_new_document(url, commit);
             return Ok(NavigationStatus::ErrorPage { status });
         }
+        self.persist_storage()?;
 
         let pending_navigation = runtime.take_navigation_request();
         self.page = Some(Page {
@@ -1364,6 +1376,7 @@ impl Browser {
     fn process_pending_navigation(
         &mut self,
     ) -> Result<Option<NavigationStatus>, NavigationError> {
+        self.persist_storage()?;
         let request = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             page.runtime.take_navigation_request()
@@ -1371,6 +1384,13 @@ impl Browser {
         request
             .map(|request| self.follow_navigation(request, 0))
             .transpose()
+    }
+
+    fn persist_storage(&self) -> Result<(), NavigationError> {
+        self.local_storage
+            .borrow()
+            .persist()
+            .map_err(|error| NavigationError::Storage(error.to_string()))
     }
 
     fn follow_navigation(
@@ -3359,6 +3379,102 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn persistent_storage_survives_browser_restart_without_a_loopback_server() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "ceri-engine-storage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the epoch")
+                .as_nanos()
+        ));
+        let seed_resources = bundle(
+            r#"<script>
+                localStorage.setItem("token", "disk");
+                caches.open("shell").then(cache =>
+                    cache.put("/offline.txt", new Response("cached", { status: 207 }))
+                );
+                const open = indexedDB.open("notes", 1);
+                open.onupgradeneeded = event => {
+                    event.target.result.createObjectStore("notes", { keyPath: "id" });
+                };
+                open.onsuccess = event => {
+                    event.target.result
+                        .transaction("notes", "readwrite")
+                        .objectStore("notes")
+                        .put({ id: "record", value: "db" });
+                };
+            </script>"#,
+        );
+        let read_resources = bundle(
+            r#"<p id="status"></p><script>
+                const open = indexedDB.open("notes");
+                open.onsuccess = event => {
+                    const request = event.target.result
+                        .transaction("notes")
+                        .objectStore("notes")
+                        .get("record");
+                    request.onsuccess = event => {
+                        caches.match("/offline.txt").then(response => {
+                            const statusCode = response.status;
+                            response.text().then(text => {
+                                document.getElementById("status").textContent =
+                                    localStorage.getItem("token") + "|" + event.target.result.value +
+                                    "|" + statusCode + ":" + text;
+                            });
+                        });
+                    };
+                };
+            </script>"#,
+        );
+        {
+            let mut browser = Browser::new(seed_resources)
+                .with_storage_directory(&storage_root)
+                .expect("persistent storage should initialize");
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("seed page should load");
+        }
+        assert!(storage_root.join("storage.bin").is_file());
+        {
+            let mut browser = Browser::new(read_resources)
+                .with_storage_directory(&storage_root)
+                .expect("persistent storage should reopen");
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("read page should load");
+            let document = browser.document().expect("read document should exist");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status should exist");
+            assert_eq!(
+                document.borrow().element_text_content(&status).as_deref(),
+                Some("disk|db|207:cached")
+            );
+        }
+        std::fs::remove_dir_all(&storage_root).expect("test storage should be cleaned up");
+    }
+
+    #[test]
+    fn persistent_storage_rejects_corrupt_snapshots() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "ceri-engine-storage-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&storage_root).expect("test storage root should be created");
+        std::fs::write(storage_root.join("storage.bin"), b"corrupt")
+            .expect("corrupt snapshot should be written");
+        let result = Browser::new(bundle("<p>page</p>")).with_storage_directory(&storage_root);
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&storage_root).expect("test storage should be cleaned up");
     }
 
     #[test]
