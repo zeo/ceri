@@ -35,6 +35,7 @@ The current slice implements:
 - `cloneNode()` for shallow or deep element copies and text-node copies, with listeners kept on the original handle
 - `innerHTML` and read-only `outerHTML` serialization for attached and detached elements, with escaped text and attributes
 - `append()` and `prepend()` mixed string or node insertion with argument-order preservation and stable attached handles
+- `replaceChildren()` direct-child replacement that keeps passed handles and listeners reattachable
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation

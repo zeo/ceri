@@ -714,6 +714,16 @@ impl Document {
         Ok(true)
     }
 
+    pub fn replace_element_children(&mut self, path: &[usize], children: Vec<Node>) -> bool {
+        self.remove_descendant_ids(path);
+        let Some(element) = self.element_at_mut(path) else {
+            return false;
+        };
+        element.children = children;
+        self.assign_ids_below(path);
+        true
+    }
+
     pub fn set_element_text_content(&mut self, path: &[usize], text: String) -> bool {
         self.remove_descendant_ids(path);
         {
