@@ -237,6 +237,8 @@ enum Builtin {
     ElementRemoveEventListener(ElementHandle),
     ElementClick(ElementHandle),
     ElementAppendChild(ElementHandle),
+    ElementAppend(ElementHandle),
+    ElementPrepend(ElementHandle),
     ElementRemoveChild(ElementHandle),
     ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
@@ -4146,6 +4148,18 @@ impl ScriptRuntime {
                             return Err(runtime_error("detached element cannot receive children"));
                         }
                         Value::Builtin(Builtin::ElementAppendChild(handle.clone()))
+                    }
+                    "append" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot receive children"));
+                        }
+                        Value::Builtin(Builtin::ElementAppend(handle.clone()))
+                    }
+                    "prepend" => {
+                        if path.is_none() {
+                            return Err(runtime_error("detached element cannot receive children"));
+                        }
+                        Value::Builtin(Builtin::ElementPrepend(handle.clone()))
                     }
                     "removeChild" => {
                         if path.is_none() {
@@ -10328,6 +10342,32 @@ impl ScriptRuntime {
                 *child.borrow_mut() = attached.borrow().clone();
                 Ok(Value::Element(child))
             }
+            Builtin::ElementAppend(parent) => {
+                for argument in &arguments {
+                    let child = child_handle_from_value(argument);
+                    self.call_builtin(
+                        Builtin::ElementAppendChild(parent.clone()),
+                        vec![Value::Element(child)],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementPrepend(parent) => {
+                for argument in arguments.iter().rev() {
+                    let child = child_handle_from_value(argument);
+                    let reference = attached_path(&parent)
+                        .and_then(|path| self.document.borrow().child_paths(&path))
+                        .and_then(|children| children.into_iter().next())
+                        .and_then(|path| attached_handle(path, &self.document))
+                        .map(Value::Element)
+                        .unwrap_or(Value::Null);
+                    self.call_builtin(
+                        Builtin::ElementInsertBefore(parent.clone()),
+                        vec![Value::Element(child), reference],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
             Builtin::ElementInsertBefore(parent) => {
                 let parent_path = attached_path(&parent)
                     .ok_or_else(|| runtime_error("insertBefore parent is no longer in the document"))?;
@@ -11194,6 +11234,15 @@ fn detached_text_element(text: &str) -> Element {
         name: "#text".to_string(),
         attrs: BTreeMap::new(),
         children: vec![Node::Text(text.to_string())],
+    }
+}
+
+fn child_handle_from_value(value: &Value) -> ElementHandle {
+    match value.resolve() {
+        Value::Element(handle) => handle,
+        value => Rc::new(RefCell::new(ElementLocation::Detached(
+            detached_text_element(&value.string_value()),
+        ))),
     }
 }
 
@@ -18140,6 +18189,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined")
+        );
+    }
+
+    #[test]
+    fn append_and_prepend_preserve_mixed_argument_order_and_identity() {
+        let document = document(
+            r#"<main id="root"><p id="mount">middle</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const mount = document.getElementById("mount");
+                const bold = document.createElement("b");
+                bold.textContent = "bold";
+                const tail = document.createTextNode(" tail");
+                mount.append("left ", bold, tail, 42);
+                const leading = document.createElement("i");
+                leading.textContent = "start";
+                mount.prepend(leading, "prefix ");
+                const status = document.getElementById("status");
+                status.textContent = mount.textContent + "|" + mount.children.length + ":" +
+                    (mount.firstChild === leading) + ":" + (tail.nextSibling.data === "42") + ":" +
+                    (bold.parentNode === mount) + ":" + (tail.parentNode === mount) + ":" +
+                    (mount.childElementCount === 2);
+                "#,
+            )
+            .expect("append and prepend should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("startprefix middleleft bold tail42|2:true:true:true:true:true")
         );
     }
 
