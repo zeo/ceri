@@ -29,6 +29,7 @@ The current slice implements:
 - stable detached and attached element handles with `document.createElement` and `appendChild`
 - direct-child `removeChild` with survivor-path preservation, live Range retargeting, listener retention, end-only detached reattachment, and `insertBefore` moves for detached or attached nodes
 - bounded `firstChild`, `lastChild`, and `childNodes` access with text-node identity, `nodeType`, `nodeName`, `nodeValue`, `splitText()`, `normalize()`, UTF-16 Range boundary offsets, replacement retargeting, and in-place text-node data mutation
+- text-node `substringData()`, `appendData()`, `insertData()`, `deleteData()`, and `replaceData()` with UTF-16 edits and live Range offset updates
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation

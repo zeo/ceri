@@ -244,6 +244,11 @@ enum Builtin {
     ElementSetRangeText(ElementHandle),
     ElementSplitText(ElementHandle),
     ElementNormalize(ElementHandle),
+    ElementSubstringData(ElementHandle),
+    ElementAppendData(ElementHandle),
+    ElementInsertData(ElementHandle),
+    ElementDeleteData(ElementHandle),
+    ElementReplaceData(ElementHandle),
     RangeSetStart(RangeHandle),
     RangeSetEnd(RangeHandle),
     RangeCollapse(RangeHandle),
@@ -3829,6 +3834,21 @@ impl ScriptRuntime {
                         Value::Builtin(Builtin::ElementSplitText(handle.clone()))
                     }
                     "normalize" => Value::Builtin(Builtin::ElementNormalize(handle.clone())),
+                    "substringData" if attached_is_text(&handle) => {
+                        Value::Builtin(Builtin::ElementSubstringData(handle.clone()))
+                    }
+                    "appendData" if attached_is_text(&handle) => {
+                        Value::Builtin(Builtin::ElementAppendData(handle.clone()))
+                    }
+                    "insertData" if attached_is_text(&handle) => {
+                        Value::Builtin(Builtin::ElementInsertData(handle.clone()))
+                    }
+                    "deleteData" if attached_is_text(&handle) => {
+                        Value::Builtin(Builtin::ElementDeleteData(handle.clone()))
+                    }
+                    "replaceData" if attached_is_text(&handle) => {
+                        Value::Builtin(Builtin::ElementReplaceData(handle.clone()))
+                    }
                     "textContent" => self
                         .element_text_content(&handle)
                         .map(Value::String)
@@ -6548,26 +6568,18 @@ impl ScriptRuntime {
         selection_changed
     }
 
-    fn adjust_ranges_for_character_data_replacement(
+    fn adjust_ranges_for_character_data_edit(
         &mut self,
         target: &[usize],
+        replacement_start: usize,
+        old_length: usize,
         new_length: usize,
     ) -> bool {
         if attached_handle(target.to_vec(), &self.document).is_none() {
             return false;
         }
-        let (target_start, old_length) = {
-            let document = self.document.borrow();
-            let Some(target_start) = document.node_text_offset(target) else {
-                return false;
-            };
-            let Some(old_length) = document
-                .node_text_content(target)
-                .map(|text| utf16_len(&text))
-            else {
-                return false;
-            };
-            (target_start, old_length)
+        let Some(target_start) = self.document.borrow().node_text_offset(target) else {
+            return false;
         };
         let document = self.document.clone();
         let selected = self.selection.borrow().range.clone();
@@ -6580,18 +6592,20 @@ impl ScriptRuntime {
             let changed = {
                 let mut range_data = range.borrow_mut();
                 let previous = range_data.clone();
-                adjust_range_boundary_for_character_data_replacement(
+                adjust_range_boundary_for_character_data_edit(
                     &mut range_data.start,
                     target,
                     target_start,
+                    replacement_start,
                     old_length,
                     new_length,
                     &document,
                 );
-                adjust_range_boundary_for_character_data_replacement(
+                adjust_range_boundary_for_character_data_edit(
                     &mut range_data.end,
                     target,
                     target_start,
+                    replacement_start,
                     old_length,
                     new_length,
                     &document,
@@ -6923,20 +6937,45 @@ impl ScriptRuntime {
         path: &NodePath,
         text: String,
     ) -> Result<bool, ScriptError> {
-        if !self
+        let old_length = self
             .document
             .borrow()
-            .node_is_text(path)
-            .is_some_and(|is_text| is_text)
-        {
+            .node_text_content(path)
+            .map(|text| utf16_len(&text));
+        let Some(old_length) = old_length else {
             return Ok(false);
-        }
-        let selection_changed = self
-            .adjust_ranges_for_character_data_replacement(path, utf16_len(&text));
+        };
+        self.replace_text_node_data_range(path, 0, old_length, &text)
+    }
+
+    fn replace_text_node_data_range(
+        &mut self,
+        path: &NodePath,
+        start: usize,
+        end: usize,
+        replacement: &str,
+    ) -> Result<bool, ScriptError> {
+        let Some(current) = self
+            .document
+            .borrow()
+            .node_text_content(path)
+        else {
+            return Ok(false);
+        };
+        let length = utf16_len(&current);
+        let start = start.min(length);
+        let end = end.min(length).max(start);
+        let (updated, _) = replace_utf16_range(&current, start, end, replacement);
+        let selection_changed = self.adjust_ranges_for_character_data_edit(
+            path,
+            start,
+            end.saturating_sub(start),
+            utf16_len(replacement),
+        );
         let changed = self
             .document
             .borrow_mut()
-            .set_text_node_data(path, text);
+            .set_text_node_data(path, updated);
         if changed && selection_changed {
             self.dispatch_document_selection_change()?;
         }
@@ -6955,6 +6994,49 @@ impl ScriptRuntime {
             return Ok(false);
         }
         self.replace_text_node_data_at(&path, text)
+    }
+
+    fn attached_text_node_data(
+        &self,
+        handle: &ElementHandle,
+    ) -> Result<(NodePath, String), ScriptError> {
+        if !attached_is_text(handle) {
+            return Err(runtime_error("CharacterData method requires a text node"));
+        }
+        let path = attached_path(handle)
+            .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
+        let text = self
+            .document
+            .borrow()
+            .node_text_content(&path)
+            .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
+        Ok((path, text))
+    }
+
+    fn character_data_offset(
+        arguments: &[Value],
+        index: usize,
+        length: usize,
+    ) -> Result<usize, ScriptError> {
+        let offset = arguments
+            .get(index)
+            .map(Value::number)
+            .transpose()?
+            .map(selection_offset)
+            .unwrap_or_default();
+        if offset > length {
+            return Err(runtime_error("CharacterData offset exceeds text length"));
+        }
+        Ok(offset)
+    }
+
+    fn character_data_count(arguments: &[Value], index: usize) -> Result<usize, ScriptError> {
+        arguments
+            .get(index)
+            .map(Value::number)
+            .transpose()?
+            .map(selection_offset)
+            .ok_or_else(|| runtime_error("CharacterData count is required"))
     }
 
     fn set_element_text_content(
@@ -8671,6 +8753,68 @@ impl ScriptRuntime {
             }
             Builtin::ElementNormalize(handle) => {
                 self.normalize_element_handle(&handle)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementSubstringData(handle) => {
+                let (_, text) = self.attached_text_node_data(&handle)?;
+                let length = utf16_len(&text);
+                let offset = Self::character_data_offset(&arguments, 0, length)?;
+                let count = Self::character_data_count(&arguments, 1)?;
+                Ok(Value::String(utf16_substring(
+                    &text,
+                    offset,
+                    offset.saturating_add(count).min(length),
+                )))
+            }
+            Builtin::ElementAppendData(handle) => {
+                let (path, text) = self.attached_text_node_data(&handle)?;
+                let replacement = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let length = utf16_len(&text);
+                self.replace_text_node_data_range(&path, length, length, &replacement)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementInsertData(handle) => {
+                let (path, text) = self.attached_text_node_data(&handle)?;
+                let length = utf16_len(&text);
+                let offset = Self::character_data_offset(&arguments, 0, length)?;
+                let replacement = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.replace_text_node_data_range(&path, offset, offset, &replacement)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementDeleteData(handle) => {
+                let (path, text) = self.attached_text_node_data(&handle)?;
+                let length = utf16_len(&text);
+                let offset = Self::character_data_offset(&arguments, 0, length)?;
+                let count = Self::character_data_count(&arguments, 1)?;
+                self.replace_text_node_data_range(
+                    &path,
+                    offset,
+                    offset.saturating_add(count).min(length),
+                    "",
+                )?;
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementReplaceData(handle) => {
+                let (path, text) = self.attached_text_node_data(&handle)?;
+                let length = utf16_len(&text);
+                let offset = Self::character_data_offset(&arguments, 0, length)?;
+                let count = Self::character_data_count(&arguments, 1)?;
+                let replacement = arguments
+                    .get(2)
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                self.replace_text_node_data_range(
+                    &path,
+                    offset,
+                    offset.saturating_add(count).min(length),
+                    &replacement,
+                )?;
                 Ok(Value::Undefined)
             }
             Builtin::RangeSetStart(range) => {
@@ -12003,10 +12147,11 @@ fn adjust_range_boundary_for_replacement(
     );
 }
 
-fn adjust_range_boundary_for_character_data_replacement(
+fn adjust_range_boundary_for_character_data_edit(
     boundary: &mut RangeBoundary,
     target: &[usize],
     target_start: usize,
+    replacement_start: usize,
     old_length: usize,
     new_length: usize,
     document: &Rc<RefCell<Document>>,
@@ -12015,14 +12160,12 @@ fn adjust_range_boundary_for_character_data_replacement(
         return;
     };
     if path == target {
-        boundary.offset = if boundary.offset <= old_length {
-            0
-        } else {
-            boundary
-                .offset
-                .saturating_sub(old_length)
-                .saturating_add(new_length)
-        };
+        boundary.offset = remap_range_offset(
+            boundary.offset,
+            replacement_start,
+            old_length,
+            new_length,
+        );
         return;
     }
     if !target.starts_with(&path) {
@@ -12032,7 +12175,9 @@ fn adjust_range_boundary_for_character_data_replacement(
     let Some(ancestor_start) = document.node_text_offset(&path) else {
         return;
     };
-    let replacement_start = target_start.saturating_sub(ancestor_start);
+    let replacement_start = target_start
+        .saturating_add(replacement_start)
+        .saturating_sub(ancestor_start);
     boundary.offset = remap_range_offset(
         boundary.offset,
         replacement_start,
@@ -17472,6 +17617,59 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("hello|1|true|true:0:0|true")
+        );
+    }
+
+    #[test]
+    fn character_data_methods_edit_utf16_ranges_in_place() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="unicode">A😀B</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const range = document.createRange();
+                range.setStart(text, 1);
+                range.setEnd(text, 4);
+                const root = document.getElementById("root");
+                const ancestor = document.createRange();
+                ancestor.setStart(root, 1);
+                ancestor.setEnd(root, 5);
+                const selection = window.getSelection();
+                selection.addRange(range);
+                let changes = 0;
+                document.addEventListener("selectionchange", () => changes = changes + 1);
+                const substring = text.substringData(1, 3);
+                text.insertData(2, "X");
+                const inserted = text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
+                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString();
+                text.deleteData(1, 2);
+                const deleted = text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
+                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString();
+                text.replaceData(1, 2, "YY");
+                const replaced = text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
+                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString();
+                text.appendData("!");
+                const unicode = document.getElementById("unicode").firstChild;
+                const emoji = unicode.substringData(1, 2);
+                const status = document.getElementById("status");
+                status.textContent = substring + "|" + inserted + "|" + deleted + "|" + replaced + "|" +
+                    text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
+                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() +
+                    "|" + changes + "|" + emoji;
+                "#,
+            )
+            .expect("CharacterData methods should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ell|heXllo:1:5:eXll|1:6:eXllo|hllo:1:3:ll|1:4:llo|hYYo:1:3:YY|1:4:YYo|hYYo!:1:3:YY|1:4:YYo|2|😀")
         );
     }
 

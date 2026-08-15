@@ -2,7 +2,7 @@
 
 Research snapshot: 2026-08-13
 
-The custom DOM path now covers live text-node `splitText()` and `normalize()` operations, including identity-preserving merges, empty-node removal, and Range boundary retargeting.
+The custom DOM path now covers live text-node `splitText()` and `normalize()` operations, including identity-preserving merges, empty-node removal, and Range boundary retargeting. CharacterData substring and mutation methods share the UTF-16 edit path and preserve the same live ranges.
 
 ## Decision
 
