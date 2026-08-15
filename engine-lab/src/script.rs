@@ -372,6 +372,13 @@ enum Builtin {
     Uint8ArraySlice(Uint8ArrayHandle),
     Uint8ArraySubarray(Uint8ArrayHandle),
     StringSlice(String),
+    StringIncludes(String),
+    StringStartsWith(String),
+    StringEndsWith(String),
+    StringTrim(String),
+    StringToLowerCase(String),
+    StringToUpperCase(String),
+    StringSplit(String),
     MapGet(MapHandle),
     MapSet(MapHandle),
     MapKeys(MapHandle),
@@ -5233,6 +5240,13 @@ impl ScriptRuntime {
             Value::String(string) => match property {
                 "length" => Ok(Value::Number(string.chars().count() as f64)),
                 "slice" => Ok(Value::Builtin(Builtin::StringSlice(string))),
+                "includes" => Ok(Value::Builtin(Builtin::StringIncludes(string))),
+                "startsWith" => Ok(Value::Builtin(Builtin::StringStartsWith(string))),
+                "endsWith" => Ok(Value::Builtin(Builtin::StringEndsWith(string))),
+                "trim" => Ok(Value::Builtin(Builtin::StringTrim(string))),
+                "toLowerCase" => Ok(Value::Builtin(Builtin::StringToLowerCase(string))),
+                "toUpperCase" => Ok(Value::Builtin(Builtin::StringToUpperCase(string))),
+                "split" => Ok(Value::Builtin(Builtin::StringSplit(string))),
                 _ => Err(runtime_error(format!("string has no property {property}"))),
             },
             Value::Set(set) => match property {
@@ -9193,6 +9207,68 @@ impl ScriptRuntime {
                     .take(end.saturating_sub(start))
                     .collect();
                 Ok(Value::String(value))
+            }
+            Builtin::StringIncludes(string) => {
+                let needle = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                let start = arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0);
+                let start = if start.is_finite() && start > 0.0 {
+                    start.floor() as usize
+                } else {
+                    0
+                };
+                let haystack = string.chars().skip(start).collect::<String>();
+                Ok(Value::Bool(haystack.contains(&needle)))
+            }
+            Builtin::StringStartsWith(string) => {
+                let needle = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                Ok(Value::Bool(string.starts_with(&needle)))
+            }
+            Builtin::StringEndsWith(string) => {
+                let needle = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_else(|| "undefined".to_string());
+                Ok(Value::Bool(string.ends_with(&needle)))
+            }
+            Builtin::StringTrim(string) => Ok(Value::String(string.trim().to_string())),
+            Builtin::StringToLowerCase(string) => Ok(Value::String(string.to_lowercase())),
+            Builtin::StringToUpperCase(string) => Ok(Value::String(string.to_uppercase())),
+            Builtin::StringSplit(string) => {
+                let parts = match arguments.first().map(Value::resolve) {
+                    None | Some(Value::Undefined) => vec![string],
+                    Some(separator) => {
+                        let separator = separator.string_value();
+                        if separator.is_empty() {
+                            string
+                                .chars()
+                                .map(|character| character.to_string())
+                                .collect()
+                        } else {
+                            string
+                                .split(&separator)
+                                .map(str::to_string)
+                                .collect()
+                        }
+                    }
+                };
+                if parts.len() > MAX_RUNTIME_ARRAY_LENGTH {
+                    return Err(runtime_error(
+                        "string split exceeds the deterministic array limit",
+                    ));
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(
+                    parts.into_iter().map(Value::String).collect(),
+                ))))
             }
             Builtin::SetHas(set) => {
                 let candidate = arguments.first().cloned().unwrap_or(Value::Undefined);
@@ -25673,6 +25749,32 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.filter callback must be a function")
+        );
+    }
+
+    #[test]
+    fn string_methods_cover_search_case_trim_and_split() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const source = "  Ceri Engine  ";
+                const words = source.trim().toLowerCase().split(" ");
+                status.textContent = source.includes("Engine") + "|" + source.includes("Engine", 4) + "|" +
+                  source.startsWith("  ") + "|" + source.endsWith("  ") + "|" + source.trim() + "|" +
+                  source.toUpperCase() + "|" + words.join(",") + "|" + "a".split().join("|");
+                "#,
+            )
+            .expect("string methods should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|true|true|true|Ceri Engine|  CERI ENGINE  |ceri,engine|a")
         );
     }
 
