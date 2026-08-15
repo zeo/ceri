@@ -114,6 +114,8 @@ enum Value {
     Location(LocationHandle),
     Navigator,
     Clipboard,
+    Crypto,
+    SubtleCrypto,
     ModuleImport(AppUrl),
     History(HistoryHandle),
     Url(UrlHandle),
@@ -304,6 +306,7 @@ enum Builtin {
     ElementClassListContains(ElementHandle),
     ElementClassListToggle(ElementHandle),
     Fetch,
+    SubtleDigest,
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
     RequestClone(RequestHandle),
@@ -1328,6 +1331,7 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("navigator".to_string(), Value::Navigator);
+            values.values.insert("crypto".to_string(), Value::Crypto);
             values
                 .values
                 .insert("location".to_string(), Value::Location(location.clone()));
@@ -3817,6 +3821,7 @@ impl ScriptRuntime {
             Value::Window => match property {
                 "document" => Ok(Value::Document),
                 "navigator" => Ok(Value::Navigator),
+                "crypto" => Ok(Value::Crypto),
                 "location" => self
                     .global
                     .borrow()
@@ -3885,6 +3890,18 @@ impl ScriptRuntime {
                 "writeText" => Ok(Value::Builtin(Builtin::ClipboardWriteText)),
                 _ => Err(runtime_error(format!(
                     "clipboard has no property {property}"
+                ))),
+            },
+            Value::Crypto => match property {
+                "subtle" => Ok(Value::SubtleCrypto),
+                _ => Err(runtime_error(format!(
+                    "crypto has no property {property}"
+                ))),
+            },
+            Value::SubtleCrypto => match property {
+                "digest" => Ok(Value::Builtin(Builtin::SubtleDigest)),
+                _ => Err(runtime_error(format!(
+                    "SubtleCrypto has no property {property}"
                 ))),
             },
             Value::Console if property == "log" => Ok(Value::Builtin(Builtin::ConsoleLog)),
@@ -9854,6 +9871,28 @@ impl ScriptRuntime {
                 }
             }
             Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments))),
+            Builtin::SubtleDigest => {
+                let algorithm = match subtle_algorithm_name(arguments.first()) {
+                    Ok(algorithm) => algorithm,
+                    Err(error) => return Ok(Value::Promise(self.rejected_promise_value(
+                        subtle_error_value("TypeError", error.message),
+                    ))),
+                };
+                let Some(Value::Bytes(bytes)) = arguments.get(1).map(Value::resolve) else {
+                    return Ok(Value::Promise(self.rejected_promise_value(subtle_error_value(
+                        "TypeError",
+                        "SubtleCrypto.digest expects an ArrayBuffer",
+                    ))));
+                };
+                match subtle_digest(&algorithm, bytes.as_ref()) {
+                    Ok(digest) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
+                        Rc::new(digest),
+                    )))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise_value(
+                        subtle_error_value("NotSupportedError", error),
+                    ))),
+                }
+            }
             Builtin::PromiseThen(promise) => {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
             }
@@ -11714,6 +11753,8 @@ impl Value {
             Self::Window => "[window]".to_string(),
             Self::Navigator => "[object Navigator]".to_string(),
             Self::Clipboard => "[object Clipboard]".to_string(),
+            Self::Crypto => "[object Crypto]".to_string(),
+            Self::SubtleCrypto => "[object SubtleCrypto]".to_string(),
             Self::Location(value) => value.borrow().to_string(),
             Self::ModuleImport(_) => "[object Module]".to_string(),
             Self::History(_) => "[object History]".to_string(),
@@ -11773,6 +11814,15 @@ fn abort_error_value() -> Value {
     Value::Error(Rc::new(ErrorData {
         name: "AbortError".to_string(),
         message: "The operation was aborted".to_string(),
+        code: None,
+        class_name: "Error".to_string(),
+    }))
+}
+
+fn subtle_error_value(name: &str, message: impl Into<String>) -> Value {
+    Value::Error(Rc::new(ErrorData {
+        name: name.to_string(),
+        message: message.into(),
         code: None,
         class_name: "Error".to_string(),
     }))
@@ -13544,6 +13594,8 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Window
         | Value::Navigator
         | Value::Clipboard
+        | Value::Crypto
+        | Value::SubtleCrypto
         | Value::Location(_)
         | Value::ModuleImport(_)
         | Value::History(_)
@@ -13592,6 +13644,424 @@ fn value_typeof(value: &Value) -> &'static str {
     }
 }
 
+fn subtle_algorithm_name(value: Option<&Value>) -> Result<String, ScriptError> {
+    let value = value.ok_or_else(|| runtime_error("SubtleCrypto.digest requires an algorithm"))?;
+    let name = match value.resolve() {
+        Value::String(name) => name,
+        Value::Object(object) => object
+            .borrow()
+            .get("name")
+            .cloned()
+            .ok_or_else(|| runtime_error("SubtleCrypto.digest algorithm has no name"))?
+            .string_value(),
+        _ => return Err(runtime_error("SubtleCrypto.digest algorithm must be a string")),
+    };
+    Ok(name.to_ascii_uppercase())
+}
+
+fn subtle_digest(algorithm: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    match algorithm {
+        "SHA-1" => Ok(sha1_digest(data)),
+        "SHA-256" => Ok(sha256_digest(data)),
+        "SHA-384" => Ok(sha512_digest(data, SHA384_INITIAL_STATE, 6)),
+        "SHA-512" => Ok(sha512_digest(data, SHA512_INITIAL_STATE, 8)),
+        _ => Err(format!(
+            "SubtleCrypto.digest does not support algorithm {algorithm}"
+        )),
+    }
+}
+
+fn sha1_digest(data: &[u8]) -> Vec<u8> {
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
+
+    let mut state = [
+        0x6745_2301u32,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
+    for chunk in padded.chunks_exact(64) {
+        let mut words = [0u32; 80];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..80 {
+            words[index] = (words[index - 3]
+                ^ words[index - 8]
+                ^ words[index - 14]
+                ^ words[index - 16])
+                .rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = state;
+        for (index, word) in words.iter().enumerate() {
+            let (function, constant) = match index {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let temporary = a
+                .rotate_left(5)
+                .wrapping_add(function)
+                .wrapping_add(e)
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temporary;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+    }
+    let mut digest = Vec::with_capacity(20);
+    for word in state {
+        digest.extend_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6A09_E667,
+    0xBB67_AE85,
+    0x3C6E_F372,
+    0xA54F_F53A,
+    0x510E_527F,
+    0x9B05_688C,
+    0x1F83_D9AB,
+    0x5BE0_CD19,
+];
+
+const SHA256_ROUND_CONSTANTS: [u32; 64] = [
+    0x428A_2F98,
+    0x7137_4491,
+    0xB5C0_FBCF,
+    0xE9B5_DBA5,
+    0x3956_C25B,
+    0x59F1_11F1,
+    0x923F_82A4,
+    0xAB1C_5ED5,
+    0xD807_AA98,
+    0x1283_5B01,
+    0x2431_85BE,
+    0x550C_7DC3,
+    0x72BE_5D74,
+    0x80DE_B1FE,
+    0x9BDC_06A7,
+    0xC19B_F174,
+    0xE49B_69C1,
+    0xEFBE_4786,
+    0x0FC1_9DC6,
+    0x240C_A1CC,
+    0x2DE9_2C6F,
+    0x4A74_84AA,
+    0x5CB0_A9DC,
+    0x76F9_88DA,
+    0x983E_5152,
+    0xA831_C66D,
+    0xB003_27C8,
+    0xBF59_7FC7,
+    0xC6E0_0BF3,
+    0xD5A7_9147,
+    0x06CA_6351,
+    0x1429_2967,
+    0x27B7_0A85,
+    0x2E1B_2138,
+    0x4D2C_6DFC,
+    0x5338_0D13,
+    0x650A_7354,
+    0x766A_0ABB,
+    0x81C2_C92E,
+    0x9272_2C85,
+    0xA2BF_E8A1,
+    0xA81A_664B,
+    0xC24B_8B70,
+    0xC76C_51A3,
+    0xD192_E819,
+    0xD699_0624,
+    0xF40E_3585,
+    0x106A_A070,
+    0x19A4_C116,
+    0x1E37_6C08,
+    0x2748_774C,
+    0x34B0_BCB5,
+    0x391C_0CB3,
+    0x4ED8_AA4A,
+    0x5B9C_CA4F,
+    0x682E_6FF3,
+    0x748F_82EE,
+    0x78A5_636F,
+    0x84C8_7814,
+    0x8CC7_0208,
+    0x90BE_FFFA,
+    0xA450_6CEB,
+    0xBEF9_A3F7,
+    0xC671_78F2,
+];
+
+fn sha256_digest(data: &[u8]) -> Vec<u8> {
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
+
+    let mut state = SHA256_INITIAL_STATE;
+    for chunk in padded.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let small_sigma0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let small_sigma1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(small_sigma0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(small_sigma1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (index, word) in words.iter().enumerate() {
+            let big_sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ ((!e) & g);
+            let temporary1 = h
+                .wrapping_add(big_sigma1)
+                .wrapping_add(choice)
+                .wrapping_add(SHA256_ROUND_CONSTANTS[index])
+                .wrapping_add(*word);
+            let big_sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temporary2 = big_sigma0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temporary1);
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1.wrapping_add(temporary2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    let mut digest = Vec::with_capacity(32);
+    for word in state {
+        digest.extend_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+const SHA384_INITIAL_STATE: [u64; 8] = [
+    0xCBBB_9D5D_C105_9ED8,
+    0x629A_292A_367C_D507,
+    0x9159_015A_3070_DD17,
+    0x152F_ECD8_F70E_5939,
+    0x6733_2667_FFC0_0B31,
+    0x8EB4_4A87_6858_1511,
+    0xDB0C_2E0D_64F9_8FA7,
+    0x47B5_481D_BEFA_4FA4,
+];
+
+const SHA512_INITIAL_STATE: [u64; 8] = [
+    0x6A09_E667_F3BC_C908,
+    0xBB67_AE85_84CA_A73B,
+    0x3C6E_F372_FE94_F82B,
+    0xA54F_F53A_5F1D_36F1,
+    0x510E_527F_ADE6_82D1,
+    0x9B05_688C_2B3E_6C1F,
+    0x1F83_D9AB_FB41_BD6B,
+    0x5BE0_CD19_137E_2179,
+];
+
+const SHA512_ROUND_CONSTANTS: [u64; 80] = [
+    0x428A_2F98_D728_AE22,
+    0x7137_4491_23EF_65CD,
+    0xB5C0_FBCF_EC4D_3B2F,
+    0xE9B5_DBA5_8189_DBBC,
+    0x3956_C25B_F348_B538,
+    0x59F1_11F1_B605_D019,
+    0x923F_82A4_AF19_4F9B,
+    0xAB1C_5ED5_DA6D_8118,
+    0xD807_AA98_A303_0242,
+    0x1283_5B01_4570_6FBE,
+    0x2431_85BE_4EE4_B28C,
+    0x550C_7DC3_D5FF_B4E2,
+    0x72BE_5D74_F27B_896F,
+    0x80DE_B1FE_3B16_96B1,
+    0x9BDC_06A7_25C7_1235,
+    0xC19B_F174_CF69_2694,
+    0xE49B_69C1_9EF1_4AD2,
+    0xEFBE_4786_384F_25E3,
+    0x0FC1_9DC6_8B8C_D5B5,
+    0x240C_A1CC_77AC_9C65,
+    0x2DE9_2C6F_592B_0275,
+    0x4A74_84AA_6EA6_E483,
+    0x5CB0_A9DC_BD41_FBD4,
+    0x76F9_88DA_8311_53B5,
+    0x983E_5152_EE66_DFAB,
+    0xA831_C66D_2DB4_3210,
+    0xB003_27C8_98FB_213F,
+    0xBF59_7FC7_BEEF_0EE4,
+    0xC6E0_0BF3_3DA8_8FC2,
+    0xD5A7_9147_930A_A725,
+    0x06CA_6351_E003_826F,
+    0x1429_2967_0A0E_6E70,
+    0x27B7_0A85_46D2_2FFC,
+    0x2E1B_2138_5C26_C926,
+    0x4D2C_6DFC_5AC4_2AED,
+    0x5338_0D13_9D95_B3DF,
+    0x650A_7354_8BAF_63DE,
+    0x766A_0ABB_3C77_B2A8,
+    0x81C2_C92E_47ED_AEE6,
+    0x9272_2C85_1482_353B,
+    0xA2BF_E8A1_4CF1_0364,
+    0xA81A_664B_BC42_3001,
+    0xC24B_8B70_D0F8_9791,
+    0xC76C_51A3_0654_BE30,
+    0xD192_E819_D6EF_5218,
+    0xD699_0624_5565_A910,
+    0xF40E_3585_5771_202A,
+    0x106A_A070_32BB_D1B8,
+    0x19A4_C116_B8D2_D0C8,
+    0x1E37_6C08_5141_AB53,
+    0x2748_774C_DF8E_EB99,
+    0x34B0_BCB5_E19B_48A8,
+    0x391C_0CB3_C5C9_5A63,
+    0x4ED8_AA4A_E341_8ACB,
+    0x5B9C_CA4F_7763_E373,
+    0x682E_6FF3_D6B2_B8A3,
+    0x748F_82EE_5DEF_B2FC,
+    0x78A5_636F_4317_2F60,
+    0x84C8_7814_A1F0_AB72,
+    0x8CC7_0208_1A64_39EC,
+    0x90BE_FFFA_2363_1E28,
+    0xA450_6CEB_DE82_BDE9,
+    0xBEF9_A3F7_B2C6_7915,
+    0xC671_78F2_E372_532B,
+    0xCA27_3ECE_EA26_619C,
+    0xD186_B8C7_21C0_C207,
+    0xEADA_7DD6_CDE0_EB1E,
+    0xF57D_4F7F_EE6E_D178,
+    0x06F0_67AA_7217_6FBA,
+    0x0A63_7DC5_A2C8_98A6,
+    0x113F_9804_BEF9_0DAE,
+    0x1B71_0B35_131C_471B,
+    0x28DB_77F5_2304_7D84,
+    0x32CA_AB7B_40C7_2493,
+    0x3C9E_BE0A_15C9_BEBC,
+    0x431D_67C4_9C10_0D4C,
+    0x4CC5_D4BE_CB3E_42B6,
+    0x597F_299C_FC65_7E2A,
+    0x5FCB_6FAB_3AD6_FAEC,
+    0x6C44_198C_4A47_5817,
+];
+
+fn sha512_digest(data: &[u8], initial_state: [u64; 8], output_words: usize) -> Vec<u8> {
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 128 != 112 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&(data.len() as u128 * 8).to_be_bytes());
+
+    let mut state = initial_state;
+    for chunk in padded.chunks_exact(128) {
+        let mut words = [0u64; 80];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            let offset = index * 8;
+            *word = u64::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+                chunk[offset + 4],
+                chunk[offset + 5],
+                chunk[offset + 6],
+                chunk[offset + 7],
+            ]);
+        }
+        for index in 16..80 {
+            let small_sigma0 = words[index - 15].rotate_right(1)
+                ^ words[index - 15].rotate_right(8)
+                ^ (words[index - 15] >> 7);
+            let small_sigma1 = words[index - 2].rotate_right(19)
+                ^ words[index - 2].rotate_right(61)
+                ^ (words[index - 2] >> 6);
+            words[index] = words[index - 16]
+                .wrapping_add(small_sigma0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(small_sigma1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (index, word) in words.iter().enumerate() {
+            let big_sigma1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let choice = (e & f) ^ ((!e) & g);
+            let temporary1 = h
+                .wrapping_add(big_sigma1)
+                .wrapping_add(choice)
+                .wrapping_add(SHA512_ROUND_CONSTANTS[index])
+                .wrapping_add(*word);
+            let big_sigma0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temporary2 = big_sigma0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temporary1);
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1.wrapping_add(temporary2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    let mut digest = Vec::with_capacity(output_words * 8);
+    for word in state.into_iter().take(output_words) {
+        digest.extend_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
 fn error_handle(value: &Value) -> ErrorHandle {
     match value.resolve() {
         Value::Error(error) => error.clone(),
@@ -13625,7 +14095,10 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
-        (Value::Navigator, Value::Navigator) | (Value::Clipboard, Value::Clipboard) => true,
+        (Value::Navigator, Value::Navigator)
+        | (Value::Clipboard, Value::Clipboard)
+        | (Value::Crypto, Value::Crypto)
+        | (Value::SubtleCrypto, Value::SubtleCrypto) => true,
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),
@@ -19947,6 +20420,104 @@ mod tests {
             Some("hello world|2|yes|42|2|true")
         );
         assert_eq!(requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn subtle_digest_matches_hash_vectors_and_script_promises() {
+        let hex_bytes = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).expect("hex should be UTF-8"), 16)
+                        .expect("hex should parse")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            subtle_digest("SHA-1", b"abc").expect("SHA-1 should be supported"),
+            hex_bytes("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+        assert_eq!(
+            subtle_digest("SHA-256", b"abc").expect("SHA-256 should be supported"),
+            hex_bytes("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            subtle_digest("SHA-384", b"abc").expect("SHA-384 should be supported"),
+            hex_bytes("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")
+        );
+        assert_eq!(
+            subtle_digest("SHA-512", b"abc").expect("SHA-512 should be supported"),
+            hex_bytes("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+        );
+        let million_a = vec![b'a'; 1_000_000];
+        assert_eq!(
+            subtle_digest("SHA-1", &million_a).expect("SHA-1 should be supported"),
+            hex_bytes("34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+        );
+        assert_eq!(
+            subtle_digest("SHA-256", &million_a).expect("SHA-256 should be supported"),
+            hex_bytes("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+        );
+        assert_eq!(
+            subtle_digest("SHA-384", &million_a).expect("SHA-384 should be supported"),
+            hex_bytes("9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985")
+        );
+        assert_eq!(
+            subtle_digest("SHA-512", &million_a).expect("SHA-512 should be supported"),
+            hex_bytes("e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
+        );
+
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const source = new Blob(["abc"]);
+                source.arrayBuffer().then((bytes) => {
+                    crypto.subtle.digest("sha-1", bytes).then((sha1) => {
+                        crypto.subtle.digest("SHA-256", bytes).then((sha256) => {
+                            crypto.subtle.digest({ name: "SHA-384" }, bytes).then((sha384) => {
+                                crypto.subtle.digest("SHA-512", bytes).then((sha512) => {
+                                    crypto.subtle.digest("MD5", bytes).catch((error) => {
+                                        status.textContent = (window.crypto === crypto) + ":" +
+                                            (crypto.subtle === window.crypto.subtle) + "|" +
+                                            sha1.byteLength + "|" +
+                                            sha256.byteLength + "|" +
+                                            sha384.byteLength + "|" +
+                                            sha512.byteLength + "|" +
+                                            error.message;
+                                    });
+                                });
+                            });
+                        });
+                    }, (error) => { status.textContent = "sha1:" + error.message; });
+                }, (error) => { status.textContent = "array:" + error.message; });
+                "#,
+            )
+            .expect("subtle digest should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true:true|20|32|48|64|SubtleCrypto.digest does not support algorithm MD5")
+        );
+        runtime
+            .execute(
+                r#"
+                document.getElementById("status").textContent = "idle";
+                crypto.subtle.digest("SHA-256", "abc").catch((error) => {
+                    document.getElementById("status").textContent = error.message;
+                });
+                "#,
+            )
+            .expect("digest should reject non-ArrayBuffer input");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("SubtleCrypto.digest expects an ArrayBuffer")
+        );
     }
 
     #[test]
