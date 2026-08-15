@@ -38,6 +38,7 @@ The current slice implements:
 - `replaceChildren()` direct-child replacement that keeps passed handles and listeners reattachable
 - `before()` and `after()` mixed sibling insertion through the same stable-node movement path
 - `replaceWith()` mixed sibling replacement that detaches the anchor through the live Range and listener path
+- `insertAdjacentHTML()` fragment insertion at all four positions through the existing parser and node insertion path
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation

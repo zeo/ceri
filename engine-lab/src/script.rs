@@ -243,6 +243,7 @@ enum Builtin {
     ElementBefore(ElementHandle),
     ElementAfter(ElementHandle),
     ElementReplaceWith(ElementHandle),
+    ElementInsertAdjacentHtml(ElementHandle),
     ElementRemoveChild(ElementHandle),
     ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
@@ -4174,6 +4175,9 @@ impl ScriptRuntime {
                     "before" => Value::Builtin(Builtin::ElementBefore(handle.clone())),
                     "after" => Value::Builtin(Builtin::ElementAfter(handle.clone())),
                     "replaceWith" => Value::Builtin(Builtin::ElementReplaceWith(handle.clone())),
+                    "insertAdjacentHTML" => {
+                        Value::Builtin(Builtin::ElementInsertAdjacentHtml(handle.clone()))
+                    }
                     "removeChild" => {
                         if path.is_none() {
                             return Err(runtime_error("detached element cannot remove children"));
@@ -10489,6 +10493,69 @@ impl ScriptRuntime {
                 self.detach_child(&parent_path, &anchor)?;
                 Ok(Value::Undefined)
             }
+            Builtin::ElementInsertAdjacentHtml(anchor) => {
+                let position = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if !matches!(
+                    position.as_str(),
+                    "beforebegin" | "afterbegin" | "beforeend" | "afterend"
+                ) {
+                    return Err(runtime_error("insertAdjacentHTML position is invalid"));
+                }
+                let source = arguments
+                    .get(1)
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let fragment = Document::parse(&source)
+                    .map_err(|error| runtime_error(error.to_string()))?;
+                let Some(anchor_path) = attached_path(&anchor) else {
+                    return Ok(Value::Undefined);
+                };
+                let parent_path = if matches!(position.as_str(), "afterbegin" | "beforeend") {
+                    anchor_path.clone()
+                } else {
+                    let Some(parent) = self.document.borrow().parent_path(&anchor_path) else {
+                        return Ok(Value::Undefined);
+                    };
+                    parent
+                };
+                let parent = attached_handle(parent_path, &self.document)
+                    .ok_or_else(|| runtime_error("insertAdjacentHTML parent is unavailable"))?;
+                let reference = match position.as_str() {
+                    "beforebegin" => Some(anchor.clone()),
+                    "afterbegin" => self
+                        .document
+                        .borrow()
+                        .child_paths(&anchor_path)
+                        .and_then(|children| children.into_iter().next())
+                        .and_then(|path| attached_handle(path, &self.document)),
+                    "afterend" => self
+                        .document
+                        .borrow()
+                        .sibling_path(&anchor_path, true)
+                        .and_then(|path| attached_handle(path, &self.document)),
+                    "beforeend" => None,
+                    _ => unreachable!("insertAdjacentHTML position was validated"),
+                };
+                for node in fragment.root.children {
+                    let child = detached_handle_from_node(node);
+                    if let Some(reference) = &reference {
+                        self.call_builtin(
+                            Builtin::ElementInsertBefore(parent.clone()),
+                            vec![Value::Element(child), Value::Element(reference.clone())],
+                        )?;
+                    } else {
+                        self.call_builtin(
+                            Builtin::ElementAppendChild(parent.clone()),
+                            vec![Value::Element(child)],
+                        )?;
+                    }
+                }
+                Ok(Value::Undefined)
+            }
             Builtin::ElementInsertBefore(parent) => {
                 let parent_path = attached_path(&parent)
                     .ok_or_else(|| runtime_error("insertBefore parent is no longer in the document"))?;
@@ -11365,6 +11432,14 @@ fn child_handle_from_value(value: &Value) -> ElementHandle {
             detached_text_element(&value.string_value()),
         ))),
     }
+}
+
+fn detached_handle_from_node(node: Node) -> ElementHandle {
+    let element = match node {
+        Node::Element(element) => element,
+        Node::Text(text) => detached_text_element(&text),
+    };
+    Rc::new(RefCell::new(ElementLocation::Detached(element)))
 }
 
 fn is_detached_text_element(element: &Element) -> bool {
@@ -18452,6 +18527,40 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("oneprereplacementposttail|true:true:true:true:true:")
+        );
+    }
+
+    #[test]
+    fn insert_adjacent_html_handles_all_four_positions() {
+        let document = document(
+            r#"<main id="root"><p id="target">one<span id="marker">!</span>tail</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const target = document.getElementById("target");
+                const marker = document.getElementById("marker");
+                target.insertAdjacentHTML("afterbegin", "<i>start</i>head");
+                target.insertAdjacentHTML("beforeend", "<b>end</b>tail2");
+                marker.insertAdjacentHTML("beforebegin", "<em>pre</em>");
+                marker.insertAdjacentHTML("afterend", "<strong>post</strong>");
+                const status = document.getElementById("status");
+                status.textContent = target.textContent + "|" + target.children.length + ":" +
+                    (target.firstElementChild.textContent === "start") + ":" +
+                    (marker.previousElementSibling.textContent === "pre") + ":" +
+                    (marker.nextElementSibling.textContent === "post") + ":" +
+                    (target.lastElementChild.textContent === "end");
+                "#,
+            )
+            .expect("insertAdjacentHTML should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("startheadonepre!posttailendtail2|5:true:true:true:true")
         );
     }
 
