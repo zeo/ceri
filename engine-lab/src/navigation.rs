@@ -3405,7 +3405,14 @@ mod tests {
                     event.target.result
                         .transaction("notes", "readwrite")
                         .objectStore("notes")
-                        .put({ id: "record", value: "db" });
+                        .put({
+                            id: "record",
+                            value: "db",
+                            bytes: new Uint8Array([1, 2]),
+                            map: new Map([["kind", "structured"]]),
+                            blob: new Blob(["blob"], { type: "text/plain" }),
+                            file: new File(["file"], "report.txt", { type: "text/file" })
+                        });
                 };
             </script>"#,
         );
@@ -3423,7 +3430,9 @@ mod tests {
                             response.text().then(text => {
                                 document.getElementById("status").textContent =
                                     localStorage.getItem("token") + "|" + event.target.result.value +
-                                    "|" + statusCode + ":" + text;
+                                    "|" + event.target.result.bytes[1] + "|" +
+                                    event.target.result.map.size + "|" + event.target.result.blob.type +
+                                    "|" + event.target.result.file.name + "|" + statusCode + ":" + text;
                             });
                         });
                     };
@@ -3453,7 +3462,7 @@ mod tests {
                 .expect("status should exist");
             assert_eq!(
                 document.borrow().element_text_content(&status).as_deref(),
-                Some("disk|db|207:cached")
+                Some("disk|db|2|1|text/plain|report.txt|207:cached")
             );
         }
         std::fs::remove_dir_all(&storage_root).expect("test storage should be cleaned up");

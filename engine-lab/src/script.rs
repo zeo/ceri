@@ -12,7 +12,7 @@ use crate::paint::CanvasCommand;
 use crate::Color;
 use crate::wasm;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -177,6 +177,37 @@ enum Value {
     Builtin(Builtin),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum CloneValue {
+    Undefined,
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<CloneValue>),
+    Object(BTreeMap<String, CloneValue>),
+    Map(Vec<(CloneValue, CloneValue)>),
+    Set(Vec<CloneValue>),
+    Bytes(Vec<u8>),
+    Uint8Array(Vec<u8>),
+    Blob {
+        bytes: Vec<u8>,
+        mime_type: String,
+    },
+    File {
+        bytes: Vec<u8>,
+        mime_type: String,
+        name: String,
+        last_modified: i64,
+    },
+    Error {
+        name: String,
+        message: String,
+        code: Option<String>,
+        class_name: String,
+    },
+}
+
 #[derive(Clone)]
 enum Builtin {
     DocumentGetElementById,
@@ -281,6 +312,7 @@ enum Builtin {
     FileListItem(FileListHandle),
     JsonParse,
     JsonStringify,
+    StructuredClone,
     SetTimeout,
     ClearTimeout,
     RequestAnimationFrame,
@@ -1250,9 +1282,13 @@ struct AbortControllerData {
 
 const MAX_WORKER_MESSAGES: usize = 256;
 const MAX_WORKER_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_CLONE_DEPTH: usize = 64;
+const MAX_CLONE_NODES: usize = 16_384;
+const MAX_CLONE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLONE_STRING_BYTES: usize = 1024 * 1024;
 
 enum WorkerCommand {
-    Message(String),
+    Message(CloneValue),
     Terminate,
 }
 
@@ -1263,7 +1299,7 @@ enum WorkerScriptType {
 }
 
 enum WorkerEvent {
-    Message(String),
+    Message(CloneValue),
     Error(String),
 }
 
@@ -1529,6 +1565,10 @@ impl ScriptRuntime {
             );
             values.values.insert("console".to_string(), Value::Console);
             values.values.insert("JSON".to_string(), Value::Json);
+            values.values.insert(
+                "structuredClone".to_string(),
+                Value::Builtin(Builtin::StructuredClone),
+            );
             values
                 .values
                 .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
@@ -4070,6 +4110,7 @@ impl ScriptRuntime {
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "JSON" => Ok(Value::Json),
+                "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
                 "ArrayBuffer" => Ok(Value::ArrayBufferConstructor),
@@ -5660,7 +5701,7 @@ impl ScriptRuntime {
                         if worker_termination_flag.load(Ordering::Acquire) {
                             break;
                         }
-                        let data = match runtime.parse_json(&message) {
+                        let data = match message.into_value() {
                             Ok(data) => data,
                             Err(error) => {
                                 let _ = event_sender.try_send(WorkerEvent::Error(error.message));
@@ -5759,7 +5800,7 @@ impl ScriptRuntime {
                 processed += 1;
                 match event {
                     WorkerEvent::Message(message) => {
-                        let data = self.parse_json(&message)?;
+                        let data = message.into_value()?;
                         let mut worker_data = worker.borrow_mut();
                         let mut callbacks = worker_data
                             .listeners
@@ -9307,10 +9348,9 @@ impl ScriptRuntime {
                         "Worker transfer lists are not supported in this slice",
                     ));
                 }
-                let message = serialize_json(
-                    arguments
-                        .first()
-                        .unwrap_or(&Value::Undefined),
+                let message = clone_payload(
+                    arguments.first().unwrap_or(&Value::Undefined),
+                    MAX_CLONE_BYTES,
                 )?;
                 let worker = worker.borrow();
                 if worker.terminated {
@@ -9342,10 +9382,9 @@ impl ScriptRuntime {
                         "Worker transfer lists are not supported in this slice",
                     ));
                 }
-                let message = serialize_json(
-                    arguments
-                        .first()
-                        .unwrap_or(&Value::Undefined),
+                let message = clone_payload(
+                    arguments.first().unwrap_or(&Value::Undefined),
+                    MAX_CLONE_BYTES,
                 )?;
                 sender
                     .try_send(WorkerEvent::Message(message))
@@ -10498,6 +10537,17 @@ impl ScriptRuntime {
             Builtin::JsonStringify => {
                 let value = arguments.first().cloned().unwrap_or(Value::Undefined);
                 serialize_json(&value).map(Value::String)
+            }
+            Builtin::StructuredClone => {
+                if arguments.len() > 1
+                    && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
+                {
+                    return Err(runtime_error(
+                        "structuredClone transfer lists are not supported in this slice",
+                    ));
+                }
+                let value = arguments.first().unwrap_or(&Value::Undefined);
+                clone_payload(value, MAX_CLONE_BYTES).and_then(CloneValue::into_value)
             }
             Builtin::ClipboardReadText => {
                 let Some(provider) = self.clipboard_provider.as_ref() else {
@@ -13315,11 +13365,7 @@ impl ScriptRuntime {
     }
 
     fn indexed_db_clone_value(&mut self, value: &Value) -> Result<Value, ScriptError> {
-        let serialized = serialize_json(value)?;
-        if serialized.len() > MAX_IDB_VALUE_BYTES {
-            return Err(runtime_error("IndexedDB value exceeds the deterministic byte limit"));
-        }
-        self.parse_json(&serialized)
+        clone_payload(value, MAX_IDB_VALUE_BYTES)?.into_value()
     }
 }
 
@@ -13557,6 +13603,302 @@ impl Value {
     }
 }
 
+struct CloneContext {
+    max_bytes: usize,
+    bytes: usize,
+    nodes: usize,
+    active: HashSet<usize>,
+}
+
+impl CloneContext {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            bytes: 0,
+            nodes: 0,
+            active: HashSet::new(),
+        }
+    }
+
+    fn visit(&mut self, depth: usize) -> Result<(), ScriptError> {
+        if depth > MAX_CLONE_DEPTH {
+            return Err(data_clone_error("maximum nesting depth exceeded"));
+        }
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_CLONE_NODES {
+            return Err(data_clone_error("maximum value node count exceeded"));
+        }
+        Ok(())
+    }
+
+    fn account_bytes(&mut self, length: usize) -> Result<(), ScriptError> {
+        self.bytes = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| data_clone_error("maximum byte count exceeded"))?;
+        if self.bytes > self.max_bytes {
+            return Err(data_clone_error("maximum byte count exceeded"));
+        }
+        Ok(())
+    }
+
+    fn enter(&mut self, pointer: usize) -> Result<(), ScriptError> {
+        if !self.active.insert(pointer) {
+            return Err(data_clone_error("cyclic values are not supported in this slice"));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self, pointer: usize) {
+        self.active.remove(&pointer);
+    }
+}
+
+fn data_clone_error(message: impl Into<String>) -> ScriptError {
+    runtime_error(format!("DataCloneError: {}", message.into()))
+}
+
+fn clone_payload(value: &Value, max_bytes: usize) -> Result<CloneValue, ScriptError> {
+    let mut context = CloneContext::new(max_bytes);
+    clone_value(value, &mut context, 0)
+}
+
+fn clone_text(
+    value: &str,
+    context: &mut CloneContext,
+    label: &str,
+) -> Result<String, ScriptError> {
+    if value.len() > MAX_CLONE_STRING_BYTES {
+        return Err(data_clone_error(format!("{label} is too large")));
+    }
+    context.account_bytes(value.len())?;
+    Ok(value.to_string())
+}
+
+fn clone_value(
+    value: &Value,
+    context: &mut CloneContext,
+    depth: usize,
+) -> Result<CloneValue, ScriptError> {
+    context.visit(depth)?;
+    match value {
+        Value::Binding(binding, _) => {
+            let pointer = Rc::as_ptr(binding) as usize;
+            context.enter(pointer)?;
+            let value = binding.borrow().clone();
+            let result = clone_value(&value, context, depth + 1);
+            context.leave(pointer);
+            result
+        }
+        Value::Undefined => Ok(CloneValue::Undefined),
+        Value::Null => Ok(CloneValue::Null),
+        Value::Bool(value) => Ok(CloneValue::Bool(*value)),
+        Value::Number(value) => Ok(CloneValue::Number(*value)),
+        Value::String(value) => Ok(CloneValue::String(clone_text(
+            value,
+            context,
+            "string",
+        )?)),
+        Value::Object(object) => {
+            let pointer = Rc::as_ptr(object) as usize;
+            context.enter(pointer)?;
+            let properties = object.borrow().clone();
+            let result = properties
+                .into_iter()
+                .map(|(key, value)| {
+                    Ok((
+                        clone_text(&key, context, "object key")?,
+                        clone_value(&value, context, depth + 1)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, ScriptError>>();
+            context.leave(pointer);
+            result.map(CloneValue::Object)
+        }
+        Value::Array(array) => {
+            let pointer = Rc::as_ptr(array) as usize;
+            context.enter(pointer)?;
+            let values = array.borrow().clone();
+            let result = values
+                .iter()
+                .map(|value| clone_value(value, context, depth + 1))
+                .collect::<Result<Vec<_>, _>>();
+            context.leave(pointer);
+            result.map(CloneValue::Array)
+        }
+        Value::Map(map) => {
+            let pointer = Rc::as_ptr(map) as usize;
+            context.enter(pointer)?;
+            let entries = map.borrow().entries.clone();
+            let result = entries
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        clone_value(key, context, depth + 1)?,
+                        clone_value(value, context, depth + 1)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ScriptError>>();
+            context.leave(pointer);
+            result.map(CloneValue::Map)
+        }
+        Value::Set(set) => {
+            let pointer = Rc::as_ptr(set) as usize;
+            context.enter(pointer)?;
+            let values = set.borrow().values.clone();
+            let result = values
+                .iter()
+                .map(|value| clone_value(value, context, depth + 1))
+                .collect::<Result<Vec<_>, _>>();
+            context.leave(pointer);
+            result.map(CloneValue::Set)
+        }
+        Value::Bytes(bytes) => {
+            let pointer = Rc::as_ptr(bytes) as usize;
+            context.enter(pointer)?;
+            let bytes = bytes.borrow().clone();
+            let result = context
+                .account_bytes(bytes.len())
+                .map(|_| CloneValue::Bytes(bytes));
+            context.leave(pointer);
+            result
+        }
+        Value::Uint8Array(array) => {
+            let pointer = Rc::as_ptr(array) as usize;
+            context.enter(pointer)?;
+            let array = array.borrow();
+            let bytes = array
+                .buffer
+                .borrow()
+                .get(array.start..array.end)
+                .ok_or_else(|| data_clone_error("Uint8Array view is out of bounds"))?
+                .to_vec();
+            let result = context
+                .account_bytes(bytes.len())
+                .map(|_| CloneValue::Uint8Array(bytes));
+            drop(array);
+            context.leave(pointer);
+            result
+        }
+        Value::Blob(blob) => {
+            let pointer = Rc::as_ptr(blob) as usize;
+            context.enter(pointer)?;
+            let bytes = blob.bytes.clone();
+            let result = context.account_bytes(bytes.len()).and_then(|_| {
+                Ok(CloneValue::Blob {
+                    bytes,
+                    mime_type: clone_text(&blob.mime_type, context, "Blob type")?,
+                })
+            });
+            context.leave(pointer);
+            result
+        }
+        Value::File(file) => {
+            let pointer = Rc::as_ptr(file) as usize;
+            context.enter(pointer)?;
+            let bytes = file.bytes.clone();
+            let result = context.account_bytes(bytes.len()).and_then(|_| {
+                Ok(CloneValue::File {
+                    bytes,
+                    mime_type: clone_text(&file.mime_type, context, "File type")?,
+                    name: clone_text(&file.name, context, "File name")?,
+                    last_modified: file.last_modified,
+                })
+            });
+            context.leave(pointer);
+            result
+        }
+        Value::Error(error) => {
+            let pointer = Rc::as_ptr(error) as usize;
+            context.enter(pointer)?;
+            let result = (|| {
+                Ok(CloneValue::Error {
+                    name: clone_text(&error.name, context, "Error name")?,
+                    message: clone_text(&error.message, context, "Error message")?,
+                    code: error
+                        .code
+                        .as_deref()
+                        .map(|value| clone_text(value, context, "Error code"))
+                        .transpose()?,
+                    class_name: clone_text(&error.class_name, context, "Error class")?,
+                })
+            })();
+            context.leave(pointer);
+            result
+        }
+        Value::Symbol(_) => Err(data_clone_error("Symbol values cannot be cloned")),
+        _ => Err(data_clone_error("value is not cloneable")),
+    }
+}
+
+impl CloneValue {
+    fn into_value(self) -> Result<Value, ScriptError> {
+        Ok(match self {
+            Self::Undefined => Value::Undefined,
+            Self::Null => Value::Null,
+            Self::Bool(value) => Value::Bool(value),
+            Self::Number(value) => Value::Number(value),
+            Self::String(value) => Value::String(value),
+            Self::Array(values) => Value::Array(Rc::new(RefCell::new(
+                values
+                    .into_iter()
+                    .map(Self::into_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            Self::Object(properties) => Value::Object(Rc::new(RefCell::new(
+                properties
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, value.into_value()?)))
+                    .collect::<Result<BTreeMap<_, _>, ScriptError>>()?,
+            ))),
+            Self::Map(entries) => Value::Map(Rc::new(RefCell::new(MapData {
+                entries: entries
+                    .into_iter()
+                    .map(|(key, value)| Ok((key.into_value()?, value.into_value()?)))
+                    .collect::<Result<Vec<_>, ScriptError>>()?,
+            }))),
+            Self::Set(values) => Value::Set(Rc::new(RefCell::new(SetData {
+                values: values
+                    .into_iter()
+                    .map(Self::into_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }))),
+            Self::Bytes(bytes) => Value::Bytes(Rc::new(RefCell::new(bytes))),
+            Self::Uint8Array(bytes) => {
+                let end = bytes.len();
+                Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
+                    buffer: Rc::new(RefCell::new(bytes)),
+                    start: 0,
+                    end,
+                })))
+            }
+            Self::Blob { bytes, mime_type } => Value::Blob(Rc::new(BlobData { bytes, mime_type })),
+            Self::File {
+                bytes,
+                mime_type,
+                name,
+                last_modified,
+            } => Value::File(Rc::new(FileData {
+                bytes,
+                mime_type,
+                name,
+                last_modified,
+            })),
+            Self::Error {
+                name,
+                message,
+                code,
+                class_name,
+            } => Value::Error(Rc::new(ErrorData {
+                name,
+                message,
+                code,
+                class_name,
+            })),
+        })
+    }
+}
+
 fn abort_error_value() -> Value {
     Value::Error(Rc::new(ErrorData {
         name: "AbortError".to_string(),
@@ -13587,7 +13929,7 @@ const MAX_CACHE_ENTRIES: usize = 1024;
 const MAX_CACHED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const STORAGE_FILE_NAME: &str = "storage.bin";
 const STORAGE_MAGIC: &[u8] = b"CERI-STORAGE\0";
-const STORAGE_FORMAT_VERSION: u32 = 1;
+const STORAGE_FORMAT_VERSION: u32 = 2;
 const MAX_STORAGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STORAGE_VALUES: usize = 4096;
 const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
@@ -13768,6 +14110,282 @@ impl<'a> StorageReader<'a> {
     }
 }
 
+fn write_clone_value(
+    writer: &mut StorageWriter,
+    value: &CloneValue,
+    depth: usize,
+) -> io::Result<()> {
+    if depth > MAX_CLONE_DEPTH {
+        return Err(storage_invalid("structured clone nesting depth exceeded"));
+    }
+    match value {
+        CloneValue::Undefined => writer.write_u8(0),
+        CloneValue::Null => writer.write_u8(1),
+        CloneValue::Bool(false) => writer.write_u8(2),
+        CloneValue::Bool(true) => writer.write_u8(3),
+        CloneValue::Number(value) => {
+            writer.write_u8(4);
+            writer.write_u64(value.to_bits());
+        }
+        CloneValue::String(value) => {
+            writer.write_u8(5);
+            writer.write_string(value, MAX_CLONE_STRING_BYTES, "structured clone string")?;
+        }
+        CloneValue::Array(values) => {
+            writer.write_u8(6);
+            writer.write_count(values.len(), MAX_CLONE_NODES, "structured clone array")?;
+            for value in values {
+                write_clone_value(writer, value, depth + 1)?;
+            }
+        }
+        CloneValue::Object(properties) => {
+            writer.write_u8(7);
+            writer.write_count(
+                properties.len(),
+                MAX_CLONE_NODES,
+                "structured clone object",
+            )?;
+            for (key, value) in properties {
+                writer.write_string(key, MAX_CLONE_STRING_BYTES, "structured clone object key")?;
+                write_clone_value(writer, value, depth + 1)?;
+            }
+        }
+        CloneValue::Map(entries) => {
+            writer.write_u8(8);
+            writer.write_count(entries.len(), MAX_CLONE_NODES, "structured clone map")?;
+            for (key, value) in entries {
+                write_clone_value(writer, key, depth + 1)?;
+                write_clone_value(writer, value, depth + 1)?;
+            }
+        }
+        CloneValue::Set(values) => {
+            writer.write_u8(9);
+            writer.write_count(values.len(), MAX_CLONE_NODES, "structured clone set")?;
+            for value in values {
+                write_clone_value(writer, value, depth + 1)?;
+            }
+        }
+        CloneValue::Bytes(bytes) => {
+            writer.write_u8(10);
+            writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone bytes")?;
+        }
+        CloneValue::Uint8Array(bytes) => {
+            writer.write_u8(11);
+            writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone Uint8Array")?;
+        }
+        CloneValue::Blob { bytes, mime_type } => {
+            writer.write_u8(12);
+            writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone Blob bytes")?;
+            writer.write_string(
+                mime_type,
+                MAX_CLONE_STRING_BYTES,
+                "structured clone Blob type",
+            )?;
+        }
+        CloneValue::File {
+            bytes,
+            mime_type,
+            name,
+            last_modified,
+        } => {
+            writer.write_u8(13);
+            writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone File bytes")?;
+            writer.write_string(
+                mime_type,
+                MAX_CLONE_STRING_BYTES,
+                "structured clone File type",
+            )?;
+            writer.write_string(name, MAX_CLONE_STRING_BYTES, "structured clone File name")?;
+            writer.write_u64(*last_modified as u64);
+        }
+        CloneValue::Error {
+            name,
+            message,
+            code,
+            class_name,
+        } => {
+            writer.write_u8(14);
+            writer.write_string(name, MAX_CLONE_STRING_BYTES, "structured clone Error name")?;
+            writer.write_string(
+                message,
+                MAX_CLONE_STRING_BYTES,
+                "structured clone Error message",
+            )?;
+            writer.write_optional_string(
+                code.as_deref(),
+                MAX_CLONE_STRING_BYTES,
+                "structured clone Error code",
+            )?;
+            writer.write_string(
+                class_name,
+                MAX_CLONE_STRING_BYTES,
+                "structured clone Error class",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+struct CloneReadContext {
+    max_bytes: usize,
+    bytes: usize,
+    nodes: usize,
+}
+
+impl CloneReadContext {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            bytes: 0,
+            nodes: 0,
+        }
+    }
+
+    fn visit(&mut self, depth: usize) -> io::Result<()> {
+        if depth > MAX_CLONE_DEPTH {
+            return Err(storage_invalid("structured clone nesting depth exceeded"));
+        }
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_CLONE_NODES {
+            return Err(storage_invalid("structured clone node limit exceeded"));
+        }
+        Ok(())
+    }
+
+    fn account_bytes(&mut self, length: usize) -> io::Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| storage_invalid("structured clone byte count overflow"))?;
+        if self.bytes > self.max_bytes {
+            return Err(storage_invalid("structured clone byte limit exceeded"));
+        }
+        Ok(())
+    }
+}
+
+fn read_clone_string(
+    reader: &mut StorageReader<'_>,
+    context: &mut CloneReadContext,
+    label: &str,
+) -> io::Result<String> {
+    let value = reader.read_string(MAX_CLONE_STRING_BYTES, label)?;
+    context.account_bytes(value.len())?;
+    Ok(value)
+}
+
+fn read_clone_bytes(
+    reader: &mut StorageReader<'_>,
+    context: &mut CloneReadContext,
+    label: &str,
+) -> io::Result<Vec<u8>> {
+    let value = reader.read_bytes(MAX_IDB_VALUE_BYTES, label)?;
+    context.account_bytes(value.len())?;
+    Ok(value)
+}
+
+fn read_clone_optional_string(
+    reader: &mut StorageReader<'_>,
+    context: &mut CloneReadContext,
+    label: &str,
+) -> io::Result<Option<String>> {
+    if reader.read_bool()? {
+        Ok(Some(read_clone_string(reader, context, label)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_clone_value(
+    reader: &mut StorageReader<'_>,
+    context: &mut CloneReadContext,
+    depth: usize,
+) -> io::Result<CloneValue> {
+    context.visit(depth)?;
+    match reader.read_u8()? {
+        0 => Ok(CloneValue::Undefined),
+        1 => Ok(CloneValue::Null),
+        2 => Ok(CloneValue::Bool(false)),
+        3 => Ok(CloneValue::Bool(true)),
+        4 => Ok(CloneValue::Number(f64::from_bits(reader.read_u64()?))),
+        5 => Ok(CloneValue::String(read_clone_string(
+            reader,
+            context,
+            "structured clone string",
+        )?)),
+        6 => {
+            let count = reader.read_count(MAX_CLONE_NODES, "structured clone array")?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(read_clone_value(reader, context, depth + 1)?);
+            }
+            Ok(CloneValue::Array(values))
+        }
+        7 => {
+            let count = reader.read_count(MAX_CLONE_NODES, "structured clone object")?;
+            let mut properties = BTreeMap::new();
+            for _ in 0..count {
+                let key = read_clone_string(
+                    reader,
+                    context,
+                    "structured clone object key",
+                )?;
+                let value = read_clone_value(reader, context, depth + 1)?;
+                if properties.insert(key, value).is_some() {
+                    return Err(storage_invalid("duplicate structured clone object key"));
+                }
+            }
+            Ok(CloneValue::Object(properties))
+        }
+        8 => {
+            let count = reader.read_count(MAX_CLONE_NODES, "structured clone map")?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push((
+                    read_clone_value(reader, context, depth + 1)?,
+                    read_clone_value(reader, context, depth + 1)?,
+                ));
+            }
+            Ok(CloneValue::Map(entries))
+        }
+        9 => {
+            let count = reader.read_count(MAX_CLONE_NODES, "structured clone set")?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(read_clone_value(reader, context, depth + 1)?);
+            }
+            Ok(CloneValue::Set(values))
+        }
+        10 => Ok(CloneValue::Bytes(read_clone_bytes(
+            reader,
+            context,
+            "structured clone bytes",
+        )?)),
+        11 => Ok(CloneValue::Uint8Array(read_clone_bytes(
+            reader,
+            context,
+            "structured clone Uint8Array",
+        )?)),
+        12 => Ok(CloneValue::Blob {
+            bytes: read_clone_bytes(reader, context, "structured clone Blob bytes")?,
+            mime_type: read_clone_string(reader, context, "structured clone Blob type")?,
+        }),
+        13 => Ok(CloneValue::File {
+            bytes: read_clone_bytes(reader, context, "structured clone File bytes")?,
+            mime_type: read_clone_string(reader, context, "structured clone File type")?,
+            name: read_clone_string(reader, context, "structured clone File name")?,
+            last_modified: reader.read_u64()? as i64,
+        }),
+        14 => Ok(CloneValue::Error {
+            name: read_clone_string(reader, context, "structured clone Error name")?,
+            message: read_clone_string(reader, context, "structured clone Error message")?,
+            code: read_clone_optional_string(reader, context, "structured clone Error code")?,
+            class_name: read_clone_string(reader, context, "structured clone Error class")?,
+        }),
+        _ => Err(storage_invalid("structured clone type tag is invalid")),
+    }
+}
+
 fn encode_storage(storage: &StorageData) -> io::Result<Vec<u8>> {
     let mut writer = StorageWriter::new();
     writer.bytes.extend_from_slice(STORAGE_MAGIC);
@@ -13862,14 +14480,14 @@ fn encode_storage(storage: &StorageData) -> io::Result<Vec<u8>> {
             writer.write_count(store.records.len(), MAX_IDB_RECORDS, "records")?;
             for (token, record) in &store.records {
                 writer.write_string(token, MAX_STORAGE_TEXT_BYTES, "record key token")?;
-                let key = serialize_json(&record.key).map_err(|error| {
-                    storage_invalid(format!("could not serialize IndexedDB key: {error}"))
+                let key = clone_payload(&record.key, MAX_IDB_VALUE_BYTES).map_err(|error| {
+                    storage_invalid(format!("could not clone IndexedDB key: {error}"))
                 })?;
-                writer.write_string(&key, MAX_STORAGE_VALUE_BYTES, "IndexedDB key")?;
-                let value = serialize_json(&record.value).map_err(|error| {
-                    storage_invalid(format!("could not serialize IndexedDB value: {error}"))
+                write_clone_value(&mut writer, &key, 0)?;
+                let value = clone_payload(&record.value, MAX_IDB_VALUE_BYTES).map_err(|error| {
+                    storage_invalid(format!("could not clone IndexedDB value: {error}"))
                 })?;
-                writer.write_string(&value, MAX_STORAGE_VALUE_BYTES, "IndexedDB value")?;
+                write_clone_value(&mut writer, &value, 0)?;
             }
         }
     }
@@ -14014,7 +14632,6 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         storage.database_order.push(name);
     }
     let database_count = reader.read_count(MAX_IDB_DATABASES, "databases")?;
-    let mut value_runtime = storage_json_runtime()?;
     for _ in 0..database_count {
         let name = reader.read_string(MAX_IDB_NAME_BYTES, "database name")?;
         let version = reader.read_u64()?;
@@ -14050,9 +14667,9 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
             let mut records = BTreeMap::new();
             for _ in 0..record_count {
                 let token = reader.read_string(MAX_STORAGE_TEXT_BYTES, "record key token")?;
-                let key_source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB key")?;
-                let key = value_runtime
-                    .parse_json(&key_source)
+                let mut key_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
+                let key = read_clone_value(&mut reader, &mut key_context, 0)?
+                    .into_value()
                     .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?;
                 indexed_db_key_token(&key)
                     .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))
@@ -14063,9 +14680,9 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
                             Err(storage_invalid("IndexedDB key token does not match key"))
                         }
                     })?;
-                let value_source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB value")?;
-                let value = value_runtime
-                    .parse_json(&value_source)
+                let mut value_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
+                let value = read_clone_value(&mut reader, &mut value_context, 0)?
+                    .into_value()
                     .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?;
                 if records.insert(token, IndexedDbRecord { key, value }).is_some() {
                     return Err(storage_invalid("duplicate IndexedDB record in storage file"));
@@ -14145,12 +14762,6 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         return Err(storage_invalid("storage file has trailing bytes"));
     }
     Ok(storage)
-}
-
-fn storage_json_runtime() -> io::Result<ScriptRuntime> {
-    let document = Document::parse("<html><body></body></html>")
-        .map_err(|error| storage_invalid(format!("could not create storage parser: {error}")))?;
-    Ok(ScriptRuntime::new(Rc::new(RefCell::new(document))))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -24591,6 +25202,148 @@ mod tests {
     }
 
     #[test]
+    fn structured_clone_copies_nested_values_and_binary_objects() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const source = {
+                  nested: [1],
+                  map: new Map([["key", { value: 2 }]]),
+                  set: new Set([7, 8]),
+                  buffer: new Uint8Array([3, 4]).buffer,
+                  typed: new Uint8Array([5, 6]),
+                  blob: new Blob(["blob"], { type: "text/plain" }),
+                  file: new File(["file"], "report.txt", { type: "text/file" }),
+                  error: new Error("oops")
+                };
+                const copy = structuredClone(source);
+                copy.map.set("new", "entry");
+                copy.typed[0] = 8;
+                const copiedBuffer = new Uint8Array(copy.buffer);
+                copiedBuffer[0] = 10;
+                status.textContent = source.nested[0] + "|" + copy.nested[0] + "|" +
+                  source.map.size + "|" + copy.map.size + "|" +
+                  new Uint8Array(source.buffer)[0] + "|" + copiedBuffer[0] + "|" +
+                  source.typed[0] + "|" + copy.typed[0] + "|" + copy.set.size + "|" +
+                  copy.blob.size + ":" + copy.blob.type + "|" + copy.file.name + "|" +
+                  copy.error.message;
+                "#,
+            )
+            .expect("structured clone should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|1|1|2|3|10|5|8|2|4:text/plain|report.txt|oops")
+        );
+    }
+
+    #[test]
+    fn structured_clone_rejects_cycles_functions_and_transfer_lists() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let cyclic = Rc::new(RefCell::new(BTreeMap::new()));
+        cyclic
+            .borrow_mut()
+            .insert("self".to_string(), Value::Object(cyclic.clone()));
+        let cycle_error = clone_payload(&Value::Object(cyclic), MAX_CLONE_BYTES)
+            .expect_err("cyclic clone should fail");
+        assert_eq!(
+            cycle_error.message,
+            "DataCloneError: cyclic values are not supported in this slice"
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                let functionValue = "unexpected";
+                try {
+                  structuredClone(() => 1);
+                } catch (error) {
+                  functionValue = error.message;
+                }
+                let transfer = "unexpected";
+                try {
+                  structuredClone({ value: 1 }, [new ArrayBuffer(1)]);
+                } catch (error) {
+                  transfer = error.message;
+                }
+                status.textContent = functionValue + "|" + transfer;
+                "#,
+            )
+            .expect("structured clone errors should be catchable");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "DataCloneError: value is not cloneable|structuredClone transfer lists are not supported in this slice",
+            )
+        );
+    }
+
+    #[test]
+    fn indexed_db_round_trips_structured_clone_values() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const open = indexedDB.open("structured", 1);
+                open.onupgradeneeded = event => {
+                  event.target.result.createObjectStore("records", { keyPath: "id" });
+                };
+                open.onsuccess = event => {
+                  const database = event.target.result;
+                  const write = database.transaction("records", "readwrite")
+                    .objectStore("records")
+                    .put({
+                      id: "record",
+                      bytes: new Uint8Array([1, 2]),
+                      map: new Map([["key", "value"]]),
+                      blob: new Blob(["blob"], { type: "text/plain" }),
+                      file: new File(["file"], "report.txt", { type: "text/file" })
+                    });
+                  write.onsuccess = () => {
+                    const read = database.transaction("records")
+                      .objectStore("records").get("record");
+                    read.onsuccess = readEvent => {
+                      const copy = readEvent.target.result;
+                      copy.bytes[0] = 9;
+                      copy.map.set("new", "entry");
+                      const verify = database.transaction("records")
+                        .objectStore("records").get("record");
+                      verify.onsuccess = verifyEvent => {
+                        const original = verifyEvent.target.result;
+                        status.textContent = copy.bytes[0] + "|" + original.bytes[0] + "|" +
+                          copy.map.size + "|" + original.map.size + "|" + copy.blob.type + "|" +
+                          copy.file.name;
+                      };
+                    };
+                  };
+                };
+                "#,
+            )
+            .expect("IndexedDB structured clone should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("9|1|2|1|text/plain|report.txt")
+        );
+    }
+
+    #[test]
     fn worker_dispatches_structured_messages_without_a_loopback_server() {
         let document = document("<p id='status'>idle</p>");
         let mut resources = ResourceBundle::default();
@@ -24599,7 +25352,12 @@ mod tests {
                 "/worker.js",
                 "text/javascript",
                 br#"self.onmessage = (event) => {
-                  postMessage({ kind: event.data.kind, text: event.data.text + "!" });
+                  postMessage({
+                    kind: event.data.kind,
+                    text: event.data.text + "!",
+                    byte: event.data.bytes[0],
+                    type: event.data.blob.type
+                  });
                 };"#
                 .to_vec(),
             )
@@ -24619,10 +25377,21 @@ mod tests {
                 let messages = 0;
                 worker.addEventListener("message", (event) => {
                   messages = messages + 1;
-                  status.textContent = worker.name + "|" + event.data.kind + "|" + event.data.text + "|" + messages;
+                  status.textContent = worker.name + "|" + event.data.kind + "|" + event.data.text + "|" +
+                    event.data.byte + "|" + event.data.type + "|" + messages;
                 }, { once: true });
-                worker.postMessage({ kind: "greeting", text: "hello" });
-                worker.postMessage({ kind: "second", text: "again" });
+                worker.postMessage({
+                  kind: "greeting",
+                  text: "hello",
+                  bytes: new Uint8Array([4]),
+                  blob: new Blob(["blob"], { type: "text/plain" })
+                });
+                worker.postMessage({
+                  kind: "second",
+                  text: "again",
+                  bytes: new Uint8Array([5]),
+                  blob: new Blob(["blob"], { type: "text/plain" })
+                });
                 "#,
             )
             .expect("worker construction and message send should execute");
@@ -24640,7 +25409,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("echo|greeting|hello!|1")
+            Some("echo|greeting|hello!|4|text/plain|1")
         );
     }
 
