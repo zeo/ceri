@@ -242,6 +242,7 @@ enum Builtin {
     ElementReplaceChildren(ElementHandle),
     ElementBefore(ElementHandle),
     ElementAfter(ElementHandle),
+    ElementReplaceWith(ElementHandle),
     ElementRemoveChild(ElementHandle),
     ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
@@ -4172,6 +4173,7 @@ impl ScriptRuntime {
                     }
                     "before" => Value::Builtin(Builtin::ElementBefore(handle.clone())),
                     "after" => Value::Builtin(Builtin::ElementAfter(handle.clone())),
+                    "replaceWith" => Value::Builtin(Builtin::ElementReplaceWith(handle.clone())),
                     "removeChild" => {
                         if path.is_none() {
                             return Err(runtime_error("detached element cannot remove children"));
@@ -10474,6 +10476,17 @@ impl ScriptRuntime {
                     }
                     self.call_builtin(builtin, call_arguments)?;
                 }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementReplaceWith(anchor) => {
+                let Some(anchor_path) = attached_path(&anchor) else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(parent_path) = self.document.borrow().parent_path(&anchor_path) else {
+                    return Ok(Value::Undefined);
+                };
+                self.call_builtin(Builtin::ElementBefore(anchor.clone()), arguments.clone())?;
+                self.detach_child(&parent_path, &anchor)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementInsertBefore(parent) => {
@@ -18404,6 +18417,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("onepre!post1post2boldtailend|2:true:true:true:true:true:true")
+        );
+    }
+
+    #[test]
+    fn replace_with_inserts_mixed_nodes_and_detaches_the_anchor() {
+        let document = document(
+            r#"<main id="root"><p id="target">one<span id="marker">!</span>tail</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const target = document.getElementById("target");
+                const marker = document.getElementById("marker");
+                const range = document.createRange();
+                range.setStart(marker, 0);
+                range.setEnd(marker, 1);
+                const replacement = document.createElement("strong");
+                replacement.textContent = "replacement";
+                marker.replaceWith("pre", replacement, "post");
+                const status = document.getElementById("status");
+                status.textContent = target.textContent + "|" + (marker.isConnected === false) + ":" +
+                    (marker.parentNode === null) + ":" + (replacement.parentNode === target) + ":" +
+                    (target.children[0] === replacement) + ":" + (range.startContainer === target) + ":" +
+                    range.toString();
+                "#,
+            )
+            .expect("replaceWith should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("oneprereplacementposttail|true:true:true:true:true:")
         );
     }
 

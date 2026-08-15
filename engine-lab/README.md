@@ -37,6 +37,7 @@ The current slice implements:
 - `append()` and `prepend()` mixed string or node insertion with argument-order preservation and stable attached handles
 - `replaceChildren()` direct-child replacement that keeps passed handles and listeners reattachable
 - `before()` and `after()` mixed sibling insertion through the same stable-node movement path
+- `replaceWith()` mixed sibling replacement that detaches the anchor through the live Range and listener path
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
