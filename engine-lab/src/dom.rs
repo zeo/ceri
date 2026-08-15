@@ -704,6 +704,16 @@ impl Document {
         Some(path)
     }
 
+    pub fn append_text_node(&mut self, parent: &[usize], text: String) -> Option<NodePath> {
+        let mut path = parent.to_vec();
+        let parent = self.element_at_mut(parent)?;
+        let index = parent.children.len();
+        parent.children.push(Node::Text(text));
+        path.push(index);
+        self.assign_ids_below(&path);
+        Some(path)
+    }
+
     pub fn insert_element_before(
         &mut self,
         parent: &[usize],
@@ -721,6 +731,28 @@ impl Document {
         let mut path = parent.to_vec();
         let parent = self.element_at_mut(parent)?;
         parent.children.insert(index, Node::Element(element));
+        path.push(index);
+        self.assign_ids_below(&path);
+        Some(path)
+    }
+
+    pub fn insert_text_node_before(
+        &mut self,
+        parent: &[usize],
+        text: String,
+        reference: &[usize],
+    ) -> Option<NodePath> {
+        if reference.len() != parent.len().saturating_add(1)
+            || reference[..parent.len()] != *parent
+        {
+            return None;
+        }
+        let index = *reference.last()?;
+        self.node_at(reference)?;
+        self.shift_paths_for_insert(parent, index);
+        let mut path = parent.to_vec();
+        let parent = self.element_at_mut(parent)?;
+        parent.children.insert(index, Node::Text(text));
         path.push(index);
         self.assign_ids_below(&path);
         Some(path)
@@ -808,19 +840,41 @@ impl Document {
             return None;
         }
         let index = *child.last()?;
-        self.element_at(child)?;
+        if !matches!(self.node_at(child), Some(Node::Element(_))) {
+            return None;
+        }
         let removed = {
             let parent = self.element_at_mut(parent)?;
             let node = parent.children.get_mut(index)?;
             std::mem::replace(node, Node::Text(String::new()))
         };
-        match removed {
-            Node::Element(element) => {
-                self.remove_ids_at_or_below(child);
-                Some(element)
-            }
-            Node::Text(_) => None,
+        let Node::Element(element) = removed else {
+            return None;
+        };
+        self.remove_ids_at_or_below(child);
+        Some(element)
+    }
+
+    pub fn remove_text_child(&mut self, parent: &[usize], child: &[usize]) -> Option<String> {
+        if child.len() != parent.len().saturating_add(1)
+            || child[..parent.len()] != *parent
+        {
+            return None;
         }
+        let index = *child.last()?;
+        if !matches!(self.node_at(child), Some(Node::Text(_))) {
+            return None;
+        }
+        let removed = {
+            let parent = self.element_at_mut(parent)?;
+            let node = parent.children.get_mut(index)?;
+            std::mem::replace(node, Node::Text(String::new()))
+        };
+        let Node::Text(text) = removed else {
+            return None;
+        };
+        self.remove_ids_at_or_below(child);
+        Some(text)
     }
 
     pub fn element_clone(&self, path: &[usize]) -> Option<Element> {

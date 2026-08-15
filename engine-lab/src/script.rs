@@ -160,6 +160,7 @@ enum Builtin {
     DocumentQuerySelector,
     DocumentQuerySelectorAll,
     DocumentCreateElement,
+    DocumentCreateTextNode,
     DocumentCreateRange,
     DocumentGetSelection,
     DocumentAddEventListener,
@@ -2012,15 +2013,26 @@ impl ScriptRuntime {
             self.blur_focused()?;
         }
         let selection_changed = self.adjust_ranges_for_remove(parent, &child_path);
-        let removed = self
-            .document
-            .borrow_mut()
-            .remove_child(parent, &child_path)
-            .ok_or_else(|| runtime_error("removeChild child is no longer in the document"))?;
+        let removed_element = self.document.borrow_mut().remove_child(parent, &child_path);
+        let removed_text = if removed_element.is_none() {
+            self.document
+                .borrow_mut()
+                .remove_text_child(parent, &child_path)
+        } else {
+            None
+        };
+        if removed_element.is_none() && removed_text.is_none() {
+            return Err(runtime_error("removeChild child is no longer in the document"));
+        }
         self.capture_detached_listeners(child, &child_path);
         self.clear_runtime_state_for_removed_subtree(&child_path);
         self.refresh_select_state_after_remove(parent);
-        *child.borrow_mut() = ElementLocation::Detached(removed);
+        *child.borrow_mut() = match removed_element {
+            Some(element) => ElementLocation::Detached(element),
+            None => ElementLocation::Detached(detached_text_element(
+                &removed_text.expect("removed text was checked"),
+            )),
+        };
         if selection_changed {
             self.dispatch_document_selection_change()?;
         }
@@ -3725,6 +3737,7 @@ impl ScriptRuntime {
                 "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
                 "querySelectorAll" => Ok(Value::Builtin(Builtin::DocumentQuerySelectorAll)),
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
+                "createTextNode" => Ok(Value::Builtin(Builtin::DocumentCreateTextNode)),
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "addEventListener" => Ok(Value::Builtin(Builtin::DocumentAddEventListener)),
@@ -5257,10 +5270,15 @@ impl ScriptRuntime {
         if !attached_is_text(handle) {
             return Value::Null;
         }
-        attached_path(handle)
-            .and_then(|path| self.document.borrow().node_text_content(&path))
-            .map(Value::String)
-            .unwrap_or(Value::Null)
+        match handle.borrow().clone() {
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().node_text_content(&path))
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            ElementLocation::Detached(element) => detached_text_data(&element)
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        }
     }
 
     fn element_child_nodes(&self, handle: &ElementHandle) -> Value {
@@ -6751,6 +6769,9 @@ impl ScriptRuntime {
         let location = handle.borrow().clone();
         match location {
             ElementLocation::Detached(mut element) => {
+                if is_detached_text_element(&element) {
+                    return Ok(());
+                }
                 element.normalize();
                 *handle.borrow_mut() = ElementLocation::Detached(element);
                 Ok(())
@@ -7005,12 +7026,21 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         text: String,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(false);
-        };
         if !attached_is_text(handle) {
             return Ok(false);
         }
+        if attached_path(handle).is_none() {
+            let mut location = handle.borrow_mut();
+            let ElementLocation::Detached(element) = &mut *location else {
+                return Ok(false);
+            };
+            let Some(current) = detached_text_data_mut(element) else {
+                return Ok(false);
+            };
+            *current = text;
+            return Ok(true);
+        }
+        let path = attached_path(handle).expect("attached text path was checked");
         self.replace_text_node_data_at(&path, text)
     }
 
@@ -8195,6 +8225,15 @@ impl ScriptRuntime {
                     ElementLocation::Detached(Element::new(&name)),
                 ))))
             }
+            Builtin::DocumentCreateTextNode => {
+                let text = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(Value::Element(Rc::new(RefCell::new(
+                    ElementLocation::Detached(detached_text_element(&text)),
+                ))))
+            }
             Builtin::DocumentCreateRange => {
                 let path = self
                     .document
@@ -8734,12 +8773,31 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementSplitText(handle) => {
-                let Some(path) = attached_path(&handle) else {
-                    return Err(runtime_error("text node is no longer in the document"));
-                };
                 if !attached_is_text(&handle) {
                     return Err(runtime_error("splitText requires a text node"));
                 }
+                let Some(path) = attached_path(&handle) else {
+                    let ElementLocation::Detached(element) = handle.borrow().clone() else {
+                        return Err(runtime_error("text node is no longer in the document"));
+                    };
+                    let text = detached_text_data(&element)
+                        .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
+                    let length = utf16_len(&text);
+                    let offset = arguments
+                        .first()
+                        .map(Value::number)
+                        .transpose()?
+                        .map(selection_offset)
+                        .unwrap_or_default()
+                        .min(length);
+                    let left = utf16_substring(&text, 0, offset);
+                    let right = utf16_substring(&text, offset, length);
+                    *handle.borrow_mut() =
+                        ElementLocation::Detached(detached_text_element(&left));
+                    return Ok(Value::Element(Rc::new(RefCell::new(
+                        ElementLocation::Detached(detached_text_element(&right)),
+                    ))));
+                };
                 let length = self
                     .document
                     .borrow()
@@ -10112,6 +10170,11 @@ impl ScriptRuntime {
                     _ => return Err(runtime_error("appendChild expects an element")),
                 };
                 if let Some(source_path) = attached_path(&child) {
+                    if attached_is_text(&child) {
+                        return Err(runtime_error(
+                            "appendChild cannot move an attached text node yet",
+                        ));
+                    }
                     let source_parent =
                         source_path[..source_path.len().saturating_sub(1)].to_vec();
                     let child_path = self
@@ -10131,19 +10194,24 @@ impl ScriptRuntime {
                     return Ok(Value::Element(child));
                 }
                 let location = child.borrow().clone();
-                let element = match location {
-                    ElementLocation::Detached(element) => element,
+                let child_path = match location {
+                    ElementLocation::Detached(element) if is_detached_text_element(&element) => {
+                        self.document
+                            .borrow_mut()
+                            .append_text_node(
+                                &parent_path,
+                                detached_text_data(&element).unwrap_or_default(),
+                            )
+                    }
+                    ElementLocation::Detached(element) => self
+                        .document
+                        .borrow_mut()
+                        .append_element(&parent_path, element),
                     ElementLocation::Attached { .. } => {
                         return Err(runtime_error("appendChild child handle is unavailable"));
                     }
-                };
-                let child_path = self
-                    .document
-                    .borrow_mut()
-                    .append_element(&parent_path, element)
-                    .ok_or_else(|| {
-                        runtime_error("appendChild parent is no longer in the document")
-                    })?;
+                }
+                .ok_or_else(|| runtime_error("appendChild parent is no longer in the document"))?;
                 self.restore_detached_listeners(&child, &child_path);
                 self.refresh_select_state_after_append(&parent_path, &child_path);
                 let attached = attached_handle(child_path, &self.document)
@@ -10167,6 +10235,11 @@ impl ScriptRuntime {
                 };
                 let reference_index = reference_path.as_ref().and_then(|path| path.last()).copied();
                 let child_path = if let Some(source_path) = attached_path(&child) {
+                    if attached_is_text(&child) {
+                        return Err(runtime_error(
+                            "insertBefore cannot move an attached text node yet",
+                        ));
+                    }
                     let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
                     let child_path = self
                         .document
@@ -10184,17 +10257,37 @@ impl ScriptRuntime {
                     child_path
                 } else {
                     let location = child.borrow().clone();
-                    let ElementLocation::Detached(element) = location else {
-                        return Err(runtime_error("insertBefore child handle is unavailable"));
-                    };
-                    let child_path = if let Some(reference_path) = reference_path {
-                        self.document
-                            .borrow_mut()
-                            .insert_element_before(&parent_path, element, &reference_path)
-                    } else {
-                        self.document
-                            .borrow_mut()
-                            .append_element(&parent_path, element)
+                    let child_path = match location {
+                        ElementLocation::Detached(element)
+                            if is_detached_text_element(&element) =>
+                        {
+                            let text = detached_text_data(&element).unwrap_or_default();
+                            if let Some(reference_path) = reference_path {
+                                self.document.borrow_mut().insert_text_node_before(
+                                    &parent_path,
+                                    text,
+                                    &reference_path,
+                                )
+                            } else {
+                                self.document
+                                    .borrow_mut()
+                                    .append_text_node(&parent_path, text)
+                            }
+                        }
+                        ElementLocation::Detached(element) => {
+                            if let Some(reference_path) = reference_path {
+                                self.document
+                                    .borrow_mut()
+                                    .insert_element_before(&parent_path, element, &reference_path)
+                            } else {
+                                self.document
+                                    .borrow_mut()
+                                    .append_element(&parent_path, element)
+                            }
+                        }
+                        ElementLocation::Attached { .. } => {
+                            return Err(runtime_error("insertBefore child handle is unavailable"));
+                        }
                     }
                     .ok_or_else(|| {
                         runtime_error(
@@ -10234,10 +10327,18 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementHasChildNodes(handle) => Ok(Value::Bool(match handle.borrow().clone() {
-                ElementLocation::Attached { .. } => attached_path(&handle)
-                    .and_then(|path| self.document.borrow().child_paths(&path))
-                    .is_some_and(|children| !children.is_empty()),
-                ElementLocation::Detached(element) => !element.children.is_empty(),
+                ElementLocation::Attached { .. } => {
+                    if attached_is_text(&handle) {
+                        false
+                    } else {
+                        attached_path(&handle)
+                            .and_then(|path| self.document.borrow().child_paths(&path))
+                            .is_some_and(|children| !children.is_empty())
+                    }
+                }
+                ElementLocation::Detached(element) => {
+                    !is_detached_text_element(&element) && !element.children.is_empty()
+                }
             })),
             Builtin::ElementSetAttribute(handle) => {
                 let name = arguments
@@ -10954,6 +11055,38 @@ fn attached_handle(
     })))
 }
 
+fn detached_text_element(text: &str) -> Element {
+    Element {
+        name: "#text".to_string(),
+        attrs: BTreeMap::new(),
+        children: vec![Node::Text(text.to_string())],
+    }
+}
+
+fn is_detached_text_element(element: &Element) -> bool {
+    element.name == "#text"
+}
+
+fn detached_text_data(element: &Element) -> Option<String> {
+    if !is_detached_text_element(element) {
+        return None;
+    }
+    match element.children.first()? {
+        Node::Text(text) => Some(text.clone()),
+        Node::Element(_) => None,
+    }
+}
+
+fn detached_text_data_mut(element: &mut Element) -> Option<&mut String> {
+    if !is_detached_text_element(element) {
+        return None;
+    }
+    match element.children.first_mut()? {
+        Node::Text(text) => Some(text),
+        Node::Element(_) => None,
+    }
+}
+
 fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
     match &*handle.borrow() {
         ElementLocation::Attached {
@@ -10971,10 +11104,10 @@ fn attached_node_id(handle: &ElementHandle) -> Option<NodeId> {
 }
 
 fn attached_is_text(handle: &ElementHandle) -> bool {
-    matches!(
-        &*handle.borrow(),
-        ElementLocation::Attached { is_text: true, .. }
-    )
+    match &*handle.borrow() {
+        ElementLocation::Attached { is_text, .. } => *is_text,
+        ElementLocation::Detached(element) => is_detached_text_element(element),
+    }
 }
 
 fn collect_sequential_focus_nodes(
@@ -17731,6 +17864,47 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true:true:true:true:true:true:false:true|true:true:true")
+        );
+    }
+
+    #[test]
+    fn document_create_text_node_attaches_and_preserves_identity() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello<span id="marker">!</span></p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const existing = first.firstChild;
+                const created = document.createTextNode(" world");
+                created.data = " world";
+                const appended = first.appendChild(created);
+                const leading = document.createTextNode("start ");
+                first.insertBefore(leading, existing);
+                const removed = first.removeChild(created);
+                const reattached = first.appendChild(removed);
+                const detached = document.createTextNode("abc");
+                const right = detached.splitText(1);
+                const status = document.getElementById("status");
+                status.textContent = (appended === created) + "|" + first.textContent + "|" +
+                    (leading.nextSibling === existing) + ":" +
+                    (created.previousSibling === document.getElementById("marker")) + ":" +
+                    (created.parentNode === first) + ":" + created.nodeType + ":" + created.nodeName + ":" +
+                    created.isConnected + "|" + (removed === created) + ":" +
+                    (reattached === created) + "|" + detached.data + ":" + right.data + ":" +
+                    right.nodeType + ":" + right.isConnected;
+                "#,
+            )
+            .expect("createTextNode should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|start hello! world|true:true:true:3:#text:true|true:true|a:bc:3:false")
         );
     }
 
