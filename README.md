@@ -77,7 +77,7 @@ The custom runtime also has bounded IndexedDB with callback-based open and opera
 
 See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.
 
-The script data model now supports bounded writes to plain-object properties and array indexes, array length changes, and `push()` or `pop()` mutation. Object and array identity comparisons use reference identity, so script-created cycles remain observable and are rejected by structured cloning.
+The script data model now supports bounded writes to plain-object properties and array indexes, array length changes, and `push()` or `pop()` mutation. Object and array identity comparisons use reference identity, so script-created cycles remain observable and are rejected by structured cloning. Object literals also accept shallow spread from plain objects, arrays, and strings.
 
 The selector matcher also accepts top-level selector lists and bounded `:not(...)` arguments in both stylesheets and DOM queries, while preserving selector specificity and rejecting malformed list entries.
 

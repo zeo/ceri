@@ -510,7 +510,7 @@ enum Expr {
         consequent: Box<Expr>,
         alternate: Box<Expr>,
     },
-    Object(Vec<(ObjectLiteralKey, Expr)>),
+    Object(Vec<ObjectLiteralProperty>),
     Array(Vec<Expr>),
     Spread(Box<Expr>),
     Template(Vec<TemplatePart>),
@@ -541,6 +541,12 @@ enum Literal {
 enum ObjectLiteralKey {
     Static(String),
     Computed(Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ObjectLiteralProperty {
+    Entry(ObjectLiteralKey, Expr),
+    Spread(Expr),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3892,17 +3898,41 @@ impl ScriptRuntime {
             }
             Expr::Object(properties) => {
                 let mut object = BTreeMap::new();
-                for (key, expression) in properties {
-                    let property = match key {
-                        ObjectLiteralKey::Static(property) => property.clone(),
-                        ObjectLiteralKey::Computed(key_expression) => self
-                            .evaluate(key_expression, environment.clone())
-                            .map(|value| value.property_key())?,
-                    };
-                    object.insert(
-                        property,
-                        self.evaluate(expression, environment.clone())?,
-                    );
+                for property in properties {
+                    match property {
+                        ObjectLiteralProperty::Spread(expression) => {
+                            let value = self.evaluate(expression, environment.clone())?;
+                            match value.resolve() {
+                                Value::Object(source) => {
+                                    object.extend(source.borrow().clone());
+                                }
+                                Value::Array(source) => {
+                                    for (index, value) in source.borrow().iter().cloned().enumerate() {
+                                        object.insert(index.to_string(), value);
+                                    }
+                                }
+                                Value::String(source) => {
+                                    for (index, value) in source.chars().enumerate() {
+                                        object.insert(index.to_string(), Value::String(value.to_string()));
+                                    }
+                                }
+                                Value::Undefined | Value::Null => {}
+                                _ => {}
+                            }
+                        }
+                        ObjectLiteralProperty::Entry(key, expression) => {
+                            let property = match key {
+                                ObjectLiteralKey::Static(property) => property.clone(),
+                                ObjectLiteralKey::Computed(key_expression) => self
+                                    .evaluate(key_expression, environment.clone())
+                                    .map(|value| value.property_key())?,
+                            };
+                            object.insert(
+                                property,
+                                self.evaluate(expression, environment.clone())?,
+                            );
+                        }
+                    }
                 }
                 Ok(Value::Object(Rc::new(RefCell::new(object))))
             }
@@ -18665,34 +18695,38 @@ impl Parser {
         let mut properties = Vec::new();
         if !self.is(TokenKind::RBrace) {
             loop {
-                let key = if self.take(TokenKind::LBracket) {
-                    let expression = self.parse_expression()?;
-                    self.expect(TokenKind::RBracket, "computed object property name")?;
-                    ObjectLiteralKey::Computed(expression)
+                if self.take(TokenKind::Ellipsis) {
+                    properties.push(ObjectLiteralProperty::Spread(self.parse_expression()?));
                 } else {
-                    let token = self.advance();
-                    let key = match token.kind {
-                        TokenKind::Identifier(key) | TokenKind::String(key) => key,
-                        _ => {
-                            return Err(self.error(
-                                "expected object property name".to_string(),
-                                token.offset,
-                            ));
-                        }
+                    let key = if self.take(TokenKind::LBracket) {
+                        let expression = self.parse_expression()?;
+                        self.expect(TokenKind::RBracket, "computed object property name")?;
+                        ObjectLiteralKey::Computed(expression)
+                    } else {
+                        let token = self.advance();
+                        let key = match token.kind {
+                            TokenKind::Identifier(key) | TokenKind::String(key) => key,
+                            _ => {
+                                return Err(self.error(
+                                    "expected object property name".to_string(),
+                                    token.offset,
+                                ));
+                            }
+                        };
+                        ObjectLiteralKey::Static(key)
                     };
-                    ObjectLiteralKey::Static(key)
-                };
-                let value = if self.take(TokenKind::Colon) {
-                    self.parse_expression()?
-                } else if self.is(TokenKind::LParen) {
-                    self.parse_function_after_name_with_async(false)?
-                } else {
-                    return Err(self.error(
-                        "object property needs a value or method body".to_string(),
-                        self.peek().offset,
-                    ));
-                };
-                properties.push((key, value));
+                    let value = if self.take(TokenKind::Colon) {
+                        self.parse_expression()?
+                    } else if self.is(TokenKind::LParen) {
+                        self.parse_function_after_name_with_async(false)?
+                    } else {
+                        return Err(self.error(
+                            "object property needs a value or method body".to_string(),
+                            self.peek().offset,
+                        ));
+                    };
+                    properties.push(ObjectLiteralProperty::Entry(key, value));
+                }
                 if !self.take(TokenKind::Comma) {
                     break;
                 }
@@ -25376,6 +25410,36 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("2|ok|true|1,4,6,7|5|4")
+        );
+    }
+
+    #[test]
+    fn object_spread_builds_shallow_copies_and_numeric_properties() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const base = { label: "base", nested: { value: 1 } };
+                const copy = { ...base, label: "copy", extra: 2 };
+                const arrayProperties = { ...["x", "y"] };
+                const stringProperties = { ..."ok" };
+                const primitiveProperties = { ...null, ...42, done: true };
+                copy.nested.value = 3;
+                status.textContent = base.label + "|" + copy.label + "|" + base.nested.value + "|" +
+                  copy.extra + "|" + arrayProperties[0] + arrayProperties[1] + "|" +
+                  stringProperties[0] + stringProperties[1] + "|" + primitiveProperties.done;
+                "#,
+            )
+            .expect("object spread should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("base|copy|3|2|xy|ok|true")
         );
     }
 
