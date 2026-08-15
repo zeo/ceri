@@ -3270,6 +3270,47 @@ mod tests {
     }
 
     #[test]
+    fn cache_storage_survives_full_document_navigation_without_a_loopback_server() {
+        let mut resources = bundle(
+            r#"<a id="next" href="/next.html">next</a><script>
+                async function seed() {
+                    const cache = await caches.open("shell");
+                    await cache.put("/offline.txt", new Response("stored", { status: 203 }));
+                }
+                seed();
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/next.html",
+                "text/html",
+                br#"<p id="status"></p><script>
+                    async function readCache() {
+                        const response = await caches.match("/offline.txt");
+                        document.getElementById("status").textContent = response.status + "|" + await response.text();
+                    }
+                    readCache();
+                </script>"#
+                    .to_vec(),
+            )
+            .expect("next page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        assert!(browser.click_id("next").expect("next link should activate"));
+        let document = browser.document().expect("next document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("203|stored")
+        );
+    }
+
+    #[test]
     fn form_get_submission_navigates_packaged_origin_without_a_listener() {
         let mut resources = bundle(
             r#"<form id="search" action="/results.html" method="get"><input name="q" value="rust browser"><button id="submit" type="submit">search</button></form>"#,

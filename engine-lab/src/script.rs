@@ -53,6 +53,7 @@ type FormDataHandle = Rc<RefCell<FormDataData>>;
 type BlobHandle = Rc<BlobData>;
 type FileHandle = Rc<FileData>;
 type FileListHandle = Rc<Vec<FileHandle>>;
+type CacheHandle = Rc<RefCell<CacheData>>;
 type Uint8ArrayHandle = Rc<RefCell<Uint8ArrayData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
@@ -150,6 +151,8 @@ enum Value {
     PromiseConstructor,
     AbortControllerConstructor,
     WorkerConstructor,
+    CacheStorage(StorageHandle),
+    Cache(CacheHandle),
     NumberNamespace,
     ArrayNamespace,
     ObjectNamespace,
@@ -215,6 +218,15 @@ enum Builtin {
     StorageKey(StorageHandle),
     StorageRemoveItem(StorageHandle),
     StorageSetItem(StorageHandle),
+    CacheStorageOpen(StorageHandle),
+    CacheStorageHas(StorageHandle),
+    CacheStorageDelete(StorageHandle),
+    CacheStorageKeys(StorageHandle),
+    CacheStorageMatch(StorageHandle),
+    CachePut(CacheHandle),
+    CacheMatch(CacheHandle),
+    CacheDelete(CacheHandle),
+    CacheKeys(CacheHandle),
     FormDataAppend(FormDataHandle),
     FormDataDelete(FormDataHandle),
     FormDataGet(FormDataHandle),
@@ -916,14 +928,43 @@ struct UrlSearchParamsData {
 
 pub(crate) struct StorageData {
     values: BTreeMap<String, String>,
+    caches: BTreeMap<String, CacheHandle>,
+    cache_order: Vec<String>,
 }
 
 impl StorageData {
     pub(crate) fn new() -> Self {
         Self {
             values: BTreeMap::new(),
+            caches: BTreeMap::new(),
+            cache_order: Vec::new(),
         }
     }
+}
+
+struct CacheData {
+    entries: BTreeMap<String, CacheEntry>,
+    order: Vec<String>,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    request_url: String,
+    request_method: String,
+    request_headers: BTreeMap<String, String>,
+    response: CachedResponse,
+}
+
+#[derive(Clone)]
+struct CachedResponse {
+    url: String,
+    status: u16,
+    status_text: String,
+    mime_type: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+    redirected: bool,
+    response_type: String,
 }
 
 #[derive(Clone)]
@@ -1429,6 +1470,10 @@ impl ScriptRuntime {
             values.values.insert(
                 "sessionStorage".to_string(),
                 Value::Storage(session_storage.clone()),
+            );
+            values.values.insert(
+                "caches".to_string(),
+                Value::CacheStorage(local_storage.clone()),
             );
             values
                 .values
@@ -3869,6 +3914,11 @@ impl ScriptRuntime {
                     .borrow()
                     .get("history")
                     .ok_or_else(|| runtime_error("window history is unavailable")),
+                "caches" => self
+                    .global
+                    .borrow()
+                    .get("caches")
+                    .ok_or_else(|| runtime_error("window caches is unavailable")),
                 "console" => Ok(Value::Console),
                 "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
@@ -4561,6 +4611,23 @@ impl ScriptRuntime {
                 "removeItem" => Ok(Value::Builtin(Builtin::StorageRemoveItem(storage))),
                 "clear" => Ok(Value::Builtin(Builtin::StorageClear(storage))),
                 _ => Err(runtime_error(format!("storage has no property {property}"))),
+            },
+            Value::CacheStorage(storage) => match property {
+                "open" => Ok(Value::Builtin(Builtin::CacheStorageOpen(storage))),
+                "has" => Ok(Value::Builtin(Builtin::CacheStorageHas(storage))),
+                "delete" => Ok(Value::Builtin(Builtin::CacheStorageDelete(storage))),
+                "keys" => Ok(Value::Builtin(Builtin::CacheStorageKeys(storage))),
+                "match" => Ok(Value::Builtin(Builtin::CacheStorageMatch(storage))),
+                _ => Err(runtime_error(format!(
+                    "CacheStorage has no property {property}"
+                ))),
+            },
+            Value::Cache(cache) => match property {
+                "put" => Ok(Value::Builtin(Builtin::CachePut(cache))),
+                "match" => Ok(Value::Builtin(Builtin::CacheMatch(cache))),
+                "delete" => Ok(Value::Builtin(Builtin::CacheDelete(cache))),
+                "keys" => Ok(Value::Builtin(Builtin::CacheKeys(cache))),
+                _ => Err(runtime_error(format!("Cache has no property {property}"))),
             },
             Value::FormData(form_data) => match property {
                 "append" => Ok(Value::Builtin(Builtin::FormDataAppend(form_data))),
@@ -9784,6 +9851,17 @@ impl ScriptRuntime {
                 storage.borrow_mut().values.clear();
                 Ok(Value::Undefined)
             }
+            Builtin::CacheStorageOpen(storage) => self.cache_storage_open(storage, &arguments),
+            Builtin::CacheStorageHas(storage) => self.cache_storage_has(storage, &arguments),
+            Builtin::CacheStorageDelete(storage) => {
+                self.cache_storage_delete(storage, &arguments)
+            }
+            Builtin::CacheStorageKeys(storage) => self.cache_storage_keys(storage),
+            Builtin::CacheStorageMatch(storage) => self.cache_storage_match(storage, &arguments),
+            Builtin::CachePut(cache) => self.cache_put(cache, &arguments),
+            Builtin::CacheMatch(cache) => self.cache_match(cache, &arguments),
+            Builtin::CacheDelete(cache) => self.cache_delete(cache, &arguments),
+            Builtin::CacheKeys(cache) => self.cache_keys(cache),
             Builtin::FormDataAppend(form_data) => {
                 let name = arguments
                     .first()
@@ -11544,6 +11622,234 @@ impl ScriptRuntime {
         ))))
     }
 
+    fn cache_storage_open(
+        &self,
+        storage: StorageHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = match cache_name(arguments.first()) {
+            Ok(name) => name,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        let cache = {
+            let mut storage = storage.borrow_mut();
+            if let Some(cache) = storage.caches.get(&name) {
+                cache.clone()
+            } else {
+                let cache = Rc::new(RefCell::new(CacheData {
+                    entries: BTreeMap::new(),
+                    order: Vec::new(),
+                }));
+                storage.caches.insert(name.clone(), cache.clone());
+                storage.cache_order.push(name);
+                cache
+            }
+        };
+        Ok(Value::Promise(self.fulfilled_promise(Value::Cache(cache))))
+    }
+
+    fn cache_storage_has(
+        &self,
+        storage: StorageHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = match cache_name(arguments.first()) {
+            Ok(name) => name,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        Ok(Value::Promise(self.fulfilled_promise(Value::Bool(
+            storage.borrow().caches.contains_key(&name),
+        ))))
+    }
+
+    fn cache_storage_delete(
+        &self,
+        storage: StorageHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = match cache_name(arguments.first()) {
+            Ok(name) => name,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        let mut storage = storage.borrow_mut();
+        let deleted = storage.caches.remove(&name).is_some();
+        if deleted {
+            storage.cache_order.retain(|candidate| candidate != &name);
+        }
+        Ok(Value::Promise(self.fulfilled_promise(Value::Bool(deleted))))
+    }
+
+    fn cache_storage_keys(&self, storage: StorageHandle) -> Result<Value, ScriptError> {
+        let names = storage
+            .borrow()
+            .cache_order
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        Ok(Value::Promise(self.fulfilled_promise(Value::Array(
+            Rc::new(RefCell::new(names)),
+        ))))
+    }
+
+    fn cache_storage_match(
+        &self,
+        storage: StorageHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let (url, method, _) = match self.cache_request_parts(arguments.first()) {
+            Ok(parts) => parts,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        let key = cache_key(&url, &method);
+        let storage = storage.borrow();
+        let cached = storage.cache_order.iter().find_map(|name| {
+            storage.caches.get(name).and_then(|cache| {
+                cache
+                    .borrow()
+                    .entries
+                    .get(&key)
+                    .map(|entry| entry.response.clone())
+            })
+        });
+        let value = cached
+            .map(cached_response_value)
+            .unwrap_or(Value::Undefined);
+        Ok(Value::Promise(self.fulfilled_promise(value)))
+    }
+
+    fn cache_put(&self, cache: CacheHandle, arguments: &[Value]) -> Result<Value, ScriptError> {
+        let (url, method, request_headers) = match self.cache_request_parts(arguments.first()) {
+            Ok(parts) => parts,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        if !matches!(method.as_str(), "GET" | "HEAD") {
+            return Ok(Value::Promise(
+                self.rejected_promise("Cache.put only accepts GET or HEAD requests"),
+            ));
+        }
+        let response = match arguments.get(1).map(Value::resolve) {
+            Some(Value::Response(response)) => response,
+            _ => {
+                return Ok(Value::Promise(
+                    self.rejected_promise("Cache.put expects a Response"),
+                ));
+            }
+        };
+        let response = match cached_response_from_response(&response) {
+            Ok(response) => response,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        let key = cache_key(&url, &method);
+        let mut cache = cache.borrow_mut();
+        if !cache.entries.contains_key(&key) && cache.entries.len() >= MAX_CACHE_ENTRIES {
+            return Ok(Value::Promise(
+                self.rejected_promise("Cache entry limit exceeded"),
+            ));
+        }
+        if !cache.entries.contains_key(&key) {
+            cache.order.push(key.clone());
+        }
+        cache.entries.insert(
+            key,
+            CacheEntry {
+                request_url: url.to_string(),
+                request_method: method,
+                request_headers,
+                response,
+            },
+        );
+        Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
+    }
+
+    fn cache_match(&self, cache: CacheHandle, arguments: &[Value]) -> Result<Value, ScriptError> {
+        let (url, method, _) = match self.cache_request_parts(arguments.first()) {
+            Ok(parts) => parts,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        let key = cache_key(&url, &method);
+        let value = cache
+            .borrow()
+            .entries
+            .get(&key)
+            .map(|entry| cached_response_value(entry.response.clone()))
+            .unwrap_or(Value::Undefined);
+        Ok(Value::Promise(self.fulfilled_promise(value)))
+    }
+
+    fn cache_delete(&self, cache: CacheHandle, arguments: &[Value]) -> Result<Value, ScriptError> {
+        let (url, method, _) = match self.cache_request_parts(arguments.first()) {
+            Ok(parts) => parts,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        let key = cache_key(&url, &method);
+        let mut cache = cache.borrow_mut();
+        let deleted = cache.entries.remove(&key).is_some();
+        if deleted {
+            cache.order.retain(|candidate| candidate != &key);
+        }
+        Ok(Value::Promise(self.fulfilled_promise(Value::Bool(deleted))))
+    }
+
+    fn cache_keys(&self, cache: CacheHandle) -> Result<Value, ScriptError> {
+        let cache = cache.borrow();
+        let requests = match cache
+            .order
+            .iter()
+            .filter_map(|key| cache.entries.get(key))
+            .map(|entry| {
+                let url = AppUrl::parse(&entry.request_url)
+                    .map_err(|error| runtime_error(error.to_string()))?;
+                Ok(Value::Request(request_handle(
+                    url,
+                    entry.request_method.clone(),
+                    entry.request_headers.clone(),
+                    Vec::new(),
+                    ResourceCacheMode::Default,
+                    FetchRedirectMode::Follow,
+                    None,
+                )))
+            })
+            .collect::<Result<Vec<_>, ScriptError>>()
+        {
+            Ok(requests) => requests,
+            Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
+        };
+        Ok(Value::Promise(self.fulfilled_promise(Value::Array(
+            Rc::new(RefCell::new(requests)),
+        ))))
+    }
+
+    fn cache_request_parts(
+        &self,
+        value: Option<&Value>,
+    ) -> Result<(AppUrl, String, BTreeMap<String, String>), ScriptError> {
+        let value = value
+            .cloned()
+            .ok_or_else(|| runtime_error("Cache request is required"))?
+            .resolve();
+        match value {
+            Value::Request(request) => Ok((
+                request.url.clone(),
+                request.method.clone(),
+                request.headers.borrow().values.clone(),
+            )),
+            Value::String(reference) => {
+                let Some(base_url) = &self.base_url else {
+                    return Err(runtime_error("Cache request URL needs a document URL"));
+                };
+                let url = base_url
+                    .resolve(&reference)
+                    .map_err(|_| runtime_error(format!("Cache rejected URL {reference}")))?;
+                Ok((url, "GET".to_string(), BTreeMap::new()))
+            }
+            Value::Url(url) => Ok((url.borrow().url.clone(), "GET".to_string(), BTreeMap::new())),
+            _ => Err(runtime_error(
+                "Cache request must be a Request or URL string",
+            )),
+        }
+    }
+
     fn consume_response_body(&self, response: &ResponseHandle) -> Result<Vec<u8>, ScriptError> {
         let mut body = response.body.borrow_mut();
         if body.consumed || body.disturbed || body.locked {
@@ -11974,6 +12280,8 @@ impl Value {
             Self::Url(value) => value.borrow().url.to_string(),
             Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
             Self::Storage(_) => "[object Storage]".to_string(),
+            Self::CacheStorage(_) => "[object CacheStorage]".to_string(),
+            Self::Cache(_) => "[object Cache]".to_string(),
             Self::FormData(_) => "[object FormData]".to_string(),
             Self::Blob(_) => "[object Blob]".to_string(),
             Self::File(_) => "[object File]".to_string(),
@@ -12047,6 +12355,67 @@ fn abort_event_value() -> Value {
     event.insert("type".to_string(), Value::String("abort".to_string()));
     event.insert("defaultPrevented".to_string(), Value::Bool(false));
     Value::Object(Rc::new(RefCell::new(event)))
+}
+
+const MAX_CACHE_NAME_BYTES: usize = 256;
+const MAX_CACHE_ENTRIES: usize = 1024;
+const MAX_CACHED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn cache_name(value: Option<&Value>) -> Result<String, ScriptError> {
+    let value = value.ok_or_else(|| runtime_error("Cache name is required"))?;
+    let name = value.string_value();
+    if name.len() > MAX_CACHE_NAME_BYTES {
+        return Err(runtime_error("Cache name exceeds the deterministic limit"));
+    }
+    Ok(name)
+}
+
+fn cache_key(url: &AppUrl, method: &str) -> String {
+    format!("{method}\n{url}")
+}
+
+fn cached_response_from_response(response: &ResponseHandle) -> Result<CachedResponse, ScriptError> {
+    let body = {
+        let mut body_state = response.body.borrow_mut();
+        if body_state.consumed || body_state.disturbed || body_state.locked {
+            return Err(runtime_error("response body is already used"));
+        }
+        let body = body_state.bytes[body_state.cursor..].to_vec();
+        if body.len() > MAX_CACHED_RESPONSE_BYTES {
+            return Err(runtime_error(
+                "Cache response exceeds the deterministic byte limit",
+            ));
+        }
+        body_state.cursor = body_state.bytes.len();
+        body_state.consumed = true;
+        body_state.disturbed = true;
+        body
+    };
+    Ok(CachedResponse {
+        url: response.url.clone(),
+        status: response.status,
+        status_text: response.status_text.clone(),
+        mime_type: response.mime_type.clone(),
+        headers: response.headers.borrow().values.clone(),
+        body,
+        redirected: response.redirected,
+        response_type: response.response_type.clone(),
+    })
+}
+
+fn cached_response_value(response: CachedResponse) -> Value {
+    Value::Response(Rc::new(response_data(
+        response.url,
+        response.status,
+        response.status_text,
+        response.mime_type,
+        headers_handle(response.headers, false),
+        response.body,
+        ResponseMetadata {
+            redirected: response.redirected,
+            response_type: response.response_type,
+        },
+    )))
 }
 
 fn response_body(bytes: Vec<u8>) -> ResponseBodyHandle {
@@ -13908,6 +14277,8 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Url(_)
         | Value::UrlSearchParams(_)
         | Value::Storage(_)
+        | Value::CacheStorage(_)
+        | Value::Cache(_)
         | Value::FormData(_)
         | Value::Blob(_)
         | Value::File(_)
@@ -14403,6 +14774,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Url(left), Value::Url(right)) => Rc::ptr_eq(left, right),
         (Value::UrlSearchParams(left), Value::UrlSearchParams(right)) => Rc::ptr_eq(left, right),
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
+        (Value::CacheStorage(left), Value::CacheStorage(right)) => Rc::ptr_eq(left, right),
+        (Value::Cache(left), Value::Cache(right)) => Rc::ptr_eq(left, right),
         (Value::Navigator, Value::Navigator)
         | (Value::Clipboard, Value::Clipboard)
         | (Value::Crypto, Value::Crypto)
@@ -19839,6 +20212,97 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("2:night:count:1:open:0:0")
+        );
+    }
+
+    #[test]
+    fn cache_storage_keeps_response_snapshots_without_a_listener() {
+        let document = document("<p id='status'>idle</p>");
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/data.txt", "text/plain", b"network".to_vec())
+            .expect("resource should be accepted");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        runtime
+            .execute(
+                r#"
+                async function run() {
+                    const status = document.getElementById("status");
+                    await caches.open("first");
+                    const cache = await caches.open("offline");
+                    const original = new Response("cached", {
+                        status: 203,
+                        headers: { "X-Cache": "yes" }
+                    });
+                    await cache.put("/data.txt", original);
+                    const hit = await cache.match("/data.txt");
+                    const body = await hit.text();
+                    const requests = await cache.keys();
+                    const globalHit = await caches.match("/data.txt");
+                    const names = await caches.keys();
+                    const has = await caches.has("offline");
+                    const deleted = await caches.delete("offline");
+                    const after = await caches.has("offline");
+                    status.textContent = names[0] + "|" + names[1] + "|" + original.bodyUsed + "|" +
+                        requests.length + "|" + requests[0].url + "|" +
+                        hit.status + "|" + hit.headers.get("x-cache") + "|" + body + "|" +
+                        globalHit.status + "|" + (window.caches === caches) + "|" +
+                        has + ":" + deleted + ":" + after;
+                }
+                run();
+                "#,
+            )
+            .expect("CacheStorage should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some(
+                "first|offline|true|1|https://app.ceri.invalid/data.txt|203|yes|cached|203|true|true:true:false",
+            )
+        );
+    }
+
+    #[test]
+    fn cache_operations_reject_invalid_requests_as_promises() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime =
+            ScriptRuntime::with_resources(document.clone(), ResourceBundle::default(), base);
+        runtime
+            .execute(
+                r#"
+                async function run() {
+                    const status = document.getElementById("status");
+                    const cache = await caches.open("offline");
+                    let method = "unexpected";
+                    try {
+                        await cache.put(new Request("/data.txt", { method: "POST" }), new Response("body"));
+                    } catch (error) {
+                        method = "rejected";
+                    }
+                    let name = "unexpected";
+                    try {
+                        await caches.open();
+                    } catch (error) {
+                        name = "rejected";
+                    }
+                    status.textContent = method + "|" + name;
+                }
+                run();
+                "#,
+            )
+            .expect("invalid cache operations should stay in the promise path");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("rejected|rejected")
         );
     }
 
