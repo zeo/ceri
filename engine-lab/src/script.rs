@@ -239,6 +239,7 @@ enum Builtin {
     ElementRemoveChild(ElementHandle),
     ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
+    ElementHasChildNodes(ElementHandle),
     ElementSelect(ElementHandle),
     ElementSetSelectionRange(ElementHandle),
     ElementSetRangeText(ElementHandle),
@@ -3868,6 +3869,23 @@ impl ScriptRuntime {
                     "childNodes" => self.element_child_nodes(&handle),
                     "firstChild" => self.element_child(&handle, true),
                     "lastChild" => self.element_child(&handle, false),
+                    "previousSibling" | "nextSibling" => path
+                        .as_ref()
+                        .and_then(|path| {
+                            self.document
+                                .borrow()
+                                .sibling_path(path, property == "nextSibling")
+                        })
+                        .and_then(|path| attached_handle(path, &self.document))
+                        .map(Value::Element)
+                        .unwrap_or(Value::Null),
+                    "hasChildNodes" => {
+                        Value::Builtin(Builtin::ElementHasChildNodes(handle.clone()))
+                    }
+                    "isConnected" => Value::Bool(
+                        path.as_ref()
+                            .is_some_and(|path| self.document.borrow().node_is_connected(path)),
+                    ),
                     "parentNode" | "parentElement" => path
                         .as_ref()
                         .and_then(|path| self.document.borrow().parent_path(path))
@@ -10215,6 +10233,12 @@ impl ScriptRuntime {
                 self.detach_child(&parent, &handle)?;
                 Ok(Value::Undefined)
             }
+            Builtin::ElementHasChildNodes(handle) => Ok(Value::Bool(match handle.borrow().clone() {
+                ElementLocation::Attached { .. } => attached_path(&handle)
+                    .and_then(|path| self.document.borrow().child_paths(&path))
+                    .is_some_and(|children| !children.is_empty()),
+                ElementLocation::Detached(element) => !element.children.is_empty(),
+            })),
             Builtin::ElementSetAttribute(handle) => {
                 let name = arguments
                     .first()
@@ -17670,6 +17694,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("ell|heXllo:1:5:eXll|1:6:eXllo|hllo:1:3:ll|1:4:llo|hYYo:1:3:YY|1:4:YYo|hYYo!:1:3:YY|1:4:YYo|2|😀")
+        );
+    }
+
+    #[test]
+    fn node_sibling_navigation_tracks_stable_handles_after_removal() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello<span id="marker">!</span><b id="tail">tail</b></p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const marker = document.getElementById("marker");
+                const tail = document.getElementById("tail");
+                const initial = (text.nextSibling === marker) + ":" +
+                    (marker.previousSibling === text) + ":" +
+                    (marker.nextSibling === tail) + ":" +
+                    (tail.previousSibling === marker) + ":" +
+                    (tail.nextSibling === null) + ":" + first.hasChildNodes() + ":" +
+                    text.hasChildNodes() + ":" + root.isConnected;
+                marker.remove();
+                const status = document.getElementById("status");
+                status.textContent = initial + "|" + (tail.previousSibling === text) + ":" +
+                    (marker.isConnected === false) + ":" + (tail.isConnected === true);
+                "#,
+            )
+            .expect("sibling navigation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true:true:true:true:true:true:false:true|true:true:true")
         );
     }
 

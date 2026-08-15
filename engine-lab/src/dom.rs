@@ -606,6 +606,27 @@ impl Document {
         self.node_at(path).map(|node| matches!(node, Node::Text(_)))
     }
 
+    pub fn sibling_path(&self, path: &[usize], next: bool) -> Option<NodePath> {
+        let mut sibling_index = *path.last()?;
+        let parent = path[..path.len().saturating_sub(1)].to_vec();
+        loop {
+            sibling_index = if next {
+                sibling_index.checked_add(1)?
+            } else {
+                sibling_index.checked_sub(1)?
+            };
+            let sibling = child_path(&parent, sibling_index);
+            if self.node_id(&sibling).is_some() {
+                return Some(sibling);
+            }
+            self.node_at(&sibling)?;
+        }
+    }
+
+    pub fn node_is_connected(&self, path: &[usize]) -> bool {
+        self.node_at(path).is_some()
+    }
+
     pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
         if path.is_empty() {
             return None;
