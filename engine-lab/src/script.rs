@@ -240,6 +240,8 @@ enum Builtin {
     ElementAppend(ElementHandle),
     ElementPrepend(ElementHandle),
     ElementReplaceChildren(ElementHandle),
+    ElementBefore(ElementHandle),
+    ElementAfter(ElementHandle),
     ElementRemoveChild(ElementHandle),
     ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
@@ -4168,6 +4170,8 @@ impl ScriptRuntime {
                         }
                         Value::Builtin(Builtin::ElementReplaceChildren(handle.clone()))
                     }
+                    "before" => Value::Builtin(Builtin::ElementBefore(handle.clone())),
+                    "after" => Value::Builtin(Builtin::ElementAfter(handle.clone())),
                     "removeChild" => {
                         if path.is_none() {
                             return Err(runtime_error("detached element cannot remove children"));
@@ -10419,6 +10423,56 @@ impl ScriptRuntime {
                         Builtin::ElementAppendChild(parent.clone()),
                         vec![Value::Element(child)],
                     )?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementBefore(anchor) => {
+                let Some(anchor_path) = attached_path(&anchor) else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(parent_path) = self.document.borrow().parent_path(&anchor_path) else {
+                    return Ok(Value::Undefined);
+                };
+                let parent = attached_handle(parent_path, &self.document)
+                    .ok_or_else(|| runtime_error("before parent is no longer in the document"))?;
+                for argument in &arguments {
+                    let child = child_handle_from_value(argument);
+                    self.call_builtin(
+                        Builtin::ElementInsertBefore(parent.clone()),
+                        vec![Value::Element(child), Value::Element(anchor.clone())],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementAfter(anchor) => {
+                let Some(anchor_path) = attached_path(&anchor) else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(parent_path) = self.document.borrow().parent_path(&anchor_path) else {
+                    return Ok(Value::Undefined);
+                };
+                let parent = attached_handle(parent_path, &self.document)
+                    .ok_or_else(|| runtime_error("after parent is no longer in the document"))?;
+                let reference = self
+                    .document
+                    .borrow()
+                    .sibling_path(&anchor_path, true)
+                    .and_then(|path| attached_handle(path, &self.document))
+                    .map(Value::Element)
+                    .unwrap_or(Value::Null);
+                let append = matches!(&reference, Value::Null);
+                for argument in &arguments {
+                    let child = child_handle_from_value(argument);
+                    let builtin = if append {
+                        Builtin::ElementAppendChild(parent.clone())
+                    } else {
+                        Builtin::ElementInsertBefore(parent.clone())
+                    };
+                    let mut call_arguments = vec![Value::Element(child)];
+                    if !append {
+                        call_arguments.push(reference.clone());
+                    }
+                    self.call_builtin(builtin, call_arguments)?;
                 }
                 Ok(Value::Undefined)
             }
@@ -18313,6 +18367,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("startoldfreshend|true:true:true:1:2:true")
+        );
+    }
+
+    #[test]
+    fn before_and_after_insert_mixed_siblings_in_order() {
+        let document = document(
+            r#"<main id="root"><p id="target">one<span id="marker">!</span>tail</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const target = document.getElementById("target");
+                const marker = document.getElementById("marker");
+                const tail = target.lastChild;
+                marker.before("pre");
+                marker.after("post1", "post2");
+                const bold = document.createElement("b");
+                bold.textContent = "bold";
+                tail.before(bold);
+                tail.after("end");
+                const status = document.getElementById("status");
+                status.textContent = target.textContent + "|" + target.children.length + ":" +
+                    (marker.parentNode === target) + ":" + (bold.parentNode === target) + ":" +
+                    (marker.previousSibling.data === "pre") + ":" +
+                    (marker.nextSibling.data === "post1") + ":" +
+                    (tail.previousSibling === bold) + ":" + (tail.nextSibling.data === "end");
+                "#,
+            )
+            .expect("before and after should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("onepre!post1post2boldtailend|2:true:true:true:true:true:true")
         );
     }
 
