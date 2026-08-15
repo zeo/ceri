@@ -764,16 +764,28 @@ impl Document {
         parent: &[usize],
         reference: Option<&[usize]>,
     ) -> Option<NodePath> {
+        if !matches!(self.node_at(source), Some(Node::Element(_))) {
+            return None;
+        }
+        self.move_node_before(source, parent, reference)
+    }
+
+    pub fn move_node_before(
+        &mut self,
+        source: &[usize],
+        parent: &[usize],
+        reference: Option<&[usize]>,
+    ) -> Option<NodePath> {
         if source.is_empty() || source == parent || parent.starts_with(source) {
             return None;
         }
         let source_parent = source[..source.len() - 1].to_vec();
         let source_index = *source.last()?;
-        self.element_at(source)?;
+        self.node_at(source)?;
         if let Some(reference) = reference {
             if reference.len() != parent.len().saturating_add(1)
                 || reference[..parent.len()] != *parent
-                || self.element_at(reference).is_none()
+                || self.node_at(reference).is_none()
             {
                 return None;
             }
@@ -790,15 +802,9 @@ impl Document {
             .filter(|(_, path)| path.starts_with(source))
             .map(|(id, path)| (*id, path[source.len()..].to_vec()))
             .collect::<Vec<_>>();
-        let element = {
+        let moved_node = {
             let source_parent_element = self.element_at_mut(&source_parent)?;
-            match source_parent_element.children.get(source_index)? {
-                Node::Element(_) => match source_parent_element.children.remove(source_index) {
-                    Node::Element(element) => element,
-                    Node::Text(_) => return None,
-                },
-                Node::Text(_) => return None,
-            }
+            source_parent_element.children.remove(source_index)
         };
         self.paths
             .retain(|_, path| !path.starts_with(source));
@@ -822,7 +828,7 @@ impl Document {
         if index > parent_element.children.len() {
             return None;
         }
-        parent_element.children.insert(index, Node::Element(element));
+        parent_element.children.insert(index, moved_node);
         path.push(index);
         for (id, relative) in moved_ids {
             let mut moved_path = path.clone();

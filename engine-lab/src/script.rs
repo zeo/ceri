@@ -10170,19 +10170,14 @@ impl ScriptRuntime {
                     _ => return Err(runtime_error("appendChild expects an element")),
                 };
                 if let Some(source_path) = attached_path(&child) {
-                    if attached_is_text(&child) {
-                        return Err(runtime_error(
-                            "appendChild cannot move an attached text node yet",
-                        ));
-                    }
                     let source_parent =
                         source_path[..source_path.len().saturating_sub(1)].to_vec();
                     let child_path = self
                         .document
                         .borrow_mut()
-                        .move_element_before(&source_path, &parent_path, None)
+                        .move_node_before(&source_path, &parent_path, None)
                         .ok_or_else(|| {
-                            runtime_error("appendChild cannot move the element into the parent")
+                            runtime_error("appendChild cannot move the node into the parent")
                         })?;
                     if child_path != source_path {
                         self.relocate_runtime_paths_for_move(&source_path, &child_path);
@@ -10235,19 +10230,14 @@ impl ScriptRuntime {
                 };
                 let reference_index = reference_path.as_ref().and_then(|path| path.last()).copied();
                 let child_path = if let Some(source_path) = attached_path(&child) {
-                    if attached_is_text(&child) {
-                        return Err(runtime_error(
-                            "insertBefore cannot move an attached text node yet",
-                        ));
-                    }
                     let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
                     let child_path = self
                         .document
                         .borrow_mut()
-                        .move_element_before(&source_path, &parent_path, reference_path.as_deref())
+                        .move_node_before(&source_path, &parent_path, reference_path.as_deref())
                         .ok_or_else(|| {
                             runtime_error(
-                                "insertBefore cannot move the element into the requested parent",
+                                "insertBefore cannot move the node into the requested parent",
                             )
                         })?;
                     if child_path != source_path {
@@ -17520,6 +17510,44 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("elloworl|first|target")
+        );
+    }
+
+    #[test]
+    fn attached_text_nodes_move_through_append_and_insert_before() {
+        let document = document(
+            r#"<main id="source"><p id="first">hello<span id="marker">!</span>tail</p></main><main id="target"><p id="second">world</p></main><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const source = document.getElementById("first");
+                const target = document.getElementById("second");
+                const marker = document.getElementById("marker");
+                const leading = source.firstChild;
+                const trailing = marker.nextSibling;
+                const range = document.createRange();
+                range.setStart(leading, 1);
+                range.setEnd(leading, 4);
+                target.appendChild(leading);
+                target.insertBefore(trailing, leading);
+                const status = document.getElementById("status");
+                status.textContent = source.textContent + "|" + target.textContent + "|" +
+                    (leading.parentNode === target) + ":" + (trailing.parentNode === target) + ":" +
+                    (target.lastChild === leading) + ":" + (trailing.nextSibling === leading) + "|" +
+                    range.startContainer.data + ":" + range.startOffset + ":" +
+                    range.endContainer.data + ":" + range.endOffset + ":" + range.toString();
+                "#,
+            )
+            .expect("attached text movement should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("!|worldtailhello|true:true:true:true|hello:1:hello:4:ell")
         );
     }
 
