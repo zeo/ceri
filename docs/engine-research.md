@@ -53,7 +53,7 @@ The provider seam is now exercised by host-backed integration tests covering the
 
 ## Compatibility gates
 
-The script runtime now mutates plain-object properties and bounded array indexes, supports array `length` changes plus `push()` and `pop()`, compares object and array references by identity, and builds shallow object copies with spread from plain objects, arrays, and strings. This makes ordinary state updates possible without opening a host transport, while cyclic script values still fail closed at the structured-clone boundary.
+The script runtime now mutates plain-object properties and bounded array indexes, supports array `length` changes plus `push()` and `pop()`, compares object and array references by identity, builds shallow object copies with spread from plain objects, arrays, and strings, and exposes bounded `Object.keys()`, `Object.values()`, `Object.entries()`, and `Object.assign()`. This makes ordinary state updates possible without opening a host transport, while cyclic script values still fail closed at the structured-clone boundary.
 
 The runtime now carries effective disabled paths into CSS matching, so `:disabled` and `:enabled` agree with form submission, validation, focus, click suppression, disabled `optgroup` state, and the first `legend` exemption inside a disabled `fieldset`.
 

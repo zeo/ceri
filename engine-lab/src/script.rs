@@ -389,6 +389,10 @@ enum Builtin {
     NumberIsFinite,
     ArrayIsArray,
     ObjectFreeze,
+    ObjectKeys,
+    ObjectValues,
+    ObjectEntries,
+    ObjectAssign,
     ElementClassListAdd(ElementHandle),
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
@@ -1295,6 +1299,7 @@ const MAX_CLONE_NODES: usize = 16_384;
 const MAX_CLONE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLONE_STRING_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_ARRAY_LENGTH: usize = 16_384;
+const MAX_RUNTIME_OBJECT_PROPERTIES: usize = 16_384;
 
 enum WorkerCommand {
     Message(CloneValue),
@@ -3902,22 +3907,8 @@ impl ScriptRuntime {
                     match property {
                         ObjectLiteralProperty::Spread(expression) => {
                             let value = self.evaluate(expression, environment.clone())?;
-                            match value.resolve() {
-                                Value::Object(source) => {
-                                    object.extend(source.borrow().clone());
-                                }
-                                Value::Array(source) => {
-                                    for (index, value) in source.borrow().iter().cloned().enumerate() {
-                                        object.insert(index.to_string(), value);
-                                    }
-                                }
-                                Value::String(source) => {
-                                    for (index, value) in source.chars().enumerate() {
-                                        object.insert(index.to_string(), Value::String(value.to_string()));
-                                    }
-                                }
-                                Value::Undefined | Value::Null => {}
-                                _ => {}
+                            for (property, value) in enumerable_object_properties(value)? {
+                                object.insert(property, value);
                             }
                         }
                         ObjectLiteralProperty::Entry(key, expression) => {
@@ -5284,6 +5275,10 @@ impl ScriptRuntime {
             },
             Value::ObjectNamespace => match property {
                 "freeze" => Ok(Value::Builtin(Builtin::ObjectFreeze)),
+                "keys" => Ok(Value::Builtin(Builtin::ObjectKeys)),
+                "values" => Ok(Value::Builtin(Builtin::ObjectValues)),
+                "entries" => Ok(Value::Builtin(Builtin::ObjectEntries)),
+                "assign" => Ok(Value::Builtin(Builtin::ObjectAssign)),
                 _ => Err(runtime_error(format!("Object has no property {property}"))),
             },
             Value::SymbolNamespace => match property {
@@ -9243,6 +9238,36 @@ impl ScriptRuntime {
                 arguments.first().is_some_and(|value| matches!(value, Value::Array(_))),
             )),
             Builtin::ObjectFreeze => Ok(arguments.first().cloned().unwrap_or(Value::Undefined)),
+            Builtin::ObjectKeys => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                reject_nullish_object_argument(&value, "Object.keys")?;
+                let keys = enumerable_object_properties(value)?
+                    .into_iter()
+                    .map(|(key, _)| Value::String(key))
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(keys))))
+            }
+            Builtin::ObjectValues => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                reject_nullish_object_argument(&value, "Object.values")?;
+                let values = enumerable_object_properties(value)?
+                    .into_iter()
+                    .map(|(_, value)| value)
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(values))))
+            }
+            Builtin::ObjectEntries => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                reject_nullish_object_argument(&value, "Object.entries")?;
+                let entries = enumerable_object_properties(value)?
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Value::Array(Rc::new(RefCell::new(vec![Value::String(key), value])))
+                    })
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(entries))))
+            }
+            Builtin::ObjectAssign => object_assign(&arguments),
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
@@ -15555,6 +15580,75 @@ fn normalize_blob_type(value: &str) -> String {
 }
 
 const MAX_TYPED_ARRAY_BYTES: usize = 16 * 1024 * 1024;
+
+fn reject_nullish_object_argument(value: &Value, method: &str) -> Result<(), ScriptError> {
+    if matches!(value.resolve(), Value::Undefined | Value::Null) {
+        return Err(runtime_error(format!("{method} requires an object value")));
+    }
+    Ok(())
+}
+
+fn enumerable_object_properties(value: Value) -> Result<Vec<(String, Value)>, ScriptError> {
+    let properties = match value.resolve() {
+        Value::Object(source) => source
+            .borrow()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.resolve()))
+            .collect(),
+        Value::Array(source) => source
+            .borrow()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, value)| (index.to_string(), value.resolve()))
+            .collect(),
+        Value::String(source) => source
+            .chars()
+            .enumerate()
+            .map(|(index, value)| (index.to_string(), Value::String(value.to_string())))
+            .collect(),
+        Value::Undefined | Value::Null => Vec::new(),
+        _ => Vec::new(),
+    };
+    if properties.len() > MAX_RUNTIME_OBJECT_PROPERTIES {
+        return Err(runtime_error(
+            "object property count exceeds the deterministic limit",
+        ));
+    }
+    Ok(properties)
+}
+
+fn object_assign(arguments: &[Value]) -> Result<Value, ScriptError> {
+    let target = arguments
+        .first()
+        .cloned()
+        .unwrap_or(Value::Undefined)
+        .resolve();
+    match target {
+        Value::Object(target) => {
+            for source in arguments.iter().skip(1).cloned() {
+                for (property, value) in enumerable_object_properties(source)? {
+                    target.borrow_mut().insert(property, value);
+                }
+            }
+            Ok(Value::Object(target))
+        }
+        Value::Array(target) => {
+            for source in arguments.iter().skip(1).cloned() {
+                for (property, value) in enumerable_object_properties(source)? {
+                    let Some(index) = runtime_array_property_index(&property) else {
+                        return Err(runtime_error(format!(
+                            "Object.assign cannot write array property {property}"
+                        )));
+                    };
+                    set_array_element(&target, index, value)?;
+                }
+            }
+            Ok(Value::Array(target))
+        }
+        _ => Err(runtime_error("Object.assign target must be an object")),
+    }
+}
 
 fn runtime_array_property_index(property: &str) -> Option<usize> {
     let index = property.parse::<usize>().ok()?;
@@ -25440,6 +25534,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("base|copy|3|2|xy|ok|true")
+        );
+    }
+
+    #[test]
+    fn object_static_methods_inspect_and_assign_values() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const target = { old: 0 };
+                const result = Object.assign(target, { a: 1, b: "two" }, { b: "override" });
+                const entries = Object.entries(result).map((entry) => entry.join("=")).join(",");
+                const arrayTarget = [];
+                Object.assign(arrayTarget, { "1": "one" }, ["zero"]);
+                let nullError = "unexpected";
+                try {
+                  Object.keys(null);
+                } catch (error) {
+                  nullError = error.message;
+                }
+                status.textContent = (result === target) + "|" + Object.keys(result).join(",") + "|" +
+                  Object.values(result).join(",") + "|" + entries + "|" +
+                  Object.keys("ok").join("") + "|" + arrayTarget.join(",") + "|" + nullError;
+                "#,
+            )
+            .expect("Object static methods should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|a,b,old|1,override,0|a=1,b=override,old=0|01|zero,one|Object.keys requires an object value")
         );
     }
 
