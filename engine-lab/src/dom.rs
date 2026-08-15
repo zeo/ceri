@@ -695,6 +695,10 @@ impl Document {
         self.element_at(path).map(Element::inner_html)
     }
 
+    pub fn element_outer_html(&self, path: &[usize]) -> Option<String> {
+        self.element_at(path).map(Element::outer_html)
+    }
+
     pub fn set_element_inner_html(
         &mut self,
         path: &[usize],
@@ -1171,6 +1175,12 @@ impl Element {
     pub fn inner_html(&self) -> String {
         let mut output = String::new();
         serialize_nodes(&self.children, &mut output);
+        output
+    }
+
+    pub fn outer_html(&self) -> String {
+        let mut output = String::new();
+        serialize_element(self, &mut output);
         output
     }
 

@@ -3880,6 +3880,10 @@ impl ScriptRuntime {
                         .element_inner_html(&handle)
                         .map(Value::String)
                         .unwrap_or_else(|| Value::String(String::new())),
+                    "outerHTML" => self
+                        .element_outer_html(&handle)
+                        .map(Value::String)
+                        .unwrap_or(Value::Undefined),
                     "childNodes" => self.element_child_nodes(&handle),
                     "children" => self.element_children(&handle),
                     "firstChild" => self.element_child(&handle, true),
@@ -7008,6 +7012,17 @@ impl ScriptRuntime {
             ElementLocation::Attached { .. } => attached_path(handle)
                 .and_then(|path| self.document.borrow().element_inner_html(&path)),
             ElementLocation::Detached(element) => Some(element.inner_html()),
+        }
+    }
+
+    fn element_outer_html(&self, handle: &ElementHandle) -> Option<String> {
+        if attached_is_text(handle) {
+            return None;
+        }
+        match handle.borrow().clone() {
+            ElementLocation::Attached { .. } => attached_path(handle)
+                .and_then(|path| self.document.borrow().element_outer_html(&path)),
+            ElementLocation::Detached(element) => Some(element.outer_html()),
         }
     }
 
@@ -18096,6 +18111,35 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true:source:false:true:insidetail:true:tail:0:true")
+        );
+    }
+
+    #[test]
+    fn outer_html_serializes_elements_and_keeps_text_on_character_data_surface() {
+        let document = document(
+            r#"<main id="root"><div id="source" data-x="a&b"><span>inside</span>tail</div><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const source = document.getElementById("source");
+                const text = source.lastChild;
+                const detached = document.createElement("em");
+                detached.innerHTML = "hello &amp; <strong>world</strong>";
+                const status = document.getElementById("status");
+                status.textContent = source.outerHTML + "|" + detached.outerHTML + "|" +
+                    text.outerHTML;
+                "#,
+            )
+            .expect("outerHTML should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined")
         );
     }
 
