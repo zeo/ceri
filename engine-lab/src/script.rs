@@ -54,6 +54,11 @@ type BlobHandle = Rc<BlobData>;
 type FileHandle = Rc<FileData>;
 type FileListHandle = Rc<Vec<FileHandle>>;
 type CacheHandle = Rc<RefCell<CacheData>>;
+type IndexedDbRequestHandle = Rc<RefCell<IndexedDbRequestData>>;
+type IndexedDbDatabaseHandle = Rc<RefCell<IndexedDbDatabaseData>>;
+type IndexedDbTransactionHandle = Rc<RefCell<IndexedDbTransactionData>>;
+type IndexedDbObjectStoreHandle = Rc<RefCell<IndexedDbObjectStoreData>>;
+type IndexedDbNameListHandle = Rc<Vec<String>>;
 type Uint8ArrayHandle = Rc<RefCell<Uint8ArrayData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
@@ -153,6 +158,12 @@ enum Value {
     WorkerConstructor,
     CacheStorage(StorageHandle),
     Cache(CacheHandle),
+    IndexedDbFactory(StorageHandle),
+    IndexedDbRequest(IndexedDbRequestHandle),
+    IndexedDbDatabase(IndexedDbDatabaseHandle),
+    IndexedDbTransaction(IndexedDbTransactionHandle),
+    IndexedDbObjectStore(IndexedDbObjectStoreHandle),
+    IndexedDbNameList(IndexedDbNameListHandle),
     NumberNamespace,
     ArrayNamespace,
     ObjectNamespace,
@@ -227,6 +238,27 @@ enum Builtin {
     CacheMatch(CacheHandle),
     CacheDelete(CacheHandle),
     CacheKeys(CacheHandle),
+    IndexedDbOpen(StorageHandle),
+    IndexedDbDeleteDatabase(StorageHandle),
+    IndexedDbRequestDispatch(IndexedDbRequestHandle),
+    IndexedDbTransactionComplete(IndexedDbTransactionHandle),
+    IndexedDbFactoryDatabases(StorageHandle),
+    IndexedDbDatabaseCreateObjectStore(IndexedDbDatabaseHandle),
+    IndexedDbDatabaseDeleteObjectStore(IndexedDbDatabaseHandle),
+    IndexedDbDatabaseTransaction(IndexedDbDatabaseHandle),
+    IndexedDbDatabaseClose(IndexedDbDatabaseHandle),
+    IndexedDbTransactionObjectStore(IndexedDbTransactionHandle),
+    IndexedDbTransactionAbort(IndexedDbTransactionHandle),
+    IndexedDbObjectStorePut(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreAdd(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreGet(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreDelete(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreClear(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreCount(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreGetAll(IndexedDbObjectStoreHandle),
+    IndexedDbObjectStoreGetAllKeys(IndexedDbObjectStoreHandle),
+    IndexedDbNameListContains(IndexedDbNameListHandle),
+    IndexedDbNameListItem(IndexedDbNameListHandle),
     FormDataAppend(FormDataHandle),
     FormDataDelete(FormDataHandle),
     FormDataGet(FormDataHandle),
@@ -930,6 +962,8 @@ pub(crate) struct StorageData {
     values: BTreeMap<String, String>,
     caches: BTreeMap<String, CacheHandle>,
     cache_order: Vec<String>,
+    databases: BTreeMap<String, IndexedDbDatabaseHandle>,
+    database_order: Vec<String>,
 }
 
 impl StorageData {
@@ -938,6 +972,8 @@ impl StorageData {
             values: BTreeMap::new(),
             caches: BTreeMap::new(),
             cache_order: Vec::new(),
+            databases: BTreeMap::new(),
+            database_order: Vec::new(),
         }
     }
 }
@@ -965,6 +1001,64 @@ struct CachedResponse {
     body: Vec<u8>,
     redirected: bool,
     response_type: String,
+}
+
+struct IndexedDbDatabaseData {
+    name: String,
+    version: u64,
+    stores: BTreeMap<String, IndexedDbStoreData>,
+    store_order: Vec<String>,
+    upgrade_active: bool,
+    upgrade_transaction: Option<IndexedDbTransactionHandle>,
+    closed: bool,
+    on_version_change: Option<Value>,
+}
+
+struct IndexedDbStoreData {
+    key_path: Option<String>,
+    auto_increment: bool,
+    records: BTreeMap<String, IndexedDbRecord>,
+    order: Vec<String>,
+    next_key: u64,
+}
+
+struct IndexedDbRecord {
+    key: Value,
+    value: Value,
+}
+
+struct IndexedDbRequestData {
+    result: Value,
+    error: Option<Value>,
+    done: bool,
+    on_success: Option<Value>,
+    on_error: Option<Value>,
+    on_upgrade_needed: Option<Value>,
+    on_blocked: Option<Value>,
+    transaction: Option<IndexedDbTransactionHandle>,
+    track_transaction: bool,
+    database: Option<IndexedDbDatabaseHandle>,
+    old_version: u64,
+    new_version: u64,
+    needs_upgrade: bool,
+}
+
+struct IndexedDbTransactionData {
+    database: IndexedDbDatabaseHandle,
+    store_names: Vec<String>,
+    mode: String,
+    pending: usize,
+    complete_dispatched: bool,
+    aborted: bool,
+    on_complete: Option<Value>,
+    on_error: Option<Value>,
+    on_abort: Option<Value>,
+}
+
+struct IndexedDbObjectStoreData {
+    database: IndexedDbDatabaseHandle,
+    name: String,
+    transaction: Option<IndexedDbTransactionHandle>,
 }
 
 #[derive(Clone)]
@@ -1474,6 +1568,10 @@ impl ScriptRuntime {
             values.values.insert(
                 "caches".to_string(),
                 Value::CacheStorage(local_storage.clone()),
+            );
+            values.values.insert(
+                "indexedDB".to_string(),
+                Value::IndexedDbFactory(local_storage.clone()),
             );
             values
                 .values
@@ -3919,6 +4017,11 @@ impl ScriptRuntime {
                     .borrow()
                     .get("caches")
                     .ok_or_else(|| runtime_error("window caches is unavailable")),
+                "indexedDB" => self
+                    .global
+                    .borrow()
+                    .get("indexedDB")
+                    .ok_or_else(|| runtime_error("window indexedDB is unavailable")),
                 "console" => Ok(Value::Console),
                 "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
@@ -4629,6 +4732,159 @@ impl ScriptRuntime {
                 "keys" => Ok(Value::Builtin(Builtin::CacheKeys(cache))),
                 _ => Err(runtime_error(format!("Cache has no property {property}"))),
             },
+            Value::IndexedDbFactory(storage) => match property {
+                "open" => Ok(Value::Builtin(Builtin::IndexedDbOpen(storage))),
+                "deleteDatabase" => Ok(Value::Builtin(Builtin::IndexedDbDeleteDatabase(storage))),
+                "databases" => Ok(Value::Builtin(Builtin::IndexedDbFactoryDatabases(storage))),
+                _ => Err(runtime_error(format!(
+                    "indexedDB has no property {property}"
+                ))),
+            },
+            Value::IndexedDbRequest(request) => match property {
+                "result" => Ok(request.borrow().result.clone()),
+                "error" => Ok(request
+                    .borrow()
+                    .error
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                "readyState" => Ok(Value::String(if request.borrow().done {
+                    "done".to_string()
+                } else {
+                    "pending".to_string()
+                })),
+                "transaction" => Ok(request
+                    .borrow()
+                    .transaction
+                    .clone()
+                    .map(Value::IndexedDbTransaction)
+                    .unwrap_or(Value::Null)),
+                "onsuccess" => Ok(request
+                    .borrow()
+                    .on_success
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                "onerror" => Ok(request
+                    .borrow()
+                    .on_error
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                "onupgradeneeded" => Ok(request
+                    .borrow()
+                    .on_upgrade_needed
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                "onblocked" => Ok(request
+                    .borrow()
+                    .on_blocked
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                _ => Err(runtime_error(format!(
+                    "IDBRequest has no property {property}"
+                ))),
+            },
+            Value::IndexedDbDatabase(database) => match property {
+                "name" => Ok(Value::String(database.borrow().name.clone())),
+                "version" => Ok(Value::Number(database.borrow().version as f64)),
+                "objectStoreNames" => Ok(Value::IndexedDbNameList(Rc::new(
+                    database.borrow().store_order.clone(),
+                ))),
+                "createObjectStore" => Ok(Value::Builtin(
+                    Builtin::IndexedDbDatabaseCreateObjectStore(database),
+                )),
+                "deleteObjectStore" => Ok(Value::Builtin(
+                    Builtin::IndexedDbDatabaseDeleteObjectStore(database),
+                )),
+                "transaction" => Ok(Value::Builtin(
+                    Builtin::IndexedDbDatabaseTransaction(database),
+                )),
+                "close" => Ok(Value::Builtin(Builtin::IndexedDbDatabaseClose(database))),
+                "onversionchange" => Ok(database
+                    .borrow()
+                    .on_version_change
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                _ => Err(runtime_error(format!(
+                    "IDBDatabase has no property {property}"
+                ))),
+            },
+            Value::IndexedDbTransaction(transaction) => match property {
+                "mode" => Ok(Value::String(transaction.borrow().mode.clone())),
+                "objectStore" => Ok(Value::Builtin(
+                    Builtin::IndexedDbTransactionObjectStore(transaction),
+                )),
+                "abort" => Ok(Value::Builtin(Builtin::IndexedDbTransactionAbort(
+                    transaction,
+                ))),
+                "oncomplete" => Ok(transaction
+                    .borrow()
+                    .on_complete
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                "onerror" => Ok(transaction
+                    .borrow()
+                    .on_error
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                "onabort" => Ok(transaction
+                    .borrow()
+                    .on_abort
+                    .clone()
+                    .unwrap_or(Value::Null)),
+                _ => Err(runtime_error(format!(
+                    "IDBTransaction has no property {property}"
+                ))),
+            },
+            Value::IndexedDbObjectStore(store) => match property {
+                "name" => Ok(Value::String(store.borrow().name.clone())),
+                "keyPath" => {
+                    let store = store.borrow();
+                    let database = store.database.borrow();
+                    Ok(database
+                        .stores
+                        .get(&store.name)
+                        .and_then(|store| store.key_path.clone())
+                        .map(Value::String)
+                        .unwrap_or(Value::Null))
+                }
+                "autoIncrement" => {
+                    let store = store.borrow();
+                    let database = store.database.borrow();
+                    Ok(Value::Bool(
+                        database
+                            .stores
+                            .get(&store.name)
+                            .is_some_and(|store| store.auto_increment),
+                    ))
+                }
+                "indexNames" => Ok(Value::IndexedDbNameList(Rc::new(Vec::new()))),
+                "transaction" => Ok(store
+                    .borrow()
+                    .transaction
+                    .clone()
+                    .map(Value::IndexedDbTransaction)
+                    .unwrap_or(Value::Null)),
+                "put" => Ok(Value::Builtin(Builtin::IndexedDbObjectStorePut(store))),
+                "add" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreAdd(store))),
+                "get" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreGet(store))),
+                "delete" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreDelete(store))),
+                "clear" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreClear(store))),
+                "count" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreCount(store))),
+                "getAll" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreGetAll(store))),
+                "getAllKeys" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreGetAllKeys(
+                    store,
+                ))),
+                _ => Err(runtime_error(format!(
+                    "IDBObjectStore has no property {property}"
+                ))),
+            },
+            Value::IndexedDbNameList(names) => match property {
+                "length" => Ok(Value::Number(names.len() as f64)),
+                "contains" => Ok(Value::Builtin(Builtin::IndexedDbNameListContains(names))),
+                "item" => Ok(Value::Builtin(Builtin::IndexedDbNameListItem(names))),
+                _ => Err(runtime_error(format!(
+                    "DOMStringList has no property {property}"
+                ))),
+            },
             Value::FormData(form_data) => match property {
                 "append" => Ok(Value::Builtin(Builtin::FormDataAppend(form_data))),
                 "delete" => Ok(Value::Builtin(Builtin::FormDataDelete(form_data))),
@@ -5005,6 +5261,17 @@ impl ScriptRuntime {
                     .map(Value::File)
                     .unwrap_or(Value::Undefined))
             }
+            Value::IndexedDbNameList(names) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(names
+                    .get(index as usize)
+                    .cloned()
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined))
+            }
             Value::String(string) => {
                 let index = index.number()?;
                 if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
@@ -5125,6 +5392,36 @@ impl ScriptRuntime {
             Value::Url(url) => self.assign_url_property(&url, property, &value_string)?,
             Value::Worker(worker) if matches!(property, "onmessage" | "onerror") => {
                 self.assign_worker_callback(&worker, property, value)?;
+                true
+            }
+            Value::IndexedDbRequest(request)
+                if matches!(
+                    property,
+                    "onsuccess" | "onerror" | "onupgradeneeded" | "onblocked"
+                ) =>
+            {
+                assign_indexed_db_callback(&request, property, value)?;
+                true
+            }
+            Value::IndexedDbDatabase(database) if property == "onversionchange" => {
+                assign_indexed_db_callback_value(
+                    &mut database.borrow_mut().on_version_change,
+                    property,
+                    value,
+                )?;
+                true
+            }
+            Value::IndexedDbTransaction(transaction)
+                if matches!(property, "oncomplete" | "onerror" | "onabort") =>
+            {
+                let mut transaction = transaction.borrow_mut();
+                let target = match property {
+                    "oncomplete" => &mut transaction.on_complete,
+                    "onerror" => &mut transaction.on_error,
+                    "onabort" => &mut transaction.on_abort,
+                    _ => unreachable!(),
+                };
+                assign_indexed_db_callback_value(target, property, value)?;
                 true
             }
             _ => false,
@@ -9862,6 +10159,83 @@ impl ScriptRuntime {
             Builtin::CacheMatch(cache) => self.cache_match(cache, &arguments),
             Builtin::CacheDelete(cache) => self.cache_delete(cache, &arguments),
             Builtin::CacheKeys(cache) => self.cache_keys(cache),
+            Builtin::IndexedDbOpen(storage) => self.indexed_db_open(storage, &arguments),
+            Builtin::IndexedDbDeleteDatabase(storage) => {
+                self.indexed_db_delete_database(storage, &arguments)
+            }
+            Builtin::IndexedDbFactoryDatabases(storage) => self.indexed_db_databases(storage),
+            Builtin::IndexedDbRequestDispatch(request) => {
+                self.dispatch_indexed_db_request(request)
+            }
+            Builtin::IndexedDbTransactionComplete(transaction) => {
+                self.dispatch_indexed_db_transaction(transaction)
+            }
+            Builtin::IndexedDbDatabaseCreateObjectStore(database) => {
+                self.indexed_db_create_object_store(database, &arguments)
+            }
+            Builtin::IndexedDbDatabaseDeleteObjectStore(database) => {
+                self.indexed_db_delete_object_store(database, &arguments)
+            }
+            Builtin::IndexedDbDatabaseTransaction(database) => {
+                self.indexed_db_transaction(database, &arguments)
+            }
+            Builtin::IndexedDbDatabaseClose(database) => {
+                database.borrow_mut().closed = true;
+                Ok(Value::Undefined)
+            }
+            Builtin::IndexedDbTransactionObjectStore(transaction) => {
+                self.indexed_db_transaction_object_store(transaction, &arguments)
+            }
+            Builtin::IndexedDbTransactionAbort(transaction) => {
+                self.indexed_db_transaction_abort(transaction)
+            }
+            Builtin::IndexedDbObjectStorePut(store) => {
+                self.indexed_db_object_store_write(store, &arguments, false)
+            }
+            Builtin::IndexedDbObjectStoreAdd(store) => {
+                self.indexed_db_object_store_write(store, &arguments, true)
+            }
+            Builtin::IndexedDbObjectStoreGet(store) => {
+                self.indexed_db_object_store_get(store, &arguments)
+            }
+            Builtin::IndexedDbObjectStoreDelete(store) => {
+                self.indexed_db_object_store_delete(store, &arguments)
+            }
+            Builtin::IndexedDbObjectStoreClear(store) => {
+                self.indexed_db_object_store_clear(store)
+            }
+            Builtin::IndexedDbObjectStoreCount(store) => {
+                self.indexed_db_object_store_count(store, &arguments)
+            }
+            Builtin::IndexedDbObjectStoreGetAll(store) => {
+                self.indexed_db_object_store_get_all(store, &arguments, false)
+            }
+            Builtin::IndexedDbObjectStoreGetAllKeys(store) => {
+                self.indexed_db_object_store_get_all(store, &arguments, true)
+            }
+            Builtin::IndexedDbNameListContains(names) => {
+                let name = arguments
+                    .first()
+                    .ok_or_else(|| runtime_error("DOMStringList.contains requires a name"))?
+                    .string_value();
+                Ok(Value::Bool(names.iter().any(|candidate| candidate == &name)))
+            }
+            Builtin::IndexedDbNameListItem(names) => {
+                let index = arguments
+                    .first()
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(-1.0);
+                Ok(if index.is_finite() && index >= 0.0 && index.fract() == 0.0 {
+                    names
+                        .get(index as usize)
+                        .cloned()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                })
+            }
             Builtin::FormDataAppend(form_data) => {
                 let name = arguments
                     .first()
@@ -11473,6 +11847,18 @@ impl ScriptRuntime {
         }
     }
 
+    fn queue_internal_microtask(&mut self, callback: Value) {
+        let next = Rc::new(RefCell::new(PromiseData {
+            outcome: PromiseOutcome::Pending,
+            reactions: Vec::new(),
+        }));
+        self.microtasks.push_back(Microtask {
+            callback,
+            argument: Value::Undefined,
+            next,
+        });
+    }
+
     fn settle_promise(&mut self, promise: &PromiseHandle, outcome: PromiseOutcome) {
         let reactions = {
             let mut promise = promise.borrow_mut();
@@ -12104,6 +12490,787 @@ fn collect_sequential_focus_nodes(
     }
 }
 
+impl ScriptRuntime {
+    fn indexed_db_open(
+        &mut self,
+        storage: StorageHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = indexed_db_name(arguments.first(), "database")?;
+        let requested_version = indexed_db_version(arguments.get(1))?;
+        let (database, old_version, target_version, needs_upgrade, error) = {
+            let mut storage = storage.borrow_mut();
+            let database = if let Some(database) = storage.databases.get(&name) {
+                database.clone()
+            } else {
+                let database = Rc::new(RefCell::new(IndexedDbDatabaseData {
+                    name: name.clone(),
+                    version: 0,
+                    stores: BTreeMap::new(),
+                    store_order: Vec::new(),
+                    upgrade_active: false,
+                    upgrade_transaction: None,
+                    closed: false,
+                    on_version_change: None,
+                }));
+                if storage.databases.len() >= MAX_IDB_DATABASES {
+                    let request = self.indexed_db_request(
+                        Value::Undefined,
+                        Some(indexed_db_error(
+                            "QuotaError",
+                            "IndexedDB database limit exceeded",
+                        )),
+                        None,
+                        None,
+                        (0, 0),
+                        false,
+                    );
+                    return Ok(request);
+                }
+                storage.databases.insert(name.clone(), database.clone());
+                storage.database_order.push(name.clone());
+                database
+            };
+            let old_version = database.borrow().version;
+            let target_version = requested_version.unwrap_or(if old_version == 0 {
+                1
+            } else {
+                old_version
+            });
+            if target_version < old_version {
+                (
+                    database,
+                    old_version,
+                    target_version,
+                    false,
+                    Some(indexed_db_error(
+                        "VersionError",
+                        "requested database version is lower than the current version",
+                    )),
+                )
+            } else if target_version > old_version {
+                let transaction = Rc::new(RefCell::new(IndexedDbTransactionData {
+                    database: database.clone(),
+                    store_names: database.borrow().store_order.clone(),
+                    mode: "versionchange".to_string(),
+                    pending: 0,
+                    complete_dispatched: false,
+                    aborted: false,
+                    on_complete: None,
+                    on_error: None,
+                    on_abort: None,
+                }));
+                {
+                    let mut database_state = database.borrow_mut();
+                    database_state.version = target_version;
+                    database_state.upgrade_active = true;
+                    database_state.upgrade_transaction = Some(transaction);
+                    database_state.closed = false;
+                }
+                (database, old_version, target_version, true, None)
+            } else {
+                database.borrow_mut().closed = false;
+                (database, old_version, target_version, false, None)
+            }
+        };
+        let transaction = database
+            .borrow()
+            .upgrade_transaction
+            .clone()
+            .filter(|_| needs_upgrade);
+        Ok(self.indexed_db_request(
+            if error.is_none() {
+                Value::IndexedDbDatabase(database.clone())
+            } else {
+                Value::Undefined
+            },
+            error,
+            transaction,
+            Some(database),
+            (old_version, target_version),
+            needs_upgrade,
+        ))
+    }
+
+    fn indexed_db_delete_database(
+        &mut self,
+        storage: StorageHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = indexed_db_name(arguments.first(), "database")?;
+        let old_version = {
+            let mut storage = storage.borrow_mut();
+            let old_version = storage.databases.remove(&name).map(|database| {
+                let mut database = database.borrow_mut();
+                let old_version = database.version;
+                database.closed = true;
+                database.stores.clear();
+                database.store_order.clear();
+                database.upgrade_active = false;
+                database.upgrade_transaction = None;
+                old_version
+            }).unwrap_or(0);
+            if old_version != 0 {
+                storage.database_order.retain(|candidate| candidate != &name);
+            }
+            old_version
+        };
+        Ok(self.indexed_db_request(
+            Value::Undefined,
+            None,
+            None,
+            None,
+            (old_version, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_databases(&self, storage: StorageHandle) -> Result<Value, ScriptError> {
+        let storage = storage.borrow();
+        let databases = storage
+            .database_order
+            .iter()
+            .filter_map(|name| storage.databases.get(name))
+            .map(|database| {
+                let database = database.borrow();
+                let mut value = BTreeMap::new();
+                value.insert("name".to_string(), Value::String(database.name.clone()));
+                value.insert("version".to_string(), Value::Number(database.version as f64));
+                Value::Object(Rc::new(RefCell::new(value)))
+            })
+            .collect();
+        Ok(Value::Promise(self.fulfilled_promise(Value::Array(
+            Rc::new(RefCell::new(databases)),
+        ))))
+    }
+
+    fn indexed_db_request(
+        &mut self,
+        result: Value,
+        error: Option<Value>,
+        transaction: Option<IndexedDbTransactionHandle>,
+        database: Option<IndexedDbDatabaseHandle>,
+        versions: (u64, u64),
+        needs_upgrade: bool,
+    ) -> Value {
+        let track_transaction = transaction.is_some() && !needs_upgrade;
+        let (old_version, new_version) = versions;
+        if track_transaction && let Some(transaction) = transaction.as_ref() {
+            transaction.borrow_mut().pending += 1;
+        }
+        let request = Rc::new(RefCell::new(IndexedDbRequestData {
+            result,
+            error,
+            done: false,
+            on_success: None,
+            on_error: None,
+            on_upgrade_needed: None,
+            on_blocked: None,
+            transaction: transaction.clone(),
+            track_transaction,
+            database,
+            old_version,
+            new_version,
+            needs_upgrade,
+        }));
+        self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbRequestDispatch(
+            request.clone(),
+        )));
+        Value::IndexedDbRequest(request)
+    }
+
+    fn dispatch_indexed_db_request(
+        &mut self,
+        request: IndexedDbRequestHandle,
+    ) -> Result<Value, ScriptError> {
+        let (needs_upgrade, database, transaction, error, old_version, new_version) = {
+            let request = request.borrow();
+            (
+                request.needs_upgrade,
+                request.database.clone(),
+                request.transaction.clone(),
+                request.error.clone(),
+                request.old_version,
+                request.new_version,
+            )
+        };
+        if needs_upgrade && error.is_none() {
+            let callback = request.borrow().on_upgrade_needed.clone();
+            if let Some(database) = database.clone() {
+                database.borrow_mut().upgrade_active = true;
+            }
+            let callback_result = if let Some(callback) = callback {
+                let event = indexed_db_event(
+                    "upgradeneeded",
+                    Value::IndexedDbRequest(request.clone()),
+                    old_version,
+                    new_version,
+                );
+                self.call(callback, vec![event])
+            } else {
+                Ok(Value::Undefined)
+            };
+            if let Some(database) = database.clone() {
+                let mut database = database.borrow_mut();
+                database.upgrade_active = false;
+                database.upgrade_transaction = None;
+            }
+            request.borrow_mut().transaction = None;
+            callback_result?;
+            if let Some(transaction) = transaction.clone() {
+                self.queue_internal_microtask(Value::Builtin(
+                    Builtin::IndexedDbTransactionComplete(transaction),
+                ));
+            }
+        }
+        request.borrow_mut().done = true;
+        let callback = if error.is_some() {
+            request.borrow().on_error.clone()
+        } else {
+            request.borrow().on_success.clone()
+        };
+        if let Some(callback) = callback {
+            let event_type = if error.is_some() { "error" } else { "success" };
+            let event = indexed_db_event(
+                event_type,
+                Value::IndexedDbRequest(request.clone()),
+                old_version,
+                new_version,
+            );
+            self.call(callback, vec![event])?;
+        }
+        let track_transaction = request.borrow().track_transaction;
+        if track_transaction && let Some(transaction) = transaction {
+            {
+                let mut transaction_state = transaction.borrow_mut();
+                transaction_state.pending = transaction_state.pending.saturating_sub(1);
+            }
+            self.queue_internal_microtask(Value::Builtin(
+                Builtin::IndexedDbTransactionComplete(transaction),
+            ));
+        }
+        Ok(Value::Undefined)
+    }
+
+    fn dispatch_indexed_db_transaction(
+        &mut self,
+        transaction: IndexedDbTransactionHandle,
+    ) -> Result<Value, ScriptError> {
+        let callback = {
+            let mut transaction_state = transaction.borrow_mut();
+            if transaction_state.pending != 0 || transaction_state.complete_dispatched {
+                return Ok(Value::Undefined);
+            }
+            transaction_state.complete_dispatched = true;
+            if transaction_state.aborted {
+                transaction_state.on_abort.clone()
+            } else {
+                transaction_state.on_complete.clone()
+            }
+        };
+        if let Some(callback) = callback {
+            let event_type = if transaction.borrow().aborted {
+                "abort"
+            } else {
+                "complete"
+            };
+            let event = indexed_db_event(
+                event_type,
+                Value::IndexedDbTransaction(transaction),
+                0,
+                0,
+            );
+            self.call(callback, vec![event])?;
+        }
+        Ok(Value::Undefined)
+    }
+
+    fn indexed_db_create_object_store(
+        &self,
+        database: IndexedDbDatabaseHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = indexed_db_name(arguments.first(), "object store")?;
+        let options = match arguments.get(1).map(Value::resolve) {
+            None | Some(Value::Undefined) | Some(Value::Null) => None,
+            Some(Value::Object(options)) => Some(options),
+            Some(_) => return Err(runtime_error("object store options must be an object")),
+        };
+        let key_path = match options
+            .as_ref()
+            .and_then(|options| options.borrow().get("keyPath").cloned())
+            .map(|value| value.resolve())
+        {
+            None | Some(Value::Null) | Some(Value::Undefined) => None,
+            Some(Value::String(path)) if !path.is_empty() && path.len() <= MAX_IDB_NAME_BYTES => {
+                Some(path)
+            }
+            Some(Value::String(_)) => {
+                return Err(runtime_error(
+                    "object store key path is empty or exceeds the deterministic limit",
+                ))
+            }
+            Some(_) => return Err(runtime_error("object store key path must be a string")),
+        };
+        let auto_increment = options
+            .as_ref()
+            .and_then(|options| options.borrow().get("autoIncrement").cloned())
+            .is_some_and(|value| value.truthy());
+        let transaction = {
+            let mut database_state = database.borrow_mut();
+            if !database_state.upgrade_active {
+                return Err(runtime_error(
+                    "IDBDatabase.createObjectStore requires an upgrade transaction",
+                ));
+            }
+            if database_state.stores.contains_key(&name) {
+                return Err(runtime_error("object store already exists"));
+            }
+            if database_state.stores.len() >= MAX_IDB_STORES {
+                return Err(runtime_error("IndexedDB object store limit exceeded"));
+            }
+            database_state.stores.insert(
+                name.clone(),
+                IndexedDbStoreData {
+                    key_path,
+                    auto_increment,
+                    records: BTreeMap::new(),
+                    order: Vec::new(),
+                    next_key: 1,
+                },
+            );
+            database_state.store_order.push(name.clone());
+            database_state.upgrade_transaction.clone()
+        };
+        Ok(Value::IndexedDbObjectStore(Rc::new(RefCell::new(
+            IndexedDbObjectStoreData {
+                database,
+                name,
+                transaction,
+            },
+        ))))
+    }
+
+    fn indexed_db_delete_object_store(
+        &self,
+        database: IndexedDbDatabaseHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = indexed_db_name(arguments.first(), "object store")?;
+        let mut database = database.borrow_mut();
+        if !database.upgrade_active {
+            return Err(runtime_error(
+                "IDBDatabase.deleteObjectStore requires an upgrade transaction",
+            ));
+        }
+        if database.stores.remove(&name).is_none() {
+            return Err(runtime_error("object store does not exist"));
+        }
+        database.store_order.retain(|candidate| candidate != &name);
+        Ok(Value::Undefined)
+    }
+
+    fn indexed_db_transaction(
+        &mut self,
+        database: IndexedDbDatabaseHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let store_names = indexed_db_store_names(arguments.first())?;
+        let mode = arguments
+            .get(1)
+            .map(Value::string_value)
+            .unwrap_or_else(|| "readonly".to_string())
+            .to_ascii_lowercase();
+        if !matches!(mode.as_str(), "readonly" | "readwrite") {
+            return Err(runtime_error("unsupported IndexedDB transaction mode"));
+        }
+        {
+            let database = database.borrow();
+            if database.closed {
+                return Err(runtime_error("IDBDatabase connection is closed"));
+            }
+            if database.upgrade_active {
+                return Err(runtime_error(
+                    "cannot create a transaction during an upgrade",
+                ));
+            }
+            if store_names
+                .iter()
+                .any(|name| !database.stores.contains_key(name))
+            {
+                return Err(runtime_error("object store is not in the database"));
+            }
+        }
+        let transaction = Rc::new(RefCell::new(IndexedDbTransactionData {
+            database,
+            store_names,
+            mode,
+            pending: 0,
+            complete_dispatched: false,
+            aborted: false,
+            on_complete: None,
+            on_error: None,
+            on_abort: None,
+        }));
+        self.queue_internal_microtask(Value::Builtin(
+            Builtin::IndexedDbTransactionComplete(transaction.clone()),
+        ));
+        Ok(Value::IndexedDbTransaction(transaction))
+    }
+
+    fn indexed_db_transaction_object_store(
+        &self,
+        transaction: IndexedDbTransactionHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let name = indexed_db_name(arguments.first(), "object store")?;
+        let database = transaction.borrow().database.clone();
+        {
+            let transaction_state = transaction.borrow();
+            if transaction_state.aborted || transaction_state.complete_dispatched {
+                return Err(runtime_error("transaction is no longer active"));
+            }
+        }
+        if !transaction.borrow().store_names.iter().any(|store| store == &name)
+            && transaction.borrow().mode != "versionchange"
+        {
+            return Err(runtime_error("object store is outside the transaction scope"));
+        }
+        if !database.borrow().stores.contains_key(&name) {
+            return Err(runtime_error("object store does not exist"));
+        }
+        Ok(Value::IndexedDbObjectStore(Rc::new(RefCell::new(
+            IndexedDbObjectStoreData {
+                database,
+                name,
+                transaction: Some(transaction),
+            },
+        ))))
+    }
+
+    fn indexed_db_transaction_abort(
+        &mut self,
+        transaction: IndexedDbTransactionHandle,
+    ) -> Result<Value, ScriptError> {
+        let mut transaction_state = transaction.borrow_mut();
+        if transaction_state.complete_dispatched {
+            return Err(runtime_error("transaction is already complete"));
+        }
+        transaction_state.aborted = true;
+        drop(transaction_state);
+        self.queue_internal_microtask(Value::Builtin(
+            Builtin::IndexedDbTransactionComplete(transaction),
+        ));
+        Ok(Value::Undefined)
+    }
+
+    fn indexed_db_store_context(
+        &self,
+        store: &IndexedDbObjectStoreHandle,
+    ) -> Result<
+        (
+            IndexedDbDatabaseHandle,
+            String,
+            IndexedDbTransactionHandle,
+            String,
+        ),
+        ScriptError,
+    > {
+        let store = store.borrow();
+        let database = store.database.clone();
+        let name = store.name.clone();
+        let transaction = store
+            .transaction
+            .clone()
+            .ok_or_else(|| runtime_error("IDBObjectStore is not attached to a transaction"))?;
+        let transaction_state = transaction.borrow();
+        if transaction_state.aborted || transaction_state.complete_dispatched {
+            return Err(runtime_error("transaction is no longer active"));
+        }
+        if database.borrow().closed {
+            return Err(runtime_error("IDBDatabase connection is closed"));
+        }
+        if transaction_state.mode != "versionchange"
+            && !transaction_state.store_names.iter().any(|store| store == &name)
+        {
+            return Err(runtime_error("object store is outside the transaction scope"));
+        }
+        let mode = transaction_state.mode.clone();
+        drop(transaction_state);
+        Ok((
+            database,
+            name,
+            transaction,
+            mode,
+        ))
+    }
+
+    fn indexed_db_object_store_write(
+        &mut self,
+        store: IndexedDbObjectStoreHandle,
+        arguments: &[Value],
+        add_only: bool,
+    ) -> Result<Value, ScriptError> {
+        let (database, name, transaction, mode) = self.indexed_db_store_context(&store)?;
+        if mode == "readonly" {
+            return Err(runtime_error("read-only transaction cannot write"));
+        }
+        let mut value = arguments
+            .first()
+            .cloned()
+            .ok_or_else(|| runtime_error("IDBObjectStore write requires a value"))?
+            .resolve();
+        value = self.indexed_db_clone_value(&value)?;
+        let explicit_key = arguments.get(1).map(Value::resolve);
+        let key = {
+            let mut database = database.borrow_mut();
+            let store = database
+                .stores
+                .get_mut(&name)
+                .ok_or_else(|| runtime_error("object store does not exist"))?;
+            let key_path = store.key_path.clone();
+            let key = if let Some(key_path) = key_path {
+                if explicit_key
+                    .as_ref()
+                    .is_some_and(|key| !matches!(key, Value::Undefined))
+                {
+                    return Err(runtime_error(
+                        "inline-key object stores do not accept an explicit key",
+                    ));
+                }
+                if let Some(key) = indexed_db_key_at_path(&value, &key_path) {
+                    key
+                } else if store.auto_increment {
+                    let key = Value::Number(store.next_key as f64);
+                    store.next_key = store.next_key.saturating_add(1);
+                    indexed_db_set_key_path(&mut value, &key_path, key.clone())?;
+                    key
+                } else {
+                    return Err(runtime_error("object store key path did not produce a key"));
+                }
+            } else if let Some(key) = explicit_key.filter(|key| !matches!(key, Value::Undefined)) {
+                key
+            } else if store.auto_increment {
+                let key = Value::Number(store.next_key as f64);
+                store.next_key = store.next_key.saturating_add(1);
+                key
+            } else {
+                return Err(runtime_error("object store requires a key"));
+            };
+            let token = indexed_db_key_token(&key)?;
+            if add_only && store.records.contains_key(&token) {
+                return Err(runtime_error("object store key already exists"));
+            }
+            if !store.records.contains_key(&token) {
+                if store.records.len() >= MAX_IDB_RECORDS {
+                    return Err(runtime_error("IndexedDB record limit exceeded"));
+                }
+                store.order.push(token.clone());
+            }
+            store.records.insert(
+                token,
+                IndexedDbRecord {
+                    key: key.clone(),
+                    value,
+                },
+            );
+            key
+        };
+        Ok(self.indexed_db_request(
+            key,
+            None,
+            Some(transaction),
+            None,
+            (0, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_object_store_get(
+        &mut self,
+        store: IndexedDbObjectStoreHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let (database, name, transaction, _) = self.indexed_db_store_context(&store)?;
+        let key = indexed_db_key_argument(arguments.first())?;
+        let value = {
+            let database = database.borrow();
+            let store = database
+                .stores
+                .get(&name)
+                .ok_or_else(|| runtime_error("object store does not exist"))?;
+            store
+                .records
+                .get(&indexed_db_key_token(&key)?)
+                .map(|record| self.indexed_db_clone_value(&record.value))
+                .transpose()?
+                .unwrap_or(Value::Undefined)
+        };
+        Ok(self.indexed_db_request(
+            value,
+            None,
+            Some(transaction),
+            None,
+            (0, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_object_store_delete(
+        &mut self,
+        store: IndexedDbObjectStoreHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let (database, name, transaction, mode) = self.indexed_db_store_context(&store)?;
+        if mode == "readonly" {
+            return Err(runtime_error("read-only transaction cannot write"));
+        }
+        let key = indexed_db_key_argument(arguments.first())?;
+        let token = indexed_db_key_token(&key)?;
+        {
+            let mut database = database.borrow_mut();
+            let store = database
+                .stores
+                .get_mut(&name)
+                .ok_or_else(|| runtime_error("object store does not exist"))?;
+            store.records.remove(&token);
+            store.order.retain(|candidate| candidate != &token);
+        }
+        Ok(self.indexed_db_request(
+            Value::Undefined,
+            None,
+            Some(transaction),
+            None,
+            (0, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_object_store_clear(
+        &mut self,
+        store: IndexedDbObjectStoreHandle,
+    ) -> Result<Value, ScriptError> {
+        let (database, name, transaction, mode) = self.indexed_db_store_context(&store)?;
+        if mode == "readonly" {
+            return Err(runtime_error("read-only transaction cannot write"));
+        }
+        {
+            let mut database = database.borrow_mut();
+            let store = database
+                .stores
+                .get_mut(&name)
+                .ok_or_else(|| runtime_error("object store does not exist"))?;
+            store.records.clear();
+            store.order.clear();
+        }
+        Ok(self.indexed_db_request(
+            Value::Undefined,
+            None,
+            Some(transaction),
+            None,
+            (0, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_object_store_count(
+        &mut self,
+        store: IndexedDbObjectStoreHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let (database, name, transaction, _) = self.indexed_db_store_context(&store)?;
+        let key = match arguments.first().map(Value::resolve) {
+            None | Some(Value::Undefined) => None,
+            Some(_) => Some(indexed_db_key_argument(arguments.first())?),
+        };
+        let count = {
+            let database = database.borrow();
+            let store = database
+                .stores
+                .get(&name)
+                .ok_or_else(|| runtime_error("object store does not exist"))?;
+            match key {
+                Some(key) => usize::from(store.records.contains_key(&indexed_db_key_token(&key)?)),
+                None => store.records.len(),
+            }
+        };
+        Ok(self.indexed_db_request(
+            Value::Number(count as f64),
+            None,
+            Some(transaction),
+            None,
+            (0, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_object_store_get_all(
+        &mut self,
+        store: IndexedDbObjectStoreHandle,
+        arguments: &[Value],
+        keys_only: bool,
+    ) -> Result<Value, ScriptError> {
+        let (database, name, transaction, _) = self.indexed_db_store_context(&store)?;
+        let key = match arguments.first().map(Value::resolve) {
+            None | Some(Value::Undefined) => None,
+            Some(_) => Some(indexed_db_key_argument(arguments.first())?),
+        };
+        let limit = arguments
+            .get(1)
+            .map(Value::number)
+            .transpose()?
+            .unwrap_or(MAX_IDB_RECORDS as f64);
+        if !limit.is_finite() || limit < 0.0 || limit.fract() != 0.0 {
+            return Err(runtime_error("getAll count must be a non-negative integer"));
+        }
+        let limit = (limit as usize).min(MAX_IDB_RECORDS);
+        let records = {
+            let database = database.borrow();
+            let store = database
+                .stores
+                .get(&name)
+                .ok_or_else(|| runtime_error("object store does not exist"))?;
+            let key_token = key.as_ref().map(indexed_db_key_token).transpose()?;
+            store
+                .order
+                .iter()
+                .filter_map(|token| store.records.get(token))
+                .filter(|record| {
+                    key_token
+                        .as_ref()
+                        .is_none_or(|candidate| indexed_db_key_token(&record.key).ok().as_ref() == Some(candidate))
+                })
+                .take(limit)
+                .map(|record| (record.key.clone(), record.value.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut values = Vec::with_capacity(records.len());
+        for (key, value) in records {
+            values.push(if keys_only {
+                key
+            } else {
+                self.indexed_db_clone_value(&value)?
+            });
+        }
+        Ok(self.indexed_db_request(
+            Value::Array(Rc::new(RefCell::new(values))),
+            None,
+            Some(transaction),
+            None,
+            (0, 0),
+            false,
+        ))
+    }
+
+    fn indexed_db_clone_value(&mut self, value: &Value) -> Result<Value, ScriptError> {
+        let serialized = serialize_json(value)?;
+        if serialized.len() > MAX_IDB_VALUE_BYTES {
+            return Err(runtime_error("IndexedDB value exceeds the deterministic byte limit"));
+        }
+        self.parse_json(&serialized)
+    }
+}
+
 fn collect_element_text(element: &Element, output: &mut String) {
     for child in &element.children {
         match child {
@@ -12282,6 +13449,12 @@ impl Value {
             Self::Storage(_) => "[object Storage]".to_string(),
             Self::CacheStorage(_) => "[object CacheStorage]".to_string(),
             Self::Cache(_) => "[object Cache]".to_string(),
+            Self::IndexedDbFactory(_) => "[object IDBFactory]".to_string(),
+            Self::IndexedDbRequest(_) => "[object IDBRequest]".to_string(),
+            Self::IndexedDbDatabase(_) => "[object IDBDatabase]".to_string(),
+            Self::IndexedDbTransaction(_) => "[object IDBTransaction]".to_string(),
+            Self::IndexedDbObjectStore(_) => "[object IDBObjectStore]".to_string(),
+            Self::IndexedDbNameList(_) => "[object DOMStringList]".to_string(),
             Self::FormData(_) => "[object FormData]".to_string(),
             Self::Blob(_) => "[object Blob]".to_string(),
             Self::File(_) => "[object File]".to_string(),
@@ -12360,6 +13533,201 @@ fn abort_event_value() -> Value {
 const MAX_CACHE_NAME_BYTES: usize = 256;
 const MAX_CACHE_ENTRIES: usize = 1024;
 const MAX_CACHED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IDB_DATABASES: usize = 32;
+const MAX_IDB_STORES: usize = 128;
+const MAX_IDB_RECORDS: usize = 4096;
+const MAX_IDB_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_IDB_NAME_BYTES: usize = 256;
+const MAX_IDB_VERSION: u64 = 1_000_000;
+
+fn indexed_db_error(name: &str, message: &str) -> Value {
+    Value::Error(Rc::new(ErrorData {
+        name: name.to_string(),
+        message: message.to_string(),
+        code: None,
+        class_name: "DOMException".to_string(),
+    }))
+}
+
+fn indexed_db_event(
+    event_type: &str,
+    target: Value,
+    old_version: u64,
+    new_version: u64,
+) -> Value {
+    let mut event = BTreeMap::new();
+    event.insert("type".to_string(), Value::String(event_type.to_string()));
+    event.insert("target".to_string(), target);
+    event.insert("oldVersion".to_string(), Value::Number(old_version as f64));
+    event.insert("newVersion".to_string(), Value::Number(new_version as f64));
+    event.insert("defaultPrevented".to_string(), Value::Bool(false));
+    Value::Object(Rc::new(RefCell::new(event)))
+}
+
+fn indexed_db_name(value: Option<&Value>, kind: &str) -> Result<String, ScriptError> {
+    let value = value.ok_or_else(|| runtime_error(format!("{kind} name is required")))?;
+    let value = value.resolve();
+    if matches!(value, Value::Undefined | Value::Null) {
+        return Err(runtime_error(format!("{kind} name is required")));
+    }
+    let name = value.string_value();
+    if name.len() > MAX_IDB_NAME_BYTES {
+        return Err(runtime_error(format!("{kind} name exceeds the deterministic limit")));
+    }
+    Ok(name)
+}
+
+fn indexed_db_version(value: Option<&Value>) -> Result<Option<u64>, ScriptError> {
+    let Some(value) = value.map(Value::resolve) else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Undefined) {
+        return Ok(None);
+    }
+    let version = value
+        .number()
+        .map_err(|_| runtime_error("database version must be a positive integer"))?;
+    if !version.is_finite()
+        || version <= 0.0
+        || version.fract() != 0.0
+        || version > MAX_IDB_VERSION as f64
+    {
+        return Err(runtime_error(
+            "database version must be a positive integer within the deterministic limit",
+        ));
+    }
+    Ok(Some(version as u64))
+}
+
+fn indexed_db_store_names(value: Option<&Value>) -> Result<Vec<String>, ScriptError> {
+    let value = value.ok_or_else(|| runtime_error("transaction object store names are required"))?;
+    let values = match value.resolve() {
+        Value::String(name) => vec![Value::String(name)],
+        Value::Array(values) => values.borrow().clone(),
+        _ => {
+            return Err(runtime_error(
+                "transaction object store names must be a string or array",
+            ))
+        }
+    };
+    let mut names = Vec::with_capacity(values.len());
+    for value in values {
+        let name = indexed_db_name(Some(&value), "object store")?;
+        if !names.iter().any(|candidate| candidate == &name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return Err(runtime_error("transaction must include an object store"));
+    }
+    if names.len() > MAX_IDB_STORES {
+        return Err(runtime_error("transaction object store limit exceeded"));
+    }
+    Ok(names)
+}
+
+fn indexed_db_key_argument(value: Option<&Value>) -> Result<Value, ScriptError> {
+    let value = value.ok_or_else(|| runtime_error("object store key is required"))?;
+    let value = value.resolve();
+    if matches!(value, Value::Undefined | Value::Null) {
+        return Err(runtime_error("object store key is required"));
+    }
+    match &value {
+        Value::String(_) => Ok(value),
+        Value::Number(number) if number.is_finite() => Ok(value),
+        _ => Err(runtime_error("object store key must be a string or finite number")),
+    }
+}
+
+fn indexed_db_key_token(value: &Value) -> Result<String, ScriptError> {
+    match value.resolve() {
+        Value::String(value) => Ok(format!("s:{value}")),
+        Value::Number(number) if number.is_finite() => {
+            let number = if number == 0.0 { 0.0 } else { number };
+            Ok(format!("n:{number:?}"))
+        }
+        _ => Err(runtime_error("object store key must be a string or finite number")),
+    }
+}
+
+fn indexed_db_key_at_path(value: &Value, path: &str) -> Option<Value> {
+    let segments: Vec<&str> = path.split('.').filter(|segment| !segment.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let mut current = value.resolve();
+    for segment in segments {
+        current = match current {
+            Value::Object(object) => object.borrow().get(segment)?.resolve(),
+            _ => return None,
+        };
+    }
+    match current {
+        Value::Undefined | Value::Null => None,
+        value => Some(value),
+    }
+}
+
+fn indexed_db_set_key_path(value: &mut Value, path: &str, key: Value) -> Result<(), ScriptError> {
+    let segments: Vec<&str> = path.split('.').filter(|segment| !segment.is_empty()).collect();
+    if segments.is_empty() {
+        return Err(runtime_error("object store key path cannot be empty"));
+    }
+    fn set_value(value: &mut Value, segments: &[&str], key: Value) -> Result<(), ScriptError> {
+        let Value::Object(object) = value.resolve() else {
+            return Err(runtime_error("inline-key value must be an object"));
+        };
+        let mut properties = object.borrow_mut();
+        if segments.len() == 1 {
+            properties.insert(segments[0].to_string(), key);
+            return Ok(());
+        }
+        let child = properties
+            .entry(segments[0].to_string())
+            .or_insert_with(|| Value::Object(Rc::new(RefCell::new(BTreeMap::new()))));
+        if matches!(child.resolve(), Value::Undefined | Value::Null) {
+            *child = Value::Object(Rc::new(RefCell::new(BTreeMap::new())));
+        }
+        set_value(child, &segments[1..], key)
+    }
+    set_value(value, &segments, key)
+}
+
+fn assign_indexed_db_callback(
+    request: &IndexedDbRequestHandle,
+    property: &str,
+    value: Value,
+) -> Result<(), ScriptError> {
+    let mut request = request.borrow_mut();
+    let target = match property {
+        "onsuccess" => &mut request.on_success,
+        "onerror" => &mut request.on_error,
+        "onupgradeneeded" => &mut request.on_upgrade_needed,
+        "onblocked" => &mut request.on_blocked,
+        _ => return Err(runtime_error("unknown IDBRequest callback")),
+    };
+    assign_indexed_db_callback_value(target, property, value)
+}
+
+fn assign_indexed_db_callback_value(
+    target: &mut Option<Value>,
+    property: &str,
+    value: Value,
+) -> Result<(), ScriptError> {
+    match value.resolve() {
+        Value::Function(_) => {
+            *target = Some(value.resolve());
+            Ok(())
+        }
+        Value::Null | Value::Undefined => {
+            *target = None;
+            Ok(())
+        }
+        _ => Err(runtime_error(format!(
+            "IDB {property} callback must be a function or null"
+        ))),
+    }
+}
 
 fn cache_name(value: Option<&Value>) -> Result<String, ScriptError> {
     let value = value.ok_or_else(|| runtime_error("Cache name is required"))?;
@@ -14279,6 +15647,12 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Storage(_)
         | Value::CacheStorage(_)
         | Value::Cache(_)
+        | Value::IndexedDbFactory(_)
+        | Value::IndexedDbRequest(_)
+        | Value::IndexedDbDatabase(_)
+        | Value::IndexedDbTransaction(_)
+        | Value::IndexedDbObjectStore(_)
+        | Value::IndexedDbNameList(_)
         | Value::FormData(_)
         | Value::Blob(_)
         | Value::File(_)
@@ -14776,6 +16150,16 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Storage(left), Value::Storage(right)) => Rc::ptr_eq(left, right),
         (Value::CacheStorage(left), Value::CacheStorage(right)) => Rc::ptr_eq(left, right),
         (Value::Cache(left), Value::Cache(right)) => Rc::ptr_eq(left, right),
+        (Value::IndexedDbFactory(left), Value::IndexedDbFactory(right)) => Rc::ptr_eq(left, right),
+        (Value::IndexedDbRequest(left), Value::IndexedDbRequest(right)) => Rc::ptr_eq(left, right),
+        (Value::IndexedDbDatabase(left), Value::IndexedDbDatabase(right)) => Rc::ptr_eq(left, right),
+        (Value::IndexedDbTransaction(left), Value::IndexedDbTransaction(right)) => {
+            Rc::ptr_eq(left, right)
+        }
+        (Value::IndexedDbObjectStore(left), Value::IndexedDbObjectStore(right)) => {
+            Rc::ptr_eq(left, right)
+        }
+        (Value::IndexedDbNameList(left), Value::IndexedDbNameList(right)) => Rc::ptr_eq(left, right),
         (Value::Navigator, Value::Navigator)
         | (Value::Clipboard, Value::Clipboard)
         | (Value::Crypto, Value::Crypto)
@@ -20303,6 +21687,175 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("rejected|rejected")
+        );
+    }
+
+    #[test]
+    fn indexed_db_upgrades_and_round_trips_json_records() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const open = indexedDB.open("notes", 1);
+                open.onerror = event => status.textContent = "error:" + event.target.error.name;
+                open.onupgradeneeded = event => {
+                    const database = event.target.result;
+                    const store = database.createObjectStore("notes", { keyPath: "id", autoIncrement: true });
+                    store.put({ title: "hello" });
+                };
+                open.onsuccess = event => {
+                    const database = event.target.result;
+                    const transaction = database.transaction("notes", "readonly");
+                    const request = transaction.objectStore("notes").get(1);
+                    request.onsuccess = event => {
+                        const record = event.target.result;
+                        status.textContent = record.id + "|" + record.title + "|" +
+                            database.objectStoreNames.length + ":" + database.objectStoreNames.contains("notes");
+                    };
+                };
+                "#,
+            )
+            .expect("IndexedDB upgrade should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("1|hello|1:true")
+        );
+    }
+
+    #[test]
+    fn indexed_db_supports_bounded_object_store_crud() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const open = indexedDB.open("items", 1);
+                open.onupgradeneeded = event => {
+                    event.target.result.createObjectStore("items", { keyPath: "id", autoIncrement: true });
+                };
+                open.onsuccess = event => {
+                    const database = event.target.result;
+                    let emptyComplete = false;
+                    const write = database.transaction("items", "readwrite");
+                    const store = write.objectStore("items");
+                    const first = store.put({ label: "one" });
+                    first.onsuccess = () => {
+                        const second = store.put({ label: "two" });
+                        second.onsuccess = () => {
+                            const empty = database.transaction("items");
+                            empty.oncomplete = () => emptyComplete = true;
+                            const read = database.transaction("items");
+                            const objectStore = read.objectStore("items");
+                            const all = objectStore.getAll();
+                            const keys = objectStore.getAllKeys();
+                            const count = objectStore.count();
+                            all.onsuccess = event => {
+                                keys.onsuccess = keyEvent => {
+                                    count.onsuccess = countEvent => {
+                                        const records = event.target.result;
+                                        status.textContent = records[0].label + ":" + records[1].label + "|" +
+                                            keyEvent.target.result[0] + ":" + keyEvent.target.result[1] + "|" +
+                                            countEvent.target.result + "|" + emptyComplete;
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+                "#,
+            )
+            .expect("IndexedDB CRUD should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("one:two|1:2|2|true")
+        );
+    }
+
+    #[test]
+    fn indexed_db_lists_deletes_and_reopens_databases() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const open = indexedDB.open("ephemeral", 1);
+                open.onsuccess = event => {
+                    indexedDB.databases().then(list => {
+                        const entry = list[0];
+                        const deletion = indexedDB.deleteDatabase("ephemeral");
+                        deletion.onsuccess = () => {
+                            const reopened = indexedDB.open("ephemeral");
+                            reopened.onsuccess = event => {
+                                const database = event.target.result;
+                                status.textContent = entry.name + ":" + entry.version + "|" +
+                                    database.version + "|" + database.objectStoreNames.length;
+                            };
+                        };
+                    });
+                };
+                "#,
+            )
+            .expect("IndexedDB database lifecycle should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("ephemeral:1|1|0")
+        );
+    }
+
+    #[test]
+    fn indexed_db_rejects_invalid_transaction_scope_and_write_mode() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const open = indexedDB.open("invalid", 1);
+                open.onupgradeneeded = event => {
+                    event.target.result.createObjectStore("notes", { keyPath: "id" });
+                };
+                open.onsuccess = event => {
+                    const database = event.target.result;
+                    let missing = false;
+                    try {
+                        database.transaction("missing");
+                    } catch (error) {
+                        missing = true;
+                    }
+                    let readonly = false;
+                    try {
+                        database.transaction("notes").objectStore("notes").put({ id: "x" });
+                    } catch (error) {
+                        readonly = true;
+                    }
+                    status.textContent = missing + ":" + readonly;
+                };
+                "#,
+            )
+            .expect("invalid IndexedDB operations should be contained");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true:true")
         );
     }
 

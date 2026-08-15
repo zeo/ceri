@@ -6,6 +6,8 @@ The custom DOM path now covers live text-node `splitText()` and `normalize()` op
 
 ## Decision
 
+The custom runtime now has a bounded in-memory IndexedDB slice. `indexedDB.open()` and `deleteDatabase()` return callback-based requests, version upgrades expose `upgradeneeded`, and readonly or readwrite transactions expose object-store creation, deletion, and JSON-cloned `put()`, `add()`, `get()`, `delete()`, `clear()`, `count()`, `getAll()`, and `getAllKeys()` operations. Database and object-store state survives full-document navigation in one browser session. Disk persistence, indexes, cursors, and structured-clone types outside JSON remain separate gates.
+
 Ceri should keep CEF as the shipping engine while two independent engine tracks are explored. The first is a dependency-free custom engine laboratory written in Rust. The second is a Servo comparison backend because Servo is written in Rust, exposes an embedding-oriented `WebView` API, and has active desktop support for Windows, macOS, and Linux. Neither track is ready to replace the CEF path without an application compatibility and recovery test suite.
 
 This separates three different goals:
@@ -116,7 +118,7 @@ An experimental backend must pass these gates in order:
 
 - ES modules and same-origin dynamic import
 - `fetch`, streams, `URL`, `URLSearchParams`, and `AbortController`
-- localStorage, IndexedDB, and bounded Web Crypto digests
+- localStorage and bounded Web Crypto digests
 - workers, timers, `requestAnimationFrame`, and WebAssembly
 - CSS grid, flexbox, container queries, forms, focus, selection, and IME
 - positioned overlays, containing blocks, overflow clipping, scrolling, stacking contexts, and z-order
@@ -178,6 +180,7 @@ The future-gate list treats full WebAssembly compatibility as unfinished. The bo
 - [W3C File API](https://w3c.github.io/FileAPI/)
 - [W3C Clipboard API and events](https://w3c.github.io/clipboard-apis/)
 - [W3C Web Cryptography API Level 2](https://www.w3.org/TR/WebCryptoAPI/)
+- [W3C Indexed Database API 3.0](https://www.w3.org/TR/IndexedDB/)
 - [WPE FAQ](https://wpewebkit.org/about/faq.html)
 - [WebKit ports](https://docs.webkit.org/Ports/Introduction.html)
 - [SpiderMonkey](https://spidermonkey.dev/)
