@@ -53,6 +53,7 @@ type FormDataHandle = Rc<RefCell<FormDataData>>;
 type BlobHandle = Rc<BlobData>;
 type FileHandle = Rc<FileData>;
 type FileListHandle = Rc<Vec<FileHandle>>;
+type Uint8ArrayHandle = Rc<RefCell<Uint8ArrayData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
@@ -105,6 +106,8 @@ enum Value {
     Response(ResponseHandle),
     ResponseConstructor,
     Bytes(BytesHandle),
+    ArrayBufferConstructor,
+    Uint8Array(Uint8ArrayHandle),
     ReadableStream(ReadableStreamHandle),
     ReadableStreamReader(ReadableStreamReaderHandle),
     Headers(HeadersHandle),
@@ -140,6 +143,7 @@ enum Value {
     FormDataConstructor,
     BlobConstructor,
     FileConstructor,
+    Uint8ArrayConstructor,
     MapConstructor,
     SetConstructor,
     ErrorConstructor,
@@ -280,6 +284,8 @@ enum Builtin {
     ElementQuerySelectorAll(ElementHandle),
     ArrayMap(ArrayHandle),
     ArrayJoin(ArrayHandle),
+    Uint8ArraySet(Uint8ArrayHandle),
+    Uint8ArraySlice(Uint8ArrayHandle),
     StringSlice(String),
     MapGet(MapHandle),
     MapSet(MapHandle),
@@ -941,6 +947,10 @@ struct FileData {
     last_modified: i64,
 }
 
+struct Uint8ArrayData {
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SelectionDirection {
     #[default]
@@ -1388,6 +1398,12 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("File".to_string(), Value::FileConstructor);
+            values
+                .values
+                .insert("ArrayBuffer".to_string(), Value::ArrayBufferConstructor);
+            values
+                .values
+                .insert("Uint8Array".to_string(), Value::Uint8ArrayConstructor);
             values
                 .values
                 .insert("Worker".to_string(), Value::WorkerConstructor);
@@ -3784,6 +3800,20 @@ impl ScriptRuntime {
                 let object = self.evaluate(object, environment)?;
                 self.assign_member(object, property, value)
             }
+            Expr::Index { object, index } => {
+                let object = self.evaluate(object, environment.clone())?;
+                let index = self.evaluate(index, environment)?.property_key();
+                let Value::Uint8Array(array) = object.resolve() else {
+                    return Err(runtime_error("indexed assignment target is not writable"));
+                };
+                let Some(index) = uint8_array_property_index(&index) else {
+                    return Err(runtime_error("Uint8Array index must be a non-negative integer"));
+                };
+                if let Some(byte) = array.borrow_mut().bytes.get_mut(index) {
+                    *byte = uint8_value(&value)?;
+                }
+                Ok(())
+            }
             _ => Err(runtime_error("assignment target is not writable")),
         }
     }
@@ -3848,6 +3878,8 @@ impl ScriptRuntime {
                 "JSON" => Ok(Value::Json),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
+                "ArrayBuffer" => Ok(Value::ArrayBufferConstructor),
+                "Uint8Array" => Ok(Value::Uint8ArrayConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
                 "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
@@ -4594,6 +4626,9 @@ impl ScriptRuntime {
             Value::FileConstructor => Err(runtime_error(format!(
                 "File has no property {property}"
             ))),
+            Value::Uint8ArrayConstructor => Err(runtime_error(format!(
+                "Uint8Array has no property {property}"
+            ))),
             Value::CanvasContext(context) => match property {
                 "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style))),
                 "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
@@ -4700,6 +4735,21 @@ impl ScriptRuntime {
                 "byteLength" | "length" => Ok(Value::Number(bytes.len() as f64)),
                 _ => Err(runtime_error(format!(
                     "ArrayBuffer has no property {property}"
+                ))),
+            },
+            Value::ArrayBufferConstructor => Err(runtime_error(format!(
+                "ArrayBuffer has no property {property}"
+            ))),
+            Value::Uint8Array(array) => match property {
+                "byteLength" | "length" => {
+                    Ok(Value::Number(array.borrow().bytes.len() as f64))
+                }
+                "byteOffset" => Ok(Value::Number(0.0)),
+                "buffer" => Ok(Value::Bytes(Rc::new(array.borrow().bytes.clone()))),
+                "set" => Ok(Value::Builtin(Builtin::Uint8ArraySet(array))),
+                "slice" => Ok(Value::Builtin(Builtin::Uint8ArraySlice(array))),
+                _ => Err(runtime_error(format!(
+                    "Uint8Array has no property {property}"
                 ))),
             },
             Value::Headers(headers) => match property {
@@ -4910,6 +4960,19 @@ impl ScriptRuntime {
                     .map(|byte| Value::Number(byte as f64))
                     .unwrap_or(Value::Undefined))
             }
+            Value::Uint8Array(array) => {
+                let index = index.number()?;
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(array
+                    .borrow()
+                    .bytes
+                    .get(index as usize)
+                    .copied()
+                    .map(|byte| Value::Number(byte as f64))
+                    .unwrap_or(Value::Undefined))
+            }
             _ => Err(runtime_error("value cannot be indexed")),
         }
     }
@@ -4967,6 +5030,18 @@ impl ScriptRuntime {
             Value::Style(handle) => self.set_element_style_property(&handle, property, value_string),
             Value::CanvasContext(context) if property == "fillStyle" => {
                 self.set_canvas_fill_style(&context, &value_string)
+            }
+            Value::Uint8Array(array) => {
+                let Some(index) = uint8_array_property_index(property) else {
+                    return Err(runtime_error(format!(
+                        "Uint8Array property {property} is not writable"
+                    )));
+                };
+                let mut array = array.borrow_mut();
+                if let Some(byte) = array.bytes.get_mut(index) {
+                    *byte = uint8_value(&value)?;
+                }
+                true
             }
             Value::Window if property == "location" => {
                 self.request_location_navigation(value_string, false);
@@ -7528,6 +7603,8 @@ impl ScriptRuntime {
             Value::FormDataConstructor => self.construct_form_data(arguments),
             Value::BlobConstructor => self.construct_blob(arguments),
             Value::FileConstructor => self.construct_file(arguments),
+            Value::ArrayBufferConstructor => self.construct_array_buffer(arguments),
+            Value::Uint8ArrayConstructor => self.construct_uint8_array(arguments),
             Value::HeadersConstructor => self.construct_headers(arguments),
             Value::RequestConstructor => self.construct_request(arguments),
             Value::ResponseConstructor => self.construct_response(arguments),
@@ -7931,6 +8008,38 @@ impl ScriptRuntime {
             name: normalize_file_name(&name),
             last_modified,
         })))
+    }
+
+    fn construct_array_buffer(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let length = arguments
+            .first()
+            .map(uint8_array_length)
+            .transpose()?
+            .unwrap_or(0);
+        Ok(Value::Bytes(Rc::new(vec![0; length])))
+    }
+
+    fn construct_uint8_array(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let source = arguments
+            .first()
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        let bytes = match source {
+            Value::Undefined | Value::Null => Vec::new(),
+            Value::Number(_) | Value::Bool(_) | Value::String(_) => {
+                vec![0; uint8_array_length(&source)?]
+            }
+            source => uint8_array_source_bytes(source)?,
+        };
+        if bytes.len() > MAX_TYPED_ARRAY_BYTES {
+            return Err(runtime_error(
+                "Uint8Array length exceeds the deterministic limit",
+            ));
+        }
+        Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
+            bytes,
+        }))))
     }
 
     fn construct_headers(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -8570,9 +8679,10 @@ impl ScriptRuntime {
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.as_ref().clone(),
+                    Some(Value::Uint8Array(array)) => array.borrow().bytes.clone(),
                     Some(_) => {
                         return Err(runtime_error(
-                            "WebAssembly.instantiate expects an ArrayBuffer",
+                            "WebAssembly.instantiate expects an ArrayBuffer or Uint8Array",
                         ))
                     }
                     None => {
@@ -9878,13 +9988,19 @@ impl ScriptRuntime {
                         subtle_error_value("TypeError", error.message),
                     ))),
                 };
-                let Some(Value::Bytes(bytes)) = arguments.get(1).map(Value::resolve) else {
-                    return Ok(Value::Promise(self.rejected_promise_value(subtle_error_value(
-                        "TypeError",
-                        "SubtleCrypto.digest expects an ArrayBuffer",
-                    ))));
+                let bytes = match arguments.get(1).map(Value::resolve) {
+                    Some(Value::Bytes(bytes)) => bytes.as_ref().clone(),
+                    Some(Value::Uint8Array(array)) => array.borrow().bytes.clone(),
+                    _ => {
+                        return Ok(Value::Promise(self.rejected_promise_value(
+                            subtle_error_value(
+                                "TypeError",
+                                "SubtleCrypto.digest expects an ArrayBuffer or Uint8Array",
+                            ),
+                        )));
+                    }
                 };
-                match subtle_digest(&algorithm, bytes.as_ref()) {
+                match subtle_digest(&algorithm, &bytes) {
                     Ok(digest) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
                         Rc::new(digest),
                     )))),
@@ -10885,6 +11001,34 @@ impl ScriptRuntime {
                     .join(&separator);
                 Ok(Value::String(joined))
             }
+            Builtin::Uint8ArraySet(array) => {
+                let source = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let bytes = uint8_array_source_bytes(source)?;
+                let offset = arguments
+                    .get(1)
+                    .map(Value::number)
+                    .transpose()?
+                    .unwrap_or(0.0);
+                if !offset.is_finite() || offset < 0.0 || offset.fract() != 0.0 {
+                    return Err(runtime_error("Uint8Array.set offset must be a non-negative integer"));
+                }
+                let offset = offset as usize;
+                let end = offset
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| runtime_error("Uint8Array.set range is out of bounds"))?;
+                let mut array = array.borrow_mut();
+                if end > array.bytes.len() {
+                    return Err(runtime_error("Uint8Array.set range is out of bounds"));
+                }
+                array.bytes[offset..end].copy_from_slice(&bytes);
+                Ok(Value::Undefined)
+            }
+            Builtin::Uint8ArraySlice(array) => {
+                let (start, end) = blob_slice_range(&arguments, array.borrow().bytes.len() as i64)?;
+                Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
+                    bytes: array.borrow().bytes[start..end].to_vec(),
+                }))))
+            }
             Builtin::MapGet(map) => {
                 let key = arguments.first().cloned().unwrap_or(Value::Undefined);
                 Ok(map
@@ -11745,6 +11889,8 @@ impl Value {
             Self::Request(_) => "[object Request]".to_string(),
             Self::Response(_) => "[response]".to_string(),
             Self::Bytes(_) => "[object ArrayBuffer]".to_string(),
+            Self::ArrayBufferConstructor => "[function ArrayBuffer]".to_string(),
+            Self::Uint8Array(_) => "[object Uint8Array]".to_string(),
             Self::ReadableStream(_) => "[object ReadableStream]".to_string(),
             Self::ReadableStreamReader(_) => "[object ReadableStreamDefaultReader]".to_string(),
             Self::Headers(_) => "[object Headers]".to_string(),
@@ -11781,6 +11927,7 @@ impl Value {
             Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::BlobConstructor => "[function Blob]".to_string(),
             Self::FileConstructor => "[function File]".to_string(),
+            Self::Uint8ArrayConstructor => "[function Uint8Array]".to_string(),
             Self::MapConstructor => "[function Map]".to_string(),
             Self::SetConstructor => "[function Set]".to_string(),
             Self::ErrorConstructor => "[function Error]".to_string(),
@@ -12151,6 +12298,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             Some("text/plain;charset=UTF-8".to_string()),
         )),
         Value::Bytes(bytes) => Ok((bytes.as_ref().clone(), None)),
+        Value::Uint8Array(array) => Ok((array.borrow().bytes.clone(), None)),
         Value::Blob(blob) => Ok((
             blob.bytes.clone(),
             (!blob.mime_type.is_empty()).then(|| blob.mime_type.clone()),
@@ -12168,7 +12316,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             Ok((body, Some(boundary)))
         }
         _ => Err(runtime_error(
-            "body must be a string, ArrayBuffer, Blob, File, URLSearchParams, or FormData",
+            "body must be a string, ArrayBuffer, Uint8Array, Blob, File, URLSearchParams, or FormData",
         )),
     }
 }
@@ -12222,6 +12370,56 @@ fn normalize_blob_type(value: &str) -> String {
     }
 }
 
+const MAX_TYPED_ARRAY_BYTES: usize = 16 * 1024 * 1024;
+
+fn uint8_array_property_index(property: &str) -> Option<usize> {
+    property.parse::<usize>().ok()
+}
+
+fn uint8_value(value: &Value) -> Result<u8, ScriptError> {
+    let number = value.number()?;
+    if !number.is_finite() || number == 0.0 {
+        return Ok(0);
+    }
+    Ok((number.trunc() as i128).rem_euclid(256) as u8)
+}
+
+fn uint8_array_length(value: &Value) -> Result<usize, ScriptError> {
+    let number = match value.resolve() {
+        Value::Undefined | Value::Null => 0.0,
+        Value::Bool(value) => f64::from(value as u8),
+        Value::Number(value) => value,
+        Value::String(value) => value.parse().unwrap_or(f64::NAN),
+        _ => return Err(runtime_error("Uint8Array length must be a number")),
+    };
+    if !number.is_finite() || number <= 0.0 {
+        return Ok(0);
+    }
+    let length = number.floor();
+    if length > MAX_TYPED_ARRAY_BYTES as f64 {
+        return Err(runtime_error(
+            "Uint8Array length exceeds the deterministic limit",
+        ));
+    }
+    Ok(length as usize)
+}
+
+fn uint8_array_source_bytes(value: Value) -> Result<Vec<u8>, ScriptError> {
+    match value.resolve() {
+        Value::Array(values) => values
+            .borrow()
+            .iter()
+            .map(uint8_value)
+            .collect::<Result<Vec<_>, _>>(),
+        Value::Bytes(bytes) => Ok(bytes.as_ref().clone()),
+        Value::Uint8Array(array) => Ok(array.borrow().bytes.clone()),
+        Value::Undefined | Value::Null => Ok(Vec::new()),
+        _ => Err(runtime_error(
+            "Uint8Array source must be an Array, ArrayBuffer, or Uint8Array",
+        )),
+    }
+}
+
 fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
     let parts = match parts.map(Value::resolve) {
         None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
@@ -12232,6 +12430,7 @@ fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
     for part in parts {
         match part.resolve() {
             Value::Bytes(part) => bytes.extend_from_slice(part.as_ref()),
+            Value::Uint8Array(part) => bytes.extend_from_slice(&part.borrow().bytes),
             Value::Blob(part) => bytes.extend_from_slice(&part.bytes),
             Value::File(part) => bytes.extend_from_slice(&part.bytes),
             part => bytes.extend_from_slice(part.string_value().as_bytes()),
@@ -13553,6 +13752,8 @@ fn evaluate_binary(
             (Value::Error(_), Value::ErrorConstructor) => true,
             (Value::Blob(_), Value::BlobConstructor) => true,
             (Value::File(_), Value::FileConstructor | Value::BlobConstructor) => true,
+            (Value::Bytes(_), Value::ArrayBufferConstructor) => true,
+            (Value::Uint8Array(_), Value::Uint8ArrayConstructor) => true,
             (Value::Worker(_), Value::WorkerConstructor) => true,
             (Value::Error(error), Value::Class(class)) => {
                 error.class_name == class.name
@@ -13586,6 +13787,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Request(_)
         | Value::Response(_)
         | Value::Bytes(_)
+        | Value::Uint8Array(_)
         | Value::ReadableStream(_)
         | Value::ReadableStreamReader(_)
         | Value::Headers(_)
@@ -13624,11 +13826,13 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::ResponseConstructor
         | Value::RequestConstructor
         | Value::HeadersConstructor
+        | Value::ArrayBufferConstructor
         | Value::UrlConstructor
         | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
         | Value::BlobConstructor
         | Value::FileConstructor
+        | Value::Uint8ArrayConstructor
         | Value::MapConstructor
         | Value::SetConstructor
         | Value::ErrorConstructor
@@ -14098,7 +14302,9 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Navigator, Value::Navigator)
         | (Value::Clipboard, Value::Clipboard)
         | (Value::Crypto, Value::Crypto)
-        | (Value::SubtleCrypto, Value::SubtleCrypto) => true,
+        | (Value::SubtleCrypto, Value::SubtleCrypto)
+        | (Value::ArrayBufferConstructor, Value::ArrayBufferConstructor)
+        | (Value::Uint8ArrayConstructor, Value::Uint8ArrayConstructor) => true,
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),
@@ -14108,6 +14314,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
         (Value::Worker(left), Value::Worker(right)) => Rc::ptr_eq(left, right),
         (Value::Bytes(left), Value::Bytes(right)) => Rc::ptr_eq(left, right),
+        (Value::Uint8Array(left), Value::Uint8Array(right)) => Rc::ptr_eq(left, right),
         (Value::Request(left), Value::Request(right)) => Rc::ptr_eq(left, right),
         (Value::Headers(left), Value::Headers(right)) => Rc::ptr_eq(left, right),
         (Value::ReadableStream(left), Value::ReadableStream(right)) => Rc::ptr_eq(left, right),
@@ -14441,6 +14648,12 @@ impl ScriptRuntime {
             Value::String(string) => Ok(string
                 .chars()
                 .map(|character| Value::String(character.to_string()))
+                .collect()),
+            Value::Uint8Array(array) => Ok(array
+                .borrow()
+                .bytes
+                .iter()
+                .map(|byte| Value::Number(*byte as f64))
                 .collect()),
             Value::Iterator(iterator) => {
                 let mut iterator = iterator.borrow_mut();
@@ -20516,7 +20729,48 @@ mod tests {
             .expect("digest should reject non-ArrayBuffer input");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("SubtleCrypto.digest expects an ArrayBuffer")
+            Some("SubtleCrypto.digest expects an ArrayBuffer or Uint8Array")
+        );
+    }
+
+    #[test]
+    fn uint8_array_values_feed_byte_apis_and_keep_numeric_semantics() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const array = new Uint8Array([1, 2, 255]);
+                array[1] = 258;
+                const copy = new Uint8Array(array.buffer);
+                copy.set([9, 8], 1);
+                const slice = copy.slice(1, 3);
+                const blank = new ArrayBuffer(2);
+                const blankView = new Uint8Array(blank);
+                blankView[1] = 7;
+                crypto.subtle.digest("SHA-256", copy).then((hash) => {
+                    new Blob([copy]).arrayBuffer().then((blobBytes) => {
+                        status.textContent = array.length + ":" + array[0] + ":" + array[1] + ":" + array[2] + "|" +
+                            copy.length + ":" + copy[0] + ":" + copy[1] + ":" + copy[2] + "|" +
+                            slice.length + ":" + slice[0] + ":" + slice[1] + "|" +
+                            copy.buffer.byteLength + ":" + blobBytes[0] + ":" + blobBytes[2] + "|" +
+                            hash.byteLength + ":" + hash[0] + ":" + hash[31] + "|" +
+                            (array instanceof Uint8Array) + ":" + (array instanceof ArrayBuffer) + "|" +
+                            blank.byteLength + ":" + blankView[1] + ":" + (blank instanceof ArrayBuffer) + ":" +
+                            (window.ArrayBuffer === ArrayBuffer) + ":" + (window.Uint8Array === Uint8Array);
+                    });
+                });
+                "#,
+            )
+            .expect("Uint8Array APIs should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("3:1:2:255|3:1:9:8|2:9:8|3:1:8|32:133:4|true:false|2:7:true:true:true")
         );
     }
 
