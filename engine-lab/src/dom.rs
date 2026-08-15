@@ -915,6 +915,19 @@ impl Document {
         self.element_at(path).cloned()
     }
 
+    pub fn node_clone(&self, path: &[usize], deep: bool) -> Option<Node> {
+        match self.node_at(path)? {
+            Node::Element(element) => {
+                let mut clone = element.clone();
+                if !deep {
+                    clone.children.clear();
+                }
+                Some(Node::Element(clone))
+            }
+            Node::Text(text) => Some(Node::Text(text.clone())),
+        }
+    }
+
     pub fn element_attribute(&self, path: &[usize], name: &str) -> Option<String> {
         self.element_at(path)
             .and_then(|element| element.attr(name).map(str::to_string))

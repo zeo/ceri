@@ -32,6 +32,7 @@ The current slice implements:
 - text-node `substringData()`, `appendData()`, `insertData()`, `deleteData()`, and `replaceData()` with UTF-16 edits and live Range offset updates
 - `previousSibling`, `nextSibling`, `previousElementSibling`, `nextElementSibling`, `hasChildNodes()`, `children`, `firstElementChild`, `lastElementChild`, `childElementCount`, and `isConnected` lookups that follow stable node identity across removal
 - `document.createTextNode()` with detached text data, UTF-16 CharacterData methods, `splitText()`, attachment through `appendChild()` or `insertBefore()`, and movement of existing text nodes
+- `cloneNode()` for shallow or deep element copies and text-node copies, with listeners kept on the original handle
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation

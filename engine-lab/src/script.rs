@@ -241,6 +241,7 @@ enum Builtin {
     ElementInsertBefore(ElementHandle),
     ElementRemove(ElementHandle),
     ElementHasChildNodes(ElementHandle),
+    ElementCloneNode(ElementHandle),
     ElementSelect(ElementHandle),
     ElementSetSelectionRange(ElementHandle),
     ElementSetRangeText(ElementHandle),
@@ -3910,6 +3911,7 @@ impl ScriptRuntime {
                     "hasChildNodes" => {
                         Value::Builtin(Builtin::ElementHasChildNodes(handle.clone()))
                     }
+                    "cloneNode" => Value::Builtin(Builtin::ElementCloneNode(handle.clone())),
                     "isConnected" => Value::Bool(
                         path.as_ref()
                             .is_some_and(|path| self.document.borrow().node_is_connected(path)),
@@ -10427,6 +10429,36 @@ impl ScriptRuntime {
                     !is_detached_text_element(&element) && !element.children.is_empty()
                 }
             })),
+            Builtin::ElementCloneNode(handle) => {
+                let deep = arguments.first().is_some_and(Value::truthy);
+                let node = match handle.borrow().clone() {
+                    ElementLocation::Attached { .. } => {
+                        let path = attached_path(&handle)
+                            .ok_or_else(|| runtime_error("node is no longer in the document"))?;
+                        self.document
+                            .borrow()
+                            .node_clone(&path, deep)
+                            .ok_or_else(|| runtime_error("node is no longer in the document"))?
+                    }
+                    ElementLocation::Detached(mut element) => {
+                        if is_detached_text_element(&element) {
+                            Node::Text(detached_text_data(&element).unwrap_or_default())
+                        } else {
+                            if !deep {
+                                element.children.clear();
+                            }
+                            Node::Element(element)
+                        }
+                    }
+                };
+                let element = match node {
+                    Node::Element(element) => element,
+                    Node::Text(text) => detached_text_element(&text),
+                };
+                Ok(Value::Element(Rc::new(RefCell::new(
+                    ElementLocation::Detached(element),
+                ))))
+            }
             Builtin::ElementSetAttribute(handle) => {
                 let name = arguments
                     .first()
@@ -18027,6 +18059,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("2:2:true:true|true:true:true:true:true:true|1:true:true:true")
+        );
+    }
+
+    #[test]
+    fn clone_node_copies_requested_content_without_listeners() {
+        let document = document(
+            r#"<main id="root"><div id="source"><span id="child">inside</span>tail</div><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const source = document.getElementById("source");
+                const shallow = source.cloneNode();
+                const deep = source.cloneNode(true);
+                const text = source.lastChild;
+                const textClone = text.cloneNode();
+                let clicks = 0;
+                source.addEventListener("click", () => clicks = clicks + 1);
+                deep.id = "copy";
+                root.appendChild(deep);
+                deep.click();
+                const status = document.getElementById("status");
+                status.textContent = (shallow !== source) + ":" + shallow.id + ":" +
+                    shallow.hasChildNodes() + ":" + deep.hasChildNodes() + ":" + deep.textContent + ":" +
+                    (textClone !== text) + ":" + textClone.data + ":" + clicks + ":" + deep.isConnected;
+                "#,
+            )
+            .expect("cloneNode should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true:source:false:true:insidetail:true:tail:0:true")
         );
     }
 
