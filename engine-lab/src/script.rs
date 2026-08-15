@@ -7044,21 +7044,53 @@ impl ScriptRuntime {
         self.replace_text_node_data_at(&path, text)
     }
 
-    fn attached_text_node_data(
-        &self,
-        handle: &ElementHandle,
-    ) -> Result<(NodePath, String), ScriptError> {
+    fn text_node_data(&self, handle: &ElementHandle) -> Result<String, ScriptError> {
         if !attached_is_text(handle) {
             return Err(runtime_error("CharacterData method requires a text node"));
         }
-        let path = attached_path(handle)
-            .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
-        let text = self
-            .document
-            .borrow()
-            .node_text_content(&path)
-            .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
-        Ok((path, text))
+        match handle.borrow().clone() {
+            ElementLocation::Attached { .. } => {
+                let path = attached_path(handle)
+                    .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
+                self.document
+                    .borrow()
+                    .node_text_content(&path)
+                    .ok_or_else(|| runtime_error("text node is no longer in the document"))
+            }
+            ElementLocation::Detached(element) => detached_text_data(&element)
+                .ok_or_else(|| runtime_error("text node is no longer in the document")),
+        }
+    }
+
+    fn replace_text_node_data_for_handle(
+        &mut self,
+        handle: &ElementHandle,
+        start: usize,
+        end: usize,
+        replacement: &str,
+    ) -> Result<bool, ScriptError> {
+        if !attached_is_text(handle) {
+            return Ok(false);
+        }
+        if let Some(path) = attached_path(handle) {
+            return self.replace_text_node_data_range(&path, start, end, replacement);
+        }
+        let mut location = handle.borrow_mut();
+        let ElementLocation::Detached(element) = &mut *location else {
+            return Ok(false);
+        };
+        let Some(current) = detached_text_data(element) else {
+            return Ok(false);
+        };
+        let length = utf16_len(&current);
+        let start = start.min(length);
+        let end = end.min(length).max(start);
+        let (updated, _) = replace_utf16_range(&current, start, end, replacement);
+        let Some(data) = detached_text_data_mut(element) else {
+            return Ok(false);
+        };
+        *data = updated;
+        Ok(true)
     }
 
     fn character_data_offset(
@@ -8832,7 +8864,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementSubstringData(handle) => {
-                let (_, text) = self.attached_text_node_data(&handle)?;
+                let text = self.text_node_data(&handle)?;
                 let length = utf16_len(&text);
                 let offset = Self::character_data_offset(&arguments, 0, length)?;
                 let count = Self::character_data_count(&arguments, 1)?;
@@ -8843,33 +8875,33 @@ impl ScriptRuntime {
                 )))
             }
             Builtin::ElementAppendData(handle) => {
-                let (path, text) = self.attached_text_node_data(&handle)?;
+                let text = self.text_node_data(&handle)?;
                 let replacement = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let length = utf16_len(&text);
-                self.replace_text_node_data_range(&path, length, length, &replacement)?;
+                self.replace_text_node_data_for_handle(&handle, length, length, &replacement)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementInsertData(handle) => {
-                let (path, text) = self.attached_text_node_data(&handle)?;
+                let text = self.text_node_data(&handle)?;
                 let length = utf16_len(&text);
                 let offset = Self::character_data_offset(&arguments, 0, length)?;
                 let replacement = arguments
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.replace_text_node_data_range(&path, offset, offset, &replacement)?;
+                self.replace_text_node_data_for_handle(&handle, offset, offset, &replacement)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementDeleteData(handle) => {
-                let (path, text) = self.attached_text_node_data(&handle)?;
+                let text = self.text_node_data(&handle)?;
                 let length = utf16_len(&text);
                 let offset = Self::character_data_offset(&arguments, 0, length)?;
                 let count = Self::character_data_count(&arguments, 1)?;
-                self.replace_text_node_data_range(
-                    &path,
+                self.replace_text_node_data_for_handle(
+                    &handle,
                     offset,
                     offset.saturating_add(count).min(length),
                     "",
@@ -8877,7 +8909,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementReplaceData(handle) => {
-                let (path, text) = self.attached_text_node_data(&handle)?;
+                let text = self.text_node_data(&handle)?;
                 let length = utf16_len(&text);
                 let offset = Self::character_data_offset(&arguments, 0, length)?;
                 let count = Self::character_data_count(&arguments, 1)?;
@@ -8885,8 +8917,8 @@ impl ScriptRuntime {
                     .get(2)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.replace_text_node_data_range(
-                    &path,
+                self.replace_text_node_data_for_handle(
+                    &handle,
                     offset,
                     offset.saturating_add(count).min(length),
                     &replacement,
@@ -14797,43 +14829,42 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
         }
         if byte == b'\'' || byte == b'"' {
             let start = cursor;
-            let quote = byte;
+            let quote = byte as char;
             cursor += 1;
             let mut value = String::new();
+            let mut terminated = false;
             while cursor < source.len() {
-                let byte = source.as_bytes()[cursor];
-                cursor += 1;
-                if byte == quote {
+                let character = source[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor stays on a character boundary");
+                cursor += character.len_utf8();
+                if character == quote {
+                    terminated = true;
                     break;
                 }
-                if byte == b'\\' {
-                    let Some(escaped) = source.as_bytes().get(cursor).copied() else {
+                if character == '\\' {
+                    let Some(escaped) = source[cursor..].chars().next() else {
                         return Err(ScriptError {
                             offset: start,
                             message: "unterminated string".to_string(),
                         });
                     };
-                    cursor += 1;
+                    cursor += escaped.len_utf8();
                     value.push(match escaped {
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'\\' => '\\',
-                        b'\'' => '\'',
-                        b'"' => '"',
-                        other => other as char,
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '\\' => '\\',
+                        '\'' => '\'',
+                        '"' => '"',
+                        other => other,
                     });
                 } else {
-                    value.push(byte as char);
-                }
-                if cursor == source.len() {
-                    return Err(ScriptError {
-                        offset: start,
-                        message: "unterminated string".to_string(),
-                    });
+                    value.push(character);
                 }
             }
-            if source.as_bytes().get(cursor.wrapping_sub(1)) != Some(&quote) {
+            if !terminated {
                 return Err(ScriptError {
                     offset: start,
                     message: "unterminated string".to_string(),
@@ -17933,6 +17964,38 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|start hello! world|true:true:true:3:#text:true|true:true|a:bc:3:false")
+        );
+    }
+
+    #[test]
+    fn detached_text_nodes_support_character_data_methods() {
+        let document = document(r#"<p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const text = document.createTextNode("A😀B");
+                const emoji = text.substringData(1, 2);
+                text.insertData(1, "x");
+                const inserted = text.data;
+                text.deleteData(1, 1);
+                text.replaceData(1, 2, "Q");
+                text.appendData("!");
+                const right = text.splitText(2);
+                const status = document.getElementById("status");
+                status.textContent = emoji + "|" + inserted + "|" + text.textContent + ":" +
+                    right.nodeValue + "|" + text.nodeType + ":" + text.nodeName + ":" +
+                    (text.parentNode === null) + ":" + right.isConnected;
+                "#,
+            )
+            .expect("detached CharacterData methods should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("😀|Ax😀B|AQ:B!|3:#text:true:false")
         );
     }
 

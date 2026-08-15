@@ -31,7 +31,7 @@ The current slice implements:
 - bounded `firstChild`, `lastChild`, and `childNodes` access with text-node identity, `nodeType`, `nodeName`, `nodeValue`, `splitText()`, `normalize()`, UTF-16 Range boundary offsets, replacement retargeting, and in-place text-node data mutation
 - text-node `substringData()`, `appendData()`, `insertData()`, `deleteData()`, and `replaceData()` with UTF-16 edits and live Range offset updates
 - `previousSibling`, `nextSibling`, `hasChildNodes()`, and `isConnected` lookups that follow stable node identity across removal
-- `document.createTextNode()` with detached text data, `splitText()`, attachment through `appendChild()` or `insertBefore()`, and movement of existing text nodes
+- `document.createTextNode()` with detached text data, UTF-16 CharacterData methods, `splitText()`, attachment through `appendChild()` or `insertBefore()`, and movement of existing text nodes
 - `parentNode`, `parentElement`, and `remove()` for attached and detached handles
 - parsed fragment replacement and serialization through `innerHTML`
 - a deterministic task clock with `setTimeout`, `clearTimeout`, `requestAnimationFrame`, and cancellation
