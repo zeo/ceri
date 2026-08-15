@@ -77,6 +77,8 @@ The custom runtime also has bounded IndexedDB with callback-based open and opera
 
 See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.
 
+The script data model now supports bounded writes to plain-object properties and array indexes, array length changes, and `push()` or `pop()` mutation. Object and array identity comparisons use reference identity, so script-created cycles remain observable and are rejected by structured cloning.
+
 The selector matcher also accepts top-level selector lists and bounded `:not(...)` arguments in both stylesheets and DOM queries, while preserving selector specificity and rejecting malformed list entries.
 
 Form controls now support `method="post"` through the same host-owned provider seam as `fetch()`. The engine sends URL-encoded or deterministic multipart bodies with typed headers, follows bounded same-origin redirects, and keeps packaged-only POST actions on an explicit recovery path without creating a localhost listener. A host-owned `FilePicker` boundary supplies validated file bytes and metadata to `input.files`, dispatches `input` and `change`, and carries selected files into multipart form entries without exposing filesystem paths to the renderer. Picker cancellation leaves the current selection unchanged. A matching `ClipboardProvider` boundary backs `navigator.clipboard.readText()` and `writeText()` with host-controlled permission failures and no renderer access to platform clipboard handles.

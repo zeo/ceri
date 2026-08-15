@@ -53,6 +53,8 @@ The provider seam is now exercised by host-backed integration tests covering the
 
 ## Compatibility gates
 
+The script runtime now mutates plain-object properties and bounded array indexes, supports array `length` changes plus `push()` and `pop()`, and compares object and array references by identity. This makes ordinary state updates possible without opening a host transport, while cyclic script values still fail closed at the structured-clone boundary.
+
 The runtime now carries effective disabled paths into CSS matching, so `:disabled` and `:enabled` agree with form submission, validation, focus, click suppression, disabled `optgroup` state, and the first `legend` exemption inside a disabled `fieldset`.
 
 The selector slice now accepts top-level selector lists in stylesheets and DOM queries, preserves commas inside attribute values and functional pseudo-class arguments, and matches bounded `:not(...)` arguments with their selector specificity. Selector lists with invalid entries remain rejected as one rule, matching the current parser's fail-closed policy.

@@ -363,6 +363,8 @@ enum Builtin {
     ElementQuerySelectorAll(ElementHandle),
     ArrayMap(ArrayHandle),
     ArrayJoin(ArrayHandle),
+    ArrayPush(ArrayHandle),
+    ArrayPop(ArrayHandle),
     Uint8ArraySet(Uint8ArrayHandle),
     Uint8ArraySlice(Uint8ArrayHandle),
     Uint8ArraySubarray(Uint8ArrayHandle),
@@ -1286,6 +1288,7 @@ const MAX_CLONE_DEPTH: usize = 64;
 const MAX_CLONE_NODES: usize = 16_384;
 const MAX_CLONE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLONE_STRING_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_ARRAY_LENGTH: usize = 16_384;
 
 enum WorkerCommand {
     Message(CloneValue),
@@ -3908,8 +3911,19 @@ impl ScriptRuntime {
                 for expression in expressions {
                     if let Expr::Spread(expression) = expression {
                         let spread = self.evaluate(expression, environment.clone())?;
-                        values.extend(self.spread_values(spread)?);
+                        let spread = self.spread_values(spread)?;
+                        if values.len().saturating_add(spread.len()) > MAX_RUNTIME_ARRAY_LENGTH {
+                            return Err(runtime_error(
+                                "array exceeds the deterministic length limit",
+                            ));
+                        }
+                        values.extend(spread);
                     } else {
+                        if values.len() == MAX_RUNTIME_ARRAY_LENGTH {
+                            return Err(runtime_error(
+                                "array exceeds the deterministic length limit",
+                            ));
+                        }
                         values.push(self.evaluate(expression, environment.clone())?);
                     }
                 }
@@ -4028,15 +4042,31 @@ impl ScriptRuntime {
             }
             Expr::Index { object, index } => {
                 let object = self.evaluate(object, environment.clone())?;
-                let index = self.evaluate(index, environment)?.property_key();
-                let Value::Uint8Array(array) = object.resolve() else {
-                    return Err(runtime_error("indexed assignment target is not writable"));
-                };
-                let Some(index) = uint8_array_property_index(&index) else {
-                    return Err(runtime_error("Uint8Array index must be a non-negative integer"));
-                };
-                set_uint8_array_byte(&array, index, uint8_value(&value)?);
-                Ok(())
+                let index = self.evaluate(index, environment)?;
+                match object.resolve() {
+                    Value::Object(object) => {
+                        object
+                            .borrow_mut()
+                            .insert(index.property_key(), value);
+                        Ok(())
+                    }
+                    Value::Array(array) => {
+                        let index = runtime_array_index(&index)?;
+                        set_array_element(&array, index, value)?;
+                        Ok(())
+                    }
+                    Value::Uint8Array(array) => {
+                        let index = index.property_key();
+                        let Some(index) = uint8_array_property_index(&index) else {
+                            return Err(runtime_error(
+                                "Uint8Array index must be a non-negative integer",
+                            ));
+                        };
+                        set_uint8_array_byte(&array, index, uint8_value(&value)?);
+                        Ok(())
+                    }
+                    _ => Err(runtime_error("indexed assignment target is not writable")),
+                }
             }
             _ => Err(runtime_error("assignment target is not writable")),
         }
@@ -5240,6 +5270,8 @@ impl ScriptRuntime {
                     "length" => Ok(Value::Number(array.borrow().len() as f64)),
                     "map" => Ok(Value::Builtin(Builtin::ArrayMap(array))),
                     "join" => Ok(Value::Builtin(Builtin::ArrayJoin(array))),
+                    "push" => Ok(Value::Builtin(Builtin::ArrayPush(array))),
+                    "pop" => Ok(Value::Builtin(Builtin::ArrayPop(array))),
                     _ => {
                         let index = property.parse::<usize>().map_err(|_| {
                             runtime_error(format!("array has no property {property}"))
@@ -5404,6 +5436,23 @@ impl ScriptRuntime {
         let truthy = value.truthy();
         let value_string = value.string_value();
         let updated = match object.resolve() {
+            Value::Object(object) => {
+                object.borrow_mut().insert(property.to_string(), value);
+                true
+            }
+            Value::Array(array) if property == "length" => {
+                set_array_length(&array, value)?;
+                true
+            }
+            Value::Array(array) => {
+                let Some(index) = runtime_array_property_index(property) else {
+                    return Err(runtime_error(format!(
+                        "array property {property} is not writable"
+                    )));
+                };
+                set_array_element(&array, index, value)?;
+                true
+            }
             Value::Element(handle) => match property {
                 "nodeValue" | "data" if attached_is_text(&handle) => {
                     self.set_text_node_data(&handle, value_string)?
@@ -11598,6 +11647,17 @@ impl ScriptRuntime {
                     .join(&separator);
                 Ok(Value::String(joined))
             }
+            Builtin::ArrayPush(array) => {
+                let mut array = array.borrow_mut();
+                if array.len().saturating_add(arguments.len()) > MAX_RUNTIME_ARRAY_LENGTH {
+                    return Err(runtime_error(
+                        "array exceeds the deterministic length limit",
+                    ));
+                }
+                array.extend(arguments);
+                Ok(Value::Number(array.len() as f64))
+            }
+            Builtin::ArrayPop(array) => Ok(array.borrow_mut().pop().unwrap_or(Value::Undefined)),
             Builtin::Uint8ArraySet(array) => {
                 let source = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let bytes = uint8_array_source_bytes(source)?;
@@ -15466,6 +15526,58 @@ fn normalize_blob_type(value: &str) -> String {
 
 const MAX_TYPED_ARRAY_BYTES: usize = 16 * 1024 * 1024;
 
+fn runtime_array_property_index(property: &str) -> Option<usize> {
+    let index = property.parse::<usize>().ok()?;
+    (index < MAX_RUNTIME_ARRAY_LENGTH).then_some(index)
+}
+
+fn runtime_array_index(value: &Value) -> Result<usize, ScriptError> {
+    let number = value.number()?;
+    if !number.is_finite()
+        || number < 0.0
+        || number.fract() != 0.0
+        || number >= MAX_RUNTIME_ARRAY_LENGTH as f64
+    {
+        return Err(runtime_error(
+            "array index must be a non-negative integer within the deterministic limit",
+        ));
+    }
+    Ok(number as usize)
+}
+
+fn set_array_element(
+    array: &ArrayHandle,
+    index: usize,
+    value: Value,
+) -> Result<(), ScriptError> {
+    if index >= MAX_RUNTIME_ARRAY_LENGTH {
+        return Err(runtime_error(
+            "array index exceeds the deterministic length limit",
+        ));
+    }
+    let mut array = array.borrow_mut();
+    if index >= array.len() {
+        array.resize(index + 1, Value::Undefined);
+    }
+    array[index] = value;
+    Ok(())
+}
+
+fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError> {
+    let number = value.number()?;
+    if !number.is_finite()
+        || number < 0.0
+        || number.fract() != 0.0
+        || number > MAX_RUNTIME_ARRAY_LENGTH as f64
+    {
+        return Err(runtime_error(
+            "array length must be a non-negative integer within the deterministic limit",
+        ));
+    }
+    array.borrow_mut().resize(number as usize, Value::Undefined);
+    Ok(())
+}
+
 fn uint8_array_property_index(property: &str) -> Option<usize> {
     property.parse::<usize>().ok()
 }
@@ -17429,6 +17541,12 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Binding(_, _), _) | (_, Value::Binding(_, _)) => {
             unreachable!("binding values resolve before comparison")
         }
+        (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
+        (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
+        (Value::Map(left), Value::Map(right)) => Rc::ptr_eq(left, right),
+        (Value::Set(left), Value::Set(right)) => Rc::ptr_eq(left, right),
+        (Value::Iterator(left), Value::Iterator(right)) => Rc::ptr_eq(left, right),
+        (Value::Promise(left), Value::Promise(right)) => Rc::ptr_eq(left, right),
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
         (Value::Function(left), Value::Function(right)) => Rc::ptr_eq(left, right),
@@ -25226,6 +25344,68 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("ready|2|{\"count\":2,\"ok\":true}")
+        );
+    }
+
+    #[test]
+    fn mutates_plain_objects_and_bounded_arrays() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const state = { count: 1, nested: { ready: false }, items: [1, 2] };
+                state.count = state.count + 1;
+                state["label"] = "ok";
+                state.nested.ready = true;
+                state.items[1] = 4;
+                state.items[state.items.length] = 5;
+                const popped = state.items.pop();
+                state.items.push(6, 7);
+                state.items.length = 4;
+                status.textContent = state.count + "|" + state.label + "|" + state.nested.ready + "|" +
+                  state.items.join(",") + "|" + popped + "|" + state.items.length;
+                "#,
+            )
+            .expect("object and array mutation should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("2|ok|true|1,4,6,7|5|4")
+        );
+    }
+
+    #[test]
+    fn script_created_cycles_are_rejected_by_structured_clone() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const cyclic = {};
+                cyclic.self = cyclic;
+                let message = "unexpected";
+                try {
+                  structuredClone(cyclic);
+                } catch (error) {
+                  message = error.message;
+                }
+                status.textContent = (cyclic.self === cyclic) + "|" + message;
+                "#,
+            )
+            .expect("script-created cycle should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("true|DataCloneError: cyclic values are not supported in this slice")
         );
     }
 
