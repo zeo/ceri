@@ -57,7 +57,7 @@ type Uint8ArrayHandle = Rc<RefCell<Uint8ArrayData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
-type BytesHandle = Rc<Vec<u8>>;
+type BytesHandle = Rc<RefCell<Vec<u8>>>;
 type WorkerHandle = Rc<RefCell<WorkerData>>;
 type WasmFunctionHandle = Rc<WasmFunctionData>;
 
@@ -286,6 +286,7 @@ enum Builtin {
     ArrayJoin(ArrayHandle),
     Uint8ArraySet(Uint8ArrayHandle),
     Uint8ArraySlice(Uint8ArrayHandle),
+    Uint8ArraySubarray(Uint8ArrayHandle),
     StringSlice(String),
     MapGet(MapHandle),
     MapSet(MapHandle),
@@ -948,7 +949,9 @@ struct FileData {
 }
 
 struct Uint8ArrayData {
-    bytes: Vec<u8>,
+    buffer: BytesHandle,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3809,9 +3812,7 @@ impl ScriptRuntime {
                 let Some(index) = uint8_array_property_index(&index) else {
                     return Err(runtime_error("Uint8Array index must be a non-negative integer"));
                 };
-                if let Some(byte) = array.borrow_mut().bytes.get_mut(index) {
-                    *byte = uint8_value(&value)?;
-                }
+                set_uint8_array_byte(&array, index, uint8_value(&value)?);
                 Ok(())
             }
             _ => Err(runtime_error("assignment target is not writable")),
@@ -4732,7 +4733,9 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Bytes(bytes) => match property {
-                "byteLength" | "length" => Ok(Value::Number(bytes.len() as f64)),
+                "byteLength" | "length" => {
+                    Ok(Value::Number(bytes.borrow().len() as f64))
+                }
                 _ => Err(runtime_error(format!(
                     "ArrayBuffer has no property {property}"
                 ))),
@@ -4742,12 +4745,15 @@ impl ScriptRuntime {
             ))),
             Value::Uint8Array(array) => match property {
                 "byteLength" | "length" => {
-                    Ok(Value::Number(array.borrow().bytes.len() as f64))
+                    Ok(Value::Number(
+                        uint8_array_view_len(&array.borrow()) as f64,
+                    ))
                 }
-                "byteOffset" => Ok(Value::Number(0.0)),
-                "buffer" => Ok(Value::Bytes(Rc::new(array.borrow().bytes.clone()))),
+                "byteOffset" => Ok(Value::Number(array.borrow().start as f64)),
+                "buffer" => Ok(Value::Bytes(array.borrow().buffer.clone())),
                 "set" => Ok(Value::Builtin(Builtin::Uint8ArraySet(array))),
                 "slice" => Ok(Value::Builtin(Builtin::Uint8ArraySlice(array))),
+                "subarray" => Ok(Value::Builtin(Builtin::Uint8ArraySubarray(array))),
                 _ => Err(runtime_error(format!(
                     "Uint8Array has no property {property}"
                 ))),
@@ -4955,6 +4961,7 @@ impl ScriptRuntime {
                     return Ok(Value::Undefined);
                 }
                 Ok(bytes
+                    .borrow()
                     .get(index as usize)
                     .copied()
                     .map(|byte| Value::Number(byte as f64))
@@ -4965,11 +4972,7 @@ impl ScriptRuntime {
                 if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
                     return Ok(Value::Undefined);
                 }
-                Ok(array
-                    .borrow()
-                    .bytes
-                    .get(index as usize)
-                    .copied()
+                Ok(uint8_array_byte(&array.borrow(), index as usize)
                     .map(|byte| Value::Number(byte as f64))
                     .unwrap_or(Value::Undefined))
             }
@@ -5037,10 +5040,7 @@ impl ScriptRuntime {
                         "Uint8Array property {property} is not writable"
                     )));
                 };
-                let mut array = array.borrow_mut();
-                if let Some(byte) = array.bytes.get_mut(index) {
-                    *byte = uint8_value(&value)?;
-                }
+                set_uint8_array_byte(&array, index, uint8_value(&value)?);
                 true
             }
             Value::Window if property == "location" => {
@@ -8016,7 +8016,7 @@ impl ScriptRuntime {
             .map(uint8_array_length)
             .transpose()?
             .unwrap_or(0);
-        Ok(Value::Bytes(Rc::new(vec![0; length])))
+        Ok(Value::Bytes(Rc::new(RefCell::new(vec![0; length]))))
     }
 
     fn construct_uint8_array(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -8025,20 +8025,63 @@ impl ScriptRuntime {
             .cloned()
             .unwrap_or(Value::Undefined)
             .resolve();
-        let bytes = match source {
-            Value::Undefined | Value::Null => Vec::new(),
-            Value::Number(_) | Value::Bool(_) | Value::String(_) => {
-                vec![0; uint8_array_length(&source)?]
+        let (buffer, start, end) = match source {
+            Value::Bytes(buffer) => {
+                let buffer_length = buffer.borrow().len();
+                let start = arguments
+                    .get(1)
+                    .map(|value| uint8_array_non_negative_integer(value, "Uint8Array byteOffset"))
+                    .transpose()?
+                    .unwrap_or(0);
+                if start > buffer_length {
+                    return Err(runtime_error("Uint8Array byteOffset is out of bounds"));
+                }
+                let end = match arguments.get(2) {
+                    None | Some(Value::Undefined) => buffer_length,
+                    Some(length) => {
+                        let length = uint8_array_non_negative_integer(
+                            length,
+                            "Uint8Array length",
+                        )?;
+                        start.checked_add(length).ok_or_else(|| {
+                            runtime_error("Uint8Array length is out of bounds")
+                        })?
+                    }
+                };
+                if end > buffer_length {
+                    return Err(runtime_error("Uint8Array length is out of bounds"));
+                }
+                (buffer, start, end)
             }
-            source => uint8_array_source_bytes(source)?,
+            Value::Undefined | Value::Null => {
+                let buffer = Rc::new(RefCell::new(Vec::new()));
+                (buffer, 0, 0)
+            }
+            Value::Number(_) | Value::Bool(_) | Value::String(_) => {
+                let buffer = Rc::new(RefCell::new(vec![0; uint8_array_length(&source)?]));
+                let end = buffer.borrow().len();
+                (buffer, 0, end)
+            }
+            Value::Uint8Array(array) => {
+                let buffer = Rc::new(RefCell::new(uint8_array_bytes(&array.borrow())));
+                let end = buffer.borrow().len();
+                (buffer, 0, end)
+            }
+            source => {
+                let buffer = Rc::new(RefCell::new(uint8_array_source_bytes(source)?));
+                let end = buffer.borrow().len();
+                (buffer, 0, end)
+            }
         };
-        if bytes.len() > MAX_TYPED_ARRAY_BYTES {
+        if end - start > MAX_TYPED_ARRAY_BYTES {
             return Err(runtime_error(
                 "Uint8Array length exceeds the deterministic limit",
             ));
         }
         Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
-            bytes,
+            buffer,
+            start,
+            end,
         }))))
     }
 
@@ -8678,8 +8721,8 @@ impl ScriptRuntime {
             Builtin::ObjectFreeze => Ok(arguments.first().cloned().unwrap_or(Value::Undefined)),
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
-                    Some(Value::Bytes(bytes)) => bytes.as_ref().clone(),
-                    Some(Value::Uint8Array(array)) => array.borrow().bytes.clone(),
+                    Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
+                    Some(Value::Uint8Array(array)) => uint8_array_bytes(&array.borrow()),
                     Some(_) => {
                         return Err(runtime_error(
                             "WebAssembly.instantiate expects an ArrayBuffer or Uint8Array",
@@ -9903,7 +9946,7 @@ impl ScriptRuntime {
                 Value::String(String::from_utf8_lossy(&blob.bytes).into_owned()),
             ))),
             Builtin::BlobBytes(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                Rc::new(blob.bytes.clone()),
+                Rc::new(RefCell::new(blob.bytes.clone())),
             )))),
             Builtin::FileSlice(file) => {
                 let (start, end) = blob_slice_range(&arguments, file.bytes.len() as i64)?;
@@ -9924,7 +9967,7 @@ impl ScriptRuntime {
                 Value::String(String::from_utf8_lossy(&file.bytes).into_owned()),
             ))),
             Builtin::FileBytes(file) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                Rc::new(file.bytes.clone()),
+                Rc::new(RefCell::new(file.bytes.clone())),
             )))),
             Builtin::FileListItem(files) => {
                 let index = arguments
@@ -9989,8 +10032,8 @@ impl ScriptRuntime {
                     ))),
                 };
                 let bytes = match arguments.get(1).map(Value::resolve) {
-                    Some(Value::Bytes(bytes)) => bytes.as_ref().clone(),
-                    Some(Value::Uint8Array(array)) => array.borrow().bytes.clone(),
+                    Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
+                    Some(Value::Uint8Array(array)) => uint8_array_bytes(&array.borrow()),
                     _ => {
                         return Ok(Value::Promise(self.rejected_promise_value(
                             subtle_error_value(
@@ -10002,7 +10045,7 @@ impl ScriptRuntime {
                 };
                 match subtle_digest(&algorithm, &bytes) {
                     Ok(digest) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                        Rc::new(digest),
+                        Rc::new(RefCell::new(digest)),
                     )))),
                     Err(error) => Ok(Value::Promise(self.rejected_promise_value(
                         subtle_error_value("NotSupportedError", error),
@@ -10023,9 +10066,9 @@ impl ScriptRuntime {
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::RequestBytes(request) => match self.consume_request_body(&request) {
-                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(Rc::new(
-                    body,
-                ))))),
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
+                    Rc::new(RefCell::new(body)),
+                )))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::RequestBlob(request) => match self.consume_request_body(&request) {
@@ -10265,9 +10308,9 @@ impl ScriptRuntime {
                 }
             }
             Builtin::ResponseBytes(response) => match self.consume_response_body(&response) {
-                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(Rc::new(
-                    body,
-                ))))),
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
+                    Rc::new(RefCell::new(body)),
+                )))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::ResponseBlob(response) => match self.consume_response_body(&response) {
@@ -10358,10 +10401,10 @@ impl ScriptRuntime {
                 }
                 body.disturbed = true;
                 let end = body.cursor.saturating_add(16).min(body.bytes.len());
-                let chunk = Rc::new(body.bytes[body.cursor..end].to_vec());
+                let chunk = body.bytes[body.cursor..end].to_vec();
                 body.cursor = end;
                 Ok(Value::Promise(self.fulfilled_promise(read_result(
-                    Value::Bytes(chunk),
+                    Value::Bytes(Rc::new(RefCell::new(chunk))),
                     false,
                 ))))
             }
@@ -11016,17 +11059,41 @@ impl ScriptRuntime {
                 let end = offset
                     .checked_add(bytes.len())
                     .ok_or_else(|| runtime_error("Uint8Array.set range is out of bounds"))?;
-                let mut array = array.borrow_mut();
-                if end > array.bytes.len() {
+                let (start, view_end, buffer) = {
+                    let array = array.borrow();
+                    (array.start, array.end, array.buffer.clone())
+                };
+                if end > view_end.saturating_sub(start) {
                     return Err(runtime_error("Uint8Array.set range is out of bounds"));
                 }
-                array.bytes[offset..end].copy_from_slice(&bytes);
+                buffer.borrow_mut()[start + offset..start + end].copy_from_slice(&bytes);
                 Ok(Value::Undefined)
             }
             Builtin::Uint8ArraySlice(array) => {
-                let (start, end) = blob_slice_range(&arguments, array.borrow().bytes.len() as i64)?;
+                let (view_start, view_end, buffer) = {
+                    let array = array.borrow();
+                    (array.start, array.end, array.buffer.clone())
+                };
+                let (start, end) =
+                    blob_slice_range(&arguments, (view_end - view_start) as i64)?;
+                let bytes = buffer.borrow()[view_start + start..view_start + end].to_vec();
                 Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
-                    bytes: array.borrow().bytes[start..end].to_vec(),
+                    buffer: Rc::new(RefCell::new(bytes)),
+                    start: 0,
+                    end: end - start,
+                }))))
+            }
+            Builtin::Uint8ArraySubarray(array) => {
+                let (view_start, view_end, buffer) = {
+                    let array = array.borrow();
+                    (array.start, array.end, array.buffer.clone())
+                };
+                let (start, end) =
+                    blob_slice_range(&arguments, (view_end - view_start) as i64)?;
+                Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
+                    buffer,
+                    start: view_start + start,
+                    end: view_start + end,
                 }))))
             }
             Builtin::MapGet(map) => {
@@ -12297,8 +12364,8 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             body.into_bytes(),
             Some("text/plain;charset=UTF-8".to_string()),
         )),
-        Value::Bytes(bytes) => Ok((bytes.as_ref().clone(), None)),
-        Value::Uint8Array(array) => Ok((array.borrow().bytes.clone(), None)),
+        Value::Bytes(bytes) => Ok((bytes.borrow().clone(), None)),
+        Value::Uint8Array(array) => Ok((uint8_array_bytes(&array.borrow()), None)),
         Value::Blob(blob) => Ok((
             blob.bytes.clone(),
             (!blob.mime_type.is_empty()).then(|| blob.mime_type.clone()),
@@ -12376,6 +12443,43 @@ fn uint8_array_property_index(property: &str) -> Option<usize> {
     property.parse::<usize>().ok()
 }
 
+fn uint8_array_view_len(array: &Uint8ArrayData) -> usize {
+    array.end - array.start
+}
+
+fn uint8_array_non_negative_integer(value: &Value, label: &str) -> Result<usize, ScriptError> {
+    let number = value.number()?;
+    if !number.is_finite()
+        || number < 0.0
+        || number.fract() != 0.0
+        || number > usize::MAX as f64
+    {
+        return Err(runtime_error(format!("{label} must be a non-negative integer")));
+    }
+    Ok(number as usize)
+}
+
+fn uint8_array_bytes(array: &Uint8ArrayData) -> Vec<u8> {
+    array.buffer.borrow()[array.start..array.end].to_vec()
+}
+
+fn uint8_array_byte(array: &Uint8ArrayData, index: usize) -> Option<u8> {
+    if index >= uint8_array_view_len(array) {
+        return None;
+    }
+    array.buffer.borrow().get(array.start + index).copied()
+}
+
+fn set_uint8_array_byte(array: &Uint8ArrayHandle, index: usize, byte: u8) {
+    let (start, end, buffer) = {
+        let array = array.borrow();
+        (array.start, array.end, array.buffer.clone())
+    };
+    if index < end - start {
+        buffer.borrow_mut()[start + index] = byte;
+    }
+}
+
 fn uint8_value(value: &Value) -> Result<u8, ScriptError> {
     let number = value.number()?;
     if !number.is_finite() || number == 0.0 {
@@ -12411,8 +12515,8 @@ fn uint8_array_source_bytes(value: Value) -> Result<Vec<u8>, ScriptError> {
             .iter()
             .map(uint8_value)
             .collect::<Result<Vec<_>, _>>(),
-        Value::Bytes(bytes) => Ok(bytes.as_ref().clone()),
-        Value::Uint8Array(array) => Ok(array.borrow().bytes.clone()),
+        Value::Bytes(bytes) => Ok(bytes.borrow().clone()),
+        Value::Uint8Array(array) => Ok(uint8_array_bytes(&array.borrow())),
         Value::Undefined | Value::Null => Ok(Vec::new()),
         _ => Err(runtime_error(
             "Uint8Array source must be an Array, ArrayBuffer, or Uint8Array",
@@ -12429,8 +12533,8 @@ fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
     let mut bytes = Vec::new();
     for part in parts {
         match part.resolve() {
-            Value::Bytes(part) => bytes.extend_from_slice(part.as_ref()),
-            Value::Uint8Array(part) => bytes.extend_from_slice(&part.borrow().bytes),
+            Value::Bytes(part) => bytes.extend_from_slice(&part.borrow()),
+            Value::Uint8Array(part) => bytes.extend_from_slice(&uint8_array_bytes(&part.borrow())),
             Value::Blob(part) => bytes.extend_from_slice(&part.bytes),
             Value::File(part) => bytes.extend_from_slice(&part.bytes),
             part => bytes.extend_from_slice(part.string_value().as_bytes()),
@@ -14649,11 +14753,9 @@ impl ScriptRuntime {
                 .chars()
                 .map(|character| Value::String(character.to_string()))
                 .collect()),
-            Value::Uint8Array(array) => Ok(array
-                .borrow()
-                .bytes
-                .iter()
-                .map(|byte| Value::Number(*byte as f64))
+            Value::Uint8Array(array) => Ok(uint8_array_bytes(&array.borrow())
+                .into_iter()
+                .map(|byte| Value::Number(byte as f64))
                 .collect()),
             Value::Iterator(iterator) => {
                 let mut iterator = iterator.borrow_mut();
@@ -20770,7 +20872,42 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("3:1:2:255|3:1:9:8|2:9:8|3:1:8|32:133:4|true:false|2:7:true:true:true")
+            Some("3:1:9:8|3:1:9:8|2:9:8|3:1:8|32:133:4|true:false|2:7:true:true:true")
+        );
+    }
+
+    #[test]
+    fn uint8_array_subarray_shares_buffer_and_slice_copies() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const buffer = new ArrayBuffer(4);
+                const view = new Uint8Array(buffer);
+                const sub = view.subarray(1, 3);
+                const offset = new Uint8Array(buffer, 1, 2);
+                const second = new Uint8Array(buffer);
+                sub[0] = 9;
+                second[2] = 7;
+                const slice = sub.slice();
+                slice[0] = 5;
+                status.textContent = view[0] + ":" + view[1] + ":" + view[2] + ":" + view[3] + "|" +
+                    offset.byteOffset + ":" + offset.byteLength + ":" + offset[0] + ":" + offset[1] + "|" +
+                    sub.byteOffset + ":" + sub.byteLength + ":" +
+                    sub.buffer.byteLength + ":" + (view.buffer === buffer) + ":" +
+                    (sub.buffer === buffer) + "|" + slice[0] + ":" + sub[0];
+                "#,
+            )
+            .expect("shared Uint8Array views should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("0:9:7:0|1:2:9:7|1:2:4:true:true|5:9")
         );
     }
 
