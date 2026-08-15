@@ -34,6 +34,25 @@ pub enum Node {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NormalizeChange {
+    RemoveEmpty {
+        parent: NodePath,
+        child: NodePath,
+        child_id: NodeId,
+        parent_offset: usize,
+    },
+    MergeText {
+        parent: NodePath,
+        first: NodePath,
+        child: NodePath,
+        first_id: NodeId,
+        child_id: NodeId,
+        first_length: usize,
+        child_length: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScriptSource {
     Inline(String),
     External(String),
@@ -455,6 +474,119 @@ impl Document {
         Some(new_path)
     }
 
+    pub fn next_normalize_change(&self, path: &[usize]) -> Option<NormalizeChange> {
+        let element = self.element_at(path)?;
+        let (parent, index) = find_normalize_candidate(element, path.to_vec())?;
+        let child = child_path(&parent, index);
+        match self.node_at(&child)? {
+            Node::Text(text) if text.is_empty() => Some(NormalizeChange::RemoveEmpty {
+                parent_offset: self
+                    .node_text_offset(&child)?
+                    .saturating_sub(self.node_text_offset(&parent)?),
+                child_id: self.node_id(&child)?,
+                parent,
+                child,
+            }),
+            Node::Text(_) => {
+                let next = child_path(&parent, index.saturating_add(1));
+                let Node::Text(_) = self.node_at(&next)? else {
+                    return None;
+                };
+                Some(NormalizeChange::MergeText {
+                    first_id: self.node_id(&child)?,
+                    child_id: self.node_id(&next)?,
+                    first_length: text_utf16_len(self.node_at(&child)?),
+                    child_length: text_utf16_len(self.node_at(&next)?),
+                    parent,
+                    first: child,
+                    child: next,
+                })
+            }
+            Node::Element(_) => None,
+        }
+    }
+
+    pub fn apply_normalize_change(&mut self, change: &NormalizeChange) -> bool {
+        match change {
+            NormalizeChange::RemoveEmpty {
+                parent,
+                child,
+                child_id,
+                ..
+            } => {
+                if self.node_id(child) != Some(*child_id)
+                    || !matches!(self.node_at(child), Some(Node::Text(text)) if text.is_empty())
+                {
+                    return false;
+                }
+                let index = *child.last().unwrap_or(&usize::MAX);
+                let Some(parent_element) = self.element_at_mut(parent) else {
+                    return false;
+                };
+                if !matches!(parent_element.children.get(index), Some(Node::Text(text)) if text.is_empty()) {
+                    return false;
+                }
+                parent_element.children.remove(index);
+                self.remove_ids_at_or_below(child);
+                self.shift_paths_for_remove(parent, index);
+                true
+            }
+            NormalizeChange::MergeText {
+                parent,
+                first,
+                child,
+                first_id,
+                child_id,
+                first_length,
+                child_length,
+            } => {
+                if self.node_id(first) != Some(*first_id)
+                    || self.node_id(child) != Some(*child_id)
+                    || *child_length != self
+                        .node_at(child)
+                        .map(text_utf16_len)
+                        .unwrap_or(usize::MAX)
+                    || *first_length != self
+                        .node_at(first)
+                        .map(text_utf16_len)
+                        .unwrap_or(usize::MAX)
+                {
+                    return false;
+                }
+                let first_index = *first.last().unwrap_or(&usize::MAX);
+                let child_index = *child.last().unwrap_or(&usize::MAX);
+                if first.len() != parent.len().saturating_add(1)
+                    || child.len() != parent.len().saturating_add(1)
+                    || first[..parent.len()] != *parent
+                    || child[..parent.len()] != *parent
+                    || child_index != first_index.saturating_add(1)
+                {
+                    return false;
+                }
+                let removed = {
+                    let Some(parent_element) = self.element_at(parent) else {
+                        return false;
+                    };
+                    let Some(Node::Text(removed)) = parent_element.children.get(child_index) else {
+                        return false;
+                    };
+                    removed.clone()
+                };
+                let Some(parent_element) = self.element_at_mut(parent) else {
+                    return false;
+                };
+                parent_element.children.remove(child_index);
+                let Some(Node::Text(first_text)) = parent_element.children.get_mut(first_index) else {
+                    return false;
+                };
+                first_text.push_str(&removed);
+                self.remove_ids_at_or_below(child);
+                self.shift_paths_for_remove(parent, child_index);
+                true
+            }
+        }
+    }
+
     pub fn child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
         match self.node_at(path)? {
             Node::Element(element) => Some(
@@ -850,6 +982,10 @@ impl Element {
         }
     }
 
+    pub fn normalize(&mut self) {
+        normalize_element(self);
+    }
+
     pub fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .get(&name.to_ascii_lowercase())
@@ -957,6 +1093,66 @@ impl Element {
             .join("; ");
         self.attrs.insert("style".to_string(), style);
         true
+    }
+}
+
+fn find_normalize_candidate(
+    element: &Element,
+    path: NodePath,
+) -> Option<(NodePath, usize)> {
+    for (index, child) in element.children.iter().enumerate() {
+        match child {
+            Node::Text(text) if text.is_empty() => return Some((path, index)),
+            Node::Text(_) if matches!(element.children.get(index.saturating_add(1)), Some(Node::Text(_))) => {
+                return Some((path, index));
+            }
+            Node::Element(child) => {
+                let mut child_path = path.clone();
+                child_path.push(index);
+                if let Some(candidate) = find_normalize_candidate(child, child_path) {
+                    return Some(candidate);
+                }
+            }
+            Node::Text(_) => {}
+        }
+    }
+    None
+}
+
+fn child_path(parent: &[usize], index: usize) -> NodePath {
+    let mut child = parent.to_vec();
+    child.push(index);
+    child
+}
+
+fn normalize_element(element: &mut Element) {
+    let mut index = 0;
+    while index < element.children.len() {
+        if matches!(element.children.get(index), Some(Node::Text(text)) if text.is_empty()) {
+            element.children.remove(index);
+            continue;
+        }
+        if matches!(element.children.get(index), Some(Node::Text(_))) {
+            while matches!(
+                element.children.get(index.saturating_add(1)),
+                Some(Node::Text(_))
+            ) {
+                let removed = element.children.remove(index.saturating_add(1));
+                let Node::Text(removed) = removed else {
+                    unreachable!("normalize candidate was a text node");
+                };
+                let Some(Node::Text(first)) = element.children.get_mut(index) else {
+                    unreachable!("normalize first node was a text node");
+                };
+                first.push_str(&removed);
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(Node::Element(child)) = element.children.get_mut(index) {
+            normalize_element(child);
+        }
+        index += 1;
     }
 }
 

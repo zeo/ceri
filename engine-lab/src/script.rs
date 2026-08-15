@@ -1,4 +1,6 @@
-use crate::dom::{AccessibilityNode, Document, Element, Node, NodeId, NodePath};
+use crate::dom::{
+    AccessibilityNode, Document, Element, Node, NodeId, NodePath, NormalizeChange,
+};
 use crate::css::StyleState;
 use crate::navigation::{
     is_http_redirect, is_javascript, is_json, AppUrl, ClipboardProvider, FilePicker,
@@ -241,6 +243,7 @@ enum Builtin {
     ElementSetSelectionRange(ElementHandle),
     ElementSetRangeText(ElementHandle),
     ElementSplitText(ElementHandle),
+    ElementNormalize(ElementHandle),
     RangeSetStart(RangeHandle),
     RangeSetEnd(RangeHandle),
     RangeCollapse(RangeHandle),
@@ -1622,6 +1625,36 @@ impl ScriptRuntime {
         }
         if let Some(composition) = &mut self.composition {
             shift_path_for_insert(&mut composition.path, parent, index);
+        }
+    }
+
+    fn shift_runtime_paths_for_remove(&mut self, parent: &[usize], index: usize) {
+        shift_hash_map_paths_for_remove(&mut self.listeners, parent, index);
+        shift_hash_map_paths_for_remove(&mut self.control_values, parent, index);
+        shift_hash_map_paths_for_remove(&mut self.control_checked, parent, index);
+        shift_btree_set_paths_for_remove(&mut self.dirty_checked_controls, parent, index);
+        shift_hash_map_paths_for_remove(&mut self.option_selected, parent, index);
+        shift_btree_set_paths_for_remove(&mut self.dirty_options, parent, index);
+        shift_btree_set_paths_for_remove(&mut self.dirty_controls, parent, index);
+        shift_btree_set_paths_for_remove(&mut self.last_user_edit, parent, index);
+        shift_btree_set_paths_for_remove(&mut self.resetting_forms, parent, index);
+        shift_btree_map_paths_for_remove(&mut self.custom_validity, parent, index);
+        shift_hash_map_paths_for_remove(&mut self.text_selections, parent, index);
+        shift_hash_map_paths_for_remove(&mut self.selected_files, parent, index);
+        shift_btree_map_paths_for_remove(&mut self.scroll_offsets, parent, index);
+        shift_hash_map_paths_for_remove(&mut self.canvas_contexts, parent, index);
+        for context in self.canvas_contexts.values() {
+            shift_path_for_remove(&mut context.borrow_mut().path, parent, index);
+        }
+        {
+            let mut file_lists = self.file_lists.borrow_mut();
+            shift_hash_map_paths_for_remove(&mut file_lists, parent, index);
+        }
+        if let Some(path) = &mut self.focused_element {
+            shift_path_for_remove(path, parent, index);
+        }
+        if let Some(composition) = &mut self.composition {
+            shift_path_for_remove(&mut composition.path, parent, index);
         }
     }
 
@@ -3795,6 +3828,7 @@ impl ScriptRuntime {
                     "splitText" if attached_is_text(&handle) => {
                         Value::Builtin(Builtin::ElementSplitText(handle.clone()))
                     }
+                    "normalize" => Value::Builtin(Builtin::ElementNormalize(handle.clone())),
                     "textContent" => self
                         .element_text_content(&handle)
                         .map(Value::String)
@@ -6610,6 +6644,142 @@ impl ScriptRuntime {
         selection_changed
     }
 
+    fn adjust_ranges_for_normalize_change(
+        &mut self,
+        change: &NormalizeChange,
+        parent: Option<&ElementHandle>,
+        first: Option<&ElementHandle>,
+    ) -> bool {
+        let selected = self.selection.borrow().range.clone();
+        let mut selection_changed = false;
+        let mut active = Vec::with_capacity(self.ranges.len());
+        for weak in self.ranges.drain(..) {
+            let Some(range) = weak.upgrade() else {
+                continue;
+            };
+            let changed = {
+                let mut range_data = range.borrow_mut();
+                let previous = range_data.clone();
+                match change {
+                    NormalizeChange::RemoveEmpty {
+                        child_id,
+                        parent_offset,
+                        ..
+                    } => {
+                        let parent = parent.expect("normalize removal parent handle");
+                        adjust_range_boundary_for_normalize_empty(
+                            &mut range_data.start,
+                            *child_id,
+                            parent,
+                            *parent_offset,
+                        );
+                        adjust_range_boundary_for_normalize_empty(
+                            &mut range_data.end,
+                            *child_id,
+                            parent,
+                            *parent_offset,
+                        );
+                    }
+                    NormalizeChange::MergeText {
+                        child_id,
+                        first_length,
+                        ..
+                    } => {
+                        let first = first.expect("normalize merge first handle");
+                        adjust_range_boundary_for_normalize_merge(
+                            &mut range_data.start,
+                            *child_id,
+                            first,
+                            *first_length,
+                        );
+                        adjust_range_boundary_for_normalize_merge(
+                            &mut range_data.end,
+                            *child_id,
+                            first,
+                            *first_length,
+                        );
+                    }
+                }
+                *range_data != previous
+            };
+            if changed
+                && selected
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &range))
+            {
+                selection_changed = true;
+            }
+            active.push(Rc::downgrade(&range));
+        }
+        self.ranges = active;
+        selection_changed
+    }
+
+    fn normalize_element_handle(&mut self, handle: &ElementHandle) -> Result<(), ScriptError> {
+        let location = handle.borrow().clone();
+        match location {
+            ElementLocation::Detached(mut element) => {
+                element.normalize();
+                *handle.borrow_mut() = ElementLocation::Detached(element);
+                Ok(())
+            }
+            ElementLocation::Attached { .. } => {
+                let Some(path) = attached_path(handle) else {
+                    return Ok(());
+                };
+                if attached_is_text(handle) {
+                    return Ok(());
+                }
+                loop {
+                    let Some(change) = self.document.borrow().next_normalize_change(&path) else {
+                        break;
+                    };
+                    let (parent, child, child_index) = match &change {
+                        NormalizeChange::RemoveEmpty { parent, child, .. }
+                        | NormalizeChange::MergeText { parent, child, .. } => {
+                            let child_index = *child
+                                .last()
+                                .expect("normalize child path is non-empty");
+                            (parent.clone(), child.clone(), child_index)
+                        }
+                    };
+                    self.clear_runtime_state_for_removed_subtree(&child);
+                    let parent_handle = match &change {
+                        NormalizeChange::RemoveEmpty { .. } => Some(
+                            attached_handle(parent.clone(), &self.document)
+                                .ok_or_else(|| runtime_error("normalize parent is detached"))?,
+                        ),
+                        NormalizeChange::MergeText { .. } => None,
+                    };
+                    let first_handle = match &change {
+                        NormalizeChange::MergeText { first, .. } => Some(
+                            attached_handle(first.clone(), &self.document)
+                                .ok_or_else(|| runtime_error("normalize first text is detached"))?,
+                        ),
+                        NormalizeChange::RemoveEmpty { .. } => None,
+                    };
+                    if !self
+                        .document
+                        .borrow_mut()
+                        .apply_normalize_change(&change)
+                    {
+                        return Err(runtime_error("normalize change became stale"));
+                    }
+                    self.shift_runtime_paths_for_remove(&parent, child_index);
+                    let selection_changed = self.adjust_ranges_for_normalize_change(
+                        &change,
+                        parent_handle.as_ref(),
+                        first_handle.as_ref(),
+                    );
+                    if selection_changed {
+                        self.dispatch_document_selection_change()?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn element_files(&self, handle: &ElementHandle) -> Value {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
@@ -8498,6 +8668,10 @@ impl ScriptRuntime {
                     self.dispatch_document_selection_change()?;
                 }
                 Ok(Value::Element(right))
+            }
+            Builtin::ElementNormalize(handle) => {
+                self.normalize_element_handle(&handle)?;
+                Ok(Value::Undefined)
             }
             Builtin::RangeSetStart(range) => {
                 let boundary = self.range_boundary_from_arguments(&arguments)?;
@@ -10621,6 +10795,13 @@ fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
     }
 }
 
+fn attached_node_id(handle: &ElementHandle) -> Option<NodeId> {
+    match &*handle.borrow() {
+        ElementLocation::Attached { id, .. } => Some(*id),
+        ElementLocation::Detached(_) => None,
+    }
+}
+
 fn attached_is_text(handle: &ElementHandle) -> bool {
     matches!(
         &*handle.borrow(),
@@ -11872,6 +12053,30 @@ fn adjust_range_boundary_for_split_text(
     }
 }
 
+fn adjust_range_boundary_for_normalize_empty(
+    boundary: &mut RangeBoundary,
+    child_id: NodeId,
+    parent: &ElementHandle,
+    parent_offset: usize,
+) {
+    if attached_node_id(&boundary.node) == Some(child_id) {
+        boundary.node = parent.clone();
+        boundary.offset = parent_offset;
+    }
+}
+
+fn adjust_range_boundary_for_normalize_merge(
+    boundary: &mut RangeBoundary,
+    child_id: NodeId,
+    first: &ElementHandle,
+    first_length: usize,
+) {
+    if attached_node_id(&boundary.node) == Some(child_id) {
+        boundary.node = first.clone();
+        boundary.offset = first_length.saturating_add(boundary.offset);
+    }
+}
+
 fn remap_range_offset(
     offset: usize,
     replacement_start: usize,
@@ -11953,6 +12158,51 @@ fn shift_btree_set_paths(paths: &mut BTreeSet<NodePath>, parent: &[usize], index
         .into_iter()
         .map(|mut path| {
             shift_path_for_insert(&mut path, parent, index);
+            path
+        })
+        .collect();
+}
+
+fn shift_hash_map_paths_for_remove<V>(
+    paths: &mut HashMap<NodePath, V>,
+    parent: &[usize],
+    index: usize,
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|(mut path, value)| {
+            shift_path_for_remove(&mut path, parent, index);
+            (path, value)
+        })
+        .collect();
+}
+
+fn shift_btree_map_paths_for_remove<V>(
+    paths: &mut BTreeMap<NodePath, V>,
+    parent: &[usize],
+    index: usize,
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|(mut path, value)| {
+            shift_path_for_remove(&mut path, parent, index);
+            (path, value)
+        })
+        .collect();
+}
+
+fn shift_btree_set_paths_for_remove(
+    paths: &mut BTreeSet<NodePath>,
+    parent: &[usize],
+    index: usize,
+) {
+    let current = std::mem::take(paths);
+    *paths = current
+        .into_iter()
+        .map(|mut path| {
+            shift_path_for_remove(&mut path, parent, index);
             path
         })
         .collect();
@@ -17145,6 +17395,83 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("he:llo:true:true|he:1:llo:2:ell|1")
+        );
+    }
+
+    #[test]
+    fn normalize_merges_text_nodes_and_retargets_live_ranges() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello<span id="marker">!</span></p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const right = text.splitText(2);
+                const empty = right.splitText(right.data.length);
+                const marker = document.getElementById("marker");
+                let clicks = 0;
+                marker.addEventListener("click", () => clicks = clicks + 1);
+                const range = document.createRange();
+                range.setStart(right, 1);
+                range.setEnd(empty, 0);
+                const selection = window.getSelection();
+                selection.addRange(range);
+                let changes = 0;
+                document.addEventListener("selectionchange", () => changes = changes + 1);
+                first.normalize();
+                marker.click();
+                const status = document.getElementById("status");
+                status.textContent = text.data + "|" + first.childNodes.length + "|" +
+                    (first.childNodes[0] === text) + "|" + range.startContainer.data + ":" +
+                    range.startOffset + ":" + range.endContainer.data + ":" + range.endOffset + ":" +
+                    range.toString() + "|" + clicks + "|" + changes + "|" + (right.data === null) +
+                    "|" + (empty.data === null);
+                "#,
+            )
+            .expect("normalize should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello|2|true|hello:3:hello:5:lo|1|2|true|true")
+        );
+    }
+
+    #[test]
+    fn normalize_removes_empty_text_nodes_and_moves_ranges_to_the_parent() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const first = document.getElementById("first");
+                const text = first.firstChild;
+                const right = text.splitText(0);
+                const range = document.createRange();
+                range.setStart(text, 0);
+                range.setEnd(text, 0);
+                first.normalize();
+                const status = document.getElementById("status");
+                status.textContent = first.textContent + "|" + first.childNodes.length + "|" +
+                    (first.firstChild === right) + "|" + (range.startContainer === first) + ":" +
+                    range.startOffset + ":" + range.endOffset + "|" + (text.data === null);
+                "#,
+            )
+            .expect("normalize should remove empty text");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("hello|1|true|true:0:0|true")
         );
     }
 
