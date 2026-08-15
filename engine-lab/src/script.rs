@@ -365,6 +365,9 @@ enum Builtin {
     ArrayJoin(ArrayHandle),
     ArrayPush(ArrayHandle),
     ArrayPop(ArrayHandle),
+    ArrayForEach(ArrayHandle),
+    ArrayFilter(ArrayHandle),
+    ArrayFind(ArrayHandle),
     Uint8ArraySet(Uint8ArrayHandle),
     Uint8ArraySlice(Uint8ArrayHandle),
     Uint8ArraySubarray(Uint8ArrayHandle),
@@ -5297,6 +5300,9 @@ impl ScriptRuntime {
                     "join" => Ok(Value::Builtin(Builtin::ArrayJoin(array))),
                     "push" => Ok(Value::Builtin(Builtin::ArrayPush(array))),
                     "pop" => Ok(Value::Builtin(Builtin::ArrayPop(array))),
+                    "forEach" => Ok(Value::Builtin(Builtin::ArrayForEach(array))),
+                    "filter" => Ok(Value::Builtin(Builtin::ArrayFilter(array))),
+                    "find" => Ok(Value::Builtin(Builtin::ArrayFind(array))),
                     _ => {
                         let index = property.parse::<usize>().map_err(|_| {
                             runtime_error(format!("array has no property {property}"))
@@ -11668,10 +11674,7 @@ impl ScriptRuntime {
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
             Builtin::ArrayMap(array) => {
-                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
-                    return Err(runtime_error("Array.map callback must be a function"));
-                }
+                let callback = array_callback(&arguments, "Array.map")?;
                 let values = array.borrow().clone();
                 let mut mapped = Vec::with_capacity(values.len());
                 for (index, value) in values.into_iter().enumerate() {
@@ -11713,6 +11716,64 @@ impl ScriptRuntime {
                 Ok(Value::Number(array.len() as f64))
             }
             Builtin::ArrayPop(array) => Ok(array.borrow_mut().pop().unwrap_or(Value::Undefined)),
+            Builtin::ArrayForEach(array) => {
+                let callback = array_callback(&arguments, "Array.forEach")?;
+                let values = array.borrow().clone();
+                for (index, value) in values.into_iter().enumerate() {
+                    self.call(
+                        callback.clone(),
+                        vec![
+                            value,
+                            Value::Number(index as f64),
+                            Value::Array(array.clone()),
+                        ],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ArrayFilter(array) => {
+                let callback = array_callback(&arguments, "Array.filter")?;
+                let values = array.borrow().clone();
+                let mut filtered = Vec::new();
+                for (index, value) in values.into_iter().enumerate() {
+                    let candidate = value.clone();
+                    if self
+                        .call(
+                            callback.clone(),
+                            vec![
+                                value,
+                                Value::Number(index as f64),
+                                Value::Array(array.clone()),
+                            ],
+                        )?
+                        .truthy()
+                    {
+                        filtered.push(candidate);
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(filtered))))
+            }
+            Builtin::ArrayFind(array) => {
+                let callback = array_callback(&arguments, "Array.find")?;
+                let values = array.borrow().clone();
+                for (index, value) in values.into_iter().enumerate() {
+                    let candidate = value.clone();
+                    if self
+                        .call(
+                            callback.clone(),
+                            vec![
+                                value,
+                                Value::Number(index as f64),
+                                Value::Array(array.clone()),
+                            ],
+                        )?
+                        .truthy()
+                    {
+                        return Ok(candidate);
+                    }
+                }
+                Ok(Value::Undefined)
+            }
             Builtin::Uint8ArraySet(array) => {
                 let source = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let bytes = uint8_array_source_bytes(source)?;
@@ -15586,6 +15647,14 @@ fn reject_nullish_object_argument(value: &Value, method: &str) -> Result<(), Scr
         return Err(runtime_error(format!("{method} requires an object value")));
     }
     Ok(())
+}
+
+fn array_callback(arguments: &[Value], method: &str) -> Result<Value, ScriptError> {
+    let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+    if !matches!(callback, Value::Function(_)) {
+        return Err(runtime_error(format!("{method} callback must be a function")));
+    }
+    Ok(callback)
 }
 
 fn enumerable_object_properties(value: Value) -> Result<Vec<(String, Value)>, ScriptError> {
@@ -25569,6 +25638,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|a,b,old|1,override,0|a=1,b=override,old=0|01|zero,one|Object.keys requires an object value")
+        );
+    }
+
+    #[test]
+    fn array_callbacks_iterate_with_values_indexes_and_source() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                const values = [1, 2, 3, 4];
+                let seen = "";
+                values.forEach((value, index, source) => {
+                  seen = seen + index + ":" + value + ":" + (source === values) + ";";
+                });
+                const greaterThanOne = values.filter((value) => value > 1);
+                const first = values.find((value) => value > 2);
+                let callbackError = "unexpected";
+                try {
+                  values.filter("nope");
+                } catch (error) {
+                  callbackError = error.message;
+                }
+                status.textContent = seen + "|" + greaterThanOne.join(",") + "|" + first + "|" + callbackError;
+                "#,
+            )
+            .expect("array callbacks should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.filter callback must be a function")
         );
     }
 
