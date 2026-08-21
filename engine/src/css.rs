@@ -402,6 +402,7 @@ pub(crate) struct StyleState {
     pub(crate) viewport_height: f32,
     pub(crate) color_scheme: ColorScheme,
     pub(crate) reduced_motion: bool,
+    pub(crate) clock: u64,
     pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
     pub(crate) root_path: Option<NodePath>,
 }
@@ -642,6 +643,51 @@ impl Edges {
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    keyframes: Vec<Keyframes>,
+}
+
+#[derive(Clone, Debug)]
+struct Keyframes {
+    name: String,
+    stops: Vec<KeyframeStop>,
+}
+
+#[derive(Clone, Debug)]
+struct KeyframeStop {
+    progress: f32,
+    declarations: Vec<Declaration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Timing {
+    Linear,
+    Ease,
+    Steps(u32),
+}
+
+impl Timing {
+    fn apply(self, progress: f32) -> f32 {
+        let progress = progress.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => progress,
+            // the cubic ease curve approximated by smoothstep, which is close enough to read as eased
+            Self::Ease => progress * progress * (3.0 - 2.0 * progress),
+            Self::Steps(count) => {
+                let count = count.max(1) as f32;
+                (progress * count).floor().min(count - 1.0) / count
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Animation {
+    pub(crate) name: String,
+    pub(crate) duration: u64,
+    pub(crate) delay: u64,
+    pub(crate) timing: Timing,
+    pub(crate) iterations: Option<f32>,
+    pub(crate) alternate: bool,
 }
 
 impl Stylesheet {
@@ -661,17 +707,98 @@ impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = strip_comments(source);
         let mut rules = Vec::new();
-        parse_rules(&source, None, &mut rules, None)?;
-        Ok(Self { rules })
+        let mut keyframes = Vec::new();
+        parse_rules(&source, None, &mut rules, &mut keyframes, None)?;
+        Ok(Self { rules, keyframes })
     }
 
     // page rendering follows CSS error handling: an unsupported rule is dropped, the rest applies
     pub fn parse_recovering(source: &str) -> (Self, Vec<String>) {
         let source = strip_comments(source);
         let mut rules = Vec::new();
+        let mut keyframes = Vec::new();
         let mut dropped = Vec::new();
-        let _ = parse_rules(&source, None, &mut rules, Some(&mut dropped));
-        (Self { rules }, dropped)
+        let _ = parse_rules(
+            &source,
+            None,
+            &mut rules,
+            &mut keyframes,
+            Some(&mut dropped),
+        );
+        (Self { rules, keyframes }, dropped)
+    }
+
+    // the animated values of an element at the current clock, blended between keyframes
+    pub(crate) fn animated_values(
+        &self,
+        animation: &Animation,
+        now: u64,
+        base: &BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let Some(keyframes) = self
+            .keyframes
+            .iter()
+            .find(|frames| frames.name == animation.name)
+        else {
+            return Vec::new();
+        };
+        if animation.duration == 0 || keyframes.stops.is_empty() {
+            return Vec::new();
+        }
+        let keyframes = with_synthesized_endpoints(keyframes, base);
+        let keyframes = &keyframes;
+        if keyframes.stops.len() < 2 {
+            return Vec::new();
+        }
+        let elapsed = now.saturating_sub(animation.delay);
+        if now < animation.delay {
+            return keyframes
+                .stops
+                .first()
+                .map(|stop| declaration_pairs(&stop.declarations))
+                .unwrap_or_default();
+        }
+        let cycle = elapsed as f32 / animation.duration as f32;
+        if let Some(iterations) = animation.iterations
+            && cycle >= iterations
+        {
+            let ended = if animation.alternate && (iterations.ceil() as u64) % 2 == 0 {
+                keyframes.stops.first()
+            } else {
+                keyframes.stops.last()
+            };
+            return ended
+                .map(|stop| declaration_pairs(&stop.declarations))
+                .unwrap_or_default();
+        }
+        let mut progress = cycle.fract();
+        if animation.alternate && (cycle.floor() as u64) % 2 == 1 {
+            progress = 1.0 - progress;
+        }
+        let progress = animation.timing.apply(progress);
+        let mut values = Vec::new();
+        for pair in keyframes.stops.windows(2) {
+            let (start, end) = (&pair[0], &pair[1]);
+            if progress > end.progress && end.progress < 1.0 {
+                continue;
+            }
+            let span = (end.progress - start.progress).max(f32::EPSILON);
+            let local = ((progress - start.progress) / span).clamp(0.0, 1.0);
+            for declaration in &start.declarations {
+                let target = end
+                    .declarations
+                    .iter()
+                    .find(|other| other.property == declaration.property);
+                let value = match target {
+                    Some(target) => interpolate_value(&declaration.value, &target.value, local)
+                        .unwrap_or_else(|| declaration.value.clone()),
+                    None => declaration.value.clone(),
+                };
+                values.push((declaration.property.clone(), value));
+            }
+            break;
+        }
+        values
     }
 
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
@@ -816,6 +943,8 @@ impl Stylesheet {
         let empty_properties = BTreeMap::new();
         let custom_properties =
             inherited_custom_properties(state, path).unwrap_or(&empty_properties);
+        let mut animation = None;
+        let mut base_values = BTreeMap::new();
         for (property, (_, _, value)) in values {
             if property.starts_with("--") {
                 continue;
@@ -823,9 +952,32 @@ impl Stylesheet {
             let Some(value) = resolve_custom_value(&value, custom_properties) else {
                 continue;
             };
+            if property == "animation" || property == "animation-name" {
+                animation = parse_animation(&value);
+                continue;
+            }
             apply_declaration(&mut style, &property, &value);
+            base_values.insert(property, value);
+        }
+        // animated values win over the normal cascade, as the animation origin requires
+        if let Some(animation) = animation.filter(|_| !state.reduced_motion) {
+            for (property, value) in self.animated_values(&animation, state.clock, &base_values) {
+                let Some(value) = resolve_custom_value(&value, custom_properties) else {
+                    continue;
+                };
+                apply_declaration(&mut style, &property, &value);
+            }
         }
         style
+    }
+
+    pub(crate) fn has_animations(&self) -> bool {
+        !self.keyframes.is_empty()
+            && self.rules.iter().any(|rule| {
+                rule.declarations.iter().any(|declaration| {
+                    declaration.property == "animation" || declaration.property == "animation-name"
+                })
+            })
     }
 
     fn cascaded_values(
@@ -1539,10 +1691,193 @@ fn parse_attribute_value(source: &str, cursor: &mut usize) -> Result<String, Str
     }
 }
 
+// css fills a missing 0% or 100% keyframe with the element's own value for that property
+fn with_synthesized_endpoints(keyframes: &Keyframes, base: &BTreeMap<String, String>) -> Keyframes {
+    let mut stops = keyframes.stops.clone();
+    let animated: Vec<String> = {
+        let mut properties: Vec<String> = stops
+            .iter()
+            .flat_map(|stop| stop.declarations.iter().map(|entry| entry.property.clone()))
+            .collect();
+        properties.sort();
+        properties.dedup();
+        properties
+    };
+    let endpoint = |progress: f32| KeyframeStop {
+        progress,
+        declarations: animated
+            .iter()
+            .filter_map(|property| {
+                base.get(property).map(|value| Declaration {
+                    property: property.clone(),
+                    value: value.clone(),
+                })
+            })
+            .collect(),
+    };
+    if stops.first().is_none_or(|stop| stop.progress > 0.0) {
+        stops.insert(0, endpoint(0.0));
+    }
+    if stops.last().is_none_or(|stop| stop.progress < 1.0) {
+        stops.push(endpoint(1.0));
+    }
+    Keyframes {
+        name: keyframes.name.clone(),
+        stops,
+    }
+}
+
+fn declaration_pairs(declarations: &[Declaration]) -> Vec<(String, String)> {
+    declarations
+        .iter()
+        .map(|declaration| (declaration.property.clone(), declaration.value.clone()))
+        .collect()
+}
+
+// colors, numbers and single-unit lengths blend, anything else steps at the midpoint
+fn interpolate_value(from: &str, to: &str, progress: f32) -> Option<String> {
+    if let (Some(start), Some(end)) = (Color::parse(from), Color::parse(to)) {
+        let mixed = start.mix(end, progress);
+        return Some(format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            mixed.red, mixed.green, mixed.blue, mixed.alpha
+        ));
+    }
+    if let (Ok(start), Ok(end)) = (from.trim().parse::<f32>(), to.trim().parse::<f32>()) {
+        return Some(format!("{}", start + (end - start) * progress));
+    }
+    if let (Some((start, start_unit)), Some((end, end_unit))) =
+        (split_length_unit(from.trim()), split_length_unit(to.trim()))
+        && start_unit == end_unit
+    {
+        return Some(format!("{}{start_unit}", start + (end - start) * progress));
+    }
+    Some(if progress < 0.5 { from } else { to }.to_string())
+}
+
+fn parse_keyframes(header: &str, body: &str) -> Option<Keyframes> {
+    let name = header
+        .get("@keyframes".len()..)?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut stops = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_open) = body[cursor..].find('{') {
+        let open = cursor + relative_open;
+        let selector = body[cursor..open].trim().to_ascii_lowercase();
+        let close = matching_brace(body, open).ok()?;
+        let declarations =
+            parse_declarations(&body[open + 1..close], Some(&mut Vec::new())).ok()?;
+        cursor = close + 1;
+        for stop in selector.split(',') {
+            let stop = stop.trim();
+            let progress = match stop {
+                "from" => 0.0,
+                "to" => 1.0,
+                other => match other.strip_suffix('%') {
+                    Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+                    None => continue,
+                },
+            };
+            stops.push(KeyframeStop {
+                progress: progress.clamp(0.0, 1.0),
+                declarations: declarations.clone(),
+            });
+        }
+    }
+    if stops.is_empty() {
+        return None;
+    }
+    stops.sort_by(|left, right| {
+        left.progress
+            .partial_cmp(&right.progress)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(Keyframes { name, stops })
+}
+
+fn parse_animation(value: &str) -> Option<Animation> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut name = None;
+    let mut durations = Vec::new();
+    let mut timing = Timing::Ease;
+    let mut iterations = Some(1.0);
+    let mut alternate = false;
+    let mut tokens = value.split_ascii_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        let lowered = token.to_ascii_lowercase();
+        if let Some(duration) = parse_duration(&lowered) {
+            durations.push(duration);
+            continue;
+        }
+        match lowered.as_str() {
+            "linear" => timing = Timing::Linear,
+            "ease" | "ease-in" | "ease-out" | "ease-in-out" => timing = Timing::Ease,
+            "infinite" => iterations = None,
+            "alternate" => alternate = true,
+            "normal" | "forwards" | "backwards" | "both" | "none" | "running" | "paused" => {}
+            other if other.starts_with("steps(") => {
+                let mut steps = other.to_string();
+                while !steps.contains(')') {
+                    let next = tokens.next()?;
+                    steps.push_str(next);
+                }
+                let inner = steps
+                    .trim_start_matches("steps(")
+                    .trim_end_matches(')')
+                    .split(',')
+                    .next()?
+                    .trim()
+                    .parse::<u32>()
+                    .ok()?;
+                timing = Timing::Steps(inner);
+            }
+            other => {
+                if let Ok(count) = other.parse::<f32>() {
+                    iterations = Some(count.max(0.0));
+                } else if name.is_none() {
+                    name = Some(token.to_string());
+                }
+            }
+        }
+    }
+    Some(Animation {
+        name: name?,
+        duration: durations.first().copied().unwrap_or(0),
+        delay: durations.get(1).copied().unwrap_or(0),
+        timing,
+        iterations,
+        alternate,
+    })
+}
+
+fn parse_duration(value: &str) -> Option<u64> {
+    if let Some(seconds) = value.strip_suffix("ms") {
+        return seconds.trim().parse::<f32>().ok().map(|value| value as u64);
+    }
+    if let Some(seconds) = value.strip_suffix('s') {
+        return seconds
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| (value * 1000.0) as u64);
+    }
+    None
+}
+
 fn parse_rules(
     source: &str,
     media: Option<MediaCondition>,
     rules: &mut Vec<Rule>,
+    keyframes: &mut Vec<Keyframes>,
     mut dropped: Option<&mut Vec<String>>,
 ) -> Result<(), String> {
     let mut cursor = 0;
@@ -1593,7 +1928,26 @@ fn parse_rules(
                     continue;
                 }
             };
-            parse_rules(body, Some(nested_media), rules, dropped.as_deref_mut())?;
+            parse_rules(
+                body,
+                Some(nested_media),
+                rules,
+                keyframes,
+                dropped.as_deref_mut(),
+            )?;
+            continue;
+        }
+        if header
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@keyframes"))
+        {
+            match parse_keyframes(header, body) {
+                Some(frames) => keyframes.push(frames),
+                None => drop_or_fail(
+                    dropped.as_deref_mut(),
+                    format!("unsupported keyframes rule: {header}"),
+                )?,
+            }
             continue;
         }
         if header.starts_with('@') {
@@ -2550,6 +2904,87 @@ mod tests {
     }
 
     #[test]
+    fn animations_sample_keyframes_against_the_clock() {
+        let stylesheet = Stylesheet::parse(
+            "@keyframes slide { from { width: 40px; background: #000000 } to { width: 240px; background: #ffffff } } .bar { animation: slide 1000ms linear infinite }",
+        )
+        .expect("stylesheet should parse");
+        assert!(stylesheet.has_animations());
+        let mut bar = Element::new("div");
+        bar.attrs.insert("class".to_string(), "bar".to_string());
+        let style_at = |clock: u64, reduced_motion: bool| {
+            stylesheet.style_for(StyleContext {
+                element: &bar,
+                path: &[0],
+                ancestors: &[],
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::Normal,
+                parent_text: InheritedText::default(),
+                state: &StyleState {
+                    clock,
+                    reduced_motion,
+                    ..StyleState::default()
+                },
+            })
+        };
+
+        assert_eq!(style_at(0, false).width.resolve(0.0, 16.0), Some(40.0));
+        assert_eq!(style_at(250, false).width.resolve(0.0, 16.0), Some(90.0));
+        assert_eq!(
+            style_at(500, false).background,
+            Color::opaque(128, 128, 128)
+        );
+        // an infinite animation wraps, so the second cycle repeats the first
+        assert_eq!(style_at(1250, false).width.resolve(0.0, 16.0), Some(90.0));
+        // a motion preference stops the animation from applying at all
+        assert_eq!(style_at(500, true).width, Length::Auto);
+
+        let stepped = Stylesheet::parse(
+            "@keyframes fade { 0% { opacity: 1 } 100% { opacity: 0 } } .bar { animation: fade 800ms steps(2, end) infinite }",
+        )
+        .expect("stylesheet should parse");
+        let opacity_at = |clock: u64| {
+            stepped
+                .style_for(StyleContext {
+                    element: &bar,
+                    path: &[0],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
+                    state: &StyleState {
+                        clock,
+                        ..StyleState::default()
+                    },
+                })
+                .opacity
+        };
+        assert_eq!(opacity_at(100), 1.0);
+        assert_eq!(opacity_at(500), 0.5);
+
+        let once = Stylesheet::parse(
+            "@keyframes grow { from { width: 10px } to { width: 20px } } .bar { animation: grow 100ms linear }",
+        )
+        .expect("stylesheet should parse");
+        let ended = once.style_for(StyleContext {
+            element: &bar,
+            path: &[0],
+            ancestors: &[],
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
+            state: &StyleState {
+                clock: 5_000,
+                ..StyleState::default()
+            },
+        });
+        assert_eq!(ended.width.resolve(0.0, 16.0), Some(20.0));
+    }
+
+    #[test]
     fn parses_radius_opacity_shadow_and_gradient_declarations() {
         let stylesheet = Stylesheet::parse(
             ".card { border-radius: 18px 8px; opacity: 0.4; box-shadow: 0 10px 30px #00000080; background: linear-gradient(90deg, #ff0000 0%, #0000ff 100%); }",
@@ -2932,7 +3367,7 @@ mod tests {
     #[test]
     fn recovering_parse_keeps_valid_rules_and_reports_the_rest() {
         let (stylesheet, dropped) = Stylesheet::parse_recovering(
-            r#"p::first-line { color: red; } .card { color: red; } @keyframes signal { from { opacity: 0; } } p { color: } .last { color: blue; }"#,
+            r#"p::first-line { color: red; } .card { color: red; } @supports (display: grid) { p { color: red } } p { color: } .last { color: blue; }"#,
         );
         assert_eq!(stylesheet.rules.len(), 3);
         assert_eq!(
@@ -2945,7 +3380,7 @@ mod tests {
         );
         assert_eq!(dropped.len(), 3);
         assert!(dropped[0].starts_with("p::first-line"));
-        assert!(dropped[1].starts_with("unsupported at-rule: @keyframes"));
+        assert!(dropped[1].starts_with("unsupported at-rule: @supports"));
         assert!(dropped[2].contains("invalid declaration: color:"));
         assert!(Stylesheet::parse("p::first-line { color: red; }").is_err());
         assert!(Stylesheet::parse("body::before { content: \"\"; }").is_ok());

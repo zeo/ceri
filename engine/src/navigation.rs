@@ -1080,6 +1080,16 @@ impl Browser {
         self.last_navigation_failure.as_ref()
     }
 
+    // a page with a running animation needs a frame per clock tick
+    pub fn has_active_animations(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| {
+            !self.preferences.reduced_motion
+                && Stylesheet::parse_recovering(&page.stylesheet)
+                    .0
+                    .has_animations()
+        })
+    }
+
     pub fn title(&self) -> Option<String> {
         self.page
             .as_ref()
@@ -1353,6 +1363,7 @@ impl Browser {
         style_state.viewport_height = viewport.height;
         style_state.color_scheme = self.preferences.color_scheme;
         style_state.reduced_motion = self.preferences.reduced_motion;
+        style_state.clock = page.runtime.now();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
         let mut layout = build_layout(&document, &stylesheet, viewport, &style_state);
         if let Some(base) = self.current_url.as_ref() {

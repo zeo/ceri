@@ -426,10 +426,14 @@ impl EngineHost {
                 handled: self.browser.blur()?,
                 ..InputResult::default()
             },
-            InputEvent::AdvanceTime(milliseconds) => InputResult {
-                tasks_run: self.browser.advance_time(milliseconds)?,
-                ..InputResult::default()
-            },
+            InputEvent::AdvanceTime(milliseconds) => {
+                let tasks_run = self.browser.advance_time(milliseconds)?;
+                InputResult {
+                    tasks_run,
+                    frame_requested: self.browser.has_active_animations(),
+                    ..InputResult::default()
+                }
+            }
         };
         self.pump_workers()?;
         self.dirty |= result.frame_requested || result.handled || result.tasks_run > 0;
