@@ -1,7 +1,7 @@
 use crate::css::{
     AlignItems, Color, Display, Edges, FlexDirection, FontWeight, Gradient, GridTemplate,
-    GridTrack, InheritedText, JustifyContent, Overflow, Position, Style, StyleContext, StyleState,
-    Stylesheet, TextAlign,
+    GridTrack, InheritedText, JustifyContent, Overflow, Position, PseudoElement, Style,
+    StyleContext, StyleState, Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::font::FontStack;
@@ -104,6 +104,8 @@ struct InlineLine {
     y: f32,
     used: f32,
     height: f32,
+    // whether the text appended so far ended on whitespace, which decides word joining
+    trailing_space: bool,
     fragments: Vec<InlineFragment>,
 }
 
@@ -124,6 +126,34 @@ struct ParentStyle {
     color: Color,
     weight: FontWeight,
     text: InheritedText,
+}
+
+// css generated content becomes a synthetic child that the normal cascade styles
+fn generated_child(
+    element: &Element,
+    path: &[usize],
+    ancestors: &[&Element],
+    stylesheet: &Stylesheet,
+    style_state: &StyleState,
+    pseudo: PseudoElement,
+) -> Option<Node> {
+    let mut candidate = Element::new(pseudo.tag());
+    let mut candidate_path = path.to_vec();
+    candidate_path.push(element.children.len());
+    let content = stylesheet.generated_content(StyleContext {
+        element: &candidate,
+        path: &candidate_path,
+        ancestors,
+        parent_font_size: 16.0,
+        parent_color: Color::BLACK,
+        parent_weight: FontWeight::Normal,
+        parent_text: InheritedText::default(),
+        state: style_state,
+    })?;
+    if !content.is_empty() {
+        candidate.children.push(Node::Text(content));
+    }
+    Some(Node::Element(candidate))
 }
 
 fn resolve_shadow(
@@ -937,8 +967,22 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let border = style.border_width.max(0.0);
     let horizontal_extras =
         margin.left + margin.right + padding.left + padding.right + (border * 2.0);
-    let explicit_height = style.height.resolve(containing_width, font_size);
     let inset = resolve_insets(style.inset, position_block, font_size);
+    // an out-of-flow box with both block insets set stretches between them
+    let explicit_height = style
+        .height
+        .resolve(containing_width, font_size)
+        .or_else(|| {
+            (mode != LayoutMode::Flow && inset.top.is_some() && inset.bottom.is_some()).then(|| {
+                (position_block.height
+                    - inset.top.unwrap_or(0.0)
+                    - inset.bottom.unwrap_or(0.0)
+                    - padding.top
+                    - padding.bottom
+                    - (border * 2.0))
+                    .max(0.0)
+            })
+        });
     let content_width = style
         .width
         .resolve(containing_width, font_size)
@@ -1035,6 +1079,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .unwrap_or(font_size * 1.25)
         .max(1.0);
     let mut line = InlineLine {
+        trailing_space: false,
         y: content_y,
         used: 0.0,
         height: line_height,
@@ -1100,7 +1145,31 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(element);
-    for (index, child) in element.children.iter().enumerate() {
+    let before = generated_child(
+        element,
+        &path,
+        &child_ancestors,
+        stylesheet,
+        style_state,
+        PseudoElement::Before,
+    );
+    let after = generated_child(
+        element,
+        &path,
+        &child_ancestors,
+        stylesheet,
+        style_state,
+        PseudoElement::After,
+    );
+    let mut sequence: Vec<(usize, &Node)> = Vec::with_capacity(element.children.len() + 2);
+    if let Some(node) = before.as_ref() {
+        sequence.push((element.children.len(), node));
+    }
+    sequence.extend(element.children.iter().enumerate());
+    if let Some(node) = after.as_ref() {
+        sequence.push((element.children.len() + 1, node));
+    }
+    for (index, child) in sequence {
         match child {
             Node::Text(value) if element.name != "textarea" => {
                 append_inline_text(value, inline_context, &mut text, &mut line)
@@ -2338,6 +2407,11 @@ fn append_inline_text(
         .letter_spacing
         .resolve(context.font_size, context.font_size)
         .unwrap_or(0.0);
+    let leading_space = transformed.chars().next().is_some_and(char::is_whitespace);
+    let trailing_space = transformed
+        .chars()
+        .next_back()
+        .is_some_and(char::is_whitespace);
     let mut first_word = true;
     for word in transformed.split_ascii_whitespace() {
         let bold = context.weight == FontWeight::Bold;
@@ -2348,7 +2422,8 @@ fn append_inline_text(
             bold,
             letter_spacing,
         );
-        let space_width = if first_word || line.fragments.is_empty() {
+        let joins_previous = !line.fragments.is_empty() && (line.trailing_space || leading_space);
+        let space_width = if line.fragments.is_empty() || (first_word && !joins_previous) {
             0.0
         } else {
             measure_text(
@@ -2370,7 +2445,7 @@ fn append_inline_text(
                 context.align,
             );
         }
-        let prefix = if line.fragments.is_empty() { "" } else { " " };
+        let prefix = if space_width > 0.0 { " " } else { "" };
         let text = format!("{prefix}{word}");
         let width = measure_text(
             &text,
@@ -2391,6 +2466,9 @@ fn append_inline_text(
             bold,
         });
         first_word = false;
+    }
+    if !transformed.trim().is_empty() || trailing_space {
+        line.trailing_space = trailing_space;
     }
 }
 
@@ -2681,6 +2759,51 @@ mod tests {
             columns[1]
         );
         assert_eq!(columns.iter().sum::<f32>(), 300.0);
+    }
+
+    #[test]
+    fn generated_content_becomes_boxes_and_joins_inline_text_without_extra_spaces() {
+        let document = Document::parse(
+            "<html><body><p class=\"tag\">bracketed</p><div class=\"rule\">bar</div><p>no<span>space</span>here</p></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "html, body, p, div { margin: 0 } .tag::before { content: \"[\" } .tag::after { content: \"]\" } .rule { position: relative; height: 40px } .rule::before { content: \"\"; position: absolute; inset: 0 auto 0 0; width: 4px; background: #00ff00 }",
+        )
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 200.0,
+            },
+        );
+        let runs = collect_text_runs(&layout.root);
+        let text = runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "[bracketed]barnospacehere");
+
+        let generated = find_box(&layout.root, "::before").expect("a generated box should exist");
+        assert_eq!(
+            (generated.rect.width, generated.rect.height),
+            (4.0, 40.0),
+            "an absolute generated box stretches between its insets"
+        );
+        assert_eq!(generated.background, Color::opaque(0, 255, 0));
+    }
+
+    fn find_box<'a>(layout_box: &'a LayoutBox, tag: &str) -> Option<&'a LayoutBox> {
+        if layout_box.tag == tag {
+            return Some(layout_box);
+        }
+        layout_box
+            .children
+            .iter()
+            .find_map(|child| find_box(child, tag))
     }
 
     fn collect_text_runs(box_: &LayoutBox) -> Vec<TextRun> {

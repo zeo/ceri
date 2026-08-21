@@ -645,6 +645,19 @@ pub struct Stylesheet {
 }
 
 impl Stylesheet {
+    fn has_generated_content(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.selectors.iter().any(|selector| {
+                selector
+                    .parts
+                    .last()
+                    .is_some_and(|part| part.compound.pseudo_element.is_some())
+            })
+        })
+    }
+}
+
+impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = strip_comments(source);
         let mut rules = Vec::new();
@@ -750,6 +763,37 @@ impl Stylesheet {
         }
     }
 
+    // the content string of a generated box, which is what decides whether it exists
+    pub(crate) fn generated_content(&self, context: StyleContext<'_>) -> Option<String> {
+        if !self.has_generated_content() {
+            return None;
+        }
+        let values = self.cascaded_values(
+            context.element,
+            context.path,
+            context.ancestors,
+            context.state,
+        );
+        let empty = BTreeMap::new();
+        let custom_properties =
+            inherited_custom_properties(context.state, context.path).unwrap_or(&empty);
+        let (_, _, raw) = values.get("content")?;
+        let resolved = resolve_custom_value(raw, custom_properties)?;
+        let resolved = resolved.trim();
+        if resolved.eq_ignore_ascii_case("none") || resolved.eq_ignore_ascii_case("normal") {
+            return None;
+        }
+        let quoted = resolved
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                resolved
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            })?;
+        Some(quoted.to_string())
+    }
+
     pub(crate) fn style_for(&self, context: StyleContext<'_>) -> Style {
         let StyleContext {
             element,
@@ -770,10 +814,8 @@ impl Stylesheet {
         );
         let values = self.cascaded_values(element, path, ancestors, state);
         let empty_properties = BTreeMap::new();
-        let custom_properties = state
-            .custom_properties
-            .get(path)
-            .unwrap_or(&empty_properties);
+        let custom_properties =
+            inherited_custom_properties(state, path).unwrap_or(&empty_properties);
         for (property, (_, _, value)) in values {
             if property.starts_with("--") {
                 continue;
@@ -936,6 +978,30 @@ struct CompoundSelector {
     classes: Vec<String>,
     attributes: Vec<AttributeSelector>,
     pseudo_classes: Vec<PseudoClass>,
+    pseudo_element: Option<PseudoElement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PseudoElement {
+    Before,
+    After,
+}
+
+impl PseudoElement {
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Before => "::before",
+            Self::After => "::after",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "::before" => Some(Self::Before),
+            "::after" => Some(Self::After),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1076,6 +1142,24 @@ impl Selector {
         let Some(last) = self.parts.last() else {
             return false;
         };
+        let generated = PseudoElement::from_tag(&element.name);
+        if last.compound.pseudo_element != generated {
+            return false;
+        }
+        if generated.is_some() {
+            // a generated box matches through the element that owns it
+            let Some((origin, ancestors)) = ancestors.split_last() else {
+                return false;
+            };
+            return self.matches_part(
+                self.parts.len() - 1,
+                &last.compound,
+                origin,
+                &path[..path.len().saturating_sub(1)],
+                ancestors,
+                state,
+            );
+        }
         self.matches_part(
             self.parts.len() - 1,
             &last.compound,
@@ -1214,7 +1298,9 @@ impl CompoundSelector {
         Specificity(
             u32::from(self.id.is_some()) + pseudo_specificity.0,
             (self.classes.len() + self.attributes.len()) as u32 + pseudo_specificity.1,
-            u32::from(self.tag.is_some()) + pseudo_specificity.2,
+            u32::from(self.tag.is_some())
+                + u32::from(self.pseudo_element.is_some())
+                + pseudo_specificity.2,
         )
     }
 }
@@ -1307,6 +1393,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
         classes: Vec::new(),
         attributes: Vec::new(),
         pseudo_classes: Vec::new(),
+        pseudo_element: None,
     };
     let start = *cursor;
     while *cursor < source.len() {
@@ -1321,7 +1408,25 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
             }
             b':' => {
                 *cursor += 1;
+                let double = *cursor < source.len() && source.as_bytes()[*cursor] == b':';
+                if double {
+                    *cursor += 1;
+                }
                 let name = parse_selector_name(source, cursor)?;
+                if let Some(element) = match name.as_str() {
+                    "before" => Some(PseudoElement::Before),
+                    "after" => Some(PseudoElement::After),
+                    _ => None,
+                } {
+                    if selector.pseudo_element.is_some() {
+                        return Err(format!("selector has two pseudo elements: {source}"));
+                    }
+                    selector.pseudo_element = Some(element);
+                    continue;
+                }
+                if double {
+                    return Err(format!("unsupported pseudo element: ::{name}"));
+                }
                 let pseudo = if name == "not" {
                     let argument = parse_function_argument(source, cursor)?;
                     PseudoClass::Not(Selector::parse_list(&argument)?)
@@ -2206,6 +2311,21 @@ fn parse_number(value: &str) -> Option<f32> {
     value.trim().parse().ok()
 }
 
+// a path without its own entry, such as a generated box, reads its ancestor's properties
+fn inherited_custom_properties<'a>(
+    state: &'a StyleState,
+    path: &[usize],
+) -> Option<&'a BTreeMap<String, String>> {
+    let mut candidate = path;
+    loop {
+        if let Some(properties) = state.custom_properties.get(candidate) {
+            return Some(properties);
+        }
+        let (_, parent) = candidate.split_last()?;
+        candidate = parent;
+    }
+}
+
 fn resolve_custom_value(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
     resolve_custom_value_inner(value, properties, &mut Vec::new())
 }
@@ -2812,7 +2932,7 @@ mod tests {
     #[test]
     fn recovering_parse_keeps_valid_rules_and_reports_the_rest() {
         let (stylesheet, dropped) = Stylesheet::parse_recovering(
-            r#"body::before { content: ""; } .card { color: red; } @keyframes signal { from { opacity: 0; } } p { color: } .last { color: blue; }"#,
+            r#"p::first-line { color: red; } .card { color: red; } @keyframes signal { from { opacity: 0; } } p { color: } .last { color: blue; }"#,
         );
         assert_eq!(stylesheet.rules.len(), 3);
         assert_eq!(
@@ -2824,10 +2944,11 @@ mod tests {
             vec![1, 0, 1]
         );
         assert_eq!(dropped.len(), 3);
-        assert!(dropped[0].starts_with("body::before"));
+        assert!(dropped[0].starts_with("p::first-line"));
         assert!(dropped[1].starts_with("unsupported at-rule: @keyframes"));
         assert!(dropped[2].contains("invalid declaration: color:"));
-        assert!(Stylesheet::parse("body::before { content: \"\"; }").is_err());
+        assert!(Stylesheet::parse("p::first-line { color: red; }").is_err());
+        assert!(Stylesheet::parse("body::before { content: \"\"; }").is_ok());
     }
 
     #[test]
