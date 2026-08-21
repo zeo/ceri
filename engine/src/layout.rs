@@ -2219,19 +2219,35 @@ fn apply_relative_offset(
     containing: ContainingBlock,
     font_size: f32,
 ) {
+    // a translation moves the visual subtree the same way a relative inset does
+    let translate = (
+        style
+            .translate
+            .0
+            .resolve(layout.rect.width, font_size)
+            .unwrap_or(0.0),
+        style
+            .translate
+            .1
+            .resolve(layout.rect.height, font_size)
+            .unwrap_or(0.0),
+    );
     if style.position != Position::Relative {
+        layout.visual_offset = translate;
         return;
     }
     let inset = resolve_insets(style.inset, containing, font_size);
     layout.visual_offset = (
-        inset
-            .left
-            .or_else(|| inset.right.map(|value| -value))
-            .unwrap_or(0.0),
-        inset
-            .top
-            .or_else(|| inset.bottom.map(|value| -value))
-            .unwrap_or(0.0),
+        translate.0
+            + inset
+                .left
+                .or_else(|| inset.right.map(|value| -value))
+                .unwrap_or(0.0),
+        translate.1
+            + inset
+                .top
+                .or_else(|| inset.bottom.map(|value| -value))
+                .unwrap_or(0.0),
     );
 }
 
@@ -2823,6 +2839,57 @@ mod tests {
             columns[1]
         );
         assert_eq!(columns.iter().sum::<f32>(), 300.0);
+    }
+
+    #[test]
+    fn a_translate_transform_moves_the_visual_subtree_without_moving_layout() {
+        let document =
+            Document::parse("<html><body><div id='card'><p>inside</p></div></body></html>")
+                .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "html, body, p { margin: 0 } #card { width: 100px; height: 40px; transform: translate(12px, -6px) }",
+        )
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        );
+        let card = find_box(&layout.root, "div").expect("the card should lay out");
+        assert_eq!(
+            (card.rect.x, card.rect.y),
+            (0.0, 0.0),
+            "flow geometry stays where layout put it"
+        );
+        assert_eq!(card.visual_offset, (12.0, -6.0));
+        // the hit lands inside the translated card, on its paragraph
+        assert_eq!(
+            layout.hit_test(20.0, 10.0).as_deref(),
+            Some([0, 0, 0, 0].as_slice())
+        );
+        assert_eq!(
+            layout.hit_test(5.0, 30.0).as_deref(),
+            Some([0, 0].as_slice()),
+            "the vacated area falls through to the parent box"
+        );
+
+        let percentage = Stylesheet::parse(
+            "html, body, p { margin: 0 } #card { width: 100px; height: 40px; transform: translateX(50%) }",
+        )
+        .expect("stylesheet should parse");
+        let shifted = crate::layout::layout(
+            &document,
+            &percentage,
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        );
+        let card = find_box(&shifted.root, "div").expect("the card should lay out");
+        assert_eq!(card.visual_offset, (50.0, 0.0));
     }
 
     #[test]

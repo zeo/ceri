@@ -561,6 +561,8 @@ pub(crate) struct Style {
     pub grid_template_columns: GridTemplate,
     pub grid_template_rows: GridTemplate,
     pub transitions: [Option<Transition>; MAX_TRANSITIONS],
+    // only translation is expressed today, which the visual offset model already carries
+    pub translate: (Length, Length),
     pub border_radius: Length,
     pub opacity: f32,
     pub gradient: Option<Gradient>,
@@ -604,6 +606,7 @@ impl Style {
             grid_template_columns: GridTemplate::empty(),
             grid_template_rows: GridTemplate::empty(),
             transitions: [None; MAX_TRANSITIONS],
+            translate: (Length::px(0.0), Length::px(0.0)),
             border_radius: Length::px(0.0),
             opacity: 1.0,
             gradient: None,
@@ -2053,6 +2056,58 @@ fn parse_keyframes(header: &str, body: &str) -> Option<Keyframes> {
     Some(Keyframes { name, stops })
 }
 
+// transform accepts translate functions, and rotation, scale and skew remain gates
+fn parse_translate(value: &str) -> Option<(Length, Length)> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some((Length::px(0.0), Length::px(0.0)));
+    }
+    let mut total = (Length::px(0.0), Length::px(0.0));
+    let mut seen = false;
+    let mut rest = value;
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open].trim().to_ascii_lowercase();
+        let close = rest[open..].find(')')? + open;
+        let arguments = &rest[open + 1..close];
+        let mut parts = arguments.split(',').map(str::trim);
+        let first = parts.next().filter(|part| !part.is_empty())?;
+        let second = parts.next();
+        if parts.next().is_some() {
+            return None;
+        }
+        let (x, y) = match name.as_str() {
+            "translate" => (Some(first), second),
+            "translatex" => (Some(first), None),
+            "translatey" => (None, Some(first)),
+            _ => return None,
+        };
+        if let Some(x) = x {
+            total.0 = add_lengths(total.0, parse_length(x)?)?;
+        }
+        if let Some(y) = y {
+            total.1 = add_lengths(total.1, parse_length(y)?)?;
+        }
+        seen = true;
+        rest = rest[close + 1..].trim();
+    }
+    seen.then_some(total)
+}
+
+fn add_lengths(left: Length, right: Length) -> Option<Length> {
+    match (left, right) {
+        (Length::Terms(left), Length::Terms(right)) => Some(Length::Terms(LengthTerms {
+            px: left.px + right.px,
+            em: left.em + right.em,
+            rem: left.rem + right.rem,
+            percent: left.percent + right.percent,
+            viewport_width: left.viewport_width + right.viewport_width,
+            viewport_height: left.viewport_height + right.viewport_height,
+            zero_width: left.zero_width + right.zero_width,
+        })),
+        _ => None,
+    }
+}
+
 // transition: <property> <duration> [timing] [delay], repeated for each comma separated entry
 fn parse_transitions(value: &str) -> [Option<Transition>; MAX_TRANSITIONS] {
     let mut transitions = [None; MAX_TRANSITIONS];
@@ -2467,6 +2522,11 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             if let Some(color) = Color::parse(value) {
                 style.gradient = None;
                 style.background = color;
+            }
+        }
+        "transform" => {
+            if let Some(translate) = parse_translate(value) {
+                style.translate = translate;
             }
         }
         "transition" => {
