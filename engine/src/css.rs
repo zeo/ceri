@@ -775,6 +775,7 @@ pub(crate) enum AnimatableProperty {
     BorderWidth,
     LetterSpacing,
     FontSize,
+    Transform,
 }
 
 impl AnimatableProperty {
@@ -790,6 +791,7 @@ impl AnimatableProperty {
             Self::BorderWidth => "border-width",
             Self::LetterSpacing => "letter-spacing",
             Self::FontSize => "font-size",
+            Self::Transform => "transform",
         }
     }
 
@@ -805,11 +807,12 @@ impl AnimatableProperty {
             "border-width" => Some(Self::BorderWidth),
             "letter-spacing" => Some(Self::LetterSpacing),
             "font-size" => Some(Self::FontSize),
+            "transform" => Some(Self::Transform),
             _ => None,
         }
     }
 
-    pub(crate) fn all() -> [Self; 10] {
+    pub(crate) fn all() -> [Self; 11] {
         [
             Self::Color,
             Self::BackgroundColor,
@@ -821,6 +824,7 @@ impl AnimatableProperty {
             Self::BorderWidth,
             Self::LetterSpacing,
             Self::FontSize,
+            Self::Transform,
         ]
     }
 }
@@ -1989,7 +1993,7 @@ fn declaration_pairs(declarations: &[Declaration]) -> Vec<(String, String)> {
         .collect()
 }
 
-// colors, numbers and single-unit lengths blend, anything else steps at the midpoint
+// colors, numbers, lengths and translate transforms blend, anything else steps at the midpoint
 fn interpolate_value(from: &str, to: &str, progress: f32) -> Option<String> {
     if let (Some(start), Some(end)) = (Color::parse(from), Color::parse(to)) {
         let mixed = start.mix(end, progress);
@@ -2007,7 +2011,20 @@ fn interpolate_value(from: &str, to: &str, progress: f32) -> Option<String> {
     {
         return Some(format!("{}{start_unit}", start + (end - start) * progress));
     }
+    if let (Some(start), Some(end)) = (
+        interpolate_translate_pair(from),
+        interpolate_translate_pair(to),
+    ) {
+        let x = start.0 + (end.0 - start.0) * progress;
+        let y = start.1 + (end.1 - start.1) * progress;
+        return Some(format!("translate({x}px, {y}px)"));
+    }
     Some(if progress < 0.5 { from } else { to }.to_string())
+}
+
+fn interpolate_translate_pair(value: &str) -> Option<(f32, f32)> {
+    let (x, y) = parse_translate(value)?;
+    Some((x.resolve(100.0, 16.0)?, y.resolve(100.0, 16.0)?))
 }
 
 fn parse_keyframes(header: &str, body: &str) -> Option<Keyframes> {
@@ -3345,6 +3362,96 @@ mod tests {
             },
         });
         assert_eq!(ended.width.resolve(0.0, 16.0), Some(20.0));
+    }
+
+    #[test]
+    fn animations_and_transitions_blend_translate_transforms() {
+        let stylesheet = Stylesheet::parse(
+            "@keyframes slide { from { transform: translateX(0px) } to { transform: translateX(80px) } } .bar { animation: slide 1000ms linear infinite; transform: translate(0px, 0px) }",
+        )
+        .expect("stylesheet should parse");
+        let mut bar = Element::new("div");
+        bar.attrs.insert("class".to_string(), "bar".to_string());
+        let translate_at = |clock: u64| {
+            stylesheet
+                .style_for(StyleContext {
+                    element: &bar,
+                    path: &[0],
+                    ancestors: &[],
+                    parent_font_size: 16.0,
+                    parent_color: Color::BLACK,
+                    parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
+                    state: &StyleState {
+                        clock,
+                        ..StyleState::default()
+                    },
+                })
+                .translate
+        };
+        assert_eq!(translate_at(250), (Length::px(20.0), Length::px(0.0)));
+        // a mixed-unit endpoint blends through the resolved pixel value
+        let stepped = Stylesheet::parse(
+            "@keyframes drift { from { transform: translate(10%, 0px) } to { transform: translate(30%, 4em) } } .bar { animation: drift 1000ms linear infinite }",
+        )
+        .expect("stylesheet should parse")
+        .style_for(StyleContext {
+            element: &bar,
+            path: &[0],
+            ancestors: &[],
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
+            state: &StyleState {
+                clock: 500,
+                ..StyleState::default()
+            },
+        });
+        let (x, y) = stepped.translate;
+        assert_eq!(x.resolve(200.0, 16.0), Some(20.0));
+        assert_eq!(y.resolve(200.0, 16.0), Some(32.0));
+
+        let transitioned = Stylesheet::parse(
+            ".card { transform: translate(0px, 0px); transition: transform 400ms linear } .card.lift { transform: translateY(-24px) }",
+        )
+        .expect("stylesheet should parse");
+        let mut card = Element::new("div");
+        card.attrs.insert("class".to_string(), "card".to_string());
+        card.attrs.insert("id".to_string(), "hero".to_string());
+        let mut style_at = |clock: u64, lifted: bool| {
+            if lifted {
+                card.attrs
+                    .insert("class".to_string(), "card lift".to_string());
+            } else {
+                card.attrs.insert("class".to_string(), "card".to_string());
+            }
+            transitioned.style_for(StyleContext {
+                element: &card,
+                path: &[0],
+                ancestors: &[],
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::Normal,
+                parent_text: InheritedText::default(),
+                state: &StyleState {
+                    clock,
+                    transitions: BTreeMap::from([(
+                        (vec![0], AnimatableProperty::Transform),
+                        TransitionState {
+                            from: "translate(0px, 0px)".to_string(),
+                            to: "translateY(-24px)".to_string(),
+                            started: 0,
+                            finishes: 400,
+                        },
+                    )]),
+                    ..StyleState::default()
+                },
+            })
+        };
+        let (x, y) = style_at(100, true).translate;
+        assert_eq!(x.resolve(100.0, 16.0), Some(0.0));
+        assert_eq!(y.resolve(100.0, 16.0), Some(-6.0));
     }
 
     #[test]
