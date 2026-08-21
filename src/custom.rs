@@ -3,8 +3,9 @@ use crate::desktop::{DesktopClipboard, DesktopFilePicker};
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
-    AppUrl, Browser, EngineHost, FontSet, HostRuntimeInfo, NavigationError, Resource,
-    ResourceBundle, ResourceProvider, Size, WindowConfig, mime_type_for, run_window,
+    AppUrl, Browser, EngineHost, ExternalRequest, FontSet, HostRuntimeInfo, NavigationError,
+    Resource, ResourceBundle, ResourceProvider, ResourceResponse, Size, WindowConfig,
+    mime_type_for, run_window,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
+const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 
 pub fn run() -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
@@ -21,6 +23,7 @@ pub fn run() -> Result<(), String> {
         launch::switch_value(arguments.clone(), ENTRY_SWITCH),
     )?;
     let storage = launch::profile_path().map(|profile| profile.join("storage"))?;
+    let allowed = allowed_origins(&arguments)?;
     let assets = launch.assets.clone();
     let config = WindowConfig {
         title: "Ceri".to_string(),
@@ -28,9 +31,9 @@ pub fn run() -> Result<(), String> {
         ..WindowConfig::default()
     };
     if let Some(path) = launch::switch_value(arguments, SCREENSHOT_SWITCH) {
-        return capture(&config, PathBuf::from(path), assets, storage);
+        return capture(&config, PathBuf::from(path), assets, storage, allowed);
     }
-    run_window(config, move || build_browser(assets, storage))
+    run_window(config, move || build_browser(assets, storage, allowed))
 }
 
 // renders one frame without opening a window, for smoke checks and release shots
@@ -39,9 +42,10 @@ fn capture(
     output: PathBuf,
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
+    allowed: Vec<String>,
 ) -> Result<(), String> {
     let mut host = EngineHost::new(
-        build_browser(assets, storage)?,
+        build_browser(assets, storage, allowed)?,
         Size {
             width: config.width as f32,
             height: config.height as f32,
@@ -71,12 +75,19 @@ fn capture(
     Ok(())
 }
 
-fn build_browser(assets: Arc<AssetOrigin>, storage: PathBuf) -> Result<Browser, String> {
+fn build_browser(
+    assets: Arc<AssetOrigin>,
+    storage: PathBuf,
+    allowed_origins: Vec<String>,
+) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
         .map_err(|error| format!("could not create {}: {error}", storage.display()))?;
     let browser = Browser::with_resource_provider(
         ResourceBundle::default(),
-        Rc::new(PackagedAssets { assets }),
+        Rc::new(PackagedAssets {
+            assets,
+            allowed_origins,
+        }),
     )
     .with_storage_directory(&storage)
     .map_err(|error| {
@@ -118,9 +129,41 @@ fn session_id() -> String {
     format!("{seconds:x}-{:x}", std::process::id())
 }
 
+// the app may only reach origins the operator listed on the command line
+fn allowed_origins(arguments: &[std::ffi::OsString]) -> Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    let mut remaining: Vec<std::ffi::OsString> = arguments.to_vec();
+    while let Some(value) = launch::switch_value(remaining.clone(), ALLOW_ORIGIN_SWITCH) {
+        let origin = ceri_engine::external_url(&value)
+            .map_err(|error| format!("--{ALLOW_ORIGIN_SWITCH} {value} is not usable: {error}"))?;
+        let origin = origin.trim_end_matches('/').to_string();
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+        let flag = format!("--{ALLOW_ORIGIN_SWITCH}");
+        let inline = format!("{flag}={value}");
+        let position = remaining.iter().position(|argument| {
+            let argument = argument.to_string_lossy();
+            argument == inline || argument == flag
+        });
+        match position {
+            Some(index) => {
+                let inline_form = remaining[index].to_string_lossy().contains('=');
+                remaining.remove(index);
+                if !inline_form && index < remaining.len() {
+                    remaining.remove(index);
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(origins)
+}
+
 // serves the packaged app through the same origin policy the CEF scheme handler uses
 struct PackagedAssets {
     assets: Arc<AssetOrigin>,
+    allowed_origins: Vec<String>,
 }
 
 impl ResourceProvider for PackagedAssets {
@@ -153,6 +196,20 @@ impl ResourceProvider for PackagedAssets {
         })?;
         Ok(Some(Resource::new(mime_type_for(&asset.path), body)))
     }
+
+    fn provide_external(
+        &self,
+        request: &ExternalRequest,
+    ) -> Result<Option<ResourceResponse>, NavigationError> {
+        if !self
+            .allowed_origins
+            .iter()
+            .any(|origin| origin.eq_ignore_ascii_case(request.origin()))
+        {
+            return Ok(None);
+        }
+        ceri_engine::request_external(request).map(Some)
+    }
 }
 
 fn is_document_path(path: &str) -> bool {
@@ -162,9 +219,11 @@ fn is_document_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackagedAssets, is_document_path};
+    use super::{PackagedAssets, allowed_origins, is_document_path};
     use crate::assets::AssetOrigin;
-    use ceri_engine::{AppUrl, ResourceProvider};
+    use ceri_engine::{AppUrl, ExternalRequest, ResourceProvider};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::sync::Arc;
 
     #[test]
@@ -183,6 +242,7 @@ mod tests {
             .join("web");
         let provider = PackagedAssets {
             assets: Arc::new(AssetOrigin::new(&root).expect("web root should exist")),
+            allowed_origins: Vec::new(),
         };
 
         let index = provider
@@ -197,6 +257,60 @@ mod tests {
                 .provide(&AppUrl::parse("https://app.ceri.invalid/missing.js").expect("url"))
                 .expect("missing subresources should not fail")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn external_fetches_need_an_allowed_origin() {
+        let root = std::env::current_dir()
+            .expect("working directory should resolve")
+            .join("web");
+        let provider = PackagedAssets {
+            assets: Arc::new(AssetOrigin::new(&root).expect("web root should exist")),
+            allowed_origins: vec!["https://api.example.test".to_string()],
+        };
+        let refused = ExternalRequest::new(
+            "https://other.example.test/data",
+            "GET",
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("request should build");
+        assert!(
+            provider
+                .provide_external(&refused)
+                .expect("a refusal is not an error")
+                .is_none()
+        );
+        let allowed = ExternalRequest::new(
+            "https://api.example.test/data",
+            "GET",
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("request should build");
+        assert_eq!(allowed.origin(), "https://api.example.test");
+    }
+
+    #[test]
+    fn reads_repeated_allow_origin_switches() {
+        let arguments: Vec<OsString> = [
+            "--ceri-allow-origin=https://api.example.test",
+            "--ceri-allow-origin",
+            "https://cdn.example.test",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            allowed_origins(&arguments).expect("origins should parse"),
+            vec![
+                "https://api.example.test".to_string(),
+                "https://cdn.example.test".to_string()
+            ]
+        );
+        assert!(
+            allowed_origins(&[OsString::from("--ceri-allow-origin=http://insecure.test")]).is_err()
         );
     }
 }

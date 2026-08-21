@@ -307,8 +307,98 @@ impl ResourceRequest {
     }
 }
 
+// a fetch outside the app origin, which the host allows or refuses on its own policy
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalRequest {
+    url: String,
+    method: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl ExternalRequest {
+    pub fn new(
+        url: impl Into<String>,
+        method: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<Self, NavigationError> {
+        let url = external_url(&url.into())?;
+        let method = method.into().trim().to_ascii_uppercase();
+        if method.is_empty() || !method.bytes().all(is_http_token_byte) {
+            return Err(NavigationError::InvalidRequestMethod(method));
+        }
+        let body = body.into();
+        if matches!(method.as_str(), "GET" | "HEAD") && !body.is_empty() {
+            return Err(NavigationError::RequestBodyNotAllowed(method));
+        }
+        Ok(Self {
+            url,
+            method,
+            headers: normalize_headers(headers)?,
+            body,
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn origin(&self) -> &str {
+        let after_scheme = &self.url["https://".len()..];
+        let authority = after_scheme
+            .split_once('/')
+            .map_or(after_scheme, |(authority, _)| authority);
+        &self.url[..("https://".len() + authority.len())]
+    }
+
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+// only absolute https targets without credentials or fragments can leave the app origin
+pub fn external_url(reference: &str) -> Result<String, NavigationError> {
+    let reference = reference.trim();
+    let Some(rest) = reference.strip_prefix("https://") else {
+        if reference.starts_with("http://") {
+            return Err(NavigationError::InsecureScheme);
+        }
+        return Err(NavigationError::InvalidUrl(reference.to_string()));
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains('@')
+        || reference.contains('#')
+        || reference.contains('\0')
+        || reference.chars().any(char::is_whitespace)
+    {
+        return Err(NavigationError::InvalidUrl(reference.to_string()));
+    }
+    if authority.eq_ignore_ascii_case(APP_ORIGIN.trim_start_matches("https://")) {
+        return Err(NavigationError::WrongOrigin);
+    }
+    Ok(reference.to_string())
+}
+
 pub trait ResourceProvider {
     fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError>;
+
+    // the default refuses, so an embedder opts into outside network access explicitly
+    fn provide_external(
+        &self,
+        _request: &ExternalRequest,
+    ) -> Result<Option<ResourceResponse>, NavigationError> {
+        Ok(None)
+    }
 
     fn provide_request(
         &self,
@@ -2796,6 +2886,94 @@ mod tests {
         assert_eq!(
             url.to_string(),
             "https://app.ceri.invalid/docs/intro.html?q=rust#top"
+        );
+    }
+
+    #[test]
+    fn external_requests_leave_the_app_origin_only_when_the_host_allows_them() {
+        use std::collections::BTreeMap;
+
+        struct SingleOrigin;
+
+        impl ResourceProvider for SingleOrigin {
+            fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+                Ok(None)
+            }
+
+            fn provide_external(
+                &self,
+                request: &ExternalRequest,
+            ) -> Result<Option<ResourceResponse>, NavigationError> {
+                if request.origin() != "https://api.example.test" {
+                    return Ok(None);
+                }
+                ResourceResponse::new(
+                    200,
+                    "application/json",
+                    BTreeMap::new(),
+                    br#"{"ok":true}"#.to_vec(),
+                )
+                .map(Some)
+            }
+        }
+
+        assert_eq!(
+            external_url("https://api.example.test/v1/items?page=2")
+                .expect("an https target should be accepted"),
+            "https://api.example.test/v1/items?page=2"
+        );
+        assert!(matches!(
+            external_url("http://api.example.test"),
+            Err(NavigationError::InsecureScheme)
+        ));
+        assert!(matches!(
+            external_url("https://app.ceri.invalid/data"),
+            Err(NavigationError::WrongOrigin)
+        ));
+        assert!(external_url("https://user:pass@api.example.test").is_err());
+        assert!(external_url("https://api.example.test/#fragment").is_err());
+
+        let request = ExternalRequest::new(
+            "https://api.example.test/v1/items",
+            "post",
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            b"{}".to_vec(),
+        )
+        .expect("a post request should build");
+        assert_eq!(request.method(), "POST");
+        assert_eq!(request.origin(), "https://api.example.test");
+        let response = SingleOrigin
+            .provide_external(&request)
+            .expect("the allowed origin should answer")
+            .expect("a response should exist");
+        assert_eq!(response.status(), 200);
+
+        let refused = ExternalRequest::new(
+            "https://other.example.test/v1",
+            "GET",
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("a get request should build");
+        assert!(
+            SingleOrigin
+                .provide_external(&refused)
+                .expect("a refusal is not an error")
+                .is_none()
+        );
+
+        // the default provider refuses every outside origin
+        struct PackagedOnly;
+        impl ResourceProvider for PackagedOnly {
+            fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+                Ok(None)
+            }
+        }
+        assert!(
+            PackagedOnly
+                .provide_external(&request)
+                .expect("the default refusal is not an error")
+                .is_none()
         );
     }
 

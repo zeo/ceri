@@ -25,12 +25,12 @@ pub use host::{
 };
 pub use layout::{LayoutDocument, Rect, Size, layout};
 #[cfg(feature = "native-http")]
-pub use native_http::NativeHttpProvider;
+pub use native_http::{NativeHttpProvider, request_external};
 pub use navigation::{
-    APP_ORIGIN, AppUrl, Browser, ClipboardProvider, FilePicker, FilePickerRequest, FileSelection,
-    NavigationError, NavigationFailure, NavigationStatus, Resource, ResourceBundle,
+    APP_ORIGIN, AppUrl, Browser, ClipboardProvider, ExternalRequest, FilePicker, FilePickerRequest,
+    FileSelection, NavigationError, NavigationFailure, NavigationStatus, Resource, ResourceBundle,
     ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse, UserPreferences,
-    mime_type_for,
+    external_url, mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};

@@ -13,6 +13,7 @@ The Rust-native engine is no longer only a laboratory. The runtime's `custom-eng
 CEF stays the default engine anyway, and the reason is compatibility rather than architecture. The gates below are still open, and an app that needs any of them would regress on the Rust-native engine:
 
 - media playback, WebGL and other GPU APIs
+- cross-origin policy beyond an operator allowlist, so there is no CORS preflight, no cookie jar and no credential mode
 - CSS transitions and transforms, and animation of properties beyond colors, numbers and single-unit lengths
 - generated content inside flex and grid containers, which only the block path builds today
 - full WebAssembly beyond the bounded i32 module path

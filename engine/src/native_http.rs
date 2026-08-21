@@ -91,6 +91,55 @@ impl NativeHttpProvider {
     }
 }
 
+// a single bounded https call for hosts that mediate outside requests themselves
+pub fn request_external(
+    request: &crate::navigation::ExternalRequest,
+) -> Result<ResourceResponse, NavigationError> {
+    let agent = Agent::config_builder()
+        .https_only(true)
+        .http_status_as_error(false)
+        .max_redirects(4)
+        .timeout_global(Some(DEFAULT_TIMEOUT))
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
+        .new_agent();
+    let mut builder = Request::builder()
+        .method(request.method())
+        .uri(request.url());
+    for (name, value) in request.headers() {
+        builder = builder.header(name, value);
+    }
+    let outgoing = builder.body(request.body().to_vec()).map_err(|error| {
+        NavigationError::ResourceProvider(format!("could not build HTTP request: {error}"))
+    })?;
+    let mut response = agent
+        .run(outgoing)
+        .map_err(|error| NavigationError::ResourceProvider(error.to_string()))?;
+    let status = response.status().as_u16();
+    let mut headers = BTreeMap::new();
+    for (name, value) in response.headers() {
+        if let Ok(value) = value.to_str() {
+            headers.insert(name.as_str().to_string(), value.to_string());
+        }
+    }
+    let mime_type = headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let body = response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|error| NavigationError::ResourceProvider(error.to_string()))?;
+    ResourceResponse::new(status, mime_type, headers, body)
+}
+
 impl ResourceProvider for NativeHttpProvider {
     fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
         let response = self.request_response(&ResourceRequest::get(url.clone()))?;

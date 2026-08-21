@@ -12194,6 +12194,7 @@ impl ScriptRuntime {
             .cloned()
             .unwrap_or(Value::Undefined)
             .resolve();
+        let mut external = None;
         let (url, request_input) = match input {
             Value::Request(request) => (request.url.clone(), Some(request)),
             input => {
@@ -12201,10 +12202,19 @@ impl ScriptRuntime {
                 let Some(base_url) = &self.base_url else {
                     return self.rejected_promise("fetch is unavailable without a document URL");
                 };
-                let Ok(url) = base_url.resolve(&reference) else {
-                    return self.rejected_promise(format!("fetch rejected URL {reference}"));
-                };
-                (url, None)
+                match base_url.resolve(&reference) {
+                    Ok(url) => (url, None),
+                    Err(_) => match crate::navigation::external_url(&reference) {
+                        Ok(target) => {
+                            external = Some(target);
+                            (base_url.clone(), None)
+                        }
+                        Err(_) => {
+                            return self
+                                .rejected_promise(format!("fetch rejected URL {reference}"));
+                        }
+                    },
+                }
             }
         };
         let options = match parse_fetch_options(arguments.get(1), request_input.as_ref()) {
@@ -12236,6 +12246,9 @@ impl ScriptRuntime {
             Ok(request) => request.with_cache_mode(options.cache_mode),
             Err(error) => return self.rejected_promise(error.to_string()),
         };
+        if let Some(target) = external {
+            return self.fetch_external(target, &request);
+        }
         if self.resources.is_none() && self.resource_provider.is_none() {
             return self.rejected_promise("fetch is unavailable without a resource bundle");
         }
@@ -12275,6 +12288,42 @@ impl ScriptRuntime {
                 response_type: "basic".to_string(),
             },
         ))))
+    }
+
+    // outside origins reach the network only when the host provider allows them
+    fn fetch_external(&self, target: String, request: &ResourceRequest) -> PromiseHandle {
+        let Some(provider) = self.resource_provider.as_deref() else {
+            return self
+                .rejected_promise(format!("fetch to {target} needs a host resource provider"));
+        };
+        let external = match crate::navigation::ExternalRequest::new(
+            target.clone(),
+            request.method(),
+            request.headers().clone(),
+            request.body().to_vec(),
+        ) {
+            Ok(external) => external,
+            Err(error) => return self.rejected_promise(error.to_string()),
+        };
+        match provider.provide_external(&external) {
+            Ok(Some(response)) => self.fulfilled_promise(Value::Response(Rc::new(response_data(
+                target,
+                response.status(),
+                String::new(),
+                response.mime_type().to_string(),
+                headers_handle(response.headers().clone(), false),
+                response.body().to_vec(),
+                ResponseMetadata {
+                    redirected: false,
+                    response_type: "cors".to_string(),
+                },
+            )))),
+            Ok(None) => self.rejected_promise(format!(
+                "the host does not permit fetching {}",
+                external.origin()
+            )),
+            Err(error) => self.rejected_promise(error.to_string()),
+        }
     }
 
     fn cache_storage_open(
@@ -25496,6 +25545,77 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("true|response body is already used")
+        );
+    }
+
+    #[test]
+    fn fetch_reaches_an_outside_origin_through_the_host_provider() {
+        struct OneOrigin;
+
+        impl crate::navigation::ResourceProvider for OneOrigin {
+            fn provide(
+                &self,
+                _url: &AppUrl,
+            ) -> Result<Option<crate::navigation::Resource>, crate::navigation::NavigationError>
+            {
+                Ok(None)
+            }
+
+            fn provide_external(
+                &self,
+                request: &crate::navigation::ExternalRequest,
+            ) -> Result<
+                Option<crate::navigation::ResourceResponse>,
+                crate::navigation::NavigationError,
+            > {
+                if request.origin() != "https://api.example.test" {
+                    return Ok(None);
+                }
+                crate::navigation::ResourceResponse::new(
+                    200,
+                    "application/json",
+                    BTreeMap::new(),
+                    format!(r#"{{"method":"{}"}}"#, request.method()).into_bytes(),
+                )
+                .map(Some)
+            }
+        }
+
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_resources_and_storage_and_runtime_info(
+            document.clone(),
+            ResourceBundle::default(),
+            Some(Rc::new(OneOrigin)),
+            base,
+            Rc::new(RefCell::new(StorageData::new())),
+            Rc::new(RefCell::new(StorageData::new())),
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                fetch("https://api.example.test/v1/items", { method: "POST", body: "{}" })
+                    .then((response) => response.json())
+                    .then((data) => {
+                        return fetch("https://blocked.example.test/v1")
+                            .then(() => data.method + "|reached")
+                            .catch(() => data.method + "|refused");
+                    })
+                    .then((outcome) => {
+                        status.textContent = outcome;
+                    });
+                "#,
+            )
+            .expect("external fetch should resolve through the provider");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("POST|refused")
         );
     }
 

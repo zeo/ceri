@@ -82,7 +82,15 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 [engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex and basic grid layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, a bounded JavaScript runtime with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
 
-Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket.
+Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket. On Windows the runtime backs the clipboard and file input with the platform clipboard and file dialog.
+
+A page can fetch outside its own origin only through origins the operator lists, and only over HTTPS with platform certificate verification:
+
+```powershell
+ceri.exe --ceri-allow-origin=https://api.example.com
+```
+
+Every other origin is refused with a typed rejection the page can catch, and navigation stays on the app origin regardless.
 
 The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, and CSS animations driven from the page clock with linear, ease and stepped timing.
 
