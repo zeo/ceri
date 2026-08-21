@@ -2743,6 +2743,59 @@ impl ScriptRuntime {
         self.focus_path(next)
     }
 
+    // select all, copy, cut and paste inside a text control, through the host clipboard
+    fn run_editing_shortcut(
+        &mut self,
+        path: &NodePath,
+        shortcut: &str,
+    ) -> Result<bool, ScriptError> {
+        let value = self.control_value_path(path).unwrap_or_default();
+        let units = value.encode_utf16().collect::<Vec<_>>();
+        let selection = self.selection_for_path(path, &value);
+        if shortcut == "a" {
+            return self.set_text_selection(
+                path.clone(),
+                0,
+                units.len(),
+                SelectionDirection::Forward,
+            );
+        }
+        let Some(clipboard) = self.clipboard_provider.clone() else {
+            return Ok(false);
+        };
+        if shortcut == "v" {
+            if self.is_readonly_path(path) {
+                return Ok(false);
+            }
+            let text = clipboard
+                .read_text()
+                .map_err(|error| runtime_error(format!("clipboard read failed: {error}")))?;
+            let text = text.replace(['\r', '\n'], " ");
+            return self.insert_text(&text);
+        }
+        let selected = String::from_utf16_lossy(&units[selection.start..selection.end]);
+        if selected.is_empty() {
+            return Ok(false);
+        }
+        clipboard
+            .write_text(&selected)
+            .map_err(|error| runtime_error(format!("clipboard write failed: {error}")))?;
+        if shortcut == "c" || self.is_readonly_path(path) {
+            return Ok(true);
+        }
+        self.insert_text("\u{8}")?;
+        let value = self.control_value_path(path).unwrap_or_default();
+        let mut remaining = value.encode_utf16().collect::<Vec<_>>();
+        // the backspace path leaves the cut range removed, so drop the sentinel it inserted
+        if remaining.last() == Some(&8) {
+            remaining.pop();
+        }
+        let cleaned: Vec<u16> = remaining.into_iter().filter(|unit| *unit != 8).collect();
+        self.control_values
+            .insert(path.clone(), String::from_utf16_lossy(&cleaned));
+        Ok(true)
+    }
+
     pub(crate) fn insert_text(&mut self, text: &str) -> Result<bool, ScriptError> {
         if self.composition.is_some() {
             return self.composition_commit(text);
@@ -3003,6 +3056,13 @@ impl ScriptRuntime {
         if dispatch.default_prevented || !self.is_text_control_path(&path) {
             return Ok(dispatch.handled);
         }
+        if (modifiers.control || modifiers.meta) && !modifiers.alt {
+            let shortcut = key.to_ascii_lowercase();
+            if matches!(shortcut.as_str(), "a" | "c" | "x" | "v") {
+                let handled = self.run_editing_shortcut(&path, &shortcut)?;
+                return Ok(dispatch.handled || handled);
+            }
+        }
         let value = self.control_value_path(&path).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
         let selection = self.selection_for_path(&path, &value);
@@ -3184,6 +3244,42 @@ impl ScriptRuntime {
 
     pub(crate) fn scroll_offset(&self, path: &[usize]) -> (f32, f32) {
         self.scroll_offsets.get(path).copied().unwrap_or_default()
+    }
+
+    // a pointer press or drag inside a text control moves or extends its selection
+    pub(crate) fn select_control_offset(
+        &mut self,
+        path: NodePath,
+        offset: usize,
+        extend: bool,
+    ) -> Result<bool, ScriptError> {
+        if !self.is_selection_control_path(&path) {
+            return Ok(false);
+        }
+        let focused = self.focus_path(path.clone())?;
+        let value = self.control_value_path(&path).unwrap_or_default();
+        let length = utf16_len(&value);
+        let offset = offset.min(length);
+        let (start, end, direction) = if extend {
+            let current = self.selection_for_path(&path, &value);
+            let anchor = match current.direction {
+                SelectionDirection::Backward => current.end,
+                _ => current.start,
+            };
+            if offset < anchor {
+                (offset, anchor, SelectionDirection::Backward)
+            } else {
+                (anchor, offset, SelectionDirection::Forward)
+            }
+        } else {
+            (offset, offset, SelectionDirection::None)
+        };
+        let moved = self.set_text_selection(path, start, end, direction)?;
+        Ok(focused || moved)
+    }
+
+    pub(crate) fn control_value(&self, path: &[usize]) -> Option<String> {
+        self.control_value_path(path)
     }
 
     pub(crate) fn set_viewport_metrics(&mut self, viewport: ViewportMetrics) {

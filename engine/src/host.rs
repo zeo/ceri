@@ -86,6 +86,7 @@ pub struct EngineHost {
     browser: Browser,
     viewport: Size,
     scale: f32,
+    selecting: bool,
     next_frame: u64,
     dirty: bool,
 }
@@ -281,6 +282,7 @@ impl EngineHost {
             browser,
             viewport,
             scale,
+            selecting: false,
             next_frame: 1,
             dirty: true,
         }
@@ -363,22 +365,40 @@ impl EngineHost {
                     ..InputResult::default()
                 }
             }
-            InputEvent::PointerMove { x, y } => InputResult {
-                handled: self
+            InputEvent::PointerMove { x, y } => {
+                let dispatched = self
                     .browser
-                    .dispatch_at(self.viewport, x, y, "pointermove")?,
-                ..InputResult::default()
-            },
-            InputEvent::PointerDown { x, y, button: _ } => InputResult {
-                handled: self
+                    .dispatch_at(self.viewport, x, y, "pointermove")?;
+                let extended =
+                    self.selecting && self.browser.select_at(self.viewport, x, y, true)?;
+                InputResult {
+                    handled: dispatched || extended,
+                    frame_requested: extended,
+                    ..InputResult::default()
+                }
+            }
+            InputEvent::PointerDown { x, y, button } => {
+                let dispatched = self
                     .browser
-                    .dispatch_at(self.viewport, x, y, "pointerdown")?,
-                ..InputResult::default()
-            },
-            InputEvent::PointerUp { x, y, button: _ } => InputResult {
-                handled: self.browser.dispatch_at(self.viewport, x, y, "pointerup")?,
-                ..InputResult::default()
-            },
+                    .dispatch_at(self.viewport, x, y, "pointerdown")?;
+                let selected = button == PointerButton::Primary
+                    && self.browser.select_at(self.viewport, x, y, false)?;
+                self.selecting = selected;
+                InputResult {
+                    handled: dispatched || selected,
+                    frame_requested: selected,
+                    ..InputResult::default()
+                }
+            }
+            InputEvent::PointerUp { x, y, button } => {
+                if button == PointerButton::Primary {
+                    self.selecting = false;
+                }
+                InputResult {
+                    handled: self.browser.dispatch_at(self.viewport, x, y, "pointerup")?,
+                    ..InputResult::default()
+                }
+            }
             InputEvent::Click { x, y } => InputResult {
                 handled: self.browser.click_at(self.viewport, x, y)?,
                 ..InputResult::default()
@@ -911,6 +931,108 @@ mod tests {
                 .element_text_content(&status)
                 .as_deref(),
             Some("down up click")
+        );
+    }
+
+    #[test]
+    fn pointer_drag_selects_control_text_and_the_clipboard_shortcuts_edit_it() {
+        use crate::navigation::ClipboardProvider;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct RecordingClipboard {
+            text: RefCell<String>,
+        }
+
+        impl ClipboardProvider for RecordingClipboard {
+            fn read_text(&self) -> Result<String, NavigationError> {
+                Ok(self.text.borrow().clone())
+            }
+
+            fn write_text(&self, text: &str) -> Result<(), NavigationError> {
+                *self.text.borrow_mut() = text.to_string();
+                Ok(())
+            }
+        }
+
+        let clipboard = Rc::new(RecordingClipboard::default());
+        let browser = Browser::new(bundle(
+            "<input id='name' value='hello world' style='width: 300px; margin: 0'>",
+        ))
+        .with_clipboard_provider(clipboard.clone());
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 60.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+
+        // a press near the start puts the caret at the beginning
+        assert!(
+            host.input(InputEvent::PointerDown {
+                x: 3.0,
+                y: 10.0,
+                button: PointerButton::Primary,
+            })
+            .expect("pointer down should be accepted")
+            .handled
+        );
+        // dragging to the right edge extends the selection to the end of the value
+        assert!(
+            host.input(InputEvent::PointerMove { x: 290.0, y: 10.0 })
+                .expect("pointer move should be accepted")
+                .handled
+        );
+        host.input(InputEvent::PointerUp {
+            x: 290.0,
+            y: 10.0,
+            button: PointerButton::Primary,
+        })
+        .expect("pointer up should be accepted");
+
+        let copy = InputEvent::KeyDownWithModifiers {
+            key: "c".to_string(),
+            modifiers: KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        };
+        assert!(host.input(copy).expect("copy should be handled").handled);
+        assert_eq!(clipboard.text.borrow().as_str(), "hello world");
+
+        let cut = InputEvent::KeyDownWithModifiers {
+            key: "x".to_string(),
+            modifiers: KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        };
+        assert!(host.input(cut).expect("cut should be handled").handled);
+        let document = host.browser().document().expect("document should exist");
+        let path = document
+            .borrow()
+            .find_element_by_id("name")
+            .expect("input should exist");
+        assert_eq!(
+            host.browser().control_value(&path).as_deref(),
+            Some(""),
+            "cutting the selection empties the control"
+        );
+
+        let paste = InputEvent::KeyDownWithModifiers {
+            key: "v".to_string(),
+            modifiers: KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        };
+        assert!(host.input(paste).expect("paste should be handled").handled);
+        assert_eq!(
+            host.browser().control_value(&path).as_deref(),
+            Some("hello world")
         );
     }
 

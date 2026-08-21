@@ -94,4 +94,6 @@ Every other origin is refused with a typed rejection the page can catch, and nav
 
 The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, and CSS animations driven from the page clock with linear, ease and stepped timing.
 
-What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS transitions and transforms, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
+
+What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS transitions and transforms, selection of prose outside form fields, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.

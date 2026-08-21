@@ -466,6 +466,70 @@ pub fn layout_with_state(
 }
 
 impl LayoutDocument {
+    // maps a point inside a text control to a UTF-16 offset in its value
+    pub fn control_text_offset_at(&self, x: f32, y: f32) -> Option<(NodePath, usize)> {
+        let mut found = None;
+        collect_control_at(&self.root, x, y, (0.0, 0.0), &mut found);
+        let (path, runs, origin) = found?;
+        let mut offset = 0;
+        let mut line = None;
+        for run in &runs {
+            let top = run.y + origin.1;
+            let bottom = top + run.font_size.max(1.0);
+            if y >= top && y < bottom {
+                line = Some((offset, run.clone()));
+                break;
+            }
+            offset += run.text.encode_utf16().count();
+        }
+        let (base, run) = line.or_else(|| {
+            let last = runs.last()?;
+            let base = runs[..runs.len() - 1]
+                .iter()
+                .map(|run| run.text.encode_utf16().count())
+                .sum();
+            Some((base, last.clone()))
+        })?;
+        Some((path, base + offset_within_run(&run, x - origin.0)))
+    }
+}
+
+fn offset_within_run(run: &TextRun, x: f32) -> usize {
+    let fonts = crate::font::active_fonts();
+    let mut offset = 0;
+    let mut pen = run.x;
+    for character in run.text.chars() {
+        let advance =
+            fonts.advance(character, run.font_stack, run.font_size, run.bold) + run.letter_spacing;
+        if x < pen + advance / 2.0 {
+            return offset;
+        }
+        pen += advance;
+        offset += character.len_utf16();
+    }
+    offset
+}
+
+#[allow(clippy::type_complexity)]
+fn collect_control_at(
+    layout_box: &LayoutBox,
+    x: f32,
+    y: f32,
+    ancestor_offset: (f32, f32),
+    found: &mut Option<(NodePath, Vec<TextRun>, (f32, f32))>,
+) {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    let inside = x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
+    if inside && layout_box.control_value.is_some() && !layout_box.text.is_empty() {
+        *found = Some((layout_box.path.clone(), layout_box.text.clone(), offset));
+    }
+    for child in &layout_box.children {
+        collect_control_at(child, x, y, offset, found);
+    }
+}
+
+impl LayoutDocument {
     pub fn paint(&self) -> crate::paint::Canvas {
         crate::paint::paint(self)
     }

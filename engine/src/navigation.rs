@@ -1180,6 +1180,12 @@ impl Browser {
         })
     }
 
+    pub fn control_value(&self, path: &[usize]) -> Option<String> {
+        self.page
+            .as_ref()
+            .and_then(|page| page.runtime.control_value(path))
+    }
+
     pub fn title(&self) -> Option<String> {
         self.page
             .as_ref()
@@ -1277,6 +1283,27 @@ impl Browser {
         } else {
             Ok(changed)
         }
+    }
+
+    // a pointer press or drag over a text control moves or extends its selection
+    pub fn select_at(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+        extend: bool,
+    ) -> Result<bool, NavigationError> {
+        let target = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?.control_text_offset_at(x, y)
+        };
+        let Some((path, offset)) = target else {
+            return Ok(false);
+        };
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime
+            .select_control_offset(path, offset, extend)
+            .map_err(|error| NavigationError::Script(error.to_string()))
     }
 
     pub fn dispatch_at(
