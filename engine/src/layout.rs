@@ -1444,14 +1444,45 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
+    let generated = [
+        generated_child(
+            element,
+            &path,
+            &child_ancestors,
+            stylesheet,
+            style_state,
+            PseudoElement::Before,
+        ),
+        generated_child(
+            element,
+            &path,
+            &child_ancestors,
+            stylesheet,
+            style_state,
+            PseudoElement::After,
+        ),
+    ];
     let mut items = Vec::new();
     let mut positioned = Vec::new();
-    for (index, child) in element.children.iter().enumerate() {
+    let owned_sequence: Vec<(usize, Node)> = {
+        let mut sequence: Vec<(usize, Node)> = Vec::with_capacity(element.children.len() + 2);
+        if let Some(node) = generated[0].as_ref() {
+            sequence.push((element.children.len(), node.clone()));
+        }
+        for (index, node) in element.children.iter().enumerate() {
+            sequence.push((index, node.clone()));
+        }
+        if let Some(node) = generated[1].as_ref() {
+            sequence.push((element.children.len() + 1, node.clone()));
+        }
+        sequence
+    };
+    for (index, child) in &owned_sequence {
         let Node::Element(child) = child else {
             continue;
         };
         let mut child_path = path.clone();
-        child_path.push(index);
+        child_path.push(*index);
         let child_style = stylesheet.style_for(StyleContext {
             element: child,
             path: &child_path,
@@ -1768,14 +1799,42 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
+    let generated = [
+        generated_child(
+            element,
+            &path,
+            &child_ancestors,
+            stylesheet,
+            style_state,
+            PseudoElement::Before,
+        ),
+        generated_child(
+            element,
+            &path,
+            &child_ancestors,
+            stylesheet,
+            style_state,
+            PseudoElement::After,
+        ),
+    ];
     let mut items = Vec::new();
     let mut positioned = Vec::new();
-    for (index, child) in element.children.iter().enumerate() {
+    let mut owned_sequence: Vec<(usize, Node)> = Vec::with_capacity(element.children.len() + 2);
+    if let Some(node) = generated[0].as_ref() {
+        owned_sequence.push((element.children.len(), node.clone()));
+    }
+    for (index, node) in element.children.iter().enumerate() {
+        owned_sequence.push((index, node.clone()));
+    }
+    if let Some(node) = generated[1].as_ref() {
+        owned_sequence.push((element.children.len() + 1, node.clone()));
+    }
+    for (index, child) in &owned_sequence {
         let Node::Element(child) = child else {
             continue;
         };
         let mut child_path = path.clone();
-        child_path.push(index);
+        child_path.push(*index);
         let child_style = stylesheet.style_for(StyleContext {
             element: child,
             path: &child_path,
@@ -3275,6 +3334,44 @@ mod tests {
         assert!((grid.children[1].rect.x - 73.333).abs() < 0.01);
         assert_eq!(grid.children[2].rect.y, 40.0);
         assert_eq!(grid.children[3].rect.y, 40.0);
+    }
+
+    #[test]
+    fn flex_and_grid_children_include_generated_content_boxes() {
+        let document = Document::parse(
+            "<style>#row { display: flex; margin: 0; } #row::before { content: 'badge'; } #grid { display: grid; grid-template-columns: 60px; margin: 0; } #grid::after { content: 'tail'; }</style><div id='row'><p>one</p></div><div id='grid'><p>cell</p></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        );
+        let row = &result.root.children[0];
+        let badge = find_box(row, "::before").expect("flex before box should exist");
+        assert!(!badge.text.is_empty(), "the generated text joins the item");
+        let grid = &result.root.children[1];
+        let tail = find_box(grid, "::after").expect("grid after box should exist");
+        assert_eq!(
+            tail.rect.x, 0.0,
+            "the generated item takes the first free track"
+        );
+
+        // the generated text runs join paint through the normal box path
+        let runs = collect_text_runs(&result.root);
+        let text = runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("badge") && text.contains("tail"),
+            "generated flex and grid content paints, got {text}"
+        );
     }
 
     #[test]

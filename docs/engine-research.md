@@ -16,7 +16,6 @@ CEF stays the default engine anyway, and the reason is compatibility rather than
 - cross-origin policy beyond an operator allowlist, so there is no CORS preflight, no cookie jar and no credential mode
 - CSS transforms beyond translate, so rotation, scale, skew, and 3D transforms stay unrendered
 - transitions on properties outside the ten the engine treats as animatable
-- generated content inside flex and grid containers, which only the block path builds today
 - pointer selection of prose outside form fields, and scrollbar thumb dragging
 - full WebAssembly beyond the bounded i32 module path
 - multi-process renderer isolation and a per-renderer sandbox
@@ -178,6 +177,8 @@ The file-input boundary now sits beside that headless form path. A host-owned `F
 The clipboard boundary now sits beside it. A host-owned `ClipboardProvider` supplies text through `navigator.clipboard.readText()` and `writeText()` promises, while permission and platform failures remain typed at the embedder boundary. The renderer never receives a native clipboard object.
 
 Transform values now join the animated surface. `transform` accepts `translate()`, `translateX()`, and `translateY()` with any length units, moves the visual subtree through the same offset path as relative positioning, and participates in keyframe animations and state transitions by blending resolved pixel offsets between endpoints. Rotation, scale, skew, matrix forms, and percentage resolution against anything other than the box itself remain separate gates.
+
+Generated content now builds inside flex and grid containers as well as the block path. A container's `::before` or `::after` box joins the flex line or the next free grid track with its own styles, so badges and markers no longer disappear when a list switches to flex or grid layout. Generated content still cannot become an anonymous inline fragment inside text, which remains a separate gate.
 
 The future-gate list treats full WebAssembly compatibility as unfinished. The bounded i32 module path above is a separate tested slice and does not change that boundary.
 
