@@ -97,31 +97,147 @@ impl Color {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Length {
     Auto,
-    Px(f32),
-    Em(f32),
-    Percent(f32),
-    Calc(CalcLength),
+    Terms(LengthTerms),
+    Clamp(LengthTerms, LengthTerms, LengthTerms),
+    Smallest(LengthTerms, LengthTerms),
+    Largest(LengthTerms, LengthTerms),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CalcLength {
+// a length is a sum of unit terms, so calc() and plain values share one resolver
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct LengthTerms {
     pub(crate) px: f32,
     pub(crate) em: f32,
+    pub(crate) rem: f32,
     pub(crate) percent: f32,
+    pub(crate) viewport_width: f32,
+    pub(crate) viewport_height: f32,
+    pub(crate) zero_width: f32,
+}
+
+impl LengthTerms {
+    fn resolve(self, containing: f32, font_size: f32) -> f32 {
+        let environment = layout_environment();
+        self.px
+            + self.em * font_size
+            + self.rem * environment.root_font_size
+            + self.percent * containing / 100.0
+            + self.viewport_width * environment.viewport.width / 100.0
+            + self.viewport_height * environment.viewport.height / 100.0
+            + self.zero_width * crate::font::active_fonts().advance('0', font_size, false)
+    }
+
+    fn is_finite(self) -> bool {
+        [
+            self.px,
+            self.em,
+            self.rem,
+            self.percent,
+            self.viewport_width,
+            self.viewport_height,
+            self.zero_width,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+    }
 }
 
 impl Length {
+    pub(crate) const fn px(value: f32) -> Self {
+        Self::Terms(LengthTerms {
+            px: value,
+            em: 0.0,
+            rem: 0.0,
+            percent: 0.0,
+            viewport_width: 0.0,
+            viewport_height: 0.0,
+            zero_width: 0.0,
+        })
+    }
+
+    pub(crate) const fn em(value: f32) -> Self {
+        Self::Terms(LengthTerms {
+            px: 0.0,
+            em: value,
+            rem: 0.0,
+            percent: 0.0,
+            viewport_width: 0.0,
+            viewport_height: 0.0,
+            zero_width: 0.0,
+        })
+    }
+
     pub(crate) fn resolve(self, containing: f32, font_size: f32) -> Option<f32> {
         match self {
             Self::Auto => None,
-            Self::Px(value) => Some(value),
-            Self::Em(value) => Some(value * font_size),
-            Self::Percent(value) => Some(containing * value / 100.0),
-            Self::Calc(value) => {
-                Some(value.px + value.em * font_size + value.percent * containing / 100.0)
+            Self::Terms(terms) => Some(terms.resolve(containing, font_size)),
+            Self::Clamp(minimum, preferred, maximum) => {
+                let minimum = minimum.resolve(containing, font_size);
+                let maximum = maximum.resolve(containing, font_size);
+                Some(
+                    preferred
+                        .resolve(containing, font_size)
+                        .clamp(minimum.min(maximum), maximum.max(minimum)),
+                )
             }
+            Self::Smallest(first, second) => Some(
+                first
+                    .resolve(containing, font_size)
+                    .min(second.resolve(containing, font_size)),
+            ),
+            Self::Largest(first, second) => Some(
+                first
+                    .resolve(containing, font_size)
+                    .max(second.resolve(containing, font_size)),
+            ),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LayoutEnvironment {
+    pub(crate) viewport: crate::layout::Size,
+    pub(crate) root_font_size: f32,
+}
+
+impl Default for LayoutEnvironment {
+    fn default() -> Self {
+        Self {
+            viewport: crate::layout::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+            root_font_size: 16.0,
+        }
+    }
+}
+
+thread_local! {
+    static LAYOUT_ENVIRONMENT: std::cell::Cell<LayoutEnvironment> =
+        const { std::cell::Cell::new(LayoutEnvironment {
+            viewport: crate::layout::Size { width: 800.0, height: 600.0 },
+            root_font_size: 16.0,
+        }) };
+}
+
+pub(crate) struct ActiveEnvironment {
+    previous: LayoutEnvironment,
+}
+
+impl Drop for ActiveEnvironment {
+    fn drop(&mut self) {
+        LAYOUT_ENVIRONMENT.with(|current| current.set(self.previous));
+    }
+}
+
+// viewport and root-relative units resolve against the pass the layout runs in
+pub(crate) fn use_layout_environment(environment: LayoutEnvironment) -> ActiveEnvironment {
+    let previous = LAYOUT_ENVIRONMENT.with(|current| current.replace(environment));
+    ActiveEnvironment { previous }
+}
+
+pub(crate) fn layout_environment() -> LayoutEnvironment {
+    LAYOUT_ENVIRONMENT.with(|current| current.get())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,10 +251,10 @@ pub(crate) struct Edges {
 impl Edges {
     pub(crate) const fn zero() -> Self {
         Self {
-            top: Length::Px(0.0),
-            right: Length::Px(0.0),
-            bottom: Length::Px(0.0),
-            left: Length::Px(0.0),
+            top: Length::px(0.0),
+            right: Length::px(0.0),
+            bottom: Length::px(0.0),
+            left: Length::px(0.0),
         }
     }
 
@@ -148,6 +264,51 @@ impl Edges {
             right: Length::Auto,
             bottom: Length::Auto,
             left: Length::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InheritedText {
+    pub(crate) transform: TextTransform,
+    pub(crate) letter_spacing: Length,
+}
+
+impl Default for InheritedText {
+    fn default() -> Self {
+        Self {
+            transform: TextTransform::None,
+            letter_spacing: Length::px(0.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextTransform {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+impl TextTransform {
+    pub(crate) fn apply(self, text: &str) -> String {
+        match self {
+            Self::None => text.to_string(),
+            Self::Uppercase => text.to_uppercase(),
+            Self::Lowercase => text.to_lowercase(),
+            Self::Capitalize => text
+                .split_inclusive(char::is_whitespace)
+                .map(|word| {
+                    let mut characters = word.chars();
+                    match characters.next() {
+                        Some(first) => {
+                            first.to_uppercase().collect::<String>() + characters.as_str()
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -239,6 +400,7 @@ pub(crate) struct StyleContext<'a> {
     pub(crate) parent_font_size: f32,
     pub(crate) parent_color: Color,
     pub(crate) parent_weight: FontWeight,
+    pub(crate) parent_text: InheritedText,
     pub(crate) state: &'a StyleState,
 }
 
@@ -283,6 +445,8 @@ pub(crate) struct Style {
     pub border_width: f32,
     pub border_color: Color,
     pub text_align: TextAlign,
+    pub text_transform: TextTransform,
+    pub letter_spacing: Length,
     pub font_weight: FontWeight,
     pub flex_direction: FlexDirection,
     pub justify_content: JustifyContent,
@@ -299,6 +463,7 @@ impl Style {
         parent_font_size: f32,
         parent_color: Color,
         parent_weight: FontWeight,
+        parent_text: InheritedText,
     ) -> Self {
         let mut style = Self {
             display: default_display(name),
@@ -312,36 +477,38 @@ impl Style {
             padding: Edges::zero(),
             background: Color::transparent(),
             color: parent_color,
-            font_size: Length::Px(parent_font_size),
-            line_height: Length::Em(1.25),
+            font_size: Length::px(parent_font_size),
+            line_height: Length::em(1.25),
             border_width: 0.0,
             border_color: Color::transparent(),
             text_align: TextAlign::Left,
+            text_transform: parent_text.transform,
+            letter_spacing: parent_text.letter_spacing,
             font_weight: parent_weight,
             flex_direction: FlexDirection::Row,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
-            gap: Length::Px(0.0),
+            gap: Length::px(0.0),
             flex_grow: 0.0,
             grid_template_columns: GridTemplate::empty(),
             grid_template_rows: GridTemplate::empty(),
         };
         match name {
             "body" => {
-                style.margin = Edges::all(Length::Px(8.0));
+                style.margin = Edges::all(Length::px(8.0));
                 style.background = Color::WHITE;
             }
             "h1" => {
-                style.margin = Edges::vertical(Length::Em(0.67));
-                style.font_size = Length::Em(2.0);
+                style.margin = Edges::vertical(Length::em(0.67));
+                style.font_size = Length::em(2.0);
                 style.font_weight = FontWeight::Bold;
             }
             "h2" => {
-                style.margin = Edges::vertical(Length::Em(0.83));
-                style.font_size = Length::Em(1.5);
+                style.margin = Edges::vertical(Length::em(0.83));
+                style.font_size = Length::em(1.5);
                 style.font_weight = FontWeight::Bold;
             }
-            "p" => style.margin = Edges::vertical(Length::Em(1.0)),
+            "p" => style.margin = Edges::vertical(Length::em(1.0)),
             "strong" | "b" => style.font_weight = FontWeight::Bold,
             _ => {}
         }
@@ -362,9 +529,9 @@ impl Edges {
     fn vertical(value: Length) -> Self {
         Self {
             top: value,
-            right: Length::Px(0.0),
+            right: Length::px(0.0),
             bottom: value,
-            left: Length::Px(0.0),
+            left: Length::px(0.0),
         }
     }
 }
@@ -488,10 +655,16 @@ impl Stylesheet {
             parent_font_size,
             parent_color,
             parent_weight,
+            parent_text,
             state,
         } = context;
-        let mut style =
-            Style::default_for(&element.name, parent_font_size, parent_color, parent_weight);
+        let mut style = Style::default_for(
+            &element.name,
+            parent_font_size,
+            parent_color,
+            parent_weight,
+            parent_text,
+        );
         let values = self.cascaded_values(element, path, ancestors, state);
         let empty_properties = BTreeMap::new();
         let custom_properties = state
@@ -575,6 +748,7 @@ impl Stylesheet {
             parent_font_size,
             parent_color,
             parent_weight,
+            parent_text: InheritedText::default(),
             state: &StyleState::default(),
         })
     }
@@ -1469,6 +1643,21 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 _ => TextAlign::Left,
             };
         }
+        "text-transform" => {
+            style.text_transform = match value.trim().to_ascii_lowercase().as_str() {
+                "uppercase" => TextTransform::Uppercase,
+                "lowercase" => TextTransform::Lowercase,
+                "capitalize" => TextTransform::Capitalize,
+                _ => TextTransform::None,
+            };
+        }
+        "letter-spacing" => {
+            if value.trim().eq_ignore_ascii_case("normal") {
+                style.letter_spacing = Length::px(0.0);
+            } else if let Some(length) = parse_length(value) {
+                style.letter_spacing = length;
+            }
+        }
         "border" => parse_border(style, value),
         "border-width" => {
             style.border_width = parse_length(value)
@@ -1540,19 +1729,92 @@ fn parse_length(value: &str) -> Option<Length> {
     if value == "auto" {
         return Some(Length::Auto);
     }
-    if value.starts_with("calc(") {
-        return parse_calc_length(&value).map(Length::Calc);
+    if let Some(expression) = value
+        .strip_prefix("calc(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return parse_length_sum(expression).map(Length::Terms);
     }
-    if let Some(value) = value.strip_suffix("px") {
-        return value.parse().ok().map(Length::Px);
+    if let Some(arguments) = value
+        .strip_prefix("clamp(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let terms = parse_length_arguments(arguments, 3)?;
+        return Some(Length::Clamp(terms[0], terms[1], terms[2]));
     }
-    if let Some(value) = value.strip_suffix("em") {
-        return value.parse().ok().map(Length::Em);
+    if let Some(arguments) = value
+        .strip_prefix("min(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let terms = parse_length_arguments(arguments, 2)?;
+        return Some(Length::Smallest(terms[0], terms[1]));
     }
-    if let Some(value) = value.strip_suffix('%') {
-        return value.parse().ok().map(Length::Percent);
+    if let Some(arguments) = value
+        .strip_prefix("max(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let terms = parse_length_arguments(arguments, 2)?;
+        return Some(Length::Largest(terms[0], terms[1]));
     }
-    (value == "0").then_some(Length::Px(0.0))
+    parse_length_unit(&value).map(Length::Terms)
+}
+
+fn parse_length_arguments(arguments: &str, expected: usize) -> Option<Vec<LengthTerms>> {
+    let terms: Vec<LengthTerms> = arguments
+        .split(',')
+        .map(|argument| {
+            let argument = argument.trim();
+            match argument
+                .strip_prefix("calc(")
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                Some(expression) => parse_length_sum(expression),
+                None => parse_length_unit(argument),
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (terms.len() == expected).then_some(terms)
+}
+
+fn parse_length_unit(value: &str) -> Option<LengthTerms> {
+    let value = value.trim();
+    let mut terms = LengthTerms::default();
+    let (number, unit) = split_length_unit(value)?;
+    match unit {
+        "px" | "" => terms.px = number,
+        "em" => terms.em = number,
+        "rem" => terms.rem = number,
+        "%" => terms.percent = number,
+        "vw" => terms.viewport_width = number,
+        "vh" => terms.viewport_height = number,
+        "vmin" | "vmax" => {
+            let environment = layout_environment();
+            let smaller_is_width = environment.viewport.width <= environment.viewport.height;
+            if (unit == "vmin") == smaller_is_width {
+                terms.viewport_width = number;
+            } else {
+                terms.viewport_height = number;
+            }
+        }
+        "ch" => terms.zero_width = number,
+        _ => return None,
+    }
+    terms.is_finite().then_some(terms)
+}
+
+fn split_length_unit(value: &str) -> Option<(f32, &str)> {
+    if value == "0" {
+        return Some((0.0, "px"));
+    }
+    let split = value
+        .find(|character: char| !matches!(character, '0'..='9' | '.' | '-' | '+'))
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number = number.trim();
+    if number.is_empty() {
+        return None;
+    }
+    number.parse::<f32>().ok().map(|number| (number, unit))
 }
 
 fn parse_function_argument(source: &str, cursor: &mut usize) -> Result<String, String> {
@@ -1635,18 +1897,14 @@ fn split_selector_list(source: &str) -> Result<Vec<&str>, String> {
     Ok(selectors)
 }
 
-fn parse_calc_length(value: &str) -> Option<CalcLength> {
-    let expression = value.strip_prefix("calc(")?.strip_suffix(')')?.trim();
+fn parse_length_sum(expression: &str) -> Option<LengthTerms> {
+    let expression = expression.trim();
     if expression.is_empty() {
         return None;
     }
     let bytes = expression.as_bytes();
     let mut cursor = 0;
-    let mut terms = CalcLength {
-        px: 0.0,
-        em: 0.0,
-        percent: 0.0,
-    };
+    let mut total = LengthTerms::default();
     let mut saw_term = false;
     let mut sign = 1.0;
     while cursor < bytes.len() {
@@ -1671,39 +1929,27 @@ fn parse_calc_length(value: &str) -> Option<CalcLength> {
         if token.is_empty() {
             return None;
         }
-        let length = parse_simple_length(token)?;
-        match length {
-            Length::Px(value) => terms.px += sign * value,
-            Length::Em(value) => terms.em += sign * value,
-            Length::Percent(value) => terms.percent += sign * value,
-            Length::Auto | Length::Calc(_) => return None,
-        }
-        if !terms.px.is_finite() || !terms.em.is_finite() || !terms.percent.is_finite() {
+        let terms = parse_length_unit(token)?;
+        total.px += sign * terms.px;
+        total.em += sign * terms.em;
+        total.rem += sign * terms.rem;
+        total.percent += sign * terms.percent;
+        total.viewport_width += sign * terms.viewport_width;
+        total.viewport_height += sign * terms.viewport_height;
+        total.zero_width += sign * terms.zero_width;
+        if !total.is_finite() {
             return None;
         }
         saw_term = true;
         sign = 1.0;
     }
-    saw_term.then_some(terms)
-}
-
-fn parse_simple_length(value: &str) -> Option<Length> {
-    if let Some(value) = value.strip_suffix("px") {
-        return value.parse().ok().map(Length::Px);
-    }
-    if let Some(value) = value.strip_suffix("em") {
-        return value.parse().ok().map(Length::Em);
-    }
-    if let Some(value) = value.strip_suffix('%') {
-        return value.parse().ok().map(Length::Percent);
-    }
-    (value == "0").then_some(Length::Px(0.0))
+    saw_term.then_some(total)
 }
 
 fn parse_line_height(value: &str) -> Option<Length> {
     let value = value.trim();
     if let Ok(multiplier) = value.parse::<f32>() {
-        return Some(Length::Em(multiplier));
+        return Some(Length::em(multiplier));
     }
     parse_length(value)
 }
@@ -1911,14 +2157,20 @@ mod tests {
     fn parses_colors_and_lengths() {
         assert_eq!(Color::parse("#42d3b4"), Some(Color::opaque(66, 211, 180)));
         assert_eq!(Color::parse("#abc"), Some(Color::opaque(170, 187, 204)));
-        assert_eq!(parse_length("2em"), Some(Length::Em(2.0)));
-        assert_eq!(parse_length("68%"), Some(Length::Percent(68.0)));
+        assert_eq!(parse_length("2em"), Some(Length::em(2.0)));
+        assert_eq!(
+            parse_length("68%"),
+            Some(Length::Terms(LengthTerms {
+                percent: 68.0,
+                ..LengthTerms::default()
+            }))
+        );
         assert_eq!(
             parse_length("calc(100% - 20px)"),
-            Some(Length::Calc(CalcLength {
+            Some(Length::Terms(LengthTerms {
                 px: -20.0,
-                em: 0.0,
                 percent: 100.0,
+                ..LengthTerms::default()
             }))
         );
         assert_eq!(
@@ -1927,6 +2179,35 @@ mod tests {
                 .resolve(200.0, 16.0),
             Some(180.0)
         );
+    }
+
+    #[test]
+    fn resolves_root_relative_viewport_and_function_lengths() {
+        let _environment = use_layout_environment(LayoutEnvironment {
+            viewport: crate::layout::Size {
+                width: 1000.0,
+                height: 500.0,
+            },
+            root_font_size: 20.0,
+        });
+        let resolve = |source: &str| {
+            parse_length(source)
+                .unwrap_or_else(|| panic!("{source} should parse"))
+                .resolve(400.0, 16.0)
+        };
+        assert_eq!(resolve("1.5rem"), Some(30.0));
+        assert_eq!(resolve("2em"), Some(32.0));
+        assert_eq!(resolve("10vw"), Some(100.0));
+        assert_eq!(resolve("10vh"), Some(50.0));
+        assert_eq!(resolve("10vmin"), Some(50.0));
+        assert_eq!(resolve("10vmax"), Some(100.0));
+        assert_eq!(resolve("50%"), Some(200.0));
+        assert_eq!(resolve("clamp(10px, 5vw, 40px)"), Some(40.0));
+        assert_eq!(resolve("clamp(10px, 1vw, 40px)"), Some(10.0));
+        assert_eq!(resolve("min(30px, 2rem)"), Some(30.0));
+        assert_eq!(resolve("max(30px, 2rem)"), Some(40.0));
+        assert_eq!(resolve("calc(2rem + 5%)"), Some(60.0));
+        assert_eq!(parse_length("3quirks"), None);
     }
 
     #[test]
@@ -1979,11 +2260,12 @@ mod tests {
             parent_font_size: 16.0,
             parent_color: Color::BLACK,
             parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
             state: &state,
         });
         assert_eq!(style.background, Color::opaque(0, 255, 0));
         assert_eq!(style.color, Color::opaque(0, 0, 255));
-        assert_eq!(style.padding, Edges::all(Length::Px(8.0)));
+        assert_eq!(style.padding, Edges::all(Length::px(8.0)));
         assert_eq!(
             resolve_custom_value(
                 "var(--loop, #abcdef)",
@@ -2021,6 +2303,7 @@ mod tests {
             parent_font_size: 16.0,
             parent_color: Color::BLACK,
             parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
             state: &state,
         });
         assert_eq!(style.width.resolve(100.0, 16.0), Some(80.0));
@@ -2030,10 +2313,10 @@ mod tests {
     #[test]
     fn parses_four_edge_shorthand() {
         let edges = parse_edges("1px 2px 3px 4px");
-        assert_eq!(edges.top, Length::Px(1.0));
-        assert_eq!(edges.right, Length::Px(2.0));
-        assert_eq!(edges.bottom, Length::Px(3.0));
-        assert_eq!(edges.left, Length::Px(4.0));
+        assert_eq!(edges.top, Length::px(1.0));
+        assert_eq!(edges.right, Length::px(2.0));
+        assert_eq!(edges.bottom, Length::px(3.0));
+        assert_eq!(edges.left, Length::px(4.0));
     }
 
     #[test]
@@ -2064,7 +2347,7 @@ mod tests {
         assert_eq!(style.flex_direction, FlexDirection::Column);
         assert_eq!(style.justify_content, JustifyContent::Center);
         assert_eq!(style.align_items, AlignItems::FlexEnd);
-        assert_eq!(style.gap, Length::Px(12.0));
+        assert_eq!(style.gap, Length::px(12.0));
         assert_eq!(style.flex_grow, 2.0);
     }
 
@@ -2087,10 +2370,10 @@ mod tests {
         );
         assert_eq!(style.position, Position::Absolute);
         assert_eq!(style.z_index, Some(-2));
-        assert_eq!(style.inset.top, Length::Px(10.0));
-        assert_eq!(style.inset.right, Length::Px(20.0));
+        assert_eq!(style.inset.top, Length::px(10.0));
+        assert_eq!(style.inset.right, Length::px(20.0));
         assert_eq!(style.inset.bottom, Length::Auto);
-        assert_eq!(style.inset.left, Length::Px(30.0));
+        assert_eq!(style.inset.left, Length::px(30.0));
         assert_eq!(style.overflow, Overflow::Hidden);
         let auto =
             Stylesheet::parse(".scroll { overflow: auto; }").expect("auto stylesheet should parse");
@@ -2123,7 +2406,7 @@ mod tests {
             FontWeight::Normal,
         );
         assert_eq!(sticky_style.position, Position::Sticky);
-        assert_eq!(sticky_style.inset.top, Length::Px(4.0));
+        assert_eq!(sticky_style.inset.top, Length::px(4.0));
     }
 
     #[test]
@@ -2148,7 +2431,7 @@ mod tests {
         assert_eq!(style.grid_template_columns.tracks[0], GridTrack::Fr(1.0));
         assert_eq!(style.grid_template_rows.count, 2);
         assert_eq!(style.grid_template_rows.tracks[0], GridTrack::Px(48.0));
-        assert_eq!(style.gap, Length::Px(12.0));
+        assert_eq!(style.gap, Length::px(12.0));
     }
 
     #[test]
@@ -2275,6 +2558,7 @@ mod tests {
                 parent_font_size: 16.0,
                 parent_color: Color::BLACK,
                 parent_weight: FontWeight::Normal,
+                parent_text: InheritedText::default(),
                 state: &state,
             })
         };
@@ -2312,6 +2596,7 @@ mod tests {
                 parent_font_size: 16.0,
                 parent_color: Color::BLACK,
                 parent_weight: FontWeight::Normal,
+                parent_text: InheritedText::default(),
                 state,
             })
         };
@@ -2357,6 +2642,7 @@ mod tests {
                     parent_font_size: 16.0,
                     parent_color: Color::BLACK,
                     parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
                     state: &state,
                 })
                 .color,
@@ -2371,6 +2657,7 @@ mod tests {
                     parent_font_size: 16.0,
                     parent_color: Color::BLACK,
                     parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
                     state: &state,
                 })
                 .color,
@@ -2385,6 +2672,7 @@ mod tests {
                     parent_font_size: 16.0,
                     parent_color: Color::BLACK,
                     parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
                     state: &state,
                 })
                 .color,
@@ -2399,6 +2687,7 @@ mod tests {
                     parent_font_size: 16.0,
                     parent_color: Color::BLACK,
                     parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
                     state: &state,
                 })
                 .background,
@@ -2414,6 +2703,7 @@ mod tests {
                     parent_font_size: 16.0,
                     parent_color: Color::BLACK,
                     parent_weight: FontWeight::Normal,
+                    parent_text: InheritedText::default(),
                     state: &state,
                 })
                 .color,

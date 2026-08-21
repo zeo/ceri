@@ -1,5 +1,6 @@
 use crate::css::{ColorScheme, Stylesheet};
 use crate::dom::{AccessibilityNode, Document, NodePath, ScriptSource, StylesheetSource};
+use crate::font::FontSet;
 use crate::image::parse_svg;
 use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
@@ -755,6 +756,7 @@ pub struct Browser {
     host_runtime_info: Option<HostRuntimeInfo>,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
+    fonts: Rc<FontSet>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -785,6 +787,7 @@ impl Browser {
             host_runtime_info: None,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
+            fonts: Rc::new(FontSet::builtin()),
         }
     }
 
@@ -837,6 +840,11 @@ impl Browser {
 
     pub fn device_pixel_ratio(&self) -> f32 {
         self.viewport.device_pixel_ratio
+    }
+
+    pub fn with_fonts(mut self, fonts: Rc<FontSet>) -> Self {
+        self.fonts = fonts;
+        self
     }
 
     pub fn set_user_preferences(&mut self, preferences: UserPreferences) {
@@ -1344,6 +1352,7 @@ impl Browser {
         style_state.viewport_height = viewport.height;
         style_state.color_scheme = self.preferences.color_scheme;
         style_state.reduced_motion = self.preferences.reduced_motion;
+        let _fonts = crate::font::use_fonts(self.fonts.clone());
         let mut layout = build_layout(&document, &stylesheet, viewport, &style_state);
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(base, &document, &mut layout);
@@ -1366,6 +1375,7 @@ impl Browser {
             .as_ref()
             .map(|page| page.runtime.canvas_commands())
             .unwrap_or(&[]);
+        let _fonts = crate::font::use_fonts(self.fonts.clone());
         Ok(crate::paint::paint_with_commands(
             &layout,
             commands,

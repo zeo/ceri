@@ -195,6 +195,54 @@ impl Canvas {
         self.fill_rect(left, top, right - left, bottom - top, color);
     }
 
+    // device-space glyph blit, the coverage bitmap is already rasterized at this scale
+    fn blend_coverage(
+        &mut self,
+        x: i32,
+        y: i32,
+        glyph: &crate::font::GlyphBitmap,
+        color: Color,
+        clip: Option<crate::layout::Rect>,
+    ) {
+        if color.alpha == 0 {
+            return;
+        }
+        for row in 0..glyph.height {
+            let pixel_y = y + row as i32;
+            if pixel_y < 0 || pixel_y as u32 >= self.height {
+                continue;
+            }
+            for column in 0..glyph.width {
+                let pixel_x = x + column as i32;
+                if pixel_x < 0 || pixel_x as u32 >= self.width {
+                    continue;
+                }
+                let coverage = glyph.coverage[row * glyph.width + column];
+                if coverage == 0 {
+                    continue;
+                }
+                if let Some(clip) = clip {
+                    let inside = (pixel_x as f32) >= clip.x.floor()
+                        && (pixel_x as f32) < (clip.x + clip.width).ceil()
+                        && (pixel_y as f32) >= clip.y.floor()
+                        && (pixel_y as f32) < (clip.y + clip.height).ceil();
+                    if !inside {
+                        continue;
+                    }
+                }
+                let alpha = u32::from(color.alpha) * u32::from(coverage) / 255;
+                self.blend_pixel(
+                    pixel_x as u32,
+                    pixel_y as u32,
+                    Color {
+                        alpha: alpha as u8,
+                        ..color
+                    },
+                );
+            }
+        }
+    }
+
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
         let index = ((y * self.width + x) * 4) as usize;
         let alpha = color.alpha as u32;
@@ -853,8 +901,13 @@ fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect, clip: Option<Rect
 }
 
 fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
-    let cell = text_advance(run.font_size);
-    let pixel = cell / 6.0;
+    let fonts = crate::font::active_fonts();
+    if !fonts.is_builtin() {
+        paint_outline_text(canvas, run, clip, offset, &fonts);
+        return;
+    }
+    let cell = text_advance(run.font_size) + run.letter_spacing;
+    let pixel = text_advance(run.font_size) / 6.0;
     let mut x = run.x;
     for character in run.text.chars() {
         let glyph = glyph_rows(character);
@@ -875,6 +928,37 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f
             }
         }
         x += cell;
+    }
+}
+
+fn paint_outline_text(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+    fonts: &crate::font::FontSet,
+) {
+    let scale = canvas.scale();
+    let device_size = run.font_size * scale;
+    let baseline = (run.y + offset.1 + fonts.ascent(run.font_size)) * scale;
+    let mut pen = (run.x + offset.0) * scale;
+    let device_clip = clip.map(|clip| Rect {
+        x: clip.x * scale,
+        y: clip.y * scale,
+        width: clip.width * scale,
+        height: clip.height * scale,
+    });
+    for character in run.text.chars() {
+        if let Some(glyph) = fonts.glyph(character, device_size, run.bold) {
+            canvas.blend_coverage(
+                pen.round() as i32 + glyph.left,
+                baseline.round() as i32 + glyph.top,
+                &glyph,
+                run.color,
+                device_clip,
+            );
+        }
+        pen += fonts.advance(character, device_size, run.bold) + run.letter_spacing * scale;
     }
 }
 
@@ -1034,6 +1118,7 @@ mod tests {
                     y: 5.0,
                     width: 8.0,
                     font_size: 12.0,
+                    letter_spacing: 0.0,
                     color: Color::WHITE,
                     bold: false,
                 }],
@@ -1124,6 +1209,7 @@ mod tests {
                         y: 5.0,
                         width: 6.0,
                         font_size: 12.0,
+                        letter_spacing: 0.0,
                         color: Color::WHITE,
                         bold: false,
                     },
@@ -1133,6 +1219,7 @@ mod tests {
                         y: 20.0,
                         width: 6.0,
                         font_size: 12.0,
+                        letter_spacing: 0.0,
                         color: Color::WHITE,
                         bold: false,
                     },

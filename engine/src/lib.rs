@@ -1,5 +1,6 @@
 mod css;
 mod dom;
+mod font;
 mod host;
 mod image;
 mod layout;
@@ -17,6 +18,7 @@ pub use dom::{
     AccessibilityNode, Document, Element, Node, NodeId, NodePath, ParseError, ScriptSource,
     StylesheetSource,
 };
+pub use font::{FontFace, FontSet, GlyphBitmap};
 pub use host::{
     EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, KeyModifiers,
     PointerButton,

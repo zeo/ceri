@@ -1,4 +1,6 @@
-use ceri_engine::{APP_ORIGIN, Browser, EngineHost, InputEvent, ResourceBundle, Size};
+use ceri_engine::{
+    APP_ORIGIN, Browser, EngineHost, FontFace, FontSet, InputEvent, ResourceBundle, Size,
+};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,8 @@ struct Options {
     url: String,
     asset_root: Option<PathBuf>,
     ticks: Vec<u64>,
+    font: Option<PathBuf>,
+    bold_font: Option<PathBuf>,
 }
 
 fn main() -> Result<(), String> {
@@ -47,7 +51,16 @@ fn main() -> Result<(), String> {
             source.into_bytes(),
         )
         .map_err(|error| error.to_string())?;
-    let mut host = EngineHost::with_scale(Browser::new(resources), options.viewport, options.scale);
+    let mut browser = Browser::new(resources);
+    if let Some(path) = options.font.as_deref() {
+        let regular = load_font(path)?;
+        let bold = match options.bold_font.as_deref() {
+            Some(path) => Some(load_font(path)?),
+            None => None,
+        };
+        browser = browser.with_fonts(std::rc::Rc::new(FontSet::new(regular, bold)));
+    }
+    let mut host = EngineHost::with_scale(browser, options.viewport, options.scale);
     let status = host
         .navigate(&options.url)
         .map_err(|error| error.to_string())?;
@@ -157,6 +170,14 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+fn load_font(path: &Path) -> Result<std::rc::Rc<FontFace>, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    FontFace::parse(bytes)
+        .map(std::rc::Rc::new)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))
+}
+
 fn parse_args<I>(args: I) -> Result<Options, String>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -173,6 +194,8 @@ where
     let mut url = format!("{APP_ORIGIN}/");
     let mut asset_root = None;
     let mut scale = 1.0_f32;
+    let mut font = None;
+    let mut bold_font = None;
     let mut ticks = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
@@ -194,10 +217,12 @@ where
                 asset_root = Some(PathBuf::from(next_value(&mut args, "--asset-root")?))
             }
             "--scale" => scale = parse_scale(next_value(&mut args, "--scale")?)?,
+            "--font" => font = Some(PathBuf::from(next_value(&mut args, "--font")?)),
+            "--bold-font" => bold_font = Some(PathBuf::from(next_value(&mut args, "--bold-font")?)),
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -217,6 +242,8 @@ where
         asset_root,
         ticks,
         scale,
+        font,
+        bold_font,
         viewport: Size {
             width: width as f32,
             height: height as f32,

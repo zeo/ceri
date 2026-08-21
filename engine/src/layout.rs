@@ -1,6 +1,7 @@
 use crate::css::{
     AlignItems, Color, Display, Edges, FlexDirection, FontWeight, GridTemplate, GridTrack,
-    JustifyContent, Overflow, Position, Style, StyleContext, StyleState, Stylesheet, TextAlign,
+    InheritedText, JustifyContent, Overflow, Position, Style, StyleContext, StyleState, Stylesheet,
+    TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::image::Image;
@@ -32,6 +33,7 @@ pub struct TextRun {
     pub y: f32,
     pub width: f32,
     pub font_size: f32,
+    pub letter_spacing: f32,
     pub color: Color,
     pub bold: bool,
 }
@@ -94,6 +96,7 @@ struct InlineFragment {
     text: String,
     width: f32,
     font_size: f32,
+    letter_spacing: f32,
     color: Color,
     bold: bool,
 }
@@ -103,6 +106,14 @@ struct ParentStyle {
     font_size: f32,
     color: Color,
     weight: FontWeight,
+    text: InheritedText,
+}
+
+fn inherited_text(style: &Style) -> InheritedText {
+    InheritedText {
+        transform: style.text_transform,
+        letter_spacing: style.letter_spacing,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +122,7 @@ struct InlineContext {
     line_height: f32,
     color: Color,
     weight: FontWeight,
+    text: InheritedText,
     content_width: f32,
     content_x: f32,
     align: TextAlign,
@@ -252,9 +264,17 @@ pub fn layout_with_state(
     viewport: Size,
     style_state: &StyleState,
 ) -> LayoutDocument {
+    let _viewport_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+        viewport,
+        root_font_size: 16.0,
+    });
     let mut computed_state = style_state.clone();
     stylesheet.populate_custom_properties(document, &mut computed_state);
     let style_state = &computed_state;
+    let _root_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+        viewport,
+        root_font_size: root_font_size(document, stylesheet, viewport, style_state),
+    });
     let viewport_block = ContainingBlock {
         x: 0.0,
         y: 0.0,
@@ -307,6 +327,7 @@ pub fn layout_with_state(
             parent_font_size: 16.0,
             parent_color: Color::BLACK,
             parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
             state: style_state,
         });
         if style.position.is_out_of_flow() {
@@ -326,6 +347,7 @@ pub fn layout_with_state(
                 font_size: 16.0,
                 color: Color::BLACK,
                 weight: FontWeight::Normal,
+                text: InheritedText::default(),
             },
             context: LayoutContext {
                 viewport,
@@ -350,6 +372,7 @@ pub fn layout_with_state(
                 font_size: 16.0,
                 color: Color::BLACK,
                 weight: FontWeight::Normal,
+                text: InheritedText::default(),
             },
             ancestors: &[],
             stylesheet,
@@ -530,6 +553,7 @@ fn append_positioned_nodes(
             parent_font_size: parent.font_size,
             parent_color: parent.color,
             parent_weight: parent.weight,
+            parent_text: parent.text,
             state: style_state,
         });
         let mode = if style.position == Position::Fixed {
@@ -840,6 +864,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         parent_font_size: parent.font_size,
         parent_color: parent.color,
         parent_weight: parent.weight,
+        parent_text: parent.text,
         state: style_state,
     });
     if style.display == Display::None {
@@ -958,7 +983,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .line_height
         .resolve(font_size, font_size)
         .unwrap_or(font_size * 1.25)
-        .max(font_size);
+        .max(1.0);
     let mut line = InlineLine {
         y: content_y,
         used: 0.0,
@@ -975,6 +1000,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .as_ref()
         .map(|value| text_control_display_value(element, value));
     let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
+    let letter_spacing = style
+        .letter_spacing
+        .resolve(font_size, font_size)
+        .unwrap_or(0.0);
     if let Some(value) = control_placeholder
         .as_ref()
         .or(control_display_value.as_ref())
@@ -990,8 +1019,14 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 text: value_line.clone(),
                 x: content_x,
                 y: content_y + line_index as f32 * line_height,
-                width: measure_text(value_line, font_size),
+                width: measure_text(
+                    value_line,
+                    font_size,
+                    style.font_weight == FontWeight::Bold,
+                    letter_spacing,
+                ),
                 font_size,
+                letter_spacing,
                 color,
                 bold: style.font_weight == FontWeight::Bold,
             });
@@ -1005,6 +1040,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         line_height,
         color: style.color,
         weight: style.font_weight,
+        text: inherited_text(&style),
         content_width,
         content_x,
         align: style.text_align,
@@ -1028,6 +1064,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     parent_font_size: font_size,
                     parent_color: style.color,
                     parent_weight: style.font_weight,
+                    parent_text: inherited_text(&style),
                     state: style_state,
                 });
                 if child_style.display == Display::None {
@@ -1064,6 +1101,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                             font_size,
                             color: style.color,
                             weight: style.font_weight,
+                            text: inherited_text(&style),
                         },
                         context: LayoutContext {
                             viewport,
@@ -1088,6 +1126,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                                 font_size,
                                 color: style.color,
                                 weight: style.font_weight,
+                                text: inherited_text(&style),
                             },
                             context: inline_context,
                             stylesheet,
@@ -1166,6 +1205,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 font_size,
                 color: style.color,
                 weight: style.font_weight,
+                text: inherited_text(&style),
             },
             ancestors: &child_ancestors,
             stylesheet,
@@ -1201,6 +1241,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         font_size,
         color: style.color,
         weight: style.font_weight,
+        text: inherited_text(&style),
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
@@ -1219,6 +1260,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             parent_font_size: font_size,
             parent_color: style.color,
             parent_weight: style.font_weight,
+            parent_text: inherited_text(&style),
             state: style_state,
         });
         if child_style.display == Display::None {
@@ -1513,6 +1555,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         font_size,
         color: style.color,
         weight: style.font_weight,
+        text: inherited_text(&style),
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
@@ -1531,6 +1574,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             parent_font_size: font_size,
             parent_color: style.color,
             parent_weight: style.font_weight,
+            parent_text: inherited_text(&style),
             state: style_state,
         });
         if child_style.display == Display::None {
@@ -1567,13 +1611,32 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         .resolve(content_width, font_size)
         .unwrap_or(0.0)
         .max(0.0);
-    let zero_intrinsic = vec![0.0_f32; column_count];
+    let mut intrinsic_columns = vec![0.0_f32; column_count];
+    for (index, item) in items.iter().enumerate() {
+        let column = index % column_count;
+        if !matches!(
+            style.grid_template_columns.tracks.get(column),
+            Some(GridTrack::Auto)
+        ) {
+            continue;
+        }
+        let width = max_content_width(MaxContentInput {
+            element: item.element,
+            path: &item.path,
+            ancestors: &child_ancestors,
+            stylesheet,
+            style_state,
+            parent: child_parent,
+            containing_width: content_width,
+        });
+        intrinsic_columns[column] = intrinsic_columns[column].max(width);
+    }
     let column_widths = resolve_grid_tracks(
         style.grid_template_columns,
         column_count,
         content_width,
         gap,
-        &zero_intrinsic,
+        &intrinsic_columns,
     );
     for (index, item) in items.iter_mut().enumerate() {
         let column = index % column_count;
@@ -1725,6 +1788,111 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     layout
 }
 
+struct MaxContentInput<'a> {
+    element: &'a Element,
+    path: &'a [usize],
+    ancestors: &'a [&'a Element],
+    stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
+    parent: ParentStyle,
+    containing_width: f32,
+}
+
+// the widest the element can be before wrapping, used for auto grid tracks
+fn max_content_width(input: MaxContentInput<'_>) -> f32 {
+    let MaxContentInput {
+        element,
+        path,
+        ancestors,
+        stylesheet,
+        style_state,
+        parent,
+        containing_width,
+    } = input;
+    let style = stylesheet.style_for(StyleContext {
+        element,
+        path,
+        ancestors,
+        parent_font_size: parent.font_size,
+        parent_color: parent.color,
+        parent_weight: parent.weight,
+        parent_text: parent.text,
+        state: style_state,
+    });
+    if style.display == Display::None {
+        return 0.0;
+    }
+    let font_size = style
+        .font_size
+        .resolve(parent.font_size, parent.font_size)
+        .unwrap_or(parent.font_size)
+        .max(1.0);
+    let margin = resolve_edges(style.margin, containing_width, font_size);
+    let padding = resolve_edges(style.padding, containing_width, font_size);
+    let extras = margin.left
+        + margin.right
+        + padding.left
+        + padding.right
+        + style.border_width.max(0.0) * 2.0;
+    if let Some(width) = style.width.resolve(containing_width, font_size) {
+        return extras + width.max(0.0);
+    }
+    let letter_spacing = style
+        .letter_spacing
+        .resolve(font_size, font_size)
+        .unwrap_or(0.0);
+    let bold = style.font_weight == FontWeight::Bold;
+    let child_parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+        text: inherited_text(&style),
+    };
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(element);
+    let mut inline = 0.0_f32;
+    let mut widest_block = 0.0_f32;
+    for (index, child) in element.children.iter().enumerate() {
+        match child {
+            Node::Text(value) => {
+                let transformed = style.text_transform.apply(value);
+                inline += measure_text(transformed.trim(), font_size, bold, letter_spacing);
+            }
+            Node::Element(child) => {
+                let mut child_path = path.to_vec();
+                child_path.push(index);
+                let width = max_content_width(MaxContentInput {
+                    element: child,
+                    path: &child_path,
+                    ancestors: &child_ancestors,
+                    stylesheet,
+                    style_state,
+                    parent: child_parent,
+                    containing_width,
+                });
+                let child_display = stylesheet
+                    .style_for(StyleContext {
+                        element: child,
+                        path: &child_path,
+                        ancestors: &child_ancestors,
+                        parent_font_size: font_size,
+                        parent_color: style.color,
+                        parent_weight: style.font_weight,
+                        parent_text: inherited_text(&style),
+                        state: style_state,
+                    })
+                    .display;
+                if child_display == Display::Inline {
+                    inline += width;
+                } else {
+                    widest_block = widest_block.max(width);
+                }
+            }
+        }
+    }
+    extras + inline.max(widest_block).min(containing_width.max(0.0))
+}
+
 fn resolve_grid_tracks(
     template: GridTemplate,
     count: usize,
@@ -1741,51 +1909,49 @@ fn resolve_grid_tracks(
             }
         })
         .collect::<Vec<_>>();
-    let fixed = tracks
-        .iter()
-        .map(|track| match track {
-            GridTrack::Px(value) => *value,
-            GridTrack::Percent(value) => available * *value / 100.0,
-            GridTrack::Auto | GridTrack::Fr(_) => 0.0,
-        })
-        .sum::<f32>();
-    let fr_total = tracks
-        .iter()
-        .map(|track| match track {
-            GridTrack::Fr(value) => *value,
-            GridTrack::Auto | GridTrack::Px(_) | GridTrack::Percent(_) => 0.0,
-        })
-        .sum::<f32>();
-    let auto_count = tracks
-        .iter()
-        .filter(|track| matches!(track, GridTrack::Auto))
-        .count();
-    let free = (available - fixed - gap * count.saturating_sub(1) as f32).max(0.0);
-    let auto_share = if fr_total == 0.0 && auto_count > 0 {
-        free / auto_count as f32
-    } else {
-        0.0
-    };
-    tracks
+    // auto tracks take their content size first, then the remaining space feeds the fr tracks
+    let mut sizes = tracks
         .iter()
         .enumerate()
         .map(|(index, track)| match track {
             GridTrack::Px(value) => value.max(0.0),
             GridTrack::Percent(value) => (available * value / 100.0).max(0.0),
-            GridTrack::Fr(value) => {
-                if fr_total > 0.0 {
-                    free * value / fr_total
-                } else {
-                    intrinsic.get(index).copied().unwrap_or(0.0)
-                }
-            }
-            GridTrack::Auto => intrinsic
-                .get(index)
-                .copied()
-                .filter(|value| *value > 0.0)
-                .unwrap_or(auto_share),
+            GridTrack::Auto => intrinsic.get(index).copied().unwrap_or(0.0).max(0.0),
+            GridTrack::Fr(_) => 0.0,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let fr_total = tracks
+        .iter()
+        .map(|track| match track {
+            GridTrack::Fr(value) => value.max(0.0),
+            _ => 0.0,
+        })
+        .sum::<f32>();
+    let reserved = sizes.iter().sum::<f32>() + gap * count.saturating_sub(1) as f32;
+    let free = (available - reserved).max(0.0);
+    if fr_total > 0.0 {
+        for (index, track) in tracks.iter().enumerate() {
+            if let GridTrack::Fr(value) = track {
+                sizes[index] = free * value.max(0.0) / fr_total;
+            }
+        }
+        return sizes;
+    }
+    let stretch: Vec<usize> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(index, track)| {
+            matches!(track, GridTrack::Auto) && sizes.get(*index).copied().unwrap_or(0.0) <= 0.0
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !stretch.is_empty() {
+        let share = free / stretch.len() as f32;
+        for index in stretch {
+            sizes[index] = share;
+        }
+    }
+    sizes
 }
 
 fn justify_offsets(justify: JustifyContent, free: f32, count: usize) -> (f32, f32) {
@@ -2010,6 +2176,7 @@ fn append_inline_element(
         parent_font_size: parent.font_size,
         parent_color: parent.color,
         parent_weight: parent.weight,
+        parent_text: parent.text,
         state: style_state,
     });
     if style.display == Display::None {
@@ -2024,12 +2191,13 @@ fn append_inline_element(
         .line_height
         .resolve(font_size, font_size)
         .unwrap_or(font_size * 1.25)
-        .max(font_size);
+        .max(1.0);
     let child_context = InlineContext {
         font_size,
         line_height,
         color: style.color,
         weight: style.font_weight,
+        text: inherited_text(&style),
         content_width: context.content_width,
         content_x: context.content_x,
         align: context.align,
@@ -2050,6 +2218,7 @@ fn append_inline_element(
                             font_size,
                             color: style.color,
                             weight: style.font_weight,
+                            text: inherited_text(&style),
                         },
                         context: child_context,
                         stylesheet,
@@ -2070,13 +2239,20 @@ fn append_inline_text(
     text: &mut Vec<TextRun>,
     line: &mut InlineLine,
 ) {
+    let transformed = context.text.transform.apply(value);
+    let letter_spacing = context
+        .text
+        .letter_spacing
+        .resolve(context.font_size, context.font_size)
+        .unwrap_or(0.0);
     let mut first_word = true;
-    for word in value.split_ascii_whitespace() {
-        let word_width = measure_text(word, context.font_size);
+    for word in transformed.split_ascii_whitespace() {
+        let bold = context.weight == FontWeight::Bold;
+        let word_width = measure_text(word, context.font_size, bold, letter_spacing);
         let space_width = if first_word || line.fragments.is_empty() {
             0.0
         } else {
-            measure_text(" ", context.font_size)
+            measure_text(" ", context.font_size, bold, letter_spacing)
         };
         if !line.fragments.is_empty()
             && line.used + space_width + word_width > context.content_width
@@ -2091,15 +2267,16 @@ fn append_inline_text(
         }
         let prefix = if line.fragments.is_empty() { "" } else { " " };
         let text = format!("{prefix}{word}");
-        let width = measure_text(&text, context.font_size);
+        let width = measure_text(&text, context.font_size, bold, letter_spacing);
         line.used += width;
         line.height = line.height.max(context.line_height);
         line.fragments.push(InlineFragment {
             text,
             width,
             font_size: context.font_size,
+            letter_spacing,
             color: context.color,
-            bold: context.weight == FontWeight::Bold,
+            bold,
         });
         first_word = false;
     }
@@ -2128,6 +2305,7 @@ fn flush_line(
             y: line.y,
             width: fragment.width,
             font_size: fragment.font_size,
+            letter_spacing: fragment.letter_spacing,
             color: fragment.color,
             bold: fragment.bold,
         });
@@ -2163,9 +2341,40 @@ fn resolve_edges(edges: Edges, containing_width: f32, font_size: f32) -> Resolve
     }
 }
 
-fn measure_text(text: &str, font_size: f32) -> f32 {
-    let glyph_advance = (font_size / 9.0).round().max(1.0) * 6.0;
-    text.chars().count() as f32 * glyph_advance
+// rem resolves against the root element font size, which itself may only use absolute units
+fn root_font_size(
+    document: &Document,
+    stylesheet: &Stylesheet,
+    viewport: Size,
+    style_state: &StyleState,
+) -> f32 {
+    const INITIAL_FONT_SIZE: f32 = 16.0;
+    let Some(path) = document.document_element_path() else {
+        return INITIAL_FONT_SIZE;
+    };
+    let Some(element) = document.element_at(&path) else {
+        return INITIAL_FONT_SIZE;
+    };
+    stylesheet
+        .style_for(StyleContext {
+            element,
+            path: &path,
+            ancestors: &[],
+            parent_font_size: INITIAL_FONT_SIZE,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
+            state: style_state,
+        })
+        .font_size
+        .resolve(viewport.width, INITIAL_FONT_SIZE)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(INITIAL_FONT_SIZE)
+}
+
+fn measure_text(text: &str, font_size: f32, bold: bool, letter_spacing: f32) -> f32 {
+    crate::font::active_fonts().measure(text, font_size, bold)
+        + letter_spacing * text.chars().count() as f32
 }
 
 fn text_control_value(
@@ -2255,7 +2464,7 @@ fn control_text_lines(
     content_width: f32,
     font_size: f32,
 ) -> Vec<String> {
-    let max_characters = (content_width / measure_text("X", font_size).max(1.0))
+    let max_characters = (content_width / measure_text("X", font_size, false, 0.0).max(1.0))
         .floor()
         .max(1.0) as usize;
     let mut lines = Vec::new();
@@ -2299,6 +2508,68 @@ fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_text_transform_and_tracking_reach_layout_runs() {
+        let document = Document::parse(
+            "<main style=\"text-transform: uppercase; letter-spacing: 2px\"><p>ab cd</p></main>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 200.0,
+            },
+        );
+        let runs = collect_text_runs(&layout.root);
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "AB CD"
+        );
+        assert!(runs.iter().all(|run| run.letter_spacing == 2.0));
+        // the builtin cell is 12px at a 16px font, and tracking adds 2px per character
+        assert_eq!(runs[0].width, 2.0 * 12.0 + 2.0 * 2.0);
+        assert_eq!(runs[1].width, 3.0 * 12.0 + 3.0 * 2.0);
+    }
+
+    #[test]
+    fn grid_auto_tracks_take_content_width_before_fr_tracks_expand() {
+        let document = Document::parse(
+            "<div style=\"display: grid; grid-template-columns: auto 1fr auto\"><p>ab</p><p>middle</p><p>cd</p></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("p { margin: 0 }").expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 300.0,
+                height: 200.0,
+            },
+        );
+        let grid = &layout.root.children[0];
+        let columns: Vec<f32> = grid.children.iter().map(|child| child.rect.width).collect();
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0], 24.0);
+        assert_eq!(columns[2], 24.0);
+        assert!(
+            columns[1] > 200.0,
+            "the fr track should absorb the remaining width, got {}",
+            columns[1]
+        );
+        assert_eq!(columns.iter().sum::<f32>(), 300.0);
+    }
+
+    fn collect_text_runs(box_: &LayoutBox) -> Vec<TextRun> {
+        let mut runs = box_.text.clone();
+        for child in &box_.children {
+            runs.extend(collect_text_runs(child));
+        }
+        runs
+    }
 
     #[test]
     fn block_flow_respects_margin_padding_and_border() {

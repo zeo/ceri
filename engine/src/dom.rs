@@ -1011,7 +1011,7 @@ impl Document {
         element.set_style_property(property, value)
     }
 
-    fn element_at(&self, path: &[usize]) -> Option<&Element> {
+    pub(crate) fn element_at(&self, path: &[usize]) -> Option<&Element> {
         let mut element = &self.root;
         for &index in path {
             element = match element.children.get(index)? {
