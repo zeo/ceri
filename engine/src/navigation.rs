@@ -1030,6 +1030,12 @@ impl Browser {
         self.last_navigation_failure.as_ref()
     }
 
+    pub fn title(&self) -> Option<String> {
+        self.page
+            .as_ref()
+            .and_then(|page| page.document.borrow().title())
+    }
+
     pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
         self.page
             .as_ref()

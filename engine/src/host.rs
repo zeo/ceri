@@ -73,6 +73,7 @@ pub struct InputResult {
 pub struct Frame {
     pub sequence: u64,
     pub viewport: Size,
+    pub title: Option<String>,
     pub canvas: Canvas,
 }
 
@@ -276,6 +277,10 @@ impl EngineHost {
         self.browser.accessibility_tree()
     }
 
+    pub fn title(&self) -> Option<String> {
+        self.browser.title()
+    }
+
     pub fn last_navigation_failure(&self) -> Option<&NavigationFailure> {
         self.browser.last_navigation_failure()
     }
@@ -401,6 +406,7 @@ impl EngineHost {
         let frame = Frame {
             sequence: self.next_frame,
             viewport: self.viewport,
+            title: self.browser.title(),
             canvas,
         };
         self.next_frame = self.next_frame.saturating_add(1);
@@ -859,6 +865,27 @@ mod tests {
                 .as_deref(),
             Some("down up click")
         );
+    }
+
+    #[test]
+    fn rendered_frames_carry_the_document_title() {
+        let mut host = EngineHost::new(
+            Browser::new(bundle(
+                "<html><head><title>Ceri Console</title></head><body><p>ready</p></body></html>",
+            )),
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let frame = host
+            .render()
+            .expect("frame should render")
+            .expect("first frame should be dirty");
+        assert_eq!(frame.title.as_deref(), Some("Ceri Console"));
+        assert_eq!(host.title().as_deref(), Some("Ceri Console"));
     }
 
     #[test]

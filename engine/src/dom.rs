@@ -207,6 +207,14 @@ impl Document {
         paths
     }
 
+    pub fn title(&self) -> Option<String> {
+        let element = first_element_named(&self.root, "title")?;
+        let mut text = String::new();
+        collect_text_nodes(element, &mut text);
+        let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!title.is_empty()).then_some(title)
+    }
+
     pub fn document_element_path(&self) -> Option<NodePath> {
         self.root
             .children
@@ -1770,6 +1778,20 @@ fn collect_text_nodes(element: &Element, output: &mut String) {
     }
 }
 
+fn first_element_named<'a>(element: &'a Element, name: &str) -> Option<&'a Element> {
+    for child in &element.children {
+        if let Node::Element(child) = child {
+            if child.name == name {
+                return Some(child);
+            }
+            if let Some(found) = first_element_named(child, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 fn text_utf16_len(node: &Node) -> usize {
     match node {
         Node::Element(element) => element.children.iter().map(text_utf16_len).sum(),
@@ -2118,6 +2140,24 @@ mod tests {
         assert_eq!(main.name, "main");
         assert_eq!(main.attr("data-kind"), Some("demo"));
         assert_eq!(main.children.len(), 1);
+    }
+
+    #[test]
+    fn reads_the_document_title_and_collapses_its_whitespace() {
+        let document = Document::parse(
+            "<html><head><title>  Ceri\n  Settings </title></head><body><p>body</p></body></html>",
+        )
+        .expect("document should parse");
+        assert_eq!(document.title().as_deref(), Some("Ceri Settings"));
+
+        let untitled = Document::parse("<main><title> </title></main>").expect("should parse");
+        assert_eq!(untitled.title(), None);
+        assert_eq!(
+            Document::parse("<main>no title</main>")
+                .expect("should parse")
+                .title(),
+            None
+        );
     }
 
     #[test]

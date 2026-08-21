@@ -9,6 +9,8 @@ mod navigation;
 mod paint;
 mod script;
 mod wasm;
+#[cfg(feature = "windowed")]
+mod window;
 
 pub use css::{Color, Display, Stylesheet};
 pub use dom::{
@@ -29,3 +31,5 @@ pub use navigation::{
 };
 pub use paint::Canvas;
 pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};
+#[cfg(feature = "windowed")]
+pub use window::{WindowConfig, run as run_window};
