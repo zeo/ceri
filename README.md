@@ -1,50 +1,63 @@
 # Ceri
 
-Ceri is a Rust-owned desktop runtime for web applications. It packages the Chromium Embedded Framework (CEF) with the application, so the browser engine is selected and updated with the app instead of coming from an operating-system webview.
+Ceri is a Rust-owned desktop runtime for web applications. The engine ships inside the app, so the rendering behaviour is chosen and updated with the release instead of arriving from an operating-system webview.
 
-The current runtime slice provides:
+Two engines sit behind one runtime contract:
 
-- CEF 150.0.14 with Chromium 150
-- Rust ownership of process startup, sandbox setup, windows, navigation policy, asset routing, and recovery
-- TypeScript-friendly JavaScript authoring through the zero-dependency SDK in `sdk/`
-- a packaged HTTPS app origin, `https://app.ceri.invalid`
-- direct bundled asset serving through a CEF scheme handler
-- no loopback HTTP server, `file://` navigation, Edge WebView2, or Node.js requirement
-- a native `cefQuery` compatibility surface for typed runtime information
-- one renderer restart followed by a Ceri-owned recovery document
+- `ceri-engine`, a Rust-native browser engine in [engine/](engine/README.md), written against the standard library with no Chromium, WebKit, Servo or third-party JavaScript engine underneath it
+- CEF 150.0.14 with Chromium 150, the compatibility engine for apps that need the full web platform today
 
-The design target is desktop Windows, macOS, and Linux on x64 and ARM64. Each release must be built with the matching CEF distribution for its target. Mobile targets are outside this CEF-based runtime.
+Both engines load the same packaged app from the same owned HTTPS origin, `https://app.ceri.invalid`, with no loopback HTTP server, no `file://` navigation, no Edge WebView2 and no Node.js requirement. Rust owns process startup, window creation, navigation policy, asset routing and recovery in both modes.
+
+## Measured difference
+
+Same app, same machine, release builds, Windows x64. The runtime bundle is the executable plus the packaged `web/` and `sdk/` assets.
+
+| | `ceri-engine` | CEF |
+| --- | --- | --- |
+| bundle size | 3.8 MB | 411 MB |
+| files in bundle | 9 | 252 |
+| processes at rest | 1 | 6 |
+| resident memory, app open | 25.9 MB | 319.7 MB |
+| start to first painted frame | 378 ms median, headless render of the packaged app | not instrumented |
+
+The Rust-native engine also renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, and reaches `4 / 4` on the packaged continuity page.
 
 ## Build
 
-Install Rust, CMake, Ninja, and the native toolchain for the target platform. The CEF crate can download its matching archive during the first build. A shared extracted CEF directory is faster and is required in restricted build environments.
+Install Rust and the native toolchain for the target platform.
 
-On Windows, point `CEF_PATH` at the extracted CEF directory and put Ninja on `PATH`:
+The Rust-native engine needs nothing else:
+
+```powershell
+cargo test --no-default-features --features custom-engine --all-targets
+cargo run --no-default-features --features custom-engine --bin ceri_bundle -- --release --output dist\windows-x64-custom
+```
+
+The generated bundle holds `ceri.exe` and an `assets` directory. Launch the executable; it resolves its asset root next to itself.
+
+Render one frame of the packaged app without opening a window, which is what CI checks on every push:
+
+```powershell
+cargo run --no-default-features --features custom-engine --bin ceri -- "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target\app.png"
+```
+
+The CEF build additionally needs CMake, Ninja and the matching CEF distribution for the target. The CEF crate can download its archive during the first build, and a shared extracted directory is faster:
 
 ```powershell
 $env:CEF_PATH = (Resolve-Path -LiteralPath '.\target\cef-cache\cef_windows_x86_64').Path
 $env:Path = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;' + $env:Path
 cargo test --all-targets
-cargo check --all-targets
+cargo run --bin ceri_bundle -- --release --output dist\windows-x64-cef
 ```
 
-Build an application bundle with the CEF files, executable, helper, and web assets:
+The default build is the CEF engine with the Windows sandbox enabled, because CEF still covers more of the web platform than the Rust-native engine does. Launch the sandboxed executable from its generated bundle: CEF starts the browser process through the bundled bootstrap DLL, so copying the executable alone does not work. For development without the sandbox, add `--no-default-features --features cef-engine`.
 
-```powershell
-cargo run --bin ceri_bundle -- --release --output dist\windows-x64-release
-```
-
-The default Windows build enables the CEF sandbox. Launch the bundled executable from the generated bundle. The sandboxed executable is not a standalone copy operation because CEF starts the browser process through the bundled bootstrap DLL.
-
-For development without the sandbox feature:
-
-```powershell
-cargo run --no-default-features --bin ceri_bundle -- --output dist\windows-x64-nosandbox-debug
-```
+Each CEF release must be built with the CEF archive for its target. The Rust-native engine has no per-target archive.
 
 ## Authoring
 
-The web surface is ordinary HTML, CSS, and JavaScript. TypeScript projects can consume the declarations in `sdk/index.d.ts` and emit browser-compatible modules into the packaged asset directory.
+The web surface is ordinary HTML, CSS and JavaScript. TypeScript projects can consume the declarations in `sdk/index.d.ts` and emit browser-compatible modules into the packaged asset directory.
 
 ```js
 import { runtimeInfo } from "./sdk/index.js";
@@ -53,54 +66,22 @@ const info = await runtimeInfo();
 console.log(info.engine, info.chromium, info.recovery);
 ```
 
-`runtimeInfo()` validates the response shape before returning it. Requests are limited to the runtime method currently implemented by Ceri. A future host API should add an explicit typed method and an explicit capability check, rather than exposing a general command evaluator.
+`runtimeInfo()` validates the response shape before returning it, and reads the promise-based `window.ceriQuery` bridge on the Rust-native engine or `window.cefQuery` on the CEF engine. Requests are limited to the runtime method Ceri implements. A new host capability should arrive as an explicit typed method with an explicit capability check, not as a general command evaluator.
 
 ## Failure behavior
 
-Ceri verifies the entry document before CEF initializes. Every packaged app document is served from the owned HTTPS origin through the CEF scheme handler. Missing assets, unsafe paths, navigation errors, and repeated renderer termination produce a Ceri recovery document with a retry link. The browser's generic network failure page is not part of the application path.
+Ceri verifies the entry document before the engine starts. Every packaged app document is served from the owned HTTPS origin: through the CEF scheme handler in the CEF build, and through the same asset-origin policy behind a `ResourceProvider` in the Rust-native build. Missing assets, unsafe paths, navigation errors and repeated renderer termination produce a Ceri recovery document with a retry link. The browser's generic network failure page is not part of the application path.
 
-The resolver rejects encoded separators, traversal, malformed UTF-8, Windows device names, invalid path characters, symlink escapes, and ambiguous empty path segments. Top-level extensionless routes may use the packaged `index.html`; missing subresources never fall back to the app shell.
+The resolver rejects encoded separators, traversal, malformed UTF-8, Windows device names, invalid path characters, symlink escapes and ambiguous empty path segments. Top-level extensionless routes may use the packaged `index.html`; missing subresources never fall back to the app shell.
+
+Page stylesheets follow CSS error handling. An unsupported rule is dropped and reported to the page console, and the rest of the sheet still applies, so one unknown at-rule cannot blank an app.
 
 See [docs/architecture.md](docs/architecture.md) for the process model and security boundaries.
 
-## Custom engine laboratory
+## The Rust-native engine
 
-The lab's DOM mutation slice also supports writable `outerHTML` replacement for attached elements with an element parent. The old handle remains reusable after replacement, while direct document children and detached elements follow the standard no-parent rejection.
+[engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex and basic grid layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, a bounded JavaScript runtime with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
 
-Effective disabled state now reaches form submission, validation, interaction, and CSS `:disabled` or `:enabled` matching, including the first `legend` exemption inside a disabled `fieldset`.
+Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket.
 
-Live DOM mutations now rehydrate select option state after `appendChild`, `insertBefore`, and `innerHTML` replacement, while form ownership is resolved again from the current tree for controls appended after startup. `parentNode`, `parentElement`, and `remove()` expose the bounded tree relationship, while `removeChild` can detach a direct child without reindexing survivor handles and append it again at the end of its new parent. Listeners on that detached subtree follow the same handle through reattachment, while detached `innerHTML` replacement discards descendant listeners. Element, document, window, and worker targets support callback-identity `removeEventListener`, duplicate registrations are ignored, `{ once: true }` listeners are removed before their callback runs, and `{ signal }` listeners are removed before an `AbortController` dispatches its abort callbacks. Attached element and text-node movement now uses stable node identity beyond vector paths, and element-only child and sibling navigation skips intervening text nodes.
-
-The isolated [engine](engine/README.md) crate is a from-scratch Rust rendering experiment. It currently parses a small HTML and CSS subset with compound, descendant, direct-child, and attribute selectors, stateful `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled` matching, supports document and subtree `querySelector` and `querySelectorAll`, loads same-origin external CSS and JavaScript from packaged resources, executes bounded static and dynamic ES module graphs with default, named, named re-exported, and export-star forwarded exports, explicit JSON dynamic-import attributes, template literals, and `import.meta.url`, exposes packaged-origin promise-based `fetch()` and `response.json()` data with deterministic `AbortController` cancellation and single-use response bodies, supports immutable `Blob` and `File` values, bounded `crypto.subtle.digest()` for SHA-1, SHA-256, SHA-384, and SHA-512, and script-created `Response` objects with status, status text, mutable headers, body cloning, `blob()` reads, `Response.json()`, `Response.error()`, and same-origin `Response.redirect()`, supports app-origin `URL` and `URLSearchParams` construction and mutation, app-origin `localStorage` and `sessionStorage` state across full-document navigations, collects named controls through `FormData` and cancellable `requestSubmit()` events with live checkbox and radio-group state, draws a small canvas 2D command set through the software paint pass, rasterizes bounded app-owned SVG images through `<img>`, basic object and array values, static node-list snapshots with `dataset`, array spread and `map`, bounded `Map` construction and access, bounded `for...of` over built-in and user-defined iterables, object and array destructuring with default values and computed object keys, `Map` iterator records, promise-backed async functions with `await`, try/catch/throw, class and error values, page-visible classic and module `Worker` objects with dedicated threads, bounded structured-cloned message queues, `structuredClone()`, and event listeners, an engine-owned typed runtime identity query, and the small standard-library surfaces used by the continuity page, constructs DOM nodes from scripts, replaces and serializes fragments through `innerHTML`, mutates attributes, inline styles, and `classList`, tracks `activeElement` and text-control values through focus, blur, key, and input events, runs a small script subset with bubbling cancellable DOM events, app-origin `Location` state, nested anchor activation, session history with `pushState()` and `popstate`, coordinate hit testing, and a deterministic task clock, navigates an app-owned HTTPS origin, performs block, flex, and basic grid layout, and exposes a platform-neutral frame and input boundary for native adapters. It paints a deterministic PPM or BMP image without CEF or another browser engine. An optional `windowed` feature connects that host boundary to a native desktop window through a CPU surface. It is research code and is not part of the production bundle.
-
-The custom runtime also has bounded IndexedDB with callback-based open and operation requests, version upgrades, readonly or readwrite transactions, object-store CRUD, and bounded structured-cloned records that survive full-document navigation. The shared clone path covers primitives, arrays, plain objects, `Map`, `Set`, `ArrayBuffer`, `Uint8Array`, `Blob`, `File`, and `Error` values, with explicit depth, node, string, and byte limits. `structuredClone()` uses the same path. `Browser::with_storage_directory()` adds an optional host-selected on-disk storage bucket for localStorage, CacheStorage, and IndexedDB, written through a versioned atomic snapshot that reads the prior JSON snapshot format and writes the current clone-tag format. sessionStorage remains browser-session state. Transfer lists, cycles, shared-reference identity, indexes, and cursors remain compatibility gates.
-
-See [docs/engine-research.md](docs/engine-research.md) for the candidate comparison and replacement gates.
-
-The script data model now supports bounded writes to plain-object properties and array indexes, array length changes, and `push()` or `pop()` mutation. `forEach()`, `filter()`, and `find()` invoke callbacks with the value, index, and source array. Strings expose bounded search, case conversion, trimming, slicing, and splitting. Object and array identity comparisons use reference identity, so script-created cycles remain observable and are rejected by structured cloning. Object literals also accept shallow spread from plain objects, arrays, and strings, while `Object.keys()`, `Object.values()`, `Object.entries()`, and `Object.assign()` cover bounded object inspection and copying.
-
-The selector matcher also accepts top-level selector lists and bounded `:not(...)` arguments in both stylesheets and DOM queries, while preserving selector specificity and rejecting malformed list entries.
-
-Form controls now support `method="post"` through the same host-owned provider seam as `fetch()`. The engine sends URL-encoded or deterministic multipart bodies with typed headers, follows bounded same-origin redirects, and keeps packaged-only POST actions on an explicit recovery path without creating a localhost listener. A host-owned `FilePicker` boundary supplies validated file bytes and metadata to `input.files`, dispatches `input` and `change`, and carries selected files into multipart form entries without exposing filesystem paths to the renderer. Picker cancellation leaves the current selection unchanged. A matching `ClipboardProvider` boundary backs `navigator.clipboard.readText()` and `writeText()` with host-controlled permission failures and no renderer access to platform clipboard handles.
-
-Text-like inputs and `textarea` now keep a bounded UTF-16 selection model with `select()`, selection accessors, `setSelectionRange()`, and `setRangeText()`. Host text insertion and basic editing keys operate on the live selection, including Enter line breaks in `textarea`. Host edits and IME composition honor `maxlength` in UTF-16 code units, while script value writes remain unrestricted. Form controls also expose a bounded constraint-validation surface for `required`, dirty-value `minlength` and `maxlength`, email and URL type checks, common anchored `pattern` expressions, custom validity messages, `validity`, `willValidate`, `validationMessage`, `checkValidity()`, and `reportValidity()`. Invalid packaged form submissions fire `invalid` at the failing controls and stay on the current app page until the constraints pass. Pattern support is deliberately bounded to literals, character classes, escapes, ranges, and quantifiers without a regex dependency. Forms also expose `reset()` with cancelable bubbling `reset` events, reset-button activation, and `defaultValue` and `defaultChecked` state. Reset restores the current text, checkbox, radio, and file state in the lab without opening a listener. Form ownership now resolves nearest ancestor forms or explicit `form` references, and `form.elements`, FormData, validation, focus, and click paths use that same association. Disabled fieldsets exclude controls except descendants of their first legend. Select controls expose option selectedness, `value`, `selectedIndex`, `options`, `selectedOptions`, `multiple`, `defaultSelected`, required-select placeholder validation, disabled `optgroup` filtering, and ordered FormData entries, with reset returning each option to its default selected state. Native select popovers and full option rendering remain separate gates. Empty text controls paint their `placeholder` hint without changing the live `value`, then replace it as soon as a value is present. Password inputs paint a masked display string while keeping the live value and UTF-16 selection intact. Read-only text controls stay focusable and submittable, preserve selection movement, and reject host edits and composition updates. Labels resolve explicit `for` references or the first labelable descendant, and permitted label clicks focus and activate that control. The first valid document-order `autofocus` candidate receives focus after page scripts unless a script has already selected a target. Shift-aware native key input extends that selection across UTF-16 boundaries, and `keydown` exposes the common modifier flags. Tab and Shift+Tab move through sequentially focusable controls, honor positive and negative `tabindex` values, and preserve normal focus and blur event order. Same-element text ranges now flow through `document.createRange()`, `document.getSelection()`, and `window.getSelection()` with bounded range and selection stringification. Single-line input values and textarea values with explicit line breaks now paint selection highlights and a software caret from the same live state, with the caret following forward or backward selection direction. Textarea soft wrapping follows the content width with `wrap="off"` support. Text-control and document `selectionchange` notifications fire when those bounded selections change. Word-aware line breaking, caret blinking, cross-node live mutation, and candidate-window positioning remain future gates. The native window also forwards preedit, commit, and disable notifications into composition lifecycle events.
-
-The custom renderer also has a bounded cascade, positioning, clipping, and scrolling slice. Inherited CSS custom properties resolve through the bounded `:root` selector, `var()` substitutions, fallbacks, and cycles, while additive `calc()` lengths reach the existing layout resolver. Relative ancestors establish overlay containing blocks, relative boxes keep their flow geometry while moving their visual subtree, absolute and fixed descendants stay out of normal flow, and hidden, clipped, or automatic-overflow boxes constrain both software paint and pointer hit testing. Positioned boxes accept bounded integer `z-index` ordering within each layout parent, with positioned z-index boxes and fixed boxes grouped into atomic paint and hit-test layers. Vertical `position: sticky` boxes stay in normal flow, track the nearest scrollport after element or document scrolling, and clamp their visual correction to the containing block. Automatic-overflow boxes track bounded `scrollTop` and `scrollLeft` offsets, reserve a classic-style scrollbar gutter, paint software tracks and thumbs, and keep the gutter outside content hit testing. The document exposes `window.scrollX`, `window.scrollY`, `scrollTo()`, and `scrollBy()`. Both paths accept host wheel input and dispatch `scroll` events. Horizontal sticky offsets, inline sticky descendants, full sticky containment rules, complete CSS stacking-context semantics, smooth scrolling, and scroll snapping remain outside this gate.
-
-FormData values expose ordered key, value, entry, `forEach()`, and symbol iteration methods in the custom runtime.
-
-The linked `URLSearchParams` surface now exposes ordered key, value, entry, `forEach()`, and symbol iteration methods while keeping URL query updates synchronized.
-
-The custom runtime also has a page-visible `Worker` slice. Same-origin classic or module worker entry scripts come from packaged assets or the embedder-owned `ResourceProvider`, then run on dedicated standard-library threads. Classic Workers can load sequential scripts through `importScripts()`. Static module imports and `fetch()` calls inside those workers use the same packaged-first policy, with provider requests serviced through an explicit host pump. Workers exchange bounded structured-cloned messages through `postMessage()`, using the same primitive, collection, binary, Blob, File, and Error value set as `structuredClone()` and IndexedDB. `addEventListener()`, `onmessage`, `onerror`, and `terminate()` are available. `EngineHost` integrates the pump into input and render work. Transfer lists, cycles, shared-reference identity, and nested workers remain compatibility gates.
-
-The custom runtime also has a bounded WebAssembly path. A page can fetch an ArrayBuffer from the embedder-owned provider, call `WebAssembly.instantiate()`, and invoke exported i32 functions. The parser and interpreter reject imports, memory, tables, globals, floating-point types, SIMD, threads, streaming compilation, and unsupported control flow before execution.
-
-The byte-value slice includes bounded `ArrayBuffer` and `Uint8Array` construction, indexed reads and writes, shared backing buffers, byte-offset and length views, `set()`, copying `slice()`, sharing `subarray()`, and integration with request bodies, Blob parts, WebAssembly input, Web Crypto digest input, structured cloning, Worker messages, and IndexedDB. The runtime also has bounded in-memory `CacheStorage` and `Cache` objects for immutable response snapshots, with named caches surviving full-document navigation without a loopback listener. Disk persistence now uses the same bounded clone format for IndexedDB records. Indexes, cursors, transfer lists, cycles, and shared-reference identity remain compatibility gates.
-
-The custom host also exposes a platform-neutral accessibility tree with semantic roles, names, values, focusability, disabled state, hidden filtering, and stable DOM paths. Its resource path has an embedder-owned `ResourceProvider` seam, so a native HTTP/TLS source can feed the same app-origin policy without a loopback listener. The optional `native-http` feature supplies a Rust-native HTTPS provider with platform certificate verification, bounded redirects, connection reuse, and a bounded response read. Navigation follows same-origin redirects under an engine-owned limit, while `ResourceRequest` carries validated fetch methods, headers, bodies, and cache modes across the seam, and `ResourceResponse` carries provider status and headers to the page. Fetch supports mutable request `Headers` construction and a bounded `Request` object with inherited init values, string, `ArrayBuffer`, `Blob`, `File`, `URLSearchParams`, or `FormData` bodies, automatic content type inference, body cloning, provider dispatch, and URL-encoded or multipart `formData()` reads, while fetched response headers remain read-only. Script-created `Response` objects support status, status text, type, mutable headers, body cloning, single-use reads, `blob()`, URL-encoded or multipart `formData()`, `Response.json()`, `Response.error()`, and same-origin `Response.redirect()`. Fetch response bodies support deterministic clone and tee branches with single-use state. `AbortSignal` can stop a fetch before provider dispatch, and `NavigationFailure` gives native adapters typed recovery status and detail without parsing the recovery DOM.
-
-The optional remote window mode routes the browser through a bounded `EngineWorker` queue. The native event thread keeps handling window input and presentation while the blocking HTTPS provider runs on the engine thread.
-
-The same body boundary supports URL-encoded and multipart `formData()` reads, with the parsed FormData entries retaining their order and File metadata.
-
-The module laboratory now preserves live named and namespace bindings through re-exports, with imported names kept read-only while source modules update their exported cells. Its stylesheet path also reevaluates bounded `@media` width and height conditions for each native viewport.
+What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS animations and transitions, generated content, rounded corners, shadows and gradients, full WebAssembly, extensions, printing, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.

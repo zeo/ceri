@@ -440,7 +440,8 @@ impl ResourceBundle {
         }
         let mut resources = Self::default();
         let mut visited = BTreeSet::new();
-        collect_directory(&root, &root, &mut resources, &mut visited)?;
+        let mut budget = BundleBudget::default();
+        collect_directory(&root, &root, &mut resources, &mut visited, &mut budget)?;
         Ok(resources)
     }
 
@@ -1976,11 +1977,41 @@ fn is_windows_device_name(segment: &str) -> bool {
         )
 }
 
+// a packaged app is bounded, so a mistaken root cannot pull an entire disk into memory
+const MAX_BUNDLE_FILES: usize = 20_000;
+const MAX_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Default)]
+struct BundleBudget {
+    files: usize,
+    bytes: u64,
+}
+
+impl BundleBudget {
+    fn take(&mut self, bytes: u64) -> io::Result<()> {
+        self.files += 1;
+        self.bytes += bytes;
+        if self.files > MAX_BUNDLE_FILES {
+            return Err(io::Error::other(format!(
+                "resource root holds more than {MAX_BUNDLE_FILES} files"
+            )));
+        }
+        if self.bytes > MAX_BUNDLE_BYTES {
+            return Err(io::Error::other(format!(
+                "resource root holds more than {} MiB",
+                MAX_BUNDLE_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn collect_directory(
     root: &Path,
     directory: &Path,
     resources: &mut ResourceBundle,
     visited: &mut BTreeSet<PathBuf>,
+    budget: &mut BundleBudget,
 ) -> io::Result<()> {
     let canonical_directory = fs::canonicalize(directory)?;
     if !canonical_directory.starts_with(root) {
@@ -2011,7 +2042,7 @@ fn collect_directory(
             ));
         }
         if canonical_path.is_dir() {
-            collect_directory(root, &path, resources, visited)?;
+            collect_directory(root, &path, resources, visited, budget)?;
             continue;
         }
         if !canonical_path.is_file() {
@@ -2024,6 +2055,7 @@ fn collect_directory(
             )
         })?;
         let url_path = relative_url_path(relative)?;
+        budget.take(entry.metadata()?.len())?;
         let body = fs::read(&path)?;
         resources
             .insert(&url_path, mime_type_for(&path), body)

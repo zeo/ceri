@@ -1,6 +1,8 @@
 # Ceri architecture
 
-Ceri keeps the browser engine inside the application boundary. Rust owns the native process model and CEF lifecycle. Web code owns presentation and application state. TypeScript is an authoring layer, not a second runtime that ships beside the app.
+Ceri keeps the browser engine inside the application boundary. Rust owns the native process model and the engine lifecycle. Web code owns presentation and application state. TypeScript is an authoring layer, not a second runtime that ships beside the app.
+
+The runtime has two engine backends behind one contract. The CEF backend runs Chromium in its own process tree. The `ceri-engine` backend is a Rust-native engine in this repository that runs in-process, on one dedicated engine thread, with no Chromium underneath it. Both load the same packaged app from `https://app.ceri.invalid`, share the asset-origin policy in `src/assets.rs`, and expose the same typed runtime query to page code.
 
 ```mermaid
 flowchart LR
@@ -23,9 +25,20 @@ The executable follows CEF's multi-process model:
 
 The browser process verifies the entry route before calling `cef::initialize`. The profile lives in a per-user Ceri directory so Chromium's cache and session state do not collide with another application.
 
+## Rust-native process model
+
+The `custom-engine` build is a single process:
+
+- the main thread owns the native window, input translation, the display scale factor and the desktop theme
+- one engine thread owns the browser state, navigation, layout, paint and the page script runtime, reached through a bounded command queue
+- frames cross back as device-pixel surfaces that the window presents through a CPU surface
+- worker threads carry page-visible `Worker` objects, with provider requests serviced through an explicit host pump
+
+There is no renderer sandbox in this mode, because there is no separate renderer process to confine. What confines the page instead is the surface the engine exposes: script has no filesystem, process, socket or clipboard handle, and every resource read crosses the embedder-owned `ResourceProvider` seam that applies the same path policy as the CEF scheme handler. Multi-process isolation for the Rust-native engine is a named gate, not a shipped property.
+
 ## App origin and asset routing
 
-The app loads from `https://app.ceri.invalid`. This is an application-owned origin registered with CEF's HTTPS scheme handler factory. It is not resolved by DNS and it does not require a listening socket.
+The app loads from `https://app.ceri.invalid`. This is an application-owned origin, registered with CEF's HTTPS scheme handler factory in the CEF build and served through the engine's `ResourceProvider` seam in the Rust-native build. It is not resolved by DNS and it does not require a listening socket.
 
 The resolver receives the URL path, normalizes it once, and checks the canonical result against the packaged asset root. It then returns a file or a Ceri-owned response document. Query strings are not used as filesystem paths. The resolver does not follow symlinks outside the asset root.
 
@@ -63,4 +76,6 @@ The bridge boundary is intentionally small. New native capabilities should be ad
 
 ## Platform contract
 
-The source layout covers Windows, macOS, and Linux CEF targets on x64 and ARM64. CEF binaries are target-specific, so a release pipeline must build once per target and package that target's CEF archive. The Windows x64 path is the locally validated path for this repository. macOS and Linux still require their native toolchains, CEF archive, signing, and installed-runtime smoke gates before a release claim is made.
+The source layout covers Windows, macOS, and Linux on x64 and ARM64. CEF binaries are target-specific, so a CEF release pipeline must build once per target and package that target's CEF archive. The Rust-native engine has no per-target archive and its bundle is the executable plus packaged assets.
+
+The Windows x64 path is the locally validated path for this repository. The Rust-native engine is built and tested on Linux, macOS and Windows in CI, including a headless render of the packaged app. macOS and Linux still require signing and installed-runtime smoke gates before a release claim is made, and the CEF path additionally requires its per-target archive.

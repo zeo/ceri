@@ -1,6 +1,6 @@
 # Browser engine research
 
-Research snapshot: 2026-08-15
+Research snapshot: 2026-08-21
 
 The custom DOM path now covers live text-node `splitText()` and `normalize()` operations, including identity-preserving merges, empty-node removal, and Range boundary retargeting. CharacterData substring and mutation methods share the UTF-16 edit path and preserve the same live ranges. Sibling navigation, element-only sibling navigation, and `isConnected` resolve through the same stable node identity after removal. `document.createTextNode()` can create detached text, run UTF-16 CharacterData methods, split it, attach it through the existing element insertion boundary, and move attached text between parents. `cloneNode()` creates shallow or deep detached copies without copying listeners. Element serialization now exposes `outerHTML` alongside `innerHTML` for attached and detached elements, and writable `outerHTML` replacement parses a fragment, preserves the old handle for reattachment, and retargets removed-subtree state through the same path. Direct children of the document and detached elements keep the standard no-parent rejection. `append()` or `prepend()` route mixed string and node arguments through the same identity-preserving insertion path. `replaceChildren()` removes direct children through the same live detach path and reattaches any passed handles with their listeners. `before()` and `after()` insert mixed siblings through the same path, while `replaceWith()` inserts replacements and detaches the anchor through the same Range and listener path. `insertAdjacentHTML()` parses and inserts fragments at all four positions through that path. The script runtime now also exposes bounded `ArrayBuffer` and `Uint8Array` byte values with shared backing buffers, byte-offset and length views, copying `slice()`, sharing `subarray()`, and `crypto.subtle.digest()` for SHA-1, SHA-256, SHA-384, and SHA-512 over either type, while key generation, encryption, signing, verification, and secure randomness remain future gates.
 
@@ -8,15 +8,23 @@ The custom DOM path now covers live text-node `splitText()` and `normalize()` op
 
 The custom runtime now has bounded IndexedDB and an optional persistent storage bucket. `indexedDB.open()` and `deleteDatabase()` return callback-based requests, version upgrades expose `upgradeneeded`, and readonly or readwrite transactions expose object-store creation, deletion, and structured-cloned `put()`, `add()`, `get()`, `delete()`, `clear()`, `count()`, `getAll()`, and `getAllKeys()` operations. The shared clone path covers primitives, arrays, plain objects, `Map`, `Set`, `ArrayBuffer`, `Uint8Array`, `Blob`, `File`, and `Error` values, with fixed depth, node, string, and byte limits. `structuredClone()` and Worker messages use the same path. Database and object-store state survives full-document navigation in one browser session. A host can pass `Browser::with_storage_directory()` to reload localStorage, CacheStorage, and IndexedDB from a versioned atomic snapshot on the next browser instance, with a reader for the prior JSON record format and a writer for the current clone-tag format, while sessionStorage remains session-only. The storage bucket is origin-scoped by the engine's fixed app origin and rejects malformed or oversized snapshots before use. Transfer lists, cycles, shared-reference identity, indexes, and cursors remain separate gates.
 
-Ceri should keep CEF as the shipping engine while two independent engine tracks are explored. The first is a dependency-free custom engine laboratory written in Rust. The second is a Servo comparison backend because Servo is written in Rust, exposes an embedding-oriented `WebView` API, and has active desktop support for Windows, macOS, and Linux. Neither track is ready to replace the CEF path without an application compatibility and recovery test suite.
+The Rust-native engine is no longer only a laboratory. The runtime's `custom-engine` build serves the packaged app through the same asset-origin policy as the CEF path, renders it with installed system fonts at the display device pixel ratio, reaches `4 / 4` on the continuity page, and ships as a 3.8 MB bundle of nine files that holds 25.9 MB resident with the app open. The CEF bundle of the same app is 411 MB across 252 files and holds 319.7 MB resident across six processes.
 
-This separates three different goals:
+CEF stays the default engine anyway, and the reason is compatibility rather than architecture. The gates below are still open, and an app that needs any of them would regress on the Rust-native engine:
 
-1. Ceri owns its desktop runtime and app protocol. This is the current product work.
-2. Ceri can embed a browser engine through a stable adapter boundary. This is the next architecture task.
-3. Ceri implements a browser engine from first principles. This is a long-term research project with no shipping commitment.
+- media playback, WebGL and other GPU APIs
+- CSS animations, transitions, generated content, rounded corners, shadows and gradients
+- full WebAssembly beyond the bounded i32 module path
+- multi-process renderer isolation and a per-renderer sandbox
+- any browser-compatibility suite result, including web-platform-tests
 
-Writing a new engine from scratch would require a standards implementation, JavaScript and WebAssembly execution, layout, painting, compositing, networking, media, accessibility, security boundaries, and platform integrations. Replacing CEF before those pieces pass the same tests would trade a known dependency for an unfinished browser.
+The Servo comparison track stays open for the layers where growing our own engine is the worse trade, particularly GPU-backed compositing and media.
+
+That gives three separable goals:
+
+1. Ceri owns its desktop runtime and app protocol. Shipped, on both engines.
+2. Ceri can drive an engine through a stable adapter boundary. Shipped: the `EngineHost` frame and input boundary, `ResourceProvider`, `FilePicker`, `ClipboardProvider` and `FontSource` seams, plus the shared native window host.
+3. Ceri's own engine covers enough of the web platform to be the default. Open, and the gate list above is the work.
 
 ## Candidates
 
@@ -26,7 +34,7 @@ Writing a new engine from scratch would require a standards implementation, Java
 | Servo | Rust implementation, an embedding `WebView` API, WebGL and WebGPU, and Windows, macOS, Linux, Android, and OpenHarmony targets | Embedding documentation is still sparse, media needs GStreamer, the public API is evolving, and Servo has no 1.0 release or specific security guarantees | Keep as a comparison backend |
 | Ladybird | A genuinely independent engine built from scratch with no Blink, WebKit, or Gecko code | The project is targeting its first 2026 alpha on Linux and macOS, and it is primarily a browser project rather than an embeddable desktop runtime | Track for research, not a Ceri backend yet |
 | WPE WebKit | A focused embedded WebKit port with hardware-accelerated rendering and media support | WPE currently runs on Linux-based systems, and WebRTC is disabled in official release tarballs by default | Useful Linux comparison, not the all-platform engine |
-| New engine written by Ceri | Full ownership of architecture and policy | Full browser-engine scope, long compatibility tail, and no security history | Build the isolated laboratory now |
+| New engine written by Ceri | Full ownership of architecture and policy, and a bundle two orders of magnitude smaller | Full browser-engine scope, long compatibility tail, and no security history | Shipping as the selectable `custom-engine` build, not yet the default |
 
 The Servo embedding chapter explicitly says its documentation is sparse and still in progress. It also documents that common desktop media support requires the GStreamer feature and platform libraries. Servo's LTS guidance says the library has no 1.0 release and is provided on a best-effort basis without specific security guarantees. Those are acceptable conditions for an isolated experiment and unacceptable conditions for silently replacing the production backend.
 
@@ -143,7 +151,9 @@ An experimental backend must pass these gates in order:
 - no renderer access to the asset root outside the native boundary
 - reproducible resource packaging and an upgrade path for engine security fixes
 
-CEF remains the comparison baseline. The Servo experiment should report pass counts and failures against the same pages, startup time, first usable frame, steady-state memory, renderer crash recovery, and bundle size. A speed claim is not valid until the workload and engine versions are pinned.
+CEF remains the comparison baseline. Any engine claim must report pass counts and failures against the same pages, startup time, first usable frame, steady-state memory, renderer crash recovery, and bundle size. A speed claim is not valid until the workload and engine versions are pinned.
+
+The current measurements were taken on Windows x64 release builds of this repository, rendering `web/index.html` at 1120x720: 3.8 MB bundle, 9 files, one process, 25.9 MB resident four seconds after launch, and a 378 ms median from process start to a written PNG of the first frame including font indexing. The CEF bundle of the same app measured 411 MB, 252 files, six processes and 319.7 MB resident. Startup for the CEF path is not instrumented, so no startup comparison is claimed.
 
 ## First experiment
 

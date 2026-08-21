@@ -1,0 +1,56 @@
+name: runtime
+
+on:
+  push:
+    paths:
+      - ".github/workflows/runtime.yml"
+      - "src/**"
+      - "engine/**"
+      - "web/**"
+      - "sdk/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - ".github/workflows/runtime.yml"
+      - "src/**"
+      - "engine/**"
+      - "web/**"
+      - "sdk/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  custom-engine:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: install linux window dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libxkbcommon-dev
+      - name: test
+        run: cargo test --locked --no-default-features --features custom-engine --all-targets
+      - name: clippy
+        run: cargo clippy --locked --no-default-features --features custom-engine --all-targets -- -D warnings
+      - name: render the packaged app without a window
+        shell: bash
+        run: |
+          cargo run --locked --no-default-features --features custom-engine --bin ceri -- \
+            "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target/app.png"
+          test -s target/app.png
+      - name: bundle
+        run: cargo run --locked --no-default-features --features custom-engine --bin ceri_bundle -- --output dist/ci
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
