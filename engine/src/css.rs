@@ -1,4 +1,5 @@
 use crate::dom::{Document, Element, Node, NodePath};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -644,6 +645,73 @@ impl Edges {
 pub struct Stylesheet {
     rules: Vec<Rule>,
     keyframes: Vec<Keyframes>,
+    index: RuleIndex,
+}
+
+// rules bucketed by the rightmost id, class or tag, so an element only tries plausible rules
+#[derive(Clone, Debug, Default)]
+struct RuleIndex {
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_tag: HashMap<String, Vec<usize>>,
+    universal: Vec<usize>,
+}
+
+impl RuleIndex {
+    fn build(rules: &[Rule]) -> Self {
+        let mut index = Self::default();
+        for (position, rule) in rules.iter().enumerate() {
+            for selector in &rule.selectors {
+                let Some(subject) = selector.parts.last().map(|part| &part.compound) else {
+                    continue;
+                };
+                if let Some(id) = subject.id.as_ref() {
+                    index.by_id.entry(id.clone()).or_default().push(position);
+                } else if let Some(class) = subject.classes.first() {
+                    index
+                        .by_class
+                        .entry(class.clone())
+                        .or_default()
+                        .push(position);
+                } else if let Some(tag) = subject.tag.as_ref() {
+                    index.by_tag.entry(tag.clone()).or_default().push(position);
+                } else {
+                    index.universal.push(position);
+                }
+            }
+        }
+        for bucket in index
+            .by_id
+            .values_mut()
+            .chain(index.by_class.values_mut())
+            .chain(index.by_tag.values_mut())
+            .chain(std::iter::once(&mut index.universal))
+        {
+            bucket.sort_unstable();
+            bucket.dedup();
+        }
+        index
+    }
+
+    fn candidates(&self, subject: &Element) -> Vec<usize> {
+        let mut candidates = self.universal.clone();
+        if let Some(bucket) = self.by_tag.get(&subject.name) {
+            candidates.extend_from_slice(bucket);
+        }
+        if let Some(id) = subject.attr("id")
+            && let Some(bucket) = self.by_id.get(id)
+        {
+            candidates.extend_from_slice(bucket);
+        }
+        for class in subject.classes() {
+            if let Some(bucket) = self.by_class.get(class) {
+                candidates.extend_from_slice(bucket);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -709,7 +777,12 @@ impl Stylesheet {
         let mut rules = Vec::new();
         let mut keyframes = Vec::new();
         parse_rules(&source, None, &mut rules, &mut keyframes, None)?;
-        Ok(Self { rules, keyframes })
+        let index = RuleIndex::build(&rules);
+        Ok(Self {
+            rules,
+            keyframes,
+            index,
+        })
     }
 
     // page rendering follows CSS error handling: an unsupported rule is dropped, the rest applies
@@ -725,7 +798,15 @@ impl Stylesheet {
             &mut keyframes,
             Some(&mut dropped),
         );
-        (Self { rules, keyframes }, dropped)
+        let index = RuleIndex::build(&rules);
+        (
+            Self {
+                rules,
+                keyframes,
+                index,
+            },
+            dropped,
+        )
     }
 
     // the animated values of an element at the current clock, blended between keyframes
@@ -861,11 +942,11 @@ impl Stylesheet {
             }
             match value.trim().to_ascii_lowercase().as_str() {
                 "initial" => {
-                    properties.remove(&property);
+                    properties.remove(property.as_ref());
                 }
                 "inherit" | "unset" => {}
                 _ => {
-                    properties.insert(property, value);
+                    properties.insert(property.into_owned(), value.into_owned());
                 }
             }
         }
@@ -957,7 +1038,7 @@ impl Stylesheet {
                 continue;
             }
             apply_declaration(&mut style, &property, &value);
-            base_values.insert(property, value);
+            base_values.insert(property.into_owned(), value);
         }
         // animated values win over the normal cascade, as the animation origin requires
         if let Some(animation) = animation.filter(|_| !state.reduced_motion) {
@@ -986,9 +1067,18 @@ impl Stylesheet {
         path: &[usize],
         ancestors: &[&Element],
         state: &StyleState,
-    ) -> HashMap<String, (Specificity, usize, String)> {
-        let mut values: HashMap<String, (Specificity, usize, String)> = HashMap::new();
-        for rule in &self.rules {
+    ) -> HashMap<Cow<'_, str>, (Specificity, usize, Cow<'_, str>)> {
+        let mut values: HashMap<Cow<'_, str>, (Specificity, usize, Cow<'_, str>)> = HashMap::new();
+        // a generated box carries the id, classes and tag of the element that owns it
+        let subject = if element.name.starts_with("::") {
+            ancestors.last().copied().unwrap_or(element)
+        } else {
+            element
+        };
+        for position in self.index.candidates(subject) {
+            let Some(rule) = self.rules.get(position) else {
+                continue;
+            };
             if rule
                 .media
                 .as_ref()
@@ -1006,12 +1096,16 @@ impl Stylesheet {
                 continue;
             };
             for declaration in &rule.declarations {
-                let candidate = (specificity, rule.order, declaration.value.clone());
+                let candidate = (
+                    specificity,
+                    rule.order,
+                    Cow::Borrowed(declaration.value.as_str()),
+                );
                 let replace = values
-                    .get(&declaration.property)
+                    .get(declaration.property.as_str())
                     .is_none_or(|current| (candidate.0, candidate.1) >= (current.0, current.1));
                 if replace {
-                    values.insert(declaration.property.clone(), candidate);
+                    values.insert(Cow::Borrowed(declaration.property.as_str()), candidate);
                 }
             }
         }
@@ -1021,8 +1115,12 @@ impl Stylesheet {
         {
             for declaration in declarations {
                 values.insert(
-                    declaration.property.clone(),
-                    (Specificity::INLINE, usize::MAX, declaration.value),
+                    Cow::Owned(declaration.property),
+                    (
+                        Specificity::INLINE,
+                        usize::MAX,
+                        Cow::Owned(declaration.value),
+                    ),
                 );
             }
         }

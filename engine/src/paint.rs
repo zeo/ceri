@@ -168,12 +168,28 @@ impl Canvas {
             width * self.scale,
             height * self.scale,
         );
-        let left = x.floor().max(0.0) as u32;
-        let top = y.floor().max(0.0) as u32;
-        let right = (x + width).ceil().max(0.0).min(self.width as f32) as u32;
-        let bottom = (y + height).ceil().max(0.0).min(self.height as f32) as u32;
-        for pixel_y in top.min(self.height)..bottom.min(self.height) {
-            for pixel_x in left.min(self.width)..right.min(self.width) {
+        let left = (x.floor().max(0.0) as u32).min(self.width);
+        let top = (y.floor().max(0.0) as u32).min(self.height);
+        let right = ((x + width).ceil().max(0.0) as u32).min(self.width);
+        let bottom = ((y + height).ceil().max(0.0) as u32).min(self.height);
+        if right <= left || bottom <= top {
+            return;
+        }
+        // an opaque span is a row copy, which is the hot path for backgrounds and borders
+        if color.alpha == 255 {
+            let sample = [color.red, color.green, color.blue, 255];
+            let stride = self.width as usize * 4;
+            for pixel_y in top..bottom {
+                let start = pixel_y as usize * stride + left as usize * 4;
+                let end = pixel_y as usize * stride + right as usize * 4;
+                for slot in self.pixels[start..end].chunks_exact_mut(4) {
+                    slot.copy_from_slice(&sample);
+                }
+            }
+            return;
+        }
+        for pixel_y in top..bottom {
+            for pixel_x in left..right {
                 self.blend_pixel(pixel_x, pixel_y, color);
             }
         }
@@ -248,6 +264,23 @@ impl Canvas {
         if shape.width <= 0.0 || shape.height <= 0.0 {
             return;
         }
+        // a square edged solid fill is the common case, and the rect path is much cheaper
+        if shape.radius <= 0.0
+            && let Paint::Solid(color) = paint
+        {
+            match clip {
+                Some(clip) => self.fill_rect_clipped(
+                    shape.x,
+                    shape.y,
+                    shape.width,
+                    shape.height,
+                    *color,
+                    clip,
+                ),
+                None => self.fill_rect(shape.x, shape.y, shape.width, shape.height, *color),
+            }
+            return;
+        }
         let device = shape.to_device(self.scale);
         let clip = clip.map(|clip| Shape::from_rect(clip, 0.0).to_device(self.scale));
         let radius = device
@@ -286,6 +319,13 @@ impl Canvas {
 
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
         let index = ((y * self.width + x) * 4) as usize;
+        if color.alpha == 255 {
+            self.pixels[index] = color.red;
+            self.pixels[index + 1] = color.green;
+            self.pixels[index + 2] = color.blue;
+            self.pixels[index + 3] = 255;
+            return;
+        }
         let alpha = color.alpha as u32;
         let inverse = 255 - alpha;
         self.pixels[index] =
@@ -721,11 +761,40 @@ fn paint_box_surface(
     let outer = Shape::from_rect(rect, radius);
     let border = layout_box.border_width.max(0.0);
     if border > 0.0 && layout_box.border_color.alpha > 0 {
-        canvas.fill_shape(
-            outer,
-            &Paint::Solid(layout_box.border_color.scale_alpha(opacity)),
-            clip,
-        );
+        let color = layout_box.border_color.scale_alpha(opacity);
+        if radius > 0.0 {
+            canvas.fill_shape(outer, &Paint::Solid(color), clip);
+        } else {
+            // square borders paint as four edges, so the box interior is filled once
+            for edge in [
+                Rect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: border,
+                },
+                Rect {
+                    x: rect.x,
+                    y: rect.y + rect.height - border,
+                    width: rect.width,
+                    height: border,
+                },
+                Rect {
+                    x: rect.x,
+                    y: rect.y + border,
+                    width: border,
+                    height: (rect.height - border * 2.0).max(0.0),
+                },
+                Rect {
+                    x: rect.x + rect.width - border,
+                    y: rect.y + border,
+                    width: border,
+                    height: (rect.height - border * 2.0).max(0.0),
+                },
+            ] {
+                canvas.fill_shape(Shape::from_rect(edge, 0.0), &Paint::Solid(color), clip);
+            }
+        }
     }
     let surface = outer.inset(border);
     if let Some(gradient) = layout_box.gradient {

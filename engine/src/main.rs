@@ -20,6 +20,7 @@ struct Options {
     ticks: Vec<u64>,
     font: Option<PathBuf>,
     bold_font: Option<PathBuf>,
+    frames: usize,
 }
 
 fn main() -> Result<(), String> {
@@ -124,6 +125,9 @@ fn main() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         println!("advanced {milliseconds}ms: {} task(s)", executed.tasks_run);
     }
+    if options.frames > 0 {
+        report_frame_times(&mut host, options.frames)?;
+    }
     let layout = host
         .browser()
         .layout(options.viewport)
@@ -170,6 +174,42 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+// a frame here is one clock tick plus a full layout and paint pass
+fn report_frame_times(host: &mut EngineHost, frames: usize) -> Result<(), String> {
+    let mut samples = Vec::with_capacity(frames);
+    for _ in 0..frames {
+        let started = std::time::Instant::now();
+        host.input(InputEvent::AdvanceTime(16))
+            .map_err(|error| error.to_string())?;
+        host.render().map_err(|error| error.to_string())?;
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(|left, right| left.partial_cmp(right).expect("frame times are finite"));
+    let median = samples[samples.len() / 2];
+    let worst = samples[samples.len() - 1];
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    println!(
+        "{frames} frames: {median:.2} ms median, {mean:.2} ms mean, {worst:.2} ms worst, {:.0} fps at the median",
+        1000.0 / median.max(f64::EPSILON)
+    );
+    // the split tells a slow cascade apart from a slow paint pass
+    let viewport = host.viewport();
+    let mut layout_samples = Vec::with_capacity(frames);
+    for _ in 0..frames {
+        let started = std::time::Instant::now();
+        host.browser()
+            .layout(viewport)
+            .map_err(|error| error.to_string())?;
+        layout_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    layout_samples.sort_by(|left, right| left.partial_cmp(right).expect("times are finite"));
+    println!(
+        "layout only: {:.2} ms median",
+        layout_samples[layout_samples.len() / 2]
+    );
+    Ok(())
+}
+
 fn load_font(path: &Path) -> Result<std::rc::Rc<FontFace>, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -196,6 +236,7 @@ where
     let mut scale = 1.0_f32;
     let mut font = None;
     let mut bold_font = None;
+    let mut frames = 0_usize;
     let mut ticks = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
@@ -217,12 +258,17 @@ where
                 asset_root = Some(PathBuf::from(next_value(&mut args, "--asset-root")?))
             }
             "--scale" => scale = parse_scale(next_value(&mut args, "--scale")?)?,
+            "--frames" => {
+                frames = next_value(&mut args, "--frames")?
+                    .parse()
+                    .map_err(|_| "frames must be a non-negative integer".to_string())?
+            }
             "--font" => font = Some(PathBuf::from(next_value(&mut args, "--font")?)),
             "--bold-font" => bold_font = Some(PathBuf::from(next_value(&mut args, "--bold-font")?)),
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--frames N] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -244,6 +290,7 @@ where
         scale,
         font,
         bold_font,
+        frames,
         viewport: Size {
             width: width as f32,
             height: height as f32,

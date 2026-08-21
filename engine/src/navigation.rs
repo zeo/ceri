@@ -818,7 +818,9 @@ struct LoadedResource {
 struct Page {
     document: Rc<RefCell<Document>>,
     runtime: ScriptRuntime,
-    stylesheet: String,
+    // parsed once per document, because layout and paint run on every frame
+    stylesheet: Stylesheet,
+    animated: bool,
 }
 
 enum HistoryCommit {
@@ -1129,7 +1131,8 @@ impl Browser {
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
         runtime.set_viewport_metrics(self.viewport);
-        for dropped in Stylesheet::parse_recovering(&stylesheet).1 {
+        let (parsed_stylesheet, dropped_rules) = Stylesheet::parse_recovering(&stylesheet);
+        for dropped in dropped_rules {
             runtime.report(format!("dropped CSS rule: {dropped}"));
         }
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
@@ -1148,10 +1151,12 @@ impl Browser {
         self.persist_storage()?;
 
         let pending_navigation = runtime.take_navigation_request();
+        let animated = parsed_stylesheet.has_animations();
         self.page = Some(Page {
             document,
             runtime,
-            stylesheet,
+            stylesheet: parsed_stylesheet,
+            animated,
         });
         self.last_navigation_failure = None;
         self.hovered_path = None;
@@ -1172,12 +1177,9 @@ impl Browser {
 
     // a page with a running animation needs a frame per clock tick
     pub fn has_active_animations(&self) -> bool {
-        self.page.as_ref().is_some_and(|page| {
-            !self.preferences.reduced_motion
-                && Stylesheet::parse_recovering(&page.stylesheet)
-                    .0
-                    .has_animations()
-        })
+        self.page
+            .as_ref()
+            .is_some_and(|page| page.animated && !self.preferences.reduced_motion)
     }
 
     pub fn control_value(&self, path: &[usize]) -> Option<String> {
@@ -1474,7 +1476,7 @@ impl Browser {
         let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
         let document = page.document.clone();
         let document = document.borrow();
-        let (stylesheet, _) = Stylesheet::parse_recovering(&page.stylesheet);
+        let stylesheet = &page.stylesheet;
         let mut style_state = page.runtime.style_state(self.hovered_path.clone());
         style_state.viewport_width = viewport.width;
         style_state.viewport_height = viewport.height;
@@ -1482,7 +1484,7 @@ impl Browser {
         style_state.reduced_motion = self.preferences.reduced_motion;
         style_state.clock = page.runtime.now();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
-        let mut layout = build_layout(&document, &stylesheet, viewport, &style_state);
+        let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(base, &document, &mut layout);
         }
@@ -1847,7 +1849,8 @@ impl Browser {
                 runtime
             },
             document,
-            stylesheet,
+            stylesheet: Stylesheet::parse_recovering(&stylesheet).0,
+            animated: false,
         });
     }
 }
