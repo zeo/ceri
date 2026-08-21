@@ -1,6 +1,6 @@
 use crate::app::create_app;
-use crate::assets::{APP_ORIGIN, AssetOrigin, AssetRoute, RequestTarget};
-use crate::browser::{LaunchConfig, close_all_browsers, show_main_window};
+use crate::browser::{close_all_browsers, show_main_window};
+use crate::launch::{ASSETS_SWITCH, ENTRY_SWITCH, LaunchConfig};
 use crate::platform;
 #[cfg(not(target_os = "windows"))]
 use cef::ImplCommandLine;
@@ -9,11 +9,7 @@ use std::error::Error;
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-const ENTRY_SWITCH: &str = "ceri-entry";
-const ASSETS_SWITCH: &str = "ceri-assets";
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct RuntimeError(String);
@@ -165,44 +161,11 @@ pub(crate) fn prepare_cef() -> Result<(), RuntimeError> {
 }
 
 fn read_launch_config(command_line: &ProcessCommandLine) -> Result<LaunchConfig, RuntimeError> {
-    let asset_root = command_line
-        .switch_value(ASSETS_SWITCH)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_asset_root);
-    let assets = AssetOrigin::new(&asset_root).map_err(|error| {
-        RuntimeError::new(format!(
-            "asset root {} is unavailable: {error}",
-            asset_root.display()
-        ))
-    })?;
-
-    let entry_path = command_line
-        .switch_value(ENTRY_SWITCH)
-        .unwrap_or_else(|| detect_entry(assets.root()).to_string());
-    let entry_path = normalized_entry(&entry_path)?;
-    let initial_url = format!("{APP_ORIGIN}{entry_path}");
-    match assets
-        .route(&initial_url, RequestTarget::TopLevelNavigation)
-        .map_err(|error| RuntimeError::new(format!("could not inspect app entry: {error}")))?
-    {
-        AssetRoute::File(_) | AssetRoute::AppShell(_) => {}
-        AssetRoute::NotFound => {
-            return Err(RuntimeError::new(format!(
-                "app entry {entry_path} does not exist under {}",
-                assets.root().display()
-            )));
-        }
-        AssetRoute::Rejected(reason) => {
-            return Err(RuntimeError::new(format!(
-                "app entry {entry_path} is unsafe: {reason:?}"
-            )));
-        }
-    }
-
-    Ok(LaunchConfig {
-        assets: Arc::new(assets),
-        initial_url,
-    })
+    crate::launch::resolve(
+        command_line.switch_value(ASSETS_SWITCH).map(PathBuf::from),
+        command_line.switch_value(ENTRY_SWITCH),
+    )
+    .map_err(RuntimeError::new)
 }
 
 fn command_line_for_run(args: &Args) -> Option<CommandLine> {
@@ -301,55 +264,6 @@ impl ProcessCommandLine {
     }
 }
 
-fn normalized_entry(entry: &str) -> Result<String, RuntimeError> {
-    if entry.contains("://") || entry.contains(['?', '#', '\0']) {
-        return Err(RuntimeError::new(
-            "app entry must be an absolute origin path",
-        ));
-    }
-    Ok(if entry.starts_with('/') {
-        entry.to_string()
-    } else {
-        format!("/{entry}")
-    })
-}
-
-fn detect_entry(asset_root: &Path) -> &'static str {
-    if asset_root.join("index.html").is_file() {
-        "/index.html"
-    } else {
-        "/web/index.html"
-    }
-}
-
-fn default_asset_root() -> PathBuf {
-    let beside_executable = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("assets")));
-    if let Some(path) = beside_executable.filter(|path| path.is_dir()) {
-        return path;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
 fn profile_path() -> Result<PathBuf, RuntimeError> {
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library").join("Application Support"));
-
-    #[cfg(target_os = "linux")]
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        });
-
-    base.map(|path| path.join("Ceri").join("profile"))
-        .ok_or_else(|| RuntimeError::new("could not resolve a per-user profile directory"))
+    crate::launch::profile_path().map_err(RuntimeError::new)
 }

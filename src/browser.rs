@@ -1,5 +1,6 @@
 use crate::app::{is_app_url, is_internal_candidate};
 use crate::assets::{APP_ORIGIN, AssetOrigin, AssetRoute, RequestTarget};
+use crate::launch::LaunchConfig;
 use cef::*;
 use std::cell::RefCell;
 use std::fs::File;
@@ -7,12 +8,6 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-
-#[derive(Clone)]
-pub struct LaunchConfig {
-    pub assets: Arc<AssetOrigin>,
-    pub initial_url: String,
-}
 
 pub fn create_browser_process(launch: LaunchConfig) -> BrowserProcessHandler {
     CeriBrowserProcess::new(launch, RefCell::new(None))

@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "A Rust-owned desktop web runtime with a bundled Chromium engine"
+description = "A Rust-owned desktop web runtime with its own browser engine"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -20,20 +20,27 @@ path = "src/main.rs"
 [[bin]]
 name = "ceri_helper"
 path = "src/bin/ceri_helper.rs"
+required-features = ["cef-engine"]
 
 [[bin]]
 name = "ceri_bundle"
 path = "src/bin/ceri_bundle.rs"
 
 [features]
-default = ["sandbox"]
-sandbox = ["cef/sandbox"]
+default = ["cef-engine", "sandbox"]
+cef-engine = ["dep:cef"]
+custom-engine = ["dep:ceri-engine"]
+sandbox = ["cef-engine", "cef/sandbox"]
 
 [package.metadata.cef.bundle]
 helper_name = "ceri_helper"
 
 [dependencies]
-cef = { version = "=150.2.1", features = ["build-util"] }
+cef = { version = "=150.2.1", features = ["build-util"], optional = true }
+ceri-engine = { path = "engine", features = [
+    "windowed",
+    "native-http",
+], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"

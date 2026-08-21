@@ -1014,6 +1014,9 @@ impl Browser {
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
         runtime.set_viewport_metrics(self.viewport);
+        for dropped in Stylesheet::parse_recovering(&stylesheet).1 {
+            runtime.report(format!("dropped CSS rule: {dropped}"));
+        }
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -1319,8 +1322,7 @@ impl Browser {
         let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
         let document = page.document.clone();
         let document = document.borrow();
-        let stylesheet =
-            Stylesheet::parse(&page.stylesheet).map_err(NavigationError::Stylesheet)?;
+        let (stylesheet, _) = Stylesheet::parse_recovering(&page.stylesheet);
         let mut style_state = page.runtime.style_state(self.hovered_path.clone());
         style_state.viewport_width = viewport.width;
         style_state.viewport_height = viewport.height;
@@ -2028,7 +2030,7 @@ fn relative_url_path(path: &Path) -> io::Result<String> {
     Ok(format!("/{}", segments.join("/")))
 }
 
-fn mime_type_for(path: &Path) -> &'static str {
+pub fn mime_type_for(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())

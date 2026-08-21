@@ -3130,6 +3130,10 @@ impl ScriptRuntime {
         &self.logs
     }
 
+    pub(crate) fn report(&mut self, message: impl Into<String>) {
+        self.logs.push(message.into());
+    }
+
     pub(crate) fn canvas_commands(&self) -> &[CanvasCommand] {
         &self.canvas_commands
     }

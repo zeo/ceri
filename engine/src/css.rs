@@ -376,8 +376,17 @@ impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = strip_comments(source);
         let mut rules = Vec::new();
-        parse_rules(&source, None, &mut rules)?;
+        parse_rules(&source, None, &mut rules, None)?;
         Ok(Self { rules })
+    }
+
+    // page rendering follows CSS error handling: an unsupported rule is dropped, the rest applies
+    pub fn parse_recovering(source: &str) -> (Self, Vec<String>) {
+        let source = strip_comments(source);
+        let mut rules = Vec::new();
+        let mut dropped = Vec::new();
+        let _ = parse_rules(&source, None, &mut rules, Some(&mut dropped));
+        (Self { rules }, dropped)
     }
 
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
@@ -534,8 +543,9 @@ impl Stylesheet {
                 }
             }
         }
+        let mut inline_dropped = Vec::new();
         if let Some(inline) = element.attr("style")
-            && let Ok(declarations) = parse_declarations(inline)
+            && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
         {
             for declaration in declarations {
                 values.insert(
@@ -1006,6 +1016,7 @@ fn parse_rules(
     source: &str,
     media: Option<MediaCondition>,
     rules: &mut Vec<Rule>,
+    mut dropped: Option<&mut Vec<String>>,
 ) -> Result<(), String> {
     let mut cursor = 0;
     while cursor < source.len() {
@@ -1014,39 +1025,89 @@ fn parse_rules(
             if remaining.trim().is_empty() {
                 break;
             }
-            return Err("stylesheet has text outside a rule".to_string());
+            return drop_or_fail(
+                dropped.as_deref_mut(),
+                "stylesheet has text outside a rule".to_string(),
+            );
         };
         let open = cursor + relative_open;
         let header = source[cursor..open].trim();
-        if header.is_empty() {
-            return Err("stylesheet rule has no selector".to_string());
-        }
-        let close = matching_brace(source, open)?;
+        let close = match matching_brace(source, open) {
+            Ok(close) => close,
+            Err(error) => {
+                drop_or_fail(dropped.as_deref_mut(), error)?;
+                break;
+            }
+        };
         let body = &source[open + 1..close];
+        cursor = close + 1;
+        if header.is_empty() {
+            drop_or_fail(
+                dropped.as_deref_mut(),
+                "stylesheet rule has no selector".to_string(),
+            )?;
+            continue;
+        }
         if header
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@media"))
         {
-            let nested_media = parse_media_condition(header)?;
             if media.is_some() {
-                return Err("nested media rules are not supported".to_string());
+                drop_or_fail(
+                    dropped.as_deref_mut(),
+                    "nested media rules are not supported".to_string(),
+                )?;
+                continue;
             }
-            parse_rules(body, Some(nested_media), rules)?;
-        } else if header.starts_with('@') {
-            return Err(format!("unsupported at-rule: {header}"));
-        } else {
-            let selectors = Selector::parse_list(header)?;
-            let declarations = parse_declarations(body)?;
-            rules.push(Rule {
-                selectors,
-                declarations,
-                order: rules.len(),
-                media: media.clone(),
-            });
+            let nested_media = match parse_media_condition(header) {
+                Ok(condition) => condition,
+                Err(error) => {
+                    drop_or_fail(dropped.as_deref_mut(), error)?;
+                    continue;
+                }
+            };
+            parse_rules(body, Some(nested_media), rules, dropped.as_deref_mut())?;
+            continue;
         }
-        cursor = close + 1;
+        if header.starts_with('@') {
+            drop_or_fail(
+                dropped.as_deref_mut(),
+                format!("unsupported at-rule: {header}"),
+            )?;
+            continue;
+        }
+        let selectors = match Selector::parse_list(header) {
+            Ok(selectors) => selectors,
+            Err(error) => {
+                drop_or_fail(dropped.as_deref_mut(), format!("{header}: {error}"))?;
+                continue;
+            }
+        };
+        let declarations = match parse_declarations(body, dropped.as_deref_mut()) {
+            Ok(declarations) => declarations,
+            Err(error) => {
+                drop_or_fail(dropped.as_deref_mut(), format!("{header}: {error}"))?;
+                continue;
+            }
+        };
+        rules.push(Rule {
+            selectors,
+            declarations,
+            order: rules.len(),
+            media: media.clone(),
+        });
     }
     Ok(())
+}
+
+fn drop_or_fail(dropped: Option<&mut Vec<String>>, error: String) -> Result<(), String> {
+    match dropped {
+        Some(dropped) => {
+            dropped.push(error);
+            Ok(())
+        }
+        None => Err(error),
+    }
 }
 
 fn matching_brace(source: &str, open: usize) -> Result<usize, String> {
@@ -1109,7 +1170,10 @@ fn parse_media_dimension(value: &str) -> Result<f32, String> {
         .ok_or_else(|| "media dimension must be finite".to_string())
 }
 
-fn parse_declarations(source: &str) -> Result<Vec<Declaration>, String> {
+fn parse_declarations(
+    source: &str,
+    mut dropped: Option<&mut Vec<String>>,
+) -> Result<Vec<Declaration>, String> {
     let mut declarations = Vec::new();
     for chunk in source.split(';') {
         let chunk = chunk.trim();
@@ -1117,7 +1181,11 @@ fn parse_declarations(source: &str) -> Result<Vec<Declaration>, String> {
             continue;
         }
         let Some(colon) = chunk.find(':') else {
-            return Err(format!("declaration has no colon: {chunk}"));
+            drop_or_fail(
+                dropped.as_deref_mut(),
+                format!("declaration has no colon: {chunk}"),
+            )?;
+            continue;
         };
         let property_name = chunk[..colon].trim();
         let property = if property_name.starts_with("--") {
@@ -1127,7 +1195,11 @@ fn parse_declarations(source: &str) -> Result<Vec<Declaration>, String> {
         };
         let value = chunk[colon + 1..].trim().to_string();
         if property.is_empty() || value.is_empty() {
-            return Err(format!("invalid declaration: {chunk}"));
+            drop_or_fail(
+                dropped.as_deref_mut(),
+                format!("invalid declaration: {chunk}"),
+            )?;
+            continue;
         }
         declarations.push(Declaration { property, value });
     }
@@ -1988,6 +2060,27 @@ mod tests {
         assert_eq!(selectors.len(), 2);
         assert!(Selector::parse_list(".card,").is_err());
         assert!(Stylesheet::parse(".card, { color: red; }").is_err());
+    }
+
+    #[test]
+    fn recovering_parse_keeps_valid_rules_and_reports_the_rest() {
+        let (stylesheet, dropped) = Stylesheet::parse_recovering(
+            r#"body::before { content: ""; } .card { color: red; } @keyframes signal { from { opacity: 0; } } p { color: } .last { color: blue; }"#,
+        );
+        assert_eq!(stylesheet.rules.len(), 3);
+        assert_eq!(
+            stylesheet
+                .rules
+                .iter()
+                .map(|rule| rule.declarations.len())
+                .collect::<Vec<_>>(),
+            vec![1, 0, 1]
+        );
+        assert_eq!(dropped.len(), 3);
+        assert!(dropped[0].starts_with("body::before"));
+        assert!(dropped[1].starts_with("unsupported at-rule: @keyframes"));
+        assert!(dropped[2].contains("invalid declaration: color:"));
+        assert!(Stylesheet::parse("body::before { content: \"\"; }").is_err());
     }
 
     #[test]

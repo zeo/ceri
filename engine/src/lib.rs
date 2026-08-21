@@ -27,7 +27,7 @@ pub use native_http::NativeHttpProvider;
 pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, ClipboardProvider, FilePicker, FilePickerRequest, FileSelection,
     NavigationError, NavigationFailure, NavigationStatus, Resource, ResourceBundle,
-    ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
+    ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse, mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};

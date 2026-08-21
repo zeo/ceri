@@ -1,5 +1,6 @@
 use crate::assets::APP_ORIGIN;
-use crate::browser::{LaunchConfig, create_browser_process};
+use crate::browser::create_browser_process;
+use crate::launch::LaunchConfig;
 use cef::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
