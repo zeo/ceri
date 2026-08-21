@@ -124,7 +124,13 @@ impl LengthTerms {
             + self.percent * containing / 100.0
             + self.viewport_width * environment.viewport.width / 100.0
             + self.viewport_height * environment.viewport.height / 100.0
-            + self.zero_width * crate::font::active_fonts().advance('0', font_size, false)
+            + self.zero_width
+                * crate::font::active_fonts().advance(
+                    '0',
+                    crate::font::FontStack::default(),
+                    font_size,
+                    false,
+                )
     }
 
     fn is_finite(self) -> bool {
@@ -272,6 +278,7 @@ impl Edges {
 pub(crate) struct InheritedText {
     pub(crate) transform: TextTransform,
     pub(crate) letter_spacing: Length,
+    pub(crate) family: crate::font::FontStack,
 }
 
 impl Default for InheritedText {
@@ -279,6 +286,7 @@ impl Default for InheritedText {
         Self {
             transform: TextTransform::None,
             letter_spacing: Length::px(0.0),
+            family: crate::font::FontStack::default(),
         }
     }
 }
@@ -447,6 +455,7 @@ pub(crate) struct Style {
     pub text_align: TextAlign,
     pub text_transform: TextTransform,
     pub letter_spacing: Length,
+    pub font_family: crate::font::FontStack,
     pub font_weight: FontWeight,
     pub flex_direction: FlexDirection,
     pub justify_content: JustifyContent,
@@ -484,6 +493,7 @@ impl Style {
             text_align: TextAlign::Left,
             text_transform: parent_text.transform,
             letter_spacing: parent_text.letter_spacing,
+            font_family: parent_text.family,
             font_weight: parent_weight,
             flex_direction: FlexDirection::Row,
             justify_content: JustifyContent::FlexStart,
@@ -1642,6 +1652,9 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "right" => TextAlign::Right,
                 _ => TextAlign::Left,
             };
+        }
+        "font-family" => {
+            style.font_family = crate::font::intern_font_stack(value);
         }
         "text-transform" => {
             style.text_transform = match value.trim().to_ascii_lowercase().as_str() {

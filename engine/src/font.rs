@@ -560,15 +560,91 @@ fn accumulate_segment(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GlyphKey {
+    family: FontStack,
     glyph: u16,
     size: u32,
     bold: bool,
 }
 
+type FaceCache = HashMap<(FontStack, bool), Option<Rc<FontFace>>>;
+
+// a css font-family list, interned so inherited style values stay copyable
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FontStack(u32);
+
+const MAX_FONT_STACKS: usize = 256;
+
+thread_local! {
+    static FONT_STACKS: RefCell<FontStackTable> = RefCell::new(FontStackTable::default());
+}
+
+#[derive(Default)]
+struct FontStackTable {
+    families: Vec<Rc<[String]>>,
+    ids: HashMap<String, FontStack>,
+}
+
+pub fn intern_font_stack(source: &str) -> FontStack {
+    let families: Vec<String> = source
+        .split(',')
+        .map(|family| {
+            family
+                .trim()
+                .trim_matches(['"', '\''])
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|family| !family.is_empty())
+        .collect();
+    if families.is_empty() {
+        return FontStack::default();
+    }
+    let key = families.join(",");
+    FONT_STACKS.with(|table| {
+        let mut table = table.borrow_mut();
+        if let Some(stack) = table.ids.get(&key) {
+            return *stack;
+        }
+        if table.families.len() >= MAX_FONT_STACKS {
+            return FontStack::default();
+        }
+        let stack = FontStack(table.families.len() as u32 + 1);
+        table.families.push(families.into());
+        table.ids.insert(key, stack);
+        stack
+    })
+}
+
+pub fn font_stack_families(stack: FontStack) -> Option<Rc<[String]>> {
+    if stack.0 == 0 {
+        return None;
+    }
+    FONT_STACKS.with(|table| table.borrow().families.get(stack.0 as usize - 1).cloned())
+}
+
+// the host owns font discovery, the engine only asks for a family by name
+pub trait FontSource {
+    fn face(&self, family: &str, bold: bool) -> Option<Rc<FontFace>>;
+}
+
+struct SingleFaceSource {
+    regular: Rc<FontFace>,
+    bold: Option<Rc<FontFace>>,
+}
+
+impl FontSource for SingleFaceSource {
+    fn face(&self, _family: &str, bold: bool) -> Option<Rc<FontFace>> {
+        if bold {
+            return self.bold.clone().or_else(|| Some(self.regular.clone()));
+        }
+        Some(self.regular.clone())
+    }
+}
+
 // text metrics and rasterized glyphs for the whole engine, cached per face and size
 pub struct FontSet {
-    regular: Option<Rc<FontFace>>,
-    bold: Option<Rc<FontFace>>,
+    source: Option<Rc<dyn FontSource>>,
+    faces: RefCell<FaceCache>,
     glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
 }
 
@@ -582,26 +658,30 @@ impl FontSet {
     // the bitmap fallback keeps deterministic metrics when no font file is supplied
     pub fn builtin() -> Self {
         Self {
-            regular: None,
-            bold: None,
+            source: None,
+            faces: RefCell::new(HashMap::new()),
+            glyphs: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub fn from_source(source: Rc<dyn FontSource>) -> Self {
+        Self {
+            source: Some(source),
+            faces: RefCell::new(HashMap::new()),
             glyphs: RefCell::new(HashMap::new()),
         }
     }
 
     pub fn new(regular: Rc<FontFace>, bold: Option<Rc<FontFace>>) -> Self {
-        Self {
-            regular: Some(regular),
-            bold,
-            glyphs: RefCell::new(HashMap::new()),
-        }
+        Self::from_source(Rc::new(SingleFaceSource { regular, bold }))
     }
 
     pub fn is_builtin(&self) -> bool {
-        self.regular.is_none()
+        self.source.is_none()
     }
 
-    pub fn measure(&self, text: &str, size: f32, bold: bool) -> f32 {
-        match self.face(bold) {
+    pub fn measure(&self, text: &str, stack: FontStack, size: f32, bold: bool) -> f32 {
+        match self.face(stack, bold) {
             Some(face) => text
                 .chars()
                 .map(|character| face.advance(face.glyph_for(character), size))
@@ -610,34 +690,41 @@ impl FontSet {
         }
     }
 
-    pub fn advance(&self, character: char, size: f32, bold: bool) -> f32 {
-        match self.face(bold) {
+    pub fn advance(&self, character: char, stack: FontStack, size: f32, bold: bool) -> f32 {
+        match self.face(stack, bold) {
             Some(face) => face.advance(face.glyph_for(character), size),
             None => builtin_advance(size),
         }
     }
 
-    pub fn ascent(&self, size: f32) -> f32 {
-        match self.face(false) {
+    pub fn ascent(&self, stack: FontStack, size: f32) -> f32 {
+        match self.face(stack, false) {
             Some(face) => face.ascent(size),
             None => size,
         }
     }
 
-    pub fn line_height(&self, size: f32) -> f32 {
-        match self.face(false) {
+    pub fn line_height(&self, stack: FontStack, size: f32) -> f32 {
+        match self.face(stack, false) {
             Some(face) => face.line_height(size),
             None => size * 1.25,
         }
     }
 
-    pub fn glyph(&self, character: char, size: f32, bold: bool) -> Option<Rc<GlyphBitmap>> {
-        let face = self.face(bold)?;
+    pub fn glyph(
+        &self,
+        character: char,
+        stack: FontStack,
+        size: f32,
+        bold: bool,
+    ) -> Option<Rc<GlyphBitmap>> {
+        let face = self.face(stack, bold)?;
         let glyph = face.glyph_for(character);
         let key = GlyphKey {
+            family: stack,
             glyph,
             size: size.to_bits(),
-            bold: bold && self.bold.is_some(),
+            bold,
         };
         if let Some(cached) = self.glyphs.borrow().get(&key) {
             return cached.clone();
@@ -650,12 +737,25 @@ impl FontSet {
         bitmap
     }
 
-    fn face(&self, bold: bool) -> Option<&Rc<FontFace>> {
-        if bold {
-            self.bold.as_ref().or(self.regular.as_ref())
-        } else {
-            self.regular.as_ref()
+    // the first family the host can supply wins, matching css font fallback
+    fn face(&self, stack: FontStack, bold: bool) -> Option<Rc<FontFace>> {
+        let source = self.source.as_ref()?;
+        if let Some(cached) = self.faces.borrow().get(&(stack, bold)) {
+            return cached.clone();
         }
+        let families = font_stack_families(stack);
+        let mut face = None;
+        if let Some(families) = families.as_deref() {
+            for family in families {
+                face = source.face(family, bold);
+                if face.is_some() {
+                    break;
+                }
+            }
+        }
+        let face = face.or_else(|| source.face("sans-serif", bold));
+        self.faces.borrow_mut().insert((stack, bold), face.clone());
+        face
     }
 }
 
@@ -988,14 +1088,51 @@ mod tests {
     fn font_set_measures_with_the_face_and_falls_back_to_the_builtin_metrics() {
         let face = Rc::new(FontFace::parse(synthetic_font()).expect("font"));
         let fonts = FontSet::new(face, None);
+        let stack = intern_font_stack("Test Face, sans-serif");
         assert!(!fonts.is_builtin());
-        assert!((fonts.measure("AA", 100.0, false) - 120.0).abs() < 0.01);
-        assert!(fonts.glyph('A', 20.0, false).is_some());
+        assert!((fonts.measure("AA", stack, 100.0, false) - 120.0).abs() < 0.01);
+        assert!(fonts.glyph('A', stack, 20.0, false).is_some());
 
         let builtin = FontSet::builtin();
         assert!(builtin.is_builtin());
-        assert_eq!(builtin.measure("AAA", 12.0, false), 18.0);
-        assert_eq!(builtin.line_height(16.0), 20.0);
-        assert!(builtin.glyph('A', 16.0, false).is_none());
+        assert_eq!(builtin.measure("AAA", stack, 12.0, false), 18.0);
+        assert_eq!(builtin.line_height(stack, 16.0), 20.0);
+        assert!(builtin.glyph('A', stack, 16.0, false).is_none());
+    }
+
+    #[test]
+    fn font_stacks_intern_by_family_list_and_resolve_in_order() {
+        let first = intern_font_stack("\"Aptos Narrow\", Tahoma, sans-serif");
+        let same = intern_font_stack("aptos narrow , tahoma , sans-serif");
+        let other = intern_font_stack("Consolas, monospace");
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert_eq!(
+            font_stack_families(first)
+                .expect("stack should resolve")
+                .to_vec(),
+            vec![
+                "aptos narrow".to_string(),
+                "tahoma".to_string(),
+                "sans-serif".to_string()
+            ]
+        );
+        assert!(font_stack_families(FontStack::default()).is_none());
+
+        struct OnlyTahoma(Rc<FontFace>);
+        impl FontSource for OnlyTahoma {
+            fn face(&self, family: &str, _bold: bool) -> Option<Rc<FontFace>> {
+                (family == "tahoma").then(|| self.0.clone())
+            }
+        }
+
+        let face = Rc::new(FontFace::parse(synthetic_font()).expect("font"));
+        let fonts = FontSet::from_source(Rc::new(OnlyTahoma(face)));
+        assert!((fonts.measure("A", first, 1000.0, false) - 600.0).abs() < 0.01);
+        // an unavailable stack falls back to the builtin metrics rather than measuring zero
+        assert_eq!(
+            fonts.measure("A", other, 1000.0, false),
+            builtin_advance(1000.0)
+        );
     }
 }

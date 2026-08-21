@@ -4,6 +4,7 @@ use crate::css::{
     TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
+use crate::font::FontStack;
 use crate::image::Image;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -34,6 +35,7 @@ pub struct TextRun {
     pub width: f32,
     pub font_size: f32,
     pub letter_spacing: f32,
+    pub font_stack: FontStack,
     pub color: Color,
     pub bold: bool,
 }
@@ -97,6 +99,7 @@ struct InlineFragment {
     width: f32,
     font_size: f32,
     letter_spacing: f32,
+    font_stack: FontStack,
     color: Color,
     bold: bool,
 }
@@ -113,6 +116,7 @@ fn inherited_text(style: &Style) -> InheritedText {
     InheritedText {
         transform: style.text_transform,
         letter_spacing: style.letter_spacing,
+        family: style.font_family,
     }
 }
 
@@ -1021,12 +1025,14 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 y: content_y + line_index as f32 * line_height,
                 width: measure_text(
                     value_line,
+                    style.font_family,
                     font_size,
                     style.font_weight == FontWeight::Bold,
                     letter_spacing,
                 ),
                 font_size,
                 letter_spacing,
+                font_stack: style.font_family,
                 color,
                 bold: style.font_weight == FontWeight::Bold,
             });
@@ -1856,7 +1862,13 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
         match child {
             Node::Text(value) => {
                 let transformed = style.text_transform.apply(value);
-                inline += measure_text(transformed.trim(), font_size, bold, letter_spacing);
+                inline += measure_text(
+                    transformed.trim(),
+                    style.font_family,
+                    font_size,
+                    bold,
+                    letter_spacing,
+                );
             }
             Node::Element(child) => {
                 let mut child_path = path.to_vec();
@@ -2248,11 +2260,23 @@ fn append_inline_text(
     let mut first_word = true;
     for word in transformed.split_ascii_whitespace() {
         let bold = context.weight == FontWeight::Bold;
-        let word_width = measure_text(word, context.font_size, bold, letter_spacing);
+        let word_width = measure_text(
+            word,
+            context.text.family,
+            context.font_size,
+            bold,
+            letter_spacing,
+        );
         let space_width = if first_word || line.fragments.is_empty() {
             0.0
         } else {
-            measure_text(" ", context.font_size, bold, letter_spacing)
+            measure_text(
+                " ",
+                context.text.family,
+                context.font_size,
+                bold,
+                letter_spacing,
+            )
         };
         if !line.fragments.is_empty()
             && line.used + space_width + word_width > context.content_width
@@ -2267,7 +2291,13 @@ fn append_inline_text(
         }
         let prefix = if line.fragments.is_empty() { "" } else { " " };
         let text = format!("{prefix}{word}");
-        let width = measure_text(&text, context.font_size, bold, letter_spacing);
+        let width = measure_text(
+            &text,
+            context.text.family,
+            context.font_size,
+            bold,
+            letter_spacing,
+        );
         line.used += width;
         line.height = line.height.max(context.line_height);
         line.fragments.push(InlineFragment {
@@ -2275,6 +2305,7 @@ fn append_inline_text(
             width,
             font_size: context.font_size,
             letter_spacing,
+            font_stack: context.text.family,
             color: context.color,
             bold,
         });
@@ -2306,6 +2337,7 @@ fn flush_line(
             width: fragment.width,
             font_size: fragment.font_size,
             letter_spacing: fragment.letter_spacing,
+            font_stack: fragment.font_stack,
             color: fragment.color,
             bold: fragment.bold,
         });
@@ -2372,8 +2404,14 @@ fn root_font_size(
         .unwrap_or(INITIAL_FONT_SIZE)
 }
 
-fn measure_text(text: &str, font_size: f32, bold: bool, letter_spacing: f32) -> f32 {
-    crate::font::active_fonts().measure(text, font_size, bold)
+fn measure_text(
+    text: &str,
+    stack: FontStack,
+    font_size: f32,
+    bold: bool,
+    letter_spacing: f32,
+) -> f32 {
+    crate::font::active_fonts().measure(text, stack, font_size, bold)
         + letter_spacing * text.chars().count() as f32
 }
 
@@ -2464,9 +2502,10 @@ fn control_text_lines(
     content_width: f32,
     font_size: f32,
 ) -> Vec<String> {
-    let max_characters = (content_width / measure_text("X", font_size, false, 0.0).max(1.0))
-        .floor()
-        .max(1.0) as usize;
+    let max_characters = (content_width
+        / measure_text("X", FontStack::default(), font_size, false, 0.0).max(1.0))
+    .floor()
+    .max(1.0) as usize;
     let mut lines = Vec::new();
     for value_line in value.split('\n') {
         if element.name != "textarea"

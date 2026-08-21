@@ -18,7 +18,7 @@ pub use dom::{
     AccessibilityNode, Document, Element, Node, NodeId, NodePath, ParseError, ScriptSource,
     StylesheetSource,
 };
-pub use font::{FontFace, FontSet, GlyphBitmap};
+pub use font::{FontFace, FontSet, FontSource, FontStack, GlyphBitmap, intern_font_stack};
 pub use host::{
     EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, KeyModifiers,
     PointerButton,

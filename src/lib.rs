@@ -7,6 +7,8 @@ mod app;
 mod browser;
 #[cfg(feature = "custom-engine")]
 mod custom;
+#[cfg(feature = "custom-engine")]
+mod fonts;
 #[cfg(feature = "cef-engine")]
 mod platform;
 #[cfg(feature = "cef-engine")]

@@ -1,8 +1,9 @@
 use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
+use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
-    AppUrl, Browser, HostRuntimeInfo, NavigationError, Resource, ResourceBundle, ResourceProvider,
-    WindowConfig, mime_type_for, run_window,
+    AppUrl, Browser, EngineHost, FontSet, HostRuntimeInfo, NavigationError, Resource,
+    ResourceBundle, ResourceProvider, Size, WindowConfig, mime_type_for, run_window,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -10,11 +11,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
+
 pub fn run() -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let launch = launch::resolve(
         launch::switch_value(arguments.clone(), ASSETS_SWITCH).map(PathBuf::from),
-        launch::switch_value(arguments, ENTRY_SWITCH),
+        launch::switch_value(arguments.clone(), ENTRY_SWITCH),
     )?;
     let storage = launch::profile_path().map(|profile| profile.join("storage"))?;
     let assets = launch.assets.clone();
@@ -23,7 +26,48 @@ pub fn run() -> Result<(), String> {
         start_url: launch.initial_url.clone(),
         ..WindowConfig::default()
     };
+    if let Some(path) = launch::switch_value(arguments, SCREENSHOT_SWITCH) {
+        return capture(&config, PathBuf::from(path), assets, storage);
+    }
     run_window(config, move || build_browser(assets, storage))
+}
+
+// renders one frame without opening a window, for smoke checks and release shots
+fn capture(
+    config: &WindowConfig,
+    output: PathBuf,
+    assets: Arc<AssetOrigin>,
+    storage: PathBuf,
+) -> Result<(), String> {
+    let mut host = EngineHost::new(
+        build_browser(assets, storage)?,
+        Size {
+            width: config.width as f32,
+            height: config.height as f32,
+        },
+    );
+    let status = host
+        .navigate(&config.start_url)
+        .map_err(|error| error.to_string())?;
+    let frame = host
+        .render()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the engine produced no frame".to_string())?;
+    frame
+        .canvas
+        .write_png(&output)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "{} {status}, painted {}x{} to {}",
+        config.start_url,
+        frame.canvas.width(),
+        frame.canvas.height(),
+        output.display()
+    );
+    for log in host.browser().console_logs() {
+        println!("console: {log}");
+    }
+    Ok(())
 }
 
 fn build_browser(assets: Arc<AssetOrigin>, storage: PathBuf) -> Result<Browser, String> {
@@ -40,8 +84,18 @@ fn build_browser(assets: Arc<AssetOrigin>, storage: PathBuf) -> Result<Browser, 
             storage.display()
         )
     })?
-    .with_host_runtime_info(runtime_info());
+    .with_host_runtime_info(runtime_info())
+    .with_fonts(Rc::new(system_font_set()));
     Ok(browser)
+}
+
+fn system_font_set() -> FontSet {
+    let fonts = SystemFonts::discover();
+    if fonts.families() == 0 {
+        eprintln!("ceri: no installed fonts were found, falling back to the builtin face");
+        return FontSet::builtin();
+    }
+    FontSet::from_source(Rc::new(fonts))
 }
 
 fn runtime_info() -> HostRuntimeInfo {

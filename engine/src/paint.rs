@@ -940,7 +940,7 @@ fn paint_outline_text(
 ) {
     let scale = canvas.scale();
     let device_size = run.font_size * scale;
-    let baseline = (run.y + offset.1 + fonts.ascent(run.font_size)) * scale;
+    let baseline = (run.y + offset.1 + fonts.ascent(run.font_stack, run.font_size)) * scale;
     let mut pen = (run.x + offset.0) * scale;
     let device_clip = clip.map(|clip| Rect {
         x: clip.x * scale,
@@ -949,7 +949,7 @@ fn paint_outline_text(
         height: clip.height * scale,
     });
     for character in run.text.chars() {
-        if let Some(glyph) = fonts.glyph(character, device_size, run.bold) {
+        if let Some(glyph) = fonts.glyph(character, run.font_stack, device_size, run.bold) {
             canvas.blend_coverage(
                 pen.round() as i32 + glyph.left,
                 baseline.round() as i32 + glyph.top,
@@ -958,7 +958,8 @@ fn paint_outline_text(
                 device_clip,
             );
         }
-        pen += fonts.advance(character, device_size, run.bold) + run.letter_spacing * scale;
+        pen += fonts.advance(character, run.font_stack, device_size, run.bold)
+            + run.letter_spacing * scale;
     }
 }
 
@@ -1119,6 +1120,7 @@ mod tests {
                     width: 8.0,
                     font_size: 12.0,
                     letter_spacing: 0.0,
+                    font_stack: crate::font::FontStack::default(),
                     color: Color::WHITE,
                     bold: false,
                 }],
@@ -1210,6 +1212,7 @@ mod tests {
                         width: 6.0,
                         font_size: 12.0,
                         letter_spacing: 0.0,
+                        font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
                         bold: false,
                     },
@@ -1220,6 +1223,7 @@ mod tests {
                         width: 6.0,
                         font_size: 12.0,
                         letter_spacing: 0.0,
+                        font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
                         bold: false,
                     },
