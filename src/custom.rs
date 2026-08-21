@@ -1,4 +1,5 @@
 use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
+use crate::desktop::{DesktopClipboard, DesktopFilePicker};
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
@@ -85,7 +86,9 @@ fn build_browser(assets: Arc<AssetOrigin>, storage: PathBuf) -> Result<Browser, 
         )
     })?
     .with_host_runtime_info(runtime_info())
-    .with_fonts(Rc::new(system_font_set()));
+    .with_fonts(Rc::new(system_font_set()))
+    .with_clipboard_provider(Rc::new(DesktopClipboard))
+    .with_file_picker(Rc::new(DesktopFilePicker));
     Ok(browser)
 }
 
