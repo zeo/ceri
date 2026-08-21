@@ -1,4 +1,4 @@
-use crate::css::{Color, Overflow};
+use crate::css::{Color, Gradient, Overflow};
 use crate::dom::NodePath;
 use crate::image::Image;
 use crate::layout::{
@@ -243,6 +243,47 @@ impl Canvas {
         }
     }
 
+    // signed distance coverage gives antialiased corners without a second pass
+    fn fill_shape(&mut self, shape: Shape, paint: &Paint, clip: Option<Rect>) {
+        if shape.width <= 0.0 || shape.height <= 0.0 {
+            return;
+        }
+        let device = shape.to_device(self.scale);
+        let clip = clip.map(|clip| Shape::from_rect(clip, 0.0).to_device(self.scale));
+        let radius = device
+            .radius
+            .min(device.width / 2.0)
+            .min(device.height / 2.0)
+            .max(0.0);
+        let left = device.x.floor().max(0.0) as u32;
+        let top = device.y.floor().max(0.0) as u32;
+        let right = (device.x + device.width)
+            .ceil()
+            .clamp(0.0, self.width as f32) as u32;
+        let bottom = (device.y + device.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        for pixel_y in top.min(self.height)..bottom.min(self.height) {
+            for pixel_x in left.min(self.width)..right.min(self.width) {
+                let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+                if let Some(clip) = clip
+                    && clip.coverage(center, 0.0) <= 0.0
+                {
+                    continue;
+                }
+                let coverage = device.coverage(center, radius);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let color = paint.color_at(center, device);
+                if color.alpha == 0 {
+                    continue;
+                }
+                self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
+            }
+        }
+    }
+
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
         let index = ((y * self.width + x) * 4) as usize;
         let alpha = color.alpha as u32;
@@ -310,6 +351,133 @@ fn adler32(bytes: &[u8]) -> u32 {
     (high << 16) | low
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+}
+
+impl Shape {
+    fn from_rect(rect: Rect, radius: f32) -> Self {
+        Self {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            radius,
+        }
+    }
+
+    fn to_device(self, scale: f32) -> Self {
+        Self {
+            x: self.x * scale,
+            y: self.y * scale,
+            width: self.width * scale,
+            height: self.height * scale,
+            radius: self.radius * scale,
+        }
+    }
+
+    fn inset(self, amount: f32) -> Self {
+        Self {
+            x: self.x + amount,
+            y: self.y + amount,
+            width: (self.width - amount * 2.0).max(0.0),
+            height: (self.height - amount * 2.0).max(0.0),
+            radius: (self.radius - amount).max(0.0),
+        }
+    }
+
+    // one pixel of feathering along the edge, which reads as antialiasing
+    fn coverage(self, point: (f32, f32), radius: f32) -> f32 {
+        let distance = self.signed_distance(point, radius);
+        (0.5 - distance).clamp(0.0, 1.0)
+    }
+
+    fn signed_distance(self, point: (f32, f32), radius: f32) -> f32 {
+        let half = (self.width / 2.0, self.height / 2.0);
+        let center = (self.x + half.0, self.y + half.1);
+        let offset = (
+            (point.0 - center.0).abs() - (half.0 - radius),
+            (point.1 - center.1).abs() - (half.1 - radius),
+        );
+        let outside = (offset.0.max(0.0), offset.1.max(0.0));
+        let outer = (outside.0 * outside.0 + outside.1 * outside.1).sqrt();
+        outer + offset.0.max(offset.1).min(0.0) - radius
+    }
+}
+
+enum Paint {
+    Solid(Color),
+    Gradient(Gradient),
+}
+
+impl Paint {
+    fn color_at(&self, point: (f32, f32), shape: Shape) -> Color {
+        match self {
+            Self::Solid(color) => *color,
+            Self::Gradient(gradient) => {
+                let angle = gradient.angle.to_radians();
+                let axis = (angle.sin(), -angle.cos());
+                let center = (shape.x + shape.width / 2.0, shape.y + shape.height / 2.0);
+                let extent = (shape.width * axis.0).abs() + (shape.height * axis.1).abs();
+                let along = (point.0 - center.0) * axis.0 + (point.1 - center.1) * axis.1;
+                let progress = if extent > 0.0 {
+                    along / extent + 0.5
+                } else {
+                    0.0
+                };
+                gradient.color_at(progress)
+            }
+        }
+    }
+}
+
+fn paint_shadow(
+    canvas: &mut Canvas,
+    shadow: &crate::layout::ResolvedShadow,
+    rect: Rect,
+    radius: f32,
+    opacity: f32,
+    clip: Option<Rect>,
+) {
+    let spread = shadow.spread;
+    let base = Shape {
+        x: rect.x + shadow.offset_x - spread,
+        y: rect.y + shadow.offset_y - spread,
+        width: rect.width + spread * 2.0,
+        height: rect.height + spread * 2.0,
+        radius: (radius + spread).max(0.0),
+    };
+    let color = shadow.color.scale_alpha(opacity);
+    if shadow.blur <= 0.0 {
+        canvas.fill_shape(base, &Paint::Solid(color), clip);
+        return;
+    }
+    // concentric rings approximate a gaussian falloff without an offscreen buffer
+    let steps = shadow.blur.ceil().clamp(1.0, 24.0) as usize;
+    let step = shadow.blur / steps as f32;
+    for ring in (0..=steps).rev() {
+        let distance = step * ring as f32;
+        let falloff = 1.0 - (ring as f32 / (steps as f32 + 1.0));
+        let layer = Shape {
+            x: base.x - distance,
+            y: base.y - distance,
+            width: base.width + distance * 2.0,
+            height: base.height + distance * 2.0,
+            radius: base.radius + distance,
+        };
+        canvas.fill_shape(
+            layer,
+            &Paint::Solid(color.scale_alpha(falloff * falloff / steps as f32 * 2.0)),
+            clip,
+        );
+    }
+}
+
 pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
     paint_with_commands(document, &[], 1.0)
 }
@@ -325,6 +493,17 @@ pub(crate) fn paint_with_commands(
         scale,
         Color::opaque(245, 248, 250),
     );
+    // the root background paints the whole canvas, as CSS backgrounds require
+    if let Some(root) = canvas_background(&document.root) {
+        let viewport = Shape {
+            x: 0.0,
+            y: 0.0,
+            width: document.viewport.width,
+            height: document.viewport.height,
+            radius: 0.0,
+        };
+        canvas.fill_shape(viewport, &root, None);
+    }
     paint_box(
         &mut canvas,
         &document.root,
@@ -334,6 +513,34 @@ pub(crate) fn paint_with_commands(
         (0.0, 0.0),
     );
     canvas
+}
+
+fn canvas_background(root: &LayoutBox) -> Option<Paint> {
+    let mut candidates = Vec::new();
+    collect_root_boxes(root, 0, &mut candidates);
+    candidates.into_iter().find_map(|layout_box| {
+        if let Some(gradient) = layout_box.gradient {
+            return Some(Paint::Gradient(gradient.scale_alpha(layout_box.opacity)));
+        }
+        (layout_box.background.alpha > 0)
+            .then(|| Paint::Solid(layout_box.background.scale_alpha(layout_box.opacity)))
+    })
+}
+
+fn collect_root_boxes<'a>(
+    layout_box: &'a LayoutBox,
+    depth: usize,
+    output: &mut Vec<&'a LayoutBox>,
+) {
+    if depth > 2 {
+        return;
+    }
+    if matches!(layout_box.tag.as_str(), "html" | "body") {
+        output.push(layout_box);
+    }
+    for child in &layout_box.children {
+        collect_root_boxes(child, depth + 1, output);
+    }
 }
 
 fn intersect_clip(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
@@ -506,15 +713,34 @@ fn paint_box_surface(
     offset: (f32, f32),
     rect: Rect,
 ) -> Option<Rect> {
-    fill_rect_optional(
-        canvas,
-        rect.x,
-        rect.y,
-        rect.width,
-        rect.height,
-        layout_box.background,
-        clip,
-    );
+    let radius = layout_box.border_radius;
+    let opacity = layout_box.opacity;
+    if let Some(shadow) = layout_box.shadow.as_ref() {
+        paint_shadow(canvas, shadow, rect, radius, opacity, clip);
+    }
+    let outer = Shape::from_rect(rect, radius);
+    let border = layout_box.border_width.max(0.0);
+    if border > 0.0 && layout_box.border_color.alpha > 0 {
+        canvas.fill_shape(
+            outer,
+            &Paint::Solid(layout_box.border_color.scale_alpha(opacity)),
+            clip,
+        );
+    }
+    let surface = outer.inset(border);
+    if let Some(gradient) = layout_box.gradient {
+        canvas.fill_shape(
+            surface,
+            &Paint::Gradient(gradient.scale_alpha(opacity)),
+            clip,
+        );
+    } else if layout_box.background.alpha > 0 {
+        canvas.fill_shape(
+            surface,
+            &Paint::Solid(layout_box.background.scale_alpha(opacity)),
+            clip,
+        );
+    }
     let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
         || layout_box.path.is_empty()
     {
@@ -539,45 +765,6 @@ fn paint_box_surface(
                 height: (rect.height - inset * 2.0).max(0.0),
             },
             content_clip,
-        );
-    }
-    if layout_box.border_width > 0.0 {
-        let border = layout_box.border_width;
-        fill_rect_optional(
-            canvas,
-            rect.x,
-            rect.y,
-            rect.width,
-            border,
-            layout_box.border_color,
-            clip,
-        );
-        fill_rect_optional(
-            canvas,
-            rect.x,
-            rect.bottom() - border,
-            rect.width,
-            border,
-            layout_box.border_color,
-            clip,
-        );
-        fill_rect_optional(
-            canvas,
-            rect.x,
-            rect.y,
-            border,
-            rect.height,
-            layout_box.border_color,
-            clip,
-        );
-        fill_rect_optional(
-            canvas,
-            rect.x + rect.width - border,
-            rect.y,
-            border,
-            rect.height,
-            layout_box.border_color,
-            clip,
         );
     }
     content_clip
@@ -1092,7 +1279,76 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::Stylesheet;
+    use crate::dom::Document;
     use crate::layout::{LayoutBox, LayoutDocument, Rect, Size};
+
+    #[test]
+    fn rounded_gradient_and_faded_surfaces_reach_the_pixels() {
+        let document = Document::parse("<html><body><div id='card'></div></body></html>")
+            .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "html, body { margin: 0 } #card { width: 40px; height: 40px; border-radius: 12px; background: #ff0000 }",
+        )
+        .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        );
+        let canvas = paint(&layout);
+        let pixel = |x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            canvas.rgba_pixels()[index..index + 3].to_vec()
+        };
+        assert_eq!(
+            pixel(20, 20),
+            vec![255, 0, 0],
+            "the centre should be filled"
+        );
+        assert_ne!(pixel(0, 0), vec![255, 0, 0], "the corner should be rounded");
+
+        let faded = Stylesheet::parse(
+            "html, body { margin: 0 } #card { width: 40px; height: 40px; background: #ff0000; opacity: 0.5 }",
+        )
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &faded,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        ));
+        let index = (20 * canvas.width() as usize + 20) * 4;
+        let blended = canvas.rgba_pixels()[index];
+        assert!(
+            (240..=255).contains(&blended),
+            "half opacity should blend towards the page background, got {blended}"
+        );
+
+        let gradient = Stylesheet::parse(
+            "html, body { margin: 0 } #card { width: 40px; height: 40px; background: linear-gradient(90deg, #000000, #ffffff) }",
+        )
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &gradient,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        ));
+        let left = canvas.rgba_pixels()[(20 * canvas.width() as usize + 2) * 4];
+        let right = canvas.rgba_pixels()[(20 * canvas.width() as usize + 37) * 4];
+        assert!(
+            right > left + 100,
+            "the gradient should brighten across the box, got {left} then {right}"
+        );
+    }
 
     #[test]
     fn painting_changes_pixels_and_writes_a_ppm_header() {
@@ -1111,6 +1367,10 @@ mod tests {
                     height: 10.0,
                 },
                 background: Color::opaque(10, 20, 30),
+                gradient: None,
+                border_radius: 0.0,
+                opacity: 1.0,
+                shadow: None,
                 border_width: 0.0,
                 border_color: Color::transparent(),
                 text: vec![TextRun {
@@ -1202,6 +1462,10 @@ mod tests {
                     height: 28.0,
                 },
                 background: Color::opaque(10, 20, 30),
+                gradient: None,
+                border_radius: 0.0,
+                opacity: 1.0,
+                shadow: None,
                 border_width: 0.0,
                 border_color: Color::transparent(),
                 text: vec![
@@ -1281,6 +1545,10 @@ mod tests {
                     height: 20.0,
                 },
                 background: Color::opaque(245, 248, 250),
+                gradient: None,
+                border_radius: 0.0,
+                opacity: 1.0,
+                shadow: None,
                 border_width: 0.0,
                 border_color: Color::transparent(),
                 text: Vec::new(),
@@ -1299,6 +1567,10 @@ mod tests {
                             height: 10.0,
                         },
                         background: Color::transparent(),
+                        gradient: None,
+                        border_radius: 0.0,
+                        opacity: 1.0,
+                        shadow: None,
                         border_width: 0.0,
                         border_color: Color::transparent(),
                         text: Vec::new(),
@@ -1331,6 +1603,10 @@ mod tests {
                             height: 10.0,
                         },
                         background: Color::opaque(0, 0, 255),
+                        gradient: None,
+                        border_radius: 0.0,
+                        opacity: 1.0,
+                        shadow: None,
                         border_width: 0.0,
                         border_color: Color::transparent(),
                         text: Vec::new(),

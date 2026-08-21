@@ -1,7 +1,7 @@
 use crate::css::{
-    AlignItems, Color, Display, Edges, FlexDirection, FontWeight, GridTemplate, GridTrack,
-    InheritedText, JustifyContent, Overflow, Position, Style, StyleContext, StyleState, Stylesheet,
-    TextAlign,
+    AlignItems, Color, Display, Edges, FlexDirection, FontWeight, Gradient, GridTemplate,
+    GridTrack, InheritedText, JustifyContent, Overflow, Position, Style, StyleContext, StyleState,
+    Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, Node, NodePath};
 use crate::font::FontStack;
@@ -40,12 +40,25 @@ pub struct TextRun {
     pub bold: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Color,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutBox {
     pub path: NodePath,
     pub tag: String,
     pub rect: Rect,
     pub background: Color,
+    pub gradient: Option<Gradient>,
+    pub border_radius: f32,
+    pub opacity: f32,
+    pub shadow: Option<ResolvedShadow>,
     pub border_width: f32,
     pub border_color: Color,
     pub text: Vec<TextRun>,
@@ -107,9 +120,31 @@ struct InlineFragment {
 #[derive(Clone, Copy)]
 struct ParentStyle {
     font_size: f32,
+    opacity: f32,
     color: Color,
     weight: FontWeight,
     text: InheritedText,
+}
+
+fn resolve_shadow(
+    shadow: Option<crate::css::BoxShadow>,
+    containing_width: f32,
+    font_size: f32,
+) -> Option<ResolvedShadow> {
+    let shadow = shadow?;
+    let resolve = |length: crate::css::Length| {
+        length
+            .resolve(containing_width, font_size)
+            .unwrap_or(0.0)
+            .clamp(-2048.0, 2048.0)
+    };
+    Some(ResolvedShadow {
+        offset_x: resolve(shadow.offset_x),
+        offset_y: resolve(shadow.offset_y),
+        blur: resolve(shadow.blur).max(0.0),
+        spread: resolve(shadow.spread),
+        color: shadow.color,
+    })
 }
 
 fn inherited_text(style: &Style) -> InheritedText {
@@ -124,6 +159,7 @@ fn inherited_text(style: &Style) -> InheritedText {
 struct InlineContext {
     font_size: f32,
     line_height: f32,
+    opacity: f32,
     color: Color,
     weight: FontWeight,
     text: InheritedText,
@@ -154,6 +190,7 @@ struct FlexItem<'a> {
 }
 
 struct FlexLayoutInput<'a> {
+    parent_opacity: f32,
     element: &'a Element,
     path: NodePath,
     ancestors: Vec<&'a Element>,
@@ -183,6 +220,7 @@ struct GridItem<'a> {
 }
 
 struct GridLayoutInput<'a> {
+    parent_opacity: f32,
     element: &'a Element,
     path: NodePath,
     ancestors: Vec<&'a Element>,
@@ -295,6 +333,10 @@ pub fn layout_with_state(
             height: viewport.height,
         },
         background: Color::transparent(),
+        gradient: None,
+        border_radius: 0.0,
+        opacity: 1.0,
+        shadow: None,
         border_width: 0.0,
         border_color: Color::transparent(),
         text: Vec::new(),
@@ -352,6 +394,7 @@ pub fn layout_with_state(
                 color: Color::BLACK,
                 weight: FontWeight::Normal,
                 text: InheritedText::default(),
+                opacity: 1.0,
             },
             context: LayoutContext {
                 viewport,
@@ -377,6 +420,7 @@ pub fn layout_with_state(
                 color: Color::BLACK,
                 weight: FontWeight::Normal,
                 text: InheritedText::default(),
+                opacity: 1.0,
             },
             ancestors: &[],
             stylesheet,
@@ -941,6 +985,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let content_y = rect.y + border + padding.top;
     if style.display == Display::Flex {
         return Some(layout_flex_element(FlexLayoutInput {
+            parent_opacity: parent.opacity,
             element,
             path,
             ancestors: ancestors.to_vec(),
@@ -963,6 +1008,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     }
     if style.display == Display::Grid {
         return Some(layout_grid_element(GridLayoutInput {
+            parent_opacity: parent.opacity,
             element,
             path,
             ancestors: ancestors.to_vec(),
@@ -1047,6 +1093,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
+        opacity: style.opacity * parent.opacity,
         content_width,
         content_x,
         align: style.text_align,
@@ -1108,6 +1155,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                             color: style.color,
                             weight: style.font_weight,
                             text: inherited_text(&style),
+                            opacity: style.opacity * parent.opacity,
                         },
                         context: LayoutContext {
                             viewport,
@@ -1133,6 +1181,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                                 color: style.color,
                                 weight: style.font_weight,
                                 text: inherited_text(&style),
+                                opacity: style.opacity * parent.opacity,
                             },
                             context: inline_context,
                             stylesheet,
@@ -1166,6 +1215,14 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         tag: element.name.clone(),
         rect,
         background: style.background,
+        gradient: style.gradient,
+        border_radius: style
+            .border_radius
+            .resolve(content_width, font_size)
+            .unwrap_or(0.0)
+            .max(0.0),
+        opacity: style.opacity * parent.opacity,
+        shadow: resolve_shadow(style.shadow, content_width, font_size),
         border_width: border,
         border_color: style.border_color,
         text,
@@ -1212,6 +1269,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 color: style.color,
                 weight: style.font_weight,
                 text: inherited_text(&style),
+                opacity: style.opacity * parent.opacity,
             },
             ancestors: &child_ancestors,
             stylesheet,
@@ -1224,6 +1282,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
 
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let FlexLayoutInput {
+        parent_opacity,
         element,
         path,
         ancestors,
@@ -1248,6 +1307,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
+        opacity: style.opacity * parent_opacity,
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
@@ -1475,6 +1535,14 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             ..rect
         },
         background: style.background,
+        gradient: style.gradient,
+        border_radius: style
+            .border_radius
+            .resolve(content_width, font_size)
+            .unwrap_or(0.0)
+            .max(0.0),
+        opacity: style.opacity * parent_opacity,
+        shadow: resolve_shadow(style.shadow, content_width, font_size),
         border_width: border,
         border_color: style.border_color,
         text: Vec::new(),
@@ -1538,6 +1606,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
 
 fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let GridLayoutInput {
+        parent_opacity,
         element,
         path,
         ancestors,
@@ -1562,6 +1631,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
+        opacity: style.opacity * parent_opacity,
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
@@ -1733,6 +1803,14 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             ..rect
         },
         background: style.background,
+        gradient: style.gradient,
+        border_radius: style
+            .border_radius
+            .resolve(content_width, font_size)
+            .unwrap_or(0.0)
+            .max(0.0),
+        opacity: style.opacity * parent_opacity,
+        shadow: resolve_shadow(style.shadow, content_width, font_size),
         border_width: border,
         border_color: style.border_color,
         text: Vec::new(),
@@ -1853,6 +1931,7 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
+        opacity: style.opacity * parent.opacity,
     };
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(element);
@@ -2210,6 +2289,7 @@ fn append_inline_element(
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
+        opacity: style.opacity * parent.opacity,
         content_width: context.content_width,
         content_x: context.content_x,
         align: context.align,
@@ -2231,6 +2311,7 @@ fn append_inline_element(
                             color: style.color,
                             weight: style.font_weight,
                             text: inherited_text(&style),
+                            opacity: style.opacity * parent.opacity,
                         },
                         context: child_context,
                         stylesheet,
@@ -2306,7 +2387,7 @@ fn append_inline_text(
             font_size: context.font_size,
             letter_spacing,
             font_stack: context.text.family,
-            color: context.color,
+            color: context.color.scale_alpha(context.opacity),
             bold,
         });
         first_word = false;

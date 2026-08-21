@@ -44,6 +44,26 @@ impl Color {
     pub const BLACK: Self = Self::opaque(0, 0, 0);
     pub const WHITE: Self = Self::opaque(255, 255, 255);
 
+    pub fn mix(self, other: Self, ratio: f32) -> Self {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let blend = |from: u8, to: u8| {
+            (f32::from(from) + (f32::from(to) - f32::from(from)) * ratio).round() as u8
+        };
+        Self {
+            red: blend(self.red, other.red),
+            green: blend(self.green, other.green),
+            blue: blend(self.blue, other.blue),
+            alpha: blend(self.alpha, other.alpha),
+        }
+    }
+
+    pub fn scale_alpha(self, factor: f32) -> Self {
+        Self {
+            alpha: (f32::from(self.alpha) * factor.clamp(0.0, 1.0)).round() as u8,
+            ..self
+        }
+    }
+
     pub const fn opaque(red: u8, green: u8, blue: u8) -> Self {
         Self {
             red,
@@ -71,11 +91,23 @@ impl Color {
                     expand_nibble(hex.as_bytes()[1])?,
                     expand_nibble(hex.as_bytes()[2])?,
                 )),
+                4 => Some(Self {
+                    red: expand_nibble(hex.as_bytes()[0])?,
+                    green: expand_nibble(hex.as_bytes()[1])?,
+                    blue: expand_nibble(hex.as_bytes()[2])?,
+                    alpha: expand_nibble(hex.as_bytes()[3])?,
+                }),
                 6 => Some(Self::opaque(
                     parse_hex_byte(&hex[0..2])?,
                     parse_hex_byte(&hex[2..4])?,
                     parse_hex_byte(&hex[4..6])?,
                 )),
+                8 => Some(Self {
+                    red: parse_hex_byte(&hex[0..2])?,
+                    green: parse_hex_byte(&hex[2..4])?,
+                    blue: parse_hex_byte(&hex[4..6])?,
+                    alpha: parse_hex_byte(&hex[6..8])?,
+                }),
                 _ => None,
             };
         }
@@ -436,6 +468,59 @@ impl GridTemplate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop {
+    pub color: Color,
+    pub position: f32,
+}
+
+// a bounded linear gradient: an axis angle in degrees plus up to four stops
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    pub angle: f32,
+    pub stops: [GradientStop; 4],
+    pub count: usize,
+}
+
+impl Gradient {
+    pub fn scale_alpha(self, factor: f32) -> Self {
+        let mut scaled = self;
+        for stop in scaled.stops.iter_mut() {
+            stop.color = stop.color.scale_alpha(factor);
+        }
+        scaled
+    }
+
+    pub(crate) fn color_at(&self, progress: f32) -> Color {
+        if self.count == 0 {
+            return Color::transparent();
+        }
+        let stops = &self.stops[..self.count];
+        let progress = progress.clamp(0.0, 1.0);
+        if progress <= stops[0].position {
+            return stops[0].color;
+        }
+        for pair in stops.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if progress <= end.position {
+                let span = (end.position - start.position).max(f32::EPSILON);
+                let ratio = ((progress - start.position) / span).clamp(0.0, 1.0);
+                return start.color.mix(end.color, ratio);
+            }
+        }
+        stops[stops.len() - 1].color
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BoxShadow {
+    pub offset_x: Length,
+    pub offset_y: Length,
+    pub blur: Length,
+    pub spread: Length,
+    pub color: Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Style {
     pub display: Display,
     pub position: Position,
@@ -464,6 +549,10 @@ pub(crate) struct Style {
     pub flex_grow: f32,
     pub grid_template_columns: GridTemplate,
     pub grid_template_rows: GridTemplate,
+    pub border_radius: Length,
+    pub opacity: f32,
+    pub gradient: Option<Gradient>,
+    pub shadow: Option<BoxShadow>,
 }
 
 impl Style {
@@ -502,6 +591,10 @@ impl Style {
             flex_grow: 0.0,
             grid_template_columns: GridTemplate::empty(),
             grid_template_rows: GridTemplate::empty(),
+            border_radius: Length::px(0.0),
+            opacity: 1.0,
+            gradient: None,
+            shadow: None,
         };
         match name {
             "body" => {
@@ -1603,8 +1696,33 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             style.padding.bottom = parse_length(value).unwrap_or(style.padding.bottom)
         }
         "padding-left" => style.padding.left = parse_length(value).unwrap_or(style.padding.left),
-        "background" | "background-color" => {
-            style.background = Color::parse(value).unwrap_or(style.background)
+        "background" | "background-color" | "background-image" => {
+            if let Some(gradient) = parse_linear_gradient(value) {
+                style.gradient = Some(gradient);
+                return;
+            }
+            if value.trim().eq_ignore_ascii_case("none") {
+                style.gradient = None;
+                return;
+            }
+            if let Some(color) = Color::parse(value) {
+                style.gradient = None;
+                style.background = color;
+            }
+        }
+        "border-radius" => {
+            // the shorthand may carry four corners, and this slice paints one radius
+            if let Some(radius) = value.split_ascii_whitespace().next().and_then(parse_length) {
+                style.border_radius = radius;
+            }
+        }
+        "opacity" => {
+            if let Some(opacity) = parse_number(value) {
+                style.opacity = opacity.clamp(0.0, 1.0);
+            }
+        }
+        "box-shadow" => {
+            style.shadow = parse_box_shadow(value);
         }
         "color" => style.color = Color::parse(value).unwrap_or(style.color),
         "font-size" => style.font_size = parse_length(value).unwrap_or(style.font_size),
@@ -1959,6 +2077,123 @@ fn parse_length_sum(expression: &str) -> Option<LengthTerms> {
     saw_term.then_some(total)
 }
 
+fn parse_linear_gradient(value: &str) -> Option<Gradient> {
+    let arguments = value
+        .trim()
+        .strip_prefix("linear-gradient(")
+        .or_else(|| value.trim().strip_prefix("linear-gradient ("))?
+        .strip_suffix(')')?;
+    let parts = split_top_level(arguments);
+    let mut parts = parts.iter().map(|part| part.trim()).peekable();
+    let first = *parts.peek()?;
+    let angle = if let Some(degrees) = first.strip_suffix("deg") {
+        let angle = degrees.trim().parse::<f32>().ok()?;
+        parts.next();
+        angle
+    } else if let Some(side) = first.strip_prefix("to ") {
+        let angle = match side.trim().to_ascii_lowercase().as_str() {
+            "top" => 0.0,
+            "right" => 90.0,
+            "bottom" => 180.0,
+            "left" => 270.0,
+            "bottom right" | "right bottom" => 135.0,
+            "bottom left" | "left bottom" => 225.0,
+            "top right" | "right top" => 45.0,
+            "top left" | "left top" => 315.0,
+            _ => return None,
+        };
+        parts.next();
+        angle
+    } else {
+        180.0
+    };
+
+    let mut stops = [GradientStop {
+        color: Color::transparent(),
+        position: 0.0,
+    }; 4];
+    let mut count = 0;
+    let entries: Vec<&str> = parts.collect();
+    if entries.len() < 2 || entries.len() > stops.len() {
+        return None;
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let mut pieces = entry.rsplitn(2, ' ');
+        let last = pieces.next()?.trim();
+        let head = pieces.next().map(str::trim);
+        let (color, position) = match (head, last.strip_suffix('%')) {
+            (Some(head), Some(percent)) => (
+                Color::parse(head)?,
+                percent.trim().parse::<f32>().ok()? / 100.0,
+            ),
+            _ => (
+                Color::parse(entry)?,
+                index as f32 / (entries.len() - 1) as f32,
+            ),
+        };
+        stops[count] = GradientStop {
+            color,
+            position: position.clamp(0.0, 1.0),
+        };
+        count += 1;
+    }
+    Some(Gradient {
+        angle,
+        stops,
+        count,
+    })
+}
+
+fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    // inset shadows and shadow lists stay outside this slice
+    if value.to_ascii_lowercase().contains("inset") || value.contains(',') {
+        return None;
+    }
+    let mut lengths = Vec::new();
+    let mut color = Color::opaque(0, 0, 0);
+    for token in value.split_ascii_whitespace() {
+        if let Some(length) = parse_length(token) {
+            lengths.push(length);
+            continue;
+        }
+        color = Color::parse(token)?;
+    }
+    if lengths.len() < 2 || lengths.len() > 4 {
+        return None;
+    }
+    Some(BoxShadow {
+        offset_x: lengths[0],
+        offset_y: lengths[1],
+        blur: lengths.get(2).copied().unwrap_or(Length::px(0.0)),
+        spread: lengths.get(3).copied().unwrap_or(Length::px(0.0)),
+        color,
+    })
+}
+
+// splits on commas that are not inside a function call
+fn split_top_level(source: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut start = 0;
+    for (index, byte) in source.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&source[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
 fn parse_line_height(value: &str) -> Option<Length> {
     let value = value.trim();
     if let Ok(multiplier) = value.parse::<f32>() {
@@ -2192,6 +2427,54 @@ mod tests {
                 .resolve(200.0, 16.0),
             Some(180.0)
         );
+    }
+
+    #[test]
+    fn parses_radius_opacity_shadow_and_gradient_declarations() {
+        let stylesheet = Stylesheet::parse(
+            ".card { border-radius: 18px 8px; opacity: 0.4; box-shadow: 0 10px 30px #00000080; background: linear-gradient(90deg, #ff0000 0%, #0000ff 100%); }",
+        )
+        .expect("stylesheet should parse");
+        let mut card = Element::new("div");
+        card.attrs.insert("class".to_string(), "card".to_string());
+        let style = stylesheet.style_for(StyleContext {
+            element: &card,
+            path: &[0],
+            ancestors: &[],
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
+            state: &StyleState::default(),
+        });
+        assert_eq!(style.border_radius.resolve(0.0, 16.0), Some(18.0));
+        assert_eq!(style.opacity, 0.4);
+        let shadow = style.shadow.expect("shadow should parse");
+        assert_eq!(shadow.offset_x.resolve(0.0, 16.0), Some(0.0));
+        assert_eq!(shadow.offset_y.resolve(0.0, 16.0), Some(10.0));
+        assert_eq!(shadow.blur.resolve(0.0, 16.0), Some(30.0));
+        assert_eq!(shadow.color.alpha, 128);
+        let gradient = style.gradient.expect("gradient should parse");
+        assert_eq!((gradient.angle, gradient.count), (90.0, 2));
+        assert_eq!(gradient.color_at(0.0), Color::opaque(255, 0, 0));
+        assert_eq!(gradient.color_at(1.0), Color::opaque(0, 0, 255));
+        assert_eq!(gradient.color_at(0.5), Color::opaque(128, 0, 128));
+
+        let none = Stylesheet::parse(".card { box-shadow: none; background: #101010; }")
+            .expect("stylesheet should parse")
+            .style_for(StyleContext {
+                element: &card,
+                path: &[0],
+                ancestors: &[],
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::Normal,
+                parent_text: InheritedText::default(),
+                state: &StyleState::default(),
+            });
+        assert!(none.shadow.is_none());
+        assert!(none.gradient.is_none());
+        assert_eq!(none.background, Color::opaque(16, 16, 16));
     }
 
     #[test]
