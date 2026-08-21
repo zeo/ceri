@@ -3,9 +3,9 @@ use crate::navigation::{
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
+use ureq::Agent;
 use ureq::http::Request;
 use ureq::tls::{RootCerts, TlsConfig};
-use ureq::Agent;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -54,9 +54,7 @@ impl NativeHttpProvider {
     ) -> Result<ResourceResponse, NavigationError> {
         let target = self.target_url(request.url());
         let path = request.url().path().to_string();
-        let mut builder = Request::builder()
-            .method(request.method())
-            .uri(&target);
+        let mut builder = Request::builder().method(request.method()).uri(&target);
         for (name, value) in request.headers() {
             builder = builder.header(name, value);
         }
@@ -99,7 +97,10 @@ impl ResourceProvider for NativeHttpProvider {
         if !(200..300).contains(&response.status()) {
             return Ok(None);
         }
-        Ok(Some(Resource::new(response.mime_type(), response.body().to_vec())))
+        Ok(Some(Resource::new(
+            response.mime_type(),
+            response.body().to_vec(),
+        )))
     }
 
     fn provide_response(
@@ -192,8 +193,14 @@ mod tests {
 
     #[test]
     fn encodes_paths_and_infers_common_mime_types() {
-        assert_eq!(encode_path("/docs/café file.html"), "/docs/caf%C3%A9%20file.html");
+        assert_eq!(
+            encode_path("/docs/café file.html"),
+            "/docs/caf%C3%A9%20file.html"
+        );
         assert_eq!(mime_type_for_path("/data/config.json"), "application/json");
-        assert_eq!(mime_type_for_path("/assets/unknown.bin"), "application/octet-stream");
+        assert_eq!(
+            mime_type_for_path("/assets/unknown.bin"),
+            "application/octet-stream"
+        );
     }
 }

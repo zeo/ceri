@@ -1,4 +1,4 @@
-use ceri_engine_lab::{Browser, HostRuntimeInfo, NavigationStatus, ResourceBundle};
+use ceri_engine::{Browser, HostRuntimeInfo, NavigationStatus, ResourceBundle};
 use std::path::{Path, PathBuf};
 
 fn continuity_resources(root: &Path) -> ResourceBundle {
@@ -10,8 +10,8 @@ fn continuity_resources(root: &Path) -> ResourceBundle {
         ("/web/recovery.json", "application/json"),
         ("/sdk/index.js", "text/javascript; charset=utf-8"),
     ] {
-        let body = std::fs::read(root.join(path.trim_start_matches('/')))
-            .expect("continuity resource");
+        let body =
+            std::fs::read(root.join(path.trim_start_matches('/'))).expect("continuity resource");
         resources
             .insert(path, mime_type, body)
             .expect("continuity resource path");
@@ -81,7 +81,10 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
         .find_element_by_selector_within(&runtime, ".check__detail")
         .expect("runtime detail");
     assert_eq!(
-        document.borrow().element_text_content(&runtime_detail).as_deref(),
+        document
+            .borrow()
+            .element_text_content(&runtime_detail)
+            .as_deref(),
         Some("ready; session lab-sess")
     );
     let runtime_line = document
@@ -89,7 +92,10 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
         .find_element_by_id("runtime-line")
         .expect("runtime line");
     assert_eq!(
-        document.borrow().element_text_content(&runtime_line).as_deref(),
+        document
+            .borrow()
+            .element_text_content(&runtime_line)
+            .as_deref(),
         Some("ceri-lab / Chromium none")
     );
 
@@ -139,7 +145,10 @@ fn keeps_the_cef_fallback_when_the_custom_host_is_absent() {
         .find_element_by_selector_within(&runtime, ".check__detail")
         .expect("runtime detail");
     assert_eq!(
-        document.borrow().element_text_content(&runtime_detail).as_deref(),
+        document
+            .borrow()
+            .element_text_content(&runtime_detail)
+            .as_deref(),
         Some("bridge-unavailable: The Ceri host bridge is unavailable in this document")
     );
 }

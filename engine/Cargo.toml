@@ -1,13 +1,13 @@
 [package]
-name = "ceri-engine-lab"
+name = "ceri-engine"
 version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "An isolated from-scratch browser engine laboratory"
+description = "The Rust-native browser engine behind the Ceri desktop runtime"
 
 [lib]
-name = "ceri_engine_lab"
+name = "ceri_engine"
 path = "src/lib.rs"
 
 [features]
@@ -25,7 +25,7 @@ ureq = { version = "=3.4.0", optional = true, default-features = false, features
 ] }
 
 [[bin]]
-name = "ceri-engine-lab"
+name = "ceri-engine"
 path = "src/main.rs"
 
 [[bin]]

@@ -109,10 +109,7 @@ pub enum EngineWorkerEvent {
 
 enum EngineWorkerCommand {
     Navigate { request_id: u64, url: String },
-    Input {
-        request_id: u64,
-        event: InputEvent,
-    },
+    Input { request_id: u64, event: InputEvent },
     Render { request_id: u64 },
     Accessibility { request_id: u64 },
     NavigationFailure { request_id: u64 },
@@ -144,11 +141,7 @@ impl EngineWorker {
                     }
                 };
                 let _ = ready.send(Ok(()));
-                run_engine_worker(
-                    EngineHost::new(browser, viewport),
-                    command_receiver,
-                    events,
-                );
+                run_engine_worker(EngineHost::new(browser, viewport), command_receiver, events);
             })
             .map_err(|error| format!("could not start engine worker: {error}"))?;
         match ready_receiver.recv() {
@@ -213,9 +206,7 @@ impl EngineWorker {
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err("engine worker queue is full".to_string()),
-            Err(TrySendError::Disconnected(_)) => {
-                Err("engine worker is unavailable".to_string())
-            }
+            Err(TrySendError::Disconnected(_)) => Err("engine worker is unavailable".to_string()),
         }
     }
 
@@ -233,12 +224,10 @@ fn run_engine_worker(
 ) {
     while let Ok(command) = commands.recv() {
         let event = match command {
-            EngineWorkerCommand::Navigate { request_id, url } => {
-                EngineWorkerEvent::Navigated {
-                    request_id,
-                    result: host.navigate(&url),
-                }
-            }
+            EngineWorkerCommand::Navigate { request_id, url } => EngineWorkerEvent::Navigated {
+                request_id,
+                result: host.navigate(&url),
+            },
             EngineWorkerCommand::Input { request_id, event } => EngineWorkerEvent::Input {
                 request_id,
                 result: host.input(event),
@@ -247,12 +236,10 @@ fn run_engine_worker(
                 request_id,
                 result: host.render(),
             },
-            EngineWorkerCommand::Accessibility { request_id } => {
-                EngineWorkerEvent::Accessibility {
-                    request_id,
-                    tree: host.accessibility_tree(),
-                }
-            }
+            EngineWorkerCommand::Accessibility { request_id } => EngineWorkerEvent::Accessibility {
+                request_id,
+                tree: host.accessibility_tree(),
+            },
             EngineWorkerCommand::NavigationFailure { request_id } => {
                 EngineWorkerEvent::NavigationFailure {
                     request_id,
@@ -433,8 +420,8 @@ impl EngineHost {
 mod tests {
     use super::*;
     use crate::navigation::{
-        AppUrl, Resource, ResourceBundle, ResourceProvider, ResourceRequest, ResourceResponse,
-        APP_ORIGIN,
+        APP_ORIGIN, AppUrl, Resource, ResourceBundle, ResourceProvider, ResourceRequest,
+        ResourceResponse,
     };
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -466,8 +453,10 @@ mod tests {
             &self,
             request: &ResourceRequest,
         ) -> Result<Option<ResourceResponse>, NavigationError> {
-            *self.thread.lock().expect("thread marker should not be poisoned") =
-                Some(std::thread::current().id());
+            *self
+                .thread
+                .lock()
+                .expect("thread marker should not be poisoned") = Some(std::thread::current().id());
             if request.url().path() != "/" {
                 return Ok(None);
             }
@@ -760,8 +749,7 @@ mod tests {
             .insert(
                 "/worker.js",
                 "text/javascript",
-                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
-                    .to_vec(),
+                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#.to_vec(),
             )
             .expect("worker resource should be accepted");
         let mut host = EngineHost::new(
@@ -891,10 +879,11 @@ mod tests {
         );
         host.navigate("https://app.ceri.invalid/")
             .expect("page should load");
-        assert!(host
-            .input(InputEvent::Click { x: 35.0, y: 15.0 })
-            .expect("visual click should dispatch")
-            .handled);
+        assert!(
+            host.input(InputEvent::Click { x: 35.0, y: 15.0 })
+                .expect("visual click should dispatch")
+                .handled
+        );
         let document = host.browser().document().expect("document should exist");
         let status = document
             .borrow()
@@ -968,21 +957,21 @@ mod tests {
         );
         host.navigate("https://app.ceri.invalid/")
             .expect("page should load");
-        assert!(host
-            .click_id("name")
-            .expect("click should focus the input"));
-        assert!(host
-            .input(InputEvent::TextInput {
+        assert!(host.click_id("name").expect("click should focus the input"));
+        assert!(
+            host.input(InputEvent::TextInput {
                 text: "ust".to_string(),
             })
             .expect("text should be inserted")
-            .handled);
-        assert!(host
-            .input(InputEvent::KeyDown {
+            .handled
+        );
+        assert!(
+            host.input(InputEvent::KeyDown {
                 key: "Backspace".to_string(),
             })
             .expect("backspace should be handled")
-            .handled);
+            .handled
+        );
         let document = host.browser().document().expect("document should exist");
         let status = document
             .borrow()
@@ -1021,8 +1010,8 @@ mod tests {
         host.navigate("https://app.ceri.invalid/")
             .expect("page should load");
         let document = host.browser().document().expect("document should exist");
-        assert!(host
-            .input(InputEvent::KeyDownWithModifiers {
+        assert!(
+            host.input(InputEvent::KeyDownWithModifiers {
                 key: "ArrowLeft".to_string(),
                 modifiers: KeyModifiers {
                     shift: true,
@@ -1032,7 +1021,8 @@ mod tests {
                 },
             })
             .expect("shift arrow should be handled")
-            .handled);
+            .handled
+        );
         let status = document
             .borrow()
             .find_element_by_id("status")
@@ -1065,22 +1055,22 @@ mod tests {
         );
         host.navigate("https://app.ceri.invalid/")
             .expect("page should load");
-        assert!(host
-            .click_id("name")
-            .expect("click should focus the input"));
-        assert!(host
-            .input(InputEvent::CompositionUpdate {
+        assert!(host.click_id("name").expect("click should focus the input"));
+        assert!(
+            host.input(InputEvent::CompositionUpdate {
                 text: "x".to_string(),
                 cursor: Some((1, 1)),
             })
             .expect("composition update should be handled")
-            .handled);
-        assert!(host
-            .input(InputEvent::CompositionCommit {
+            .handled
+        );
+        assert!(
+            host.input(InputEvent::CompositionCommit {
                 text: "安".to_string(),
             })
             .expect("composition commit should be handled")
-            .handled);
+            .handled
+        );
         let document = host.browser().document().expect("document should exist");
         let status = document
             .borrow()
@@ -1113,15 +1103,25 @@ mod tests {
             .expect("home should load");
         assert!(host.click_id("go").expect("link should activate"));
         assert_eq!(
-            host.browser().current_url().expect("URL should exist").path(),
+            host.browser()
+                .current_url()
+                .expect("URL should exist")
+                .path(),
             "/about.html"
         );
         assert!(host.back().expect("history back should run"));
         assert_eq!(
-            host.browser().current_url().expect("URL should exist").path(),
+            host.browser()
+                .current_url()
+                .expect("URL should exist")
+                .path(),
             "/"
         );
-        assert!(host.render().expect("history frame should render").is_some());
+        assert!(
+            host.render()
+                .expect("history frame should render")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1151,7 +1151,10 @@ mod tests {
                 result,
             } => {
                 assert_eq!(completed, request_id);
-                assert_eq!(result.expect("navigation should load"), NavigationStatus::Loaded);
+                assert_eq!(
+                    result.expect("navigation should load"),
+                    NavigationStatus::Loaded
+                );
             }
             other => panic!("unexpected worker event: {other:?}"),
         }

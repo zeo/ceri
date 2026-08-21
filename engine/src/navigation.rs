@@ -1,9 +1,7 @@
 use crate::css::Stylesheet;
 use crate::dom::{AccessibilityNode, Document, NodePath, ScriptSource, StylesheetSource};
 use crate::image::parse_svg;
-use crate::layout::{
-    ImageLayer, LayoutDocument, Size, layout_with_state as build_layout,
-};
+use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
 use crate::paint::Canvas;
 use crate::script::{
     HostRuntimeInfo, KeyModifiers, ModuleSourceLoader, NavigationRequest, ScriptRuntime,
@@ -77,7 +75,11 @@ impl AppUrl {
         &self.fragment
     }
 
-    pub fn with_query_fragment(&self, query: impl Into<String>, fragment: impl Into<String>) -> Self {
+    pub fn with_query_fragment(
+        &self,
+        query: impl Into<String>,
+        fragment: impl Into<String>,
+    ) -> Self {
         Self {
             path: self.path.clone(),
             query: query.into(),
@@ -331,11 +333,7 @@ pub struct FilePickerRequest {
 }
 
 impl FilePickerRequest {
-    pub fn new(
-        name: impl Into<String>,
-        multiple: bool,
-        accept: Option<String>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, multiple: bool, accept: Option<String>) -> Self {
         Self {
             name: name.into(),
             multiple,
@@ -384,10 +382,7 @@ impl FileSelection {
             return Err(NavigationError::InvalidFileMetadata);
         }
         let mime_type = mime_type.into();
-        if !mime_type
-            .bytes()
-            .all(|byte| (0x20..=0x7e).contains(&byte))
-        {
+        if !mime_type.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
             return Err(NavigationError::InvalidFileMimeType);
         }
         Ok(Self {
@@ -591,9 +586,7 @@ impl fmt::Display for NavigationError {
             Self::InvalidFileMimeType => {
                 formatter.write_str("selected file MIME type contains invalid bytes")
             }
-            Self::InvalidFileMetadata => {
-                formatter.write_str("selected file metadata is invalid")
-            }
+            Self::InvalidFileMetadata => formatter.write_str("selected file metadata is invalid"),
             Self::DotSegment => formatter.write_str("dot segments are not allowed in app paths"),
             Self::EmptySegment => formatter.write_str("empty path segments are not allowed"),
             Self::InvalidResourcePath(path) => write!(formatter, "invalid resource path: {path}"),
@@ -604,7 +597,10 @@ impl fmt::Display for NavigationError {
                 write!(formatter, "invalid resource request header: {header}")
             }
             Self::RequestBodyNotAllowed(method) => {
-                write!(formatter, "resource request body is not allowed for {method}")
+                write!(
+                    formatter,
+                    "resource request body is not allowed for {method}"
+                )
             }
             Self::InvalidResponseStatus(status) => {
                 write!(formatter, "invalid resource response status: {status}")
@@ -616,7 +612,9 @@ impl fmt::Display for NavigationError {
                 write!(formatter, "resource request returned HTTP {status}: {path}")
             }
             Self::ResourceNotFound(path) => write!(formatter, "resource not found: {path}"),
-            Self::ResourceProvider(detail) => write!(formatter, "resource provider failed: {detail}"),
+            Self::ResourceProvider(detail) => {
+                write!(formatter, "resource provider failed: {detail}")
+            }
             Self::FilePicker(detail) => write!(formatter, "file picker failed: {detail}"),
             Self::Clipboard(detail) => write!(formatter, "clipboard failed: {detail}"),
             Self::Storage(detail) => write!(formatter, "storage failed: {detail}"),
@@ -789,10 +787,7 @@ impl Browser {
         browser
     }
 
-    pub fn with_storage_directory(
-        mut self,
-        directory: impl AsRef<Path>,
-    ) -> io::Result<Self> {
+    pub fn with_storage_directory(mut self, directory: impl AsRef<Path>) -> io::Result<Self> {
         self.local_storage = Rc::new(RefCell::new(StorageData::load_from_directory(directory)?));
         Ok(self)
     }
@@ -862,8 +857,7 @@ impl Browser {
                 "non-GET navigation requires a resource provider".to_string(),
             ));
         };
-        let Some((url, resource)) = load_provider_request_at(provider.as_ref(), request, 0)?
-        else {
+        let Some((url, resource)) = load_provider_request_at(provider.as_ref(), request, 0)? else {
             return Err(NavigationError::ResourceNotFound(
                 request.url().path().to_string(),
             ));
@@ -925,10 +919,7 @@ impl Browser {
         redirect_depth: usize,
     ) -> Result<NavigationStatus, NavigationError> {
         let requested_url = request.url().clone();
-        let LoadedResource {
-            url,
-            resource,
-        } = match self.load_navigation_request(&request) {
+        let LoadedResource { url, resource } = match self.load_navigation_request(&request) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
                 self.install_error_page(
@@ -1111,9 +1102,7 @@ impl Browser {
         }
         let changed = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            let changed = page
-                .runtime
-                .set_scroll_offset(target.path.clone(), offset);
+            let changed = page.runtime.set_scroll_offset(target.path.clone(), offset);
             if changed {
                 if target.path.is_empty() {
                     page.runtime
@@ -1328,12 +1317,7 @@ impl Browser {
         Ok(self.layout(viewport)?.describe())
     }
 
-    fn attach_image_layers(
-        &self,
-        base: &AppUrl,
-        document: &Document,
-        layout: &mut LayoutDocument,
-    ) {
+    fn attach_image_layers(&self, base: &AppUrl, document: &Document, layout: &mut LayoutDocument) {
         let mut paths = Vec::new();
         collect_image_paths(&layout.root, &mut paths);
         for path in paths {
@@ -1373,9 +1357,7 @@ impl Browser {
         }
     }
 
-    fn process_pending_navigation(
-        &mut self,
-    ) -> Result<Option<NavigationStatus>, NavigationError> {
+    fn process_pending_navigation(&mut self) -> Result<Option<NavigationStatus>, NavigationError> {
         self.persist_storage()?;
         let request = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
@@ -1690,9 +1672,8 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
                 let Some(provider) = self.provider else {
                     return Err(runtime_error(format!("module {path} was not found")));
                 };
-                let Some((loaded_url, resource)) =
-                    load_provider_resource(provider, &url)
-                        .map_err(|error| runtime_error(error.to_string()))?
+                let Some((loaded_url, resource)) = load_provider_resource(provider, &url)
+                    .map_err(|error| runtime_error(error.to_string()))?
                 else {
                     return Err(runtime_error(format!("module {path} was not found")));
                 };
@@ -2068,7 +2049,10 @@ pub(crate) fn normalize_headers(
             return Err(NavigationError::InvalidRequestHeader(name));
         }
         let value = value.trim().to_string();
-        if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0..=31 | 127)) {
+        if value
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | 0..=31 | 127))
+        {
             return Err(NavigationError::InvalidRequestHeader(name));
         }
         normalized.insert(name, value);
@@ -2211,9 +2195,8 @@ mod tests {
 
     impl ResourceProvider for ShellProvider {
         fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
-            Ok((url.path() == "/index.html").then(|| {
-                Resource::new("text/html", b"<p id='status'>shell</p>".to_vec())
-            }))
+            Ok((url.path() == "/index.html")
+                .then(|| Resource::new("text/html", b"<p id='status'>shell</p>".to_vec())))
         }
     }
 
@@ -2414,7 +2397,11 @@ mod tests {
                 .mime_type(),
             "text/javascript"
         );
-        assert!(resources.resource("/target/debug/engine-lab.exe").is_none());
+        assert!(
+            resources
+                .resource("/target/debug/ceri-engine.exe")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2431,8 +2418,7 @@ mod tests {
             .insert(
                 "/worker.js",
                 "text/javascript",
-                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
-                    .to_vec(),
+                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#.to_vec(),
             )
             .expect("worker resource should be accepted");
         let mut browser = Browser::new(resources);
@@ -2469,15 +2455,14 @@ mod tests {
                   worker.onmessage = (event) => { status.textContent = event.data; };
                   worker.postMessage("provider");
                 </script>"#
-                .to_vec(),
+                    .to_vec(),
             ),
         );
         provider_resources.insert(
             "/worker.js".to_string(),
             Resource::new(
                 "text/javascript",
-                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
-                    .to_vec(),
+                br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#.to_vec(),
             ),
         );
         let mut browser = Browser::with_resource_provider(
@@ -2533,7 +2518,7 @@ mod tests {
                     .then((response) => response.text())
                     .then((body) => postMessage(suffix(event.data) + ":" + body));
                 });"#
-                .to_vec(),
+                    .to_vec(),
             ),
         );
         provider_resources.insert(
@@ -2586,12 +2571,15 @@ mod tests {
                   worker.onmessage = (event) => { status.textContent = event.data; };
                   worker.postMessage("classic");
                 </script>"#
-                .to_vec(),
+                    .to_vec(),
             ),
         );
         provider_resources.insert(
             "/worker.js".to_string(),
-            Resource::new("text/javascript", b"importScripts('./worker-helper.js');".to_vec()),
+            Resource::new(
+                "text/javascript",
+                b"importScripts('./worker-helper.js');".to_vec(),
+            ),
         );
         provider_resources.insert(
             "/worker-helper.js".to_string(),
@@ -2629,10 +2617,9 @@ mod tests {
     #[test]
     fn browser_instantiates_provider_wasm_without_a_loopback_server() {
         let wasm = vec![
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02,
-            0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61,
-            0x64, 0x64, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01,
-            0x6a, 0x0b,
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f,
+            0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64,
+            0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
         ];
         let mut provider_resources = BTreeMap::new();
         provider_resources.insert(
@@ -2859,7 +2846,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("home should load");
-        assert!(browser.click_id("label").expect("nested link should activate"));
+        assert!(
+            browser
+                .click_id("label")
+                .expect("nested link should activate")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 2);
         let document = browser.document().expect("about document should exist");
@@ -2886,9 +2877,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("label page should load");
-        assert!(browser
-            .click_id("name-label")
-            .expect("label click should activate the input"));
+        assert!(
+            browser
+                .click_id("name-label")
+                .expect("label click should activate the input")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -2935,15 +2928,21 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("readonly page should load");
-        assert!(browser
-            .click_id("name")
-            .expect("readonly control should focus"));
-        assert!(!browser
-            .insert_text("!")
-            .expect("readonly control should reject host text"));
-        assert!(!browser
-            .key_down("Backspace")
-            .expect("readonly control should reject deletion"));
+        assert!(
+            browser
+                .click_id("name")
+                .expect("readonly control should focus")
+        );
+        assert!(
+            !browser
+                .insert_text("!")
+                .expect("readonly control should reject host text")
+        );
+        assert!(
+            !browser
+                .key_down("Backspace")
+                .expect("readonly control should reject deletion")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -2968,12 +2967,16 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("maxlength page should load");
-        assert!(browser
-            .click_id("name")
-            .expect("maxlength control should focus"));
-        assert!(browser
-            .insert_text("😀x")
-            .expect("host text should stop at maxlength"));
+        assert!(
+            browser
+                .click_id("name")
+                .expect("maxlength control should focus")
+        );
+        assert!(
+            browser
+                .insert_text("😀x")
+                .expect("host text should stop at maxlength")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -2996,15 +2999,21 @@ mod tests {
             </script>"#,
         );
         resources
-            .insert("/done.html", "text/html", br#"<p id="status">done</p>"#.to_vec())
+            .insert(
+                "/done.html",
+                "text/html",
+                br#"<p id="status">done</p>"#.to_vec(),
+            )
             .expect("destination page should be accepted");
         let mut browser = Browser::new(resources);
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("validation page should load");
-        assert!(browser
-            .click_id("submit")
-            .expect("invalid submit click should dispatch"));
+        assert!(
+            browser
+                .click_id("submit")
+                .expect("invalid submit click should dispatch")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/");
         let document = browser.document().expect("document should exist");
         let status = document
@@ -3015,15 +3024,17 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("invalid")
         );
-        assert!(browser
-            .click_id("name")
-            .expect("name input should focus"));
-        assert!(browser
-            .insert_text("Ceri")
-            .expect("required value should accept host text"));
-        assert!(browser
-            .click_id("submit")
-            .expect("valid submit click should navigate"));
+        assert!(browser.click_id("name").expect("name input should focus"));
+        assert!(
+            browser
+                .insert_text("Ceri")
+                .expect("required value should accept host text")
+        );
+        assert!(
+            browser
+                .click_id("submit")
+                .expect("valid submit click should navigate")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/done.html");
     }
 
@@ -3076,7 +3087,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("home should load");
-        assert!(browser.click_id("go").expect("location replace should navigate"));
+        assert!(
+            browser
+                .click_id("go")
+                .expect("location replace should navigate")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 1);
         assert_eq!(browser.history()[0].path(), "/about.html");
@@ -3102,7 +3117,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("home should load");
-        assert!(browser.click_id("go").expect("location assignment should navigate"));
+        assert!(
+            browser
+                .click_id("go")
+                .expect("location assignment should navigate")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 2);
     }
@@ -3137,7 +3156,9 @@ mod tests {
         assert_eq!(browser.history().len(), 2);
         assert!(Rc::ptr_eq(
             &home_document,
-            &browser.document().expect("SPA document should remain loaded")
+            &browser
+                .document()
+                .expect("SPA document should remain loaded")
         ));
         let status = browser
             .document()
@@ -3158,7 +3179,9 @@ mod tests {
         assert_eq!(browser.current_url().unwrap().path(), "/");
         assert!(Rc::ptr_eq(
             &home_document,
-            &browser.document().expect("SPA document should remain loaded")
+            &browser
+                .document()
+                .expect("SPA document should remain loaded")
         ));
         assert_eq!(
             browser
@@ -3196,9 +3219,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("home should load");
-        assert!(browser
-            .click_id("replace")
-            .expect("replaceState should run"));
+        assert!(
+            browser
+                .click_id("replace")
+                .expect("replaceState should run")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/settings");
         assert_eq!(browser.history().len(), 1);
         let document = browser.document().expect("SPA document should exist");
@@ -3214,9 +3239,8 @@ mod tests {
 
     #[test]
     fn history_traversal_reloads_different_documents() {
-        let mut resources = bundle(
-            r#"<a id="about" href="/about.html">about</a><p id="status">home</p>"#,
-        );
+        let mut resources =
+            bundle(r#"<a id="about" href="/about.html">about</a><p id="status">home</p>"#);
         resources
             .insert(
                 "/about.html",
@@ -3228,7 +3252,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("home should load");
-        assert!(browser.click_id("about").expect("about link should activate"));
+        assert!(
+            browser
+                .click_id("about")
+                .expect("about link should activate")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert!(browser.back().expect("history back should run"));
         assert_eq!(browser.current_url().unwrap().path(), "/");
@@ -3502,7 +3530,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("search page should load");
-        assert!(browser.click_id("submit").expect("submit click should dispatch"));
+        assert!(
+            browser
+                .click_id("submit")
+                .expect("submit click should dispatch")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/results.html");
         assert_eq!(browser.current_url().unwrap().query(), "q=rust+browser");
         let document = browser.document().expect("results document should exist");
@@ -3527,7 +3559,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("form page should load");
-        assert!(browser.click_id("submit").expect("submit click should dispatch"));
+        assert!(
+            browser
+                .click_id("submit")
+                .expect("submit click should dispatch")
+        );
         assert_eq!(browser.current_url().unwrap().path(), "/result.html");
         let document = browser.document().expect("result document should exist");
         let status = document
@@ -3563,7 +3599,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("multipart form page should load");
-        assert!(browser.click_id("submit").expect("multipart submit should dispatch"));
+        assert!(
+            browser
+                .click_id("submit")
+                .expect("multipart submit should dispatch")
+        );
         let document = browser.document().expect("multipart result should exist");
         let status = document
             .borrow()
@@ -3596,13 +3636,9 @@ mod tests {
     fn file_picker_selection_reaches_file_list_and_multipart_submission() {
         let requests = Rc::new(RefCell::new(Vec::new()));
         let picker_requests = Rc::new(RefCell::new(Vec::new()));
-        let selection = FileSelection::new(
-            "report.txt",
-            "text/plain",
-            b"file payload".to_vec(),
-            123,
-        )
-        .expect("file selection should be valid");
+        let selection =
+            FileSelection::new("report.txt", "text/plain", b"file payload".to_vec(), 123)
+                .expect("file selection should be valid");
         let picker = Rc::new(StaticFilePicker {
             requests: picker_requests.clone(),
             selection: Some(vec![selection]),
@@ -3615,7 +3651,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("upload page should load");
-        assert!(browser.click_id("file").expect("file picker should activate"));
+        assert!(
+            browser
+                .click_id("file")
+                .expect("file picker should activate")
+        );
         let document = browser.document().expect("upload document should exist");
         let status = document
             .borrow()
@@ -3651,9 +3691,11 @@ mod tests {
         );
         let body = String::from_utf8(requests[1].body().to_vec())
             .expect("text upload body should be UTF-8");
-        assert!(body.contains(
-            "Content-Disposition: form-data; name=\"upload\"; filename=\"report.txt\""
-        ));
+        assert!(
+            body.contains(
+                "Content-Disposition: form-data; name=\"upload\"; filename=\"report.txt\""
+            )
+        );
         assert!(body.contains("Content-Type: text/plain\r\n\r\nfile payload\r\n"));
     }
 
@@ -3746,7 +3788,11 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("form page should load");
-        assert!(browser.click_id("submit").expect("submit click should dispatch"));
+        assert!(
+            browser
+                .click_id("submit")
+                .expect("submit click should dispatch")
+        );
         assert_eq!(
             browser
                 .last_navigation_failure()
@@ -3839,7 +3885,10 @@ mod tests {
             .expect("provider failure should expose a diagnostic");
         assert_eq!(failure.url.path(), "/");
         assert_eq!(failure.status, 503);
-        assert_eq!(failure.detail, "resource provider failed: transport unavailable");
+        assert_eq!(
+            failure.detail,
+            "resource provider failed: transport unavailable"
+        );
     }
 
     #[test]
@@ -3884,7 +3933,9 @@ mod tests {
         assert_eq!(browser.current_url().unwrap().path(), "/login");
         assert_eq!(browser.history().len(), 1);
         assert_eq!(&*paths.borrow(), &["/".to_string(), "/login".to_string()]);
-        let document = browser.document().expect("redirected document should exist");
+        let document = browser
+            .document()
+            .expect("redirected document should exist");
         let status = document
             .borrow()
             .find_element_by_id("status")
@@ -3952,10 +4003,8 @@ mod tests {
 
     #[test]
     fn provider_shell_fallback_preserves_the_requested_app_url() {
-        let mut browser = Browser::with_resource_provider(
-            ResourceBundle::default(),
-            Rc::new(ShellProvider),
-        );
+        let mut browser =
+            Browser::with_resource_provider(ResourceBundle::default(), Rc::new(ShellProvider));
         assert_eq!(
             browser
                 .navigate("https://app.ceri.invalid/dashboard")
@@ -4126,16 +4175,18 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("page should load");
-        assert!(browser
-            .click_at(
-                Size {
-                    width: 240.0,
-                    height: 120.0,
-                },
-                35.0,
-                15.0,
-            )
-            .expect("relative visual click should dispatch"));
+        assert!(
+            browser
+                .click_at(
+                    Size {
+                        width: 240.0,
+                        height: 120.0,
+                    },
+                    35.0,
+                    15.0,
+                )
+                .expect("relative visual click should dispatch")
+        );
         let document = browser.document().unwrap();
         let status = document
             .borrow()
@@ -4145,16 +4196,18 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("relative")
         );
-        assert!(browser
-            .click_at(
-                Size {
-                    width: 240.0,
-                    height: 120.0,
-                },
-                110.0,
-                25.0,
-            )
-            .expect("top z-index click should dispatch"));
+        assert!(
+            browser
+                .click_at(
+                    Size {
+                        width: 240.0,
+                        height: 120.0,
+                    },
+                    110.0,
+                    25.0,
+                )
+                .expect("top z-index click should dispatch")
+        );
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("high")
@@ -4191,9 +4244,11 @@ mod tests {
         let canvas = browser.paint(viewport).expect("stacking page should paint");
         let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
-        assert!(browser
-            .click_at(viewport, 10.0, 10.0)
-            .expect("stacking click should dispatch"));
+        assert!(
+            browser
+                .click_at(viewport, 10.0, 10.0)
+                .expect("stacking click should dispatch")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -4225,18 +4280,20 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("page should load");
-        assert!(browser
-            .scroll_at(
-                Size {
-                    width: 120.0,
-                    height: 100.0,
-                },
-                10.0,
-                10.0,
-                0.0,
-                30.0,
-            )
-            .expect("wheel scroll should dispatch"));
+        assert!(
+            browser
+                .scroll_at(
+                    Size {
+                        width: 120.0,
+                        height: 100.0,
+                    },
+                    10.0,
+                    10.0,
+                    0.0,
+                    30.0,
+                )
+                .expect("wheel scroll should dispatch")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -4253,30 +4310,34 @@ mod tests {
             })
             .expect("scrolled page should layout");
         assert_eq!(layout.root.children[0].children[0].rect.y, -30.0);
-        assert!(browser
-            .scroll_at(
-                Size {
-                    width: 120.0,
-                    height: 100.0,
-                },
-                10.0,
-                10.0,
-                0.0,
-                100.0,
-            )
-            .expect("scroll should clamp to the content boundary"));
-        assert!(!browser
-            .scroll_at(
-                Size {
-                    width: 120.0,
-                    height: 100.0,
-                },
-                10.0,
-                10.0,
-                0.0,
-                100.0,
-            )
-            .expect("scroll at the boundary should be ignored"));
+        assert!(
+            browser
+                .scroll_at(
+                    Size {
+                        width: 120.0,
+                        height: 100.0,
+                    },
+                    10.0,
+                    10.0,
+                    0.0,
+                    100.0,
+                )
+                .expect("scroll should clamp to the content boundary")
+        );
+        assert!(
+            !browser
+                .scroll_at(
+                    Size {
+                        width: 120.0,
+                        height: 100.0,
+                    },
+                    10.0,
+                    10.0,
+                    0.0,
+                    100.0,
+                )
+                .expect("scroll at the boundary should be ignored")
+        );
     }
 
     #[test]
@@ -4302,21 +4363,23 @@ mod tests {
             width: 120.0,
             height: 80.0,
         };
-        assert!(browser
-            .scroll_at(viewport, 10.0, 10.0, 0.0, 20.0)
-            .expect("sticky wheel input should scroll"));
-        let layout = browser
-            .layout(viewport)
-            .expect("sticky page should layout");
+        assert!(
+            browser
+                .scroll_at(viewport, 10.0, 10.0, 0.0, 20.0)
+                .expect("sticky wheel input should scroll")
+        );
+        let layout = browser.layout(viewport).expect("sticky page should layout");
         let sticky = &layout.root.children[0].children[0];
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
         let canvas = browser.paint(viewport).expect("sticky page should paint");
         let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
-        assert!(browser
-            .click_at(viewport, 10.0, 4.0)
-            .expect("sticky click should dispatch"));
+        assert!(
+            browser
+                .click_at(viewport, 10.0, 4.0)
+                .expect("sticky click should dispatch")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -4350,21 +4413,23 @@ mod tests {
             width: 120.0,
             height: 80.0,
         };
-        assert!(browser
-            .scroll_at(viewport, 10.0, 70.0, 0.0, 20.0)
-            .expect("sticky wheel input should scroll"));
-        let layout = browser
-            .layout(viewport)
-            .expect("sticky page should layout");
+        assert!(
+            browser
+                .scroll_at(viewport, 10.0, 70.0, 0.0, 20.0)
+                .expect("sticky wheel input should scroll")
+        );
+        let layout = browser.layout(viewport).expect("sticky page should layout");
         let sticky = &layout.root.children[0];
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
         let canvas = browser.paint(viewport).expect("sticky page should paint");
         let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
-        assert!(browser
-            .click_at(viewport, 10.0, 4.0)
-            .expect("sticky click should dispatch"));
+        assert!(
+            browser
+                .click_at(viewport, 10.0, 4.0)
+                .expect("sticky click should dispatch")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -4421,13 +4486,18 @@ mod tests {
             width: 80.0,
             height: 80.0,
         };
-        let canvas = browser.paint(viewport).expect("scrollbar page should paint");
+        let canvas = browser
+            .paint(viewport)
+            .expect("scrollbar page should paint");
         let content = ((4 * canvas.width() + 10) * 4) as usize;
         let vertical_thumb = ((4 * canvas.width() + 35) * 4) as usize;
         let horizontal_thumb = ((34 * canvas.width() + 4) * 4) as usize;
         let vertical_track = ((20 * canvas.width() + 35) * 4) as usize;
         let horizontal_track = ((34 * canvas.width() + 20) * 4) as usize;
-        assert_eq!(&canvas.rgba_pixels()[content..content + 4], [255, 0, 0, 255]);
+        assert_eq!(
+            &canvas.rgba_pixels()[content..content + 4],
+            [255, 0, 0, 255]
+        );
         assert_eq!(
             &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
             [126, 138, 150, 255]
@@ -4444,9 +4514,11 @@ mod tests {
             &canvas.rgba_pixels()[horizontal_track..horizontal_track + 4],
             [232, 236, 240, 255]
         );
-        assert!(browser
-            .scroll_at(viewport, 35.0, 20.0, 0.0, 10.0)
-            .expect("wheel input over the scrollbar should scroll"));
+        assert!(
+            browser
+                .scroll_at(viewport, 35.0, 20.0, 0.0, 10.0)
+                .expect("wheel input over the scrollbar should scroll")
+        );
         let layout = browser
             .layout(viewport)
             .expect("scrolled scrollbar page should layout");
@@ -4490,9 +4562,11 @@ mod tests {
             &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
             [126, 138, 150, 255]
         );
-        assert!(browser
-            .scroll_at(viewport, 10.0, 10.0, 0.0, 30.0)
-            .expect("document wheel scroll should dispatch"));
+        assert!(
+            browser
+                .scroll_at(viewport, 10.0, 10.0, 0.0, 30.0)
+                .expect("document wheel scroll should dispatch")
+        );
         let document = browser.document().expect("document should exist");
         let status = document
             .borrow()
@@ -4507,12 +4581,16 @@ mod tests {
             .expect("scrolled document should layout");
         assert_eq!(layout.root.children[0].rect.y, -30.0);
         assert_eq!(layout.root.children[1].rect.y, 0.0);
-        assert!(browser
-            .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
-            .expect("document scroll should clamp to the page boundary"));
-        assert!(!browser
-            .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
-            .expect("document scroll at the boundary should be ignored"));
+        assert!(
+            browser
+                .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
+                .expect("document scroll should clamp to the page boundary")
+        );
+        assert!(
+            !browser
+                .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
+                .expect("document scroll at the boundary should be ignored")
+        );
     }
 
     #[test]
@@ -4633,14 +4711,19 @@ mod tests {
         );
         provided.insert(
             "/message.js".to_string(),
-            Resource::new("text/javascript", br#"export const label = "provider";"#.to_vec()),
+            Resource::new(
+                "text/javascript",
+                br#"export const label = "provider";"#.to_vec(),
+            ),
         );
         provided.insert(
             "/data.json".to_string(),
             Resource::new("application/json", br#"{"message":"ready"}"#.to_vec()),
         );
 
-        let provider = Rc::new(MemoryProvider { resources: provided });
+        let provider = Rc::new(MemoryProvider {
+            resources: provided,
+        });
         let mut browser = Browser::with_resource_provider(ResourceBundle::default(), provider);
         assert_eq!(
             browser
@@ -4722,9 +4805,8 @@ mod tests {
 
     #[test]
     fn packaged_static_modules_execute_with_same_origin_imports() {
-        let mut resources = bundle(
-            r#"<p id="status">idle</p><script type="module" src="/entry.js"></script>"#,
-        );
+        let mut resources =
+            bundle(r#"<p id="status">idle</p><script type="module" src="/entry.js"></script>"#);
         resources
             .insert(
                 "/entry.js",
@@ -4759,9 +4841,8 @@ mod tests {
 
     #[test]
     fn cross_origin_module_imports_install_the_recovery_document() {
-        let mut resources = bundle(
-            r#"<p>before</p><script type="module" src="/entry.js"></script>"#,
-        );
+        let mut resources =
+            bundle(r#"<p>before</p><script type="module" src="/entry.js"></script>"#);
         resources
             .insert(
                 "/entry.js",
@@ -4782,7 +4863,9 @@ mod tests {
             .find_element_by_id("recovery")
             .expect("recovery element should exist");
         assert_eq!(
-            document.borrow().element_attribute(&recovery, "data-status"),
+            document
+                .borrow()
+                .element_attribute(&recovery, "data-status"),
             Some("500".to_string())
         );
     }
@@ -4916,10 +4999,12 @@ mod tests {
                 height: 120.0,
             })
             .expect("canvas page should paint");
-        assert!(canvas
-            .rgba_pixels()
-            .chunks_exact(4)
-            .any(|pixel| pixel == [255, 0, 0, 255]));
+        assert!(
+            canvas
+                .rgba_pixels()
+                .chunks_exact(4)
+                .any(|pixel| pixel == [255, 0, 0, 255])
+        );
     }
 
     #[test]
@@ -4951,14 +5036,18 @@ mod tests {
                 height: 80.0,
             })
             .expect("image page should paint");
-        assert!(canvas
-            .rgba_pixels()
-            .chunks_exact(4)
-            .any(|pixel| pixel == [110, 231, 197, 255]));
-        assert!(canvas
-            .rgba_pixels()
-            .chunks_exact(4)
-            .any(|pixel| pixel == [224, 108, 117, 255]));
+        assert!(
+            canvas
+                .rgba_pixels()
+                .chunks_exact(4)
+                .any(|pixel| pixel == [110, 231, 197, 255])
+        );
+        assert!(
+            canvas
+                .rgba_pixels()
+                .chunks_exact(4)
+                .any(|pixel| pixel == [224, 108, 117, 255])
+        );
     }
 
     #[test]
@@ -5006,38 +5095,48 @@ mod tests {
                 height: 180.0,
             })
             .expect("initial layout should build");
-        assert_eq!(initial.root.children[0].background, Color::opaque(17, 17, 17));
+        assert_eq!(
+            initial.root.children[0].background,
+            Color::opaque(17, 17, 17)
+        );
         assert_eq!(initial.root.children[0].border_width, 0.0);
 
-        assert!(browser
-            .dispatch_at(
-                Size {
-                    width: 240.0,
-                    height: 180.0,
-                },
-                20.0,
-                20.0,
-                "pointermove",
-            )
-            .expect("pointer move should update hover"));
+        assert!(
+            browser
+                .dispatch_at(
+                    Size {
+                        width: 240.0,
+                        height: 180.0,
+                    },
+                    20.0,
+                    20.0,
+                    "pointermove",
+                )
+                .expect("pointer move should update hover")
+        );
         let hovered = browser
             .layout(Size {
                 width: 240.0,
                 height: 180.0,
             })
             .expect("hovered layout should build");
-        assert_eq!(hovered.root.children[0].background, Color::opaque(255, 0, 0));
+        assert_eq!(
+            hovered.root.children[0].background,
+            Color::opaque(255, 0, 0)
+        );
 
-        assert!(browser
-            .click_at(
-                Size {
-                    width: 240.0,
-                    height: 180.0,
-                },
-                20.0,
-                20.0,
-            )
-            .expect("button click should focus"));
+        assert!(
+            browser
+                .click_at(
+                    Size {
+                        width: 240.0,
+                        height: 180.0,
+                    },
+                    20.0,
+                    20.0,
+                )
+                .expect("button click should focus")
+        );
         let focused = browser
             .layout(Size {
                 width: 240.0,
@@ -5053,6 +5152,9 @@ mod tests {
                 height: 180.0,
             })
             .expect("checked layout should build");
-        assert_eq!(checked.root.children[1].background, Color::opaque(0, 0, 255));
+        assert_eq!(
+            checked.root.children[1].background,
+            Color::opaque(0, 0, 255)
+        );
     }
 }

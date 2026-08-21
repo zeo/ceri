@@ -99,7 +99,7 @@ FormData bodies use deterministic multipart encoding with ordered text and File 
 Run the deterministic demo from the repository root:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-engine-lab.bmp --width 800 --height 520 --click run-check
+cargo run -p ceri-engine -- --input engine/demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-engine.bmp --width 800 --height 520 --click run-check
 ```
 
 The command loads the asset root into the engine's packaged resource bundle, navigates the app origin without opening a listener, resolves the demo's external CSS and JavaScript, and can dispatch a deterministic click with `--click ID`. A missing extensionless route falls back to the packaged shell, while missing top-level or required subresources receive an engine-owned recovery document. It prints the navigation result, layout tree, event result, console output, and number of non-background pixels. The output can be a plain PPM or BMP image, so the paint path does not depend on an image library.
@@ -107,13 +107,13 @@ The command loads the asset root into the engine's packaged resource bundle, nav
 The flex sample exercises row growth, gaps, column composition, and alignment:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/flex-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-flex-demo.bmp --width 800 --height 420
+cargo run -p ceri-engine -- --input engine/flex-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-flex-demo.bmp --width 800 --height 420
 ```
 
 The task-clock sample advances the page without sleeping or relying on wall time:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/timer-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-timer-demo.bmp --width 800 --height 300 --tick 16 --tick 84
+cargo run -p ceri-engine -- --input engine/timer-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-timer-demo.bmp --width 800 --height 300 --tick 16 --tick 84
 ```
 
 The first tick runs the animation frame at 16ms. The second reaches 100ms and runs the timeout. Repeating the command produces the same callbacks and pixels.
@@ -121,19 +121,19 @@ The first tick runs the animation frame at 16ms. The second reaches 100ms and ru
 The dynamic-DOM sample creates a detached element, fills it with an HTML fragment through `innerHTML`, appends it into the document, and paints the resulting tree:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/dynamic-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-dynamic-demo.bmp --width 800 --height 360
+cargo run -p ceri-engine -- --input engine/dynamic-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-dynamic-demo.bmp --width 800 --height 360
 ```
 
 The nested-selector sample exercises compound selectors, descendant cascade, direct-child matching, and flex layout together:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/selector-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-selector-demo.bmp --width 800 --height 360
+cargo run -p ceri-engine -- --input engine/selector-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-selector-demo.bmp --width 800 --height 360
 ```
 
 The collection sample runs the first continuity-page collection expression without a listener. It queries `[data-check]` nodes, spreads the static node list into an array, maps each element to a key-value pair, reads `dataset`, and constructs a `Map`:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/collection-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-collection-demo.bmp --width 800 --height 420
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/collection-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-collection-demo.bmp --width 800 --height 420
 ```
 
 The current collection boundary stops before generators, user-defined iterator objects, and computed destructuring keys. Those remain explicit compatibility gates for the continuity page.
@@ -141,49 +141,49 @@ The current collection boundary stops before generators, user-defined iterator o
 The destructuring sample exercises nested object and array bindings, object rest, a destructuring arrow-function parameter, and a `Map` iterator record:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/destructure-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-destructure-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/destructure-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-destructure-demo.bmp --width 800 --height 320
 ```
 
 The dynamic-module sample runs a classic script that imports a same-origin packaged module, awaits its namespace object, destructures the exports, and joins an exported array:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/dynamic-import-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-dynamic-import-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/dynamic-import-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-dynamic-import-demo.bmp --width 800 --height 320
 ```
 
 The JSON-module sample imports a same-origin JSON resource through `import()` with an explicit `{ with: { type: "json" } }` attribute and reads its default export:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/json-import-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-json-import-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/json-import-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-json-import-demo.bmp --width 800 --height 320
 ```
 
 The live-binding sample updates an exported counter and observes the new value through both a named import and a namespace import:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/live-binding-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-live-binding-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/live-binding-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-live-binding-demo.bmp --width 800 --height 320
 ```
 
 The default-binding sample evaluates fallback expressions for missing object properties, nested objects, array entries, and references to earlier bindings:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/defaults-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-defaults-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/defaults-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-defaults-demo.bmp --width 800 --height 320
 ```
 
 The computed-key sample resolves object-pattern property names from string variables and binds the matching values:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/computed-key-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-computed-key-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/computed-key-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-computed-key-demo.bmp --width 800 --height 320
 ```
 
 The iterator sample defines a `Symbol.iterator` method, returns `next()` records from a closure, and consumes the values through `for...of`:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/iterator-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-iterator-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/iterator-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-iterator-demo.bmp --width 800 --height 320
 ```
 
 The packaged continuity page is also an integration target. It loads the real `/web/index.html`, its stylesheet, module graph, SDK module, and recovery asset through the custom resource bundle. The page reaches `4 / 4`: module loading, local storage, packaged fetch, and the engine-owned runtime identity query pass. The page stays loaded and does not fall back to a recovery document:
 
 ```powershell
-cargo test --locked --manifest-path engine-lab/Cargo.toml --test continuity
+cargo test --locked -p ceri-engine --test continuity
 ```
 
 The current language boundary stops before generators, broader class method semantics, and dynamic import attributes beyond same-origin JSON modules. Those remain explicit compatibility gates.
@@ -191,13 +191,13 @@ The current language boundary stops before generators, broader class method sema
 The event sample starts a click on a nested element and handles it on an ancestor through an external script:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo.bmp --width 800 --height 360 --click label
+cargo run -p ceri-engine -- --input engine/event-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-event-demo.bmp --width 800 --height 360 --click label
 ```
 
 The same sample can dispatch a pointer location through layout hit testing instead of naming an element:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml -- --input engine-lab/event-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-event-demo-pointer.bmp --width 800 --height 360 --click-at 60,160
+cargo run -p ceri-engine -- --input engine/event-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-event-demo-pointer.bmp --width 800 --height 360 --click-at 60,160
 ```
 
 `EngineHost` is the native-window boundary. A platform adapter navigates it, submits `InputEvent` values, calls `render`, and uploads `Frame.canvas.rgba_pixels()` using `Frame.canvas.bytes_per_row()`. It also exposes session-history `go`, `back`, and `forward` operations so native navigation controls can use the same browser state as page scripts. The lab CLI uses this boundary for navigation, coordinate input, timers, and presentation.
@@ -207,14 +207,14 @@ The default lab build stays dependency-free. The optional `windowed` feature add
 Compile the adapter from the repository root:
 
 ```powershell
-cargo check --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri-engine-window
-cargo run --manifest-path engine-lab/Cargo.toml --features windowed --bin ceri-engine-window
+cargo check -p ceri-engine --features windowed --bin ceri-engine-window
+cargo run -p ceri-engine --features windowed --bin ceri-engine-window
 ```
 
 To load a remote app through the Rust-native HTTPS provider, pass an HTTPS base URL and enable both optional features:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --features "windowed native-http" --bin ceri-engine-window -- --native-base https://example.com/app
+cargo run -p ceri-engine --features "windowed native-http" --bin ceri-engine-window -- --native-base https://example.com/app
 ```
 
 The remote mode maps `https://app.ceri.invalid/` into the supplied base, follows bounded same-origin redirects, and never opens a listener. The windowed remote mode constructs the provider and browser on `EngineWorker`, then queues navigation, input, and frame work across a bounded channel. The native event thread can continue receiving window messages while a provider request is in flight.
@@ -224,7 +224,7 @@ The adapter is an integration slice for Windows, macOS, and Linux desktop surfac
 The fetch demo exercises an app-owned resource without opening a listener:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/fetch-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-fetch-demo.bmp
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/fetch-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-fetch-demo.bmp
 ```
 
 The script data model supports bounded writes to plain-object properties and array indexes, array `length` changes, and `push()` or `pop()` mutation. `forEach()`, `filter()`, and `find()` invoke callbacks with the value, index, and source array. Strings expose bounded search, case conversion, trimming, slicing, and splitting. Object and array comparisons use reference identity, which keeps cyclic values observable before the structured-clone boundary rejects them. Object literals accept shallow spread from plain objects, arrays, and strings, and `Object.keys()`, `Object.values()`, `Object.entries()`, and `Object.assign()` cover bounded object inspection and copying.
@@ -234,9 +234,9 @@ This first fetch slice is deterministic and limited to same-origin resources sup
 The navigation demo exercises link default actions and `Location.replace()` across packaged pages:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-link.bmp --click open-link
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-replace.bmp --click replace-link
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/navigation-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-navigation-spa.bmp --click push-link --click back-link
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/navigation-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-navigation-link.bmp --click open-link
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/navigation-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-navigation-replace.bmp --click replace-link
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/navigation-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-navigation-spa.bmp --click push-link --click back-link
 ```
 
 The first command activates `/navigation-about.html` through a nested link. The second uses `window.location.replace()` and preserves the query and fragment in the app-owned URL. The third adds a same-document route with `history.pushState()`, then traverses it with `history.back()` and `popstate`. Full-page history entries reload their packaged document, while same-document entries retain the DOM and runtime. External origins, loopback listeners, and network transports remain outside this laboratory slice.
@@ -244,7 +244,7 @@ The first command activates `/navigation-about.html` through a nested link. The 
 The URL demo exercises the app-origin `URL` and `URLSearchParams` APIs without a listener:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/url-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-url-demo.bmp --click run-url
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/url-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-url-demo.bmp --click run-url
 ```
 
 The demo resolves a URL against the current app location, mutates its query parameters, sorts the entries, and displays the synchronized URL string. The constructor rejects origins outside `https://app.ceri.invalid`.
@@ -252,7 +252,7 @@ The demo resolves a URL against the current app location, mutates its query para
 The input demo exercises focus, active-element state, text insertion, and key editing:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/input-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-input-demo.bmp --click name --text rust --key Backspace
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/input-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-input-demo.bmp --click name --text rust --key Backspace
 ```
 
 The `--text` and `--key` switches feed the same `EngineHost` input boundary used by the optional native window adapter. The window adapter forwards winit keyboard and IME preedit, commit, and disable events through that boundary.
@@ -262,7 +262,7 @@ Text controls also expose the bounded selection surface used by form editors. Te
 The grid demo exercises fixed row tracks, fractional columns, repeat syntax, and gaps:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/grid-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-grid-demo.bmp
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/grid-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-grid-demo.bmp
 ```
 
 Grid placement is currently row-major. Explicit `grid-column`, auto-placement modes, and subgrid remain separate compatibility work.
@@ -272,7 +272,7 @@ Positioned overlays use the nearest `position: relative` ancestor as their bound
 The storage demo exercises app-owned `localStorage` and `sessionStorage` values without opening a listener:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/storage-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-storage-demo.bmp --click run-storage
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/storage-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-storage-demo.bmp --click run-storage
 ```
 
 The stores live in the `Browser` instance, so values survive full-document navigation and remain isolated from other browser instances. `Browser::with_storage_directory()` adds an optional versioned atomic snapshot for localStorage, CacheStorage, and IndexedDB. sessionStorage stays in memory for the browser session. Quota enforcement and cross-process sharing remain separate gates.
@@ -280,7 +280,7 @@ The stores live in the `Browser` instance, so values survive full-document navig
 The form demo exercises named controls, `FormData`, and a cancellable submit event:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/form-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-form-demo.bmp --click submit
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/form-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-form-demo.bmp --click submit
 ```
 
 The current form boundary collects string values from named `input`, `textarea`, `select`, and `button` descendants, skips disabled and unchecked checkbox or radio controls, applies cancellable checkbox click defaults, and resolves GET actions back into the packaged app origin with URL-encoded query pairs. Labels resolve their explicit `for` target or first labelable descendant, and a permitted label click forwards focus and activation to that control. POST actions encode the same controls as `application/x-www-form-urlencoded`, or as deterministic `multipart/form-data` when the form declares that `enctype`, through the host-owned `ResourceProvider`, then follow bounded same-origin redirects before parsing the returned HTML. A host-owned `FilePicker` supplies validated names, MIME types, bytes, and modification times to file controls. `input.files`, `FileList.item()`, and the `C:\\fakepath\\` display value update on a real selection, while picker cancellation preserves the prior selection. Selected files become multipart `File` entries, and an empty file control follows the standard empty-file entry rule. The renderer never receives a filesystem path. A `ClipboardProvider` supplies text to and from `navigator.clipboard` through fulfilled or rejected promises, leaving platform permission decisions in the host. A POST action requires a provider, so the default packaged bundle never opens a listener or silently invents a transport.
@@ -288,7 +288,7 @@ The current form boundary collects string values from named `input`, `textarea`,
 The canvas demo exercises the first drawing surface without a GPU or webview:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/canvas-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-canvas-demo.bmp --click redraw
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/canvas-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-canvas-demo.bmp --click redraw
 ```
 
 The current canvas context is intentionally small. It records app-owned `fillStyle`, `fillRect`, and `clearRect` commands, clips them to the laid-out canvas element, and replays them during the software paint pass. Paths, text, images, transforms, compositing, and GPU contexts remain separate compatibility gates.
@@ -296,7 +296,7 @@ The current canvas context is intentionally small. It records app-owned `fillSty
 The packaged SVG demo exercises a dependency-free image path:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/image-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-image-demo.bmp
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/image-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-image-demo.bmp
 ```
 
 The current image slice accepts app-origin `image/svg+xml` resources, enforces bounded dimensions, and rasterizes `rect`, `circle`, `line`, inherited paint, and simple inline style declarations. Broken, unsupported, or cross-origin image references stay absent from the frame instead of escaping the resource boundary. PNG, JPEG, animated formats, filters, text, paths, and image decoding remain separate gates.
@@ -304,7 +304,7 @@ The current image slice accepts app-origin `image/svg+xml` resources, enforces b
 The static module demo exercises packaged module loading without a listener:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-module-demo.bmp --width 800 --height 300
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/module-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-module-demo.bmp --width 800 --height 300
 ```
 
 The current module slice accepts external and inline `type="module"` scripts, resolves relative same-origin imports, supports default and named imports, namespace imports, live named and namespace bindings, `export default`, `export const`, `export function`, local export lists, named `export { ... } from` re-exports, and `export * from` forwarding with explicit-export precedence, caches completed modules, exposes `import.meta.url`, and rejects cycles or missing and cross-origin dependencies. Classic scripts can also use same-origin dynamic `import()` and receive a promise-backed module namespace, with deterministic rejection for missing, unsupported, and cross-origin resources. A dynamic import can request a same-origin `application/json` resource with `{ with: { type: "json" } }`, which exposes a parsed value as the namespace default export. Template literals support text plus `${...}` expressions. Async module evaluation, import attributes beyond JSON, tagged templates, nested template literals, and the rest of JavaScript grammar remain separate gates.
@@ -312,25 +312,25 @@ The current module slice accepts external and inline `type="module"` scripts, re
 The default-module sample loads a packaged module with a default function and a named value:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/default-module-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-default-module-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/default-module-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-default-module-demo.bmp --width 800 --height 320
 ```
 
 The re-export sample loads a named value through an intermediate packaged barrel module:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/reexport-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-reexport-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/reexport-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-reexport-demo.bmp --width 800 --height 320
 ```
 
 The export-star sample forwards every non-default name from a source module and keeps an explicit barrel export when the names collide:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/export-star-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-export-star-demo.bmp --width 800 --height 320
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/export-star-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-export-star-demo.bmp --width 800 --height 320
 ```
 
 The dynamic selector demo exercises stateful CSS through the host input boundary:
 
 ```powershell
-cargo run --manifest-path engine-lab/Cargo.toml --bin ceri-engine-lab -- --input engine-lab/state-demo.html --asset-root engine-lab --url https://app.ceri.invalid/ --output target/ceri-state-demo.bmp --move-at 80,260 --click switch
+cargo run -p ceri-engine --bin ceri-engine -- --input engine/state-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-state-demo.bmp --move-at 80,260 --click switch
 ```
 
 The `--move-at` switch dispatches a pointer move before the click, while the click updates focus and checkbox state. The layout and paint pass then recompute pseudo-class styles without a page reload.

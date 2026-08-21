@@ -592,13 +592,8 @@ fn hit_test_context(
     let mut contexts = stacking_context_entries(layout, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().rev().filter(|entry| entry.z_index >= 0) {
-        if let Some(path) = hit_test_context(
-            entry.layout,
-            x,
-            y,
-            entry.clip,
-            entry.ancestor_offset,
-        ) {
+        if let Some(path) = hit_test_context(entry.layout, x, y, entry.clip, entry.ancestor_offset)
+        {
             return Some(path);
         }
     }
@@ -606,13 +601,8 @@ fn hit_test_context(
         return Some(path);
     }
     for entry in contexts.iter().rev().filter(|entry| entry.z_index < 0) {
-        if let Some(path) = hit_test_context(
-            entry.layout,
-            x,
-            y,
-            entry.clip,
-            entry.ancestor_offset,
-        ) {
+        if let Some(path) = hit_test_context(entry.layout, x, y, entry.clip, entry.ancestor_offset)
+        {
             return Some(path);
         }
     }
@@ -676,13 +666,7 @@ pub(crate) fn stacking_context_entries(
 ) -> Vec<StackingContextEntry<'_>> {
     let mut entries = Vec::new();
     let mut order = 0;
-    collect_stacking_contexts(
-        layout,
-        clip,
-        ancestor_offset,
-        &mut order,
-        &mut entries,
-    );
+    collect_stacking_contexts(layout, clip, ancestor_offset, &mut order, &mut entries);
     entries
 }
 
@@ -719,7 +703,10 @@ fn stacking_child_clip(
     visual_offset: (f32, f32),
 ) -> Option<Rect> {
     if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.path.is_empty() {
-        intersect_rect(clip, translate_rect(scrollbar_metrics(layout).scrollport, visual_offset))
+        intersect_rect(
+            clip,
+            translate_rect(scrollbar_metrics(layout).scrollport, visual_offset),
+        )
     } else {
         clip
     }
@@ -731,10 +718,7 @@ pub(crate) fn paint_order(children: &[LayoutBox]) -> Vec<usize> {
     order
 }
 
-pub(crate) fn visual_offset_for(
-    layout: &LayoutBox,
-    ancestor_offset: (f32, f32),
-) -> (f32, f32) {
+pub(crate) fn visual_offset_for(layout: &LayoutBox, ancestor_offset: (f32, f32)) -> (f32, f32) {
     if layout.position == Position::Fixed {
         layout.visual_offset
     } else {
@@ -773,21 +757,19 @@ fn scroll_target_box(
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
-    let child_clip = if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto)
-        || layout.path.is_empty()
-    {
-        intersect_rect(clip, translate_rect(scrollbar_metrics(layout).scrollport, visual_offset))
-    } else {
-        clip
-    };
+    let child_clip =
+        if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.path.is_empty() {
+            intersect_rect(
+                clip,
+                translate_rect(scrollbar_metrics(layout).scrollport, visual_offset),
+            )
+        } else {
+            clip
+        };
     for index in paint_order(&layout.children).into_iter().rev() {
-        if let Some(target) = scroll_target_box(
-            &layout.children[index],
-            x,
-            y,
-            child_clip,
-            visual_offset,
-        ) {
+        if let Some(target) =
+            scroll_target_box(&layout.children[index], x, y, child_clip, visual_offset)
+        {
             return Some(target);
         }
     }
@@ -1935,12 +1917,7 @@ fn apply_sticky_descendants(
         if child.overflow == Overflow::Auto {
             continue;
         }
-        apply_sticky_descendants(
-            &mut child.children,
-            scrollport,
-            child_rect,
-            child_offset,
-        );
+        apply_sticky_descendants(&mut child.children, scrollport, child_rect, child_offset);
     }
 }
 
@@ -1951,12 +1928,10 @@ fn measure_scroll_content(layout: &LayoutBox) -> Size {
         if child.position == Position::Fixed {
             continue;
         }
-        right = right.max(
-            child.rect.x + child.visual_offset.0 + child.rect.width + child.margin.right,
-        );
-        bottom = bottom.max(
-            child.rect.y + child.visual_offset.1 + child.rect.height + child.margin.bottom,
-        );
+        right =
+            right.max(child.rect.x + child.visual_offset.0 + child.rect.width + child.margin.right);
+        bottom = bottom
+            .max(child.rect.y + child.visual_offset.1 + child.rect.height + child.margin.bottom);
     }
     Size {
         width: (right - layout.rect.x).max(layout.rect.width),
@@ -2425,7 +2400,11 @@ mod tests {
         assert_eq!(input.text[0].color, Color::opaque(120, 145, 155));
         assert_eq!(textarea.control_value.as_deref(), Some(""));
         assert_eq!(
-            textarea.text.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+            textarea
+                .text
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
             ["line one", "line two"]
         );
         let mut state = StyleState::default();
@@ -2512,12 +2491,8 @@ mod tests {
         .expect("textarea document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state
-            .control_values
-            .insert(vec![0], "abcdef".to_string());
-        state
-            .control_values
-            .insert(vec![1], "abcdef".to_string());
+        state.control_values.insert(vec![0], "abcdef".to_string());
+        state.control_values.insert(vec![1], "abcdef".to_string());
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -2530,7 +2505,11 @@ mod tests {
         let wrapped = &result.root.children[0];
         let no_wrap = &result.root.children[1];
         assert_eq!(
-            wrapped.text.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+            wrapped
+                .text
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
             ["ab", "cd", "ef"]
         );
         assert_eq!(no_wrap.text.len(), 1);
@@ -2758,9 +2737,7 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state
-            .scroll_offsets
-            .insert(vec![1], (20.0, 30.0));
+        state.scroll_offsets.insert(vec![1], (20.0, 30.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -2772,7 +2749,13 @@ mod tests {
         );
         let viewport = &result.root.children[0];
         let content = &viewport.children[0];
-        assert_eq!(viewport.scroll_content, Size { width: 80.0, height: 60.0 });
+        assert_eq!(
+            viewport.scroll_content,
+            Size {
+                width: 80.0,
+                height: 60.0
+            }
+        );
         assert_eq!(viewport.scroll_offset, (20.0, 30.0));
         assert_eq!(content.rect.x, -20.0);
         assert_eq!(content.rect.y, -30.0);
@@ -2815,14 +2798,20 @@ mod tests {
         assert_eq!(metrics.scrollport.width, 28.0);
         assert_eq!(metrics.scrollport.height, 28.0);
         assert_eq!(metrics.vertical_track.unwrap().width, SCROLLBAR_THICKNESS);
-        assert_eq!(metrics.horizontal_track.unwrap().height, SCROLLBAR_THICKNESS);
+        assert_eq!(
+            metrics.horizontal_track.unwrap().height,
+            SCROLLBAR_THICKNESS
+        );
         let canvas = result.paint();
         let content = ((4 * canvas.width() + 10) * 4) as usize;
         let vertical_thumb = ((4 * canvas.width() + 35) * 4) as usize;
         let horizontal_thumb = ((34 * canvas.width() + 4) * 4) as usize;
         let vertical_track = ((20 * canvas.width() + 35) * 4) as usize;
         let horizontal_track = ((34 * canvas.width() + 20) * 4) as usize;
-        assert_eq!(&canvas.rgba_pixels()[content..content + 4], [255, 0, 0, 255]);
+        assert_eq!(
+            &canvas.rgba_pixels()[content..content + 4],
+            [255, 0, 0, 255]
+        );
         assert_eq!(
             &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
             [126, 138, 150, 255]

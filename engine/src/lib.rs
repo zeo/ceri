@@ -3,9 +3,9 @@ mod dom;
 mod host;
 mod image;
 mod layout;
-mod navigation;
 #[cfg(feature = "native-http")]
 mod native_http;
+mod navigation;
 mod paint;
 mod script;
 mod wasm;
@@ -20,12 +20,12 @@ pub use host::{
     PointerButton,
 };
 pub use layout::{LayoutDocument, Rect, Size, layout};
-pub use navigation::{
-    APP_ORIGIN, AppUrl, Browser, NavigationError, NavigationFailure, NavigationStatus, Resource,
-    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, ResourceBundle,
-    ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
-};
 #[cfg(feature = "native-http")]
 pub use native_http::NativeHttpProvider;
+pub use navigation::{
+    APP_ORIGIN, AppUrl, Browser, ClipboardProvider, FilePicker, FilePickerRequest, FileSelection,
+    NavigationError, NavigationFailure, NavigationStatus, Resource, ResourceBundle,
+    ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
+};
 pub use paint::Canvas;
 pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};

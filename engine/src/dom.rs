@@ -229,7 +229,10 @@ impl Document {
 
     pub fn form_owner_path(&self, path: &[usize]) -> Option<NodePath> {
         let element = self.element_at(path)?;
-        if !matches!(element.name.as_str(), "button" | "input" | "select" | "textarea") {
+        if !matches!(
+            element.name.as_str(),
+            "button" | "input" | "select" | "textarea"
+        ) {
             return None;
         }
         if let Some(form_id) = element.attr("form") {
@@ -246,7 +249,10 @@ impl Document {
         let mut candidate = path.to_vec();
         while !candidate.is_empty() {
             candidate.pop();
-            if self.element_at(&candidate).is_some_and(|element| element.name == "form") {
+            if self
+                .element_at(&candidate)
+                .is_some_and(|element| element.name == "form")
+            {
                 return Some(candidate);
             }
         }
@@ -523,7 +529,8 @@ impl Document {
                 let Some(parent_element) = self.element_at_mut(parent) else {
                     return false;
                 };
-                if !matches!(parent_element.children.get(index), Some(Node::Text(text)) if text.is_empty()) {
+                if !matches!(parent_element.children.get(index), Some(Node::Text(text)) if text.is_empty())
+                {
                     return false;
                 }
                 parent_element.children.remove(index);
@@ -542,14 +549,16 @@ impl Document {
             } => {
                 if self.node_id(first) != Some(*first_id)
                     || self.node_id(child) != Some(*child_id)
-                    || *child_length != self
-                        .node_at(child)
-                        .map(text_utf16_len)
-                        .unwrap_or(usize::MAX)
-                    || *first_length != self
-                        .node_at(first)
-                        .map(text_utf16_len)
-                        .unwrap_or(usize::MAX)
+                    || *child_length
+                        != self
+                            .node_at(child)
+                            .map(text_utf16_len)
+                            .unwrap_or(usize::MAX)
+                    || *first_length
+                        != self
+                            .node_at(first)
+                            .map(text_utf16_len)
+                            .unwrap_or(usize::MAX)
                 {
                     return false;
                 }
@@ -576,7 +585,8 @@ impl Document {
                     return false;
                 };
                 parent_element.children.remove(child_index);
-                let Some(Node::Text(first_text)) = parent_element.children.get_mut(first_index) else {
+                let Some(Node::Text(first_text)) = parent_element.children.get_mut(first_index)
+                else {
                     return false;
                 };
                 first_text.push_str(&removed);
@@ -762,8 +772,7 @@ impl Document {
         element: Element,
         reference: &[usize],
     ) -> Option<NodePath> {
-        if reference.len() != parent.len().saturating_add(1)
-            || reference[..parent.len()] != *parent
+        if reference.len() != parent.len().saturating_add(1) || reference[..parent.len()] != *parent
         {
             return None;
         }
@@ -784,8 +793,7 @@ impl Document {
         text: String,
         reference: &[usize],
     ) -> Option<NodePath> {
-        if reference.len() != parent.len().saturating_add(1)
-            || reference[..parent.len()] != *parent
+        if reference.len() != parent.len().saturating_add(1) || reference[..parent.len()] != *parent
         {
             return None;
         }
@@ -848,8 +856,7 @@ impl Document {
             let source_parent_element = self.element_at_mut(&source_parent)?;
             source_parent_element.children.remove(source_index)
         };
-        self.paths
-            .retain(|_, path| !path.starts_with(source));
+        self.paths.retain(|_, path| !path.starts_with(source));
         self.shift_paths_for_remove(&source_parent, source_index);
         let parent = path_after_remove(parent, &source_parent, source_index)?;
         let reference = if let Some(reference) = reference {
@@ -860,7 +867,10 @@ impl Document {
         let index = reference
             .as_ref()
             .map(|reference| *reference.last().expect("reference path is non-empty"))
-            .unwrap_or_else(|| self.element_at(&parent).map_or(0, |element| element.children.len()));
+            .unwrap_or_else(|| {
+                self.element_at(&parent)
+                    .map_or(0, |element| element.children.len())
+            });
         if index > self.element_at(&parent)?.children.len() {
             return None;
         }
@@ -882,9 +892,7 @@ impl Document {
     }
 
     pub fn remove_child(&mut self, parent: &[usize], child: &[usize]) -> Option<Element> {
-        if child.len() != parent.len().saturating_add(1)
-            || child[..parent.len()] != *parent
-        {
+        if child.len() != parent.len().saturating_add(1) || child[..parent.len()] != *parent {
             return None;
         }
         let index = *child.last()?;
@@ -904,9 +912,7 @@ impl Document {
     }
 
     pub fn remove_text_child(&mut self, parent: &[usize], child: &[usize]) -> Option<String> {
-        if child.len() != parent.len().saturating_add(1)
-            || child[..parent.len()] != *parent
-        {
+        if child.len() != parent.len().saturating_add(1) || child[..parent.len()] != *parent {
             return None;
         }
         let index = *child.last()?;
@@ -1064,9 +1070,8 @@ impl Document {
     }
 
     fn remove_descendant_ids(&mut self, path: &[usize]) {
-        self.paths.retain(|_, candidate| {
-            !(candidate.starts_with(path) && candidate.len() > path.len())
-        });
+        self.paths
+            .retain(|_, candidate| !(candidate.starts_with(path) && candidate.len() > path.len()));
         self.rebuild_path_index();
     }
 
@@ -1078,9 +1083,7 @@ impl Document {
 
     fn shift_paths_for_insert(&mut self, parent: &[usize], index: usize) {
         for path in self.paths.values_mut() {
-            if path.len() > parent.len()
-                && path.starts_with(parent)
-                && path[parent.len()] >= index
+            if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] >= index
             {
                 path[parent.len()] += 1;
             }
@@ -1090,10 +1093,7 @@ impl Document {
 
     fn shift_paths_for_remove(&mut self, parent: &[usize], index: usize) {
         for path in self.paths.values_mut() {
-            if path.len() > parent.len()
-                && path.starts_with(parent)
-                && path[parent.len()] > index
-            {
+            if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] > index {
                 path[parent.len()] -= 1;
             }
         }
@@ -1238,14 +1238,16 @@ impl Element {
     }
 }
 
-fn find_normalize_candidate(
-    element: &Element,
-    path: NodePath,
-) -> Option<(NodePath, usize)> {
+fn find_normalize_candidate(element: &Element, path: NodePath) -> Option<(NodePath, usize)> {
     for (index, child) in element.children.iter().enumerate() {
         match child {
             Node::Text(text) if text.is_empty() => return Some((path, index)),
-            Node::Text(_) if matches!(element.children.get(index.saturating_add(1)), Some(Node::Text(_))) => {
+            Node::Text(_)
+                if matches!(
+                    element.children.get(index.saturating_add(1)),
+                    Some(Node::Text(_))
+                ) =>
+            {
                 return Some((path, index));
             }
             Node::Element(child) => {
@@ -1402,7 +1404,10 @@ fn input_accessibility_role(element: &Element) -> String {
 }
 
 fn accessibility_name(element: &Element) -> String {
-    if let Some(label) = element.attr("aria-label").filter(|label| !label.trim().is_empty()) {
+    if let Some(label) = element
+        .attr("aria-label")
+        .filter(|label| !label.trim().is_empty())
+    {
         return label.trim().to_string();
     }
     if element.name == "img"
@@ -1410,7 +1415,10 @@ fn accessibility_name(element: &Element) -> String {
     {
         return alt.to_string();
     }
-    if let Some(title) = element.attr("title").filter(|title| !title.trim().is_empty()) {
+    if let Some(title) = element
+        .attr("title")
+        .filter(|title| !title.trim().is_empty())
+    {
         return title.trim().to_string();
     }
     if matches!(
@@ -1553,9 +1561,9 @@ fn collect_script_text(element: &Element, scripts: &mut Vec<String>) {
 
 fn collect_script_sources(element: &Element, scripts: &mut Vec<ScriptSource>) {
     if element.name == "script" {
-        let is_module = element.attr("type").is_some_and(|kind| {
-            kind.trim().eq_ignore_ascii_case("module")
-        });
+        let is_module = element
+            .attr("type")
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("module"));
         if let Some(source) = element.attr("src") {
             scripts.push(if is_module {
                 ScriptSource::ExternalModule(source.to_string())
@@ -1637,7 +1645,10 @@ fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mu
             continue;
         };
         path.push(index);
-        if matches!(child.name.as_str(), "button" | "input" | "select" | "textarea") {
+        if matches!(
+            child.name.as_str(),
+            "button" | "input" | "select" | "textarea"
+        ) {
             paths.push(path.clone());
         }
         collect_form_control_paths(child, path, paths);
@@ -1761,11 +1772,7 @@ fn collect_text_nodes(element: &Element, output: &mut String) {
 
 fn text_utf16_len(node: &Node) -> usize {
     match node {
-        Node::Element(element) => element
-            .children
-            .iter()
-            .map(text_utf16_len)
-            .sum(),
+        Node::Element(element) => element.children.iter().map(text_utf16_len).sum(),
         Node::Text(text) => text.encode_utf16().count(),
     }
 }
@@ -2122,7 +2129,10 @@ mod tests {
         let tree = document.accessibility_tree();
         assert_eq!(tree.role, "document");
         let main = &tree.children[0];
-        assert_eq!((main.role.as_str(), main.path.as_slice()), ("main", [0].as_slice()));
+        assert_eq!(
+            (main.role.as_str(), main.path.as_slice()),
+            ("main", [0].as_slice())
+        );
         assert_eq!(main.children.len(), 4);
         assert_eq!(
             (
@@ -2257,10 +2267,7 @@ mod tests {
             document.form_control_paths(&form),
             Some(vec![vec![0, 0], vec![0, 1, 0], vec![0, 2]])
         );
-        assert_eq!(
-            document.form_ancestor_path(&[0, 1, 0]),
-            Some(vec![0])
-        );
+        assert_eq!(document.form_ancestor_path(&[0, 1, 0]), Some(vec![0]));
     }
 
     #[test]
@@ -2278,19 +2285,10 @@ mod tests {
         let hidden = document
             .find_element_by_id("hidden")
             .expect("hidden label should exist");
-        assert_eq!(
-            document.label_control_path(&explicit),
-            Some(vec![1])
-        );
-        assert_eq!(
-            document.label_control_path(&wrapped),
-            Some(vec![2, 1])
-        );
+        assert_eq!(document.label_control_path(&explicit), Some(vec![1]));
+        assert_eq!(document.label_control_path(&wrapped), Some(vec![2, 1]));
         assert!(document.label_control_path(&hidden).is_none());
-        assert_eq!(
-            document.label_ancestor_path(&[2, 0]),
-            Some(vec![2])
-        );
+        assert_eq!(document.label_ancestor_path(&[2, 0]), Some(vec![2]));
     }
 
     #[test]
@@ -2361,7 +2359,12 @@ mod tests {
         let last = document
             .find_element_by_id("last")
             .expect("survivor should exist");
-        assert_eq!(document.remove_child(&main, &gone).map(|element| element.name), Some("p".to_string()));
+        assert_eq!(
+            document
+                .remove_child(&main, &gone)
+                .map(|element| element.name),
+            Some("p".to_string())
+        );
         assert!(document.find_element_by_id("gone").is_none());
         assert_eq!(
             document.element_text_content(&last).as_deref(),
@@ -2434,7 +2437,9 @@ mod tests {
         let reference = document
             .find_element_by_id("reference")
             .expect("reference should exist");
-        let moved_id = document.node_id(&moved).expect("moved element should have an id");
+        let moved_id = document
+            .node_id(&moved)
+            .expect("moved element should have an id");
         let stay_id = document
             .node_id(&[0, 1])
             .expect("surviving sibling should have an id");

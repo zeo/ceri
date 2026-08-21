@@ -1,4 +1,4 @@
-use ceri_engine_lab::{APP_ORIGIN, Browser, EngineHost, InputEvent, ResourceBundle, Size};
+use ceri_engine::{APP_ORIGIN, Browser, EngineHost, InputEvent, ResourceBundle, Size};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -91,11 +91,7 @@ fn main() -> Result<(), String> {
         println!(
             "text input {:?}: {}",
             text,
-            if result.handled {
-                "handled"
-            } else {
-                "ignored"
-            }
+            if result.handled { "handled" } else { "ignored" }
         );
     }
     for key in &options.keys {
@@ -105,11 +101,7 @@ fn main() -> Result<(), String> {
         println!(
             "key {:?}: {}",
             key,
-            if result.handled {
-                "handled"
-            } else {
-                "ignored"
-            }
+            if result.handled { "handled" } else { "ignored" }
         );
     }
     for milliseconds in &options.ticks {
@@ -166,7 +158,7 @@ where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
     let mut input = None;
-    let mut output = PathBuf::from("target/ceri-engine-lab.ppm");
+    let mut output = PathBuf::from("target/ceri-engine.ppm");
     let mut width = 800;
     let mut height = 520;
     let mut clicks = Vec::new();
@@ -199,7 +191,7 @@ where
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-lab --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }

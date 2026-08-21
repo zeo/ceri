@@ -1,15 +1,12 @@
-use crate::dom::{
-    AccessibilityNode, Document, Element, Node, NodeId, NodePath, NormalizeChange,
-};
+use crate::Color;
 use crate::css::StyleState;
+use crate::dom::{AccessibilityNode, Document, Element, Node, NodeId, NodePath, NormalizeChange};
 use crate::navigation::{
-    is_http_redirect, is_javascript, is_json, AppUrl, ClipboardProvider, FilePicker,
-    FilePickerRequest, NavigationError, Resource, ResourceBundle, ResourceCacheMode,
-    normalize_headers, ResourceProvider, ResourceRequest, ResourceResponse,
-    APP_ORIGIN,
+    APP_ORIGIN, AppUrl, ClipboardProvider, FilePicker, FilePickerRequest, NavigationError,
+    Resource, ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
+    ResourceResponse, is_http_redirect, is_javascript, is_json, normalize_headers,
 };
 use crate::paint::CanvasCommand;
-use crate::Color;
 use crate::wasm;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -19,9 +16,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::rc::Weak;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 
 type EnvironmentRef = Rc<RefCell<Environment>>;
@@ -1558,10 +1555,10 @@ impl ScriptRuntime {
         host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
-        let local_storage = local_storage
-            .unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
-        let session_storage = session_storage
-            .unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
+        let local_storage =
+            local_storage.unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
+        let session_storage =
+            session_storage.unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
         let location = Rc::new(RefCell::new(base_url.clone().unwrap_or_else(|| {
             AppUrl::parse("https://app.ceri.invalid/").expect("built-in app origin should parse")
         })));
@@ -1583,10 +1580,9 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("location".to_string(), Value::Location(location.clone()));
-            values.values.insert(
-                "history".to_string(),
-                Value::History(history.clone()),
-            );
+            values
+                .values
+                .insert("history".to_string(), Value::History(history.clone()));
             values.values.insert("console".to_string(), Value::Console);
             values.values.insert("JSON".to_string(), Value::Json);
             values.values.insert(
@@ -1947,7 +1943,9 @@ impl ScriptRuntime {
         let source_parent = source[..source.len().saturating_sub(1)].to_vec();
         let source_index = *source.last().expect("move source path is non-empty");
         let destination_parent = destination[..destination.len().saturating_sub(1)].to_vec();
-        let destination_index = *destination.last().expect("move destination path is non-empty");
+        let destination_index = *destination
+            .last()
+            .expect("move destination path is non-empty");
         relocate_hash_map_paths(
             &mut self.listeners,
             source,
@@ -2226,9 +2224,12 @@ impl ScriptRuntime {
     }
 
     fn clear_runtime_state_for_removed_subtree(&mut self, path: &[usize]) {
-        self.listeners.retain(|candidate, _| !candidate.starts_with(path));
-        self.control_values.retain(|candidate, _| !candidate.starts_with(path));
-        self.control_checked.retain(|candidate, _| !candidate.starts_with(path));
+        self.listeners
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.control_values
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.control_checked
+            .retain(|candidate, _| !candidate.starts_with(path));
         self.dirty_checked_controls
             .retain(|candidate| !candidate.starts_with(path));
         self.option_selected
@@ -2263,11 +2264,7 @@ impl ScriptRuntime {
         }
     }
 
-    fn detach_child(
-        &mut self,
-        parent: &[usize],
-        child: &ElementHandle,
-    ) -> Result<(), ScriptError> {
+    fn detach_child(&mut self, parent: &[usize], child: &ElementHandle) -> Result<(), ScriptError> {
         let Some(child_path) = attached_path(child) else {
             return Err(runtime_error("removeChild expects an attached child"));
         };
@@ -2300,7 +2297,9 @@ impl ScriptRuntime {
             None
         };
         if removed_element.is_none() && removed_text.is_none() {
-            return Err(runtime_error("removeChild child is no longer in the document"));
+            return Err(runtime_error(
+                "removeChild child is no longer in the document",
+            ));
         }
         self.capture_detached_listeners(child, &child_path);
         self.clear_runtime_state_for_removed_subtree(&child_path);
@@ -2418,10 +2417,7 @@ impl ScriptRuntime {
                 "dynamic import is unavailable without resources",
             ));
         }
-        let resources = self
-            .resources
-            .clone()
-            .unwrap_or_default();
+        let resources = self.resources.clone().unwrap_or_default();
         let provider = self.resource_provider.clone();
         let resource = resolve_runtime_resource(&resources, provider.as_deref(), &url)?
             .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
@@ -2498,27 +2494,29 @@ impl ScriptRuntime {
         {
             let mut values = environment.borrow_mut();
             for export in &program.exports {
-                values.values.entry(export.local.clone()).or_insert_with(|| {
-                    Value::Binding(Rc::new(RefCell::new(Value::Undefined)), true)
-                });
+                values
+                    .values
+                    .entry(export.local.clone())
+                    .or_insert_with(|| {
+                        Value::Binding(Rc::new(RefCell::new(Value::Undefined)), true)
+                    });
             }
         }
         for import in &program.imports {
             let (dependency_url, dependency_source) = loader.load_module(&url, &import.source)?;
-            let namespace = self.execute_module_graph(&dependency_source, dependency_url, loader)?;
+            let namespace =
+                self.execute_module_graph(&dependency_source, dependency_url, loader)?;
             let mut values = environment.borrow_mut();
             for binding in &import.bindings {
                 let value = match binding {
-                    ModuleImportBinding::Named { imported, .. } => namespace
-                        .values
-                        .get(imported)
-                        .cloned()
-                        .ok_or_else(|| {
+                    ModuleImportBinding::Named { imported, .. } => {
+                        namespace.values.get(imported).cloned().ok_or_else(|| {
                             runtime_error(format!(
                                 "module {} has no export {imported}",
                                 import.source
                             ))
-                        })?,
+                        })?
+                    }
                     ModuleImportBinding::Namespace { .. } => namespace.object_value(),
                 };
                 let value = match value {
@@ -2547,9 +2545,9 @@ impl ScriptRuntime {
         let values = environment.borrow();
         let mut exports = BTreeMap::new();
         for export in program.exports {
-            let value = values
-                .get_raw(&export.local)
-                .ok_or_else(|| runtime_error(format!("module export {} is undefined", export.local)))?;
+            let value = values.get_raw(&export.local).ok_or_else(|| {
+                runtime_error(format!("module export {} is undefined", export.local))
+            })?;
             exports.insert(export.exported, value);
         }
         for namespace in star_namespaces {
@@ -2617,12 +2615,14 @@ impl ScriptRuntime {
         let start = label_path.len();
         if path.len() > start
             && (start + 1..=path.len()).any(|length| {
-                document.element_clone(&path[..length]).is_some_and(|element| {
-                    matches!(
-                        element.name.as_str(),
-                        "a" | "button" | "input" | "select" | "textarea"
-                    )
-                })
+                document
+                    .element_clone(&path[..length])
+                    .is_some_and(|element| {
+                        matches!(
+                            element.name.as_str(),
+                            "a" | "button" | "input" | "select" | "textarea"
+                        )
+                    })
             })
         {
             return None;
@@ -2696,12 +2696,7 @@ impl ScriptRuntime {
         let mut entries = Vec::new();
         let mut order = 0usize;
         let tree = self.document.borrow().accessibility_tree();
-        collect_sequential_focus_nodes(
-            &tree,
-            &mut order,
-            &mut entries,
-            &self.document,
-        );
+        collect_sequential_focus_nodes(&tree, &mut order, &mut entries, &self.document);
         entries.sort_by_key(|(tabindex, order, _)| {
             if *tabindex > 0 {
                 (0, *tabindex, *order)
@@ -2721,9 +2716,7 @@ impl ScriptRuntime {
             .as_ref()
             .and_then(|focused| paths.iter().position(|path| path == focused))
         {
-            Some(index) if backwards => {
-                paths[(index + paths.len() - 1) % paths.len()].clone()
-            }
+            Some(index) if backwards => paths[(index + paths.len() - 1) % paths.len()].clone(),
             Some(index) => paths[(index + 1) % paths.len()].clone(),
             None if backwards => paths.last().cloned().unwrap_or_default(),
             None => paths.first().cloned().unwrap_or_default(),
@@ -2820,12 +2813,8 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             };
         }
-        let dispatch = self.dispatch_event_with_details(
-            path.clone(),
-            "compositionstart",
-            "",
-            "",
-        )?;
+        let dispatch =
+            self.dispatch_event_with_details(path.clone(), "compositionstart", "", "")?;
         self.drain_microtasks()?;
         if dispatch.default_prevented {
             return Ok(None);
@@ -2849,12 +2838,8 @@ impl ScriptRuntime {
         let Some(composition) = self.composition.clone() else {
             return Ok(false);
         };
-        let update = self.dispatch_event_with_details(
-            path.clone(),
-            "compositionupdate",
-            "",
-            text,
-        )?;
+        let update =
+            self.dispatch_event_with_details(path.clone(), "compositionupdate", "", text)?;
         self.drain_microtasks()?;
         let value = self.control_value_path(&path).unwrap_or_default();
         let length = utf16_len(&value);
@@ -2867,8 +2852,7 @@ impl ScriptRuntime {
                 truncate_utf16(text, maximum.saturating_sub(occupied))
             })
             .unwrap_or_else(|| text.to_string());
-        let (value, selection_end) =
-            replace_utf16_range(&value, start, end, &replacement_text);
+        let (value, selection_end) = replace_utf16_range(&value, start, end, &replacement_text);
         self.control_values.insert(path.clone(), value);
         if start != end || !replacement_text.is_empty() {
             self.mark_user_edit(&path);
@@ -2928,20 +2912,12 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             },
         );
-        let input = self.dispatch_event_with_details(
-            path.clone(),
-            "input",
-            "",
-            &replacement_text,
-        )?;
+        let input =
+            self.dispatch_event_with_details(path.clone(), "input", "", &replacement_text)?;
         self.drain_microtasks()?;
         self.composition = None;
-        let end_event = self.dispatch_event_with_details(
-            path,
-            "compositionend",
-            "",
-            &replacement_text,
-        )?;
+        let end_event =
+            self.dispatch_event_with_details(path, "compositionend", "", &replacement_text)?;
         self.drain_microtasks()?;
         Ok(input.handled || end_event.handled || start != end || !replacement_text.is_empty())
     }
@@ -2955,12 +2931,7 @@ impl ScriptRuntime {
             self.composition = None;
             return Ok(false);
         }
-        let update = self.dispatch_event_with_details(
-            path.clone(),
-            "compositionupdate",
-            "",
-            "",
-        )?;
+        let update = self.dispatch_event_with_details(path.clone(), "compositionupdate", "", "")?;
         self.drain_microtasks()?;
         self.composition = None;
         let value = self.control_value_path(&path).unwrap_or_default();
@@ -2997,13 +2968,8 @@ impl ScriptRuntime {
         let Some(path) = self.focused_element.clone() else {
             return Ok(false);
         };
-        let dispatch = self.dispatch_event_with_modifiers(
-            path.clone(),
-            "keydown",
-            key,
-            "",
-            modifiers,
-        )?;
+        let dispatch =
+            self.dispatch_event_with_modifiers(path.clone(), "keydown", key, "", modifiers)?;
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
@@ -3353,11 +3319,7 @@ impl ScriptRuntime {
             .map(|file| format!("C:\\fakepath\\{}", file.name))
             .unwrap_or_default();
         self.selected_files.insert(path.to_vec(), files);
-        let files = self
-            .selected_files
-            .get(path)
-            .cloned()
-            .unwrap_or_default();
+        let files = self.selected_files.get(path).cloned().unwrap_or_default();
         self.file_lists
             .borrow_mut()
             .insert(path.to_vec(), Rc::new(files));
@@ -3387,8 +3349,8 @@ impl ScriptRuntime {
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
             .unwrap_or_default();
-        let is_reset = (element.name == "button" || element.name == "input")
-            && input_type == "reset";
+        let is_reset =
+            (element.name == "button" || element.name == "input") && input_type == "reset";
         is_reset
             .then(|| self.document.borrow().form_ancestor_path(path))
             .flatten()
@@ -3636,10 +3598,7 @@ impl ScriptRuntime {
                 if let Some(Value::Binding(binding, true)) = existing {
                     *binding.borrow_mut() = value;
                 } else {
-                    environment
-                        .borrow_mut()
-                        .values
-                        .insert(name.clone(), value);
+                    environment.borrow_mut().values.insert(name.clone(), value);
                 }
                 Ok(())
             }
@@ -3668,7 +3627,8 @@ impl ScriptRuntime {
                             .string_value(),
                     };
                     consumed.insert(property.clone());
-                    let nested_value = if let Some(nested_value) = object_properties.get(&property) {
+                    let nested_value = if let Some(nested_value) = object_properties.get(&property)
+                    {
                         nested_value.clone()
                     } else {
                         self.member(value.clone(), &property)
@@ -3928,10 +3888,8 @@ impl ScriptRuntime {
                                     .evaluate(key_expression, environment.clone())
                                     .map(|value| value.property_key())?,
                             };
-                            object.insert(
-                                property,
-                                self.evaluate(expression, environment.clone())?,
-                            );
+                            object
+                                .insert(property, self.evaluate(expression, environment.clone())?);
                         }
                     }
                 }
@@ -3992,29 +3950,22 @@ impl ScriptRuntime {
                                     "dynamic import accepts at most two arguments",
                                 ))
                             } else {
-                                self.evaluate(argument, environment.clone()).and_then(
-                                    |reference| {
+                                self.evaluate(argument, environment.clone())
+                                    .and_then(|reference| {
                                         let attributes = arguments
                                             .get(1)
                                             .map(|argument| {
                                                 self.evaluate(argument, environment.clone())
                                             })
                                             .transpose()?;
-                                        let attributes = attributes.as_ref().filter(|value| {
-                                            !matches!(value, Value::Undefined)
-                                        });
-                                        self.dynamic_import(
-                                            base_url,
-                                            &reference,
-                                            attributes,
-                                        )
-                                    },
-                                )
+                                        let attributes = attributes
+                                            .as_ref()
+                                            .filter(|value| !matches!(value, Value::Undefined));
+                                        self.dynamic_import(base_url, &reference, attributes)
+                                    })
                             }
                         }
-                        (None, _) => Err(runtime_error(
-                            "dynamic import requires a document URL",
-                        )),
+                        (None, _) => Err(runtime_error("dynamic import requires a document URL")),
                         (_, None) => Err(runtime_error("dynamic import requires a specifier")),
                     };
                     return Ok(Value::Promise(match outcome {
@@ -4076,9 +4027,7 @@ impl ScriptRuntime {
                 let index = self.evaluate(index, environment)?;
                 match object.resolve() {
                     Value::Object(object) => {
-                        object
-                            .borrow_mut()
-                            .insert(index.property_key(), value);
+                        object.borrow_mut().insert(index.property_key(), value);
                         Ok(())
                     }
                     Value::Array(array) => {
@@ -4114,9 +4063,7 @@ impl ScriptRuntime {
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "addEventListener" => Ok(Value::Builtin(Builtin::DocumentAddEventListener)),
-                "removeEventListener" => {
-                    Ok(Value::Builtin(Builtin::DocumentRemoveEventListener))
-                }
+                "removeEventListener" => Ok(Value::Builtin(Builtin::DocumentRemoveEventListener)),
                 "documentElement" => Ok(self
                     .document
                     .borrow()
@@ -4187,18 +4134,16 @@ impl ScriptRuntime {
                 {
                     Ok(Value::Builtin(Builtin::WorkerGlobalImportScripts))
                 }
-                "postMessage" if self.worker_sender.is_some() => Ok(Value::Builtin(
-                    Builtin::WorkerGlobalPostMessage(
+                "postMessage" if self.worker_sender.is_some() => {
+                    Ok(Value::Builtin(Builtin::WorkerGlobalPostMessage(
                         self.worker_sender
                             .clone()
                             .expect("worker sender checked above"),
-                    ),
-                )),
-                "onmessage" | "onerror" if self.worker_sender.is_some() => Ok(self
-                    .global
-                    .borrow()
-                    .get(property)
-                    .unwrap_or(Value::Null)),
+                    )))
+                }
+                "onmessage" | "onerror" if self.worker_sender.is_some() => {
+                    Ok(self.global.borrow().get(property).unwrap_or(Value::Null))
+                }
                 "ceriQuery" => Ok(self
                     .host_runtime_info
                     .as_ref()
@@ -4222,9 +4167,7 @@ impl ScriptRuntime {
             },
             Value::Crypto => match property {
                 "subtle" => Ok(Value::SubtleCrypto),
-                _ => Err(runtime_error(format!(
-                    "crypto has no property {property}"
-                ))),
+                _ => Err(runtime_error(format!("crypto has no property {property}"))),
             },
             Value::SubtleCrypto => match property {
                 "digest" => Ok(Value::Builtin(Builtin::SubtleDigest)),
@@ -4236,11 +4179,7 @@ impl ScriptRuntime {
             Value::Element(handle) => {
                 let path = attached_path(&handle);
                 let value = match property {
-                    "nodeType" => Value::Number(if attached_is_text(&handle) {
-                        3.0
-                    } else {
-                        1.0
-                    }),
+                    "nodeType" => Value::Number(if attached_is_text(&handle) { 3.0 } else { 1.0 }),
                     "nodeName" => Value::String(self.element_node_name(&handle)),
                     "nodeValue" | "data" => self.element_node_value(&handle),
                     "splitText" if attached_is_text(&handle) => {
@@ -4302,10 +4241,9 @@ impl ScriptRuntime {
                     "previousElementSibling" | "nextElementSibling" => path
                         .as_ref()
                         .and_then(|path| {
-                            self.document.borrow().element_sibling_path(
-                                path,
-                                property == "nextElementSibling",
-                            )
+                            self.document
+                                .borrow()
+                                .element_sibling_path(path, property == "nextElementSibling")
                         })
                         .and_then(|path| attached_handle(path, &self.document))
                         .map(Value::Element)
@@ -4333,17 +4271,15 @@ impl ScriptRuntime {
                     "elements" => self.element_form_elements(&handle),
                     "defaultValue" => self.element_default_value(&handle),
                     "selected" => Value::Bool(self.element_selected(&handle)),
-                    "defaultSelected" => {
-                        Value::Bool(self.element_default_selected(&handle))
-                    },
+                    "defaultSelected" => Value::Bool(self.element_default_selected(&handle)),
                     "selectedIndex" => Value::Number(
                         path.as_ref()
                             .map(|path| self.select_selected_index(path) as f64)
                             .unwrap_or(-1.0),
                     ),
-                    "multiple" => Value::Bool(
-                        self.element_attribute(&handle, "multiple").is_some(),
-                    ),
+                    "multiple" => {
+                        Value::Bool(self.element_attribute(&handle, "multiple").is_some())
+                    }
                     "options" => self.element_options(&handle, false),
                     "selectedOptions" => self.element_options(&handle, true),
                     "index" => Value::Number(
@@ -4367,9 +4303,9 @@ impl ScriptRuntime {
                             .map(|path| self.validation_message(path))
                             .unwrap_or_default(),
                     ),
-                    "required" => Value::Bool(
-                        self.element_attribute(&handle, "required").is_some(),
-                    ),
+                    "required" => {
+                        Value::Bool(self.element_attribute(&handle, "required").is_some())
+                    }
                     "maxLength" => Value::Number(
                         path.as_ref()
                             .and_then(|path| self.control_length_attribute(path, "maxlength"))
@@ -4387,12 +4323,12 @@ impl ScriptRuntime {
                     "selectionDirection" => self.element_selection_direction(&handle)?,
                     "checked" => Value::Bool(self.element_checked(&handle)),
                     "defaultChecked" => Value::Bool(self.element_default_checked(&handle)),
-                    "disabled" => Value::Bool(
-                        self.element_attribute(&handle, "disabled").is_some(),
-                    ),
-                    "readOnly" => Value::Bool(
-                        self.element_attribute(&handle, "readonly").is_some(),
-                    ),
+                    "disabled" => {
+                        Value::Bool(self.element_attribute(&handle, "disabled").is_some())
+                    }
+                    "readOnly" => {
+                        Value::Bool(self.element_attribute(&handle, "readonly").is_some())
+                    }
                     "scrollLeft" => Value::Number(
                         path.as_ref()
                             .map(|path| self.scroll_offset(path).0 as f64)
@@ -4458,7 +4394,9 @@ impl ScriptRuntime {
                     }
                     "setSelectionRange" => {
                         if path.is_none() {
-                            return Err(runtime_error("detached element cannot set a selection range"));
+                            return Err(runtime_error(
+                                "detached element cannot set a selection range",
+                            ));
                         }
                         Value::Builtin(Builtin::ElementSetSelectionRange(handle.clone()))
                     }
@@ -4471,9 +4409,8 @@ impl ScriptRuntime {
                         Value::Builtin(Builtin::ElementSetRangeText(handle.clone()))
                     }
                     "requestSubmit" => {
-                        let path = path.ok_or_else(|| {
-                            runtime_error("detached element cannot submit")
-                        })?;
+                        let path =
+                            path.ok_or_else(|| runtime_error("detached element cannot submit"))?;
                         let is_form = self
                             .document
                             .borrow()
@@ -4487,8 +4424,8 @@ impl ScriptRuntime {
                         Value::Builtin(Builtin::ElementRequestSubmit(handle.clone()))
                     }
                     "reset" => {
-                        let path = path
-                            .ok_or_else(|| runtime_error("detached element cannot reset"))?;
+                        let path =
+                            path.ok_or_else(|| runtime_error("detached element cannot reset"))?;
                         let is_form = self
                             .document
                             .borrow()
@@ -4656,19 +4593,17 @@ impl ScriptRuntime {
                         Ok(if path.is_empty() {
                             Value::Document
                         } else {
-                            Value::Element(
-                                attached_handle(path, &self.document).ok_or_else(|| {
-                                    runtime_error("range ancestor is no longer in the document")
-                                })?,
-                            )
+                            Value::Element(attached_handle(path, &self.document).ok_or_else(
+                                || runtime_error("range ancestor is no longer in the document"),
+                            )?)
                         })
                     }
                     "setStart" => Ok(Value::Builtin(Builtin::RangeSetStart(range.clone()))),
                     "setEnd" => Ok(Value::Builtin(Builtin::RangeSetEnd(range.clone()))),
                     "collapse" => Ok(Value::Builtin(Builtin::RangeCollapse(range.clone()))),
-                    "selectNodeContents" => Ok(Value::Builtin(
-                        Builtin::RangeSelectNodeContents(range.clone()),
-                    )),
+                    "selectNodeContents" => Ok(Value::Builtin(Builtin::RangeSelectNodeContents(
+                        range.clone(),
+                    ))),
                     "cloneRange" => Ok(Value::Builtin(Builtin::RangeClone(range.clone()))),
                     "toString" => Ok(Value::Builtin(Builtin::RangeToString(range.clone()))),
                     "detach" => Ok(Value::Builtin(Builtin::RangeDetach)),
@@ -4680,11 +4615,11 @@ impl ScriptRuntime {
                 let range = selection_data.range.clone();
                 match property {
                     "rangeCount" => Ok(Value::Number(if range.is_some() { 1.0 } else { 0.0 })),
-                    "isCollapsed" => Ok(Value::Bool(
-                        range
-                            .as_ref()
-                            .is_none_or(|range| self.range_is_collapsed(&range.borrow())),
-                    )),
+                    "isCollapsed" => {
+                        Ok(Value::Bool(range.as_ref().is_none_or(|range| {
+                            self.range_is_collapsed(&range.borrow())
+                        })))
+                    }
                     "anchorNode" | "focusNode" => Ok(range
                         .as_ref()
                         .map(|range| {
@@ -4728,7 +4663,9 @@ impl ScriptRuntime {
                     "toString" => Ok(Value::Builtin(Builtin::SelectionToString(
                         selection.clone(),
                     ))),
-                    _ => Err(runtime_error(format!("Selection has no property {property}"))),
+                    _ => Err(runtime_error(format!(
+                        "Selection has no property {property}"
+                    ))),
                 }
             }
             Value::Style(handle) => Ok(self
@@ -4774,38 +4711,37 @@ impl ScriptRuntime {
             Value::Location(url) => {
                 let url = url.borrow();
                 match property {
-                "href" => Ok(Value::String(url.to_string())),
-                "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
-                "protocol" => Ok(Value::String("https:".to_string())),
-                "host" => Ok(Value::String("app.ceri.invalid".to_string())),
-                "hostname" => Ok(Value::String("app.ceri.invalid".to_string())),
-                "pathname" => Ok(Value::String(url.path().to_string())),
-                "search" => Ok(Value::String(if url.query().is_empty() {
-                    String::new()
-                } else {
-                    format!("?{}", url.query())
-                })),
-                "hash" => Ok(Value::String(if url.fragment().is_empty() {
-                    String::new()
-                } else {
-                    format!("#{}", url.fragment())
-                })),
-                "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
-                "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
-                _ => Err(runtime_error(format!("location has no property {property}"))),
+                    "href" => Ok(Value::String(url.to_string())),
+                    "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
+                    "protocol" => Ok(Value::String("https:".to_string())),
+                    "host" => Ok(Value::String("app.ceri.invalid".to_string())),
+                    "hostname" => Ok(Value::String("app.ceri.invalid".to_string())),
+                    "pathname" => Ok(Value::String(url.path().to_string())),
+                    "search" => Ok(Value::String(if url.query().is_empty() {
+                        String::new()
+                    } else {
+                        format!("?{}", url.query())
+                    })),
+                    "hash" => Ok(Value::String(if url.fragment().is_empty() {
+                        String::new()
+                    } else {
+                        format!("#{}", url.fragment())
+                    })),
+                    "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
+                    "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
+                    _ => Err(runtime_error(format!(
+                        "location has no property {property}"
+                    ))),
                 }
             }
             Value::ModuleImport(url) if property == "meta" => {
                 let mut meta = BTreeMap::new();
-                meta.insert(
-                    "url".to_string(),
-                    Value::String(url.to_string()),
-                );
+                meta.insert("url".to_string(), Value::String(url.to_string()));
                 Ok(Value::Object(Rc::new(RefCell::new(meta))))
             }
-            Value::ModuleImport(_) => Err(runtime_error(format!(
-                "import has no property {property}"
-            ))),
+            Value::ModuleImport(_) => {
+                Err(runtime_error(format!("import has no property {property}")))
+            }
             Value::History(history) => match property {
                 "state" => Ok(history.borrow().state.clone()),
                 "length" => Ok(Value::Number(history.borrow().length as f64)),
@@ -4884,11 +4820,7 @@ impl ScriptRuntime {
             },
             Value::IndexedDbRequest(request) => match property {
                 "result" => Ok(request.borrow().result.clone()),
-                "error" => Ok(request
-                    .borrow()
-                    .error
-                    .clone()
-                    .unwrap_or(Value::Null)),
+                "error" => Ok(request.borrow().error.clone().unwrap_or(Value::Null)),
                 "readyState" => Ok(Value::String(if request.borrow().done {
                     "done".to_string()
                 } else {
@@ -4900,26 +4832,14 @@ impl ScriptRuntime {
                     .clone()
                     .map(Value::IndexedDbTransaction)
                     .unwrap_or(Value::Null)),
-                "onsuccess" => Ok(request
-                    .borrow()
-                    .on_success
-                    .clone()
-                    .unwrap_or(Value::Null)),
-                "onerror" => Ok(request
-                    .borrow()
-                    .on_error
-                    .clone()
-                    .unwrap_or(Value::Null)),
+                "onsuccess" => Ok(request.borrow().on_success.clone().unwrap_or(Value::Null)),
+                "onerror" => Ok(request.borrow().on_error.clone().unwrap_or(Value::Null)),
                 "onupgradeneeded" => Ok(request
                     .borrow()
                     .on_upgrade_needed
                     .clone()
                     .unwrap_or(Value::Null)),
-                "onblocked" => Ok(request
-                    .borrow()
-                    .on_blocked
-                    .clone()
-                    .unwrap_or(Value::Null)),
+                "onblocked" => Ok(request.borrow().on_blocked.clone().unwrap_or(Value::Null)),
                 _ => Err(runtime_error(format!(
                     "IDBRequest has no property {property}"
                 ))),
@@ -4936,9 +4856,9 @@ impl ScriptRuntime {
                 "deleteObjectStore" => Ok(Value::Builtin(
                     Builtin::IndexedDbDatabaseDeleteObjectStore(database),
                 )),
-                "transaction" => Ok(Value::Builtin(
-                    Builtin::IndexedDbDatabaseTransaction(database),
-                )),
+                "transaction" => Ok(Value::Builtin(Builtin::IndexedDbDatabaseTransaction(
+                    database,
+                ))),
                 "close" => Ok(Value::Builtin(Builtin::IndexedDbDatabaseClose(database))),
                 "onversionchange" => Ok(database
                     .borrow()
@@ -4951,9 +4871,9 @@ impl ScriptRuntime {
             },
             Value::IndexedDbTransaction(transaction) => match property {
                 "mode" => Ok(Value::String(transaction.borrow().mode.clone())),
-                "objectStore" => Ok(Value::Builtin(
-                    Builtin::IndexedDbTransactionObjectStore(transaction),
-                )),
+                "objectStore" => Ok(Value::Builtin(Builtin::IndexedDbTransactionObjectStore(
+                    transaction,
+                ))),
                 "abort" => Ok(Value::Builtin(Builtin::IndexedDbTransactionAbort(
                     transaction,
                 ))),
@@ -4962,16 +4882,8 @@ impl ScriptRuntime {
                     .on_complete
                     .clone()
                     .unwrap_or(Value::Null)),
-                "onerror" => Ok(transaction
-                    .borrow()
-                    .on_error
-                    .clone()
-                    .unwrap_or(Value::Null)),
-                "onabort" => Ok(transaction
-                    .borrow()
-                    .on_abort
-                    .clone()
-                    .unwrap_or(Value::Null)),
+                "onerror" => Ok(transaction.borrow().on_error.clone().unwrap_or(Value::Null)),
+                "onabort" => Ok(transaction.borrow().on_abort.clone().unwrap_or(Value::Null)),
                 _ => Err(runtime_error(format!(
                     "IDBTransaction has no property {property}"
                 ))),
@@ -5036,31 +4948,31 @@ impl ScriptRuntime {
                 "set" => Ok(Value::Builtin(Builtin::FormDataSet(form_data))),
                 "keys" => Ok(Value::Builtin(Builtin::FormDataKeys(form_data))),
                 "values" => Ok(Value::Builtin(Builtin::FormDataValues(form_data))),
-                "entries" | "@@iterator" => {
-                    Ok(Value::Builtin(Builtin::FormDataEntries(form_data)))
-                }
+                "entries" | "@@iterator" => Ok(Value::Builtin(Builtin::FormDataEntries(form_data))),
                 "forEach" => Ok(Value::Builtin(Builtin::FormDataForEach(form_data))),
-                _ => Err(runtime_error(format!("FormData has no property {property}"))),
+                _ => Err(runtime_error(format!(
+                    "FormData has no property {property}"
+                ))),
             },
             Value::FileList(files) => match property {
                 "length" => Ok(Value::Number(files.len() as f64)),
                 "item" => Ok(Value::Builtin(Builtin::FileListItem(files))),
-                _ => Err(runtime_error(format!("FileList has no property {property}"))),
+                _ => Err(runtime_error(format!(
+                    "FileList has no property {property}"
+                ))),
             },
             Value::Worker(worker) => {
                 let handle = worker.clone();
                 let worker = worker.borrow();
                 match property {
-                    "postMessage" => Ok(Value::Builtin(Builtin::WorkerPostMessage(
-                        handle.clone(),
-                    ))),
+                    "postMessage" => Ok(Value::Builtin(Builtin::WorkerPostMessage(handle.clone()))),
                     "terminate" => Ok(Value::Builtin(Builtin::WorkerTerminate(handle))),
-                    "addEventListener" => Ok(Value::Builtin(Builtin::WorkerAddEventListener(
-                        handle,
-                    ))),
-                    "removeEventListener" => Ok(Value::Builtin(
-                        Builtin::WorkerRemoveEventListener(handle),
-                    )),
+                    "addEventListener" => {
+                        Ok(Value::Builtin(Builtin::WorkerAddEventListener(handle)))
+                    }
+                    "removeEventListener" => {
+                        Ok(Value::Builtin(Builtin::WorkerRemoveEventListener(handle)))
+                    }
                     "onmessage" => Ok(worker.onmessage.clone().unwrap_or(Value::Null)),
                     "onerror" => Ok(worker.onerror.clone().unwrap_or(Value::Null)),
                     "url" => Ok(Value::String(worker.url.to_string())),
@@ -5076,9 +4988,9 @@ impl ScriptRuntime {
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::BlobBytes(blob))),
                 _ => Err(runtime_error(format!("Blob has no property {property}"))),
             },
-            Value::BlobConstructor => Err(runtime_error(format!(
-                "Blob has no property {property}"
-            ))),
+            Value::BlobConstructor => {
+                Err(runtime_error(format!("Blob has no property {property}")))
+            }
             Value::File(file) => match property {
                 "size" => Ok(Value::Number(file.bytes.len() as f64)),
                 "type" => Ok(Value::String(file.mime_type.clone())),
@@ -5089,9 +5001,9 @@ impl ScriptRuntime {
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::FileBytes(file))),
                 _ => Err(runtime_error(format!("File has no property {property}"))),
             },
-            Value::FileConstructor => Err(runtime_error(format!(
-                "File has no property {property}"
-            ))),
+            Value::FileConstructor => {
+                Err(runtime_error(format!("File has no property {property}")))
+            }
             Value::Uint8ArrayConstructor => Err(runtime_error(format!(
                 "Uint8Array has no property {property}"
             ))),
@@ -5112,17 +5024,11 @@ impl ScriptRuntime {
             },
             Value::AbortSignal(signal) => match property {
                 "aborted" => Ok(Value::Bool(signal.borrow().aborted)),
-                "reason" => Ok(signal
-                    .borrow()
-                    .reason
-                    .clone()
-                    .unwrap_or(Value::Undefined)),
-                "addEventListener" => Ok(Value::Builtin(
-                    Builtin::AbortSignalAddEventListener(signal),
-                )),
-                "throwIfAborted" => Ok(Value::Builtin(
-                    Builtin::AbortSignalThrowIfAborted(signal),
-                )),
+                "reason" => Ok(signal.borrow().reason.clone().unwrap_or(Value::Undefined)),
+                "addEventListener" => {
+                    Ok(Value::Builtin(Builtin::AbortSignalAddEventListener(signal)))
+                }
+                "throwIfAborted" => Ok(Value::Builtin(Builtin::AbortSignalThrowIfAborted(signal))),
                 _ => Err(runtime_error(format!(
                     "AbortSignal has no property {property}"
                 ))),
@@ -5174,9 +5080,7 @@ impl ScriptRuntime {
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::RequestBytes(request))),
                 "blob" => Ok(Value::Builtin(Builtin::RequestBlob(request))),
                 "formData" => Ok(Value::Builtin(Builtin::RequestFormData(request))),
-                _ => Err(runtime_error(format!(
-                    "request has no property {property}"
-                ))),
+                _ => Err(runtime_error(format!("request has no property {property}"))),
             },
             Value::ReadableStream(stream) => match property {
                 "locked" => Ok(Value::Bool(stream.borrow().body.borrow().locked)),
@@ -5189,18 +5093,16 @@ impl ScriptRuntime {
             },
             Value::ReadableStreamReader(reader) => match property {
                 "read" => Ok(Value::Builtin(Builtin::ReadableStreamReaderRead(reader))),
-                "releaseLock" => Ok(Value::Builtin(
-                    Builtin::ReadableStreamReaderReleaseLock(reader),
-                )),
+                "releaseLock" => Ok(Value::Builtin(Builtin::ReadableStreamReaderReleaseLock(
+                    reader,
+                ))),
                 "cancel" => Ok(Value::Builtin(Builtin::ReadableStreamReaderCancel(reader))),
                 _ => Err(runtime_error(format!(
                     "ReadableStreamDefaultReader has no property {property}"
                 ))),
             },
             Value::Bytes(bytes) => match property {
-                "byteLength" | "length" => {
-                    Ok(Value::Number(bytes.borrow().len() as f64))
-                }
+                "byteLength" | "length" => Ok(Value::Number(bytes.borrow().len() as f64)),
                 _ => Err(runtime_error(format!(
                     "ArrayBuffer has no property {property}"
                 ))),
@@ -5210,9 +5112,7 @@ impl ScriptRuntime {
             ))),
             Value::Uint8Array(array) => match property {
                 "byteLength" | "length" => {
-                    Ok(Value::Number(
-                        uint8_array_view_len(&array.borrow()) as f64,
-                    ))
+                    Ok(Value::Number(uint8_array_view_len(&array.borrow()) as f64))
                 }
                 "byteOffset" => Ok(Value::Number(array.borrow().start as f64)),
                 "buffer" => Ok(Value::Bytes(array.borrow().buffer.clone())),
@@ -5233,9 +5133,7 @@ impl ScriptRuntime {
                 "entries" => Ok(Value::Builtin(Builtin::HeadersEntries(headers))),
                 "forEach" => Ok(Value::Builtin(Builtin::HeadersForEach(headers))),
                 "set" => Ok(Value::Builtin(Builtin::HeadersSet(headers))),
-                _ => Err(runtime_error(format!(
-                    "headers has no property {property}"
-                ))),
+                _ => Err(runtime_error(format!("headers has no property {property}"))),
             },
             Value::String(string) => match property {
                 "length" => Ok(Value::Number(string.chars().count() as f64)),
@@ -5264,7 +5162,9 @@ impl ScriptRuntime {
                 }
                 "next" => Ok(Value::Builtin(Builtin::IteratorNext(iterator))),
                 "join" => Ok(Value::Builtin(Builtin::IteratorJoin(iterator))),
-                _ => Err(runtime_error(format!("iterator has no property {property}"))),
+                _ => Err(runtime_error(format!(
+                    "iterator has no property {property}"
+                ))),
             },
             Value::Error(error) => match property {
                 "name" => Ok(Value::String(error.name.clone())),
@@ -5307,28 +5207,26 @@ impl ScriptRuntime {
                 .get(property)
                 .map(Value::resolve)
                 .unwrap_or(Value::Undefined)),
-            Value::Array(array) => {
-                match property {
-                    "length" => Ok(Value::Number(array.borrow().len() as f64)),
-                    "map" => Ok(Value::Builtin(Builtin::ArrayMap(array))),
-                    "join" => Ok(Value::Builtin(Builtin::ArrayJoin(array))),
-                    "push" => Ok(Value::Builtin(Builtin::ArrayPush(array))),
-                    "pop" => Ok(Value::Builtin(Builtin::ArrayPop(array))),
-                    "forEach" => Ok(Value::Builtin(Builtin::ArrayForEach(array))),
-                    "filter" => Ok(Value::Builtin(Builtin::ArrayFilter(array))),
-                    "find" => Ok(Value::Builtin(Builtin::ArrayFind(array))),
-                    _ => {
-                        let index = property.parse::<usize>().map_err(|_| {
-                            runtime_error(format!("array has no property {property}"))
-                        })?;
-                        Ok(array
-                            .borrow()
-                            .get(index)
-                            .cloned()
-                            .unwrap_or(Value::Undefined))
-                    }
+            Value::Array(array) => match property {
+                "length" => Ok(Value::Number(array.borrow().len() as f64)),
+                "map" => Ok(Value::Builtin(Builtin::ArrayMap(array))),
+                "join" => Ok(Value::Builtin(Builtin::ArrayJoin(array))),
+                "push" => Ok(Value::Builtin(Builtin::ArrayPush(array))),
+                "pop" => Ok(Value::Builtin(Builtin::ArrayPop(array))),
+                "forEach" => Ok(Value::Builtin(Builtin::ArrayForEach(array))),
+                "filter" => Ok(Value::Builtin(Builtin::ArrayFilter(array))),
+                "find" => Ok(Value::Builtin(Builtin::ArrayFind(array))),
+                _ => {
+                    let index = property
+                        .parse::<usize>()
+                        .map_err(|_| runtime_error(format!("array has no property {property}")))?;
+                    Ok(array
+                        .borrow()
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(Value::Undefined))
                 }
-            }
+            },
             Value::NodeList(nodes) => {
                 if property == "length" {
                     Ok(Value::Number(nodes.len() as f64))
@@ -5514,8 +5412,7 @@ impl ScriptRuntime {
                 "defaultValue" => self.set_element_default_value(&handle, value_string)?,
                 "selected" => self.set_element_selected(&handle, truthy),
                 "defaultSelected" => self.set_element_default_selected(&handle, truthy),
-                "selectedIndex" => self
-                    .set_element_selected_index(&handle, value.number()?)?,
+                "selectedIndex" => self.set_element_selected_index(&handle, value.number()?)?,
                 "multiple" => self.set_element_multiple(&handle, truthy),
                 "text" => self.set_element_option_text(&handle, value_string)?,
                 "selectionStart" => self.set_element_selection_start(&handle, value.number()?)?,
@@ -5528,10 +5425,12 @@ impl ScriptRuntime {
                 "disabled" => self.set_element_disabled(&handle, truthy),
                 "readOnly" => self.set_element_readonly(&handle, truthy),
                 "required" => self.set_element_required(&handle, truthy),
-                "maxLength" => self
-                    .set_element_length_attribute(&handle, "maxlength", value.number()?)?,
-                "minLength" => self
-                    .set_element_length_attribute(&handle, "minlength", value.number()?)?,
+                "maxLength" => {
+                    self.set_element_length_attribute(&handle, "maxlength", value.number()?)?
+                }
+                "minLength" => {
+                    self.set_element_length_attribute(&handle, "minlength", value.number()?)?
+                }
                 "scrollLeft" => self.set_scroll_offset_property(&handle, 0, value.number()?)?,
                 "scrollTop" => self.set_scroll_offset_property(&handle, 1, value.number()?)?,
                 _ => false,
@@ -5539,7 +5438,9 @@ impl ScriptRuntime {
             Value::Dataset(handle) => {
                 self.set_element_attribute(&handle, &dataset_attribute_name(property), value_string)
             }
-            Value::Style(handle) => self.set_element_style_property(&handle, property, value_string),
+            Value::Style(handle) => {
+                self.set_element_style_property(&handle, property, value_string)
+            }
             Value::CanvasContext(context) if property == "fillStyle" => {
                 self.set_canvas_fill_style(&context, &value_string)
             }
@@ -5556,7 +5457,9 @@ impl ScriptRuntime {
                 self.request_location_navigation(value_string, false);
                 true
             }
-            Value::Window if self.worker_sender.is_some() && matches!(property, "onmessage" | "onerror") => {
+            Value::Window
+                if self.worker_sender.is_some() && matches!(property, "onmessage" | "onerror") =>
+            {
                 self.assign_worker_global_callback(property, value)?;
                 true
             }
@@ -5614,7 +5517,11 @@ impl ScriptRuntime {
         let callback = match value.resolve() {
             Value::Function(_) => value,
             Value::Null | Value::Undefined => Value::Null,
-            _ => return Err(runtime_error(format!("Worker {property} must be a function or null"))),
+            _ => {
+                return Err(runtime_error(format!(
+                    "Worker {property} must be a function or null"
+                )));
+            }
         };
         self.global
             .borrow_mut()
@@ -5632,13 +5539,21 @@ impl ScriptRuntime {
         let callback = match value.resolve() {
             Value::Function(_) => Some(value),
             Value::Null | Value::Undefined => None,
-            _ => return Err(runtime_error(format!("Worker {property} must be a function or null"))),
+            _ => {
+                return Err(runtime_error(format!(
+                    "Worker {property} must be a function or null"
+                )));
+            }
         };
         let mut worker = worker.borrow_mut();
         match property {
             "onmessage" => worker.onmessage = callback,
             "onerror" => worker.onerror = callback,
-            _ => return Err(runtime_error(format!("Worker has no writable property {property}"))),
+            _ => {
+                return Err(runtime_error(format!(
+                    "Worker has no writable property {property}"
+                )));
+            }
         }
         Ok(())
     }
@@ -5676,7 +5591,7 @@ impl ScriptRuntime {
                             _ => {
                                 return Err(runtime_error(format!(
                                     "unsupported Worker script type {type_name}"
-                                )))
+                                )));
                             }
                         };
                     }
@@ -5748,14 +5663,10 @@ impl ScriptRuntime {
                 .borrow_mut()
                 .values
                 .insert("self".to_string(), Value::Window);
-            runtime
-                .global
-                .borrow_mut()
-                .values
-                .insert(
-                    "postMessage".to_string(),
-                    Value::Builtin(Builtin::WorkerGlobalPostMessage(event_sender.clone())),
-                );
+            runtime.global.borrow_mut().values.insert(
+                "postMessage".to_string(),
+                Value::Builtin(Builtin::WorkerGlobalPostMessage(event_sender.clone())),
+            );
             runtime
                 .global
                 .borrow_mut()
@@ -5875,7 +5786,9 @@ impl ScriptRuntime {
             let response = self
                 .resource_provider
                 .as_ref()
-                .map_or(Ok(None), |provider| provider.provide_response(&request.request));
+                .map_or(Ok(None), |provider| {
+                    provider.provide_response(&request.request)
+                });
             let _ = request.reply.send(response);
         }
         Ok(())
@@ -6045,18 +5958,13 @@ impl ScriptRuntime {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
         };
-        let Some(child_path) = self
-            .document
-            .borrow()
-            .child_paths(&path)
-            .and_then(|paths| {
-                if first {
-                    paths.into_iter().next()
-                } else {
-                    paths.into_iter().next_back()
-                }
-            })
-        else {
+        let Some(child_path) = self.document.borrow().child_paths(&path).and_then(|paths| {
+            if first {
+                paths.into_iter().next()
+            } else {
+                paths.into_iter().next_back()
+            }
+        }) else {
             return Value::Null;
         };
         attached_handle(child_path, &self.document)
@@ -6068,17 +5976,17 @@ impl ScriptRuntime {
         let Some(path) = attached_path(handle) else {
             return Value::Null;
         };
-        let Some(child_path) = self
-            .document
-            .borrow()
-            .element_child_paths(&path)
-            .and_then(|paths| {
-                if first {
-                    paths.into_iter().next()
-                } else {
-                    paths.into_iter().next_back()
-                }
-            })
+        let Some(child_path) =
+            self.document
+                .borrow()
+                .element_child_paths(&path)
+                .and_then(|paths| {
+                    if first {
+                        paths.into_iter().next()
+                    } else {
+                        paths.into_iter().next_back()
+                    }
+                })
         else {
             return Value::Null;
         };
@@ -6128,7 +6036,15 @@ impl ScriptRuntime {
             "input" => !element.attr("type").is_some_and(|kind| {
                 matches!(
                     kind.to_ascii_lowercase().as_str(),
-                    "button" | "checkbox" | "color" | "file" | "hidden" | "radio" | "range" | "reset" | "submit"
+                    "button"
+                        | "checkbox"
+                        | "color"
+                        | "file"
+                        | "hidden"
+                        | "radio"
+                        | "range"
+                        | "reset"
+                        | "submit"
                 )
             }),
             _ => false,
@@ -6201,7 +6117,11 @@ impl ScriptRuntime {
         self.document
             .borrow()
             .element_clone(path)
-            .and_then(|element| element.attr(name).and_then(|value| value.trim().parse().ok()))
+            .and_then(|element| {
+                element
+                    .attr(name)
+                    .and_then(|value| value.trim().parse().ok())
+            })
     }
 
     fn mark_user_edit(&mut self, path: &[usize]) {
@@ -6224,9 +6144,10 @@ impl ScriptRuntime {
                     .attr("type")
                     .map(|kind| kind.to_ascii_lowercase())
                     .unwrap_or_else(|| "text".to_string());
-                !(matches!(kind.as_str(), "button" | "hidden" | "image" | "reset" | "submit")
-                    || element.attr("readonly").is_some()
-                        && self.is_selection_control_path(path))
+                !(matches!(
+                    kind.as_str(),
+                    "button" | "hidden" | "image" | "reset" | "submit"
+                ) || element.attr("readonly").is_some() && self.is_selection_control_path(path))
             }
             _ => false,
         }
@@ -6268,10 +6189,7 @@ impl ScriptRuntime {
                             .all(|candidate| !self.control_checked_path(candidate))
                     })
                     .unwrap_or_else(|| !self.control_checked_path(path)),
-                "file" => self
-                    .selected_files
-                    .get(path)
-                    .is_none_or(Vec::is_empty),
+                "file" => self.selected_files.get(path).is_none_or(Vec::is_empty),
                 _ => value.is_empty(),
             }
         };
@@ -6539,8 +6457,9 @@ impl ScriptRuntime {
 
     fn element_selected(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .is_some_and(|path| self.option_selected_path(&path)),
+            ElementLocation::Attached { .. } => {
+                attached_path(handle).is_some_and(|path| self.option_selected_path(&path))
+            }
             ElementLocation::Detached(element) => {
                 element.name == "option" && element.attr("selected").is_some()
             }
@@ -6685,12 +6604,15 @@ impl ScriptRuntime {
             return false;
         }
         let options = self.option_paths(path);
-        let matching = options.iter().find(|option| {
-            self.document
-                .borrow()
-                .element_clone(option)
-                .is_some_and(|element| option_value(&element) == value)
-        }).cloned();
+        let matching = options
+            .iter()
+            .find(|option| {
+                self.document
+                    .borrow()
+                    .element_clone(option)
+                    .is_some_and(|element| option_value(&element) == value)
+            })
+            .cloned();
         for option in &options {
             let selected = matching.as_ref().is_some_and(|matching| matching == option);
             self.set_option_selected_raw(option, selected, true);
@@ -6773,10 +6695,12 @@ impl ScriptRuntime {
         if !index.is_finite() || index.fract() != 0.0 {
             return Ok(false);
         }
-        Ok(self.set_select_selected_index(
-            &attached_path(handle).unwrap_or_default(),
-            index as i32,
-        ))
+        Ok(
+            self.set_select_selected_index(
+                &attached_path(handle).unwrap_or_default(),
+                index as i32,
+            ),
+        )
     }
 
     fn set_element_multiple(&mut self, handle: &ElementHandle, multiple: bool) -> bool {
@@ -6907,11 +6831,7 @@ impl ScriptRuntime {
         Ok(changed)
     }
 
-    fn set_element_default_checked(
-        &mut self,
-        handle: &ElementHandle,
-        checked: bool,
-    ) -> bool {
+    fn set_element_default_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
         let Some(path) = attached_path(handle) else {
             let mut location = handle.borrow_mut();
             let ElementLocation::Detached(element) = &mut *location else {
@@ -7039,12 +6959,7 @@ impl ScriptRuntime {
         let value = self.control_value_path(&path).unwrap_or_default();
         let selection = self.selection_for_path(&path, &value);
         let start = selection_offset(start);
-        self.set_text_selection(
-            path,
-            start,
-            selection.end.max(start),
-            selection.direction,
-        )
+        self.set_text_selection(path, start, selection.end.max(start), selection.direction)
     }
 
     fn set_element_selection_end(
@@ -7570,9 +7485,8 @@ impl ScriptRuntime {
                     let (parent, child, child_index) = match &change {
                         NormalizeChange::RemoveEmpty { parent, child, .. }
                         | NormalizeChange::MergeText { parent, child, .. } => {
-                            let child_index = *child
-                                .last()
-                                .expect("normalize child path is non-empty");
+                            let child_index =
+                                *child.last().expect("normalize child path is non-empty");
                             (parent.clone(), child.clone(), child_index)
                         }
                     };
@@ -7591,11 +7505,7 @@ impl ScriptRuntime {
                         ),
                         NormalizeChange::RemoveEmpty { .. } => None,
                     };
-                    if !self
-                        .document
-                        .borrow_mut()
-                        .apply_normalize_change(&change)
-                    {
+                    if !self.document.borrow_mut().apply_normalize_change(&change) {
                         return Err(runtime_error("normalize change became stale"));
                     }
                     self.shift_runtime_paths_for_remove(&parent, child_index);
@@ -7633,22 +7543,16 @@ impl ScriptRuntime {
         let mut file_lists = self.file_lists.borrow_mut();
         let files = file_lists
             .entry(path.clone())
-            .or_insert_with(|| {
-                Rc::new(
-                    self.selected_files
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or_default(),
-                )
-            })
+            .or_insert_with(|| Rc::new(self.selected_files.get(&path).cloned().unwrap_or_default()))
             .clone();
         Value::FileList(files)
     }
 
     fn element_checked(&self, handle: &ElementHandle) -> bool {
         match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .is_some_and(|path| self.control_checked_path(&path)),
+            ElementLocation::Attached { .. } => {
+                attached_path(handle).is_some_and(|path| self.control_checked_path(&path))
+            }
             ElementLocation::Detached(element) => element.attr("checked").is_some(),
         }
     }
@@ -7785,11 +7689,7 @@ impl ScriptRuntime {
         end: usize,
         replacement: &str,
     ) -> Result<bool, ScriptError> {
-        let Some(current) = self
-            .document
-            .borrow()
-            .node_text_content(path)
-        else {
+        let Some(current) = self.document.borrow().node_text_content(path) else {
             return Ok(false);
         };
         let length = utf16_len(&current);
@@ -7802,10 +7702,7 @@ impl ScriptRuntime {
             end.saturating_sub(start),
             utf16_len(replacement),
         );
-        let changed = self
-            .document
-            .borrow_mut()
-            .set_text_node_data(path, updated);
+        let changed = self.document.borrow_mut().set_text_node_data(path, updated);
         if changed && selection_changed {
             self.dispatch_document_selection_change()?;
         }
@@ -8001,13 +7898,11 @@ impl ScriptRuntime {
                 if self.document.borrow().element_clone(&path).is_none() {
                     return Ok(false);
                 }
-                let replacement = Document::parse(&source)
-                    .map_err(|error| runtime_error(error.to_string()))?;
+                let replacement =
+                    Document::parse(&source).map_err(|error| runtime_error(error.to_string()))?;
                 let replacement_length = utf16_len(&replacement.text_content());
-                let selection_changed = self.adjust_ranges_for_replacement(
-                    &path,
-                    replacement_length,
-                );
+                let selection_changed =
+                    self.adjust_ranges_for_replacement(&path, replacement_length);
                 let changed = self
                     .document
                     .borrow_mut()
@@ -8062,8 +7957,8 @@ impl ScriptRuntime {
                 "outerHTML cannot replace a direct child of the document",
             ));
         }
-        let fragment = Document::parse(&source)
-            .map_err(|error| runtime_error(error.to_string()))?;
+        let fragment =
+            Document::parse(&source).map_err(|error| runtime_error(error.to_string()))?;
         for node in fragment.root.children {
             let child = detached_handle_from_node(node);
             let reference = attached_path(handle)
@@ -8212,7 +8107,8 @@ impl ScriptRuntime {
                                 .attr("type")
                                 .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
                     });
-                if checked && is_radio
+                if checked
+                    && is_radio
                     && let Some(group) = self.document.borrow().radio_group_paths(&path)
                 {
                     for candidate in group {
@@ -8248,9 +8144,11 @@ impl ScriptRuntime {
                     return false;
                 };
                 if disabled {
-                    self.document
-                        .borrow_mut()
-                        .set_element_attribute(&path, "disabled", String::new())
+                    self.document.borrow_mut().set_element_attribute(
+                        &path,
+                        "disabled",
+                        String::new(),
+                    )
                 } else {
                     self.document
                         .borrow_mut()
@@ -8279,9 +8177,11 @@ impl ScriptRuntime {
                     return false;
                 };
                 if readonly {
-                    self.document
-                        .borrow_mut()
-                        .set_element_attribute(&path, "readonly", String::new())
+                    self.document.borrow_mut().set_element_attribute(
+                        &path,
+                        "readonly",
+                        String::new(),
+                    )
                 } else {
                     self.document
                         .borrow_mut()
@@ -8350,10 +8250,7 @@ impl ScriptRuntime {
                 let ElementLocation::Detached(element) = &mut *location else {
                     return false;
                 };
-                element
-                    .attrs
-                    .remove(&name.to_ascii_lowercase())
-                    .is_some()
+                element.attrs.remove(&name.to_ascii_lowercase()).is_some()
             }
         }
     }
@@ -8365,9 +8262,11 @@ impl ScriptRuntime {
                     return false;
                 };
                 if required {
-                    self.document
-                        .borrow_mut()
-                        .set_element_attribute(&path, "required", String::new())
+                    self.document.borrow_mut().set_element_attribute(
+                        &path,
+                        "required",
+                        String::new(),
+                    )
                 } else {
                     self.document
                         .borrow_mut()
@@ -8395,12 +8294,10 @@ impl ScriptRuntime {
         name: &str,
         value: f64,
     ) -> Result<bool, ScriptError> {
-        if !value.is_finite()
-            || value.fract() != 0.0
-            || value < 0.0
-            || value > usize::MAX as f64
-        {
-            return Err(runtime_error(format!("{name} must be a non-negative integer")));
+        if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value > usize::MAX as f64 {
+            return Err(runtime_error(format!(
+                "{name} must be a non-negative integer"
+            )));
         }
         let value = value as usize;
         Ok(self.set_element_attribute(handle, name, value.to_string()))
@@ -8439,10 +8336,7 @@ impl ScriptRuntime {
         }))))
     }
 
-    fn construct_url_search_params(
-        &self,
-        arguments: Vec<Value>,
-    ) -> Result<Value, ScriptError> {
+    fn construct_url_search_params(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
         let value = arguments.first().cloned().unwrap_or(Value::Null);
         let pairs = params_from_value(&value)?;
         Ok(Value::UrlSearchParams(Rc::new(RefCell::new(
@@ -8457,7 +8351,9 @@ impl ScriptRuntime {
             }))));
         };
         let Value::Element(handle) = form else {
-            return Err(runtime_error("FormData constructor requires a form element"));
+            return Err(runtime_error(
+                "FormData constructor requires a form element",
+            ));
         };
         let path = attached_path(handle)
             .ok_or_else(|| runtime_error("FormData constructor requires an attached form"))?;
@@ -8485,11 +8381,7 @@ impl ScriptRuntime {
                 .unwrap_or_default();
             if matches!(input_type.as_str(), "button" | "file" | "reset" | "submit") {
                 if input_type == "file" {
-                    let files = self
-                        .selected_files
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or_default();
+                    let files = self.selected_files.get(&path).cloned().unwrap_or_default();
                     if files.is_empty() {
                         pairs.push((
                             name.to_string(),
@@ -8525,7 +8417,9 @@ impl ScriptRuntime {
                 .unwrap_or_default();
             pairs.push((name.to_string(), FormDataEntry::Text(value)));
         }
-        Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+        Ok(Value::FormData(Rc::new(RefCell::new(FormDataData {
+            pairs,
+        }))))
     }
 
     fn construct_blob(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -8578,13 +8472,10 @@ impl ScriptRuntime {
                 let end = match arguments.get(2) {
                     None | Some(Value::Undefined) => buffer_length,
                     Some(length) => {
-                        let length = uint8_array_non_negative_integer(
-                            length,
-                            "Uint8Array length",
-                        )?;
-                        start.checked_add(length).ok_or_else(|| {
-                            runtime_error("Uint8Array length is out of bounds")
-                        })?
+                        let length = uint8_array_non_negative_integer(length, "Uint8Array length")?;
+                        start
+                            .checked_add(length)
+                            .ok_or_else(|| runtime_error("Uint8Array length is out of bounds"))?
                     }
                 };
                 if end > buffer_length {
@@ -8630,7 +8521,10 @@ impl ScriptRuntime {
             .cloned()
             .unwrap_or(Value::Undefined)
             .resolve();
-        Ok(Value::Headers(headers_handle(header_values_from_init(init)?, true)))
+        Ok(Value::Headers(headers_handle(
+            header_values_from_init(init)?,
+            true,
+        )))
     }
 
     fn construct_request(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -8639,43 +8533,35 @@ impl ScriptRuntime {
             .cloned()
             .unwrap_or(Value::Undefined)
             .resolve();
-        let (
-            url,
-            mut method,
-            mut headers,
-            mut body,
-            mut cache_mode,
-            mut redirect,
-            mut signal,
-        ) = match input {
-            Value::Request(request) => (
-                request.url.clone(),
-                request.method.clone(),
-                request.headers.borrow().values.clone(),
-                request_body_snapshot(&request.body)?,
-                request.cache_mode.clone(),
-                request.redirect,
-                request.signal.clone(),
-            ),
-            input => {
-                let base_url = self
-                    .base_url
-                    .as_ref()
-                    .ok_or_else(|| runtime_error("Request is unavailable without a document URL"))?;
-                let url = base_url
-                    .resolve(&input.string_value())
-                    .map_err(|error| runtime_error(error.to_string()))?;
-                (
-                    url,
-                    "GET".to_string(),
-                    BTreeMap::new(),
-                    Vec::new(),
-                    ResourceCacheMode::Default,
-                    FetchRedirectMode::Follow,
-                    None,
-                )
-            }
-        };
+        let (url, mut method, mut headers, mut body, mut cache_mode, mut redirect, mut signal) =
+            match input {
+                Value::Request(request) => (
+                    request.url.clone(),
+                    request.method.clone(),
+                    request.headers.borrow().values.clone(),
+                    request_body_snapshot(&request.body)?,
+                    request.cache_mode.clone(),
+                    request.redirect,
+                    request.signal.clone(),
+                ),
+                input => {
+                    let base_url = self.base_url.as_ref().ok_or_else(|| {
+                        runtime_error("Request is unavailable without a document URL")
+                    })?;
+                    let url = base_url
+                        .resolve(&input.string_value())
+                        .map_err(|error| runtime_error(error.to_string()))?;
+                    (
+                        url,
+                        "GET".to_string(),
+                        BTreeMap::new(),
+                        Vec::new(),
+                        ResourceCacheMode::Default,
+                        FetchRedirectMode::Follow,
+                        None,
+                    )
+                }
+            };
         let init = arguments
             .get(1)
             .cloned()
@@ -8742,11 +8628,7 @@ impl ScriptRuntime {
     }
 
     fn construct_response(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let body = arguments
-            .first()
-            .cloned()
-            .unwrap_or(Value::Null)
-            .resolve();
+        let body = arguments.first().cloned().unwrap_or(Value::Null).resolve();
         let init = arguments
             .get(1)
             .cloned()
@@ -8790,7 +8672,9 @@ impl ScriptRuntime {
             {
                 status_text = value.string_value();
                 if !valid_status_text(&status_text) {
-                    return Err(runtime_error("Response statusText contains invalid characters"));
+                    return Err(runtime_error(
+                        "Response statusText contains invalid characters",
+                    ));
                 }
             }
             if let Some(value) = init.get("headers").map(Value::resolve)
@@ -8806,9 +8690,7 @@ impl ScriptRuntime {
                 "Response body is not allowed for this status",
             ));
         }
-        let mime_type = inferred_mime_type
-            .map(str::to_string)
-            .or(body_mime_type);
+        let mime_type = inferred_mime_type.map(str::to_string).or(body_mime_type);
         if let Some(mime_type) = mime_type
             && !headers.contains_key("content-type")
         {
@@ -8852,7 +8734,10 @@ impl ScriptRuntime {
         let mut values = Vec::new();
         if let Some(value) = arguments.first() {
             for candidate in self.iterable_values(value.clone())? {
-                if !values.iter().any(|existing| values_equal(existing, &candidate)) {
+                if !values
+                    .iter()
+                    .any(|existing| values_equal(existing, &candidate))
+                {
                     values.push(candidate);
                 }
             }
@@ -8938,7 +8823,8 @@ impl ScriptRuntime {
         let Value::FormData(form_data) = self.construct_form_data(vec![Value::Element(
             attached_handle(path, &self.document)
                 .ok_or_else(|| runtime_error("form is no longer in the document"))?,
-        )])? else {
+        )])?
+        else {
             unreachable!("form data constructor returns form data");
         };
         let base = self
@@ -8981,11 +8867,7 @@ impl ScriptRuntime {
                     let (body, content_type) = multipart_form_data_body(&form_data);
                     (body, content_type)
                 }
-                _ => {
-                    return Err(runtime_error(format!(
-                        "unsupported form enctype {enctype}"
-                    )))
-                }
+                _ => return Err(runtime_error(format!("unsupported form enctype {enctype}"))),
             };
             let mut headers = BTreeMap::new();
             headers.insert("content-type".to_string(), content_type);
@@ -8996,10 +8878,7 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn url_search_params(
-        &self,
-        url: &UrlHandle,
-    ) -> Result<UrlSearchParamsHandle, ScriptError> {
+    fn url_search_params(&self, url: &UrlHandle) -> Result<UrlSearchParamsHandle, ScriptError> {
         if let Some(params) = url.borrow().search_params.clone() {
             return Ok(params);
         }
@@ -9254,10 +9133,7 @@ impl ScriptRuntime {
                                 .map(|character| character.to_string())
                                 .collect()
                         } else {
-                            string
-                                .split(&separator)
-                                .map(str::to_string)
-                                .collect()
+                            string.split(&separator).map(str::to_string).collect()
                         }
                     }
                 };
@@ -9285,9 +9161,9 @@ impl ScriptRuntime {
                 ),
                 reactions: Vec::new(),
             })))),
-            Builtin::PromiseResolve => Ok(Value::Promise(self.fulfilled_promise(
-                arguments.first().cloned().unwrap_or(Value::Undefined),
-            ))),
+            Builtin::PromiseResolve => Ok(Value::Promise(
+                self.fulfilled_promise(arguments.first().cloned().unwrap_or(Value::Undefined)),
+            )),
             Builtin::PromiseRejectPending(promise) => {
                 let reason = arguments.first().cloned().unwrap_or(Value::Undefined);
                 self.settle_promise(&promise, PromiseOutcome::Rejected(reason));
@@ -9311,13 +9187,13 @@ impl ScriptRuntime {
                 let parsed = parse_integer(&source, radix).unwrap_or(f64::NAN);
                 Ok(Value::Number(parsed))
             }
-            Builtin::NumberIsFinite => Ok(Value::Bool(
+            Builtin::NumberIsFinite => Ok(Value::Bool(arguments.first().is_some_and(
+                |value| matches!(value, Value::Number(number) if number.is_finite()),
+            ))),
+            Builtin::ArrayIsArray => Ok(Value::Bool(
                 arguments
                     .first()
-                    .is_some_and(|value| matches!(value, Value::Number(number) if number.is_finite())),
-            )),
-            Builtin::ArrayIsArray => Ok(Value::Bool(
-                arguments.first().is_some_and(|value| matches!(value, Value::Array(_))),
+                    .is_some_and(|value| matches!(value, Value::Array(_))),
             )),
             Builtin::ObjectFreeze => Ok(arguments.first().cloned().unwrap_or(Value::Undefined)),
             Builtin::ObjectKeys => {
@@ -9357,12 +9233,12 @@ impl ScriptRuntime {
                     Some(_) => {
                         return Err(runtime_error(
                             "WebAssembly.instantiate expects an ArrayBuffer or Uint8Array",
-                        ))
+                        ));
                     }
                     None => {
                         return Err(runtime_error(
                             "WebAssembly.instantiate requires module bytes",
-                        ))
+                        ));
                     }
                 };
                 if let Some(imports) = arguments.get(1).map(Value::resolve)
@@ -9372,20 +9248,17 @@ impl ScriptRuntime {
                         "WebAssembly.instantiate imports must be an object",
                     ));
                 }
-                let module = Rc::new(
-                    wasm::Module::instantiate(&bytes)
-                        .map_err(|error| runtime_error(format!("WebAssembly module error: {error}")))?,
-                );
+                let module = Rc::new(wasm::Module::instantiate(&bytes).map_err(|error| {
+                    runtime_error(format!("WebAssembly module error: {error}"))
+                })?);
                 let mut exports = BTreeMap::new();
                 for (name, function_index) in module.exported_functions() {
                     exports.insert(
                         name.to_string(),
-                        Value::Builtin(Builtin::WebAssemblyFunction(Rc::new(
-                            WasmFunctionData {
-                                module: module.clone(),
-                                function_index,
-                            },
-                        ))),
+                        Value::Builtin(Builtin::WebAssemblyFunction(Rc::new(WasmFunctionData {
+                            module: module.clone(),
+                            function_index,
+                        }))),
                     );
                 }
                 let instance = Value::Object(Rc::new(RefCell::new(BTreeMap::from([(
@@ -9393,7 +9266,10 @@ impl ScriptRuntime {
                     Value::Object(Rc::new(RefCell::new(exports))),
                 )]))));
                 let source = Value::Object(Rc::new(RefCell::new(BTreeMap::from([
-                    ("module".to_string(), Value::Object(Rc::new(RefCell::new(BTreeMap::new())))),
+                    (
+                        "module".to_string(),
+                        Value::Object(Rc::new(RefCell::new(BTreeMap::new()))),
+                    ),
                     ("instance".to_string(), instance),
                 ]))));
                 Ok(Value::Promise(self.fulfilled_promise(source)))
@@ -9418,7 +9294,9 @@ impl ScriptRuntime {
                 let result = function
                     .module
                     .invoke(function.function_index, &arguments)
-                    .map_err(|error| runtime_error(format!("WebAssembly function error: {error}")))?;
+                    .map_err(|error| {
+                        runtime_error(format!("WebAssembly function error: {error}"))
+                    })?;
                 Ok(result
                     .map(|value| Value::Number(value as f64))
                     .unwrap_or(Value::Undefined))
@@ -9455,7 +9333,10 @@ impl ScriptRuntime {
                     let provider = self.resource_provider.clone();
                     let resource = resolve_runtime_resource(&resources, provider.as_deref(), &url)?
                         .ok_or_else(|| {
-                            runtime_error(format!("imported worker script {} was not found", url.path()))
+                            runtime_error(format!(
+                                "imported worker script {} was not found",
+                                url.path()
+                            ))
                         })?;
                     if !is_javascript(&resource) {
                         return Err(runtime_error(format!(
@@ -9665,7 +9546,8 @@ impl ScriptRuntime {
                     return Err(runtime_error("document event listener must be a function"));
                 }
                 if let Some(listeners) = self.listeners.get_mut(&Vec::new()) {
-                    listeners.retain(|listener| !event_listener_matches(listener, &event, &callback));
+                    listeners
+                        .retain(|listener| !event_listener_matches(listener, &event, &callback));
                 }
                 Ok(Value::Undefined)
             }
@@ -9780,12 +9662,7 @@ impl ScriptRuntime {
                     .get(2)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.set_text_selection(
-                    path,
-                    start,
-                    end,
-                    selection_direction(&direction),
-                )?;
+                self.set_text_selection(path, start, end, selection_direction(&direction))?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementSetRangeText(handle) => {
@@ -9815,8 +9692,7 @@ impl ScriptRuntime {
                         .min(length);
                     let left = utf16_substring(&text, 0, offset);
                     let right = utf16_substring(&text, offset, length);
-                    *handle.borrow_mut() =
-                        ElementLocation::Detached(detached_text_element(&left));
+                    *handle.borrow_mut() = ElementLocation::Detached(detached_text_element(&left));
                     return Ok(Value::Element(Rc::new(RefCell::new(
                         ElementLocation::Detached(detached_text_element(&right)),
                     ))));
@@ -10040,7 +9916,9 @@ impl ScriptRuntime {
                     .transpose()?
                     .unwrap_or(0.0);
                 if !index.is_finite() || index.fract() != 0.0 || index < 0.0 {
-                    return Err(runtime_error("Selection range index must be a non-negative integer"));
+                    return Err(runtime_error(
+                        "Selection range index must be a non-negative integer",
+                    ));
                 }
                 if index != 0.0 {
                     return Err(runtime_error("Selection range index is out of bounds"));
@@ -10070,10 +9948,14 @@ impl ScriptRuntime {
                     return Ok(Value::Undefined);
                 }
                 let Value::Element(handle) = node else {
-                    return Err(runtime_error("Selection.collapse expects an Element or null"));
+                    return Err(runtime_error(
+                        "Selection.collapse expects an Element or null",
+                    ));
                 };
                 let Some(path) = attached_path(&handle) else {
-                    return Err(runtime_error("Selection.collapse requires an attached Element"));
+                    return Err(runtime_error(
+                        "Selection.collapse requires an attached Element",
+                    ));
                 };
                 let value = self
                     .document
@@ -10092,7 +9974,10 @@ impl ScriptRuntime {
                         node: handle.clone(),
                         offset,
                     },
-                    end: RangeBoundary { node: handle, offset },
+                    end: RangeBoundary {
+                        node: handle,
+                        offset,
+                    },
                 };
                 let changed = selection
                     .borrow()
@@ -10217,9 +10102,13 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let value = arguments.get(1).map(Value::string_value);
-                params.borrow_mut().pairs.retain(|(entry_name, entry_value)| {
-                    entry_name != &name || value.as_ref().is_some_and(|value| entry_value != value)
-                });
+                params
+                    .borrow_mut()
+                    .pairs
+                    .retain(|(entry_name, entry_value)| {
+                        entry_name != &name
+                            || value.as_ref().is_some_and(|value| entry_value != value)
+                    });
                 self.sync_url_search_params(&params);
                 Ok(Value::Undefined)
             }
@@ -10402,11 +10291,12 @@ impl ScriptRuntime {
                     return Err(runtime_error("Storage key exceeds the deterministic limit"));
                 }
                 if value.len() > MAX_STORAGE_VALUE_BYTES {
-                    return Err(runtime_error("Storage value exceeds the deterministic limit"));
+                    return Err(runtime_error(
+                        "Storage value exceeds the deterministic limit",
+                    ));
                 }
                 let mut storage = storage.borrow_mut();
-                if !storage.values.contains_key(&key)
-                    && storage.values.len() >= MAX_STORAGE_VALUES
+                if !storage.values.contains_key(&key) && storage.values.len() >= MAX_STORAGE_VALUES
                 {
                     return Err(runtime_error("Storage entry limit exceeded"));
                 }
@@ -10427,9 +10317,7 @@ impl ScriptRuntime {
             }
             Builtin::CacheStorageOpen(storage) => self.cache_storage_open(storage, &arguments),
             Builtin::CacheStorageHas(storage) => self.cache_storage_has(storage, &arguments),
-            Builtin::CacheStorageDelete(storage) => {
-                self.cache_storage_delete(storage, &arguments)
-            }
+            Builtin::CacheStorageDelete(storage) => self.cache_storage_delete(storage, &arguments),
             Builtin::CacheStorageKeys(storage) => self.cache_storage_keys(storage),
             Builtin::CacheStorageMatch(storage) => self.cache_storage_match(storage, &arguments),
             Builtin::CachePut(cache) => self.cache_put(cache, &arguments),
@@ -10441,9 +10329,7 @@ impl ScriptRuntime {
                 self.indexed_db_delete_database(storage, &arguments)
             }
             Builtin::IndexedDbFactoryDatabases(storage) => self.indexed_db_databases(storage),
-            Builtin::IndexedDbRequestDispatch(request) => {
-                self.dispatch_indexed_db_request(request)
-            }
+            Builtin::IndexedDbRequestDispatch(request) => self.dispatch_indexed_db_request(request),
             Builtin::IndexedDbTransactionComplete(transaction) => {
                 self.dispatch_indexed_db_transaction(transaction)
             }
@@ -10478,9 +10364,7 @@ impl ScriptRuntime {
             Builtin::IndexedDbObjectStoreDelete(store) => {
                 self.indexed_db_object_store_delete(store, &arguments)
             }
-            Builtin::IndexedDbObjectStoreClear(store) => {
-                self.indexed_db_object_store_clear(store)
-            }
+            Builtin::IndexedDbObjectStoreClear(store) => self.indexed_db_object_store_clear(store),
             Builtin::IndexedDbObjectStoreCount(store) => {
                 self.indexed_db_object_store_count(store, &arguments)
             }
@@ -10495,7 +10379,9 @@ impl ScriptRuntime {
                     .first()
                     .ok_or_else(|| runtime_error("DOMStringList.contains requires a name"))?
                     .string_value();
-                Ok(Value::Bool(names.iter().any(|candidate| candidate == &name)))
+                Ok(Value::Bool(
+                    names.iter().any(|candidate| candidate == &name),
+                ))
             }
             Builtin::IndexedDbNameListItem(names) => {
                 let index = arguments
@@ -10503,25 +10389,24 @@ impl ScriptRuntime {
                     .map(Value::number)
                     .transpose()?
                     .unwrap_or(-1.0);
-                Ok(if index.is_finite() && index >= 0.0 && index.fract() == 0.0 {
-                    names
-                        .get(index as usize)
-                        .cloned()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                })
+                Ok(
+                    if index.is_finite() && index >= 0.0 && index.fract() == 0.0 {
+                        names
+                            .get(index as usize)
+                            .cloned()
+                            .map(Value::String)
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    },
+                )
             }
             Builtin::FormDataAppend(form_data) => {
                 let name = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let value = form_data_entry(
-                    arguments.get(1),
-                    form_data_filename(arguments.get(2)),
-                );
+                let value = form_data_entry(arguments.get(1), form_data_filename(arguments.get(2)));
                 form_data.borrow_mut().pairs.push((name, value));
                 Ok(Value::Undefined)
             }
@@ -10582,10 +10467,7 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let value = form_data_entry(
-                    arguments.get(1),
-                    form_data_filename(arguments.get(2)),
-                );
+                let value = form_data_entry(arguments.get(1), form_data_filename(arguments.get(2)));
                 let mut form_data = form_data.borrow_mut();
                 if let Some(index) = form_data
                     .pairs
@@ -10641,7 +10523,9 @@ impl ScriptRuntime {
             Builtin::FormDataForEach(form_data) => {
                 let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
                 if !matches!(callback, Value::Function(_)) {
-                    return Err(runtime_error("FormData.forEach callback must be a function"));
+                    return Err(runtime_error(
+                        "FormData.forEach callback must be a function",
+                    ));
                 }
                 let entries = form_data.borrow().pairs.clone();
                 for (name, value) in entries {
@@ -10671,12 +10555,12 @@ impl ScriptRuntime {
                     mime_type,
                 })))
             }
-            Builtin::BlobText(blob) => Ok(Value::Promise(self.fulfilled_promise(
-                Value::String(String::from_utf8_lossy(&blob.bytes).into_owned()),
-            ))),
-            Builtin::BlobBytes(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                Rc::new(RefCell::new(blob.bytes.clone())),
+            Builtin::BlobText(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
+                String::from_utf8_lossy(&blob.bytes).into_owned(),
             )))),
+            Builtin::BlobBytes(blob) => Ok(Value::Promise(
+                self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(blob.bytes.clone())))),
+            )),
             Builtin::FileSlice(file) => {
                 let (start, end) = blob_slice_range(&arguments, file.bytes.len() as i64)?;
                 let mime_type = arguments
@@ -10692,12 +10576,12 @@ impl ScriptRuntime {
                     mime_type,
                 })))
             }
-            Builtin::FileText(file) => Ok(Value::Promise(self.fulfilled_promise(
-                Value::String(String::from_utf8_lossy(&file.bytes).into_owned()),
-            ))),
-            Builtin::FileBytes(file) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                Rc::new(RefCell::new(file.bytes.clone())),
+            Builtin::FileText(file) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
+                String::from_utf8_lossy(&file.bytes).into_owned(),
             )))),
+            Builtin::FileBytes(file) => Ok(Value::Promise(
+                self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(file.bytes.clone())))),
+            )),
             Builtin::FileListItem(files) => {
                 let index = arguments
                     .first()
@@ -10742,9 +10626,7 @@ impl ScriptRuntime {
                     )));
                 };
                 match provider.read_text() {
-                    Ok(text) => Ok(Value::Promise(
-                        self.fulfilled_promise(Value::String(text)),
-                    )),
+                    Ok(text) => Ok(Value::Promise(self.fulfilled_promise(Value::String(text)))),
                     Err(error) => Ok(Value::Promise(self.rejected_promise(error.to_string()))),
                 }
             }
@@ -10767,9 +10649,11 @@ impl ScriptRuntime {
             Builtin::SubtleDigest => {
                 let algorithm = match subtle_algorithm_name(arguments.first()) {
                     Ok(algorithm) => algorithm,
-                    Err(error) => return Ok(Value::Promise(self.rejected_promise_value(
-                        subtle_error_value("TypeError", error.message),
-                    ))),
+                    Err(error) => {
+                        return Ok(Value::Promise(self.rejected_promise_value(
+                            subtle_error_value("TypeError", error.message),
+                        )));
+                    }
                 };
                 let bytes = match arguments.get(1).map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
@@ -10784,21 +10668,19 @@ impl ScriptRuntime {
                     }
                 };
                 match subtle_digest(&algorithm, &bytes) {
-                    Ok(digest) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                        Rc::new(RefCell::new(digest)),
-                    )))),
-                    Err(error) => Ok(Value::Promise(self.rejected_promise_value(
-                        subtle_error_value("NotSupportedError", error),
-                    ))),
+                    Ok(digest) => Ok(Value::Promise(
+                        self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(digest)))),
+                    )),
+                    Err(error) => Ok(Value::Promise(
+                        self.rejected_promise_value(subtle_error_value("NotSupportedError", error)),
+                    )),
                 }
             }
             Builtin::PromiseThen(promise) => {
                 self.promise_then(promise, arguments.first(), arguments.get(1))
             }
             Builtin::PromiseCatch(promise) => self.promise_then(promise, None, arguments.first()),
-            Builtin::RequestClone(request) => {
-                Ok(Value::Request(clone_request(&request)?))
-            }
+            Builtin::RequestClone(request) => Ok(Value::Request(clone_request(&request)?)),
             Builtin::RequestText(request) => match self.consume_request_body(&request) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
                     String::from_utf8_lossy(&body).into_owned(),
@@ -10806,14 +10688,14 @@ impl ScriptRuntime {
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::RequestBytes(request) => match self.consume_request_body(&request) {
-                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                    Rc::new(RefCell::new(body)),
-                )))),
+                Ok(body) => Ok(Value::Promise(
+                    self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body)))),
+                )),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::RequestBlob(request) => match self.consume_request_body(&request) {
-                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Blob(Rc::new(
-                    BlobData {
+                Ok(body) => Ok(Value::Promise(
+                    self.fulfilled_promise(Value::Blob(Rc::new(BlobData {
                         bytes: body,
                         mime_type: request
                             .headers
@@ -10822,8 +10704,8 @@ impl ScriptRuntime {
                             .get("content-type")
                             .cloned()
                             .unwrap_or_default(),
-                    },
-                ))))),
+                    }))),
+                )),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::RequestFormData(request) => {
@@ -10959,11 +10841,7 @@ impl ScriptRuntime {
                 let data = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let body = serialize_json(&data)?;
                 let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                self.construct_response_parts(
-                    Value::String(body),
-                    init,
-                    Some("application/json"),
-                )
+                self.construct_response_parts(Value::String(body), init, Some("application/json"))
             }
             Builtin::ResponseRedirectConstructor => {
                 let reference = arguments
@@ -11048,18 +10926,18 @@ impl ScriptRuntime {
                 }
             }
             Builtin::ResponseBytes(response) => match self.consume_response_body(&response) {
-                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Bytes(
-                    Rc::new(RefCell::new(body)),
-                )))),
+                Ok(body) => Ok(Value::Promise(
+                    self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body)))),
+                )),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::ResponseBlob(response) => match self.consume_response_body(&response) {
-                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Blob(Rc::new(
-                    BlobData {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Blob(
+                    Rc::new(BlobData {
                         bytes: body,
                         mime_type: response.mime_type.clone(),
-                    },
-                ))))),
+                    }),
+                )))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
             Builtin::ResponseFormData(response) => {
@@ -11134,10 +11012,9 @@ impl ScriptRuntime {
                 if body.cursor >= body.bytes.len() {
                     body.consumed = true;
                     body.disturbed = true;
-                    return Ok(Value::Promise(self.fulfilled_promise(read_result(
-                        Value::Undefined,
-                        true,
-                    ))));
+                    return Ok(Value::Promise(
+                        self.fulfilled_promise(read_result(Value::Undefined, true)),
+                    ));
                 }
                 body.disturbed = true;
                 let end = body.cursor.saturating_add(16).min(body.bytes.len());
@@ -11174,10 +11051,7 @@ impl ScriptRuntime {
                 Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
             }
             Builtin::AbortControllerAbort(controller) => {
-                let reason = arguments
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(abort_error_value);
+                let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);
                 let signal = controller.borrow().signal.clone();
                 let listeners = {
                     let mut signal = signal.borrow_mut();
@@ -11253,9 +11127,9 @@ impl ScriptRuntime {
                     ));
                 };
                 if request != RUNTIME_INFO_REQUEST {
-                    return Ok(Value::Promise(self.rejected_promise(
-                        "host bridge rejected an unsupported request",
-                    )));
+                    return Ok(Value::Promise(
+                        self.rejected_promise("host bridge rejected an unsupported request"),
+                    ));
                 }
                 let mut payload = BTreeMap::new();
                 payload.insert("engine".to_string(), Value::String(info.engine));
@@ -11314,7 +11188,8 @@ impl ScriptRuntime {
                     return Err(runtime_error("event listener must be a function"));
                 }
                 if let Some(listeners) = self.listeners.get_mut(&path) {
-                    listeners.retain(|listener| !event_listener_matches(listener, &event, &callback));
+                    listeners
+                        .retain(|listener| !event_listener_matches(listener, &event, &callback));
                 }
                 Ok(Value::Undefined)
             }
@@ -11325,15 +11200,15 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementAppendChild(parent) => {
-                let parent_path = attached_path(&parent)
-                    .ok_or_else(|| runtime_error("appendChild parent is no longer in the document"))?;
+                let parent_path = attached_path(&parent).ok_or_else(|| {
+                    runtime_error("appendChild parent is no longer in the document")
+                })?;
                 let child = match arguments.first() {
                     Some(Value::Element(handle)) => handle.clone(),
                     _ => return Err(runtime_error("appendChild expects an element")),
                 };
                 if let Some(source_path) = attached_path(&child) {
-                    let source_parent =
-                        source_path[..source_path.len().saturating_sub(1)].to_vec();
+                    let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
                     let child_path = self
                         .document
                         .borrow_mut()
@@ -11345,20 +11220,20 @@ impl ScriptRuntime {
                         self.relocate_runtime_paths_for_move(&source_path, &child_path);
                         self.refresh_select_state_after_move(&source_parent, &child_path);
                     }
-                    let attached = attached_handle(child_path, &self.document)
-                        .ok_or_else(|| runtime_error("appendChild failed to preserve node identity"))?;
+                    let attached =
+                        attached_handle(child_path, &self.document).ok_or_else(|| {
+                            runtime_error("appendChild failed to preserve node identity")
+                        })?;
                     *child.borrow_mut() = attached.borrow().clone();
                     return Ok(Value::Element(child));
                 }
                 let location = child.borrow().clone();
                 let child_path = match location {
                     ElementLocation::Detached(element) if is_detached_text_element(&element) => {
-                        self.document
-                            .borrow_mut()
-                            .append_text_node(
-                                &parent_path,
-                                detached_text_data(&element).unwrap_or_default(),
-                            )
+                        self.document.borrow_mut().append_text_node(
+                            &parent_path,
+                            detached_text_data(&element).unwrap_or_default(),
+                        )
                     }
                     ElementLocation::Detached(element) => self
                         .document
@@ -11526,8 +11401,8 @@ impl ScriptRuntime {
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let fragment = Document::parse(&source)
-                    .map_err(|error| runtime_error(error.to_string()))?;
+                let fragment =
+                    Document::parse(&source).map_err(|error| runtime_error(error.to_string()))?;
                 let Some(anchor_path) = attached_path(&anchor) else {
                     return Ok(Value::Undefined);
                 };
@@ -11574,18 +11449,25 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementInsertBefore(parent) => {
-                let parent_path = attached_path(&parent)
-                    .ok_or_else(|| runtime_error("insertBefore parent is no longer in the document"))?;
+                let parent_path = attached_path(&parent).ok_or_else(|| {
+                    runtime_error("insertBefore parent is no longer in the document")
+                })?;
                 let child = match arguments.first() {
                     Some(Value::Element(handle)) => handle.clone(),
                     _ => return Err(runtime_error("insertBefore expects an element")),
                 };
                 let reference_path = match arguments.get(1).map(Value::resolve) {
                     None | Some(Value::Null) | Some(Value::Undefined) => None,
-                    Some(Value::Element(reference)) => Some(attached_path(&reference).ok_or_else(
-                        || runtime_error("insertBefore reference is no longer in the document"),
-                    )?),
-                    Some(_) => return Err(runtime_error("insertBefore reference must be an element or null")),
+                    Some(Value::Element(reference)) => {
+                        Some(attached_path(&reference).ok_or_else(|| {
+                            runtime_error("insertBefore reference is no longer in the document")
+                        })?)
+                    }
+                    Some(_) => {
+                        return Err(runtime_error(
+                            "insertBefore reference must be an element or null",
+                        ));
+                    }
                 };
                 let child_path = if let Some(source_path) = attached_path(&child) {
                     let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
@@ -11604,11 +11486,7 @@ impl ScriptRuntime {
                     }
                     child_path
                 } else {
-                    self.insert_detached_before(
-                        &parent_path,
-                        &child,
-                        reference_path.as_deref(),
-                    )?
+                    self.insert_detached_before(&parent_path, &child, reference_path.as_deref())?
                 };
                 let attached = attached_handle(child_path, &self.document)
                     .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
@@ -11620,8 +11498,9 @@ impl ScriptRuntime {
                     Some(Value::Element(handle)) => handle.clone(),
                     _ => return Err(runtime_error("removeChild expects an element")),
                 };
-                let parent_path = attached_path(&parent)
-                    .ok_or_else(|| runtime_error("removeChild parent is no longer in the document"))?;
+                let parent_path = attached_path(&parent).ok_or_else(|| {
+                    runtime_error("removeChild parent is no longer in the document")
+                })?;
                 self.detach_child(&parent_path, &child)?;
                 Ok(Value::Element(child))
             }
@@ -11635,20 +11514,22 @@ impl ScriptRuntime {
                 self.detach_child(&parent, &handle)?;
                 Ok(Value::Undefined)
             }
-            Builtin::ElementHasChildNodes(handle) => Ok(Value::Bool(match handle.borrow().clone() {
-                ElementLocation::Attached { .. } => {
-                    if attached_is_text(&handle) {
-                        false
-                    } else {
-                        attached_path(&handle)
-                            .and_then(|path| self.document.borrow().child_paths(&path))
-                            .is_some_and(|children| !children.is_empty())
+            Builtin::ElementHasChildNodes(handle) => {
+                Ok(Value::Bool(match handle.borrow().clone() {
+                    ElementLocation::Attached { .. } => {
+                        if attached_is_text(&handle) {
+                            false
+                        } else {
+                            attached_path(&handle)
+                                .and_then(|path| self.document.borrow().child_paths(&path))
+                                .is_some_and(|children| !children.is_empty())
+                        }
                     }
-                }
-                ElementLocation::Detached(element) => {
-                    !is_detached_text_element(&element) && !element.children.is_empty()
-                }
-            })),
+                    ElementLocation::Detached(element) => {
+                        !is_detached_text_element(&element) && !element.children.is_empty()
+                    }
+                }))
+            }
             Builtin::ElementCloneNode(handle) => {
                 let deep = arguments.first().is_some_and(Value::truthy);
                 let node = match handle.borrow().clone() {
@@ -11859,7 +11740,9 @@ impl ScriptRuntime {
                     .transpose()?
                     .unwrap_or(0.0);
                 if !offset.is_finite() || offset < 0.0 || offset.fract() != 0.0 {
-                    return Err(runtime_error("Uint8Array.set offset must be a non-negative integer"));
+                    return Err(runtime_error(
+                        "Uint8Array.set offset must be a non-negative integer",
+                    ));
                 }
                 let offset = offset as usize;
                 let end = offset
@@ -11880,8 +11763,7 @@ impl ScriptRuntime {
                     let array = array.borrow();
                     (array.start, array.end, array.buffer.clone())
                 };
-                let (start, end) =
-                    blob_slice_range(&arguments, (view_end - view_start) as i64)?;
+                let (start, end) = blob_slice_range(&arguments, (view_end - view_start) as i64)?;
                 let bytes = buffer.borrow()[view_start + start..view_start + end].to_vec();
                 Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
                     buffer: Rc::new(RefCell::new(bytes)),
@@ -11894,8 +11776,7 @@ impl ScriptRuntime {
                     let array = array.borrow();
                     (array.start, array.end, array.buffer.clone())
                 };
-                let (start, end) =
-                    blob_slice_range(&arguments, (view_end - view_start) as i64)?;
+                let (start, end) = blob_slice_range(&arguments, (view_end - view_start) as i64)?;
                 Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
                     buffer,
                     start: view_start + start,
@@ -12032,7 +11913,11 @@ impl ScriptRuntime {
         callbacks
     }
 
-    fn dispatch_event(&mut self, path: NodePath, event: &str) -> Result<EventDispatch, ScriptError> {
+    fn dispatch_event(
+        &mut self,
+        path: NodePath,
+        event: &str,
+    ) -> Result<EventDispatch, ScriptError> {
         self.dispatch_event_with_details(path, event, "", "")
     }
 
@@ -12737,10 +12622,7 @@ impl ScriptRuntime {
     }
 }
 
-fn attached_handle(
-    path: NodePath,
-    document: &Rc<RefCell<Document>>,
-) -> Option<ElementHandle> {
+fn attached_handle(path: NodePath, document: &Rc<RefCell<Document>>) -> Option<ElementHandle> {
     let document_ref = document.borrow();
     let id = document_ref.node_id(&path)?;
     let is_text = document_ref.node_is_text(&path)?;
@@ -12803,9 +12685,9 @@ fn detached_text_data_mut(element: &mut Element) -> Option<&mut String> {
 
 fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
     match &*handle.borrow() {
-        ElementLocation::Attached {
-            id, document, ..
-        } => document.upgrade()?.borrow().path_for_id(*id),
+        ElementLocation::Attached { id, document, .. } => {
+            document.upgrade()?.borrow().path_for_id(*id)
+        }
         ElementLocation::Detached(_) => None,
     }
 }
@@ -12834,7 +12716,11 @@ fn collect_sequential_focus_nodes(
         let tabindex = document
             .borrow()
             .element_clone(&node.path)
-            .and_then(|element| element.attr("tabindex").and_then(|value| value.parse().ok()))
+            .and_then(|element| {
+                element
+                    .attr("tabindex")
+                    .and_then(|value| value.parse().ok())
+            })
             .unwrap_or(0);
         entries.push((tabindex, *order, node.path.clone()));
         *order += 1;
@@ -12886,11 +12772,8 @@ impl ScriptRuntime {
                 database
             };
             let old_version = database.borrow().version;
-            let target_version = requested_version.unwrap_or(if old_version == 0 {
-                1
-            } else {
-                old_version
-            });
+            let target_version =
+                requested_version.unwrap_or(if old_version == 0 { 1 } else { old_version });
             if target_version < old_version {
                 (
                     database,
@@ -12954,29 +12837,28 @@ impl ScriptRuntime {
         let name = indexed_db_name(arguments.first(), "database")?;
         let old_version = {
             let mut storage = storage.borrow_mut();
-            let old_version = storage.databases.remove(&name).map(|database| {
-                let mut database = database.borrow_mut();
-                let old_version = database.version;
-                database.closed = true;
-                database.stores.clear();
-                database.store_order.clear();
-                database.upgrade_active = false;
-                database.upgrade_transaction = None;
-                old_version
-            }).unwrap_or(0);
+            let old_version = storage
+                .databases
+                .remove(&name)
+                .map(|database| {
+                    let mut database = database.borrow_mut();
+                    let old_version = database.version;
+                    database.closed = true;
+                    database.stores.clear();
+                    database.store_order.clear();
+                    database.upgrade_active = false;
+                    database.upgrade_transaction = None;
+                    old_version
+                })
+                .unwrap_or(0);
             if old_version != 0 {
-                storage.database_order.retain(|candidate| candidate != &name);
+                storage
+                    .database_order
+                    .retain(|candidate| candidate != &name);
             }
             old_version
         };
-        Ok(self.indexed_db_request(
-            Value::Undefined,
-            None,
-            None,
-            None,
-            (old_version, 0),
-            false,
-        ))
+        Ok(self.indexed_db_request(Value::Undefined, None, None, None, (old_version, 0), false))
     }
 
     fn indexed_db_databases(&self, storage: StorageHandle) -> Result<Value, ScriptError> {
@@ -12989,7 +12871,10 @@ impl ScriptRuntime {
                 let database = database.borrow();
                 let mut value = BTreeMap::new();
                 value.insert("name".to_string(), Value::String(database.name.clone()));
-                value.insert("version".to_string(), Value::Number(database.version as f64));
+                value.insert(
+                    "version".to_string(),
+                    Value::Number(database.version as f64),
+                );
                 Value::Object(Rc::new(RefCell::new(value)))
             })
             .collect();
@@ -13099,9 +12984,9 @@ impl ScriptRuntime {
                 let mut transaction_state = transaction.borrow_mut();
                 transaction_state.pending = transaction_state.pending.saturating_sub(1);
             }
-            self.queue_internal_microtask(Value::Builtin(
-                Builtin::IndexedDbTransactionComplete(transaction),
-            ));
+            self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbTransactionComplete(
+                transaction,
+            )));
         }
         Ok(Value::Undefined)
     }
@@ -13128,12 +13013,8 @@ impl ScriptRuntime {
             } else {
                 "complete"
             };
-            let event = indexed_db_event(
-                event_type,
-                Value::IndexedDbTransaction(transaction),
-                0,
-                0,
-            );
+            let event =
+                indexed_db_event(event_type, Value::IndexedDbTransaction(transaction), 0, 0);
             self.call(callback, vec![event])?;
         }
         Ok(Value::Undefined)
@@ -13162,7 +13043,7 @@ impl ScriptRuntime {
             Some(Value::String(_)) => {
                 return Err(runtime_error(
                     "object store key path is empty or exceeds the deterministic limit",
-                ))
+                ));
             }
             Some(_) => return Err(runtime_error("object store key path must be a string")),
         };
@@ -13266,9 +13147,9 @@ impl ScriptRuntime {
             on_error: None,
             on_abort: None,
         }));
-        self.queue_internal_microtask(Value::Builtin(
-            Builtin::IndexedDbTransactionComplete(transaction.clone()),
-        ));
+        self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbTransactionComplete(
+            transaction.clone(),
+        )));
         Ok(Value::IndexedDbTransaction(transaction))
     }
 
@@ -13285,10 +13166,16 @@ impl ScriptRuntime {
                 return Err(runtime_error("transaction is no longer active"));
             }
         }
-        if !transaction.borrow().store_names.iter().any(|store| store == &name)
+        if !transaction
+            .borrow()
+            .store_names
+            .iter()
+            .any(|store| store == &name)
             && transaction.borrow().mode != "versionchange"
         {
-            return Err(runtime_error("object store is outside the transaction scope"));
+            return Err(runtime_error(
+                "object store is outside the transaction scope",
+            ));
         }
         if !database.borrow().stores.contains_key(&name) {
             return Err(runtime_error("object store does not exist"));
@@ -13312,9 +13199,9 @@ impl ScriptRuntime {
         }
         transaction_state.aborted = true;
         drop(transaction_state);
-        self.queue_internal_microtask(Value::Builtin(
-            Builtin::IndexedDbTransactionComplete(transaction),
-        ));
+        self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbTransactionComplete(
+            transaction,
+        )));
         Ok(Value::Undefined)
     }
 
@@ -13345,18 +13232,18 @@ impl ScriptRuntime {
             return Err(runtime_error("IDBDatabase connection is closed"));
         }
         if transaction_state.mode != "versionchange"
-            && !transaction_state.store_names.iter().any(|store| store == &name)
+            && !transaction_state
+                .store_names
+                .iter()
+                .any(|store| store == &name)
         {
-            return Err(runtime_error("object store is outside the transaction scope"));
+            return Err(runtime_error(
+                "object store is outside the transaction scope",
+            ));
         }
         let mode = transaction_state.mode.clone();
         drop(transaction_state);
-        Ok((
-            database,
-            name,
-            transaction,
-            mode,
-        ))
+        Ok((database, name, transaction, mode))
     }
 
     fn indexed_db_object_store_write(
@@ -13430,14 +13317,7 @@ impl ScriptRuntime {
             );
             key
         };
-        Ok(self.indexed_db_request(
-            key,
-            None,
-            Some(transaction),
-            None,
-            (0, 0),
-            false,
-        ))
+        Ok(self.indexed_db_request(key, None, Some(transaction), None, (0, 0), false))
     }
 
     fn indexed_db_object_store_get(
@@ -13460,14 +13340,7 @@ impl ScriptRuntime {
                 .transpose()?
                 .unwrap_or(Value::Undefined)
         };
-        Ok(self.indexed_db_request(
-            value,
-            None,
-            Some(transaction),
-            None,
-            (0, 0),
-            false,
-        ))
+        Ok(self.indexed_db_request(value, None, Some(transaction), None, (0, 0), false))
     }
 
     fn indexed_db_object_store_delete(
@@ -13590,9 +13463,9 @@ impl ScriptRuntime {
                 .iter()
                 .filter_map(|token| store.records.get(token))
                 .filter(|record| {
-                    key_token
-                        .as_ref()
-                        .is_none_or(|candidate| indexed_db_key_token(&record.key).ok().as_ref() == Some(candidate))
+                    key_token.as_ref().is_none_or(|candidate| {
+                        indexed_db_key_token(&record.key).ok().as_ref() == Some(candidate)
+                    })
                 })
                 .take(limit)
                 .map(|record| (record.key.clone(), record.value.clone()))
@@ -13643,11 +13516,14 @@ fn default_value_for_element(element: &Element) -> Option<String> {
 }
 
 fn option_value(element: &Element) -> String {
-    element.attr("value").map(str::to_string).unwrap_or_else(|| {
-        let mut value = String::new();
-        collect_element_text(element, &mut value);
-        value
-    })
+    element
+        .attr("value")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let mut value = String::new();
+            collect_element_text(element, &mut value);
+            value
+        })
 }
 
 fn delay_milliseconds(value: f64) -> u64 {
@@ -13687,7 +13563,7 @@ impl Environment {
                 Value::Binding(_, false) => {
                     return Err(runtime_error(format!(
                         "cannot assign to imported binding {name}"
-                    )))
+                    )));
                 }
                 _ => {
                     self.values.insert(name.to_string(), value);
@@ -13819,9 +13695,7 @@ impl Value {
             Self::ResponseConstructor => "[function Response]".to_string(),
             Self::RequestConstructor => "[function Request]".to_string(),
             Self::HeadersConstructor => "[function Headers]".to_string(),
-            Self::UrlConstructor | Self::UrlSearchParamsConstructor => {
-                "[function URL]".to_string()
-            }
+            Self::UrlConstructor | Self::UrlSearchParamsConstructor => "[function URL]".to_string(),
             Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::BlobConstructor => "[function Blob]".to_string(),
             Self::FileConstructor => "[function File]".to_string(),
@@ -13896,7 +13770,9 @@ impl CloneContext {
 
     fn enter(&mut self, pointer: usize) -> Result<(), ScriptError> {
         if !self.active.insert(pointer) {
-            return Err(data_clone_error("cyclic values are not supported in this slice"));
+            return Err(data_clone_error(
+                "cyclic values are not supported in this slice",
+            ));
         }
         Ok(())
     }
@@ -13915,11 +13791,7 @@ fn clone_payload(value: &Value, max_bytes: usize) -> Result<CloneValue, ScriptEr
     clone_value(value, &mut context, 0)
 }
 
-fn clone_text(
-    value: &str,
-    context: &mut CloneContext,
-    label: &str,
-) -> Result<String, ScriptError> {
+fn clone_text(value: &str, context: &mut CloneContext, label: &str) -> Result<String, ScriptError> {
     if value.len() > MAX_CLONE_STRING_BYTES {
         return Err(data_clone_error(format!("{label} is too large")));
     }
@@ -13946,11 +13818,7 @@ fn clone_value(
         Value::Null => Ok(CloneValue::Null),
         Value::Bool(value) => Ok(CloneValue::Bool(*value)),
         Value::Number(value) => Ok(CloneValue::Number(*value)),
-        Value::String(value) => Ok(CloneValue::String(clone_text(
-            value,
-            context,
-            "string",
-        )?)),
+        Value::String(value) => Ok(CloneValue::String(clone_text(value, context, "string")?)),
         Value::Object(object) => {
             let pointer = Rc::as_ptr(object) as usize;
             context.enter(pointer)?;
@@ -14393,11 +14261,7 @@ fn write_clone_value(
         }
         CloneValue::Object(properties) => {
             writer.write_u8(7);
-            writer.write_count(
-                properties.len(),
-                MAX_CLONE_NODES,
-                "structured clone object",
-            )?;
+            writer.write_count(properties.len(), MAX_CLONE_NODES, "structured clone object")?;
             for (key, value) in properties {
                 writer.write_string(key, MAX_CLONE_STRING_BYTES, "structured clone object key")?;
                 write_clone_value(writer, value, depth + 1)?;
@@ -14578,11 +14442,7 @@ fn read_clone_value(
             let count = reader.read_count(MAX_CLONE_NODES, "structured clone object")?;
             let mut properties = BTreeMap::new();
             for _ in 0..count {
-                let key = read_clone_string(
-                    reader,
-                    context,
-                    "structured clone object key",
-                )?;
+                let key = read_clone_string(reader, context, "structured clone object key")?;
                 let value = read_clone_value(reader, context, depth + 1)?;
                 if properties.insert(key, value).is_some() {
                     return Err(storage_invalid("duplicate structured clone object key"));
@@ -14644,7 +14504,11 @@ fn encode_storage(storage: &StorageData) -> io::Result<Vec<u8>> {
     writer.bytes.extend_from_slice(STORAGE_MAGIC);
     writer.write_u32(STORAGE_FORMAT_VERSION);
 
-    writer.write_count(storage.values.len(), MAX_STORAGE_VALUES, "localStorage entries")?;
+    writer.write_count(
+        storage.values.len(),
+        MAX_STORAGE_VALUES,
+        "localStorage entries",
+    )?;
     for (key, value) in &storage.values {
         writer.write_string(key, MAX_STORAGE_TEXT_BYTES, "localStorage key")?;
         writer.write_string(value, MAX_STORAGE_VALUE_BYTES, "localStorage value")?;
@@ -14665,10 +14529,22 @@ fn encode_storage(storage: &StorageData) -> io::Result<Vec<u8>> {
         writer.write_count(cache.entries.len(), MAX_CACHE_ENTRIES, "cache entries")?;
         for (key, entry) in &cache.entries {
             writer.write_string(key, MAX_STORAGE_TEXT_BYTES, "cache entry key")?;
-            writer.write_string(&entry.request_url, MAX_STORAGE_TEXT_BYTES, "cache request URL")?;
-            writer.write_string(&entry.request_method, MAX_STORAGE_HEADER_BYTES, "cache request method")?;
+            writer.write_string(
+                &entry.request_url,
+                MAX_STORAGE_TEXT_BYTES,
+                "cache request URL",
+            )?;
+            writer.write_string(
+                &entry.request_method,
+                MAX_STORAGE_HEADER_BYTES,
+                "cache request method",
+            )?;
             write_headers(&mut writer, &entry.request_headers)?;
-            writer.write_string(&entry.response.url, MAX_STORAGE_TEXT_BYTES, "cached response URL")?;
+            writer.write_string(
+                &entry.response.url,
+                MAX_STORAGE_TEXT_BYTES,
+                "cached response URL",
+            )?;
             writer.write_u16(entry.response.status);
             writer.write_string(
                 &entry.response.status_text,
@@ -14795,7 +14671,9 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         let key = reader.read_string(MAX_STORAGE_TEXT_BYTES, "localStorage key")?;
         let value = reader.read_string(MAX_STORAGE_VALUE_BYTES, "localStorage value")?;
         if storage.values.insert(key, value).is_some() {
-            return Err(storage_invalid("duplicate localStorage key in storage file"));
+            return Err(storage_invalid(
+                "duplicate localStorage key in storage file",
+            ));
         }
     }
 
@@ -14820,25 +14698,20 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         for _ in 0..entry_count {
             let key = reader.read_string(MAX_STORAGE_TEXT_BYTES, "cache entry key")?;
             let request_url = reader.read_string(MAX_STORAGE_TEXT_BYTES, "cache request URL")?;
-            let request_method = reader.read_string(MAX_STORAGE_HEADER_BYTES, "cache request method")?;
+            let request_method =
+                reader.read_string(MAX_STORAGE_HEADER_BYTES, "cache request method")?;
             let request_headers = read_headers(&mut reader)?;
             let response_url = reader.read_string(MAX_STORAGE_TEXT_BYTES, "cached response URL")?;
             let status = reader.read_u16()?;
-            let status_text = reader.read_string(
-                MAX_STORAGE_HEADER_BYTES,
-                "cached response status text",
-            )?;
-            let mime_type = reader.read_string(
-                MAX_STORAGE_HEADER_BYTES,
-                "cached response MIME type",
-            )?;
+            let status_text =
+                reader.read_string(MAX_STORAGE_HEADER_BYTES, "cached response status text")?;
+            let mime_type =
+                reader.read_string(MAX_STORAGE_HEADER_BYTES, "cached response MIME type")?;
             let headers = read_headers(&mut reader)?;
             let body = reader.read_bytes(MAX_CACHED_RESPONSE_BYTES, "cached response body")?;
             let redirected = reader.read_bool()?;
-            let response_type = reader.read_string(
-                MAX_STORAGE_HEADER_BYTES,
-                "cached response type",
-            )?;
+            let response_type =
+                reader.read_string(MAX_STORAGE_HEADER_BYTES, "cached response type")?;
             if entries
                 .insert(
                     key,
@@ -14866,16 +14739,18 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         if storage.caches.contains_key(&name) {
             return Err(storage_invalid("duplicate cache name in storage file"));
         }
-        storage.caches.insert(
-            name,
-            Rc::new(RefCell::new(CacheData { entries, order })),
-        );
+        storage
+            .caches
+            .insert(name, Rc::new(RefCell::new(CacheData { entries, order })));
     }
     if storage
         .cache_order
         .iter()
         .any(|name| !storage.caches.contains_key(name))
-        || storage.caches.keys().any(|name| !storage.cache_order.contains(name))
+        || storage
+            .caches
+            .keys()
+            .any(|name| !storage.cache_order.contains(name))
     {
         return Err(storage_invalid("cache order does not match cache records"));
     }
@@ -14896,14 +14771,18 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         let name = reader.read_string(MAX_IDB_NAME_BYTES, "database name")?;
         let version = reader.read_u64()?;
         if version > MAX_IDB_VERSION {
-            return Err(storage_invalid("database version exceeds the deterministic limit"));
+            return Err(storage_invalid(
+                "database version exceeds the deterministic limit",
+            ));
         }
         let store_order_count = reader.read_count(MAX_IDB_STORES, "object store order")?;
         let mut store_order = Vec::with_capacity(store_order_count);
         for _ in 0..store_order_count {
             let store_name = reader.read_string(MAX_IDB_NAME_BYTES, "object store name")?;
             if store_order.contains(&store_name) {
-                return Err(storage_invalid("duplicate object store name in storage file"));
+                return Err(storage_invalid(
+                    "duplicate object store name in storage file",
+                ));
             }
             store_order.push(store_name);
         }
@@ -14911,7 +14790,8 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
         let mut stores = BTreeMap::new();
         for _ in 0..store_count {
             let store_name = reader.read_string(MAX_IDB_NAME_BYTES, "object store name")?;
-            let key_path = reader.read_optional_string(MAX_IDB_NAME_BYTES, "object store key path")?;
+            let key_path =
+                reader.read_optional_string(MAX_IDB_NAME_BYTES, "object store key path")?;
             let auto_increment = reader.read_bool()?;
             let next_key = reader.read_u64()?.max(1);
             let order_count = reader.read_count(MAX_IDB_RECORDS, "record order")?;
@@ -14929,14 +14809,16 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
                 let token = reader.read_string(MAX_STORAGE_TEXT_BYTES, "record key token")?;
                 let key = if let Some(runtime) = legacy_value_runtime.as_mut() {
                     let source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB key")?;
-                    runtime
-                        .parse_json(&source)
-                        .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?
+                    runtime.parse_json(&source).map_err(|error| {
+                        storage_invalid(format!("invalid IndexedDB key: {error}"))
+                    })?
                 } else {
                     let mut key_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
                     read_clone_value(&mut reader, &mut key_context, 0)?
                         .into_value()
-                        .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))?
+                        .map_err(|error| {
+                            storage_invalid(format!("invalid IndexedDB key: {error}"))
+                        })?
                 };
                 indexed_db_key_token(&key)
                     .map_err(|error| storage_invalid(format!("invalid IndexedDB key: {error}")))
@@ -14949,17 +14831,24 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
                     })?;
                 let value = if let Some(runtime) = legacy_value_runtime.as_mut() {
                     let source = reader.read_string(MAX_STORAGE_VALUE_BYTES, "IndexedDB value")?;
-                    runtime
-                        .parse_json(&source)
-                        .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?
+                    runtime.parse_json(&source).map_err(|error| {
+                        storage_invalid(format!("invalid IndexedDB value: {error}"))
+                    })?
                 } else {
                     let mut value_context = CloneReadContext::new(MAX_IDB_VALUE_BYTES);
                     read_clone_value(&mut reader, &mut value_context, 0)?
                         .into_value()
-                        .map_err(|error| storage_invalid(format!("invalid IndexedDB value: {error}")))?
+                        .map_err(|error| {
+                            storage_invalid(format!("invalid IndexedDB value: {error}"))
+                        })?
                 };
-                if records.insert(token, IndexedDbRecord { key, value }).is_some() {
-                    return Err(storage_invalid("duplicate IndexedDB record in storage file"));
+                if records
+                    .insert(token, IndexedDbRecord { key, value })
+                    .is_some()
+                {
+                    return Err(storage_invalid(
+                        "duplicate IndexedDB record in storage file",
+                    ));
                 }
             }
             if stores
@@ -15030,7 +14919,9 @@ fn decode_storage(bytes: &[u8]) -> io::Result<StorageData> {
             .keys()
             .any(|name| !storage.database_order.contains(name))
     {
-        return Err(storage_invalid("database order does not match database records"));
+        return Err(storage_invalid(
+            "database order does not match database records",
+        ));
     }
     if !reader.is_exhausted() {
         return Err(storage_invalid("storage file has trailing bytes"));
@@ -15091,12 +14982,7 @@ fn indexed_db_error(name: &str, message: &str) -> Value {
     }))
 }
 
-fn indexed_db_event(
-    event_type: &str,
-    target: Value,
-    old_version: u64,
-    new_version: u64,
-) -> Value {
+fn indexed_db_event(event_type: &str, target: Value, old_version: u64, new_version: u64) -> Value {
     let mut event = BTreeMap::new();
     event.insert("type".to_string(), Value::String(event_type.to_string()));
     event.insert("target".to_string(), target);
@@ -15114,7 +15000,9 @@ fn indexed_db_name(value: Option<&Value>, kind: &str) -> Result<String, ScriptEr
     }
     let name = value.string_value();
     if name.len() > MAX_IDB_NAME_BYTES {
-        return Err(runtime_error(format!("{kind} name exceeds the deterministic limit")));
+        return Err(runtime_error(format!(
+            "{kind} name exceeds the deterministic limit"
+        )));
     }
     Ok(name)
 }
@@ -15142,14 +15030,15 @@ fn indexed_db_version(value: Option<&Value>) -> Result<Option<u64>, ScriptError>
 }
 
 fn indexed_db_store_names(value: Option<&Value>) -> Result<Vec<String>, ScriptError> {
-    let value = value.ok_or_else(|| runtime_error("transaction object store names are required"))?;
+    let value =
+        value.ok_or_else(|| runtime_error("transaction object store names are required"))?;
     let values = match value.resolve() {
         Value::String(name) => vec![Value::String(name)],
         Value::Array(values) => values.borrow().clone(),
         _ => {
             return Err(runtime_error(
                 "transaction object store names must be a string or array",
-            ))
+            ));
         }
     };
     let mut names = Vec::with_capacity(values.len());
@@ -15177,7 +15066,9 @@ fn indexed_db_key_argument(value: Option<&Value>) -> Result<Value, ScriptError> 
     match &value {
         Value::String(_) => Ok(value),
         Value::Number(number) if number.is_finite() => Ok(value),
-        _ => Err(runtime_error("object store key must be a string or finite number")),
+        _ => Err(runtime_error(
+            "object store key must be a string or finite number",
+        )),
     }
 }
 
@@ -15188,12 +15079,17 @@ fn indexed_db_key_token(value: &Value) -> Result<String, ScriptError> {
             let number = if number == 0.0 { 0.0 } else { number };
             Ok(format!("n:{number:?}"))
         }
-        _ => Err(runtime_error("object store key must be a string or finite number")),
+        _ => Err(runtime_error(
+            "object store key must be a string or finite number",
+        )),
     }
 }
 
 fn indexed_db_key_at_path(value: &Value, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.is_empty() {
         return None;
     }
@@ -15211,7 +15107,10 @@ fn indexed_db_key_at_path(value: &Value, path: &str) -> Option<Value> {
 }
 
 fn indexed_db_set_key_path(value: &mut Value, path: &str, key: Value) -> Result<(), ScriptError> {
-    let segments: Vec<&str> = path.split('.').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.is_empty() {
         return Err(runtime_error("object store key path cannot be empty"));
     }
@@ -15618,8 +15517,7 @@ fn decode_form_component(value: &str) -> Result<String, ScriptError> {
         }
         index += 1;
     }
-    String::from_utf8(decoded)
-        .map_err(|_| runtime_error("URLSearchParams contains invalid UTF-8"))
+    String::from_utf8(decoded).map_err(|_| runtime_error("URLSearchParams contains invalid UTF-8"))
 }
 
 fn serialize_form_urlencoded(pairs: &[(String, String)]) -> String {
@@ -15667,11 +15565,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
     }
 }
 
-fn blob_slice_index(
-    value: Option<&Value>,
-    size: i64,
-    default: i64,
-) -> Result<i64, ScriptError> {
+fn blob_slice_index(value: Option<&Value>, size: i64, default: i64) -> Result<i64, ScriptError> {
     let Some(value) = value.map(Value::resolve) else {
         return Ok(default);
     };
@@ -15706,10 +15600,7 @@ fn blob_slice_range(arguments: &[Value], size: i64) -> Result<(usize, usize), Sc
 }
 
 fn normalize_blob_type(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| (0x20..=0x7e).contains(&byte))
-    {
+    if value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
         value.to_ascii_lowercase()
     } else {
         String::new()
@@ -15728,7 +15619,9 @@ fn reject_nullish_object_argument(value: &Value, method: &str) -> Result<(), Scr
 fn array_callback(arguments: &[Value], method: &str) -> Result<Value, ScriptError> {
     let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
     if !matches!(callback, Value::Function(_)) {
-        return Err(runtime_error(format!("{method} callback must be a function")));
+        return Err(runtime_error(format!(
+            "{method} callback must be a function"
+        )));
     }
     Ok(callback)
 }
@@ -15814,11 +15707,7 @@ fn runtime_array_index(value: &Value) -> Result<usize, ScriptError> {
     Ok(number as usize)
 }
 
-fn set_array_element(
-    array: &ArrayHandle,
-    index: usize,
-    value: Value,
-) -> Result<(), ScriptError> {
+fn set_array_element(array: &ArrayHandle, index: usize, value: Value) -> Result<(), ScriptError> {
     if index >= MAX_RUNTIME_ARRAY_LENGTH {
         return Err(runtime_error(
             "array index exceeds the deterministic length limit",
@@ -15857,12 +15746,10 @@ fn uint8_array_view_len(array: &Uint8ArrayData) -> usize {
 
 fn uint8_array_non_negative_integer(value: &Value, label: &str) -> Result<usize, ScriptError> {
     let number = value.number()?;
-    if !number.is_finite()
-        || number < 0.0
-        || number.fract() != 0.0
-        || number > usize::MAX as f64
-    {
-        return Err(runtime_error(format!("{label} must be a non-negative integer")));
+    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number > usize::MAX as f64 {
+        return Err(runtime_error(format!(
+            "{label} must be a non-negative integer"
+        )));
     }
     Ok(number as usize)
 }
@@ -16061,7 +15948,10 @@ fn valid_email_address(value: &str) -> bool {
         || local.chars().any(|character| {
             character.is_ascii_whitespace()
                 || !character.is_ascii()
-                || matches!(character, '"' | '(' | ')' | ',' | ':' | ';' | '<' | '>' | '[' | ']')
+                || matches!(
+                    character,
+                    '"' | '(' | ')' | ',' | ':' | ';' | '<' | '>' | '[' | ']'
+                )
         })
         || domain.starts_with('.')
         || domain.ends_with('.')
@@ -16084,18 +15974,17 @@ fn valid_url_value(value: &str) -> bool {
         return false;
     };
     !scheme.is_empty()
-        && scheme
-            .chars()
-            .enumerate()
-            .all(|(index, character)| {
-                if index == 0 {
-                    character.is_ascii_alphabetic()
-                } else {
-                    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-                }
-            })
+        && scheme.chars().enumerate().all(|(index, character)| {
+            if index == 0 {
+                character.is_ascii_alphabetic()
+            } else {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            }
+        })
         && !authority.is_empty()
-        && !authority.chars().any(|character| character.is_ascii_whitespace())
+        && !authority
+            .chars()
+            .any(|character| character.is_ascii_whitespace())
 }
 
 #[derive(Clone)]
@@ -16164,14 +16053,8 @@ fn parse_pattern_escape(characters: &[char], cursor: usize) -> Option<(PatternAt
     let atom = match escaped {
         'd' => PatternAtom::Class(vec![('0', '9')], false),
         'D' => PatternAtom::Class(vec![('0', '9')], true),
-        'w' => PatternAtom::Class(
-            vec![('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')],
-            false,
-        ),
-        'W' => PatternAtom::Class(
-            vec![('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')],
-            true,
-        ),
+        'w' => PatternAtom::Class(vec![('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')], false),
+        'W' => PatternAtom::Class(vec![('0', '9'), ('A', 'Z'), ('a', 'z'), ('_', '_')], true),
         's' => PatternAtom::Class(
             vec![('\t', '\t'), ('\n', '\n'), ('\r', '\r'), (' ', ' ')],
             false,
@@ -16194,7 +16077,8 @@ fn parse_pattern_class(characters: &[char], cursor: usize) -> Option<(PatternAto
     let mut ranges = Vec::new();
     while let Some(&character) = characters.get(cursor) {
         if character == ']' {
-            return (!ranges.is_empty()).then_some((PatternAtom::Class(ranges, negated), cursor + 1));
+            return (!ranges.is_empty())
+                .then_some((PatternAtom::Class(ranges, negated), cursor + 1));
         }
         let first = if character == '\\' {
             let escaped = *characters.get(cursor + 1)?;
@@ -16218,7 +16102,11 @@ fn parse_pattern_class(characters: &[char], cursor: usize) -> Option<(PatternAto
             cursor += 1;
             character
         };
-        if characters.get(cursor) == Some(&'-') && characters.get(cursor + 1).is_some_and(|value| *value != ']') {
+        if characters.get(cursor) == Some(&'-')
+            && characters
+                .get(cursor + 1)
+                .is_some_and(|value| *value != ']')
+        {
             let last = characters[cursor + 1];
             ranges.push((first.min(last), first.max(last)));
             cursor += 2;
@@ -16242,7 +16130,10 @@ fn parse_pattern_quantifier(
         '?' => Some((0, Some(1), cursor + 1)),
         '{' => {
             let mut end = cursor + 1;
-            while characters.get(end).is_some_and(|character| character.is_ascii_digit()) {
+            while characters
+                .get(end)
+                .is_some_and(|character| character.is_ascii_digit())
+            {
                 end += 1;
             }
             if end == cursor + 1 {
@@ -16261,7 +16152,10 @@ fn parse_pattern_quantifier(
             }
             end += 1;
             let limit_start = end;
-            while characters.get(end).is_some_and(|character| character.is_ascii_digit()) {
+            while characters
+                .get(end)
+                .is_some_and(|character| character.is_ascii_digit())
+            {
                 end += 1;
             }
             let maximum = if end == limit_start {
@@ -16275,7 +16169,8 @@ fn parse_pattern_quantifier(
                         .ok()?,
                 )
             };
-            if characters.get(end) != Some(&'}') || maximum.is_some_and(|maximum| maximum < minimum) {
+            if characters.get(end) != Some(&'}') || maximum.is_some_and(|maximum| maximum < minimum)
+            {
                 return None;
             }
             Some((minimum, maximum, end + 1))
@@ -16325,12 +16220,10 @@ fn pattern_atom_matches(atom: &PatternAtom, character: char) -> bool {
         PatternAtom::Literal(expected) => character == *expected,
         PatternAtom::Any => true,
         PatternAtom::Class(ranges, negated) => {
-            let matched = ranges.iter().any(|(start, end)| (*start..=*end).contains(&character));
-            if *negated {
-                !matched
-            } else {
-                matched
-            }
+            let matched = ranges
+                .iter()
+                .any(|(start, end)| (*start..=*end).contains(&character));
+            if *negated { !matched } else { matched }
         }
     }
 }
@@ -16356,7 +16249,12 @@ fn utf16_substring(value: &str, start: usize, end: usize) -> String {
     String::from_utf16_lossy(&units[start..end])
 }
 
-fn replace_utf16_range(value: &str, start: usize, end: usize, replacement: &str) -> (String, usize) {
+fn replace_utf16_range(
+    value: &str,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) -> (String, usize) {
     let units = value.encode_utf16().collect::<Vec<_>>();
     let start = start.min(units.len());
     let end = end.min(units.len()).max(start);
@@ -16475,12 +16373,8 @@ fn adjust_range_boundary_for_replacement(
         return;
     };
     let replacement_start = target_start.saturating_sub(ancestor_start);
-    boundary.offset = remap_range_offset(
-        boundary.offset,
-        replacement_start,
-        old_length,
-        new_length,
-    );
+    boundary.offset =
+        remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
 }
 
 fn adjust_range_boundary_for_character_data_edit(
@@ -16496,12 +16390,8 @@ fn adjust_range_boundary_for_character_data_edit(
         return;
     };
     if path == target {
-        boundary.offset = remap_range_offset(
-            boundary.offset,
-            replacement_start,
-            old_length,
-            new_length,
-        );
+        boundary.offset =
+            remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
         return;
     }
     if !target.starts_with(&path) {
@@ -16514,12 +16404,8 @@ fn adjust_range_boundary_for_character_data_edit(
     let replacement_start = target_start
         .saturating_add(replacement_start)
         .saturating_sub(ancestor_start);
-    boundary.offset = remap_range_offset(
-        boundary.offset,
-        replacement_start,
-        old_length,
-        new_length,
-    );
+    boundary.offset =
+        remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
 }
 
 fn adjust_range_boundary_for_split_text(
@@ -16575,9 +16461,7 @@ fn remap_range_offset(
         if offset <= replacement_start {
             offset
         } else if offset >= replacement_end {
-            offset
-                .saturating_sub(old_length)
-                .saturating_add(new_length)
+            offset.saturating_sub(old_length).saturating_add(new_length)
         } else {
             replacement_start
         }
@@ -16595,19 +16479,12 @@ fn node_value(path: NodePath, document: &Rc<RefCell<Document>>) -> Value {
 }
 
 fn shift_path_for_insert(path: &mut NodePath, parent: &[usize], index: usize) {
-    if path.len() > parent.len()
-        && path.starts_with(parent)
-        && path[parent.len()] >= index
-    {
+    if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] >= index {
         path[parent.len()] += 1;
     }
 }
 
-fn shift_hash_map_paths<V>(
-    paths: &mut HashMap<NodePath, V>,
-    parent: &[usize],
-    index: usize,
-) {
+fn shift_hash_map_paths<V>(paths: &mut HashMap<NodePath, V>, parent: &[usize], index: usize) {
     let current = std::mem::take(paths);
     *paths = current
         .into_iter()
@@ -16618,11 +16495,7 @@ fn shift_hash_map_paths<V>(
         .collect();
 }
 
-fn shift_btree_map_paths<V>(
-    paths: &mut BTreeMap<NodePath, V>,
-    parent: &[usize],
-    index: usize,
-) {
+fn shift_btree_map_paths<V>(paths: &mut BTreeMap<NodePath, V>, parent: &[usize], index: usize) {
     let current = std::mem::take(paths);
     *paths = current
         .into_iter()
@@ -16710,10 +16583,7 @@ fn relocate_path_for_move(
 }
 
 fn shift_path_for_remove(path: &mut NodePath, parent: &[usize], index: usize) {
-    if path.len() > parent.len()
-        && path.starts_with(parent)
-        && path[parent.len()] > index
-    {
+    if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] > index {
         path[parent.len()] -= 1;
     }
 }
@@ -16805,9 +16675,7 @@ fn relocate_btree_set_paths(
 fn selection_anchor_focus(selection: TextSelection) -> (usize, usize) {
     match selection.direction {
         SelectionDirection::Backward => (selection.end, selection.start),
-        SelectionDirection::Forward | SelectionDirection::None => {
-            (selection.start, selection.end)
-        }
+        SelectionDirection::Forward | SelectionDirection::None => (selection.start, selection.end),
     }
 }
 
@@ -16862,12 +16730,10 @@ fn file_lists_equal(left: &[FileHandle], right: &[FileHandle]) -> bool {
 }
 
 fn form_data_filename(value: Option<&Value>) -> Option<String> {
-    value
-        .map(Value::resolve)
-        .and_then(|value| match value {
-            Value::Undefined => None,
-            value => Some(normalize_file_name(&value.string_value())),
-        })
+    value.map(Value::resolve).and_then(|value| match value {
+        Value::Undefined => None,
+        value => Some(normalize_file_name(&value.string_value())),
+    })
 }
 
 fn form_data_file(blob: &BlobHandle, name: String) -> FileHandle {
@@ -16880,14 +16746,17 @@ fn form_data_file(blob: &BlobHandle, name: String) -> FileHandle {
 }
 
 fn form_data_file_with_name(file: &FileHandle, name: Option<String>) -> FileHandle {
-    name.map_or_else(|| file.clone(), |name| {
-        Rc::new(FileData {
-            bytes: file.bytes.clone(),
-            mime_type: file.mime_type.clone(),
-            name,
-            last_modified: file.last_modified,
-        })
-    })
+    name.map_or_else(
+        || file.clone(),
+        |name| {
+            Rc::new(FileData {
+                bytes: file.bytes.clone(),
+                mime_type: file.mime_type.clone(),
+                name,
+                last_modified: file.last_modified,
+            })
+        },
+    )
 }
 
 fn form_data_entry(value: Option<&Value>, filename: Option<String>) -> FormDataEntry {
@@ -16929,7 +16798,9 @@ fn form_data_from_body(body: &[u8], mime_type: &str) -> Result<Value, ScriptErro
             "formData() body must be URL-encoded or multipart/form-data",
         ));
     };
-    Ok(Value::FormData(Rc::new(RefCell::new(FormDataData { pairs }))))
+    Ok(Value::FormData(Rc::new(RefCell::new(FormDataData {
+        pairs,
+    }))))
 }
 
 fn parse_multipart_form_data(
@@ -17004,7 +16875,11 @@ fn multipart_boundary(mime_type: &str) -> Option<String> {
         }
         let value = value.trim();
         if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-            Some(value[1..value.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\"))
+            Some(
+                value[1..value.len() - 1]
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\"),
+            )
         } else {
             Some(value.to_string())
         }
@@ -17077,9 +16952,7 @@ fn parse_multipart_parameter(value: &str) -> String {
             parsed.push(character);
         }
     }
-    parsed
-        .replace("%0D", "\r")
-        .replace("%0A", "\n")
+    parsed.replace("%0D", "\r").replace("%0A", "\n")
 }
 
 fn split_multipart_parameters(value: &str) -> Vec<String> {
@@ -17117,9 +16990,10 @@ fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
 fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
     let pairs = form_data.borrow().pairs.clone();
     let mut boundary = "----ceri-form-data-boundary".to_string();
-    while pairs.iter().any(|(name, value)| {
-        name.contains(&boundary) || form_data_entry_contains(value, &boundary)
-    }) {
+    while pairs
+        .iter()
+        .any(|(name, value)| name.contains(&boundary) || form_data_entry_contains(value, &boundary))
+    {
         boundary.push('x');
     }
     let mut body = Vec::new();
@@ -17156,10 +17030,7 @@ fn multipart_form_data_body(form_data: &FormDataHandle) -> (Vec<u8>, String) {
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (
-        body,
-        format!("multipart/form-data; boundary={boundary}"),
-    )
+    (body, format!("multipart/form-data; boundary={boundary}"))
 }
 
 fn form_data_entry_contains(entry: &FormDataEntry, boundary: &str) -> bool {
@@ -17167,7 +17038,10 @@ fn form_data_entry_contains(entry: &FormDataEntry, boundary: &str) -> bool {
         FormDataEntry::Text(value) => value.contains(boundary),
         FormDataEntry::File(file) => {
             file.name.contains(boundary)
-                || file.bytes.windows(boundary.len()).any(|window| window == boundary.as_bytes())
+                || file
+                    .bytes
+                    .windows(boundary.len())
+                    .any(|window| window == boundary.as_bytes())
         }
     }
 }
@@ -17378,7 +17252,11 @@ fn subtle_algorithm_name(value: Option<&Value>) -> Result<String, ScriptError> {
             .cloned()
             .ok_or_else(|| runtime_error("SubtleCrypto.digest algorithm has no name"))?
             .string_value(),
-        _ => return Err(runtime_error("SubtleCrypto.digest algorithm must be a string")),
+        _ => {
+            return Err(runtime_error(
+                "SubtleCrypto.digest algorithm must be a string",
+            ));
+        }
     };
     Ok(name.to_ascii_uppercase())
 }
@@ -17422,11 +17300,9 @@ fn sha1_digest(data: &[u8]) -> Vec<u8> {
             ]);
         }
         for index in 16..80 {
-            words[index] = (words[index - 3]
-                ^ words[index - 8]
-                ^ words[index - 14]
-                ^ words[index - 16])
-                .rotate_left(1);
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
         }
         let [mut a, mut b, mut c, mut d, mut e] = state;
         for (index, word) in words.iter().enumerate() {
@@ -17829,14 +17705,18 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Cache(left), Value::Cache(right)) => Rc::ptr_eq(left, right),
         (Value::IndexedDbFactory(left), Value::IndexedDbFactory(right)) => Rc::ptr_eq(left, right),
         (Value::IndexedDbRequest(left), Value::IndexedDbRequest(right)) => Rc::ptr_eq(left, right),
-        (Value::IndexedDbDatabase(left), Value::IndexedDbDatabase(right)) => Rc::ptr_eq(left, right),
+        (Value::IndexedDbDatabase(left), Value::IndexedDbDatabase(right)) => {
+            Rc::ptr_eq(left, right)
+        }
         (Value::IndexedDbTransaction(left), Value::IndexedDbTransaction(right)) => {
             Rc::ptr_eq(left, right)
         }
         (Value::IndexedDbObjectStore(left), Value::IndexedDbObjectStore(right)) => {
             Rc::ptr_eq(left, right)
         }
-        (Value::IndexedDbNameList(left), Value::IndexedDbNameList(right)) => Rc::ptr_eq(left, right),
+        (Value::IndexedDbNameList(left), Value::IndexedDbNameList(right)) => {
+            Rc::ptr_eq(left, right)
+        }
         (Value::Navigator, Value::Navigator)
         | (Value::Clipboard, Value::Clipboard)
         | (Value::Crypto, Value::Crypto)
@@ -17878,7 +17758,11 @@ fn listener_options(arguments: &[Value]) -> Result<ListenerOptions, ScriptError>
             let signal = match options.get("signal").map(Value::resolve) {
                 None | Some(Value::Undefined) | Some(Value::Null) => None,
                 Some(Value::AbortSignal(signal)) => Some(signal),
-                Some(_) => return Err(runtime_error("event listener signal must be an AbortSignal")),
+                Some(_) => {
+                    return Err(runtime_error(
+                        "event listener signal must be an AbortSignal",
+                    ));
+                }
             };
             Ok(ListenerOptions {
                 once: options.get("once").is_some_and(Value::truthy),
@@ -17999,7 +17883,9 @@ fn parse_cache_mode(
             "no-cache" => Ok(ResourceCacheMode::NoCache),
             "force-cache" => Ok(ResourceCacheMode::ForceCache),
             "only-if-cached" => Ok(ResourceCacheMode::OnlyIfCached),
-            _ => Err(runtime_error(format!("unsupported fetch cache mode {mode}"))),
+            _ => Err(runtime_error(format!(
+                "unsupported fetch cache mode {mode}"
+            ))),
         },
         Some(_) => Err(runtime_error("fetch cache mode must be a string")),
     }
@@ -18015,7 +17901,9 @@ fn parse_redirect_mode(
             "follow" => Ok(FetchRedirectMode::Follow),
             "error" => Ok(FetchRedirectMode::Error),
             "manual" => Ok(FetchRedirectMode::Manual),
-            _ => Err(runtime_error(format!("unsupported fetch redirect mode {mode}"))),
+            _ => Err(runtime_error(format!(
+                "unsupported fetch redirect mode {mode}"
+            ))),
         },
         Some(_) => Err(runtime_error("fetch redirect mode must be a string")),
     }
@@ -18128,9 +18016,7 @@ fn parse_fetch_options(
             "method" | "headers" | "body" | "cache" | "redirect" | "signal"
         )
     }) {
-        return Err(runtime_error(
-            "fetch options contain an unsupported key",
-        ));
+        return Err(runtime_error("fetch options contain an unsupported key"));
     }
     let method = match options.get("method").map(Value::resolve) {
         None | Some(Value::Undefined) => default_method,
@@ -18159,7 +18045,10 @@ fn parse_fetch_options(
         headers.insert("content-type".to_string(), mime_type);
     }
     let body_from_request = request_input.is_some()
-        && matches!(options.get("body").map(Value::resolve), None | Some(Value::Undefined));
+        && matches!(
+            options.get("body").map(Value::resolve),
+            None | Some(Value::Undefined)
+        );
     let cache_mode = parse_cache_mode(options.get("cache"), default_cache)?;
     let redirect = parse_redirect_mode(options.get("redirect"), default_redirect)?;
     let signal = parse_signal(options.get("signal"), default_signal)?;
@@ -18272,17 +18161,23 @@ fn parse_dynamic_import_type(
     };
     let attributes = attributes.borrow();
     if attributes.keys().any(|key| key != "with") {
-        return Err(runtime_error("dynamic import options contain an unsupported key"));
+        return Err(runtime_error(
+            "dynamic import options contain an unsupported key",
+        ));
     }
     let Some(with) = attributes.get("with") else {
-        return Err(runtime_error("dynamic import options require a with object"));
+        return Err(runtime_error(
+            "dynamic import options require a with object",
+        ));
     };
     let Value::Object(with) = with else {
         return Err(runtime_error("dynamic import with must be an object"));
     };
     let with = with.borrow();
     if with.keys().any(|key| key != "type") {
-        return Err(runtime_error("dynamic import with contains an unsupported key"));
+        return Err(runtime_error(
+            "dynamic import with contains an unsupported key",
+        ));
     }
     let Some(module_type) = with.get("type") else {
         return Err(runtime_error("dynamic import with requires a type"));
@@ -18460,7 +18355,9 @@ impl Parser {
                 ..
             } = &statement
             else {
-                return Err(self.error("expected exported function".to_string(), self.peek().offset));
+                return Err(
+                    self.error("expected exported function".to_string(), self.peek().offset)
+                );
             };
             exports.push(ModuleExport {
                 local: name.clone(),
@@ -18907,10 +18804,7 @@ impl Parser {
             }
             let expression_start = start + 2;
             let end = find_template_expression_end(source, expression_start).ok_or_else(|| {
-                self.error(
-                    "unterminated template interpolation".to_string(),
-                    start,
-                )
+                self.error("unterminated template interpolation".to_string(), start)
             })?;
             let mut parser = Parser::new(&source[expression_start..end])?;
             let expression = parser.parse_expression()?;
@@ -19004,7 +18898,10 @@ impl Parser {
         self.parse_binding_pattern_with_default(context, true)
     }
 
-    fn parse_binding_pattern_without_default(&mut self, context: &str) -> Result<Pattern, ScriptError> {
+    fn parse_binding_pattern_without_default(
+        &mut self,
+        context: &str,
+    ) -> Result<Pattern, ScriptError> {
         self.parse_binding_pattern_with_default(context, false)
     }
 
@@ -19234,10 +19131,7 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(self.error(
-                format!("expected {expected}"),
-                self.peek().offset,
-            ))
+            Err(self.error(format!("expected {expected}"), self.peek().offset))
         }
     }
 
@@ -19535,7 +19429,10 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
                     });
                 }
             }
-            if !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Template(_))) {
+            if !matches!(
+                tokens.last().map(|token| &token.kind),
+                Some(TokenKind::Template(_))
+            ) {
                 return Err(ScriptError {
                     offset: start,
                     message: "unterminated template literal".to_string(),
@@ -19690,25 +19587,19 @@ mod tests {
                     headers.insert("Location".to_string(), "/final".to_string());
                     ResourceResponse::new(302, "text/plain", headers, Vec::new()).map(Some)
                 }
-                "/final" => ResourceResponse::new(
-                    200,
-                    "text/plain",
-                    BTreeMap::new(),
-                    b"followed".to_vec(),
-                )
-                .map(Some),
+                "/final" => {
+                    ResourceResponse::new(200, "text/plain", BTreeMap::new(), b"followed".to_vec())
+                        .map(Some)
+                }
                 "/submit" => {
                     let mut headers = BTreeMap::new();
                     headers.insert("Location".to_string(), "/done".to_string());
                     ResourceResponse::new(303, "text/plain", headers, Vec::new()).map(Some)
                 }
-                "/done" => ResourceResponse::new(
-                    200,
-                    "text/plain",
-                    BTreeMap::new(),
-                    b"submitted".to_vec(),
-                )
-                .map(Some),
+                "/done" => {
+                    ResourceResponse::new(200, "text/plain", BTreeMap::new(), b"submitted".to_vec())
+                        .map(Some)
+                }
                 _ => Ok(None),
             }
         }
@@ -19750,13 +19641,8 @@ mod tests {
                     .unwrap_or_default();
                 let mut headers = BTreeMap::new();
                 headers.insert("Content-Type".to_string(), mime_type.clone());
-                return ResourceResponse::new(
-                    200,
-                    mime_type,
-                    headers,
-                    request.body().to_vec(),
-                )
-                .map(Some);
+                return ResourceResponse::new(200, mime_type, headers, request.body().to_vec())
+                    .map(Some);
             }
             if request.url().path() != "/headers" {
                 return Ok(None);
@@ -19779,8 +19665,7 @@ mod tests {
             Ok((url.path() == "/worker.js").then(|| {
                 Resource::new(
                     "text/javascript",
-                    br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#
-                        .to_vec(),
+                    br#"self.onmessage = (event) => { postMessage(event.data + "!"); };"#.to_vec(),
                 )
             }))
         }
@@ -20127,9 +20012,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some(
-                "async|3|module /missing.js was not found|URL is outside the app origin",
-            )
+            Some("async|3|module /missing.js was not found|URL is outside the app origin",)
         );
     }
 
@@ -20182,8 +20065,8 @@ mod tests {
     #[test]
     fn exposes_import_meta_url_to_modules() {
         let document = document("<p id='status'>idle</p>");
-        let base = AppUrl::parse("https://app.ceri.invalid/entry.js")
-            .expect("module URL should parse");
+        let base =
+            AppUrl::parse("https://app.ceri.invalid/entry.js").expect("module URL should parse");
         let mut loader = StaticModuleLoader {
             modules: BTreeMap::new(),
         };
@@ -20456,9 +20339,11 @@ mod tests {
                 "##,
             )
             .expect_err("an endless iterator should hit the deterministic limit");
-        assert!(error
-            .message
-            .contains("user-defined iterator exceeded the deterministic limit"));
+        assert!(
+            error
+                .message
+                .contains("user-defined iterator exceeded the deterministic limit")
+        );
     }
 
     #[test]
@@ -20700,12 +20585,16 @@ mod tests {
                 "#,
             )
             .expect("one-shot window listener should register");
-        assert!(runtime
-            .dispatch_window_event("resize")
-            .expect("first window event should dispatch"));
-        assert!(!runtime
-            .dispatch_window_event("resize")
-            .expect("second window event should dispatch"));
+        assert!(
+            runtime
+                .dispatch_window_event("resize")
+                .expect("first window event should dispatch")
+        );
+        assert!(
+            !runtime
+                .dispatch_window_event("resize")
+                .expect("second window event should dispatch")
+        );
         runtime
             .execute("document.getElementById(\"status\").textContent = resizeEvents;")
             .expect("window listener result should serialize");
@@ -20803,9 +20692,11 @@ mod tests {
                 "#,
             )
             .expect("window listener signal should register");
-        assert!(!runtime
-            .dispatch_window_event("resize")
-            .expect("window event should dispatch"));
+        assert!(
+            !runtime
+                .dispatch_window_event("resize")
+                .expect("window event should dispatch")
+        );
         runtime
             .execute("document.getElementById(\"status\").textContent = resizeEvents;")
             .expect("window signal result should serialize");
@@ -20859,9 +20750,7 @@ mod tests {
 
     #[test]
     fn event_default_can_be_cancelled() {
-        let document = document(
-            r#"<a id="go" href="/next.html">open</a><p id="status">idle</p>"#,
-        );
+        let document = document(r#"<a id="go" href="/next.html">open</a><p id="status">idle</p>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
@@ -20928,9 +20817,7 @@ mod tests {
 
     #[test]
     fn focus_and_text_input_update_controls_and_events() {
-        let document = document(
-            r#"<input id="name" value="R"><p id="status">idle</p>"#,
-        );
+        let document = document(r#"<input id="name" value="R"><p id="status">idle</p>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
@@ -20953,13 +20840,13 @@ mod tests {
             .borrow()
             .find_element_by_id("name")
             .expect("input should exist");
-        assert!(runtime
-            .focus_path(input_path)
-            .expect("input should focus"));
+        assert!(runtime.focus_path(input_path).expect("input should focus"));
         assert!(runtime.insert_text("ust").expect("text should insert"));
-        assert!(runtime
-            .key_down_with_modifiers("Backspace", KeyModifiers::default())
-            .expect("backspace should edit the value"));
+        assert!(
+            runtime
+                .key_down_with_modifiers("Backspace", KeyModifiers::default())
+                .expect("backspace should edit the value")
+        );
         assert!(runtime.blur_focused().expect("input should blur"));
         let status = document
             .borrow()
@@ -20977,25 +20864,30 @@ mod tests {
             r#"<div autofocus>ignored</div><input id="disabled" autofocus disabled><input id="first" autofocus><button id="second" autofocus>second</button>"#,
         );
         let mut runtime = ScriptRuntime::new(first_document.clone());
-        assert!(runtime
-            .apply_autofocus()
-            .expect("autofocus should focus the first valid candidate"));
-        assert_eq!(runtime.active_element(), Some(vec![2]));
-        assert!(!runtime
-            .apply_autofocus()
-            .expect("autofocus should not replace existing focus"));
-
-        let manual_document = document(
-            r#"<input id="first" autofocus><button id="second">second</button>"#,
+        assert!(
+            runtime
+                .apply_autofocus()
+                .expect("autofocus should focus the first valid candidate")
         );
+        assert_eq!(runtime.active_element(), Some(vec![2]));
+        assert!(
+            !runtime
+                .apply_autofocus()
+                .expect("autofocus should not replace existing focus")
+        );
+
+        let manual_document =
+            document(r#"<input id="first" autofocus><button id="second">second</button>"#);
         let mut manual_runtime = ScriptRuntime::new(manual_document.clone());
         manual_runtime
             .execute("document.getElementById(\"second\").focus();")
             .expect("script focus should execute");
         assert_eq!(manual_runtime.active_element(), Some(vec![1]));
-        assert!(!manual_runtime
-            .apply_autofocus()
-            .expect("autofocus should preserve script focus"));
+        assert!(
+            !manual_runtime
+                .apply_autofocus()
+                .expect("autofocus should preserve script focus")
+        );
         assert_eq!(manual_runtime.active_element(), Some(vec![1]));
     }
 
@@ -21025,25 +20917,35 @@ mod tests {
             .borrow()
             .find_element_by_id("code")
             .expect("code input should exist");
-        assert!(runtime
-            .focus_path(code_path.clone())
-            .expect("readonly input should remain focusable"));
-        assert!(!runtime
-            .insert_text("!")
-            .expect("readonly input should reject host text"));
-        assert!(!runtime
-            .key_down_with_modifiers("Backspace", KeyModifiers::default())
-            .expect("readonly input should reject deletion"));
-        assert!(runtime
-            .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
-            .expect("readonly input should allow selection movement"));
+        assert!(
+            runtime
+                .focus_path(code_path.clone())
+                .expect("readonly input should remain focusable")
+        );
+        assert!(
+            !runtime
+                .insert_text("!")
+                .expect("readonly input should reject host text")
+        );
+        assert!(
+            !runtime
+                .key_down_with_modifiers("Backspace", KeyModifiers::default())
+                .expect("readonly input should reject deletion")
+        );
+        assert!(
+            runtime
+                .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
+                .expect("readonly input should allow selection movement")
+        );
         assert_eq!(runtime.active_element(), Some(vec![0]));
         runtime
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").selectionStart + \"|\" + document.getElementById(\"code\").selectionEnd;")
             .expect("readonly selection should remain script-visible");
-        assert!(!runtime
-            .composition_update("x", None)
-            .expect("readonly input should reject composition"));
+        assert!(
+            !runtime
+                .composition_update("x", None)
+                .expect("readonly input should reject composition")
+        );
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("3|3")
@@ -21052,27 +20954,43 @@ mod tests {
             .borrow()
             .find_element_by_id("note")
             .expect("readonly textarea should exist");
-        assert!(runtime
-            .focus_path(note_path)
-            .expect("readonly textarea should remain focusable"));
-        assert!(!runtime
-            .key_down_with_modifiers("Enter", KeyModifiers::default())
-            .expect("readonly textarea should reject Enter editing"));
+        assert!(
+            runtime
+                .focus_path(note_path)
+                .expect("readonly textarea should remain focusable")
+        );
+        assert!(
+            !runtime
+                .key_down_with_modifiers("Enter", KeyModifiers::default())
+                .expect("readonly textarea should reject Enter editing")
+        );
         runtime
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"note\").value;")
             .expect("readonly textarea value should remain script-visible");
-        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("draft"));
-        assert!(runtime
-            .focus_path(code_path)
-            .expect("code input should regain focus"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("draft")
+        );
+        assert!(
+            runtime
+                .focus_path(code_path)
+                .expect("code input should regain focus")
+        );
         runtime
             .execute("document.getElementById(\"code\").readOnly = false; document.getElementById(\"code\").value = \"script\";")
             .expect("script should be able to change readonly state and value");
-        assert!(runtime.insert_text("!").expect("editable value should accept text"));
+        assert!(
+            runtime
+                .insert_text("!")
+                .expect("editable value should accept text")
+        );
         runtime
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").value;")
             .expect("script should read the updated value");
-        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("scr!ipt"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("scr!ipt")
+        );
     }
 
     #[test]
@@ -21095,9 +21013,11 @@ mod tests {
                 "#,
             )
             .expect("maxlength listeners should register");
-        assert!(runtime
-            .insert_text("😀x")
-            .expect("host text should insert up to maxlength"));
+        assert!(
+            runtime
+                .insert_text("😀x")
+                .expect("host text should insert up to maxlength")
+        );
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some("😀|ab😀")
@@ -21121,29 +21041,57 @@ mod tests {
             .borrow()
             .find_element_by_id("ime")
             .expect("IME input should exist");
-        assert!(runtime.focus_path(ime_path.clone()).expect("IME input should focus"));
-        assert!(runtime
-            .composition_update("😀x", None)
-            .expect("composition should fit whole UTF-16 characters"));
-        assert_eq!(runtime.control_value_path(&ime_path).as_deref(), Some("abc😀"));
-        assert!(runtime
-            .composition_commit("xy")
-            .expect("composition should commit within maxlength"));
-        assert_eq!(runtime.control_value_path(&ime_path).as_deref(), Some("abcxy"));
+        assert!(
+            runtime
+                .focus_path(ime_path.clone())
+                .expect("IME input should focus")
+        );
+        assert!(
+            runtime
+                .composition_update("😀x", None)
+                .expect("composition should fit whole UTF-16 characters")
+        );
+        assert_eq!(
+            runtime.control_value_path(&ime_path).as_deref(),
+            Some("abc😀")
+        );
+        assert!(
+            runtime
+                .composition_commit("xy")
+                .expect("composition should commit within maxlength")
+        );
+        assert_eq!(
+            runtime.control_value_path(&ime_path).as_deref(),
+            Some("abcxy")
+        );
 
         let note_path = document
             .borrow()
             .find_element_by_id("note")
             .expect("textarea should exist");
-        assert!(runtime.focus_path(note_path.clone()).expect("textarea should focus"));
-        assert!(runtime
-            .key_down_with_modifiers("Enter", KeyModifiers::default())
-            .expect("Enter should use the last available UTF-16 unit"));
-        assert_eq!(runtime.control_value_path(&note_path).as_deref(), Some("abc\n"));
-        assert!(!runtime
-            .key_down_with_modifiers("Enter", KeyModifiers::default())
-            .expect("Enter should stop at maxlength"));
-        assert_eq!(runtime.control_value_path(&note_path).as_deref(), Some("abc\n"));
+        assert!(
+            runtime
+                .focus_path(note_path.clone())
+                .expect("textarea should focus")
+        );
+        assert!(
+            runtime
+                .key_down_with_modifiers("Enter", KeyModifiers::default())
+                .expect("Enter should use the last available UTF-16 unit")
+        );
+        assert_eq!(
+            runtime.control_value_path(&note_path).as_deref(),
+            Some("abc\n")
+        );
+        assert!(
+            !runtime
+                .key_down_with_modifiers("Enter", KeyModifiers::default())
+                .expect("Enter should stop at maxlength")
+        );
+        assert_eq!(
+            runtime.control_value_path(&note_path).as_deref(),
+            Some("abc\n")
+        );
     }
 
     #[test]
@@ -21181,8 +21129,16 @@ mod tests {
             .borrow()
             .find_element_by_id("name")
             .expect("name input should exist");
-        assert!(runtime.focus_path(name_path).expect("name input should focus"));
-        assert!(runtime.insert_text("x").expect("short user value should insert"));
+        assert!(
+            runtime
+                .focus_path(name_path)
+                .expect("name input should focus")
+        );
+        assert!(
+            runtime
+                .insert_text("x")
+                .expect("short user value should insert")
+        );
         runtime
             .execute("status.textContent = name.value + \"|\" + validity.tooShort + \"|\" + name.checkValidity() + \"|\" + form.checkValidity() + \"|\" + submits;")
             .expect("short value validity should be readable");
@@ -21190,7 +21146,11 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("x|true|false|false|0")
         );
-        assert!(runtime.insert_text("yz").expect("valid user value should insert"));
+        assert!(
+            runtime
+                .insert_text("yz")
+                .expect("valid user value should insert")
+        );
         runtime
             .execute("name.setCustomValidity(\"custom\"); status.textContent = validity.customError + \"|\" + name.validationMessage + \"|\" + name.checkValidity() + \"|\" + submits; name.setCustomValidity(\"\"); form.requestSubmit(); status.textContent = name.value + \"|\" + validity.valid + \"|\" + submits;")
             .expect("custom validity and valid submission should execute");
@@ -21307,7 +21267,11 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("updated|updated|false|false|draft|1")
         );
-        assert!(runtime.click_id("reset").expect("reset button should activate"));
+        assert!(
+            runtime
+                .click_id("reset")
+                .expect("reset button should activate")
+        );
         status = document
             .borrow()
             .find_element_by_id("status")
@@ -21810,50 +21774,64 @@ mod tests {
             .borrow()
             .find_element_by_id("first")
             .expect("first input should exist");
-        assert!(runtime.focus_path(first_path).expect("first input should focus"));
-        assert!(runtime
-            .key_down_with_modifiers("Tab", KeyModifiers::default())
-            .expect("Tab should move focus"));
+        assert!(
+            runtime
+                .focus_path(first_path)
+                .expect("first input should focus")
+        );
+        assert!(
+            runtime
+                .key_down_with_modifiers("Tab", KeyModifiers::default())
+                .expect("Tab should move focus")
+        );
         assert_eq!(runtime.active_element(), Some(vec![1]));
         assert_eq!(
-            runtime
-                .execute("document.getElementById(\"status\").textContent = events;"),
+            runtime.execute("document.getElementById(\"status\").textContent = events;"),
             Ok(())
         );
         let status = document
             .borrow()
             .find_element_by_id("status")
             .expect("status should exist");
-        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("first-blur|second-focus|"));
-        assert!(runtime
-            .key_down_with_modifiers(
-                "Tab",
-                KeyModifiers {
-                    shift: true,
-                    ..KeyModifiers::default()
-                },
-            )
-            .expect("Shift+Tab should move focus backward"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("first-blur|second-focus|")
+        );
+        assert!(
+            runtime
+                .key_down_with_modifiers(
+                    "Tab",
+                    KeyModifiers {
+                        shift: true,
+                        ..KeyModifiers::default()
+                    },
+                )
+                .expect("Shift+Tab should move focus backward")
+        );
         assert_eq!(runtime.active_element(), Some(vec![0]));
-        assert!(runtime
-            .key_down_with_modifiers(
-                "Tab",
-                KeyModifiers {
-                    shift: true,
-                    ..KeyModifiers::default()
-                },
-            )
-            .expect("Shift+Tab should reach positive tabindex entries"));
+        assert!(
+            runtime
+                .key_down_with_modifiers(
+                    "Tab",
+                    KeyModifiers {
+                        shift: true,
+                        ..KeyModifiers::default()
+                    },
+                )
+                .expect("Shift+Tab should reach positive tabindex entries")
+        );
         assert_eq!(runtime.active_element(), Some(vec![3]));
-        assert!(runtime
-            .key_down_with_modifiers(
-                "Tab",
-                KeyModifiers {
-                    shift: true,
-                    ..KeyModifiers::default()
-                },
-            )
-            .expect("Shift+Tab should follow positive tabindex ordering"));
+        assert!(
+            runtime
+                .key_down_with_modifiers(
+                    "Tab",
+                    KeyModifiers {
+                        shift: true,
+                        ..KeyModifiers::default()
+                    },
+                )
+                .expect("Shift+Tab should follow positive tabindex ordering")
+        );
         assert_eq!(runtime.active_element(), Some(vec![4]));
         let skipped_path = document
             .borrow()
@@ -21900,13 +21878,15 @@ mod tests {
             .borrow()
             .find_element_by_id("name")
             .expect("input should exist");
-        assert!(runtime
-            .focus_path(input_path)
-            .expect("input should focus"));
+        assert!(runtime.focus_path(input_path).expect("input should focus"));
         runtime
             .execute("document.getElementById(\"name\").setSelectionRange(1, 2);")
             .expect("selection should update");
-        assert!(runtime.insert_text("X").expect("selection should be replaced"));
+        assert!(
+            runtime
+                .insert_text("X")
+                .expect("selection should be replaced")
+        );
         assert_eq!(
             runtime.key_down_with_modifiers("ArrowLeft", KeyModifiers::default()),
             Ok(true)
@@ -21919,7 +21899,11 @@ mod tests {
             runtime.key_down_with_modifiers("Home", KeyModifiers::default()),
             Ok(true)
         );
-        assert!(runtime.insert_text("!").expect("text should insert at home"));
+        assert!(
+            runtime
+                .insert_text("!")
+                .expect("text should insert at home")
+        );
         assert_eq!(runtime.execute("document.getElementById(\"status\").textContent = document.getElementById(\"name\").value;"), Ok(()));
         status = document
             .borrow()
@@ -21939,21 +21923,33 @@ mod tests {
             .borrow()
             .find_element_by_id("note")
             .expect("textarea should exist");
-        assert!(runtime.focus_path(note_path).expect("textarea should focus"));
-        assert!(runtime
-            .key_down_with_modifiers("Enter", KeyModifiers::default())
-            .expect("Enter should insert a line break"));
+        assert!(
+            runtime
+                .focus_path(note_path)
+                .expect("textarea should focus")
+        );
+        assert!(
+            runtime
+                .key_down_with_modifiers("Enter", KeyModifiers::default())
+                .expect("Enter should insert a line break")
+        );
         assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("AB\n"));
-        assert!(runtime
-            .key_down_with_modifiers("Backspace", KeyModifiers::default())
-            .expect("Backspace should remove the line break"));
+        assert!(
+            runtime
+                .key_down_with_modifiers("Backspace", KeyModifiers::default())
+                .expect("Backspace should remove the line break")
+        );
         assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("AB"));
-        assert!(runtime
-            .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
-            .expect("ArrowLeft should move before the final character"));
-        assert!(runtime
-            .key_down_with_modifiers("Delete", KeyModifiers::default())
-            .expect("Delete should remove the final character"));
+        assert!(
+            runtime
+                .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
+                .expect("ArrowLeft should move before the final character")
+        );
+        assert!(
+            runtime
+                .key_down_with_modifiers("Delete", KeyModifiers::default())
+                .expect("Delete should remove the final character")
+        );
         assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("A"));
     }
 
@@ -21975,17 +21971,19 @@ mod tests {
                 "#,
             )
             .expect("modifier listener should register");
-        assert!(runtime
-            .key_down_with_modifiers(
-                "ArrowLeft",
-                KeyModifiers {
-                    shift: true,
-                    control: true,
-                    alt: false,
-                    meta: true,
-                },
-            )
-            .expect("shift arrow should extend selection"));
+        assert!(
+            runtime
+                .key_down_with_modifiers(
+                    "ArrowLeft",
+                    KeyModifiers {
+                        shift: true,
+                        control: true,
+                        alt: false,
+                        meta: true,
+                    },
+                )
+                .expect("shift arrow should extend selection")
+        );
         runtime
             .execute(
                 "status.textContent = input.selectionStart + \"|\" + input.selectionEnd + \"|\" + input.selectionDirection + \"|\" + flags;",
@@ -21999,15 +21997,17 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("1|3|backward|true:true:false:true")
         );
-        assert!(runtime
-            .key_down_with_modifiers(
-                "ArrowRight",
-                KeyModifiers {
-                    shift: true,
-                    ..KeyModifiers::default()
-                },
-            )
-            .expect("shift arrow should contract selection"));
+        assert!(
+            runtime
+                .key_down_with_modifiers(
+                    "ArrowRight",
+                    KeyModifiers {
+                        shift: true,
+                        ..KeyModifiers::default()
+                    },
+                )
+                .expect("shift arrow should contract selection")
+        );
         assert_eq!(
             runtime.execute(
                 "status.textContent = input.selectionStart + \"|\" + input.selectionEnd + \"|\" + input.selectionDirection;",
@@ -22346,9 +22346,8 @@ mod tests {
 
     #[test]
     fn split_text_moves_live_boundaries_to_the_new_text_node() {
-        let document = document(
-            r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#,
-        );
+        let document =
+            document(r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
@@ -22427,9 +22426,8 @@ mod tests {
 
     #[test]
     fn normalize_removes_empty_text_nodes_and_moves_ranges_to_the_parent() {
-        let document = document(
-            r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#,
-        );
+        let document =
+            document(r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
@@ -22507,7 +22505,9 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("ell|heXllo:1:5:eXll|1:6:eXllo|hllo:1:3:ll|1:4:llo|hYYo:1:3:YY|1:4:YYo|hYYo!:1:3:YY|1:4:YYo|2|😀")
+            Some(
+                "ell|heXllo:1:5:eXll|1:6:eXllo|hllo:1:3:ll|1:4:llo|hYYo:1:3:YY|1:4:YYo|hYYo!:1:3:YY|1:4:YYo|2|😀"
+            )
         );
     }
 
@@ -22649,7 +22649,9 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined")
+            Some(
+                "<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined"
+            )
         );
     }
 
@@ -22722,15 +22724,16 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("keep|true:true:true|outerHTML element has no parent node|outerHTML cannot replace a direct child of the document")
+            Some(
+                "keep|true:true:true|outerHTML element has no parent node|outerHTML cannot replace a direct child of the document"
+            )
         );
     }
 
     #[test]
     fn append_and_prepend_preserve_mixed_argument_order_and_identity() {
-        let document = document(
-            r#"<main id="root"><p id="mount">middle</p><p id="status">idle</p></main>"#,
-        );
+        let document =
+            document(r#"<main id="root"><p id="mount">middle</p><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
@@ -23056,15 +23059,21 @@ mod tests {
                 "#,
             )
             .expect("composition listeners should register");
-        assert!(runtime
-            .composition_update("x", Some((1, 1)))
-            .expect("preedit should update"));
-        assert!(runtime
-            .composition_update("xy", Some((2, 2)))
-            .expect("preedit should replace"));
-        assert!(runtime
-            .composition_commit("安")
-            .expect("composition should commit"));
+        assert!(
+            runtime
+                .composition_update("x", Some((1, 1)))
+                .expect("preedit should update")
+        );
+        assert!(
+            runtime
+                .composition_update("xy", Some((2, 2)))
+                .expect("preedit should replace")
+        );
+        assert!(
+            runtime
+                .composition_commit("安")
+                .expect("composition should commit")
+        );
         runtime
             .execute(
                 "document.getElementById(\"status\").textContent = document.getElementById(\"name\").value + \"|\" + document.getElementById(\"name\").selectionStart + \"|\" + events;",
@@ -23076,7 +23085,9 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("a安b|2|compositionstart:|compositionupdate:x:ab:true|x:axb:true|compositionupdate:xy:axb:true|xy:axyb:true|安:a安b:true|compositionend:安:a安b|")
+            Some(
+                "a安b|2|compositionstart:|compositionupdate:x:ab:true|x:axb:true|compositionupdate:xy:axb:true|xy:axyb:true|安:a安b:true|compositionend:安:a安b|"
+            )
         );
 
         let cancel_document = Rc::new(RefCell::new(
@@ -23089,12 +23100,16 @@ mod tests {
                 "const input = document.getElementById(\"name\"); input.focus(); input.setSelectionRange(1, 1);",
             )
             .expect("canceled composition should prepare");
-        assert!(cancel_runtime
-            .composition_update("z", Some((1, 1)))
-            .expect("second preedit should update"));
-        assert!(cancel_runtime
-            .composition_cancel()
-            .expect("composition should cancel"));
+        assert!(
+            cancel_runtime
+                .composition_update("z", Some((1, 1)))
+                .expect("second preedit should update")
+        );
+        assert!(
+            cancel_runtime
+                .composition_cancel()
+                .expect("composition should cancel")
+        );
         cancel_runtime
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"name\").value;")
             .expect("canceled composition should be readable");
@@ -23113,9 +23128,7 @@ mod tests {
 
     #[test]
     fn element_scroll_offsets_are_readable_and_writable() {
-        let document = document(
-            "<div id='viewport'><p id='status'>idle</p></div>",
-        );
+        let document = document("<div id='viewport'><p id='status'>idle</p></div>");
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
@@ -23667,9 +23680,11 @@ mod tests {
                 "#,
             )
             .expect("label listeners should register");
-        assert!(runtime
-            .click_id("explicit")
-            .expect("explicit label should activate its control"));
+        assert!(
+            runtime
+                .click_id("explicit")
+                .expect("explicit label should activate its control")
+        );
         assert_eq!(runtime.active_element(), Some(vec![1]));
         let status = document
             .borrow()
@@ -23679,9 +23694,11 @@ mod tests {
             document.borrow().element_text_content(&status).as_deref(),
             Some("focused:name")
         );
-        assert!(runtime
-            .click_id("caption")
-            .expect("wrapped label should activate its control"));
+        assert!(
+            runtime
+                .click_id("caption")
+                .expect("wrapped label should activate its control")
+        );
         assert_eq!(runtime.active_element(), Some(vec![2, 1]));
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
@@ -23702,9 +23719,11 @@ mod tests {
                 "#,
             )
             .expect("label listener should register");
-        assert!(runtime
-            .click_id("guarded")
-            .expect("prevented label click should be handled"));
+        assert!(
+            runtime
+                .click_id("guarded")
+                .expect("prevented label click should be handled")
+        );
         assert_eq!(runtime.active_element(), None);
         assert_eq!(
             runtime
@@ -23716,7 +23735,10 @@ mod tests {
             .borrow()
             .find_element_by_id("status")
             .expect("status should exist");
-        assert_eq!(document.borrow().element_text_content(&status).as_deref(), Some("false"));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("false")
+        );
     }
 
     #[test]
@@ -24383,12 +24405,18 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].body(), b"q=hello+world&tag=rust");
         assert_eq!(
-            requests[0].headers().get("content-type").map(String::as_str),
+            requests[0]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("application/x-www-form-urlencoded;charset=UTF-8")
         );
         assert_eq!(requests[1].body(), b"custom=yes");
         assert_eq!(
-            requests[1].headers().get("content-type").map(String::as_str),
+            requests[1]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("application/custom")
         );
     }
@@ -24456,11 +24484,15 @@ mod tests {
         );
         assert_eq!(
             subtle_digest("SHA-384", b"abc").expect("SHA-384 should be supported"),
-            hex_bytes("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")
+            hex_bytes(
+                "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+            )
         );
         assert_eq!(
             subtle_digest("SHA-512", b"abc").expect("SHA-512 should be supported"),
-            hex_bytes("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+            hex_bytes(
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+            )
         );
         let million_a = vec![b'a'; 1_000_000];
         assert_eq!(
@@ -24473,11 +24505,15 @@ mod tests {
         );
         assert_eq!(
             subtle_digest("SHA-384", &million_a).expect("SHA-384 should be supported"),
-            hex_bytes("9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985")
+            hex_bytes(
+                "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985"
+            )
         );
         assert_eq!(
             subtle_digest("SHA-512", &million_a).expect("SHA-512 should be supported"),
-            hex_bytes("e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
+            hex_bytes(
+                "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b"
+            )
         );
 
         let document = document("<p id='status'>idle</p>");
@@ -24655,7 +24691,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].body(), b"hello world");
         assert_eq!(
-            requests[0].headers().get("content-type").map(String::as_str),
+            requests[0]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("text/plain")
         );
     }
@@ -24702,7 +24741,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].body(), b"report");
         assert_eq!(
-            requests[0].headers().get("content-type").map(String::as_str),
+            requests[0]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("text/plain")
         );
     }
@@ -24745,7 +24787,10 @@ mod tests {
         let requests = requests.borrow();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].headers().get("content-type").map(String::as_str),
+            requests[0]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("multipart/form-data; boundary=----ceri-form-data-boundary")
         );
         assert_eq!(
@@ -24791,7 +24836,10 @@ mod tests {
         let requests = requests.borrow();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].headers().get("content-type").map(String::as_str),
+            requests[0]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("multipart/form-data; boundary=----ceri-form-data-boundaryx")
         );
         let body = String::from_utf8(requests[0].body().to_vec())
@@ -24849,7 +24897,10 @@ mod tests {
         let requests = requests.borrow();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].headers().get("content-type").map(String::as_str),
+            requests[0]
+                .headers()
+                .get("content-type")
+                .map(String::as_str),
             Some("multipart/form-data; boundary=----ceri-form-data-boundaryx")
         );
         assert_eq!(
@@ -25713,7 +25764,9 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("true|a,b,old|1,override,0|a=1,b=override,old=0|01|zero,one|Object.keys requires an object value")
+            Some(
+                "true|a,b,old|1,override,0|a=1,b=override,old=0|01|zero,one|Object.keys requires an object value"
+            )
         );
     }
 
@@ -25748,7 +25801,9 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.filter callback must be a function")
+            Some(
+                "0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.filter callback must be a function"
+            )
         );
     }
 
@@ -26076,13 +26131,19 @@ mod tests {
         let type_error = runtime
             .execute(r#"new Worker("/worker.js", { type: "shared" });"#)
             .expect_err("unknown worker types should be rejected");
-        assert!(type_error
-            .message
-            .contains("unsupported Worker script type shared"));
+        assert!(
+            type_error
+                .message
+                .contains("unsupported Worker script type shared")
+        );
         let missing_error = runtime
             .execute(r#"new Worker("/missing.js");"#)
             .expect_err("missing packaged workers should be rejected");
-        assert!(missing_error.message.contains("worker script /missing.js was not found"));
+        assert!(
+            missing_error
+                .message
+                .contains("worker script /missing.js was not found")
+        );
     }
 
     #[test]

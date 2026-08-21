@@ -46,8 +46,7 @@ impl Image {
         let source_weight = source_alpha * 255 / output_alpha;
         let destination_weight = 255 - source_weight;
         self.pixels[index] = Color {
-            red: ((color.red as u32 * source_weight
-                + destination.red as u32 * destination_weight)
+            red: ((color.red as u32 * source_weight + destination.red as u32 * destination_weight)
                 / 255) as u8,
             green: ((color.green as u32 * source_weight
                 + destination.green as u32 * destination_weight)
@@ -113,14 +112,20 @@ pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
         || view_width <= 0.0
         || view_height <= 0.0
     {
-        return Err(ImageError("SVG view box must be positive and finite".to_string()));
+        return Err(ImageError(
+            "SVG view box must be positive and finite".to_string(),
+        ));
     }
     let width = parse_dimension(
-        root.attr("width").and_then(parse_scalar).unwrap_or(view_width),
+        root.attr("width")
+            .and_then(parse_scalar)
+            .unwrap_or(view_width),
         "width",
     )?;
     let height = parse_dimension(
-        root.attr("height").and_then(parse_scalar).unwrap_or(view_height),
+        root.attr("height")
+            .and_then(parse_scalar)
+            .unwrap_or(view_height),
         "height",
     )?;
     if (width as usize).saturating_mul(height as usize) > MAX_IMAGE_PIXELS {
@@ -201,14 +206,7 @@ fn render_element(
     }
 }
 
-fn draw_rect(
-    image: &mut Image,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    style: PaintStyle,
-) {
+fn draw_rect(image: &mut Image, x: f32, y: f32, width: f32, height: f32, style: PaintStyle) {
     if let Some(fill) = style.fill {
         let left = x.floor().clamp(0.0, image.width as f32) as i32;
         let top = y.floor().clamp(0.0, image.height as f32) as i32;
@@ -235,23 +233,53 @@ fn draw_rect_outline(
     thickness: f32,
     color: Color,
 ) {
-    draw_rect(image, x, y, width, thickness, PaintStyle { fill: Some(color), stroke: None, stroke_width: 1.0 });
+    draw_rect(
+        image,
+        x,
+        y,
+        width,
+        thickness,
+        PaintStyle {
+            fill: Some(color),
+            stroke: None,
+            stroke_width: 1.0,
+        },
+    );
     draw_rect(
         image,
         x,
         y + height - thickness,
         width,
         thickness,
-        PaintStyle { fill: Some(color), stroke: None, stroke_width: 1.0 },
+        PaintStyle {
+            fill: Some(color),
+            stroke: None,
+            stroke_width: 1.0,
+        },
     );
-    draw_rect(image, x, y, thickness, height, PaintStyle { fill: Some(color), stroke: None, stroke_width: 1.0 });
+    draw_rect(
+        image,
+        x,
+        y,
+        thickness,
+        height,
+        PaintStyle {
+            fill: Some(color),
+            stroke: None,
+            stroke_width: 1.0,
+        },
+    );
     draw_rect(
         image,
         x + width - thickness,
         y,
         thickness,
         height,
-        PaintStyle { fill: Some(color), stroke: None, stroke_width: 1.0 },
+        PaintStyle {
+            fill: Some(color),
+            stroke: None,
+            stroke_width: 1.0,
+        },
     );
 }
 
@@ -289,11 +317,7 @@ fn draw_line(image: &mut Image, x1: f32, y1: f32, x2: f32, y2: f32, style: Paint
         return;
     }
     let distance = distance as usize;
-    let radius = style
-        .stroke_width
-        .max(1.0)
-        .min(MAX_IMAGE_DIMENSION as f32)
-        / 2.0;
+    let radius = style.stroke_width.max(1.0).min(MAX_IMAGE_DIMENSION as f32) / 2.0;
     for step in 0..=distance {
         let progress = step as f32 / distance as f32;
         let x = x1 + (x2 - x1) * progress;

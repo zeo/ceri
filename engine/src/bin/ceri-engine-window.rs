@@ -1,9 +1,9 @@
-use ceri_engine_lab::{
+#[cfg(feature = "native-http")]
+use ceri_engine::NativeHttpProvider;
+use ceri_engine::{
     APP_ORIGIN, Browser, EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent,
     KeyModifiers, PointerButton, ResourceBundle, Size,
 };
-#[cfg(feature = "native-http")]
-use ceri_engine_lab::NativeHttpProvider;
 use softbuffer::{Context, Surface};
 use std::env;
 use std::num::NonZeroU32;
@@ -128,10 +128,7 @@ impl App {
                             request_redraw = true;
                         }
                     }
-                    EngineWorkerEvent::Input {
-                        request_id,
-                        result,
-                    } => {
+                    EngineWorkerEvent::Input { request_id, result } => {
                         if worker.time_request == Some(request_id) {
                             worker.time_request = None;
                         }
@@ -142,10 +139,7 @@ impl App {
                             request_redraw = true;
                         }
                     }
-                    EngineWorkerEvent::Frame {
-                        request_id,
-                        result,
-                    } => {
+                    EngineWorkerEvent::Frame { request_id, result } => {
                         if worker.render_request == Some(request_id) {
                             worker.render_request = None;
                         }
@@ -383,9 +377,7 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed =>
-            {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let key = match event.logical_key {
                     Key::Character(character) => character.to_string(),
                     Key::Named(named) => format!("{named:?}"),
@@ -462,8 +454,7 @@ fn main() -> Result<(), String> {
         #[cfg(feature = "native-http")]
         {
             let mut worker = EngineWorker::spawn(viewport, move || {
-                let provider =
-                    NativeHttpProvider::new(base).map_err(|error| error.to_string())?;
+                let provider = NativeHttpProvider::new(base).map_err(|error| error.to_string())?;
                 Ok(Browser::with_resource_provider(
                     ResourceBundle::default(),
                     Rc::new(provider),
@@ -489,7 +480,7 @@ fn main() -> Result<(), String> {
         }
     } else {
         let mut resources = ResourceBundle::from_directory(env!("CARGO_MANIFEST_DIR"))
-            .map_err(|error| format!("could not load engine-lab resources: {error}"))?;
+            .map_err(|error| format!("could not load packaged engine resources: {error}"))?;
         resources
             .insert(
                 "/index.html",
@@ -532,7 +523,7 @@ where
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine-window [--native-base HTTPS_URL]\n\nWithout --native-base, the packaged engine-lab demo is shown. With it, EngineWorker loads the app origin through the optional native HTTPS provider."
+                    "usage: ceri-engine-window [--native-base HTTPS_URL]\n\nWithout --native-base, the packaged engine demo is shown. With it, EngineWorker loads the app origin through the optional native HTTPS provider."
                 );
                 std::process::exit(0);
             }
@@ -549,9 +540,12 @@ mod tests {
     #[test]
     fn parses_optional_native_base() {
         assert_eq!(
-            parse_native_base(vec!["--native-base".to_string(), "https://example.test".to_string()])
-                .expect("native base should parse")
-                .as_deref(),
+            parse_native_base(vec![
+                "--native-base".to_string(),
+                "https://example.test".to_string()
+            ])
+            .expect("native base should parse")
+            .as_deref(),
             Some("https://example.test")
         );
     }

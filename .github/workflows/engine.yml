@@ -1,14 +1,16 @@
-name: engine lab
+name: engine
 
 on:
   push:
     paths:
-      - ".github/workflows/engine-lab.yml"
-      - "engine-lab/**"
+      - ".github/workflows/engine.yml"
+      - "engine/**"
+      - "Cargo.lock"
   pull_request:
     paths:
-      - ".github/workflows/engine-lab.yml"
-      - "engine-lab/**"
+      - ".github/workflows/engine.yml"
+      - "engine/**"
+      - "Cargo.lock"
   workflow_dispatch:
 
 permissions:
@@ -32,17 +34,17 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.features }}" = "default" ]; then
-            cargo test --locked --manifest-path engine-lab/Cargo.toml --all-targets
+            cargo test --locked -p ceri-engine --all-targets
           else
-            cargo test --locked --manifest-path engine-lab/Cargo.toml --features "${{ matrix.features }}" --all-targets
+            cargo test --locked -p ceri-engine --features "${{ matrix.features }}" --all-targets
           fi
       - name: clippy
         shell: bash
         run: |
           if [ "${{ matrix.features }}" = "default" ]; then
-            cargo clippy --locked --manifest-path engine-lab/Cargo.toml --all-targets -- -D warnings
+            cargo clippy --locked -p ceri-engine --all-targets -- -D warnings
           else
-            cargo clippy --locked --manifest-path engine-lab/Cargo.toml --features "${{ matrix.features }}" --all-targets -- -D warnings
+            cargo clippy --locked -p ceri-engine --features "${{ matrix.features }}" --all-targets -- -D warnings
           fi
 
   format:

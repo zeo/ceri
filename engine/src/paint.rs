@@ -164,10 +164,7 @@ pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
     paint_with_commands(document, &[])
 }
 
-pub(crate) fn paint_with_commands(
-    document: &LayoutDocument,
-    commands: &[CanvasCommand],
-) -> Canvas {
+pub(crate) fn paint_with_commands(document: &LayoutDocument, commands: &[CanvasCommand]) -> Canvas {
     let mut canvas = Canvas::new(
         document.viewport.width.max(1.0) as u32,
         document.viewport.height.max(1.0) as u32,
@@ -259,14 +256,7 @@ fn paint_canvas_command(
     let Some(command_clip) = intersect_clip(clip, rect) else {
         return;
     };
-    canvas.fill_rect_clipped(
-        rect.x + x,
-        rect.y + y,
-        width,
-        height,
-        color,
-        command_clip,
-    );
+    canvas.fill_rect_clipped(rect.x + x, rect.y + y, width, height, color, command_clip);
 }
 
 fn paint_box(
@@ -277,14 +267,7 @@ fn paint_box(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
-    paint_context(
-        canvas,
-        layout_box,
-        commands,
-        images,
-        clip,
-        ancestor_offset,
-    );
+    paint_context(canvas, layout_box, commands, images, clip, ancestor_offset);
 }
 
 fn paint_context(
@@ -473,8 +456,9 @@ fn paint_control_selection(
     if layout_box.control_text_origin.is_none() || start == end {
         return;
     }
-    for (line_index, (line_start, line_end)) in
-        control_line_ranges(value, &layout_box.text).iter().enumerate()
+    for (line_index, (line_start, line_end)) in control_line_ranges(value, &layout_box.text)
+        .iter()
+        .enumerate()
     {
         let Some(run) = layout_box.text.get(line_index) else {
             break;
@@ -547,11 +531,7 @@ fn control_line_ranges(value: &str, lines: &[TextRun]) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn control_text_position(
-    layout_box: &LayoutBox,
-    value: &str,
-    offset: usize,
-) -> Option<(f32, f32)> {
+fn control_text_position(layout_box: &LayoutBox, value: &str, offset: usize) -> Option<(f32, f32)> {
     let ranges = control_line_ranges(value, &layout_box.text);
     let mut line_index = ranges.len().saturating_sub(1);
     for (index, (_, line_end)) in ranges.iter().enumerate() {
@@ -631,7 +611,15 @@ fn paint_scrollbars(
             (layout_box.scroll_content.height - metrics.scrollport.height).max(0.0),
             true,
         );
-        fill_rect_optional(canvas, thumb.x, thumb.y, thumb.width, thumb.height, thumb_color, clip);
+        fill_rect_optional(
+            canvas,
+            thumb.x,
+            thumb.y,
+            thumb.width,
+            thumb.height,
+            thumb_color,
+            clip,
+        );
     }
     if let Some(track) = metrics.horizontal_track {
         let track = translate_rect(track, offset);
@@ -652,7 +640,15 @@ fn paint_scrollbars(
             (layout_box.scroll_content.width - metrics.scrollport.width).max(0.0),
             false,
         );
-        fill_rect_optional(canvas, thumb.x, thumb.y, thumb.width, thumb.height, thumb_color, clip);
+        fill_rect_optional(
+            canvas,
+            thumb.x,
+            thumb.y,
+            thumb.width,
+            thumb.height,
+            thumb_color,
+            clip,
+        );
     }
     if let (Some(vertical), Some(horizontal)) = (metrics.vertical_track, metrics.horizontal_track) {
         let corner = translate_rect(
@@ -967,7 +963,10 @@ mod tests {
         );
         let caret_x = (4.0 + text_advance(12.0)) as u32;
         let caret_index = ((5 * focused_canvas.width() + caret_x) * 4) as usize;
-        assert_eq!(&focused_canvas.rgba_pixels()[caret_index..caret_index + 3], &[0, 0, 0]);
+        assert_eq!(
+            &focused_canvas.rgba_pixels()[caret_index..caret_index + 3],
+            &[0, 0, 0]
+        );
         let selection_index = ((5 * focused_canvas.width() + 4) * 4) as usize;
         assert_eq!(
             &focused_canvas.rgba_pixels()[selection_index..selection_index + 3],
@@ -981,7 +980,7 @@ mod tests {
             &[0, 0, 0]
         );
 
-        let path = std::env::temp_dir().join(format!("ceri-engine-lab-{}.bmp", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ceri-engine-{}.bmp", std::process::id()));
         canvas.write_bmp(&path).expect("bmp should write");
         let bytes = std::fs::read(&path).expect("bmp should be readable");
         assert_eq!(&bytes[..2], b"BM");
@@ -1050,9 +1049,15 @@ mod tests {
         };
         let canvas = paint(&document);
         let selection_index = ((20 * canvas.width() + 9) * 4) as usize;
-        assert_eq!(&canvas.rgba_pixels()[selection_index..selection_index + 3], &[170, 205, 238]);
+        assert_eq!(
+            &canvas.rgba_pixels()[selection_index..selection_index + 3],
+            &[170, 205, 238]
+        );
         let caret_index = ((20 * canvas.width() + 10) * 4) as usize;
-        assert_eq!(&canvas.rgba_pixels()[caret_index..caret_index + 3], &[0, 0, 0]);
+        assert_eq!(
+            &canvas.rgba_pixels()[caret_index..caret_index + 3],
+            &[0, 0, 0]
+        );
         document.root.control_selection = Some((0, 0, false));
         assert_ne!(paint(&document).rgba_pixels(), canvas.rgba_pixels());
     }

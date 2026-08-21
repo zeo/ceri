@@ -1,3 +1,7 @@
+[workspace]
+members = ["engine"]
+resolver = "3"
+
 [package]
 name = "ceri"
 version = "0.1.0"

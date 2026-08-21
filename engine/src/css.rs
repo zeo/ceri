@@ -843,8 +843,7 @@ impl PseudoClass {
             Self::Checked => {
                 element.name == "input"
                     && element.attr("type").is_some_and(|kind| {
-                        kind.eq_ignore_ascii_case("checkbox")
-                            || kind.eq_ignore_ascii_case("radio")
+                        kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
                     })
                     && state.is_checked(element, path)
             }
@@ -1600,7 +1599,11 @@ fn parse_grid_track(value: &str) -> Option<GridTrack> {
         return Some(GridTrack::Auto);
     }
     if let Some(value) = value.strip_suffix("fr") {
-        return value.parse::<f32>().ok().filter(|value| *value > 0.0).map(GridTrack::Fr);
+        return value
+            .parse::<f32>()
+            .ok()
+            .filter(|value| *value > 0.0)
+            .map(GridTrack::Fr);
     }
     if let Some(value) = value.strip_suffix("px") {
         return value.parse::<f32>().ok().map(GridTrack::Px);
@@ -1849,8 +1852,8 @@ mod tests {
         assert_eq!(style.inset.bottom, Length::Auto);
         assert_eq!(style.inset.left, Length::Px(30.0));
         assert_eq!(style.overflow, Overflow::Hidden);
-        let auto = Stylesheet::parse(".scroll { overflow: auto; }")
-            .expect("auto stylesheet should parse");
+        let auto =
+            Stylesheet::parse(".scroll { overflow: auto; }").expect("auto stylesheet should parse");
         let mut scroll = Element::new("div");
         scroll
             .attrs
