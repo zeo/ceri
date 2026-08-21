@@ -15,13 +15,13 @@ Same app, same machine, release builds, Windows x64. The runtime bundle is the e
 
 | | `ceri-engine` | CEF |
 | --- | --- | --- |
-| bundle size | 3.8 MB | 411 MB |
+| bundle size | 3.9 MB | 411 MB |
 | files in bundle | 9 | 252 |
 | processes at rest | 1 | 6 |
-| resident memory, app open | 25.9 MB | 319.7 MB |
-| start to first painted frame | 378 ms median, headless render of the packaged app | not instrumented |
+| resident memory, app open | 33.2 MB | 319.7 MB |
+| start to first painted frame | 153 ms median, headless render of the packaged app | not instrumented |
 
-The Rust-native engine also renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, and reaches `4 / 4` on the packaged continuity page.
+The Rust-native engine renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, reaches `4 / 4` on the packaged continuity page, and applies every rule in that page's stylesheet with nothing dropped.
 
 ## Build
 
@@ -84,4 +84,6 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket.
 
-What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS animations and transitions, generated content, rounded corners, shadows and gradients, full WebAssembly, extensions, printing, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, and CSS animations driven from the page clock with linear, ease and stepped timing.
+
+What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS transitions and transforms, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.

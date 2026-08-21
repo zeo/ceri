@@ -762,7 +762,7 @@ impl Stylesheet {
         if let Some(iterations) = animation.iterations
             && cycle >= iterations
         {
-            let ended = if animation.alternate && (iterations.ceil() as u64) % 2 == 0 {
+            let ended = if animation.alternate && (iterations.ceil() as u64).is_multiple_of(2) {
                 keyframes.stops.first()
             } else {
                 keyframes.stops.last()
@@ -772,7 +772,7 @@ impl Stylesheet {
                 .unwrap_or_default();
         }
         let mut progress = cycle.fract();
-        if animation.alternate && (cycle.floor() as u64) % 2 == 1 {
+        if animation.alternate && !(cycle.floor() as u64).is_multiple_of(2) {
             progress = 1.0 - progress;
         }
         let progress = animation.timing.apply(progress);
