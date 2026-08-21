@@ -37,6 +37,10 @@ helper_name = "ceri_helper"
 
 [dependencies]
 cef = { version = "=150.2.1", features = ["build-util"], optional = true }
+ceri-engine = { path = "engine", features = ["windowed"], optional = true }
+
+# windows reaches the network through the platform stack, other targets use the engine client
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 ceri-engine = { path = "engine", features = [
     "windowed",
     "native-http",

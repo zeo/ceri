@@ -11,6 +11,8 @@ mod custom;
 mod desktop;
 #[cfg(feature = "custom-engine")]
 mod fonts;
+#[cfg(feature = "custom-engine")]
+mod http;
 #[cfg(feature = "cef-engine")]
 mod platform;
 #[cfg(feature = "cef-engine")]

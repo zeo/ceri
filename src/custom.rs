@@ -208,7 +208,7 @@ impl ResourceProvider for PackagedAssets {
         {
             return Ok(None);
         }
-        ceri_engine::request_external(request).map(Some)
+        crate::http::request(request).map(Some)
     }
 }
 

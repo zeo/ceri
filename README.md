@@ -15,11 +15,12 @@ Same app, same machine, release builds, Windows x64. The runtime bundle is the e
 
 | | `ceri-engine` | CEF |
 | --- | --- | --- |
-| bundle size | 3.9 MB | 411 MB |
+| bundle size | 4.0 MB | 411 MB |
 | files in bundle | 9 | 252 |
 | processes at rest | 1 | 6 |
-| resident memory, app open | 33.2 MB | 319.7 MB |
-| start to first painted frame | 153 ms median, headless render of the packaged app | not instrumented |
+| resident memory, app open | 26.9 MB | 319.7 MB |
+| start to first painted frame | 160 ms median, headless render of the packaged app | not instrumented |
+| frame time, app animating | 3.3 ms at 1120x720, 5.7 ms at twice the device pixel ratio | not instrumented |
 
 The Rust-native engine renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, reaches `4 / 4` on the packaged continuity page, and applies every rule in that page's stylesheet with nothing dropped.
 
@@ -84,7 +85,7 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket. On Windows the runtime backs the clipboard and file input with the platform clipboard and file dialog.
 
-A page can fetch outside its own origin only through origins the operator lists, and only over HTTPS with platform certificate verification:
+A page can fetch outside its own origin only through origins the operator lists, and only over HTTPS. Windows uses the platform HTTP stack, so TLS trust and updates stay with the operating system and the bundle carries no TLS library:
 
 ```powershell
 ceri.exe --ceri-allow-origin=https://api.example.com
