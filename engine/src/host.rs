@@ -318,6 +318,7 @@ impl EngineHost {
 
     pub fn navigate(&mut self, url: &str) -> Result<NavigationStatus, NavigationError> {
         let status = self.browser.navigate(url)?;
+        self.browser.sample_transitions(self.viewport)?;
         self.dirty = true;
         Ok(status)
     }
@@ -460,7 +461,13 @@ impl EngineHost {
             }
         };
         self.pump_workers()?;
-        self.dirty |= result.frame_requested || result.handled || result.tasks_run > 0;
+        // state changes may start a transition, which needs frames until it finishes
+        let transitioning = self.browser.sample_transitions(self.viewport)?;
+        self.dirty |= result.frame_requested
+            || result.handled
+            || result.tasks_run > 0
+            || transitioning
+            || self.browser.has_active_animations();
         Ok(InputResult {
             frame_requested: self.dirty,
             ..result
@@ -496,6 +503,7 @@ impl EngineHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::Color;
     use crate::navigation::{
         APP_ORIGIN, AppUrl, Resource, ResourceBundle, ResourceProvider, ResourceRequest,
         ResourceResponse,
@@ -1068,6 +1076,64 @@ mod tests {
             .expect("the recovery document should render")
             .expect("a frame should be produced");
         assert!(frame.canvas.non_background_pixels() > 0);
+    }
+
+    #[test]
+    fn hovering_a_button_transitions_its_colour_over_the_clock() {
+        let mut host = EngineHost::new(
+            Browser::new(bundle(
+                "<style>button { width: 100px; height: 40px; margin: 0; background-color: #000000; transition: background-color 200ms linear } button:hover { background-color: #ffffff }</style><button id='go'>go</button>",
+            )),
+            Size {
+                width: 160.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let background = |host: &EngineHost| {
+            let layout = host
+                .browser()
+                .layout(host.viewport())
+                .expect("layout should resolve");
+            find_button(&layout.root)
+                .expect("the button should lay out")
+                .background
+        };
+        assert_eq!(background(&host), Color::opaque(0, 0, 0));
+
+        // moving onto the button starts the transition rather than jumping to the target
+        host.input(InputEvent::PointerMove { x: 50.0, y: 20.0 })
+            .expect("pointer move should be accepted");
+        let started = background(&host);
+        assert!(
+            started.red < 40,
+            "the transition starts near the old colour, got {started:?}"
+        );
+        assert!(host.browser().has_active_animations());
+
+        host.input(InputEvent::AdvanceTime(100))
+            .expect("the clock should advance");
+        let midway = background(&host);
+        assert!(
+            (100..=160).contains(&midway.red),
+            "halfway through 200ms the colour should be halfway, got {midway:?}"
+        );
+
+        host.input(InputEvent::AdvanceTime(150))
+            .expect("the clock should advance");
+        assert_eq!(background(&host), Color::opaque(255, 255, 255));
+        assert!(
+            !host.browser().has_active_animations(),
+            "a finished transition stops asking for frames"
+        );
+    }
+
+    fn find_button(layout_box: &crate::layout::LayoutBox) -> Option<&crate::layout::LayoutBox> {
+        if layout_box.tag == "button" {
+            return Some(layout_box);
+        }
+        layout_box.children.iter().find_map(find_button)
     }
 
     #[test]

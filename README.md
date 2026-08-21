@@ -93,10 +93,10 @@ ceri.exe --ceri-allow-origin=https://api.example.com
 
 Every other origin is refused with a typed rejection the page can catch, and navigation stays on the app origin regardless.
 
-The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, and CSS animations driven from the page clock with linear, ease and stepped timing.
+The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, CSS animations driven from the page clock with linear, ease and stepped timing, and transitions on colors, opacity, lengths and radii that start when a state change alters a declared value.
 
 Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
 
 The window takes its caption from `document.title`, its icon from the packaged favicon, and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document, which is what the CEF path does with a dead renderer.
 
-What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS transitions and transforms, selection of prose outside form fields, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS transforms, selection of prose outside form fields, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.

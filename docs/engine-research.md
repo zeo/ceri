@@ -14,7 +14,8 @@ CEF stays the default engine anyway, and the reason is compatibility rather than
 
 - media playback, WebGL and other GPU APIs
 - cross-origin policy beyond an operator allowlist, so there is no CORS preflight, no cookie jar and no credential mode
-- CSS transitions and transforms, and animation of properties beyond colors, numbers and single-unit lengths
+- CSS transforms, and animation or transition of properties beyond colors, numbers and single-unit lengths
+- transitions on properties outside the ten the engine treats as animatable
 - generated content inside flex and grid containers, which only the block path builds today
 - pointer selection of prose outside form fields, and scrollbar thumb dragging
 - full WebAssembly beyond the bounded i32 module path

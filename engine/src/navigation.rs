@@ -1,5 +1,7 @@
-use crate::css::{ColorScheme, Stylesheet};
-use crate::dom::{AccessibilityNode, Document, NodePath, ScriptSource, StylesheetSource};
+use crate::css::{AnimatableProperty, ColorScheme, StyleContext, Stylesheet, TransitionState};
+use crate::dom::{
+    AccessibilityNode, Document, Element, Node, NodePath, ScriptSource, StylesheetSource,
+};
 use crate::font::FontSet;
 use crate::image::parse_svg;
 use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
@@ -846,6 +848,8 @@ pub struct Browser {
     local_storage: StorageHandle,
     session_storage: StorageHandle,
     hovered_path: Option<NodePath>,
+    transitions: BTreeMap<(NodePath, AnimatableProperty), TransitionState>,
+    declared: BTreeMap<(NodePath, AnimatableProperty), String>,
     host_runtime_info: Option<HostRuntimeInfo>,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
@@ -877,6 +881,8 @@ impl Browser {
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_path: None,
+            transitions: BTreeMap::new(),
+            declared: BTreeMap::new(),
             host_runtime_info: None,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
@@ -1175,11 +1181,92 @@ impl Browser {
         self.last_navigation_failure.as_ref()
     }
 
-    // a page with a running animation needs a frame per clock tick
+    // a page with a running animation or transition needs a frame per clock tick
     pub fn has_active_animations(&self) -> bool {
-        self.page
-            .as_ref()
-            .is_some_and(|page| page.animated && !self.preferences.reduced_motion)
+        if self.preferences.reduced_motion {
+            return false;
+        }
+        let animated = self.page.as_ref().is_some_and(|page| page.animated);
+        animated || !self.transitions.is_empty()
+    }
+
+    // records which animatable values changed, so layout can blend from the old ones
+    pub fn sample_transitions(&mut self, viewport: Size) -> Result<bool, NavigationError> {
+        let Some(page) = self.page.as_ref() else {
+            return Ok(false);
+        };
+        if !page.stylesheet.has_transitions() || self.preferences.reduced_motion {
+            self.transitions.clear();
+            self.declared.clear();
+            return Ok(false);
+        }
+        let clock = page.runtime.now();
+        let document = page.document.clone();
+        let document = document.borrow();
+        let mut state = page.runtime.style_state(self.hovered_path.clone());
+        state.viewport_width = viewport.width;
+        state.viewport_height = viewport.height;
+        state.color_scheme = self.preferences.color_scheme;
+        state.reduced_motion = self.preferences.reduced_motion;
+        state.clock = clock;
+        page.stylesheet
+            .populate_custom_properties(&document, &mut state);
+
+        let mut seen = BTreeSet::new();
+        let mut changed = false;
+        let mut targets = Vec::new();
+        collect_transition_targets(&document.root, &mut Vec::new(), &mut targets);
+        for path in targets {
+            let Some(element) = document.element_at(&path) else {
+                continue;
+            };
+            let ancestors = ancestor_chain(&document, &path);
+            let context = || StyleContext {
+                element,
+                path: &path,
+                ancestors: &ancestors,
+                parent_font_size: 16.0,
+                parent_color: crate::css::Color::BLACK,
+                parent_weight: crate::css::FontWeight::Normal,
+                parent_text: Default::default(),
+                state: &state,
+            };
+            let transitions = page.stylesheet.transitions_for(context());
+            for transition in transitions.into_iter().flatten() {
+                let key = (path.clone(), transition.property);
+                seen.insert(key.clone());
+                let Some(value) = page
+                    .stylesheet
+                    .declared_value(context(), transition.property)
+                else {
+                    continue;
+                };
+                match self.declared.get(&key) {
+                    Some(previous) if previous == &value => {}
+                    Some(previous) => {
+                        self.transitions.insert(
+                            key.clone(),
+                            TransitionState {
+                                from: previous.clone(),
+                                to: value.clone(),
+                                started: clock,
+                                finishes: clock
+                                    .saturating_add(transition.delay)
+                                    .saturating_add(transition.duration),
+                            },
+                        );
+                        changed = true;
+                    }
+                    None => {}
+                }
+                self.declared.insert(key, value);
+            }
+        }
+        // a finished transition is dropped, so the page stops asking for frames
+        self.transitions
+            .retain(|key, active| seen.contains(key) && clock <= active.finishes);
+        self.declared.retain(|key, _| seen.contains(key));
+        Ok(changed)
     }
 
     // shows the engine's own recovery document, which a host uses after a failed restart
@@ -1495,6 +1582,7 @@ impl Browser {
         style_state.color_scheme = self.preferences.color_scheme;
         style_state.reduced_motion = self.preferences.reduced_motion;
         style_state.clock = page.runtime.now();
+        style_state.transitions = self.transitions.clone();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         if let Some(base) = self.current_url.as_ref() {
@@ -1951,6 +2039,32 @@ fn is_svg(resource: &Resource) -> bool {
         .split(';')
         .next()
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/svg+xml"))
+}
+
+// elements are candidates in document order, which keeps sampling deterministic
+fn collect_transition_targets(element: &Element, path: &mut NodePath, targets: &mut Vec<NodePath>) {
+    for (index, node) in element.children.iter().enumerate() {
+        let Node::Element(child) = node else {
+            continue;
+        };
+        path.push(index);
+        targets.push(path.clone());
+        collect_transition_targets(child, path, targets);
+        path.pop();
+    }
+}
+
+fn ancestor_chain<'a>(document: &'a Document, path: &[usize]) -> Vec<&'a Element> {
+    let mut chain = Vec::with_capacity(path.len());
+    let mut current = &document.root;
+    for &index in &path[..path.len().saturating_sub(1)] {
+        let Some(Node::Element(next)) = current.children.get(index) else {
+            return chain;
+        };
+        chain.push(next);
+        current = next;
+    }
+    chain
 }
 
 fn collect_image_paths(layout: &crate::layout::LayoutBox, paths: &mut Vec<NodePath>) {

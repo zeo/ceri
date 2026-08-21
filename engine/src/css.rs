@@ -389,6 +389,14 @@ pub(crate) enum AlignItems {
     FlexEnd,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TransitionState {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) started: u64,
+    pub(crate) finishes: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StyleState {
     pub(crate) hovered_path: Option<NodePath>,
@@ -404,6 +412,7 @@ pub(crate) struct StyleState {
     pub(crate) color_scheme: ColorScheme,
     pub(crate) reduced_motion: bool,
     pub(crate) clock: u64,
+    pub(crate) transitions: BTreeMap<(NodePath, AnimatableProperty), TransitionState>,
     pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
     pub(crate) root_path: Option<NodePath>,
 }
@@ -551,6 +560,7 @@ pub(crate) struct Style {
     pub flex_grow: f32,
     pub grid_template_columns: GridTemplate,
     pub grid_template_rows: GridTemplate,
+    pub transitions: [Option<Transition>; MAX_TRANSITIONS],
     pub border_radius: Length,
     pub opacity: f32,
     pub gradient: Option<Gradient>,
@@ -593,6 +603,7 @@ impl Style {
             flex_grow: 0.0,
             grid_template_columns: GridTemplate::empty(),
             grid_template_rows: GridTemplate::empty(),
+            transitions: [None; MAX_TRANSITIONS],
             border_radius: Length::px(0.0),
             opacity: 1.0,
             gradient: None,
@@ -747,6 +758,79 @@ impl Timing {
         }
     }
 }
+
+// the properties a transition can drive in this engine, kept small so style values stay copyable
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AnimatableProperty {
+    Color,
+    BackgroundColor,
+    BorderColor,
+    Opacity,
+    Width,
+    Height,
+    BorderRadius,
+    BorderWidth,
+    LetterSpacing,
+    FontSize,
+}
+
+impl AnimatableProperty {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Color => "color",
+            Self::BackgroundColor => "background-color",
+            Self::BorderColor => "border-color",
+            Self::Opacity => "opacity",
+            Self::Width => "width",
+            Self::Height => "height",
+            Self::BorderRadius => "border-radius",
+            Self::BorderWidth => "border-width",
+            Self::LetterSpacing => "letter-spacing",
+            Self::FontSize => "font-size",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "color" => Some(Self::Color),
+            "background" | "background-color" => Some(Self::BackgroundColor),
+            "border-color" => Some(Self::BorderColor),
+            "opacity" => Some(Self::Opacity),
+            "width" => Some(Self::Width),
+            "height" => Some(Self::Height),
+            "border-radius" => Some(Self::BorderRadius),
+            "border-width" => Some(Self::BorderWidth),
+            "letter-spacing" => Some(Self::LetterSpacing),
+            "font-size" => Some(Self::FontSize),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn all() -> [Self; 10] {
+        [
+            Self::Color,
+            Self::BackgroundColor,
+            Self::BorderColor,
+            Self::Opacity,
+            Self::Width,
+            Self::Height,
+            Self::BorderRadius,
+            Self::BorderWidth,
+            Self::LetterSpacing,
+            Self::FontSize,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Transition {
+    pub(crate) property: AnimatableProperty,
+    pub(crate) duration: u64,
+    pub(crate) delay: u64,
+    pub(crate) timing: Timing,
+}
+
+pub(crate) const MAX_TRANSITIONS: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Animation {
@@ -1040,6 +1124,33 @@ impl Stylesheet {
             apply_declaration(&mut style, &property, &value);
             base_values.insert(property.into_owned(), value);
         }
+        // a running transition replaces the declared value while it is in flight
+        if !state.transitions.is_empty() && !state.reduced_motion {
+            for transition in style.transitions.into_iter().flatten() {
+                let Some(active) = state.transitions.get(&(path.to_vec(), transition.property))
+                else {
+                    continue;
+                };
+                let elapsed = state.clock.saturating_sub(active.started);
+                if elapsed < transition.delay {
+                    apply_declaration(&mut style, transition.property.name(), &active.from);
+                    continue;
+                }
+                let progress = if transition.duration == 0 {
+                    1.0
+                } else {
+                    ((elapsed - transition.delay) as f32 / transition.duration as f32).min(1.0)
+                };
+                if progress >= 1.0 {
+                    continue;
+                }
+                if let Some(value) =
+                    interpolate_value(&active.from, &active.to, transition.timing.apply(progress))
+                {
+                    apply_declaration(&mut style, transition.property.name(), &value);
+                }
+            }
+        }
         // animated values win over the normal cascade, as the animation origin requires
         if let Some(animation) = animation.filter(|_| !state.reduced_motion) {
             for (property, value) in self.animated_values(&animation, state.clock, &base_values) {
@@ -1050,6 +1161,49 @@ impl Stylesheet {
             }
         }
         style
+    }
+
+    pub(crate) fn has_transitions(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property == "transition")
+        })
+    }
+
+    // the declared value of one animatable property, before any transition is applied
+    pub(crate) fn declared_value(
+        &self,
+        context: StyleContext<'_>,
+        property: AnimatableProperty,
+    ) -> Option<String> {
+        let values = self.cascaded_values(
+            context.element,
+            context.path,
+            context.ancestors,
+            context.state,
+        );
+        let empty = BTreeMap::new();
+        let custom_properties =
+            inherited_custom_properties(context.state, context.path).unwrap_or(&empty);
+        let (_, _, raw) = values.get(property.name())?;
+        resolve_custom_value(raw, custom_properties)
+    }
+
+    pub(crate) fn transitions_for(
+        &self,
+        context: StyleContext<'_>,
+    ) -> [Option<Transition>; MAX_TRANSITIONS] {
+        let values = self.cascaded_values(
+            context.element,
+            context.path,
+            context.ancestors,
+            context.state,
+        );
+        match values.get("transition") {
+            Some((_, _, raw)) => parse_transitions(raw),
+            None => [None; MAX_TRANSITIONS],
+        }
     }
 
     pub(crate) fn has_animations(&self) -> bool {
@@ -1899,6 +2053,54 @@ fn parse_keyframes(header: &str, body: &str) -> Option<Keyframes> {
     Some(Keyframes { name, stops })
 }
 
+// transition: <property> <duration> [timing] [delay], repeated for each comma separated entry
+fn parse_transitions(value: &str) -> [Option<Transition>; MAX_TRANSITIONS] {
+    let mut transitions = [None; MAX_TRANSITIONS];
+    if value.trim().eq_ignore_ascii_case("none") {
+        return transitions;
+    }
+    let mut next = 0;
+    for entry in split_top_level(value) {
+        let mut properties = Vec::new();
+        let mut durations = Vec::new();
+        let mut timing = Timing::Ease;
+        for token in entry.split_ascii_whitespace() {
+            let lowered = token.to_ascii_lowercase();
+            if let Some(duration) = parse_duration(&lowered) {
+                durations.push(duration);
+                continue;
+            }
+            match lowered.as_str() {
+                "linear" => timing = Timing::Linear,
+                "ease" | "ease-in" | "ease-out" | "ease-in-out" => timing = Timing::Ease,
+                "all" => properties.extend_from_slice(&AnimatableProperty::all()),
+                name => {
+                    if let Some(property) = AnimatableProperty::parse(name) {
+                        properties.push(property);
+                    }
+                }
+            }
+        }
+        let Some(&duration) = durations.first() else {
+            continue;
+        };
+        let delay = durations.get(1).copied().unwrap_or(0);
+        for property in properties {
+            if next >= transitions.len() {
+                return transitions;
+            }
+            transitions[next] = Some(Transition {
+                property,
+                duration,
+                delay,
+                timing,
+            });
+            next += 1;
+        }
+    }
+    transitions
+}
+
 fn parse_animation(value: &str) -> Option<Animation> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("none") {
@@ -2266,6 +2468,9 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.gradient = None;
                 style.background = color;
             }
+        }
+        "transition" => {
+            style.transitions = parse_transitions(value);
         }
         "border-radius" => {
             // the shorthand may carry four corners, and this slice paints one radius
