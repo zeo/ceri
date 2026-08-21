@@ -6,6 +6,7 @@ use crate::layout::Size;
 use crate::navigation::{APP_ORIGIN, Browser, UserPreferences};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -21,7 +22,13 @@ pub struct WindowConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    pub minimum_width: u32,
+    pub minimum_height: u32,
     pub start_url: String,
+    // square RGBA pixels for the window and taskbar icon
+    pub icon: Option<(Vec<u8>, u32)>,
+    // where the window position and size are remembered between launches
+    pub geometry_path: Option<PathBuf>,
 }
 
 impl Default for WindowConfig {
@@ -30,20 +37,60 @@ impl Default for WindowConfig {
             title: "Ceri".to_string(),
             width: 1120,
             height: 720,
+            minimum_width: 480,
+            minimum_height: 320,
             start_url: format!("{APP_ORIGIN}/"),
+            icon: None,
+            geometry_path: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl WindowGeometry {
+    fn read(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut parts = text.split_whitespace();
+        let mut next = || parts.next()?.parse::<i64>().ok();
+        let (x, y, width, height) = (next()?, next()?, next()?, next()?);
+        if !(64..=32_768).contains(&width) || !(64..=32_768).contains(&height) {
+            return None;
+        }
+        Some(Self {
+            x: x.clamp(-32_768, 32_768) as i32,
+            y: y.clamp(-32_768, 32_768) as i32,
+            width: width as u32,
+            height: height as u32,
+        })
+    }
+
+    fn write(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            format!("{} {} {} {}", self.x, self.y, self.width, self.height),
+        );
     }
 }
 
 pub fn run<F>(config: WindowConfig, factory: F) -> Result<(), String>
 where
-    F: FnOnce() -> Result<Browser, String> + Send + 'static,
+    F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
 {
     let viewport = Size {
         width: config.width.max(1) as f32,
         height: config.height.max(1) as f32,
     };
-    let mut worker = EngineWorker::spawn(viewport, factory)?;
+    let mut worker = EngineWorker::spawn(viewport, factory.clone())?;
     worker.navigate(config.start_url.clone())?;
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let context =
@@ -51,6 +98,8 @@ where
     let mut app = App {
         config,
         context,
+        factory,
+        restarts: 0,
         worker,
         navigation_pending: true,
         time_request: None,
@@ -71,9 +120,11 @@ where
         .map_err(|error| error.to_string())
 }
 
-struct App {
+struct App<F> {
     config: WindowConfig,
     context: Context<OwnedDisplayHandle>,
+    factory: F,
+    restarts: u8,
     worker: EngineWorker,
     navigation_pending: bool,
     time_request: Option<u64>,
@@ -90,7 +141,53 @@ struct App {
     last_tick: Instant,
 }
 
-impl App {
+impl<F> App<F>
+where
+    F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
+{
+    // one restart, then the engine's own recovery document, matching the CEF path
+    fn recover(&mut self, event_loop: &ActiveEventLoop, detail: &str) -> bool {
+        self.restarts = self.restarts.saturating_add(1);
+        if self.restarts > 2 {
+            eprintln!("ceri: the engine stopped again, closing the window");
+            event_loop.exit();
+            return false;
+        }
+        let recovering = self.restarts > 1;
+        let factory = self.factory.clone();
+        let detail = detail.to_string();
+        let reason = detail.clone();
+        let spawned = EngineWorker::spawn(self.viewport, move || {
+            let mut browser = factory()?;
+            if recovering {
+                browser.show_recovery(500, &reason);
+            }
+            Ok(browser)
+        });
+        match spawned {
+            Ok(mut worker) => {
+                if !recovering && worker.navigate(self.config.start_url.clone()).is_err() {
+                    eprintln!("ceri: the restarted engine refused the app URL");
+                    event_loop.exit();
+                    return false;
+                }
+                eprintln!("ceri: the engine restarted after {detail}");
+                self.worker = worker;
+                self.navigation_pending = !recovering;
+                self.time_request = None;
+                self.render_request = None;
+                self.latest_frame = None;
+                self.request_redraw();
+                true
+            }
+            Err(error) => {
+                eprintln!("ceri: the engine could not restart: {error}");
+                event_loop.exit();
+                false
+            }
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -125,11 +222,7 @@ impl App {
                 true
             }
             Err(error) if error == "engine worker queue is full" => true,
-            Err(error) => {
-                eprintln!("ceri: engine input failed: {error}");
-                event_loop.exit();
-                false
-            }
+            Err(error) => self.recover(event_loop, &error),
         }
     }
 
@@ -141,11 +234,7 @@ impl App {
                     self.navigation_pending = false;
                     match result {
                         Ok(_) => request_redraw = true,
-                        Err(error) => {
-                            eprintln!("ceri: navigation failed: {error}");
-                            event_loop.exit();
-                            return false;
-                        }
+                        Err(error) => return self.recover(event_loop, &error.to_string()),
                     }
                 }
                 EngineWorkerEvent::Input { request_id, result } => {
@@ -154,11 +243,7 @@ impl App {
                     }
                     match result {
                         Ok(_) => request_redraw = true,
-                        Err(error) => {
-                            eprintln!("ceri: engine input failed: {error}");
-                            event_loop.exit();
-                            return false;
-                        }
+                        Err(error) => return self.recover(event_loop, &error.to_string()),
                     }
                 }
                 EngineWorkerEvent::Frame { request_id, result } => {
@@ -172,11 +257,7 @@ impl App {
                                 request_redraw = true;
                             }
                         }
-                        Err(error) => {
-                            eprintln!("ceri: engine render failed: {error}");
-                            event_loop.exit();
-                            return false;
-                        }
+                        Err(error) => return self.recover(event_loop, &error.to_string()),
                     }
                 }
                 EngineWorkerEvent::Accessibility { .. }
@@ -231,8 +312,7 @@ impl App {
                 Ok(request_id) => self.render_request = Some(request_id),
                 Err(error) if error == "engine worker queue is full" => {}
                 Err(error) => {
-                    eprintln!("ceri: engine render request failed: {error}");
-                    event_loop.exit();
+                    self.recover(event_loop, &error);
                     return;
                 }
             }
@@ -272,6 +352,26 @@ impl App {
         }
     }
 
+    fn remember_geometry(&self) {
+        let Some(path) = self.config.geometry_path.as_deref() else {
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let size = window.inner_size();
+        let position = window
+            .outer_position()
+            .unwrap_or(winit::dpi::PhysicalPosition::new(0, 0));
+        WindowGeometry {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        }
+        .write(path);
+    }
+
     fn window_color_scheme(&self) -> ColorScheme {
         match self.window.as_ref().and_then(|window| window.theme()) {
             Some(Theme::Dark) => ColorScheme::Dark,
@@ -307,18 +407,44 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl<F> ApplicationHandler for App<F>
+where
+    F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
+{
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             self.request_redraw();
             return;
         }
-        let attributes = Window::default_attributes()
+        let remembered = self
+            .config
+            .geometry_path
+            .as_deref()
+            .and_then(WindowGeometry::read);
+        let mut attributes = Window::default_attributes()
             .with_title(self.config.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(
-                self.config.width,
-                self.config.height,
-            ));
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                self.config.minimum_width.max(1),
+                self.config.minimum_height.max(1),
+            ))
+            .with_inner_size(match remembered {
+                Some(geometry) => {
+                    winit::dpi::PhysicalSize::new(geometry.width, geometry.height).into()
+                }
+                None => winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                    self.config.width as f64,
+                    self.config.height as f64,
+                )),
+            });
+        if let Some(geometry) = remembered {
+            attributes =
+                attributes.with_position(winit::dpi::PhysicalPosition::new(geometry.x, geometry.y));
+        }
+        if let Some((rgba, size)) = self.config.icon.clone()
+            && let Ok(icon) = winit::window::Icon::from_rgba(rgba, size, size)
+        {
+            attributes = attributes.with_window_icon(Some(icon));
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Rc::new(window),
             Err(error) => {
@@ -361,7 +487,10 @@ impl ApplicationHandler for App {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.remember_geometry();
+                event_loop.exit();
+            }
             WindowEvent::Focused(false) => {
                 self.submit(event_loop, InputEvent::Blur);
             }
@@ -532,5 +661,33 @@ mod tests {
         assert_eq!((unscaled.width, unscaled.height), (800.0, 600.0));
         let guarded = layout_viewport(0, 0, 0.0);
         assert_eq!((guarded.width, guarded.height), (1.0, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::WindowGeometry;
+
+    #[test]
+    fn window_geometry_round_trips_through_a_file() {
+        let path = std::env::temp_dir().join(format!("ceri-window-{}", std::process::id()));
+        let geometry = WindowGeometry {
+            x: 120,
+            y: -40,
+            width: 1280,
+            height: 800,
+        };
+        geometry.write(&path);
+        assert_eq!(WindowGeometry::read(&path), Some(geometry));
+
+        std::fs::write(&path, "0 0 4 4").expect("a tiny geometry should be writable");
+        assert_eq!(
+            WindowGeometry::read(&path),
+            None,
+            "an unusable size is ignored rather than applied"
+        );
+        std::fs::write(&path, "not a window").expect("garbage should be writable");
+        assert_eq!(WindowGeometry::read(&path), None);
+        let _ = std::fs::remove_file(&path);
     }
 }

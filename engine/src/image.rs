@@ -87,6 +87,25 @@ impl Default for PaintStyle {
     }
 }
 
+// a square RGBA buffer for window and taskbar icons, scaled from an app owned SVG
+pub fn rasterize_svg_icon(source: &str, size: u32) -> Option<(Vec<u8>, u32)> {
+    let size = size.clamp(16, 512);
+    let image = parse_svg(source).ok()?;
+    if image.width == 0 || image.height == 0 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for row in 0..size {
+        let source_y = (row * image.height / size).min(image.height - 1);
+        for column in 0..size {
+            let source_x = (column * image.width / size).min(image.width - 1);
+            let color = image.pixel(source_x, source_y);
+            rgba.extend_from_slice(&[color.red, color.green, color.blue, color.alpha]);
+        }
+    }
+    Some((rgba, size))
+}
+
 pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
     let document = Document::parse(source).map_err(|error| ImageError(error.to_string()))?;
     let root = document

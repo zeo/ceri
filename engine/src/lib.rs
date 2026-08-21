@@ -23,6 +23,7 @@ pub use host::{
     EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, KeyModifiers,
     PointerButton,
 };
+pub use image::rasterize_svg_icon;
 pub use layout::{LayoutDocument, Rect, Size, layout};
 #[cfg(feature = "native-http")]
 pub use native_http::{NativeHttpProvider, request_external};

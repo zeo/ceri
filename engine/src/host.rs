@@ -292,6 +292,10 @@ impl EngineHost {
         &self.browser
     }
 
+    pub fn browser_mut(&mut self) -> &mut Browser {
+        &mut self.browser
+    }
+
     pub fn viewport(&self) -> Size {
         self.viewport
     }
@@ -1034,6 +1038,36 @@ mod tests {
             host.browser().control_value(&path).as_deref(),
             Some("hello world")
         );
+    }
+
+    #[test]
+    fn a_host_can_show_the_engine_recovery_document_after_a_restart() {
+        let mut host = EngineHost::new(
+            Browser::new(bundle("<main><p id='status'>ready</p></main>")),
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        host.browser_mut()
+            .show_recovery(500, "the engine worker stopped");
+        let document = host.browser().document().expect("document should exist");
+        assert!(
+            document.borrow().find_element_by_id("status").is_none(),
+            "the recovery document replaces the app document"
+        );
+        let failure = host
+            .last_navigation_failure()
+            .expect("a recovery leaves a typed failure");
+        assert_eq!(failure.status, 500);
+        assert!(failure.detail.contains("worker stopped"));
+        let frame = host
+            .render()
+            .expect("the recovery document should render")
+            .expect("a frame should be produced");
+        assert!(frame.canvas.non_background_pixels() > 0);
     }
 
     #[test]

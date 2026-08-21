@@ -1182,6 +1182,18 @@ impl Browser {
             .is_some_and(|page| page.animated && !self.preferences.reduced_motion)
     }
 
+    // shows the engine's own recovery document, which a host uses after a failed restart
+    pub fn show_recovery(&mut self, status: u16, detail: &str) {
+        let url = self
+            .current_url
+            .clone()
+            .or_else(|| AppUrl::parse(&format!("{APP_ORIGIN}/")).ok());
+        let Some(url) = url else {
+            return;
+        };
+        self.install_error_page(&url, status, detail);
+    }
+
     pub fn control_value(&self, path: &[usize]) -> Option<String> {
         self.page
             .as_ref()

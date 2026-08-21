@@ -97,4 +97,6 @@ The visual surface covers antialiased outline text with system font fallback, ro
 
 Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
 
+The window takes its caption from `document.title`, its icon from the packaged favicon, and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document, which is what the CEF path does with a dead renderer.
+
 What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, CSS transitions and transforms, selection of prose outside form fields, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.

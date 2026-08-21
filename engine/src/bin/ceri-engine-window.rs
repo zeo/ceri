@@ -12,13 +12,15 @@ fn main() -> Result<(), String> {
         width: 800,
         height: 520,
         start_url: format!("{APP_ORIGIN}/"),
+        ..WindowConfig::default()
     };
 
     if let Some(base) = native_base {
         #[cfg(feature = "native-http")]
         {
             return run_window(config, move || {
-                let provider = NativeHttpProvider::new(base).map_err(|error| error.to_string())?;
+                let provider =
+                    NativeHttpProvider::new(base.clone()).map_err(|error| error.to_string())?;
                 Ok(Browser::with_resource_provider(
                     ResourceBundle::default(),
                     Rc::new(provider),
