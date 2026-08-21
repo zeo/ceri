@@ -32,12 +32,29 @@ pub(crate) enum CanvasCommand {
 pub struct Canvas {
     width: u32,
     height: u32,
+    scale: f32,
     background: Color,
     pixels: Vec<u8>,
 }
 
 impl Canvas {
     pub fn new(width: u32, height: u32, background: Color) -> Self {
+        Self::device(width, height, 1.0, background)
+    }
+
+    // width and height are layout pixels, the surface itself is allocated in device pixels
+    pub fn scaled(width: f32, height: f32, scale: f32, background: Color) -> Self {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let device_width = (width.max(1.0) * scale).round().max(1.0) as u32;
+        let device_height = (height.max(1.0) * scale).round().max(1.0) as u32;
+        Self::device(device_width, device_height, scale, background)
+    }
+
+    fn device(width: u32, height: u32, scale: f32, background: Color) -> Self {
         let mut pixels = vec![0; width as usize * height as usize * 4];
         for pixel in pixels.chunks_exact_mut(4) {
             pixel.copy_from_slice(&[background.red, background.green, background.blue, 255]);
@@ -45,9 +62,14 @@ impl Canvas {
         Self {
             width,
             height,
+            scale,
             background,
             pixels,
         }
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     pub fn width(&self) -> u32 {
@@ -119,6 +141,12 @@ impl Canvas {
         if width <= 0.0 || height <= 0.0 || color.alpha == 0 {
             return;
         }
+        let (x, y, width, height) = (
+            x * self.scale,
+            y * self.scale,
+            width * self.scale,
+            height * self.scale,
+        );
         let left = x.floor().max(0.0) as u32;
         let top = y.floor().max(0.0) as u32;
         let right = (x + width).ceil().max(0.0).min(self.width as f32) as u32;
@@ -161,13 +189,18 @@ impl Canvas {
 }
 
 pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
-    paint_with_commands(document, &[])
+    paint_with_commands(document, &[], 1.0)
 }
 
-pub(crate) fn paint_with_commands(document: &LayoutDocument, commands: &[CanvasCommand]) -> Canvas {
-    let mut canvas = Canvas::new(
-        document.viewport.width.max(1.0) as u32,
-        document.viewport.height.max(1.0) as u32,
+pub(crate) fn paint_with_commands(
+    document: &LayoutDocument,
+    commands: &[CanvasCommand],
+    scale: f32,
+) -> Canvas {
+    let mut canvas = Canvas::scaled(
+        document.viewport.width,
+        document.viewport.height,
+        scale,
         Color::opaque(245, 248, 250),
     );
     paint_box(
@@ -719,22 +752,25 @@ fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect, clip: Option<Rect
     let Some(draw_rect) = intersect_clip(clip, rect) else {
         return;
     };
-    let left = draw_rect.x.floor().max(0.0) as u32;
-    let top = draw_rect.y.floor().max(0.0) as u32;
-    let right = (draw_rect.x + draw_rect.width)
+    let scale = canvas.scale;
+    let left = (draw_rect.x * scale).floor().max(0.0) as u32;
+    let top = (draw_rect.y * scale).floor().max(0.0) as u32;
+    let right = ((draw_rect.x + draw_rect.width) * scale)
         .ceil()
         .max(0.0)
         .min(canvas.width as f32) as u32;
-    let bottom = (draw_rect.y + draw_rect.height)
+    let bottom = ((draw_rect.y + draw_rect.height) * scale)
         .ceil()
         .max(0.0)
         .min(canvas.height as f32) as u32;
+    let origin = (rect.x * scale, rect.y * scale);
+    let extent = (rect.width * scale, rect.height * scale);
     for pixel_y in top.min(canvas.height)..bottom.min(canvas.height) {
-        let source_y = (((pixel_y as f32 - rect.y) / rect.height) * image.height as f32)
+        let source_y = (((pixel_y as f32 - origin.1) / extent.1) * image.height as f32)
             .floor()
             .clamp(0.0, image.height.saturating_sub(1) as f32) as u32;
         for pixel_x in left.min(canvas.width)..right.min(canvas.width) {
-            let source_x = (((pixel_x as f32 - rect.x) / rect.width) * image.width as f32)
+            let source_x = (((pixel_x as f32 - origin.0) / extent.0) * image.width as f32)
                 .floor()
                 .clamp(0.0, image.width.saturating_sub(1) as f32) as u32;
             canvas.blend_pixel(pixel_x, pixel_y, image.pixel(source_x, source_y));
@@ -743,27 +779,28 @@ fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect, clip: Option<Rect
 }
 
 fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
-    let scale = (run.font_size / 9.0).round().max(1.0) as u32;
+    let cell = text_advance(run.font_size);
+    let pixel = cell / 6.0;
     let mut x = run.x;
     for character in run.text.chars() {
         let glyph = glyph_rows(character);
         for (row, bits) in glyph.iter().enumerate() {
             for column in 0..5 {
                 if bits & (1 << (4 - column)) != 0 {
-                    let width = if run.bold { scale + 1 } else { scale };
+                    let width = if run.bold { pixel + 1.0 } else { pixel };
                     fill_rect_optional(
                         canvas,
-                        x + column as f32 * scale as f32 + offset.0,
-                        run.y + row as f32 * scale as f32 + offset.1,
-                        width as f32,
-                        scale as f32,
+                        x + column as f32 * pixel + offset.0,
+                        run.y + row as f32 * pixel + offset.1,
+                        width,
+                        pixel,
                         run.color,
                         clip,
                     );
                 }
             }
         }
-        x += scale as f32 * 6.0;
+        x += cell;
     }
 }
 
@@ -1177,7 +1214,7 @@ mod tests {
             color: Color::opaque(255, 0, 0),
         }];
 
-        let canvas = paint_with_commands(&document, &commands);
+        let canvas = paint_with_commands(&document, &commands, 1.0);
         assert_eq!(
             &canvas.rgba_pixels()[((5 * 20 + 5) * 4) as usize..][..4],
             [0, 0, 255, 255]

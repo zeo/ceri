@@ -57,6 +57,7 @@ where
         latest_frame: None,
         applied_title: None,
         viewport,
+        scale: 1.0,
         window: None,
         surface: None,
         cursor: (0.0, 0.0),
@@ -78,6 +79,7 @@ struct App {
     latest_frame: Option<Frame>,
     applied_title: Option<String>,
     viewport: Size,
+    scale: f32,
     window: Option<Rc<Window>>,
     surface: Option<WindowSurface>,
     cursor: (f32, f32),
@@ -101,6 +103,10 @@ impl App {
             InputEvent::Resize(viewport) => Some(*viewport),
             _ => None,
         };
+        let rescale = match &event {
+            InputEvent::ScaleChanged(scale) => Some(*scale),
+            _ => None,
+        };
         match self.worker.input(event) {
             Ok(request_id) => {
                 if is_clock_tick {
@@ -108,6 +114,9 @@ impl App {
                 }
                 if let Some(viewport) = resize {
                     self.viewport = viewport;
+                }
+                if let Some(scale) = rescale {
+                    self.scale = scale;
                 }
                 self.request_redraw();
                 true
@@ -203,10 +212,11 @@ impl App {
         else {
             return;
         };
-        let viewport = Size {
-            width: size.width as f32,
-            height: size.height as f32,
-        };
+        let scale = self.window_scale();
+        if self.scale != scale && !self.submit(event_loop, InputEvent::ScaleChanged(scale)) {
+            return;
+        }
+        let viewport = layout_viewport(size.width, size.height, scale);
         if self.viewport != viewport && !self.submit(event_loop, InputEvent::Resize(viewport)) {
             return;
         }
@@ -247,16 +257,23 @@ impl App {
                 return;
             }
         };
-        for (pixel, rgba) in buffer
-            .iter_mut()
-            .zip(frame.canvas.rgba_pixels().chunks_exact(4))
-        {
-            *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
-        }
+        present_frame(
+            &frame,
+            size.width as usize,
+            size.height as usize,
+            &mut buffer,
+        );
         if let Err(error) = buffer.present() {
             eprintln!("ceri: window surface present failed: {error}");
             event_loop.exit();
         }
+    }
+
+    fn window_scale(&self) -> f32 {
+        self.window
+            .as_ref()
+            .map(|window| window.scale_factor() as f32)
+            .unwrap_or(self.scale)
     }
 
     fn pointer_button(button: MouseButton) -> Option<PointerButton> {
@@ -277,7 +294,7 @@ impl ApplicationHandler for App {
         }
         let attributes = Window::default_attributes()
             .with_title(self.config.title.clone())
-            .with_inner_size(winit::dpi::PhysicalSize::new(
+            .with_inner_size(winit::dpi::LogicalSize::new(
                 self.config.width,
                 self.config.height,
             ));
@@ -302,6 +319,10 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.surface = Some(surface);
         self.last_tick = Instant::now();
+        let scale = self.window_scale();
+        if scale != self.scale {
+            self.submit(event_loop, InputEvent::ScaleChanged(scale));
+        }
         self.request_redraw();
     }
 
@@ -320,17 +341,17 @@ impl ApplicationHandler for App {
                 self.submit(event_loop, InputEvent::Blur);
             }
             WindowEvent::Resized(size) => {
-                self.submit(
-                    event_loop,
-                    InputEvent::Resize(Size {
-                        width: size.width as f32,
-                        height: size.height as f32,
-                    }),
-                );
+                let viewport = layout_viewport(size.width, size.height, self.window_scale());
+                self.submit(event_loop, InputEvent::Resize(viewport));
+                self.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.submit(event_loop, InputEvent::ScaleChanged(scale_factor as f32));
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as f32, position.y as f32);
+                let scale = f64::from(self.scale);
+                self.cursor = ((position.x / scale) as f32, (position.y / scale) as f32);
                 self.submit(
                     event_loop,
                     InputEvent::PointerMove {
@@ -343,7 +364,8 @@ impl ApplicationHandler for App {
                 let (delta_x, delta_y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x * 40.0, -y * 40.0),
                     MouseScrollDelta::PixelDelta(position) => {
-                        (position.x as f32, -position.y as f32)
+                        let scale = f64::from(self.scale);
+                        ((position.x / scale) as f32, -(position.y / scale) as f32)
                     }
                 };
                 let (x, y) = self.cursor;
@@ -434,5 +456,48 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
             now + Duration::from_millis(16),
         ));
+    }
+}
+
+fn layout_viewport(width: u32, height: u32, scale: f32) -> Size {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    Size {
+        width: (width.max(1) as f32 / scale).max(1.0),
+        height: (height.max(1) as f32 / scale).max(1.0),
+    }
+}
+
+fn present_frame(frame: &Frame, width: usize, height: usize, buffer: &mut [u32]) {
+    let canvas_width = frame.canvas.width() as usize;
+    let canvas_height = frame.canvas.height() as usize;
+    let pixels = frame.canvas.rgba_pixels();
+    let stride = frame.canvas.bytes_per_row();
+    let copy_width = width.min(canvas_width);
+    let copy_height = height.min(canvas_height);
+    for row in 0..copy_height {
+        let source = &pixels[row * stride..row * stride + canvas_width * 4];
+        let target = &mut buffer[row * width..row * width + copy_width];
+        for (pixel, rgba) in target.iter_mut().zip(source.chunks_exact(4)) {
+            *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::layout_viewport;
+
+    #[test]
+    fn layout_viewport_divides_physical_pixels_by_the_display_scale() {
+        let viewport = layout_viewport(2400, 1500, 2.0);
+        assert_eq!((viewport.width, viewport.height), (1200.0, 750.0));
+        let unscaled = layout_viewport(800, 600, 1.0);
+        assert_eq!((unscaled.width, unscaled.height), (800.0, 600.0));
+        let guarded = layout_viewport(0, 0, 0.0);
+        assert_eq!((guarded.width, guarded.height), (1.0, 1.0));
     }
 }

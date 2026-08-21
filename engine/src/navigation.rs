@@ -5,7 +5,7 @@ use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build
 use crate::paint::Canvas;
 use crate::script::{
     HostRuntimeInfo, KeyModifiers, ModuleSourceLoader, NavigationRequest, ScriptRuntime,
-    StorageData, StorageHandle, runtime_error,
+    StorageData, StorageHandle, ViewportMetrics, runtime_error,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -753,6 +753,7 @@ pub struct Browser {
     session_storage: StorageHandle,
     hovered_path: Option<NodePath>,
     host_runtime_info: Option<HostRuntimeInfo>,
+    viewport: ViewportMetrics,
 }
 
 impl Browser {
@@ -775,6 +776,7 @@ impl Browser {
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_path: None,
             host_runtime_info: None,
+            viewport: ViewportMetrics::default(),
         }
     }
 
@@ -808,6 +810,25 @@ impl Browser {
     pub fn with_host_runtime_info(mut self, info: HostRuntimeInfo) -> Self {
         self.host_runtime_info = Some(info);
         self
+    }
+
+    pub fn set_viewport(&mut self, viewport: Size, device_pixel_ratio: f32) {
+        self.viewport = ViewportMetrics {
+            width: viewport.width.max(0.0),
+            height: viewport.height.max(0.0),
+            device_pixel_ratio: if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
+                device_pixel_ratio
+            } else {
+                1.0
+            },
+        };
+        if let Some(page) = self.page.as_mut() {
+            page.runtime.set_viewport_metrics(self.viewport);
+        }
+    }
+
+    pub fn device_pixel_ratio(&self) -> f32 {
+        self.viewport.device_pixel_ratio
     }
 
     fn load_resource(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
@@ -992,6 +1013,7 @@ impl Browser {
         );
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
+        runtime.set_viewport_metrics(self.viewport);
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -1310,13 +1332,25 @@ impl Browser {
     }
 
     pub fn paint(&self, viewport: Size) -> Result<Canvas, NavigationError> {
+        self.paint_scaled(viewport, 1.0)
+    }
+
+    pub fn paint_scaled(
+        &self,
+        viewport: Size,
+        device_pixel_ratio: f32,
+    ) -> Result<Canvas, NavigationError> {
         let layout = self.layout(viewport)?;
         let commands = self
             .page
             .as_ref()
             .map(|page| page.runtime.canvas_commands())
             .unwrap_or(&[]);
-        Ok(crate::paint::paint_with_commands(&layout, commands))
+        Ok(crate::paint::paint_with_commands(
+            &layout,
+            commands,
+            device_pixel_ratio,
+        ))
     }
 
     pub fn describe(&self, viewport: Size) -> Result<String, NavigationError> {
@@ -1650,6 +1684,7 @@ impl Browser {
                 );
                 runtime.set_file_picker(self.file_picker.clone());
                 runtime.set_clipboard_provider(self.clipboard_provider.clone());
+                runtime.set_viewport_metrics(self.viewport);
                 runtime
             },
             document,

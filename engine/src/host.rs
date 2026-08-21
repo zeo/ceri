@@ -59,6 +59,7 @@ pub enum InputEvent {
     },
     CompositionCancel,
     Blur,
+    ScaleChanged(f32),
     AdvanceTime(u64),
 }
 
@@ -73,6 +74,7 @@ pub struct InputResult {
 pub struct Frame {
     pub sequence: u64,
     pub viewport: Size,
+    pub scale: f32,
     pub title: Option<String>,
     pub canvas: Canvas,
 }
@@ -80,6 +82,7 @@ pub struct Frame {
 pub struct EngineHost {
     browser: Browser,
     viewport: Size,
+    scale: f32,
     next_frame: u64,
     dirty: bool,
 }
@@ -218,6 +221,14 @@ impl EngineWorker {
     }
 }
 
+fn normalize_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
 fn run_engine_worker(
     mut host: EngineHost,
     commands: Receiver<EngineWorkerCommand>,
@@ -257,9 +268,16 @@ fn run_engine_worker(
 
 impl EngineHost {
     pub fn new(browser: Browser, viewport: Size) -> Self {
+        Self::with_scale(browser, viewport, 1.0)
+    }
+
+    pub fn with_scale(mut browser: Browser, viewport: Size, scale: f32) -> Self {
+        let scale = normalize_scale(scale);
+        browser.set_viewport(viewport, scale);
         Self {
             browser,
             viewport,
+            scale,
             next_frame: 1,
             dirty: true,
         }
@@ -271,6 +289,10 @@ impl EngineHost {
 
     pub fn viewport(&self) -> Size {
         self.viewport
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
@@ -316,6 +338,15 @@ impl EngineHost {
         let result = match event {
             InputEvent::Resize(viewport) => {
                 self.viewport = viewport;
+                self.browser.set_viewport(viewport, self.scale);
+                InputResult {
+                    frame_requested: true,
+                    ..InputResult::default()
+                }
+            }
+            InputEvent::ScaleChanged(scale) => {
+                self.scale = normalize_scale(scale);
+                self.browser.set_viewport(self.viewport, self.scale);
                 InputResult {
                     frame_requested: true,
                     ..InputResult::default()
@@ -402,10 +433,11 @@ impl EngineHost {
         if !self.dirty {
             return Ok(None);
         }
-        let canvas = self.browser.paint(self.viewport)?;
+        let canvas = self.browser.paint_scaled(self.viewport, self.scale)?;
         let frame = Frame {
             sequence: self.next_frame,
             viewport: self.viewport,
+            scale: self.scale,
             title: self.browser.title(),
             canvas,
         };
@@ -864,6 +896,78 @@ mod tests {
                 .element_text_content(&status)
                 .as_deref(),
             Some("down up click")
+        );
+    }
+
+    #[test]
+    fn device_scale_only_changes_the_frame_surface() {
+        let mut host = EngineHost::with_scale(
+            Browser::new(bundle("<main><p id='status'>ready</p></main>")),
+            Size {
+                width: 160.0,
+                height: 100.0,
+            },
+            2.0,
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let frame = host
+            .render()
+            .expect("frame should render")
+            .expect("first frame should be dirty");
+        assert_eq!(frame.scale, 2.0);
+        assert_eq!(
+            (frame.viewport, frame.canvas.width(), frame.canvas.height()),
+            (
+                Size {
+                    width: 160.0,
+                    height: 100.0
+                },
+                320,
+                200
+            )
+        );
+
+        assert!(
+            host.input(InputEvent::ScaleChanged(1.0))
+                .expect("scale change should be accepted")
+                .frame_requested
+        );
+        let frame = host
+            .render()
+            .expect("frame should render")
+            .expect("scale change should invalidate the frame");
+        assert_eq!(
+            (frame.scale, frame.canvas.width(), frame.canvas.height()),
+            (1.0, 160, 100)
+        );
+    }
+
+    #[test]
+    fn pages_read_the_host_viewport_and_device_pixel_ratio() {
+        let mut host = EngineHost::with_scale(
+            Browser::new(bundle(
+                r#"<p id="status">idle</p><script>
+                    document.getElementById("status").textContent =
+                        window.innerWidth + "x" + window.innerHeight + "@" + window.devicePixelRatio;
+                </script>"#,
+            )),
+            Size {
+                width: 640.0,
+                height: 480.0,
+            },
+            1.5,
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("640x480@1.5")
         );
     }
 

@@ -7,6 +7,7 @@ struct Options {
     input: PathBuf,
     output: PathBuf,
     viewport: Size,
+    scale: f32,
     clicks: Vec<String>,
     click_points: Vec<(f32, f32)>,
     pointer_moves: Vec<(f32, f32)>,
@@ -46,7 +47,7 @@ fn main() -> Result<(), String> {
             source.into_bytes(),
         )
         .map_err(|error| error.to_string())?;
-    let mut host = EngineHost::new(Browser::new(resources), options.viewport);
+    let mut host = EngineHost::with_scale(Browser::new(resources), options.viewport, options.scale);
     let status = host
         .navigate(&options.url)
         .map_err(|error| error.to_string())?;
@@ -168,6 +169,7 @@ where
     let mut keys = Vec::new();
     let mut url = format!("{APP_ORIGIN}/");
     let mut asset_root = None;
+    let mut scale = 1.0_f32;
     let mut ticks = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
@@ -188,10 +190,11 @@ where
             "--asset-root" => {
                 asset_root = Some(PathBuf::from(next_value(&mut args, "--asset-root")?))
             }
+            "--scale" => scale = parse_scale(next_value(&mut args, "--scale")?)?,
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -210,6 +213,7 @@ where
         url,
         asset_root,
         ticks,
+        scale,
         viewport: Size {
             width: width as f32,
             height: height as f32,
@@ -235,6 +239,15 @@ fn parse_dimension(value: String, name: &str) -> Result<u32, String> {
         return Err(format!("{name} must be a positive integer"));
     }
     Ok(dimension)
+}
+
+fn parse_scale(value: String) -> Result<f32, String> {
+    let scale = value
+        .parse::<f32>()
+        .map_err(|_| "scale must be a positive number".to_string())?;
+    (scale.is_finite() && scale > 0.0)
+        .then_some(scale)
+        .ok_or_else(|| "scale must be a positive number".to_string())
 }
 
 fn parse_delay(value: String) -> Result<u64, String> {

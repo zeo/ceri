@@ -678,6 +678,23 @@ enum BinaryOperator {
     Or,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewportMetrics {
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) device_pixel_ratio: f32,
+}
+
+impl Default for ViewportMetrics {
+    fn default() -> Self {
+        Self {
+            width: 800.0,
+            height: 600.0,
+            device_pixel_ratio: 1.0,
+        }
+    }
+}
+
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
     resources: Option<ResourceBundle>,
@@ -708,6 +725,7 @@ pub struct ScriptRuntime {
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
+    viewport: ViewportMetrics,
     canvas_contexts: HashMap<NodePath, CanvasContextHandle>,
     canvas_commands: Vec<CanvasCommand>,
     logs: Vec<String>,
@@ -1708,6 +1726,7 @@ impl ScriptRuntime {
         let mut runtime = Self {
             document,
             resources,
+            viewport: ViewportMetrics::default(),
             resource_provider,
             base_url,
             global,
@@ -3163,6 +3182,10 @@ impl ScriptRuntime {
         self.scroll_offsets.get(path).copied().unwrap_or_default()
     }
 
+    pub(crate) fn set_viewport_metrics(&mut self, viewport: ViewportMetrics) {
+        self.viewport = viewport;
+    }
+
     pub(crate) fn document_scroll_offset(&self) -> (f32, f32) {
         self.scroll_offset(&[])
     }
@@ -4089,6 +4112,9 @@ impl ScriptRuntime {
                     .borrow()
                     .get("location")
                     .ok_or_else(|| runtime_error("window location is unavailable")),
+                "innerWidth" => Ok(Value::Number(self.viewport.width as f64)),
+                "innerHeight" => Ok(Value::Number(self.viewport.height as f64)),
+                "devicePixelRatio" => Ok(Value::Number(self.viewport.device_pixel_ratio as f64)),
                 "scrollX" | "pageXOffset" => {
                     Ok(Value::Number(self.document_scroll_offset().0 as f64))
                 }
