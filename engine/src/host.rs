@@ -1,6 +1,8 @@
 use crate::AccessibilityNode;
 use crate::layout::Size;
-use crate::navigation::{Browser, NavigationError, NavigationFailure, NavigationStatus};
+use crate::navigation::{
+    Browser, NavigationError, NavigationFailure, NavigationStatus, UserPreferences,
+};
 use crate::paint::Canvas;
 pub use crate::script::KeyModifiers;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -60,6 +62,7 @@ pub enum InputEvent {
     CompositionCancel,
     Blur,
     ScaleChanged(f32),
+    PreferencesChanged(UserPreferences),
     AdvanceTime(u64),
 }
 
@@ -349,6 +352,14 @@ impl EngineHost {
                 self.browser.set_viewport(self.viewport, self.scale);
                 InputResult {
                     frame_requested: true,
+                    ..InputResult::default()
+                }
+            }
+            InputEvent::PreferencesChanged(preferences) => {
+                let changed = self.browser.user_preferences() != preferences;
+                self.browser.set_user_preferences(preferences);
+                InputResult {
+                    frame_requested: changed,
                     ..InputResult::default()
                 }
             }

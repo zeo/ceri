@@ -136,6 +136,9 @@ fn main() -> Result<(), String> {
         Some(extension) if extension.eq_ignore_ascii_case("bmp") => {
             canvas.write_bmp(&options.output)
         }
+        Some(extension) if extension.eq_ignore_ascii_case("png") => {
+            canvas.write_png(&options.output)
+        }
         _ => canvas.write_ppm(&options.output),
     };
     write_image

@@ -1,8 +1,9 @@
+use crate::css::ColorScheme;
 use crate::host::{
     EngineWorker, EngineWorkerEvent, Frame, InputEvent, KeyModifiers, PointerButton,
 };
 use crate::layout::Size;
-use crate::navigation::{APP_ORIGIN, Browser};
+use crate::navigation::{APP_ORIGIN, Browser, UserPreferences};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -11,7 +12,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
 use winit::keyboard::{Key, ModifiersState};
-use winit::window::{Window, WindowId};
+use winit::window::{Theme, Window, WindowId};
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
@@ -62,6 +63,7 @@ where
         surface: None,
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
+        preferences: UserPreferences::default(),
         last_tick: Instant::now(),
     };
     event_loop
@@ -84,6 +86,7 @@ struct App {
     surface: Option<WindowSurface>,
     cursor: (f32, f32),
     modifiers: ModifiersState,
+    preferences: UserPreferences,
     last_tick: Instant,
 }
 
@@ -269,6 +272,24 @@ impl App {
         }
     }
 
+    fn window_color_scheme(&self) -> ColorScheme {
+        match self.window.as_ref().and_then(|window| window.theme()) {
+            Some(Theme::Dark) => ColorScheme::Dark,
+            Some(Theme::Light) => ColorScheme::Light,
+            None => self.preferences.color_scheme,
+        }
+    }
+
+    fn apply_preferences(&mut self, event_loop: &ActiveEventLoop, scheme: ColorScheme) {
+        let preferences = UserPreferences {
+            color_scheme: scheme,
+            ..self.preferences
+        };
+        if self.submit(event_loop, InputEvent::PreferencesChanged(preferences)) {
+            self.preferences = preferences;
+        }
+    }
+
     fn window_scale(&self) -> f32 {
         self.window
             .as_ref()
@@ -323,6 +344,10 @@ impl ApplicationHandler for App {
         if scale != self.scale {
             self.submit(event_loop, InputEvent::ScaleChanged(scale));
         }
+        let scheme = self.window_color_scheme();
+        if scheme != self.preferences.color_scheme {
+            self.apply_preferences(event_loop, scheme);
+        }
         self.request_redraw();
     }
 
@@ -347,6 +372,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.submit(event_loop, InputEvent::ScaleChanged(scale_factor as f32));
+                self.request_redraw();
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                let scheme = match theme {
+                    Theme::Dark => ColorScheme::Dark,
+                    Theme::Light => ColorScheme::Light,
+                };
+                self.apply_preferences(event_loop, scheme);
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {

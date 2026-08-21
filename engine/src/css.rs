@@ -199,6 +199,8 @@ pub(crate) struct StyleState {
     pub(crate) text_selections: BTreeMap<NodePath, (usize, usize, bool)>,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
+    pub(crate) color_scheme: ColorScheme,
+    pub(crate) reduced_motion: bool,
     pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
     pub(crate) root_path: Option<NodePath>,
 }
@@ -592,6 +594,15 @@ struct MediaCondition {
     max_width: Option<f32>,
     min_height: Option<f32>,
     max_height: Option<f32>,
+    color_scheme: Option<ColorScheme>,
+    reduced_motion: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorScheme {
+    #[default]
+    Light,
+    Dark,
 }
 
 impl MediaCondition {
@@ -607,6 +618,12 @@ impl MediaCondition {
             && self
                 .max_height
                 .is_none_or(|value| state.viewport_height <= value)
+            && self
+                .color_scheme
+                .is_none_or(|scheme| scheme == state.color_scheme)
+            && self
+                .reduced_motion
+                .is_none_or(|reduced| reduced == state.reduced_motion)
     }
 }
 
@@ -631,6 +648,8 @@ struct SelectorPart {
 enum Combinator {
     Descendant,
     Child,
+    NextSibling,
+    SubsequentSibling,
 }
 
 #[derive(Clone, Debug)]
@@ -656,7 +675,57 @@ enum PseudoClass {
     Checked,
     Disabled,
     Enabled,
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    NthChild(NthPattern),
     Not(Vec<Selector>),
+}
+
+// an+b as defined by Selectors Level 4, with odd and even folded into it
+#[derive(Clone, Copy, Debug)]
+struct NthPattern {
+    step: i32,
+    offset: i32,
+}
+
+impl NthPattern {
+    fn parse(argument: &str) -> Result<Self, String> {
+        let argument = argument.trim().to_ascii_lowercase();
+        match argument.as_str() {
+            "odd" => return Ok(Self { step: 2, offset: 1 }),
+            "even" => return Ok(Self { step: 2, offset: 0 }),
+            _ => {}
+        }
+        if let Ok(offset) = argument.parse::<i32>() {
+            return Ok(Self { step: 0, offset });
+        }
+        let Some((step_text, offset_text)) = argument.split_once('n') else {
+            return Err(format!("unsupported nth-child argument: {argument}"));
+        };
+        let step = match step_text.trim() {
+            "" | "+" => 1,
+            "-" => -1,
+            value => value
+                .parse::<i32>()
+                .map_err(|_| format!("unsupported nth-child step: {value}"))?,
+        };
+        let offset = match offset_text.replace(' ', "").as_str() {
+            "" => 0,
+            value => value
+                .parse::<i32>()
+                .map_err(|_| format!("unsupported nth-child offset: {value}"))?,
+        };
+        Ok(Self { step, offset })
+    }
+
+    fn matches(&self, position: i32) -> bool {
+        if self.step == 0 {
+            return position == self.offset;
+        }
+        let distance = position - self.offset;
+        distance % self.step == 0 && distance / self.step >= 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -680,11 +749,17 @@ impl Selector {
             if cursor >= source.len() {
                 break;
             }
-            if source.as_bytes()[cursor] == b'>' {
+            let explicit = match source.as_bytes()[cursor] {
+                b'>' => Some(Combinator::Child),
+                b'+' => Some(Combinator::NextSibling),
+                b'~' => Some(Combinator::SubsequentSibling),
+                _ => None,
+            };
+            if let Some(explicit) = explicit {
                 if parts.is_empty() || combinator.is_some() {
-                    return Err(format!("invalid child combinator in selector: {source}"));
+                    return Err(format!("invalid combinator in selector: {source}"));
                 }
-                combinator = Some(Combinator::Child);
+                combinator = Some(explicit);
                 cursor += 1;
                 continue;
             }
@@ -776,6 +851,35 @@ impl Selector {
                         )
                     })
             }
+            Some(Combinator::NextSibling) | Some(Combinator::SubsequentSibling) => {
+                let immediate = self.parts[index].combinator == Some(Combinator::NextSibling);
+                let Some(parent) = ancestors.last() else {
+                    return false;
+                };
+                let Some((&position, parent_path)) = path.split_last() else {
+                    return false;
+                };
+                let mut siblings = element_children(parent)
+                    .into_iter()
+                    .take_while(|(child_index, _)| *child_index < position)
+                    .collect::<Vec<_>>();
+                siblings.reverse();
+                if immediate {
+                    siblings.truncate(1);
+                }
+                siblings.into_iter().any(|(child_index, sibling)| {
+                    let mut sibling_path = parent_path.to_vec();
+                    sibling_path.push(child_index);
+                    self.matches_part(
+                        index - 1,
+                        &self.parts[index - 1].compound,
+                        sibling,
+                        &sibling_path,
+                        ancestors,
+                        state,
+                    )
+                })
+            }
             None => false,
         }
     }
@@ -859,6 +963,13 @@ impl PseudoClass {
             }
             Self::Disabled => state.is_disabled(element, path),
             Self::Enabled => !state.is_disabled(element, path),
+            Self::FirstChild => child_position(path, ancestors) == Some(1),
+            Self::LastChild => child_position(path, ancestors)
+                .is_some_and(|position| position == element_child_count(ancestors).unwrap_or(0)),
+            Self::OnlyChild => element_child_count(ancestors) == Some(1),
+            Self::NthChild(pattern) => {
+                child_position(path, ancestors).is_some_and(|position| pattern.matches(position))
+            }
             Self::Not(selectors) => !selectors
                 .iter()
                 .any(|selector| selector.matches(element, path, ancestors, state)),
@@ -875,6 +986,33 @@ impl PseudoClass {
             _ => Specificity(0, 1, 0),
         }
     }
+}
+
+fn element_children(parent: &Element) -> Vec<(usize, &Element)> {
+    parent
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| match node {
+            Node::Element(child) => Some((index, child)),
+            Node::Text(_) => None,
+        })
+        .collect()
+}
+
+fn element_child_count(ancestors: &[&Element]) -> Option<i32> {
+    ancestors
+        .last()
+        .map(|parent| element_children(parent).len() as i32)
+}
+
+fn child_position(path: &[usize], ancestors: &[&Element]) -> Option<i32> {
+    let parent = ancestors.last()?;
+    let &index = path.last()?;
+    element_children(parent)
+        .into_iter()
+        .position(|(child_index, _)| child_index == index)
+        .map(|position| position as i32 + 1)
 }
 
 fn skip_selector_whitespace(source: &str, cursor: &mut usize) -> bool {
@@ -910,6 +1048,9 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 let pseudo = if name == "not" {
                     let argument = parse_function_argument(source, cursor)?;
                     PseudoClass::Not(Selector::parse_list(&argument)?)
+                } else if name == "nth-child" {
+                    let argument = parse_function_argument(source, cursor)?;
+                    PseudoClass::NthChild(NthPattern::parse(&argument)?)
                 } else {
                     match name.as_str() {
                         "root" => PseudoClass::Root,
@@ -918,6 +1059,10 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                         "checked" => PseudoClass::Checked,
                         "disabled" => PseudoClass::Disabled,
                         "enabled" => PseudoClass::Enabled,
+                        "focus-visible" | "focus-within" => PseudoClass::Focus,
+                        "first-child" => PseudoClass::FirstChild,
+                        "last-child" => PseudoClass::LastChild,
+                        "only-child" => PseudoClass::OnlyChild,
                         _ => return Err(format!("unsupported pseudo-class: :{name}")),
                     }
                 };
@@ -1146,8 +1291,29 @@ fn parse_media_condition(header: &str) -> Result<MediaCondition, String> {
         let Some((name, value)) = feature.split_once(':') else {
             return Err(format!("unsupported media feature: {feature}"));
         };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "prefers-color-scheme" => {
+                condition.color_scheme = Some(match value {
+                    "dark" => ColorScheme::Dark,
+                    "light" => ColorScheme::Light,
+                    other => return Err(format!("unsupported color scheme: {other}")),
+                });
+                continue;
+            }
+            "prefers-reduced-motion" => {
+                condition.reduced_motion = Some(match value {
+                    "reduce" => true,
+                    "no-preference" => false,
+                    other => return Err(format!("unsupported motion preference: {other}")),
+                });
+                continue;
+            }
+            _ => {}
+        }
         let value = parse_media_dimension(value)?;
-        match name.trim().to_ascii_lowercase().as_str() {
+        match name.as_str() {
             "min-width" => condition.min_width = Some(value),
             "max-width" => condition.max_width = Some(value),
             "min-height" => condition.min_height = Some(value),
@@ -1692,7 +1858,9 @@ fn default_display(name: &str) -> Display {
         | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3"
         | "h4" | "h5" | "h6" | "header" | "hgroup" | "hr" | "main" | "nav" | "ol" | "p" | "pre"
         | "section" | "table" | "ul" => Display::Block,
-        "head" | "link" | "meta" | "script" | "style" | "title" => Display::None,
+        "head" | "link" | "meta" | "noscript" | "script" | "style" | "template" | "title" => {
+            Display::None
+        }
         _ => Display::Inline,
     }
 }
@@ -2081,6 +2249,85 @@ mod tests {
         assert!(dropped[1].starts_with("unsupported at-rule: @keyframes"));
         assert!(dropped[2].contains("invalid declaration: color:"));
         assert!(Stylesheet::parse("body::before { content: \"\"; }").is_err());
+    }
+
+    #[test]
+    fn matches_sibling_combinators_and_structural_pseudo_classes() {
+        let stylesheet = Stylesheet::parse(
+            "p + p { color: red; } h1 ~ p { background-color: green; } li:first-child { color: blue; } li:last-child { color: yellow; } li:nth-child(2n) { border-width: 3px; }",
+        )
+        .expect("stylesheet should parse");
+        let mut list = Element::new("ul");
+        for _ in 0..3 {
+            list.children.push(Node::Element(Element::new("li")));
+        }
+        let mut section = Element::new("section");
+        section.children.push(Node::Element(Element::new("h1")));
+        section.children.push(Node::Text(" ".to_string()));
+        section.children.push(Node::Element(Element::new("p")));
+        section.children.push(Node::Element(Element::new("p")));
+        let state = StyleState::default();
+        let style = |element: &Element, path: &[usize], ancestors: &[&Element]| {
+            stylesheet.style_for(StyleContext {
+                element,
+                path,
+                ancestors,
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::Normal,
+                state: &state,
+            })
+        };
+
+        let paragraph = Element::new("p");
+        let first_paragraph = style(&paragraph, &[2], &[&section]);
+        assert_eq!(first_paragraph.color, Color::BLACK);
+        assert_eq!(first_paragraph.background, Color::opaque(0, 128, 0));
+        let second_paragraph = style(&paragraph, &[3], &[&section]);
+        assert_eq!(second_paragraph.color, Color::opaque(255, 0, 0));
+        assert_eq!(second_paragraph.background, Color::opaque(0, 128, 0));
+
+        let item = Element::new("li");
+        assert_eq!(style(&item, &[0], &[&list]).color, Color::opaque(0, 0, 255));
+        assert_eq!(
+            style(&item, &[2], &[&list]).color,
+            Color::opaque(255, 255, 0)
+        );
+        assert_eq!(style(&item, &[1], &[&list]).border_width, 3.0);
+        assert_eq!(style(&item, &[0], &[&list]).border_width, 0.0);
+    }
+
+    #[test]
+    fn media_queries_read_host_color_scheme_and_motion_preferences() {
+        let stylesheet = Stylesheet::parse(
+            "@media (prefers-color-scheme: dark) { p { color: red; } } @media (prefers-reduced-motion: reduce) { p { background-color: green; } }",
+        )
+        .expect("stylesheet should parse");
+        let paragraph = Element::new("p");
+        let style_with = |state: &StyleState| {
+            stylesheet.style_for(StyleContext {
+                element: &paragraph,
+                path: &[0],
+                ancestors: &[],
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::Normal,
+                state,
+            })
+        };
+
+        let light = StyleState::default();
+        assert_eq!(style_with(&light).color, Color::BLACK);
+        let dark = StyleState {
+            color_scheme: ColorScheme::Dark,
+            ..StyleState::default()
+        };
+        assert_eq!(style_with(&dark).color, Color::opaque(255, 0, 0));
+        let still = StyleState {
+            reduced_motion: true,
+            ..StyleState::default()
+        };
+        assert_eq!(style_with(&still).background, Color::opaque(0, 128, 0));
     }
 
     #[test]

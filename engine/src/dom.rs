@@ -1490,7 +1490,7 @@ fn is_accessibility_focusable(element: &Element) -> bool {
 fn is_accessibility_hidden(element: &Element) -> bool {
     if matches!(
         element.name.as_str(),
-        "head" | "link" | "meta" | "script" | "style" | "template" | "title"
+        "head" | "link" | "meta" | "noscript" | "script" | "style" | "template" | "title"
     ) || (element.name == "input"
         && element
             .attr("type")

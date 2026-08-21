@@ -12,7 +12,7 @@ mod wasm;
 #[cfg(feature = "windowed")]
 mod window;
 
-pub use css::{Color, Display, Stylesheet};
+pub use css::{Color, ColorScheme, Display, Stylesheet};
 pub use dom::{
     AccessibilityNode, Document, Element, Node, NodeId, NodePath, ParseError, ScriptSource,
     StylesheetSource,
@@ -27,7 +27,8 @@ pub use native_http::NativeHttpProvider;
 pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, ClipboardProvider, FilePicker, FilePickerRequest, FileSelection,
     NavigationError, NavigationFailure, NavigationStatus, Resource, ResourceBundle,
-    ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse, mime_type_for,
+    ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse, UserPreferences,
+    mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};

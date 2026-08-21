@@ -1,4 +1,4 @@
-use crate::css::Stylesheet;
+use crate::css::{ColorScheme, Stylesheet};
 use crate::dom::{AccessibilityNode, Document, NodePath, ScriptSource, StylesheetSource};
 use crate::image::parse_svg;
 use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
@@ -754,6 +754,13 @@ pub struct Browser {
     hovered_path: Option<NodePath>,
     host_runtime_info: Option<HostRuntimeInfo>,
     viewport: ViewportMetrics,
+    preferences: UserPreferences,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UserPreferences {
+    pub color_scheme: ColorScheme,
+    pub reduced_motion: bool,
 }
 
 impl Browser {
@@ -777,6 +784,7 @@ impl Browser {
             hovered_path: None,
             host_runtime_info: None,
             viewport: ViewportMetrics::default(),
+            preferences: UserPreferences::default(),
         }
     }
 
@@ -829,6 +837,14 @@ impl Browser {
 
     pub fn device_pixel_ratio(&self) -> f32 {
         self.viewport.device_pixel_ratio
+    }
+
+    pub fn set_user_preferences(&mut self, preferences: UserPreferences) {
+        self.preferences = preferences;
+    }
+
+    pub fn user_preferences(&self) -> UserPreferences {
+        self.preferences
     }
 
     fn load_resource(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
@@ -1326,6 +1342,8 @@ impl Browser {
         let mut style_state = page.runtime.style_state(self.hovered_path.clone());
         style_state.viewport_width = viewport.width;
         style_state.viewport_height = viewport.height;
+        style_state.color_scheme = self.preferences.color_scheme;
+        style_state.reduced_motion = self.preferences.reduced_motion;
         let mut layout = build_layout(&document, &stylesheet, viewport, &style_state);
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(base, &document, &mut layout);
