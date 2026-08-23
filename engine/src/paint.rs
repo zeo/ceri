@@ -549,6 +549,7 @@ pub(crate) fn paint_with_commands(
         &document.root,
         commands,
         &document.images,
+        &document.prose_selections,
         None,
         (0.0, 0.0),
     );
@@ -666,10 +667,19 @@ fn paint_box(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
+    prose_selections: &[(NodePath, usize, usize)],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
-    paint_context(canvas, layout_box, commands, images, clip, ancestor_offset);
+    paint_context(
+        canvas,
+        layout_box,
+        commands,
+        images,
+        prose_selections,
+        clip,
+        ancestor_offset,
+    );
 }
 
 fn paint_context(
@@ -677,6 +687,7 @@ fn paint_context(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
+    prose_selections: &[(NodePath, usize, usize)],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
@@ -691,12 +702,27 @@ fn paint_context(
             entry.layout,
             commands,
             images,
+            prose_selections,
             entry.clip,
             entry.ancestor_offset,
         );
     }
-    paint_box_text(canvas, layout_box, content_clip, offset);
-    paint_non_context_children(canvas, layout_box, commands, images, content_clip, offset);
+    paint_box_text(
+        canvas,
+        layout_box,
+        content_clip,
+        offset,
+        &prose_selections_for_box(layout_box, prose_selections),
+    );
+    paint_non_context_children(
+        canvas,
+        layout_box,
+        commands,
+        images,
+        prose_selections,
+        content_clip,
+        offset,
+    );
     paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
     for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
         paint_context(
@@ -704,6 +730,7 @@ fn paint_context(
             entry.layout,
             commands,
             images,
+            prose_selections,
             entry.clip,
             entry.ancestor_offset,
         );
@@ -716,6 +743,7 @@ fn paint_non_context_children(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
+    prose_selections: &[(NodePath, usize, usize)],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
@@ -724,7 +752,15 @@ fn paint_non_context_children(
         if child.creates_stacking_context {
             continue;
         }
-        paint_non_context_subtree(canvas, child, commands, images, clip, ancestor_offset);
+        paint_non_context_subtree(
+            canvas,
+            child,
+            commands,
+            images,
+            prose_selections,
+            clip,
+            ancestor_offset,
+        );
     }
 }
 
@@ -733,14 +769,29 @@ fn paint_non_context_subtree(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
+    prose_selections: &[(NodePath, usize, usize)],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
     let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect);
-    paint_box_text(canvas, layout_box, content_clip, offset);
-    paint_non_context_children(canvas, layout_box, commands, images, content_clip, offset);
+    paint_box_text(
+        canvas,
+        layout_box,
+        content_clip,
+        offset,
+        &prose_selections_for_box(layout_box, prose_selections),
+    );
+    paint_non_context_children(
+        canvas,
+        layout_box,
+        commands,
+        images,
+        prose_selections,
+        content_clip,
+        offset,
+    );
     paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
     paint_scrollbars(canvas, layout_box, offset, clip);
 }
@@ -844,12 +895,88 @@ fn paint_box_text(
     layout_box: &LayoutBox,
     clip: Option<Rect>,
     offset: (f32, f32),
+    prose_selections: &[(NodePath, usize, usize)],
 ) {
     paint_control_selection(canvas, layout_box, clip, offset);
+    paint_prose_selection(canvas, layout_box, prose_selections, clip, offset);
     for run in &layout_box.text {
         paint_text(canvas, run, clip, offset);
     }
     paint_control_caret(canvas, layout_box, clip, offset);
+}
+
+// highlights the selected UTF-16 span of runs that carry a DOM text node
+fn paint_prose_selection(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    prose_selections: &[(NodePath, usize, usize)],
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
+    for (path, start, end) in prose_selections {
+        for run in &layout_box.text {
+            if run.node_path.as_deref() != Some(path) || run.text.trim().is_empty() {
+                continue;
+            }
+            let run_units = run.text.encode_utf16().count();
+            let run_start = run.node_offset;
+            let run_end = run_start + run_units;
+            let selected_start = (*start).max(run_start);
+            let selected_end = (*end).min(run_end);
+            if selected_start >= selected_end {
+                continue;
+            }
+            let fonts = crate::font::active_fonts();
+            let height = if fonts.is_builtin() {
+                text_advance(run.font_size) / 6.0 * 7.0
+            } else {
+                run.font_size.max(1.0)
+            };
+            // the highlight spans from the first selected glyph to the last
+            let prefix_width = width_within_run(run, selected_start - run_start, &fonts);
+            let end_width = width_within_run(run, selected_end - run_start, &fonts);
+            let selected_width = (end_width - prefix_width).max(0.0);
+            fill_rect_optional(
+                canvas,
+                run.x + offset.0 + prefix_width,
+                run.y + offset.1,
+                selected_width,
+                height,
+                Color::opaque(170, 205, 238),
+                clip,
+            );
+        }
+    }
+}
+
+fn width_within_run(run: &TextRun, units: usize, fonts: &crate::font::FontSet) -> f32 {
+    let mut width = 0.0;
+    let mut consumed = 0;
+    for character in run.text.chars() {
+        if consumed >= units {
+            break;
+        }
+        width +=
+            fonts.advance(character, run.font_stack, run.font_size, run.bold) + run.letter_spacing;
+        consumed += character.len_utf16();
+    }
+    width
+}
+
+fn prose_selections_for_box(
+    layout_box: &LayoutBox,
+    prose_selections: &[(NodePath, usize, usize)],
+) -> Vec<(NodePath, usize, usize)> {
+    prose_selections
+        .iter()
+        .filter(|(path, _, _)| {
+            layout_box
+                .text
+                .iter()
+                .any(|run| run.node_path.as_deref() == Some(path))
+        })
+        .cloned()
+        .collect()
 }
 
 fn paint_control_selection(
@@ -1353,6 +1480,85 @@ mod tests {
     use crate::layout::{LayoutBox, LayoutDocument, Rect, Size};
 
     #[test]
+    fn prose_selection_highlight_covers_the_selected_glyph_span() {
+        let document = LayoutDocument {
+            viewport: Size {
+                width: 64.0,
+                height: 24.0,
+            },
+            root: LayoutBox {
+                path: Vec::new(),
+                tag: "root".to_string(),
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 24.0,
+                },
+                background: Color::opaque(245, 248, 250),
+                gradient: None,
+                border_radius: 0.0,
+                opacity: 1.0,
+                shadow: None,
+                border_width: 0.0,
+                border_color: Color::transparent(),
+                text: vec![TextRun {
+                    text: "ABCDEF".to_string(),
+                    x: 4.0,
+                    y: 2.0,
+                    width: 36.0,
+                    font_size: 12.0,
+                    letter_spacing: 0.0,
+                    font_stack: crate::font::FontStack::default(),
+                    color: Color::BLACK,
+                    bold: false,
+                    node_path: Some(vec![1, 0]),
+                    node_offset: 0,
+                }],
+                control_value: None,
+                control_selection: None,
+                control_focused: false,
+                control_text_origin: None,
+                children: Vec::new(),
+                position: crate::css::Position::Static,
+                visual_offset: (0.0, 0.0),
+                z_index: 0,
+                creates_stacking_context: true,
+                sticky_inset: crate::css::Edges::auto(),
+                font_size: 16.0,
+                overflow: Overflow::Visible,
+                scroll_content: Size {
+                    width: 64.0,
+                    height: 24.0,
+                },
+                scroll_offset: (0.0, 0.0),
+                margin: Default::default(),
+            },
+            images: Vec::new(),
+            prose_selections: vec![(vec![1, 0], 1, 2)],
+        };
+
+        let canvas = paint(&document);
+        let pixels = canvas.rgba_pixels();
+        let stride = canvas.width() as usize;
+        let page_background = [245, 248, 250];
+        let cell = text_advance(12.0);
+        let glyph_x = (4.0 + cell) as usize;
+        for row in 0..7 {
+            for column in 0..5 {
+                let x = glyph_x + column as usize;
+                let y = 2 + row as usize;
+                let index = (y * stride + x) * 4;
+                assert_ne!(
+                    pixels[index..index + 3],
+                    page_background,
+                    "pixel ({x},{y}) inside the selected glyph should sit on the highlight"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rounded_gradient_and_faded_surfaces_reach_the_pixels() {
         let document = Document::parse("<html><body><div id='card'></div></body></html>")
             .expect("document should parse");
@@ -1452,6 +1658,8 @@ mod tests {
                     font_stack: crate::font::FontStack::default(),
                     color: Color::WHITE,
                     bold: false,
+                    node_path: None,
+                    node_offset: 0,
                 }],
                 control_value: None,
                 control_selection: None,
@@ -1473,6 +1681,7 @@ mod tests {
                 margin: Default::default(),
             },
             images: Vec::new(),
+            prose_selections: Vec::new(),
         };
         let canvas = paint(&document);
         assert!(canvas.non_background_pixels() > 0);
@@ -1548,6 +1757,8 @@ mod tests {
                         font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
                         bold: false,
+                        node_path: None,
+                        node_offset: 0,
                     },
                     TextRun {
                         text: "CD".to_string(),
@@ -1559,6 +1770,8 @@ mod tests {
                         font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
                         bold: false,
+                        node_path: None,
+                        node_offset: 0,
                     },
                 ],
                 control_value: Some("ABCD".to_string()),
@@ -1581,6 +1794,7 @@ mod tests {
                 margin: Default::default(),
             },
             images: Vec::new(),
+            prose_selections: Vec::new(),
         };
         let canvas = paint(&document);
         let selection_index = ((20 * canvas.width() + 9) * 4) as usize;
@@ -1714,6 +1928,7 @@ mod tests {
                 margin: Default::default(),
             },
             images: Vec::new(),
+            prose_selections: Vec::new(),
         };
         let commands = [CanvasCommand::FillRect {
             path: vec![0],

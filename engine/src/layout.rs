@@ -38,6 +38,9 @@ pub struct TextRun {
     pub font_stack: FontStack,
     pub color: Color,
     pub bold: bool,
+    // DOM text node that produced this run, so prose can be selected by pointer
+    pub node_path: Option<NodePath>,
+    pub node_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,6 +87,8 @@ pub struct LayoutDocument {
     pub viewport: Size,
     pub root: LayoutBox,
     pub(crate) images: Vec<ImageLayer>,
+    // prose ranges to highlight, keyed by the DOM text node that owns the run
+    pub(crate) prose_selections: Vec<(NodePath, usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +122,8 @@ struct InlineFragment {
     font_stack: FontStack,
     color: Color,
     bold: bool,
+    node_path: Option<NodePath>,
+    node_offset: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +203,13 @@ struct InlineContext {
     content_width: f32,
     content_x: f32,
     align: TextAlign,
+}
+
+// which DOM text node the next appended words belong to, for prose selection
+#[derive(Clone)]
+struct InlineSource {
+    path: Option<NodePath>,
+    offset: usize,
 }
 
 struct InlineElementInput<'a> {
@@ -462,6 +476,7 @@ pub fn layout_with_state(
         viewport,
         root,
         images: Vec::new(),
+        prose_selections: Vec::new(),
     }
 }
 
@@ -491,6 +506,22 @@ impl LayoutDocument {
             Some((base, last.clone()))
         })?;
         Some((path, base + offset_within_run(&run, x - origin.0)))
+    }
+
+    // maps a point over prose to the DOM text node and UTF-16 offset it lands on
+    pub fn prose_text_offset_at(&self, x: f32, y: f32) -> Option<(NodePath, usize)> {
+        let mut found = Vec::new();
+        collect_prose_at(&self.root, x, y, (0.0, 0.0), &mut found);
+        // a drag past the end of a line clamps to its nearest run instead of missing
+        let (node_path, run) = found
+            .iter()
+            .filter(|(_, run)| run.x <= x)
+            .next_back()
+            .or_else(|| found.first())?;
+        Some((
+            node_path.clone(),
+            run.node_offset + offset_within_run(run, x - run.x),
+        ))
     }
 }
 
@@ -526,6 +557,32 @@ fn collect_control_at(
     }
     for child in &layout_box.children {
         collect_control_at(child, x, y, offset, found);
+    }
+}
+
+fn collect_prose_at(
+    layout_box: &LayoutBox,
+    _x: f32,
+    y: f32,
+    ancestor_offset: (f32, f32),
+    found: &mut Vec<(NodePath, TextRun)>,
+) {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    for run in &layout_box.text {
+        if run.node_path.is_none() || run.text.trim().is_empty() {
+            continue;
+        }
+        let top = run.y + offset.1;
+        let bottom = top + run.font_size.max(1.0);
+        if y >= top && y < bottom {
+            let mut hit = run.clone();
+            hit.x += offset.0;
+            hit.y += offset.1;
+            found.push((run.node_path.clone().expect("checked above"), hit));
+        }
+    }
+    for child in &layout_box.children {
+        collect_prose_at(child, _x, y, offset, found);
     }
 }
 
@@ -1190,6 +1247,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 font_stack: style.font_family,
                 color,
                 bold: style.font_weight == FontWeight::Bold,
+                node_path: None,
+                node_offset: 0,
             });
         }
         line.y = content_y + value_lines.len() as f32 * line_height;
@@ -1236,7 +1295,16 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     for (index, child) in sequence {
         match child {
             Node::Text(value) if element.name != "textarea" => {
-                append_inline_text(value, inline_context, &mut text, &mut line)
+                let source = InlineSource {
+                    // the run belongs to this element's text child at this index
+                    path: Some({
+                        let mut node_path = path.clone();
+                        node_path.push(index);
+                        node_path
+                    }),
+                    offset: 0,
+                };
+                append_inline_text(value, inline_context, source, &mut text, &mut line)
             }
             Node::Text(_) => {}
             Node::Element(_) if element.name == "textarea" => {}
@@ -2506,7 +2574,17 @@ fn append_inline_element(
     child_ancestors.push(element);
     for (index, child) in element.children.iter().enumerate() {
         match child {
-            Node::Text(value) => append_inline_text(value, child_context, text, line),
+            Node::Text(value) => {
+                let source = InlineSource {
+                    path: Some({
+                        let mut node_path = path.to_vec();
+                        node_path.push(index);
+                        node_path
+                    }),
+                    offset: 0,
+                };
+                append_inline_text(value, child_context, source, text, line)
+            }
             Node::Element(child) => {
                 let mut child_path = path.to_vec();
                 child_path.push(index);
@@ -2537,6 +2615,7 @@ fn append_inline_element(
 fn append_inline_text(
     value: &str,
     context: InlineContext,
+    source: InlineSource,
     text: &mut Vec<TextRun>,
     line: &mut InlineLine,
 ) {
@@ -2552,6 +2631,7 @@ fn append_inline_text(
         .next_back()
         .is_some_and(char::is_whitespace);
     let mut first_word = true;
+    let mut consumed = 0_usize;
     for word in transformed.split_ascii_whitespace() {
         let bold = context.weight == FontWeight::Bold;
         let word_width = measure_text(
@@ -2586,6 +2666,20 @@ fn append_inline_text(
         }
         let prefix = if space_width > 0.0 { " " } else { "" };
         let text = format!("{prefix}{word}");
+        // the word lands at its UTF-16 offset inside the source node, past any
+        // collapsed whitespace that word-wrapping dropped from this run
+        let node_offset = source
+            .path
+            .as_ref()
+            .map(|_| {
+                let start = transformed[consumed..]
+                    .find(word)
+                    .map(|relative| consumed + relative)
+                    .unwrap_or(consumed);
+                consumed = start + text.len();
+                value[..start].encode_utf16().count() + source.offset
+            })
+            .unwrap_or(source.offset);
         let width = measure_text(
             &text,
             context.text.family,
@@ -2603,6 +2697,8 @@ fn append_inline_text(
             font_stack: context.text.family,
             color: context.color.scale_alpha(context.opacity),
             bold,
+            node_path: source.path.clone(),
+            node_offset,
         });
         first_word = false;
     }
@@ -2638,6 +2734,8 @@ fn flush_line(
             font_stack: fragment.font_stack,
             color: fragment.color,
             bold: fragment.bold,
+            node_path: fragment.node_path,
+            node_offset: fragment.node_offset,
         });
         x += fragment.width;
     }

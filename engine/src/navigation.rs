@@ -1394,16 +1394,27 @@ impl Browser {
         y: f32,
         extend: bool,
     ) -> Result<bool, NavigationError> {
-        let target = {
+        let control = {
             let _fonts = crate::font::use_fonts(self.fonts.clone());
             self.layout(viewport)?.control_text_offset_at(x, y)
         };
-        let Some((path, offset)) = target else {
+        if let Some((path, offset)) = control {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            return page
+                .runtime
+                .select_control_offset(path, offset, extend)
+                .map_err(|error| NavigationError::Script(error.to_string()));
+        }
+        let prose = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?.prose_text_offset_at(x, y)
+        };
+        let Some((path, offset)) = prose else {
             return Ok(false);
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime
-            .select_control_offset(path, offset, extend)
+            .select_prose_offset(path, offset, extend)
             .map_err(|error| NavigationError::Script(error.to_string()))
     }
 
@@ -1585,6 +1596,7 @@ impl Browser {
         style_state.transitions = self.transitions.clone();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
+        layout.prose_selections = page.runtime.prose_selections();
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(base, &document, &mut layout);
         }

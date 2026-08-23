@@ -1049,6 +1049,102 @@ mod tests {
     }
 
     #[test]
+    fn pointer_drag_selects_prose_and_ctrl_c_copies_it() {
+        use crate::navigation::ClipboardProvider;
+
+        struct RecordingClipboard {
+            text: std::cell::RefCell<String>,
+        }
+
+        impl ClipboardProvider for RecordingClipboard {
+            fn read_text(&self) -> Result<String, NavigationError> {
+                Ok(self.text.borrow().clone())
+            }
+
+            fn write_text(&self, text: &str) -> Result<(), NavigationError> {
+                *self.text.borrow_mut() = text.to_string();
+                Ok(())
+            }
+        }
+
+        let clipboard = Rc::new(RecordingClipboard {
+            text: std::cell::RefCell::new(String::new()),
+        });
+        let browser = Browser::new(bundle(
+            "<style>p { margin: 0; font-size: 16px; }</style><p id='copy'>selectable prose</p>",
+        ))
+        .with_clipboard_provider(clipboard.clone());
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        // dragging across the paragraph selects its text
+        assert!(
+            host.input(InputEvent::PointerDown {
+                x: 12.0,
+                y: 14.0,
+                button: PointerButton::Primary,
+            })
+            .expect("pointer down should be accepted")
+            .handled,
+            "pressing on prose should start a selection"
+        );
+        assert!(
+            host.input(InputEvent::PointerMove { x: 300.0, y: 10.0 })
+                .expect("pointer move should be accepted")
+                .handled,
+            "dragging over prose should extend the selection"
+        );
+        host.input(InputEvent::PointerUp {
+            x: 300.0,
+            y: 14.0,
+            button: PointerButton::Primary,
+        })
+        .expect("pointer up should be accepted");
+
+        // the selection paints as a highlight behind the glyphs
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout should resolve");
+        assert!(
+            !layout.prose_selections.is_empty(),
+            "the drag should leave a document selection"
+        );
+        let canvas = layout.paint();
+        let pixels = canvas.rgba_pixels();
+        let highlight_count = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] == [170, 205, 238])
+            .count();
+        assert!(
+            highlight_count > 0,
+            "the selected span should paint the highlight colour"
+        );
+        // Ctrl+C copies the prose through the host clipboard seam
+        let copy = InputEvent::KeyDownWithModifiers {
+            key: "c".to_string(),
+            modifiers: KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        };
+        assert!(host.input(copy).expect("copy should be handled").handled);
+        let copied = clipboard.text.borrow().clone();
+        assert!(
+            ["selectable", "prose"]
+                .iter()
+                .any(|word| copied.contains(word)),
+            "the copied text should come from the paragraph, got {copied:?}"
+        );
+    }
+
+    #[test]
     fn a_host_can_show_the_engine_recovery_document_after_a_restart() {
         let mut host = EngineHost::new(
             Browser::new(bundle("<main><p id='status'>ready</p></main>")),

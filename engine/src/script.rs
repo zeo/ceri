@@ -3037,11 +3037,39 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = self.focused_element.clone() else {
+        // a document-level shortcut still runs with no focused element; the
+        // keydown event targets the document element in that case
+        let document_shortcut_target = (modifiers.control || modifiers.meta)
+            && !modifiers.alt
+            && key.eq_ignore_ascii_case("c");
+        let has_copyable_prose = self
+            .selection
+            .borrow()
+            .range
+            .clone()
+            .is_some_and(|range| !self.range_is_collapsed(&range.borrow()));
+        if self.focused_element.is_none() && !(document_shortcut_target && has_copyable_prose) {
             return Ok(false);
+        }
+        let dispatch_target = self.focused_element.clone().or_else(|| {
+            Some(
+                self.document
+                    .borrow()
+                    .document_element_path()
+                    .unwrap_or_default(),
+            )
+        });
+        let path = match &dispatch_target {
+            Some(target) => target.clone(),
+            None => return Ok(false),
         };
-        let dispatch =
-            self.dispatch_event_with_modifiers(path.clone(), "keydown", key, "", modifiers)?;
+        let dispatch = self.dispatch_event_with_modifiers(
+            dispatch_target.expect("target was checked"),
+            "keydown",
+            key,
+            "",
+            modifiers,
+        )?;
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
@@ -3052,6 +3080,19 @@ impl ScriptRuntime {
             }
             let moved = self.move_focus_sequential(modifiers.shift)?;
             return Ok(dispatch.handled || moved);
+        }
+        // Ctrl or Cmd with C copies prose when the document selection is non-empty
+        if (modifiers.control || modifiers.meta)
+            && !modifiers.alt
+            && key.eq_ignore_ascii_case("c")
+            && let Some(range) = self.selection.borrow().range.clone()
+            && !self.range_is_collapsed(&range.borrow())
+            && let Some(clipboard) = self.clipboard_provider.clone()
+        {
+            clipboard
+                .write_text(&self.range_to_string(&range))
+                .map_err(|error| runtime_error(format!("clipboard write failed: {error}")))?;
+            return Ok(true);
         }
         if dispatch.default_prevented || !self.is_text_control_path(&path) {
             return Ok(dispatch.handled);
@@ -3198,6 +3239,34 @@ impl ScriptRuntime {
         &self.canvas_commands
     }
 
+    // document prose ranges as (text node path, start, end) for paint highlighting
+    pub(crate) fn prose_selections(&self) -> Vec<(NodePath, usize, usize)> {
+        let Some(range) = self.selection.borrow().range.clone() else {
+            return Vec::new();
+        };
+        let range = range.borrow();
+        let Some(start_node) = attached_path(&range.start.node) else {
+            return Vec::new();
+        };
+        let Some(end_node) = attached_path(&range.end.node) else {
+            return Vec::new();
+        };
+        if start_node != end_node {
+            return Vec::new();
+        }
+        let document = self.document.borrow();
+        let length = document
+            .node_text_content(&start_node)
+            .map(|content| content.encode_utf16().count())
+            .unwrap_or_default();
+        let start = range.start.offset.min(length);
+        let end = range.end.offset.min(length);
+        if start == end {
+            return Vec::new();
+        }
+        vec![(start_node, start.min(end), start.max(end))]
+    }
+
     pub(crate) fn style_state(&self, hovered_path: Option<NodePath>) -> StyleState {
         let mut state = StyleState {
             hovered_path,
@@ -3276,6 +3345,62 @@ impl ScriptRuntime {
         };
         let moved = self.set_text_selection(path, start, end, direction)?;
         Ok(focused || moved)
+    }
+
+    // a pointer press or drag over prose moves or extends the document selection
+    pub(crate) fn select_prose_offset(
+        &mut self,
+        path: NodePath,
+        offset: usize,
+        extend: bool,
+    ) -> Result<bool, ScriptError> {
+        let Some(node) = attached_handle(path, &self.document) else {
+            return Ok(false);
+        };
+        let node_path = attached_path(&node).unwrap_or_default();
+        let content = self
+            .document
+            .borrow()
+            .node_text_content(&node_path)
+            .unwrap_or_default();
+        let offset = offset.min(utf16_len(&content));
+        let boundary = RangeBoundary { node, offset };
+        let existing = self.selection.borrow().range.clone();
+        let changed = match (existing, extend) {
+            (Some(range), true) => {
+                let anchor_position = range.borrow().start.clone();
+                let anchor = self.range_boundary_position(&anchor_position);
+                let focus_position = self.range_boundary_position(&boundary);
+                let mut range_data = range.borrow_mut();
+                let previous = range_data.clone();
+                if anchor
+                    .zip(focus_position)
+                    .is_some_and(|(anchor, focus)| focus < anchor)
+                {
+                    range_data.start = boundary;
+                } else {
+                    range_data.end = boundary;
+                }
+                *range_data != previous
+            }
+            _ => {
+                let previous = self.selection.borrow().range.clone();
+                let collapsed = Rc::new(RefCell::new(RangeData {
+                    start: boundary.clone(),
+                    end: boundary,
+                }));
+                self.track_range(&collapsed);
+                let changed =
+                    previous.is_none_or(|previous| *previous.borrow() != *collapsed.borrow());
+                self.selection.borrow_mut().range.replace(collapsed);
+                changed
+            }
+        };
+        if changed {
+            self.dispatch_document_selection_change()?;
+        }
+        // a resolved press starts the selection gesture even when the range did not move
+        Ok(true)
     }
 
     pub(crate) fn control_value(&self, path: &[usize]) -> Option<String> {

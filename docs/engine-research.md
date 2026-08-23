@@ -15,8 +15,8 @@ CEF stays the default engine anyway, and the reason is compatibility rather than
 - media playback, WebGL and other GPU APIs
 - cross-origin policy beyond an operator allowlist, so there is no CORS preflight, no cookie jar and no credential mode
 - CSS transforms beyond translate, so rotation, scale, skew, and 3D transforms stay unrendered
-- transitions on properties outside the ten the engine treats as animatable
-- pointer selection of prose outside form fields, and scrollbar thumb dragging
+- transitions on properties outside the eleven the engine treats as animatable
+- scrollbar thumb dragging
 - full WebAssembly beyond the bounded i32 module path
 - multi-process renderer isolation and a per-renderer sandbox
 - platform accessibility adapters, so the accessibility tree has no UIA, AT-SPI or NSAccessibility bridge yet
@@ -24,6 +24,8 @@ CEF stays the default engine anyway, and the reason is compatibility rather than
 - any browser-compatibility suite result, including web-platform-tests
 
 The Servo comparison track stays open for the layers where growing our own engine is the worse trade, particularly GPU-backed compositing and media.
+
+Pointer selection now covers prose outside form fields. A press over a text run collapses the document selection to that spot, a drag extends it, and layout tags each run with the DOM text node and UTF-16 offset it came from so hit testing resolves to node-and-offset boundaries even across word-wrapped runs. Selected spans paint as highlight rectangles behind glyphs with widths measured in the active font, and Ctrl or Cmd with C copies the selection through the host clipboard seam when no editable control has focus. Cross-node selection ranges, double-click word selection, and Shift plus arrow-key extension over prose remain open.
 
 That gives three separable goals:
 
