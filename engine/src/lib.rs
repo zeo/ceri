@@ -24,7 +24,7 @@ pub use host::{
     PointerButton,
 };
 pub use image::rasterize_svg_icon;
-pub use layout::{LayoutDocument, Rect, Size, layout};
+pub use layout::{LayoutDocument, Rect, Size, ThumbDrag, layout};
 #[cfg(feature = "native-http")]
 pub use native_http::{NativeHttpProvider, request_external};
 pub use navigation::{

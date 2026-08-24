@@ -604,6 +604,11 @@ impl LayoutDocument {
     pub(crate) fn scroll_target_at(&self, x: f32, y: f32) -> Option<ScrollTarget> {
         scroll_target_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
+
+    // maps a pointer over a scrollbar thumb to the drag state that moves it
+    pub(crate) fn thumb_drag_at(&self, x: f32, y: f32) -> Option<ThumbDrag> {
+        thumb_drag_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -612,6 +617,19 @@ pub(crate) struct ScrollTarget {
     pub(crate) max_x: f32,
     pub(crate) max_y: f32,
     pub(crate) offset: (f32, f32),
+}
+
+#[derive(Clone, Debug)]
+pub struct ThumbDrag {
+    pub(crate) path: NodePath,
+    // track rectangle and thumb geometry in viewport coordinates
+    pub track: Rect,
+    pub vertical: bool,
+    pub thumb_extent: f32,
+    // pointer position along the track minus the thumb's own start
+    pub grab: f32,
+    pub(crate) offset: (f32, f32),
+    pub(crate) max_offset: f32,
 }
 
 pub(crate) const SCROLLBAR_THICKNESS: f32 = 12.0;
@@ -1014,6 +1032,90 @@ fn scroll_target_box(
 
 fn contains_point(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+}
+
+fn thumb_drag_box(
+    layout_box: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) -> Option<ThumbDrag> {
+    if let Some(clip) = clip
+        && !contains_point(clip, x, y)
+    {
+        return None;
+    }
+    let visual_offset = visual_offset_for(layout_box, ancestor_offset);
+    let child_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
+        || layout_box.path.is_empty()
+    {
+        intersect_rect(
+            clip,
+            translate_rect(scrollbar_metrics(layout_box).scrollport, visual_offset),
+        )
+    } else {
+        clip
+    };
+    for child in &layout_box.children {
+        if let Some(target) = thumb_drag_box(child, x, y, child_clip, visual_offset) {
+            return Some(target);
+        }
+    }
+    let metrics = scrollbar_metrics(layout_box);
+    for (track_rect, vertical) in [
+        (metrics.vertical_track, true),
+        (metrics.horizontal_track, false),
+    ] {
+        let Some(track) = track_rect else { continue };
+        let track = translate_rect(track, visual_offset);
+        if !contains_point(track, x, y) {
+            continue;
+        }
+        let extent = |rect: Rect| if vertical { rect.height } else { rect.width };
+        let viewport_extent = if vertical {
+            metrics.scrollport.height
+        } else {
+            metrics.scrollport.width
+        };
+        let content_extent = if vertical {
+            layout_box.scroll_content.height
+        } else {
+            layout_box.scroll_content.width
+        };
+        let offset_along = if vertical {
+            layout_box.scroll_offset.1
+        } else {
+            layout_box.scroll_offset.0
+        };
+        let max_offset = (content_extent - viewport_extent).max(0.0);
+        let minimum = 8.0_f32.min(extent(track));
+        let thumb_extent = if content_extent > 0.0 {
+            (extent(track) * (viewport_extent / content_extent).clamp(0.0, 1.0))
+                .max(minimum)
+                .min(extent(track))
+        } else {
+            extent(track)
+        };
+        let travel = (extent(track) - thumb_extent).max(0.0);
+        let progress = if max_offset > 0.0 {
+            (offset_along / max_offset).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let pointer_along = if vertical { y } else { x } - if vertical { track.y } else { track.x };
+        return Some(ThumbDrag {
+            path: layout_box.path.clone(),
+            track,
+            vertical,
+            thumb_extent,
+            // where the pointer sits inside the thumb, kept through the drag
+            grab: (pointer_along - travel * progress).clamp(0.0, thumb_extent),
+            offset: layout_box.scroll_offset,
+            max_offset,
+        });
+    }
+    None
 }
 
 fn intersect_rect(parent: Option<Rect>, rect: Rect) -> Option<Rect> {

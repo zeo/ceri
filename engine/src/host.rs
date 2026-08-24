@@ -87,6 +87,7 @@ pub struct EngineHost {
     viewport: Size,
     scale: f32,
     selecting: bool,
+    selecting_thumb: Option<crate::ThumbDrag>,
     next_frame: u64,
     dirty: bool,
 }
@@ -283,6 +284,7 @@ impl EngineHost {
             viewport,
             scale,
             selecting: false,
+            selecting_thumb: None,
             next_frame: 1,
             dirty: true,
         }
@@ -374,11 +376,15 @@ impl EngineHost {
                 let dispatched = self
                     .browser
                     .dispatch_at(self.viewport, x, y, "pointermove")?;
+                let dragged = match &self.selecting_thumb {
+                    Some(drag) => self.browser.drag_thumb(drag, x, y)?,
+                    _ => false,
+                };
                 let extended =
                     self.selecting && self.browser.select_at(self.viewport, x, y, true)?;
                 InputResult {
-                    handled: dispatched || extended,
-                    frame_requested: extended,
+                    handled: dispatched || dragged || extended,
+                    frame_requested: dragged || extended,
                     ..InputResult::default()
                 }
             }
@@ -386,18 +392,25 @@ impl EngineHost {
                 let dispatched = self
                     .browser
                     .dispatch_at(self.viewport, x, y, "pointerdown")?;
+                let thumb_drag = (button == PointerButton::Primary)
+                    .then(|| self.browser.thumb_at(self.viewport, x, y))
+                    .flatten();
+                if let Some(drag) = &thumb_drag {
+                    self.selecting_thumb = Some(drag.clone());
+                }
                 let selected = button == PointerButton::Primary
                     && self.browser.select_at(self.viewport, x, y, false)?;
                 self.selecting = selected;
                 InputResult {
-                    handled: dispatched || selected,
-                    frame_requested: selected,
+                    handled: dispatched || thumb_drag.is_some() || selected,
+                    frame_requested: thumb_drag.is_some() || selected,
                     ..InputResult::default()
                 }
             }
             InputEvent::PointerUp { x, y, button } => {
                 if button == PointerButton::Primary {
                     self.selecting = false;
+                    self.selecting_thumb = None;
                 }
                 InputResult {
                     handled: self.browser.dispatch_at(self.viewport, x, y, "pointerup")?,
@@ -782,6 +795,62 @@ mod tests {
             })
             .expect("scrolled scrollbar page should layout");
         assert_eq!(layout.root.children[0].scroll_offset, (0.0, 10.0));
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_thumb_scrolls_with_the_pointer() {
+        let browser = Browser::new(bundle(
+            r#"<style>
+                #viewport { width: 60px; height: 60px; overflow: auto; margin: 0; }
+                #content { width: 40px; height: 300px; margin: 0; }
+            </style>
+            <div id="viewport"><div id="content"></div></div>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("scrollbar page should load");
+
+        // the vertical thumb sits at the top of the track beside the viewport
+        let press = InputEvent::PointerDown {
+            x: 53.0,
+            y: 5.0,
+            button: PointerButton::Primary,
+        };
+        let pressed = host.input(press).expect("thumb press should be accepted");
+        assert!(pressed.handled, "pressing the thumb should start a drag");
+
+        // dragging down by half the track pulls the content with the pointer
+        let drag = InputEvent::PointerMove { x: 53.0, y: 20.0 };
+        let moved = host.input(drag).expect("thumb drag should be accepted");
+        assert!(moved.handled, "dragging should scroll");
+        assert!(moved.frame_requested);
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("dragged page should layout");
+        let offset = layout.root.children[0].scroll_offset.1;
+        assert!(
+            offset > 5.0,
+            "a downward drag should scroll down, got {offset}"
+        );
+
+        // releasing ends the drag so later moves stop scrolling
+        host.input(InputEvent::PointerUp {
+            x: 53.0,
+            y: 20.0,
+            button: PointerButton::Primary,
+        })
+        .expect("release should be accepted");
+        let idle = host
+            .input(InputEvent::PointerMove { x: 53.0, y: 40.0 })
+            .expect("post-release move should be accepted");
+        assert!(!idle.handled, "moving after release should not scroll");
     }
 
     #[test]

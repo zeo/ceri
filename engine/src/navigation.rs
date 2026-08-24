@@ -4,7 +4,9 @@ use crate::dom::{
 };
 use crate::font::FontSet;
 use crate::image::parse_svg;
-use crate::layout::{ImageLayer, LayoutDocument, Size, layout_with_state as build_layout};
+use crate::layout::{
+    ImageLayer, LayoutDocument, Size, ThumbDrag, layout_with_state as build_layout,
+};
 use crate::paint::Canvas;
 use crate::script::{
     HostRuntimeInfo, KeyModifiers, ModuleSourceLoader, NavigationRequest, ScriptRuntime,
@@ -1374,6 +1376,73 @@ impl Browser {
                 } else {
                     page.runtime
                         .dispatch_path_event(target.path, "scroll")
+                        .map_err(|error| NavigationError::Script(error.to_string()))?;
+                }
+            }
+            changed
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(changed)
+        }
+    }
+
+    // returns the scrollbar thumb drag state under a pointer press
+    pub fn thumb_at(&self, viewport: Size, x: f32, y: f32) -> Option<ThumbDrag> {
+        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        self.layout(viewport).ok()?.thumb_drag_at(x, y)
+    }
+
+    // moves a scrollbar thumb so the pointer stays grabbed at its press offset
+    pub fn drag_thumb(
+        &mut self,
+        drag: &ThumbDrag,
+        x: f32,
+        y: f32,
+    ) -> Result<bool, NavigationError> {
+        // the thumb keeps the pointer's offset inside it from the press, so it
+        // does not jump to center under the pointer
+        let travel = (if drag.vertical {
+            drag.track.height
+        } else {
+            drag.track.width
+        } - drag.thumb_extent)
+            .max(0.0);
+
+        let pointer_along = (if drag.vertical { y } else { x })
+            - if drag.vertical {
+                drag.track.y
+            } else {
+                drag.track.x
+            }
+            - drag.grab;
+        let offset_along = if travel > 0.0 && drag.max_offset > 0.0 {
+            (pointer_along / travel).clamp(0.0, 1.0) * drag.max_offset
+        } else if drag.vertical {
+            drag.offset.1
+        } else {
+            drag.offset.0
+        };
+        let offset = if drag.vertical {
+            (drag.offset.0, offset_along)
+        } else {
+            (offset_along, drag.offset.1)
+        };
+        if offset == drag.offset {
+            return Ok(false);
+        }
+        let changed = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            let changed = page.runtime.set_scroll_offset(drag.path.clone(), offset);
+            if changed {
+                if drag.path.is_empty() {
+                    page.runtime
+                        .dispatch_window_event("scroll")
+                        .map_err(|error| NavigationError::Script(error.to_string()))?;
+                } else {
+                    page.runtime
+                        .dispatch_path_event(drag.path.clone(), "scroll")
                         .map_err(|error| NavigationError::Script(error.to_string()))?;
                 }
             }
