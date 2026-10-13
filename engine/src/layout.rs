@@ -102,6 +102,8 @@ pub struct LayoutBox {
     pub rect: Rect,
     pub background: Color,
     pub gradient: Option<Gradient>,
+    pub(crate) background_image: Option<crate::css::BackgroundImage>,
+    pub(crate) object_fit: crate::css::ObjectFit,
     pub border_radius: f32,
     pub opacity: f32,
     pub shadow: Option<ResolvedShadow>,
@@ -137,7 +139,9 @@ pub struct LayoutDocument {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ImageLayer {
     pub(crate) path: NodePath,
-    pub(crate) image: Image,
+    pub(crate) image: std::rc::Rc<Image>,
+    // a CSS background rather than the element's own content
+    pub(crate) background: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -155,6 +159,8 @@ struct InlineLine {
     // whether the text appended so far ended on whitespace, which decides word joining
     trailing_space: bool,
     fragments: Vec<InlineFragment>,
+    // inline-block and replaced boxes already placed by a flushed line
+    placed: Vec<LayoutBox>,
 }
 
 struct InlineFragment {
@@ -168,6 +174,9 @@ struct InlineFragment {
     node_path: Option<NodePath>,
     node_offset: usize,
     source_len: usize,
+    line_height: f32,
+    // an inline-block or replaced element that sits on the line like a word
+    atomic: Option<Box<LayoutBox>>,
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +273,8 @@ struct InlineElementInput<'a> {
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
     ancestors: &'a [&'a Element],
+    viewport: Size,
+    containing_block: ContainingBlock,
 }
 
 struct FlexItem<'a> {
@@ -422,6 +433,8 @@ pub fn layout_with_state(
         },
         background: Color::transparent(),
         gradient: None,
+        background_image: None,
+        object_fit: crate::css::ObjectFit::Fill,
         border_radius: 0.0,
         opacity: 1.0,
         shadow: None,
@@ -1323,8 +1336,16 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     .max(0.0)
             })
         })
+        .or_else(|| {
+            style
+                .aspect_ratio
+                .zip(explicit_height)
+                .map(|(ratio, height)| height * ratio)
+        })
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
         .max(0.0);
+    let explicit_height =
+        explicit_height.or_else(|| style.aspect_ratio.map(|ratio| content_width / ratio));
     let border_box_width = content_width + padding.left + padding.right + (border * 2.0);
     let rect = Rect {
         x: if mode == LayoutMode::Flow {
@@ -1412,6 +1433,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         used: 0.0,
         height: line_height,
         fragments: Vec::new(),
+        placed: Vec::new(),
     };
     let mut text = Vec::new();
     let control_value = text_control_value(element, &path, style_state);
@@ -1550,6 +1572,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         content_width,
                         style.text_align,
                     );
+                    children.append(&mut line.placed);
                     if let Some(child_box) = layout_element(ElementLayoutInput {
                         node: LayoutNode {
                             element: child_element,
@@ -1596,6 +1619,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                             stylesheet,
                             style_state,
                             ancestors: &child_ancestors,
+                            viewport,
+                            containing_block: descendant_block,
                         },
                         &mut text,
                         &mut line,
@@ -1611,6 +1636,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         content_width,
         style.text_align,
     );
+    children.append(&mut line.placed);
     let content_height = explicit_height
         .unwrap_or((line.y - content_y).max(0.0))
         .max(0.0);
@@ -1625,6 +1651,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         rect,
         background: style.background,
         gradient: style.gradient,
+        background_image: style.background_layer(),
+        object_fit: style.object_fit,
         border_radius: style
             .border_radius
             .resolve(content_width, font_size)
@@ -1976,6 +2004,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         },
         background: style.background,
         gradient: style.gradient,
+        background_image: style.background_layer(),
+        object_fit: style.object_fit,
         border_radius: style
             .border_radius
             .resolve(content_width, font_size)
@@ -2272,6 +2302,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         },
         background: style.background,
         gradient: style.gradient,
+        background_image: style.background_layer(),
+        object_fit: style.object_fit,
         border_radius: style
             .border_radius
             .resolve(content_width, font_size)
@@ -2441,7 +2473,7 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
                         state: style_state,
                     })
                     .display;
-                if child_display == Display::Inline {
+                if matches!(child_display, Display::Inline | Display::InlineBlock) {
                     inline += width;
                 } else {
                     widest_block = widest_block.max(width);
@@ -2728,6 +2760,8 @@ fn append_inline_element(
         stylesheet,
         style_state,
         ancestors,
+        viewport,
+        containing_block,
     } = input;
     if element.name == "br" {
         if line.fragments.is_empty() {
@@ -2755,6 +2789,10 @@ fn append_inline_element(
         state: style_state,
     });
     if style.display == Display::None {
+        return;
+    }
+    if style.display == Display::InlineBlock || is_replaced(element) {
+        append_atomic(input, &style, text, line);
         return;
     }
     let font_size = style
@@ -2811,6 +2849,8 @@ fn append_inline_element(
                         stylesheet,
                         style_state,
                         ancestors: &child_ancestors,
+                        viewport,
+                        containing_block,
                     },
                     text,
                     line,
@@ -2904,12 +2944,107 @@ fn append_inline_text(
             node_path: source.path.clone(),
             node_offset,
             source_len,
+            line_height: context.line_height,
+            atomic: None,
         });
         first_word = false;
     }
     if !value.trim().is_empty() || trailing_space {
         line.trailing_space = trailing_space;
     }
+}
+
+fn is_replaced(element: &Element) -> bool {
+    element.name == "img"
+}
+
+// lays out an inline-block or replaced element as a block, then places it on the line
+fn append_atomic(
+    input: InlineElementInput<'_>,
+    style: &Style,
+    text: &mut Vec<TextRun>,
+    line: &mut InlineLine,
+) {
+    let InlineElementInput {
+        element,
+        path,
+        parent,
+        context,
+        stylesheet,
+        style_state,
+        ancestors,
+        viewport,
+        containing_block,
+    } = input;
+    let font_size = style
+        .font_size
+        .resolve(parent.font_size, parent.font_size)
+        .unwrap_or(parent.font_size)
+        .max(1.0);
+    // an auto width shrinks to the content, as inline-block sizing requires
+    let containing_width =
+        if style.width == crate::css::Length::Auto && style.aspect_ratio.is_none() {
+            max_content_width(MaxContentInput {
+                element,
+                path,
+                ancestors,
+                stylesheet,
+                style_state,
+                parent,
+                containing_width: context.content_width,
+            })
+            .min(context.content_width)
+        } else {
+            context.content_width
+        };
+    let Some(laid_out) = layout_element(ElementLayoutInput {
+        node: LayoutNode {
+            element,
+            path: path.to_vec(),
+            ancestors,
+        },
+        containing_x: context.content_x + line.used,
+        containing_y: line.y,
+        containing_width,
+        parent,
+        context: LayoutContext {
+            viewport,
+            containing_block,
+            mode: LayoutMode::Flow,
+            stylesheet,
+            style_state,
+        },
+    }) else {
+        return;
+    };
+    let outer_width = laid_out.rect.width + laid_out.margin.left + laid_out.margin.right;
+    let outer_height = laid_out.rect.height + laid_out.margin.top + laid_out.margin.bottom;
+    if !line.fragments.is_empty() && line.used + outer_width > context.content_width {
+        flush_line(
+            line,
+            text,
+            context.content_x,
+            context.content_width,
+            context.align,
+        );
+    }
+    line.used += outer_width;
+    line.height = line.height.max(outer_height);
+    line.trailing_space = false;
+    line.fragments.push(InlineFragment {
+        text: String::new(),
+        width: outer_width,
+        font_size,
+        letter_spacing: 0.0,
+        font_stack: context.text.family,
+        color: Color::transparent(),
+        bold: false,
+        node_path: None,
+        node_offset: 0,
+        source_len: 0,
+        line_height: outer_height,
+        atomic: Some(Box::new(laid_out)),
+    });
 }
 
 fn flush_line(
@@ -2928,11 +3063,29 @@ fn flush_line(
         TextAlign::Right => (content_width - line.used).max(0.0),
     };
     let mut x = content_x + offset;
+    // text shares the bottom of a line that a taller inline box stretched
+    let stretched = line
+        .fragments
+        .iter()
+        .any(|fragment| fragment.atomic.is_some());
     for fragment in line.fragments.drain(..) {
+        let top = if stretched {
+            line.y + (line.height - fragment.line_height).max(0.0)
+        } else {
+            line.y
+        };
+        if let Some(mut atomic) = fragment.atomic {
+            let outer_x = atomic.rect.x - atomic.margin.left;
+            let outer_y = atomic.rect.y - atomic.margin.top;
+            translate_layout_box(&mut atomic, x - outer_x, top - outer_y);
+            line.placed.push(*atomic);
+            x += fragment.width;
+            continue;
+        }
         text.push(TextRun {
             text: fragment.text,
             x,
-            y: line.y,
+            y: top,
             width: fragment.width,
             font_size: fragment.font_size,
             letter_spacing: fragment.letter_spacing,

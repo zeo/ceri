@@ -1,0 +1,9 @@
+baseline-444.jpg 61 37
+baseline-422.jpg 61 37
+baseline-420.jpg 61 37
+gray.jpg 61 37
+progressive-420.jpg 61 37
+progressive-444.jpg 61 37
+restart-420.jpg 61 37
+cmyk.jpg 61 37
+orientation-6.jpg 37 61

@@ -1,4 +1,4 @@
-use crate::css::{Color, Gradient, Overflow};
+use crate::css::{BackgroundImage, BackgroundSize, Color, Gradient, ObjectFit, Overflow};
 use crate::dom::NodePath;
 use crate::image::Image;
 use crate::layout::{
@@ -862,6 +862,34 @@ fn paint_box_surface(
             clip,
         );
     }
+    if let Some(background) = layout_box.background_image.as_ref()
+        && let Some(layer) = images
+            .iter()
+            .find(|layer| layer.background && layer.path == layout_box.path)
+    {
+        let area = Rect {
+            x: surface.x,
+            y: surface.y,
+            width: surface.width,
+            height: surface.height,
+        };
+        paint_image(
+            canvas,
+            ImageDraw {
+                image: &layer.image,
+                placement: background_placement(
+                    area,
+                    &layer.image,
+                    background,
+                    layout_box.font_size,
+                ),
+                area: surface,
+                clip,
+                opacity,
+                repeat: (background.repeat.x, background.repeat.y),
+            },
+        );
+    }
     let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
         || layout_box.path.is_empty()
     {
@@ -873,19 +901,26 @@ fn paint_box_surface(
         clip
     };
     if layout_box.tag == "img"
-        && let Some(layer) = images.iter().find(|layer| layer.path == layout_box.path)
+        && let Some(layer) = images
+            .iter()
+            .find(|layer| !layer.background && layer.path == layout_box.path)
     {
-        let inset = layout_box.border_width.max(0.0);
+        let content = Rect {
+            x: surface.x,
+            y: surface.y,
+            width: surface.width,
+            height: surface.height,
+        };
         paint_image(
             canvas,
-            &layer.image,
-            Rect {
-                x: rect.x + inset,
-                y: rect.y + inset,
-                width: (rect.width - inset * 2.0).max(0.0),
-                height: (rect.height - inset * 2.0).max(0.0),
+            ImageDraw {
+                image: &layer.image,
+                placement: fitted_placement(content, &layer.image, layout_box.object_fit),
+                area: surface,
+                clip: content_clip,
+                opacity,
+                repeat: (false, false),
             },
-            content_clip,
         );
     }
     content_clip
@@ -1248,36 +1283,250 @@ fn scrollbar_thumb(
     }
 }
 
-fn paint_image(canvas: &mut Canvas, image: &Image, rect: Rect, clip: Option<Rect>) {
-    if rect.width <= 0.0 || rect.height <= 0.0 {
+// an image mapped onto `placement` in layout space and painted only inside `area`,
+// tiled across the area along the axes that repeat
+struct ImageDraw<'a> {
+    image: &'a Image,
+    placement: Rect,
+    area: Shape,
+    clip: Option<Rect>,
+    opacity: f32,
+    repeat: (bool, bool),
+}
+
+fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
+    let ImageDraw {
+        image,
+        placement,
+        area,
+        clip,
+        opacity,
+        repeat,
+    } = draw;
+    if placement.width <= 0.0
+        || placement.height <= 0.0
+        || image.width == 0
+        || image.height == 0
+        || opacity <= 0.0
+    {
         return;
     }
-    let Some(draw_rect) = intersect_clip(clip, rect) else {
+    let scale = canvas.scale;
+    let area_device = area.to_device(scale);
+    let radius = area_device
+        .radius
+        .min(area_device.width / 2.0)
+        .min(area_device.height / 2.0)
+        .max(0.0);
+    let mut bounds = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    };
+    if !repeat.0 {
+        bounds = intersect_rect(
+            bounds,
+            Rect {
+                y: bounds.y,
+                height: bounds.height,
+                ..placement
+            },
+        );
+    }
+    if !repeat.1 {
+        bounds = intersect_rect(
+            bounds,
+            Rect {
+                x: bounds.x,
+                width: bounds.width,
+                ..placement
+            },
+        );
+    }
+    let Some(bounds) = intersect_clip(clip, bounds) else {
         return;
     };
-    let scale = canvas.scale;
-    let left = (draw_rect.x * scale).floor().max(0.0) as u32;
-    let top = (draw_rect.y * scale).floor().max(0.0) as u32;
-    let right = ((draw_rect.x + draw_rect.width) * scale)
+    let left = (bounds.x * scale).floor().max(0.0) as u32;
+    let top = (bounds.y * scale).floor().max(0.0) as u32;
+    let right = ((bounds.x + bounds.width) * scale)
         .ceil()
-        .max(0.0)
-        .min(canvas.width as f32) as u32;
-    let bottom = ((draw_rect.y + draw_rect.height) * scale)
+        .clamp(0.0, canvas.width as f32) as u32;
+    let bottom = ((bounds.y + bounds.height) * scale)
         .ceil()
-        .max(0.0)
-        .min(canvas.height as f32) as u32;
-    let origin = (rect.x * scale, rect.y * scale);
-    let extent = (rect.width * scale, rect.height * scale);
-    for pixel_y in top.min(canvas.height)..bottom.min(canvas.height) {
-        let source_y = (((pixel_y as f32 - origin.1) / extent.1) * image.height as f32)
-            .floor()
-            .clamp(0.0, image.height.saturating_sub(1) as f32) as u32;
-        for pixel_x in left.min(canvas.width)..right.min(canvas.width) {
-            let source_x = (((pixel_x as f32 - origin.0) / extent.0) * image.width as f32)
-                .floor()
-                .clamp(0.0, image.width.saturating_sub(1) as f32) as u32;
-            canvas.blend_pixel(pixel_x, pixel_y, image.pixel(source_x, source_y));
+        .clamp(0.0, canvas.height as f32) as u32;
+    let origin = (placement.x * scale, placement.y * scale);
+    let step = (
+        image.width as f32 / (placement.width * scale),
+        image.height as f32 / (placement.height * scale),
+    );
+    // whole-pixel placement at the image's own resolution copies pixels directly
+    let aligned = (step.0 - 1.0).abs() < 1e-4
+        && (step.1 - 1.0).abs() < 1e-4
+        && origin.0.fract() == 0.0
+        && origin.1.fract() == 0.0;
+    for pixel_y in top..bottom {
+        for pixel_x in left..right {
+            let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+            let coverage = if radius > 0.0 {
+                area_device.coverage(center, radius)
+            } else {
+                1.0
+            };
+            if coverage <= 0.0 {
+                continue;
+            }
+            let color = if aligned {
+                let column = wrap_or_none(pixel_x as f32 - origin.0, image.width, repeat.0);
+                let row = wrap_or_none(pixel_y as f32 - origin.1, image.height, repeat.1);
+                let (Some(column), Some(row)) = (column, row) else {
+                    continue;
+                };
+                image.pixel(column, row)
+            } else {
+                let u = (center.0 - origin.0) * step.0 - 0.5;
+                let v = (center.1 - origin.1) * step.1 - 0.5;
+                sample_bilinear(image, u, v, repeat)
+            };
+            if color.alpha == 0 {
+                continue;
+            }
+            canvas.blend_pixel(pixel_x, pixel_y, color.scale_alpha(opacity * coverage));
         }
+    }
+}
+
+fn wrap_or_none(position: f32, size: u32, repeat: bool) -> Option<u32> {
+    let position = position as i64;
+    if repeat {
+        Some(position.rem_euclid(i64::from(size)) as u32)
+    } else {
+        (0..i64::from(size))
+            .contains(&position)
+            .then_some(position as u32)
+    }
+}
+
+// interpolates in premultiplied alpha so transparent neighbours do not darken edges
+fn sample_bilinear(image: &Image, u: f32, v: f32, repeat: (bool, bool)) -> Color {
+    let (x0, y0) = (u.floor(), v.floor());
+    let (fraction_x, fraction_y) = (u - x0, v - y0);
+    let index = |position: f32, size: u32, repeats: bool| -> u32 {
+        let position = position as i64;
+        if repeats {
+            position.rem_euclid(i64::from(size)) as u32
+        } else {
+            position.clamp(0, i64::from(size) - 1) as u32
+        }
+    };
+    let mut sum = [0.0_f32; 4];
+    for (dy, weight_y) in [(0.0, 1.0 - fraction_y), (1.0, fraction_y)] {
+        for (dx, weight_x) in [(0.0, 1.0 - fraction_x), (1.0, fraction_x)] {
+            let weight = weight_x * weight_y;
+            if weight == 0.0 {
+                continue;
+            }
+            let color = image.pixel(
+                index(x0 + dx, image.width, repeat.0),
+                index(y0 + dy, image.height, repeat.1),
+            );
+            let alpha = f32::from(color.alpha) * weight;
+            sum[0] += f32::from(color.red) * alpha;
+            sum[1] += f32::from(color.green) * alpha;
+            sum[2] += f32::from(color.blue) * alpha;
+            sum[3] += alpha;
+        }
+    }
+    if sum[3] <= 0.0 {
+        return Color::transparent();
+    }
+    let channel = |value: f32| (value / sum[3]).round().clamp(0.0, 255.0) as u8;
+    Color::rgba(
+        channel(sum[0]),
+        channel(sum[1]),
+        channel(sum[2]),
+        sum[3].round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn intersect_rect(first: Rect, second: Rect) -> Rect {
+    let x = first.x.max(second.x);
+    let y = first.y.max(second.y);
+    Rect {
+        x,
+        y,
+        width: ((first.x + first.width).min(second.x + second.width) - x).max(0.0),
+        height: ((first.y + first.height).min(second.y + second.height) - y).max(0.0),
+    }
+}
+
+// where object-fit puts the image inside the content box, centered as object-position defaults
+fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
+    let (width, height) = (image.width as f32, image.height as f32);
+    let contain = (content.width / width).min(content.height / height);
+    let scale = match fit {
+        ObjectFit::Fill => return content,
+        ObjectFit::Contain => contain,
+        ObjectFit::Cover => (content.width / width).max(content.height / height),
+        ObjectFit::None => 1.0,
+        ObjectFit::ScaleDown => contain.min(1.0),
+    };
+    let (placed_width, placed_height) = (width * scale, height * scale);
+    Rect {
+        x: content.x + (content.width - placed_width) / 2.0,
+        y: content.y + (content.height - placed_height) / 2.0,
+        width: placed_width,
+        height: placed_height,
+    }
+}
+
+// the first tile of a background image inside its positioning area
+fn background_placement(
+    area: Rect,
+    image: &Image,
+    background: &BackgroundImage,
+    font_size: f32,
+) -> Rect {
+    let (natural_width, natural_height) = (image.width as f32, image.height as f32);
+    let (width, height) = match background.size {
+        BackgroundSize::Auto => (natural_width, natural_height),
+        BackgroundSize::Cover | BackgroundSize::Contain => {
+            let horizontal = area.width / natural_width;
+            let vertical = area.height / natural_height;
+            let scale = if background.size == BackgroundSize::Cover {
+                horizontal.max(vertical)
+            } else {
+                horizontal.min(vertical)
+            };
+            (natural_width * scale, natural_height * scale)
+        }
+        BackgroundSize::Explicit(width, height) => {
+            let width = width.resolve(area.width, font_size);
+            let height = height.resolve(area.height, font_size);
+            match (width, height) {
+                (Some(width), Some(height)) => (width, height),
+                (Some(width), None) => (width, width * natural_height / natural_width),
+                (None, Some(height)) => (height * natural_width / natural_height, height),
+                (None, None) => (natural_width, natural_height),
+            }
+        }
+    };
+    // percentages place the same point of the image and the area on each other
+    let x = background
+        .position
+        .0
+        .resolve(area.width - width, font_size)
+        .unwrap_or(0.0);
+    let y = background
+        .position
+        .1
+        .resolve(area.height - height, font_size)
+        .unwrap_or(0.0);
+    Rect {
+        x: area.x + x,
+        y: area.y + y,
+        width,
+        height,
     }
 }
 
@@ -1495,6 +1744,8 @@ mod tests {
                 },
                 background: Color::opaque(245, 248, 250),
                 gradient: None,
+                background_image: None,
+                object_fit: crate::css::ObjectFit::Fill,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -1647,6 +1898,8 @@ mod tests {
                 },
                 background: Color::opaque(10, 20, 30),
                 gradient: None,
+                background_image: None,
+                object_fit: crate::css::ObjectFit::Fill,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -1746,6 +1999,8 @@ mod tests {
                 },
                 background: Color::opaque(10, 20, 30),
                 gradient: None,
+                background_image: None,
+                object_fit: crate::css::ObjectFit::Fill,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -1836,6 +2091,8 @@ mod tests {
                 },
                 background: Color::opaque(245, 248, 250),
                 gradient: None,
+                background_image: None,
+                object_fit: crate::css::ObjectFit::Fill,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -1858,6 +2115,8 @@ mod tests {
                         },
                         background: Color::transparent(),
                         gradient: None,
+                        background_image: None,
+                        object_fit: crate::css::ObjectFit::Fill,
                         border_radius: 0.0,
                         opacity: 1.0,
                         shadow: None,
@@ -1894,6 +2153,8 @@ mod tests {
                         },
                         background: Color::opaque(0, 0, 255),
                         gradient: None,
+                        background_image: None,
+                        object_fit: crate::css::ObjectFit::Fill,
                         border_radius: 0.0,
                         opacity: 1.0,
                         shadow: None,

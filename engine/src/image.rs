@@ -1,9 +1,15 @@
 use crate::css::Color;
 use crate::dom::{Document, Element, Node};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 const MAX_IMAGE_DIMENSION: u32 = 2048;
 const MAX_IMAGE_PIXELS: usize = 4_000_000;
+// decoded raster images are larger than rasterized SVG, but still bounded before allocation
+const MAX_RASTER_DIMENSION: u32 = 16_384;
+const MAX_RASTER_PIXELS: usize = 40_000_000;
 const MAX_SVG_DEPTH: usize = 64;
 const MAX_LINE_STEPS: usize = 16_384;
 
@@ -15,7 +21,7 @@ pub(crate) struct Image {
 }
 
 impl Image {
-    fn new(width: u32, height: u32) -> Self {
+    pub(crate) fn new(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
@@ -62,6 +68,28 @@ impl Image {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImageError(String);
 
+impl ImageError {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self(detail.into())
+    }
+}
+
+// rejects raster dimensions before a decoder allocates for them
+pub(crate) fn check_dimensions(width: u32, height: u32) -> Result<(), ImageError> {
+    if width == 0 || height == 0 {
+        return Err(ImageError::new("image has no pixels"));
+    }
+    if width > MAX_RASTER_DIMENSION
+        || height > MAX_RASTER_DIMENSION
+        || (width as usize) * (height as usize) > MAX_RASTER_PIXELS
+    {
+        return Err(ImageError::new(format!(
+            "image of {width}x{height} exceeds the decode limit"
+        )));
+    }
+    Ok(())
+}
+
 impl fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -87,20 +115,175 @@ impl Default for PaintStyle {
     }
 }
 
-// a square RGBA buffer for window and taskbar icons, scaled from an app owned SVG
-pub fn rasterize_svg_icon(source: &str, size: u32) -> Option<(Vec<u8>, u32)> {
-    let size = size.clamp(16, 512);
-    let image = parse_svg(source).ok()?;
-    if image.width == 0 || image.height == 0 {
-        return None;
+// decodes any supported image by its leading bytes, falling back to the declared type for SVG
+pub(crate) fn decode_image(bytes: &[u8], mime_type: &str) -> Result<Image, ImageError> {
+    if crate::png::is_png(bytes) {
+        return crate::png::decode_png(bytes);
     }
+    if crate::jpeg::is_jpeg(bytes) {
+        return crate::jpeg::decode_jpeg(bytes);
+    }
+    if crate::gif::is_gif(bytes) {
+        return crate::gif::decode_gif(bytes);
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Err(ImageError::new("WebP images are not supported yet"));
+    }
+    let declared_svg = mime_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/svg+xml"));
+    let text = std::str::from_utf8(bytes).ok();
+    if declared_svg
+        || text.is_some_and(|text| text.trim_start().starts_with('<') && text.contains("<svg"))
+    {
+        return parse_svg(text.ok_or_else(|| ImageError::new("SVG is not UTF-8"))?);
+    }
+    Err(ImageError::new("unsupported image format"))
+}
+
+// the MIME type and bytes of a data: URL, with base64 or percent-encoded payloads
+pub(crate) fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
+    let rest = url
+        .get(..5)?
+        .eq_ignore_ascii_case("data:")
+        .then(|| &url[5..])?;
+    let (header, payload) = rest.split_once(',')?;
+    let base64 = header.to_ascii_lowercase().ends_with(";base64");
+    let mime_type = header
+        .split(';')
+        .next()
+        .filter(|mime| !mime.is_empty())
+        .unwrap_or("text/plain")
+        .to_ascii_lowercase();
+    let bytes = if base64 {
+        decode_base64(payload)?
+    } else {
+        percent_decode(payload)
+    };
+    Some((mime_type, bytes))
+}
+
+fn decode_base64(payload: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(payload.len() * 3 / 4);
+    let (mut buffer, mut bits) = (0_u32, 0_u32);
+    for byte in payload.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
+fn percent_decode(payload: &str) -> Vec<u8> {
+    let bytes = payload.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let decoded = (bytes[index] == b'%')
+            .then(|| payload.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(byte) => {
+                output.push(byte);
+                index += 3;
+            }
+            None => {
+                output.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    output
+}
+
+// a copyable handle for an image URL written in a stylesheet, so computed styles stay Copy
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ImageSource(u32);
+
+const MAX_IMAGE_SOURCES: usize = 4096;
+
+#[derive(Default)]
+struct ImageSourceTable {
+    urls: Vec<Rc<str>>,
+    ids: HashMap<Rc<str>, ImageSource>,
+}
+
+thread_local! {
+    static IMAGE_SOURCES: RefCell<ImageSourceTable> = RefCell::default();
+}
+
+pub(crate) fn intern_image_source(url: &str) -> Option<ImageSource> {
+    IMAGE_SOURCES.with(|table| {
+        let mut table = table.borrow_mut();
+        if let Some(source) = table.ids.get(url) {
+            return Some(*source);
+        }
+        if table.urls.len() >= MAX_IMAGE_SOURCES {
+            return None;
+        }
+        let url: Rc<str> = url.into();
+        let source = ImageSource(table.urls.len() as u32);
+        table.urls.push(url.clone());
+        table.ids.insert(url, source);
+        Some(source)
+    })
+}
+
+pub(crate) fn image_source_url(source: ImageSource) -> Option<Rc<str>> {
+    IMAGE_SOURCES.with(|table| table.borrow().urls.get(source.0 as usize).cloned())
+}
+
+// a square RGBA buffer for window and taskbar icons, scaled from an app owned image;
+// each icon pixel averages the source pixels it covers, so large images shrink cleanly
+pub fn rasterize_icon(bytes: &[u8], size: u32) -> Option<(Vec<u8>, u32)> {
+    let size = size.clamp(16, 512);
+    let image = decode_image(bytes, "").ok()?;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for row in 0..size {
-        let source_y = (row * image.height / size).min(image.height - 1);
+        let top = row * image.height / size;
+        let bottom = ((row + 1) * image.height / size)
+            .max(top + 1)
+            .min(image.height);
         for column in 0..size {
-            let source_x = (column * image.width / size).min(image.width - 1);
-            let color = image.pixel(source_x, source_y);
-            rgba.extend_from_slice(&[color.red, color.green, color.blue, color.alpha]);
+            let left = column * image.width / size;
+            let right = ((column + 1) * image.width / size)
+                .max(left + 1)
+                .min(image.width);
+            let mut sum = [0_u64; 4];
+            for y in top..bottom {
+                for x in left..right {
+                    let color = image.pixel(x, y);
+                    let alpha = u64::from(color.alpha);
+                    sum[0] += u64::from(color.red) * alpha;
+                    sum[1] += u64::from(color.green) * alpha;
+                    sum[2] += u64::from(color.blue) * alpha;
+                    sum[3] += alpha;
+                }
+            }
+            let count = u64::from((bottom - top) * (right - left));
+            let channel = |value: u64| value.checked_div(sum[3]).unwrap_or(0) as u8;
+            rgba.extend_from_slice(&[
+                channel(sum[0]),
+                channel(sum[1]),
+                channel(sum[2]),
+                (sum[3] / count) as u8,
+            ]);
         }
     }
     Some((rgba, size))
@@ -438,6 +621,51 @@ fn map_y(value: f32, view_y: f32, scale: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_urls_decode_base64_and_percent_encoded_payloads() {
+        let (mime, bytes) = decode_data_url("data:text/plain;base64,aGVs\nbG8=").expect("base64");
+        assert_eq!(
+            (mime.as_str(), bytes.as_slice()),
+            ("text/plain", b"hello".as_slice())
+        );
+        let (mime, bytes) =
+            decode_data_url("DATA:image/svg+xml,%3Csvg%20width='2'%20height='2'/%3E")
+                .expect("text");
+        assert_eq!(mime, "image/svg+xml");
+        assert_eq!(bytes, b"<svg width='2' height='2'/>");
+        assert!(decode_data_url("data:;base64,!!").is_none());
+        assert!(decode_data_url("https://app.ceri.invalid/").is_none());
+    }
+
+    #[test]
+    fn decoding_sniffs_the_format_and_names_unsupported_ones() {
+        let webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
+        assert!(
+            decode_image(webp, "image/webp")
+                .unwrap_err()
+                .to_string()
+                .contains("WebP")
+        );
+        let svg = decode_image(
+            b"<svg width='3' height='2'><rect width='3' height='2'/></svg>",
+            "",
+        )
+        .expect("SVG is recognized without a declared type");
+        assert_eq!((svg.width, svg.height), (3, 2));
+    }
+
+    #[test]
+    fn icons_shrink_any_supported_image_by_area_averaging() {
+        let png = std::fs::read(format!(
+            "{}/tests/fixtures/rgb8.png",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture");
+        let (rgba, size) = rasterize_icon(&png, 16).expect("PNG icon");
+        assert_eq!((rgba.len(), size), (16 * 16 * 4, 16));
+        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
 
     #[test]
     fn parses_svg_shapes_into_pixels() {

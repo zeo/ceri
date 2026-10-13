@@ -3,7 +3,7 @@ use crate::dom::{
     AccessibilityNode, Document, Element, Node, NodePath, ScriptSource, StylesheetSource,
 };
 use crate::font::FontSet;
-use crate::image::parse_svg;
+use crate::image::Image;
 use crate::layout::{
     ImageLayer, LayoutDocument, Size, ThumbDrag, layout_with_state as build_layout,
 };
@@ -13,8 +13,8 @@ use crate::script::{
     StorageData, StorageHandle, ViewportMetrics, runtime_error,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -825,6 +825,8 @@ struct Page {
     // parsed once per document, because layout and paint run on every frame
     stylesheet: Stylesheet,
     animated: bool,
+    // decoded once per document and shared by every frame; failures are remembered too
+    images: RefCell<HashMap<String, Option<Rc<Image>>>>,
 }
 
 enum HistoryCommit {
@@ -1186,6 +1188,7 @@ impl Browser {
             runtime,
             stylesheet: parsed_stylesheet,
             animated,
+            images: RefCell::default(),
         });
         self.last_navigation_failure = None;
         self.hovered_path = None;
@@ -1895,10 +1898,25 @@ impl Browser {
         style_state.clock = page.runtime.now();
         style_state.transitions = self.transitions.clone();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
+        if let Some(base) = self.current_url.as_ref() {
+            for path in document
+                .find_elements_by_selector("img")
+                .unwrap_or_default()
+            {
+                let image = document
+                    .element_attribute(&path, "src")
+                    .and_then(|source| self.image_for(page, base, &source));
+                if let Some(image) = image {
+                    style_state
+                        .image_sizes
+                        .insert(path, (image.width, image.height));
+                }
+            }
+        }
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         layout.prose_selections = page.runtime.prose_selections();
         if let Some(base) = self.current_url.as_ref() {
-            self.attach_image_layers(base, &document, &mut layout);
+            self.attach_image_layers(page, base, &document, &mut layout);
         }
         Ok(layout)
     }
@@ -1930,30 +1948,57 @@ impl Browser {
         Ok(self.layout(viewport)?.describe())
     }
 
-    fn attach_image_layers(&self, base: &AppUrl, document: &Document, layout: &mut LayoutDocument) {
-        let mut paths = Vec::new();
-        collect_image_paths(&layout.root, &mut paths);
-        for path in paths {
-            let Some(reference) = document.element_attribute(&path, "src") else {
+    fn attach_image_layers(
+        &self,
+        page: &Page,
+        base: &AppUrl,
+        document: &Document,
+        layout: &mut LayoutDocument,
+    ) {
+        let mut sources = Vec::new();
+        collect_image_sources(&layout.root, &mut sources);
+        for (path, background) in sources {
+            let reference = match background {
+                Some(source) => crate::image::image_source_url(source).map(|url| url.to_string()),
+                None => document.element_attribute(&path, "src"),
+            };
+            let Some(image) =
+                reference.and_then(|reference| self.image_for(page, base, &reference))
+            else {
                 continue;
             };
-            let Ok(url) = base.resolve(&reference) else {
-                continue;
-            };
-            let Ok(resource) = self.load_subresource(&url) else {
-                continue;
-            };
-            if !is_svg(&resource) {
-                continue;
-            }
-            let Ok(source) = std::str::from_utf8(resource.body()) else {
-                continue;
-            };
-            let Ok(image) = parse_svg(source) else {
-                continue;
-            };
-            layout.images.push(ImageLayer { path, image });
+            layout.images.push(ImageLayer {
+                path,
+                image,
+                background: background.is_some(),
+            });
         }
+    }
+
+    // decodes an image reference once per document, from data: URLs or app-origin resources
+    fn image_for(&self, page: &Page, base: &AppUrl, reference: &str) -> Option<Rc<Image>> {
+        let reference = reference.trim();
+        let key = if reference.len() > 5 && reference[..5].eq_ignore_ascii_case("data:") {
+            reference.to_string()
+        } else {
+            base.resolve(reference).ok()?.to_string()
+        };
+        if let Some(cached) = page.images.borrow().get(&key) {
+            return cached.clone();
+        }
+        let decoded = if let Some((mime_type, bytes)) = crate::image::decode_data_url(&key) {
+            crate::image::decode_image(&bytes, &mime_type).ok()
+        } else {
+            base.resolve(reference)
+                .ok()
+                .and_then(|url| self.load_subresource(&url).ok())
+                .and_then(|resource| {
+                    crate::image::decode_image(resource.body(), &resource.mime_type).ok()
+                })
+        }
+        .map(Rc::new);
+        page.images.borrow_mut().insert(key, decoded.clone());
+        decoded
     }
 
     fn activate_path(&mut self, path: Vec<usize>) -> Result<bool, NavigationError> {
@@ -2263,6 +2308,7 @@ impl Browser {
             document,
             stylesheet: Stylesheet::parse_recovering(&stylesheet).0,
             animated: false,
+            images: RefCell::default(),
         });
     }
 }
@@ -2345,14 +2391,6 @@ pub(crate) fn is_json(resource: &Resource) -> bool {
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn is_svg(resource: &Resource) -> bool {
-    resource
-        .mime_type
-        .split(';')
-        .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/svg+xml"))
-}
-
 // elements are candidates in document order, which keeps sampling deterministic
 fn collect_transition_targets(element: &Element, path: &mut NodePath, targets: &mut Vec<NodePath>) {
     for (index, node) in element.children.iter().enumerate() {
@@ -2379,12 +2417,19 @@ fn ancestor_chain<'a>(document: &'a Document, path: &[usize]) -> Vec<&'a Element
     chain
 }
 
-fn collect_image_paths(layout: &crate::layout::LayoutBox, paths: &mut Vec<NodePath>) {
+// image elements and boxes with background images, in tree order
+fn collect_image_sources(
+    layout: &crate::layout::LayoutBox,
+    sources: &mut Vec<(NodePath, Option<crate::image::ImageSource>)>,
+) {
+    if let Some(background) = layout.background_image {
+        sources.push((layout.path.clone(), Some(background.source)));
+    }
     if layout.tag == "img" {
-        paths.push(layout.path.clone());
+        sources.push((layout.path.clone(), None));
     }
     for child in &layout.children {
-        collect_image_paths(child, paths);
+        collect_image_sources(child, sources);
     }
 }
 
@@ -5838,6 +5883,189 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel == [224, 108, 117, 255])
         );
+    }
+
+    fn image_bundle(source: &str) -> ResourceBundle {
+        let mut resources = bundle(source);
+        for name in ["rgb8.png", "rgba8.png", "baseline-420.jpg", "frame.gif"] {
+            let bytes = std::fs::read(format!(
+                "{}/tests/fixtures/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("image fixture should exist");
+            resources
+                .insert(&format!("/{name}"), mime_type_for(Path::new(name)), bytes)
+                .expect("image fixture should be accepted");
+        }
+        resources
+    }
+
+    fn image_page(source: &str, width: f32, height: f32) -> (Browser, LayoutDocument, Canvas) {
+        let mut browser = Browser::new(image_bundle(source));
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load"),
+            NavigationStatus::Loaded
+        );
+        let viewport = Size { width, height };
+        let layout = browser.layout(viewport).expect("layout should build");
+        let canvas = browser.paint(viewport).expect("page should paint");
+        (browser, layout, canvas)
+    }
+
+    fn find_box<'a>(
+        layout: &'a crate::layout::LayoutBox,
+        tag: &str,
+    ) -> Option<&'a crate::layout::LayoutBox> {
+        if layout.tag == tag {
+            return Some(layout);
+        }
+        layout
+            .children
+            .iter()
+            .find_map(|child| find_box(child, tag))
+    }
+
+    fn pixel_at(canvas: &Canvas, x: u32, y: u32) -> [u8; 4] {
+        let index = ((y * canvas.width() + x) * 4) as usize;
+        canvas.rgba_pixels()[index..index + 4]
+            .try_into()
+            .expect("four channels")
+    }
+
+    // the generated fixtures color pixel (x, y) from its coordinates
+    fn fixture_color(x: u32, y: u32) -> [u8; 4] {
+        [
+            ((x * 19 + y * 7) % 256) as u8,
+            ((x * 5 + y * 31) % 256) as u8,
+            ((x * 11 + y * 13 + 40) % 256) as u8,
+            255,
+        ]
+    }
+
+    #[test]
+    fn an_inline_image_takes_its_natural_size_and_sits_on_the_line() {
+        let (_, layout, canvas) = image_page(
+            "<style>body { margin: 0; } p { margin: 0; font-size: 16px; }</style><p>logo <img src=\"/rgb8.png\"> text</p>",
+            200.0,
+            60.0,
+        );
+        let image = find_box(&layout.root, "img").expect("the image should lay out");
+        assert_eq!((image.rect.width, image.rect.height), (13.0, 7.0));
+        assert!(image.rect.x > 0.0, "the image follows the text before it");
+        let paragraph = find_box(&layout.root, "p").expect("paragraph");
+        let after = paragraph
+            .text
+            .iter()
+            .find(|run| run.text.trim() == "text")
+            .expect("text after the image");
+        assert!(after.x >= image.rect.x + image.rect.width);
+        let (x, y) = (image.rect.x as u32, image.rect.y as u32);
+        assert_eq!(pixel_at(&canvas, x + 2, y + 3), fixture_color(2, 3));
+    }
+
+    #[test]
+    fn one_declared_side_scales_the_other_by_the_natural_ratio() {
+        let (_, layout, _) = image_page(
+            "<style>body { margin: 0; }</style><img src=\"/rgb8.png\" style=\"display: block; width: 26px\"><div style=\"width: 30px; aspect-ratio: 3 / 1\"></div>",
+            200.0,
+            60.0,
+        );
+        let image = find_box(&layout.root, "img").expect("image");
+        assert_eq!((image.rect.width, image.rect.height), (26.0, 14.0));
+        let block = find_box(&layout.root, "div").expect("div");
+        assert_eq!(block.rect.height, 10.0);
+    }
+
+    #[test]
+    fn object_fit_contain_letterboxes_and_cover_crops() {
+        let (_, _, canvas) = image_page(
+            "<style>body { margin: 0; } img { display: block; width: 26px; height: 26px; }</style><img src=\"/rgb8.png\" style=\"object-fit: contain\"><img src=\"/rgb8.png\" style=\"object-fit: cover\">",
+            100.0,
+            60.0,
+        );
+        let blank = pixel_at(&canvas, 99, 59);
+        // contain scales by two and centers vertically, leaving white bands above and below
+        assert_eq!(pixel_at(&canvas, 13, 1), blank);
+        assert_ne!(pixel_at(&canvas, 13, 13), blank);
+        // cover fills the whole square
+        assert_ne!(pixel_at(&canvas, 1, 27), blank);
+        assert_ne!(pixel_at(&canvas, 24, 51), blank);
+    }
+
+    #[test]
+    fn data_urls_decode_without_reaching_the_resource_bundle() {
+        let (_, layout, canvas) = image_page(
+            "<style>body { margin: 0; }</style><img style=\"display: block\" src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHCAIAAABcElBNAAAAJHRFWHRDb21tZW50AGFuY2lsbGFyeSBjaHVua3MgYXJlIHNraXBwZWQXJBj8AAAAQElEQVR42mNgYNAQZjVW47Kz5Pf0EQmJl4wvkstqVS6dodGwWrd7n9G0i+YLn9isYWSXNxVm5SaImNjleYlBzHx2erxCwNKhtwAAAEFJREFUPAQRC0g5KzdBxKA8O9NsQYnn0vqYVV3566c2bVkwdefqFfu27T588NyJMw/PXv9y6RH79beMWrvKiPEHAPIZMLzOFGjtAAAAAElFTkSuQmCC\">",
+            100.0,
+            40.0,
+        );
+        assert_eq!(layout.images.len(), 1);
+        assert_eq!(pixel_at(&canvas, 4, 5), fixture_color(4, 5));
+    }
+
+    #[test]
+    fn background_images_position_tile_and_respect_no_repeat() {
+        let (_, _, canvas) = image_page(
+            "<style>body { margin: 0; } div { width: 60px; height: 20px; }</style><div style=\"background: url('/rgb8.png') no-repeat 10px 5px\"></div><div style=\"background-image: url(/rgb8.png)\"></div><div style=\"background: url(/rgb8.png) center / 26px auto no-repeat\"></div>",
+            100.0,
+            80.0,
+        );
+        let blank = pixel_at(&canvas, 99, 79);
+        assert_eq!(pixel_at(&canvas, 12, 8), fixture_color(2, 3));
+        assert_eq!(pixel_at(&canvas, 1, 1), blank);
+        assert_eq!(pixel_at(&canvas, 30, 15), blank);
+        // the repeating background tiles every 13 by 7 pixels from the box origin
+        assert_eq!(pixel_at(&canvas, 15, 20 + 10), fixture_color(2, 3));
+        // a sized and centered background leaves the box corners empty
+        assert_eq!(pixel_at(&canvas, 1, 41), blank);
+        assert_ne!(pixel_at(&canvas, 30, 50), blank);
+    }
+
+    #[test]
+    fn inline_blocks_shrink_to_their_content_and_flow_with_text() {
+        let (_, layout, _) = image_page(
+            "<style>body { margin: 0; } p { margin: 0; font-size: 16px; } span.badge { display: inline-block; padding: 2px; background: #ff0000; }</style><p>before <span class=\"badge\">new</span> after</p>",
+            300.0,
+            60.0,
+        );
+        let paragraph = find_box(&layout.root, "p").expect("paragraph");
+        let badge = paragraph
+            .children
+            .iter()
+            .find(|child| child.tag == "span")
+            .expect("the inline-block lays out as a box");
+        assert!(
+            badge.rect.width < 100.0,
+            "an auto width shrinks to the content"
+        );
+        let before = paragraph
+            .text
+            .iter()
+            .find(|run| run.text.trim() == "before")
+            .expect("before");
+        let after = paragraph
+            .text
+            .iter()
+            .find(|run| run.text.trim() == "after")
+            .expect("after");
+        assert!(badge.rect.x >= before.x + before.width);
+        assert!(after.x >= badge.rect.x + badge.rect.width);
+    }
+
+    #[test]
+    fn jpeg_and_gif_images_reach_the_frame() {
+        let (_, layout, canvas) = image_page(
+            "<style>body { margin: 0; } img { display: block; }</style><img src=\"/baseline-420.jpg\"><img src=\"/frame.gif\">",
+            100.0,
+            80.0,
+        );
+        let blank = pixel_at(&canvas, 99, 79);
+        assert_eq!(layout.images.len(), 2);
+        let jpeg = find_box(&layout.root, "img").expect("jpeg");
+        assert_eq!((jpeg.rect.width, jpeg.rect.height), (61.0, 37.0));
+        assert_ne!(pixel_at(&canvas, 30, 18), blank);
     }
 
     #[test]

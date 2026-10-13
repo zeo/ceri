@@ -111,7 +111,12 @@ fn build_browser(
 
 // the packaged favicon becomes the window and taskbar icon
 fn app_icon(assets: &AssetOrigin) -> Option<(Vec<u8>, u32)> {
-    for candidate in ["/web/favicon.svg", "/favicon.svg"] {
+    for candidate in [
+        "/web/favicon.svg",
+        "/web/favicon.png",
+        "/favicon.svg",
+        "/favicon.png",
+    ] {
         let route = assets
             .route(
                 &format!("{}{candidate}", ceri_engine::APP_ORIGIN),
@@ -121,8 +126,8 @@ fn app_icon(assets: &AssetOrigin) -> Option<(Vec<u8>, u32)> {
         let AssetRoute::File(asset) = route else {
             continue;
         };
-        let source = fs::read_to_string(&asset.path).ok()?;
-        if let Some(icon) = ceri_engine::rasterize_svg_icon(&source, 64) {
+        let source = fs::read(&asset.path).ok()?;
+        if let Some(icon) = ceri_engine::rasterize_icon(&source, 64) {
             return Some(icon);
         }
     }

@@ -93,7 +93,7 @@ ceri.exe --ceri-allow-origin=https://api.example.com
 
 Every other origin is refused with a typed rejection the page can catch, and navigation stays on the app origin regardless.
 
-The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, CSS animations driven from the page clock with linear, ease and stepped timing, and transitions on colors, opacity, lengths and radii that start when a state change alters a declared value.
+The visual surface covers antialiased outline text with system font fallback, PNG, JPEG and GIF images decoded by the engine itself with natural sizing, `object-fit` and background images, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, CSS animations driven from the page clock with linear, ease and stepped timing, and transitions on colors, opacity, lengths and radii that start when a state change alters a declared value.
 
 Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, a double click takes the word and a triple click the whole value, Ctrl with an arrow or Backspace moves or deletes by word (Alt on macOS), and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
 

@@ -8,6 +8,8 @@ pub enum Display {
     Flex,
     Grid,
     Inline,
+    // laid out as a block, then placed on the line like a word
+    InlineBlock,
     None,
 }
 
@@ -62,6 +64,15 @@ impl Color {
         Self {
             alpha: (f32::from(self.alpha) * factor.clamp(0.0, 1.0)).round() as u8,
             ..self
+        }
+    }
+
+    pub const fn rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha,
         }
     }
 
@@ -415,6 +426,8 @@ pub(crate) struct StyleState {
     pub(crate) transitions: BTreeMap<(NodePath, AnimatableProperty), TransitionState>,
     pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
     pub(crate) root_path: Option<NodePath>,
+    // natural pixel sizes of decoded images, keyed by their element
+    pub(crate) image_sizes: BTreeMap<NodePath, (u32, u32)>,
 }
 
 impl StyleState {
@@ -567,6 +580,57 @@ pub(crate) struct Style {
     pub opacity: f32,
     pub gradient: Option<Gradient>,
     pub shadow: Option<BoxShadow>,
+    // width over height, from aspect-ratio or a replaced element's natural size
+    pub aspect_ratio: Option<f32>,
+    pub object_fit: ObjectFit,
+    pub background_image: Option<crate::image::ImageSource>,
+    pub background_size: BackgroundSize,
+    pub background_position: (Length, Length),
+    pub background_repeat: BackgroundRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum BackgroundSize {
+    Auto,
+    Cover,
+    Contain,
+    // an auto side keeps the image's ratio
+    Explicit(Length, Length),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundRepeat {
+    pub(crate) x: bool,
+    pub(crate) y: bool,
+}
+
+// a resolved background image layer, carried on the layout box for paint
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BackgroundImage {
+    pub(crate) source: crate::image::ImageSource,
+    pub(crate) size: BackgroundSize,
+    pub(crate) position: (Length, Length),
+    pub(crate) repeat: BackgroundRepeat,
+}
+
+impl Style {
+    pub(crate) fn background_layer(&self) -> Option<BackgroundImage> {
+        Some(BackgroundImage {
+            source: self.background_image?,
+            size: self.background_size,
+            position: self.background_position,
+            repeat: self.background_repeat,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectFit {
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
 }
 
 impl Style {
@@ -611,6 +675,12 @@ impl Style {
             opacity: 1.0,
             gradient: None,
             shadow: None,
+            aspect_ratio: None,
+            object_fit: ObjectFit::Fill,
+            background_image: None,
+            background_size: BackgroundSize::Auto,
+            background_position: (Length::px(0.0), Length::px(0.0)),
+            background_repeat: BackgroundRepeat { x: true, y: true },
         };
         match name {
             "body" => {
@@ -1165,6 +1235,19 @@ impl Stylesheet {
                     continue;
                 };
                 apply_declaration(&mut style, &property, &value);
+            }
+        }
+        // an image with no declared size takes its natural size; with one side
+        // declared, the other follows the natural ratio
+        if let Some(&(width, height)) = state.image_sizes.get(path)
+            && element.name == "img"
+        {
+            style
+                .aspect_ratio
+                .get_or_insert(width as f32 / height as f32);
+            if style.width == Length::Auto && style.height == Length::Auto {
+                style.width = Length::px(width as f32);
+                style.height = Length::px(height as f32);
             }
         }
         style
@@ -2488,6 +2571,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "flex" => Display::Flex,
                 "grid" => Display::Grid,
                 "inline" => Display::Inline,
+                "inline-block" => Display::InlineBlock,
                 _ => Display::Block,
             };
         }
@@ -2530,16 +2614,56 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "background" | "background-color" | "background-image" => {
             if let Some(gradient) = parse_linear_gradient(value) {
                 style.gradient = Some(gradient);
+                style.background_image = None;
                 return;
             }
             if value.trim().eq_ignore_ascii_case("none") {
                 style.gradient = None;
+                if property != "background-color" {
+                    style.background_image = None;
+                }
                 return;
             }
             if let Some(color) = Color::parse(value) {
                 style.gradient = None;
                 style.background = color;
+                if property == "background" {
+                    style.background_image = None;
+                }
+                return;
             }
+            if property != "background-color" {
+                apply_background_layer(style, value, property == "background");
+            }
+        }
+        "background-size" => {
+            if let Some(size) = parse_background_size(value) {
+                style.background_size = size;
+            }
+        }
+        "background-position" => {
+            if let Some(position) = parse_background_position(value) {
+                style.background_position = position;
+            }
+        }
+        "background-repeat" => {
+            if let Some(repeat) = parse_background_repeat(value) {
+                style.background_repeat = repeat;
+            }
+        }
+        "aspect-ratio" => {
+            if let Some(ratio) = parse_aspect_ratio(value) {
+                style.aspect_ratio = ratio;
+            }
+        }
+        "object-fit" => {
+            style.object_fit = match value.trim().to_ascii_lowercase().as_str() {
+                "contain" => ObjectFit::Contain,
+                "cover" => ObjectFit::Cover,
+                "none" => ObjectFit::None,
+                "scale-down" => ObjectFit::ScaleDown,
+                _ => ObjectFit::Fill,
+            };
         }
         "transform" => {
             if let Some(translate) = parse_translate(value) {
@@ -3198,6 +3322,183 @@ fn parse_grid_track(value: &str) -> Option<GridTrack> {
         return value.parse::<f32>().ok().map(GridTrack::Percent);
     }
     None
+}
+
+// splits on whitespace outside parentheses, so url(...) and functions stay whole
+fn split_words(value: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut depth = 0_usize;
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if character.is_whitespace() && depth == 0 {
+            if let Some(begin) = start.take() {
+                words.push(&value[begin..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(begin) = start {
+        words.push(&value[begin..]);
+    }
+    words
+}
+
+fn parse_url(word: &str) -> Option<&str> {
+    let inner = word
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("url("))
+        .and_then(|_| word[4..].strip_suffix(')'))?
+        .trim();
+    Some(inner.trim_matches(['"', '\'']))
+}
+
+// the image, color, position, size and repeat parts of a background declaration
+fn apply_background_layer(style: &mut Style, value: &str, shorthand: bool) {
+    let layer = split_top_level(value).into_iter().next().unwrap_or(value);
+    // the size follows a slash outside parentheses, so a slash inside url() stays put
+    let mut depth = 0_usize;
+    let slash = layer.char_indices().find_map(|(index, character)| {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => return Some(index),
+            _ => {}
+        }
+        None
+    });
+    let (place, size) = match slash {
+        Some(index) => (&layer[..index], Some(&layer[index + 1..])),
+        None => (layer, None),
+    };
+    // after the slash, only the leading one or two words are the size
+    let mut size_words = Vec::new();
+    let mut trailing = Vec::new();
+    for word in size.map(split_words).unwrap_or_default() {
+        let is_size = matches!(
+            word.to_ascii_lowercase().as_str(),
+            "auto" | "cover" | "contain"
+        ) || parse_length(word).is_some();
+        if is_size && size_words.len() < 2 && trailing.is_empty() {
+            size_words.push(word);
+        } else {
+            trailing.push(word);
+        }
+    }
+    let mut image = None;
+    let mut positions = Vec::new();
+    let mut repeat = None;
+    for word in split_words(place).into_iter().chain(trailing) {
+        if let Some(url) = parse_url(word) {
+            image = crate::image::intern_image_source(url);
+        } else if let Some(parsed) = parse_background_repeat(word) {
+            repeat = Some(parsed);
+        } else if let Some(color) = Color::parse(word) {
+            if shorthand {
+                style.background = color;
+            }
+        } else {
+            positions.push(word);
+        }
+    }
+    if image.is_none() && !shorthand {
+        return;
+    }
+    style.gradient = None;
+    style.background_image = image;
+    if shorthand {
+        style.background_position = parse_background_position(&positions.join(" "))
+            .unwrap_or((Length::px(0.0), Length::px(0.0)));
+        style.background_repeat = repeat.unwrap_or(BackgroundRepeat { x: true, y: true });
+        style.background_size =
+            parse_background_size(&size_words.join(" ")).unwrap_or(BackgroundSize::Auto);
+    }
+}
+
+fn parse_background_size(value: &str) -> Option<BackgroundSize> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "cover" => return Some(BackgroundSize::Cover),
+        "contain" => return Some(BackgroundSize::Contain),
+        "auto" | "auto auto" => return Some(BackgroundSize::Auto),
+        _ => {}
+    }
+    let mut words = value.split_whitespace();
+    let parse = |word: &str| {
+        if word == "auto" {
+            Some(Length::Auto)
+        } else {
+            parse_length(word)
+        }
+    };
+    let width = parse(words.next()?)?;
+    let height = words.next().map(parse).unwrap_or(Some(Length::Auto))?;
+    Some(BackgroundSize::Explicit(width, height))
+}
+
+// keywords become percentages; one value centers the other axis
+fn parse_background_position(value: &str) -> Option<(Length, Length)> {
+    let percent = |amount: f32| {
+        Length::Terms(LengthTerms {
+            percent: amount,
+            ..LengthTerms::default()
+        })
+    };
+    let words = split_words(value.trim());
+    if words.is_empty() || words.len() > 2 {
+        return None;
+    }
+    let mut horizontal = None;
+    let mut vertical = None;
+    let mut loose = Vec::new();
+    for word in &words {
+        match word.to_ascii_lowercase().as_str() {
+            "left" => horizontal = Some(percent(0.0)),
+            "right" => horizontal = Some(percent(100.0)),
+            "top" => vertical = Some(percent(0.0)),
+            "bottom" => vertical = Some(percent(100.0)),
+            "center" => loose.push(percent(50.0)),
+            other => loose.push(parse_length(other)?),
+        }
+    }
+    let mut loose = loose.into_iter();
+    let horizontal = horizontal.or_else(|| loose.next()).unwrap_or(percent(50.0));
+    let vertical = vertical.or_else(|| loose.next()).unwrap_or(percent(50.0));
+    Some((horizontal, vertical))
+}
+
+fn parse_background_repeat(value: &str) -> Option<BackgroundRepeat> {
+    let repeat = |x, y| Some(BackgroundRepeat { x, y });
+    match value.trim().to_ascii_lowercase().as_str() {
+        "repeat" | "repeat repeat" => repeat(true, true),
+        "no-repeat" | "no-repeat no-repeat" => repeat(false, false),
+        "repeat-x" | "repeat no-repeat" => repeat(true, false),
+        "repeat-y" | "no-repeat repeat" => repeat(false, true),
+        _ => None,
+    }
+}
+
+// "16 / 9", "1.5" or "auto 4 / 3"; Some(None) clears a declared ratio
+fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
+    let value = value.trim().to_ascii_lowercase();
+    let ratio = value.trim_start_matches("auto").trim();
+    if ratio.is_empty() {
+        return (value == "auto").then_some(None);
+    }
+    let (width, height) = match ratio.split_once('/') {
+        Some((width, height)) => (
+            width.trim().parse::<f32>().ok()?,
+            height.trim().parse::<f32>().ok()?,
+        ),
+        None => (ratio.parse::<f32>().ok()?, 1.0),
+    };
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some(Some(width / height))
 }
 
 fn default_display(name: &str) -> Display {
