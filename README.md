@@ -15,10 +15,10 @@ Same app, same machine, release builds, Windows x64. The runtime bundle is the e
 
 | | `ceri-engine` | CEF |
 | --- | --- | --- |
-| bundle size | 4.0 MB | 411 MB |
+| bundle size | 4.6 MB | 411 MB |
 | files in bundle | 9 | 252 |
 | processes at rest | 1 | 6 |
-| resident memory, app open | 26.9 MB | 319.7 MB |
+| resident memory, app open | 31 MB | 319.7 MB |
 | start to first painted frame | 160 ms median, headless render of the packaged app | not instrumented |
 | frame time, app animating | 3.3 ms at 1120x720, 5.7 ms at twice the device pixel ratio | not instrumented |
 

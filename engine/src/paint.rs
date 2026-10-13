@@ -409,7 +409,7 @@ impl Canvas {
             }
         };
         let Some(bounds) = DeviceBounds::of(self, target, clip) else {
-            LAYER_BUFFERS.with(|pool| pool.borrow_mut().push(layer.pixels));
+            recycle_layer(layer.pixels);
             return;
         };
         let factor = opacity.clamp(0.0, 1.0);
@@ -435,12 +435,7 @@ impl Canvas {
                 }
             }
         }
-        LAYER_BUFFERS.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            if pool.len() < MAX_POOLED_LAYERS {
-                pool.push(layer.pixels);
-            }
-        });
+        recycle_layer(layer.pixels);
     }
 
     // bilinear sample of premultiplied pixels, transparent beyond the edges
@@ -492,23 +487,26 @@ impl Canvas {
 
     // a transparent surface the size of this one, cleared only inside the bounds that will be
     // composited; buffers are pooled so an animating fade does not allocate every frame
+    // a transparent surface covering only the device pixels in bounds, aligned to this one
+    // so compositing copies pixel for pixel
     fn layer(&self, bounds: DeviceBounds) -> Canvas {
+        let width = bounds.right - bounds.left;
+        let height = bounds.bottom - bounds.top;
         let mut pixels = LAYER_BUFFERS
             .with(|pool| pool.borrow_mut().pop())
             .unwrap_or_default();
-        pixels.resize(self.pixels.len(), 0);
-        let stride = self.width as usize * 4;
-        for row in bounds.top..bounds.bottom {
-            let start = row as usize * stride;
-            pixels[start + bounds.left as usize * 4..start + bounds.right as usize * 4].fill(0);
-        }
+        pixels.clear();
+        pixels.resize(width as usize * height as usize * 4, 0);
         Canvas {
-            width: self.width,
-            height: self.height,
+            width,
+            height,
             scale: self.scale,
             background: Color::transparent(),
             pixels,
-            shift: self.shift,
+            shift: (
+                self.shift.0 + bounds.left as f32 / self.scale,
+                self.shift.1 + bounds.top as f32 / self.scale,
+            ),
         }
     }
 
@@ -516,35 +514,46 @@ impl Canvas {
     fn composite(&mut self, layer: Canvas, bounds: DeviceBounds, opacity: f32) {
         let factor = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
         let stride = self.width as usize * 4;
-        for row in bounds.top..bounds.bottom {
+        let layer_stride = layer.width as usize * 4;
+        for (row, source_row) in
+            (bounds.top..bounds.bottom).zip(layer.pixels.chunks_exact(layer_stride))
+        {
             let start = row as usize * stride + bounds.left as usize * 4;
             let end = row as usize * stride + bounds.right as usize * 4;
             for (target, source) in self.pixels[start..end]
                 .chunks_exact_mut(4)
-                .zip(layer.pixels[start..end].chunks_exact(4))
+                .zip(source_row.chunks_exact(4))
             {
                 if source[3] == 0 {
                     continue;
                 }
                 let alpha = (u32::from(source[3]) * factor) >> 8;
                 let inverse = 255 - alpha;
-                for channel in 0..4 {
-                    let faded = (u32::from(source[channel]) * factor) >> 8;
-                    target[channel] =
-                        (faded + u32::from(target[channel]) * inverse / 255).min(255) as u8;
+                for (target, source) in target.iter_mut().zip(source) {
+                    let faded = (u32::from(*source) * factor) >> 8;
+                    *target = (faded + u32::from(*target) * inverse / 255).min(255) as u8;
                 }
             }
         }
-        LAYER_BUFFERS.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            if pool.len() < MAX_POOLED_LAYERS {
-                pool.push(layer.pixels);
-            }
-        });
+        recycle_layer(layer.pixels);
     }
 }
 
 const MAX_POOLED_LAYERS: usize = 8;
+// larger buffers go back to the allocator, so one big layer does not stay resident
+const MAX_POOLED_LAYER_BYTES: usize = 4 * 1024 * 1024;
+
+fn recycle_layer(pixels: Vec<u8>) {
+    if pixels.capacity() > MAX_POOLED_LAYER_BYTES {
+        return;
+    }
+    LAYER_BUFFERS.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < MAX_POOLED_LAYERS {
+            pool.push(pixels);
+        }
+    });
+}
 // a transformed subtree larger than this renders at reduced resolution instead of failing
 const MAX_TRANSFORM_LAYER_PIXELS: f32 = 16_000_000.0;
 
