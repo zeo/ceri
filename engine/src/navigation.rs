@@ -6068,6 +6068,85 @@ mod tests {
         assert_ne!(pixel_at(&canvas, 30, 18), blank);
     }
 
+    fn close(actual: [u8; 4], expected: [u8; 3]) -> bool {
+        actual[..3]
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.abs_diff(expected) <= 3)
+    }
+
+    #[test]
+    fn opacity_fades_a_subtree_as_one_group() {
+        let (_, _, canvas) = image_page(
+            "<style>body { margin: 0; } #paper { background: #ffffff; width: 100px; height: 100px; }</style><div id=\"paper\"><div style=\"opacity: 0.5; width: 40px; height: 40px; background: #ff0000\"><div style=\"width: 20px; height: 20px; background: #0000ff\"></div></div><div style=\"opacity: 0.5\"><div style=\"opacity: 0.5; width: 10px; height: 10px; background: #ff0000\"></div></div><div style=\"opacity: 0.5; width: 13px; height: 7px\"><img style=\"display: block\" src=\"/rgb8.png\"></div></div>",
+            100.0,
+            100.0,
+        );
+        // the child covers the parent inside the group, so no red shows through the blue
+        assert!(
+            close(pixel_at(&canvas, 10, 10), [128, 128, 255]),
+            "{:?}",
+            pixel_at(&canvas, 10, 10)
+        );
+        assert!(
+            close(pixel_at(&canvas, 30, 30), [255, 128, 128]),
+            "{:?}",
+            pixel_at(&canvas, 30, 30)
+        );
+        // nested groups multiply
+        assert!(
+            close(pixel_at(&canvas, 5, 45), [255, 191, 191]),
+            "{:?}",
+            pixel_at(&canvas, 5, 45)
+        );
+        // images inside a faded group fade with it
+        let [red, green, blue, _] = fixture_color(4, 3);
+        let mix = |value: u8| ((u16::from(value) + 255) / 2) as u8;
+        assert!(
+            close(pixel_at(&canvas, 4, 53), [mix(red), mix(green), mix(blue)]),
+            "{:?}",
+            pixel_at(&canvas, 4, 53)
+        );
+    }
+
+    #[test]
+    fn text_inside_a_faded_box_fades_and_still_takes_clicks() {
+        let mut browser = Browser::new(bundle(
+            "<style>body { margin: 0; } #paper { background: #ffffff; padding: 4px; } button { display: block; width: 80px; height: 30px; color: #000000; background: #ffffff; font-size: 16px; }</style><div id=\"paper\"><div style=\"opacity: 0.4\"><button id=\"go\">GO</button></div><p id=\"status\">idle</p></div><script>document.getElementById('go').addEventListener('click', () => { document.getElementById('status').textContent = 'clicked'; });</script>",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 80.0,
+        };
+        let canvas = browser.paint(viewport).expect("page should paint");
+        let darkest = (4..34)
+            .flat_map(|y| (4..84).map(move |x| (x, y)))
+            .map(|(x, y)| pixel_at(&canvas, x, y)[0])
+            .min()
+            .expect("button pixels");
+        assert!(
+            darkest >= 140,
+            "black text at 40% opacity stays light, got {darkest}"
+        );
+        assert!(
+            browser
+                .click_at(viewport, 20.0, 15.0)
+                .expect("click should route")
+        );
+        let document = browser.document().expect("document");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("clicked")
+        );
+    }
+
     #[test]
     fn unsupported_or_cross_origin_images_stay_out_of_the_frame() {
         let mut resources = bundle(

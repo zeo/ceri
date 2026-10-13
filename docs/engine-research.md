@@ -19,7 +19,6 @@ CEF stays the default engine anyway, and the reason is compatibility rather than
 - full WebAssembly beyond the bounded i32 module path
 - multi-process renderer isolation and a per-renderer sandbox
 - platform accessibility adapters, so the accessibility tree has no UIA, AT-SPI or NSAccessibility bridge yet
-- group opacity compositing, which is approximated by multiplying inherited alpha
 - any browser-compatibility suite result, including web-platform-tests
 
 The Servo comparison track stays open for the layers where growing our own engine is the worse trade, particularly GPU-backed compositing and media.
@@ -178,6 +177,8 @@ The file-input boundary now sits beside that headless form path. A host-owned `F
 The clipboard boundary now sits beside it. A host-owned `ClipboardProvider` supplies text through `navigator.clipboard.readText()` and `writeText()` promises, while permission and platform failures remain typed at the embedder boundary. The renderer never receives a native clipboard object.
 
 Transform values now join the animated surface. `transform` accepts `translate()`, `translateX()`, and `translateY()` with any length units, moves the visual subtree through the same offset path as relative positioning, and participates in keyframe animations and state transitions by blending resolved pixel offsets between endpoints. Rotation, scale, skew, matrix forms, and percentage resolution against anything other than the box itself remain separate gates.
+
+Opacity below one now fades a subtree as a group. The box becomes a stacking context, its descendants paint into a transparent premultiplied layer sized to what the subtree can reach, and the layer composites once at the box's opacity, so a child covering its parent hides the parent instead of mixing with it, nested groups multiply, and text, images, canvas output and scrollbars inside the group fade together. A single box whose own paint cannot overlap itself skips the layer and fades its fills directly, and layer buffers are pooled across frames, so the packaged app's frame time is unchanged. Inline elements with opacity still fade their own glyphs individually.
 
 Raster images now decode without an image library. An engine-owned inflater feeds a PNG decoder that covers every color type, bit depth, filter and Adam7 interlacing, a JPEG decoder covers baseline and progressive Huffman files with any sampling factors, restart intervals, Adobe CMYK and EXIF orientation, and a GIF decoder takes the first frame. Measured on Windows x64 release builds, a 3000x2000 JPEG decodes in 86 ms baseline or 93 ms progressive, and the same picture as PNG in 56 ms; decoded pixels stay within 3 levels of libjpeg's output on the test set. Every decoder checks the declared size against the decode limit before it allocates, and truncated or corrupted files fail with a typed error rather than a panic. Images are cached per document, sized from their natural dimensions, placed by `object-fit`, and painted with bilinear sampling, opacity and rounded clipping. `background-image` with position, size and repeat uses the same path, and images and `inline-block` boxes now sit on text lines. WebP, animated frames, `object-position` and multiple background layers remain gates.
 

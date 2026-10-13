@@ -335,8 +335,154 @@ impl Canvas {
             ((color.green as u32 * alpha + self.pixels[index + 1] as u32 * inverse) / 255) as u8;
         self.pixels[index + 2] =
             ((color.blue as u32 * alpha + self.pixels[index + 2] as u32 * inverse) / 255) as u8;
-        self.pixels[index + 3] = 255;
+        self.pixels[index + 3] =
+            ((alpha * 255 + self.pixels[index + 3] as u32 * inverse) / 255) as u8;
     }
+
+    // a transparent surface the size of this one, cleared only inside the bounds that will be
+    // composited; buffers are pooled so an animating fade does not allocate every frame
+    fn layer(&self, bounds: DeviceBounds) -> Canvas {
+        let mut pixels = LAYER_BUFFERS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_default();
+        pixels.resize(self.pixels.len(), 0);
+        let stride = self.width as usize * 4;
+        for row in bounds.top..bounds.bottom {
+            let start = row as usize * stride;
+            pixels[start + bounds.left as usize * 4..start + bounds.right as usize * 4].fill(0);
+        }
+        Canvas {
+            width: self.width,
+            height: self.height,
+            scale: self.scale,
+            background: Color::transparent(),
+            pixels,
+        }
+    }
+
+    // draws a premultiplied layer over this surface at the given group opacity
+    fn composite(&mut self, layer: Canvas, bounds: DeviceBounds, opacity: f32) {
+        let factor = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
+        let stride = self.width as usize * 4;
+        for row in bounds.top..bounds.bottom {
+            let start = row as usize * stride + bounds.left as usize * 4;
+            let end = row as usize * stride + bounds.right as usize * 4;
+            for (target, source) in self.pixels[start..end]
+                .chunks_exact_mut(4)
+                .zip(layer.pixels[start..end].chunks_exact(4))
+            {
+                if source[3] == 0 {
+                    continue;
+                }
+                let alpha = (u32::from(source[3]) * factor) >> 8;
+                let inverse = 255 - alpha;
+                for channel in 0..4 {
+                    let faded = (u32::from(source[channel]) * factor) >> 8;
+                    target[channel] =
+                        (faded + u32::from(target[channel]) * inverse / 255).min(255) as u8;
+                }
+            }
+        }
+        LAYER_BUFFERS.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < MAX_POOLED_LAYERS {
+                pool.push(layer.pixels);
+            }
+        });
+    }
+}
+
+const MAX_POOLED_LAYERS: usize = 8;
+
+thread_local! {
+    static LAYER_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceBounds {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+impl DeviceBounds {
+    fn of(canvas: &Canvas, rect: Rect, clip: Option<Rect>) -> Option<Self> {
+        let rect = intersect_clip(clip, rect)?;
+        let left = (rect.x * canvas.scale)
+            .floor()
+            .clamp(0.0, canvas.width as f32) as u32;
+        let top = (rect.y * canvas.scale)
+            .floor()
+            .clamp(0.0, canvas.height as f32) as u32;
+        let right = ((rect.x + rect.width) * canvas.scale)
+            .ceil()
+            .clamp(0.0, canvas.width as f32) as u32;
+        let bottom = ((rect.y + rect.height) * canvas.scale)
+            .ceil()
+            .clamp(0.0, canvas.height as f32) as u32;
+        (right > left && bottom > top).then_some(Self {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    }
+}
+
+// everything a subtree can paint: its boxes, shadows and text, in layout space
+fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let mut bounds = visual_rect_for(layout_box, ancestor_offset);
+    if let Some(shadow) = layout_box.shadow {
+        let reach = shadow.blur + shadow.spread.max(0.0);
+        bounds = union_rect(
+            bounds,
+            Rect {
+                x: bounds.x + shadow.offset_x - reach,
+                y: bounds.y + shadow.offset_y - reach,
+                width: bounds.width + reach * 2.0,
+                height: bounds.height + reach * 2.0,
+            },
+        );
+    }
+    for run in &layout_box.text {
+        bounds = union_rect(
+            bounds,
+            Rect {
+                x: run.x + offset.0,
+                y: run.y + offset.1,
+                width: run.width,
+                height: run.font_size * 1.5,
+            },
+        );
+    }
+    for child in &layout_box.children {
+        bounds = union_rect(bounds, subtree_bounds(child, offset));
+    }
+    bounds
+}
+
+fn union_rect(first: Rect, second: Rect) -> Rect {
+    let x = first.x.min(second.x);
+    let y = first.y.min(second.y);
+    Rect {
+        x,
+        y,
+        width: (first.x + first.width).max(second.x + second.width) - x,
+        height: (first.y + first.height).max(second.y + second.height) - y,
+    }
+}
+
+// a box whose own paint cannot overlap itself fades correctly without a layer
+fn fades_without_layer(layout_box: &LayoutBox) -> bool {
+    layout_box.children.is_empty()
+        && layout_box.text.is_empty()
+        && layout_box.shadow.is_none()
+        && (layout_box.border_width <= 0.0 || layout_box.border_radius <= 0.0)
+        && layout_box.background_image.is_none()
+        && !matches!(layout_box.tag.as_str(), "img" | "canvas")
+        && layout_box.overflow == Overflow::Visible
 }
 
 fn write_png_chunk(file: &mut File, kind: &[u8; 4], body: &[u8]) -> io::Result<()> {
@@ -692,9 +838,70 @@ fn paint_context(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
+    let opacity = layout_box.opacity;
+    if opacity <= 0.0 {
+        return;
+    }
+    // opacity fades the painted subtree as one image, so overlapping descendants do not
+    // show through each other
+    if opacity < 1.0 && !fades_without_layer(layout_box) {
+        let Some(bounds) =
+            DeviceBounds::of(canvas, subtree_bounds(layout_box, ancestor_offset), clip)
+        else {
+            return;
+        };
+        let mut layer = canvas.layer(bounds);
+        paint_context_contents(
+            &mut layer,
+            layout_box,
+            ContextPaint {
+                commands,
+                images,
+                prose_selections,
+                clip,
+                ancestor_offset,
+                opacity: 1.0,
+            },
+        );
+        canvas.composite(layer, bounds, opacity);
+        return;
+    }
+    paint_context_contents(
+        canvas,
+        layout_box,
+        ContextPaint {
+            commands,
+            images,
+            prose_selections,
+            clip,
+            ancestor_offset,
+            opacity,
+        },
+    );
+}
+
+struct ContextPaint<'a> {
+    commands: &'a [CanvasCommand],
+    images: &'a [ImageLayer],
+    prose_selections: &'a [ProseSpan],
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+    // the opacity this box's own surface paints with; a group layer applies it later
+    opacity: f32,
+}
+
+fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: ContextPaint<'_>) {
+    let ContextPaint {
+        commands,
+        images,
+        prose_selections,
+        clip,
+        ancestor_offset,
+        opacity,
+    } = paint;
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
-    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect);
+    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
@@ -776,7 +983,15 @@ fn paint_non_context_subtree(
 ) {
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
-    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect);
+    let content_clip = paint_box_surface(
+        canvas,
+        layout_box,
+        images,
+        clip,
+        offset,
+        rect,
+        layout_box.opacity,
+    );
     paint_box_text(
         canvas,
         layout_box,
@@ -804,9 +1019,9 @@ fn paint_box_surface(
     clip: Option<Rect>,
     offset: (f32, f32),
     rect: Rect,
+    opacity: f32,
 ) -> Option<Rect> {
     let radius = layout_box.border_radius;
-    let opacity = layout_box.opacity;
     if let Some(shadow) = layout_box.shadow.as_ref() {
         paint_shadow(canvas, shadow, rect, radius, opacity, clip);
     }

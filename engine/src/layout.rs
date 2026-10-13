@@ -1491,7 +1491,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
-        opacity: style.opacity * parent.opacity,
+        opacity: 1.0,
         content_width,
         content_x,
         align: style.text_align,
@@ -1587,7 +1587,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                             color: style.color,
                             weight: style.font_weight,
                             text: inherited_text(&style),
-                            opacity: style.opacity * parent.opacity,
+                            opacity: 1.0,
                         },
                         context: LayoutContext {
                             viewport,
@@ -1613,7 +1613,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                                 color: style.color,
                                 weight: style.font_weight,
                                 text: inherited_text(&style),
-                                opacity: style.opacity * parent.opacity,
+                                opacity: 1.0,
                             },
                             context: inline_context,
                             stylesheet,
@@ -1671,7 +1671,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
-        creates_stacking_context: creates_stacking_context(style),
+        creates_stacking_context: creates_stacking_context(style)
+            || style.opacity * parent.opacity < 1.0,
         sticky_inset: style.inset,
         font_size,
         overflow: style.overflow,
@@ -1706,7 +1707,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 color: style.color,
                 weight: style.font_weight,
                 text: inherited_text(&style),
-                opacity: style.opacity * parent.opacity,
+                opacity: 1.0,
             },
             ancestors: &child_ancestors,
             stylesheet,
@@ -1744,7 +1745,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
-        opacity: style.opacity * parent_opacity,
+        opacity: 1.0,
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
@@ -2024,7 +2025,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
-        creates_stacking_context: creates_stacking_context(style),
+        creates_stacking_context: creates_stacking_context(style)
+            || style.opacity * parent_opacity < 1.0,
         sticky_inset: style.inset,
         font_size,
         overflow: style.overflow,
@@ -2101,7 +2103,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
-        opacity: style.opacity * parent_opacity,
+        opacity: 1.0,
     };
     let mut child_ancestors = ancestors;
     child_ancestors.push(element);
@@ -2322,7 +2324,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
-        creates_stacking_context: creates_stacking_context(style),
+        creates_stacking_context: creates_stacking_context(style)
+            || style.opacity * parent_opacity < 1.0,
         sticky_inset: style.inset,
         font_size,
         overflow: style.overflow,
@@ -2431,7 +2434,7 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
         color: style.color,
         weight: style.font_weight,
         text: inherited_text(&style),
-        opacity: style.opacity * parent.opacity,
+        opacity: 1.0,
     };
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(element);
