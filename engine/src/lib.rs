@@ -9,6 +9,8 @@ mod native_http;
 mod navigation;
 mod paint;
 mod script;
+mod selection;
+mod text;
 mod wasm;
 #[cfg(feature = "windowed")]
 mod window;

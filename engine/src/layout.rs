@@ -38,9 +38,52 @@ pub struct TextRun {
     pub font_stack: FontStack,
     pub color: Color,
     pub bold: bool,
-    // DOM text node that produced this run, so prose can be selected by pointer
+    // DOM text node that produced this run, so prose can be selected by pointer;
+    // node_offset is where the word starts, past any leading space in text
     pub node_path: Option<NodePath>,
     pub node_offset: usize,
+    // UTF-16 length of the source word, which text-transform may change in text
+    pub source_len: usize,
+}
+
+impl TextRun {
+    fn prefix_units(&self) -> usize {
+        usize::from(self.text.starts_with(' '))
+    }
+
+    // the node offset that a UTF-16 index inside this run's text stands for
+    pub(crate) fn node_offset_at(&self, index: usize) -> usize {
+        self.node_offset
+            + index
+                .saturating_sub(self.prefix_units())
+                .min(self.source_len)
+    }
+
+    // the run text indices covered by a node-local selection span; the leading
+    // space joins the selection when the span starts before the word
+    pub(crate) fn selected_units(
+        &self,
+        start: usize,
+        end: usize,
+        continued: bool,
+    ) -> Option<(usize, usize)> {
+        let prefix = self.prefix_units();
+        let length = self.text.encode_utf16().count();
+        // the end of the source word maps to the end of the drawn text, which
+        // text-transform may have lengthened
+        let index = |offset: usize| {
+            if offset < self.node_offset {
+                0
+            } else if offset - self.node_offset >= self.source_len {
+                length
+            } else {
+                (prefix + offset - self.node_offset).min(length)
+            }
+        };
+        let from = if continued { 0 } else { index(start) };
+        let to = index(end);
+        (from < to).then_some((from, to))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,7 +131,7 @@ pub struct LayoutDocument {
     pub root: LayoutBox,
     pub(crate) images: Vec<ImageLayer>,
     // prose ranges to highlight, keyed by the DOM text node that owns the run
-    pub(crate) prose_selections: Vec<(NodePath, usize, usize)>,
+    pub(crate) prose_selections: Vec<ProseSpan>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +167,7 @@ struct InlineFragment {
     bold: bool,
     node_path: Option<NodePath>,
     node_offset: usize,
+    source_len: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -508,20 +552,78 @@ impl LayoutDocument {
         Some((path, base + offset_within_run(&run, x - origin.0)))
     }
 
-    // maps a point over prose to the DOM text node and UTF-16 offset it lands on
-    pub fn prose_text_offset_at(&self, x: f32, y: f32) -> Option<(NodePath, usize)> {
-        let mut found = Vec::new();
-        collect_prose_at(&self.root, x, y, (0.0, 0.0), &mut found);
-        // a drag past the end of a line clamps to its nearest run instead of missing
-        let (node_path, run) = found
+    // maps a point over prose to the DOM text node and UTF-16 offset it lands on;
+    // a snapping drag resolves points between lines or beside text to the nearest line
+    pub fn prose_text_offset_at(&self, x: f32, y: f32, snap: bool) -> Option<(NodePath, usize)> {
+        let runs = self.prose_runs();
+        let within_line = |run: &ProseRun| y >= run.run.y && y < run.run.y + run.line_height();
+        let mut line = runs
             .iter()
-            .filter(|(_, run)| run.x <= x)
-            .next_back()
-            .or_else(|| found.first())?;
-        Some((
-            node_path.clone(),
-            run.node_offset + offset_within_run(run, x - run.x),
-        ))
+            .filter(|run| within_line(run) && (snap || contains_point(run.box_rect, x, y)))
+            .collect::<Vec<_>>();
+        if line.is_empty() && snap {
+            let nearest = runs.iter().min_by(|left, right| {
+                left.vertical_distance(y)
+                    .total_cmp(&right.vertical_distance(y))
+            })?;
+            line = runs
+                .iter()
+                .filter(|run| run.run.y == nearest.run.y && run.box_path == nearest.box_path)
+                .collect();
+        }
+        let hit = line.into_iter().min_by(|left, right| {
+            left.horizontal_distance(x)
+                .total_cmp(&right.horizontal_distance(x))
+        })?;
+        let index = offset_within_run(&hit.run, x);
+        Some((hit.node_path.clone(), hit.run.node_offset_at(index)))
+    }
+
+    // every painted prose run in tree order, translated to the viewport
+    pub(crate) fn prose_runs(&self) -> Vec<ProseRun> {
+        let mut runs = Vec::new();
+        collect_prose_runs(&self.root, (0.0, 0.0), &mut runs);
+        runs
+    }
+}
+
+// a selected span of one text node; continued spans began in an earlier node,
+// so a run's leading space belongs to the selection
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProseSpan {
+    pub(crate) path: NodePath,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) continued: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProseRun {
+    pub(crate) node_path: NodePath,
+    pub(crate) box_path: NodePath,
+    pub(crate) box_rect: Rect,
+    pub(crate) run: TextRun,
+}
+
+impl ProseRun {
+    pub(crate) fn line_height(&self) -> f32 {
+        self.run.font_size.max(1.0)
+    }
+
+    fn vertical_distance(&self, y: f32) -> f32 {
+        if y < self.run.y {
+            self.run.y - y
+        } else {
+            (y - (self.run.y + self.line_height())).max(0.0)
+        }
+    }
+
+    fn horizontal_distance(&self, x: f32) -> f32 {
+        if x < self.run.x {
+            self.run.x - x
+        } else {
+            (x - (self.run.x + self.run.width)).max(0.0)
+        }
     }
 }
 
@@ -560,29 +662,32 @@ fn collect_control_at(
     }
 }
 
-fn collect_prose_at(
+fn collect_prose_runs(
     layout_box: &LayoutBox,
-    _x: f32,
-    y: f32,
     ancestor_offset: (f32, f32),
-    found: &mut Vec<(NodePath, TextRun)>,
+    found: &mut Vec<ProseRun>,
 ) {
     let offset = visual_offset_for(layout_box, ancestor_offset);
+    let box_rect = visual_rect_for(layout_box, ancestor_offset);
     for run in &layout_box.text {
-        if run.node_path.is_none() || run.text.trim().is_empty() {
+        let Some(node_path) = &run.node_path else {
+            continue;
+        };
+        if run.text.trim().is_empty() {
             continue;
         }
-        let top = run.y + offset.1;
-        let bottom = top + run.font_size.max(1.0);
-        if y >= top && y < bottom {
-            let mut hit = run.clone();
-            hit.x += offset.0;
-            hit.y += offset.1;
-            found.push((run.node_path.clone().expect("checked above"), hit));
-        }
+        let mut run = run.clone();
+        run.x += offset.0;
+        run.y += offset.1;
+        found.push(ProseRun {
+            node_path: node_path.clone(),
+            box_path: layout_box.path.clone(),
+            box_rect,
+            run,
+        });
     }
     for child in &layout_box.children {
-        collect_prose_at(child, _x, y, offset, found);
+        collect_prose_runs(child, offset, found);
     }
 }
 
@@ -1351,6 +1456,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 bold: style.font_weight == FontWeight::Bold,
                 node_path: None,
                 node_offset: 0,
+                source_len: 0,
             });
         }
         line.y = content_y + value_lines.len() as f32 * line_height;
@@ -2721,20 +2827,30 @@ fn append_inline_text(
     text: &mut Vec<TextRun>,
     line: &mut InlineLine,
 ) {
-    let transformed = context.text.transform.apply(value);
     let letter_spacing = context
         .text
         .letter_spacing
         .resolve(context.font_size, context.font_size)
         .unwrap_or(0.0);
-    let leading_space = transformed.chars().next().is_some_and(char::is_whitespace);
-    let trailing_space = transformed
-        .chars()
-        .next_back()
-        .is_some_and(char::is_whitespace);
+    let leading_space = value.chars().next().is_some_and(char::is_whitespace);
+    let trailing_space = value.chars().next_back().is_some_and(char::is_whitespace);
     let mut first_word = true;
-    let mut consumed = 0_usize;
-    for word in transformed.split_ascii_whitespace() {
+    let mut consumed_bytes = 0_usize;
+    let mut consumed_units = source.offset;
+    // words come from the source so offsets stay exact when text-transform
+    // changes the length of what is drawn
+    for source_word in value.split_ascii_whitespace() {
+        let start = source_word.as_ptr() as usize - value.as_ptr() as usize;
+        consumed_units += value[consumed_bytes..start].encode_utf16().count();
+        consumed_bytes = start + source_word.len();
+        let node_offset = consumed_units;
+        let source_len = source_word.encode_utf16().count();
+        consumed_units += source_len;
+        let transformed_word = match context.text.transform {
+            crate::css::TextTransform::None => std::borrow::Cow::Borrowed(source_word),
+            transform => std::borrow::Cow::Owned(transform.apply(source_word)),
+        };
+        let word = transformed_word.as_ref();
         let bold = context.weight == FontWeight::Bold;
         let word_width = measure_text(
             word,
@@ -2768,20 +2884,6 @@ fn append_inline_text(
         }
         let prefix = if space_width > 0.0 { " " } else { "" };
         let text = format!("{prefix}{word}");
-        // the word lands at its UTF-16 offset inside the source node, past any
-        // collapsed whitespace that word-wrapping dropped from this run
-        let node_offset = source
-            .path
-            .as_ref()
-            .map(|_| {
-                let start = transformed[consumed..]
-                    .find(word)
-                    .map(|relative| consumed + relative)
-                    .unwrap_or(consumed);
-                consumed = start + text.len();
-                value[..start].encode_utf16().count() + source.offset
-            })
-            .unwrap_or(source.offset);
         let width = measure_text(
             &text,
             context.text.family,
@@ -2801,10 +2903,11 @@ fn append_inline_text(
             bold,
             node_path: source.path.clone(),
             node_offset,
+            source_len,
         });
         first_word = false;
     }
-    if !transformed.trim().is_empty() || trailing_space {
+    if !value.trim().is_empty() || trailing_space {
         line.trailing_space = trailing_space;
     }
 }
@@ -2838,6 +2941,7 @@ fn flush_line(
             bold: fragment.bold,
             node_path: fragment.node_path,
             node_offset: fragment.node_offset,
+            source_len: fragment.source_len,
         });
         x += fragment.width;
     }

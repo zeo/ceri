@@ -90,7 +90,22 @@ pub struct EngineHost {
     selecting_thumb: Option<crate::ThumbDrag>,
     next_frame: u64,
     dirty: bool,
+    // milliseconds of host clock, used to count rapid presses as one series
+    clock: u64,
+    last_press: Option<Press>,
 }
+
+#[derive(Clone, Copy)]
+struct Press {
+    time: u64,
+    x: f32,
+    y: f32,
+    count: u32,
+}
+
+// the platform defaults on Windows; a press inside both continues the series
+const MULTI_CLICK_MILLISECONDS: u64 = 500;
+const MULTI_CLICK_DISTANCE: f32 = 4.0;
 
 #[derive(Debug)]
 pub enum EngineWorkerEvent {
@@ -287,6 +302,8 @@ impl EngineHost {
             selecting_thumb: None,
             next_frame: 1,
             dirty: true,
+            clock: 0,
+            last_press: None,
         }
     }
 
@@ -345,6 +362,26 @@ impl EngineHost {
         self.go(1)
     }
 
+    fn count_press(&mut self, x: f32, y: f32) -> u32 {
+        let count = match self.last_press {
+            Some(press)
+                if self.clock.saturating_sub(press.time) <= MULTI_CLICK_MILLISECONDS
+                    && (press.x - x).abs() <= MULTI_CLICK_DISTANCE
+                    && (press.y - y).abs() <= MULTI_CLICK_DISTANCE =>
+            {
+                press.count + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some(Press {
+            time: self.clock,
+            x,
+            y,
+            count,
+        });
+        count
+    }
+
     pub fn input(&mut self, event: InputEvent) -> Result<InputResult, NavigationError> {
         self.pump_workers()?;
         let result = match event {
@@ -392,14 +429,23 @@ impl EngineHost {
                 let dispatched = self
                     .browser
                     .dispatch_at(self.viewport, x, y, "pointerdown")?;
-                let thumb_drag = (button == PointerButton::Primary)
+                let primary = button == PointerButton::Primary;
+                let count = if primary { self.count_press(x, y) } else { 1 };
+                let thumb_drag = primary
                     .then(|| self.browser.thumb_at(self.viewport, x, y))
                     .flatten();
                 if let Some(drag) = &thumb_drag {
                     self.selecting_thumb = Some(drag.clone());
                 }
-                let selected = button == PointerButton::Primary
-                    && self.browser.select_at(self.viewport, x, y, false)?;
+                // a press on a scrollbar thumb drags it and leaves the selection alone
+                let selected = primary
+                    && thumb_drag.is_none()
+                    && if count >= 2 {
+                        self.browser
+                            .select_unit_at(self.viewport, x, y, count.min(3))?
+                    } else {
+                        self.browser.select_at(self.viewport, x, y, false)?
+                    };
                 self.selecting = selected;
                 InputResult {
                     handled: dispatched || thumb_drag.is_some() || selected,
@@ -417,10 +463,15 @@ impl EngineHost {
                     ..InputResult::default()
                 }
             }
-            InputEvent::Click { x, y } => InputResult {
-                handled: self.browser.click_at(self.viewport, x, y)?,
-                ..InputResult::default()
-            },
+            InputEvent::Click { x, y } => {
+                let count = self.last_press.map_or(1, |press| press.count);
+                InputResult {
+                    handled: self
+                        .browser
+                        .click_at_with_count(self.viewport, x, y, count)?,
+                    ..InputResult::default()
+                }
+            }
             InputEvent::Scroll {
                 x,
                 y,
@@ -465,6 +516,7 @@ impl EngineHost {
                 ..InputResult::default()
             },
             InputEvent::AdvanceTime(milliseconds) => {
+                self.clock = self.clock.saturating_add(milliseconds);
                 let tasks_run = self.browser.advance_time(milliseconds)?;
                 InputResult {
                     tasks_run,
@@ -1562,7 +1614,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("2|3|backward|true:true:false:true")
+            Some("0|3|backward|true:true:false:true")
         );
     }
 
@@ -1746,5 +1798,313 @@ mod tests {
             } if request_id == render
         ));
         worker.shutdown();
+    }
+
+    struct SharedClipboard {
+        text: std::cell::RefCell<String>,
+    }
+
+    impl crate::navigation::ClipboardProvider for SharedClipboard {
+        fn read_text(&self) -> Result<String, NavigationError> {
+            Ok(self.text.borrow().clone())
+        }
+
+        fn write_text(&self, text: &str) -> Result<(), NavigationError> {
+            *self.text.borrow_mut() = text.to_string();
+            Ok(())
+        }
+    }
+
+    fn prose_host(source: &str, width: f32, height: f32) -> (EngineHost, Rc<SharedClipboard>) {
+        let clipboard = Rc::new(SharedClipboard {
+            text: std::cell::RefCell::new(String::new()),
+        });
+        let browser = Browser::new(bundle(source)).with_clipboard_provider(clipboard.clone());
+        let mut host = EngineHost::new(browser, Size { width, height });
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        (host, clipboard)
+    }
+
+    // the viewport point at the start or end of the run that draws a word
+    fn word_point(host: &EngineHost, word: &str, at_end: bool) -> (f32, f32) {
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout should resolve");
+        let prose = layout
+            .prose_runs()
+            .into_iter()
+            .find(|prose| prose.run.text.trim() == word)
+            .unwrap_or_else(|| panic!("a run should draw {word}"));
+        let y = prose.run.y + prose.line_height() / 2.0;
+        if at_end {
+            (prose.run.x + prose.run.width - 0.25, y)
+        } else {
+            (prose.run.x + 0.25, y)
+        }
+    }
+
+    fn press(host: &mut EngineHost, (x, y): (f32, f32)) {
+        host.input(InputEvent::PointerDown {
+            x,
+            y,
+            button: PointerButton::Primary,
+        })
+        .expect("pointer down should be accepted");
+    }
+
+    fn drag(host: &mut EngineHost, (x, y): (f32, f32)) {
+        host.input(InputEvent::PointerMove { x, y })
+            .expect("pointer move should be accepted");
+    }
+
+    fn release(host: &mut EngineHost, (x, y): (f32, f32)) {
+        host.input(InputEvent::PointerUp {
+            x,
+            y,
+            button: PointerButton::Primary,
+        })
+        .expect("pointer up should be accepted");
+        host.input(InputEvent::Click { x, y })
+            .expect("click should be accepted");
+    }
+
+    fn chord(host: &mut EngineHost, key: &str, modifiers: KeyModifiers) {
+        host.input(InputEvent::KeyDownWithModifiers {
+            key: key.to_string(),
+            modifiers,
+        })
+        .expect("key should be accepted");
+    }
+
+    fn copied(host: &mut EngineHost, clipboard: &SharedClipboard) -> String {
+        clipboard.text.borrow_mut().clear();
+        chord(
+            host,
+            "c",
+            KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        );
+        clipboard.text.borrow().clone()
+    }
+
+    const TWO_PARAGRAPHS: &str = "<style>p { margin: 0 0 8px; font-size: 16px; }</style><script>const hidden = 'script text';</script><p>first para</p><p>second line</p>";
+
+    #[test]
+    fn a_drag_across_paragraphs_copies_the_rendered_text_and_highlights_both() {
+        let (mut host, clipboard) = prose_host(TWO_PARAGRAPHS, 320.0, 120.0);
+        let start = word_point(&host, "first", false);
+        let end = word_point(&host, "second", true);
+        press(&mut host, start);
+        drag(&mut host, end);
+        release(&mut host, end);
+        assert_eq!(copied(&mut host, &clipboard), "first para\nsecond");
+
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout should resolve");
+        assert_eq!(layout.prose_selections.len(), 2);
+        let canvas = layout.paint();
+        let width = canvas.width() as usize;
+        let highlighted_rows = canvas
+            .rgba_pixels()
+            .chunks_exact(width * 4)
+            .enumerate()
+            .filter(|(_, row)| {
+                row.chunks_exact(4)
+                    .any(|pixel| pixel[..3] == [170, 205, 238])
+            })
+            .map(|(row, _)| row as f32)
+            .collect::<Vec<_>>();
+        assert!(
+            highlighted_rows
+                .iter()
+                .any(|row| (*row - start.1).abs() < 4.0)
+        );
+        assert!(
+            highlighted_rows
+                .iter()
+                .any(|row| (*row - end.1).abs() < 4.0)
+        );
+    }
+
+    #[test]
+    fn a_backward_drag_keeps_the_press_point_as_the_anchor() {
+        let (mut host, clipboard) = prose_host(TWO_PARAGRAPHS, 320.0, 120.0);
+        let anchor = word_point(&host, "second", true);
+        press(&mut host, anchor);
+        let para = word_point(&host, "para", false);
+        drag(&mut host, para);
+        assert_eq!(copied(&mut host, &clipboard), "para\nsecond");
+        let line_end = word_point(&host, "line", true);
+        drag(&mut host, line_end);
+        release(&mut host, line_end);
+        assert_eq!(copied(&mut host, &clipboard), " line");
+    }
+
+    #[test]
+    fn repeated_clicks_select_a_word_then_its_block_and_report_the_count() {
+        let (mut host, clipboard) = prose_host(
+            "<style>p { margin: 0 0 8px; font-size: 16px; }</style><p id='target'>first para</p><p id='status'>idle</p><script>
+                const target = document.getElementById('target');
+                const status = document.getElementById('status');
+                let clicks = '';
+                target.addEventListener('click', (event) => { clicks = clicks + event.detail; });
+                target.addEventListener('dblclick', (event) => { status.textContent = 'dbl' + event.detail + ':' + clicks; });
+            </script>",
+            320.0,
+            120.0,
+        );
+        let point = word_point(&host, "para", false);
+        let point = (point.0 + 6.0, point.1);
+        press(&mut host, point);
+        release(&mut host, point);
+        press(&mut host, point);
+        release(&mut host, point);
+        assert_eq!(copied(&mut host, &clipboard), "para");
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("dbl2:12")
+        );
+        press(&mut host, point);
+        release(&mut host, point);
+        assert_eq!(copied(&mut host, &clipboard), "first para");
+
+        // a press after the series window starts a fresh single click
+        host.input(InputEvent::AdvanceTime(600))
+            .expect("clock should advance");
+        press(&mut host, point);
+        release(&mut host, point);
+        assert_eq!(copied(&mut host, &clipboard), "");
+    }
+
+    #[test]
+    fn a_drag_after_a_double_click_extends_by_whole_words() {
+        let (mut host, clipboard) = prose_host(TWO_PARAGRAPHS, 320.0, 120.0);
+        let point = word_point(&host, "para", false);
+        let point = (point.0 + 6.0, point.1);
+        press(&mut host, point);
+        release(&mut host, point);
+        press(&mut host, point);
+        let into_line = word_point(&host, "line", false);
+        drag(&mut host, (into_line.0 + 6.0, into_line.1));
+        release(&mut host, (into_line.0 + 6.0, into_line.1));
+        assert_eq!(copied(&mut host, &clipboard), "para\nsecond line");
+    }
+
+    #[test]
+    fn shift_arrows_extend_prose_by_characters_words_and_lines() {
+        let (mut host, clipboard) = prose_host(TWO_PARAGRAPHS, 320.0, 120.0);
+        let point = word_point(&host, "first", false);
+        let point = (point.0 + 6.0, point.1);
+        press(&mut host, point);
+        release(&mut host, point);
+        press(&mut host, point);
+        release(&mut host, point);
+        assert_eq!(copied(&mut host, &clipboard), "first");
+
+        let shift = KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        };
+        let word = KeyModifiers {
+            shift: true,
+            control: !cfg!(target_os = "macos"),
+            alt: cfg!(target_os = "macos"),
+            ..KeyModifiers::default()
+        };
+        chord(&mut host, "ArrowRight", shift);
+        assert_eq!(copied(&mut host, &clipboard), "first ");
+        chord(&mut host, "ArrowRight", word);
+        assert_eq!(copied(&mut host, &clipboard), "first para");
+        chord(&mut host, "ArrowRight", word);
+        chord(&mut host, "End", shift);
+        assert_eq!(copied(&mut host, &clipboard), "first para\nsecond line");
+        chord(&mut host, "Home", shift);
+        assert_eq!(copied(&mut host, &clipboard), "first para");
+        chord(&mut host, "ArrowLeft", shift);
+        assert_eq!(copied(&mut host, &clipboard), "first par");
+    }
+
+    #[test]
+    fn select_all_without_focus_takes_every_rendered_line() {
+        let (mut host, clipboard) = prose_host(TWO_PARAGRAPHS, 320.0, 120.0);
+        chord(
+            &mut host,
+            "a",
+            KeyModifiers {
+                control: true,
+                ..KeyModifiers::default()
+            },
+        );
+        assert_eq!(copied(&mut host, &clipboard), "first para\nsecond line");
+    }
+
+    #[test]
+    fn a_press_on_the_scrollbar_thumb_does_not_select_the_text_beside_it() {
+        let (mut host, _) = prose_host(
+            "<style>body { margin: 0; } #pane { width: 200px; height: 60px; overflow: auto; } p { margin: 0; font-size: 16px; }</style><div id='pane'><p>one</p><p>two</p><p>three</p><p>four</p><p>five</p><p>six</p></div>",
+            320.0,
+            120.0,
+        );
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout should resolve");
+        let thumb = (0..200)
+            .rev()
+            .map(|x| (x as f32 + 0.5, 4.0))
+            .find(|(x, y)| layout.thumb_drag_at(*x, *y).is_some())
+            .expect("the pane should paint a thumb at its top");
+        press(&mut host, thumb);
+        let page_selection = host
+            .browser()
+            .selected_text(host.viewport())
+            .expect("selection should read");
+        assert_eq!(page_selection, "");
+    }
+
+    #[test]
+    fn transformed_prose_with_length_changing_case_maps_selection_offsets() {
+        let (mut host, clipboard) = prose_host(
+            "<style>p { margin: 0; font-size: 16px; text-transform: uppercase; }</style><p>straße ǆemo</p>",
+            320.0,
+            80.0,
+        );
+        let start = word_point(&host, "STRASSE", false);
+        let end = word_point(&host, "ǄEMO", true);
+        press(&mut host, start);
+        drag(&mut host, end);
+        release(&mut host, end);
+        assert_eq!(copied(&mut host, &clipboard), "STRASSE ǄEMO");
+    }
+
+    #[test]
+    fn a_selection_across_inline_elements_keeps_the_spaces_between_them() {
+        let (mut host, clipboard) = prose_host(
+            "<style>p { margin: 0; font-size: 16px; }</style><p>plain <b>bold</b> tail</p>",
+            320.0,
+            80.0,
+        );
+        let start = word_point(&host, "plain", false);
+        let end = word_point(&host, "tail", true);
+        press(&mut host, start);
+        drag(&mut host, end);
+        release(&mut host, end);
+        assert_eq!(copied(&mut host, &clipboard), "plain bold tail");
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout should resolve");
+        assert_eq!(layout.prose_selections.len(), 3);
     }
 }

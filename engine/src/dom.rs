@@ -443,6 +443,59 @@ impl Document {
         Some(offset)
     }
 
+    // text nodes overlapping the flat UTF-16 range [start, end), as node-local spans
+    pub fn text_node_spans(&self, start: usize, end: usize) -> Vec<(NodePath, usize, usize)> {
+        fn walk(
+            element: &Element,
+            path: &mut NodePath,
+            position: &mut usize,
+            range: (usize, usize),
+            spans: &mut Vec<(NodePath, usize, usize)>,
+        ) {
+            for (index, child) in element.children.iter().enumerate() {
+                if *position >= range.1 {
+                    return;
+                }
+                path.push(index);
+                match child {
+                    Node::Element(child) => walk(child, path, position, range, spans),
+                    Node::Text(text) => {
+                        let length = text.encode_utf16().count();
+                        let from = range.0.max(*position);
+                        let to = range.1.min(*position + length);
+                        if from < to {
+                            spans.push((path.clone(), from - *position, to - *position));
+                        }
+                        *position += length;
+                    }
+                }
+                path.pop();
+            }
+        }
+        let mut spans = Vec::new();
+        if start < end {
+            walk(
+                &self.root,
+                &mut Vec::new(),
+                &mut 0,
+                (start, end),
+                &mut spans,
+            );
+        }
+        spans
+    }
+
+    // the text node and offset at a flat UTF-16 position, preferring the node that starts there
+    pub fn text_point(&self, position: usize) -> Option<(NodePath, usize)> {
+        if let Some((path, start, _)) = self.text_node_spans(position, position + 1).pop() {
+            return Some((path, start));
+        }
+        let (path, _, end) = self
+            .text_node_spans(position.checked_sub(1)?, position)
+            .pop()?;
+        Some((path, end))
+    }
+
     pub fn node_text_content(&self, path: &[usize]) -> Option<String> {
         match self.node_at(path)? {
             Node::Element(element) => {

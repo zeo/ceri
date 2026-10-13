@@ -95,7 +95,9 @@ Every other origin is refused with a typed rejection the page can catch, and nav
 
 The visual surface covers antialiased outline text with system font fallback, rounded corners, gradients, box shadows, opacity, generated content through `::before` and `::after`, CSS animations driven from the page clock with linear, ease and stepped timing, and transitions on colors, opacity, lengths and radii that start when a state change alters a declared value.
 
-Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
+Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, a double click takes the word and a triple click the whole value, Ctrl with an arrow or Backspace moves or deletes by word (Alt on macOS), and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
+
+Page text selects the same way outside form fields. A drag can cross paragraphs and inline elements, a double click takes a word, a triple click takes the block, and a drag after a double click grows by whole words. Shift with an arrow, Home or End extends the selection by character, word or line, and Ctrl or Cmd with A selects every rendered line. Copy writes the text as it is drawn, with a line break between blocks, so `<script>` and `<style>` contents never reach the clipboard.
 
 Scrollbars behave like native scrollbars: the wheel scrolls from anywhere over the gutter, and pressing the thumb drags it with the pointer while it stays grabbed at its press offset.
 

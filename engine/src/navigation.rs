@@ -856,12 +856,32 @@ pub struct Browser {
     viewport: ViewportMetrics,
     preferences: UserPreferences,
     fonts: Rc<FontSet>,
+    // the word or block a multi-click selected, which a following drag extends by
+    selection_unit: Option<SelectionUnit>,
+}
+
+#[derive(Clone, Copy)]
+struct SelectionUnit {
+    start: usize,
+    end: usize,
+    words: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UserPreferences {
     pub color_scheme: ColorScheme,
     pub reduced_motion: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProseKey {
+    Copy,
+    SelectAll,
+    Extend,
+}
+
+fn script_error(error: crate::script::ScriptError) -> NavigationError {
+    NavigationError::Script(error.to_string())
 }
 
 impl Browser {
@@ -889,6 +909,7 @@ impl Browser {
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
+            selection_unit: None,
         }
     }
 
@@ -1338,11 +1359,40 @@ impl Browser {
     }
 
     pub fn click_at(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
+        self.click_at_with_count(viewport, x, y, 1)
+    }
+
+    // a host click that is the nth in a rapid series; the second also fires dblclick
+    pub fn click_at_with_count(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+        count: u32,
+    ) -> Result<bool, NavigationError> {
         let path = self.layout(viewport)?.hit_test(x, y);
         let Some(path) = path else {
             return Ok(false);
         };
-        self.activate_path(path)
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime.set_click_detail(count);
+        let clicked = self.activate_path(path.clone());
+        let double = match self.page.as_mut() {
+            Some(page)
+                if count == 2
+                    && clicked.is_ok()
+                    && page.document.borrow().node_is_connected(&path) =>
+            {
+                page.runtime
+                    .dispatch_path_event(path, "dblclick")
+                    .map_err(script_error)
+            }
+            _ => Ok(false),
+        };
+        if let Some(page) = self.page.as_mut() {
+            page.runtime.set_click_detail(1);
+        }
+        Ok(clicked? | double?)
     }
 
     pub fn scroll_at(
@@ -1455,7 +1505,8 @@ impl Browser {
         }
     }
 
-    // a pointer press or drag over a text control moves or extends its selection
+    // a pointer press or drag over a text control or prose moves or extends its selection;
+    // a press that lands on neither clears the document selection
     pub fn select_at(
         &mut self,
         viewport: Size,
@@ -1463,28 +1514,206 @@ impl Browser {
         y: f32,
         extend: bool,
     ) -> Result<bool, NavigationError> {
-        let control = {
+        let layout = {
             let _fonts = crate::font::use_fonts(self.fonts.clone());
-            self.layout(viewport)?.control_text_offset_at(x, y)
+            self.layout(viewport)?
         };
-        if let Some((path, offset)) = control {
+        if !extend {
+            self.selection_unit = None;
+        }
+        if let Some((path, offset)) = layout.control_text_offset_at(x, y) {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             return page
                 .runtime
                 .select_control_offset(path, offset, extend)
-                .map_err(|error| NavigationError::Script(error.to_string()));
+                .map_err(script_error);
         }
-        let prose = {
-            let _fonts = crate::font::use_fonts(self.fonts.clone());
-            self.layout(viewport)?.prose_text_offset_at(x, y)
-        };
-        let Some((path, offset)) = prose else {
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let Some((path, offset)) = layout.prose_text_offset_at(x, y, extend) else {
+            if !extend {
+                page.runtime
+                    .clear_document_selection()
+                    .map_err(script_error)?;
+            }
             return Ok(false);
         };
-        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let Some(unit) = self.selection_unit.filter(|_| extend) else {
+            return page
+                .runtime
+                .select_prose_offset(path, offset, extend)
+                .map_err(script_error);
+        };
+        // a drag after a multi-click grows by whole units from the clicked one
+        let (anchor, focus) = {
+            let document = page.document.borrow();
+            let Some(position) = document.node_text_offset(&path).map(|start| start + offset)
+            else {
+                return Ok(false);
+            };
+            let (word_start, word_end) = if unit.words {
+                crate::selection::word_around(&document, &path, offset)
+                    .unwrap_or((position, position))
+            } else {
+                (position, position)
+            };
+            if position < unit.start {
+                (unit.end, word_start)
+            } else {
+                (unit.start, word_end.max(unit.end))
+            }
+        };
         page.runtime
-            .select_prose_offset(path, offset, extend)
-            .map_err(|error| NavigationError::Script(error.to_string()))
+            .select_document_points(anchor, focus, false)
+            .map_err(script_error)?;
+        Ok(true)
+    }
+
+    // a double click selects the word under the pointer, a triple click its block
+    pub fn select_unit_at(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+        clicks: u32,
+    ) -> Result<bool, NavigationError> {
+        let layout = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?
+        };
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        if let Some((path, offset)) = layout.control_text_offset_at(x, y) {
+            let value = page.runtime.control_value(&path).unwrap_or_default();
+            let units = value.encode_utf16().collect::<Vec<_>>();
+            let (start, end) = if clicks == 2 {
+                crate::text::word_at(&units, offset)
+            } else {
+                (0, units.len())
+            };
+            return page
+                .runtime
+                .select_control_range(path, start, end)
+                .map_err(script_error);
+        }
+        let Some((path, offset)) = layout.prose_text_offset_at(x, y, false) else {
+            return Ok(false);
+        };
+        let bounds = {
+            let document = page.document.borrow();
+            if clicks == 2 {
+                crate::selection::word_around(&document, &path, offset)
+            } else {
+                document
+                    .node_text_offset(&path)
+                    .map(|start| start + offset)
+                    .and_then(|position| {
+                        crate::selection::ProseText::new(&layout, &document).block_around(position)
+                    })
+            }
+        };
+        let Some((start, end)) = bounds else {
+            return Ok(false);
+        };
+        self.selection_unit = Some(SelectionUnit {
+            start,
+            end,
+            words: clicks == 2,
+        });
+        page.runtime
+            .select_document_points(start, end, true)
+            .map_err(script_error)?;
+        Ok(true)
+    }
+
+    // the selected prose as a reader sees it, for the clipboard
+    pub fn selected_text(&self, viewport: Size) -> Result<String, NavigationError> {
+        let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+        let Some((anchor, focus)) = page.runtime.document_selection_points() else {
+            return Ok(String::new());
+        };
+        let layout = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?
+        };
+        let document = page.document.borrow();
+        Ok(crate::selection::ProseText::new(&layout, &document)
+            .text_between(anchor.min(focus), anchor.max(focus)))
+    }
+
+    // copy, select-all and keyboard extension over prose while no text control has focus
+    fn prose_key(
+        &mut self,
+        key: &str,
+        modifiers: KeyModifiers,
+    ) -> Result<Option<bool>, NavigationError> {
+        let command = modifiers.control || modifiers.meta;
+        let by_word = crate::script::word_modifier(modifiers);
+        let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+        if (modifiers.alt && !by_word) || page.runtime.focused_text_control() {
+            return Ok(None);
+        }
+        let points = page.runtime.document_selection_points();
+        let action = match key {
+            "c" | "C" if command && points.is_some_and(|(anchor, focus)| anchor != focus) => {
+                ProseKey::Copy
+            }
+            "a" | "A" if command => ProseKey::SelectAll,
+            "ArrowLeft" | "ArrowRight" | "Home" | "End" if modifiers.shift && points.is_some() => {
+                ProseKey::Extend
+            }
+            _ => return Ok(None),
+        };
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let dispatch = page
+            .runtime
+            .dispatch_shortcut_keydown(key, modifiers)
+            .map_err(script_error)?;
+        if dispatch.default_prevented {
+            return Ok(Some(dispatch.handled));
+        }
+        let viewport = Size {
+            width: self.viewport.width,
+            height: self.viewport.height,
+        };
+        if action == ProseKey::Copy {
+            let text = self.selected_text(viewport)?;
+            if let Some(clipboard) = &self.clipboard_provider {
+                clipboard.write_text(&text)?;
+            }
+            return Ok(Some(true));
+        }
+        let layout = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?
+        };
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let selection = {
+            let prose = crate::selection::ProseText::new(&layout, &page.document.borrow());
+            match (action, points) {
+                (ProseKey::SelectAll, _) => prose.bounds(),
+                (_, Some((anchor, focus))) => {
+                    let forward = matches!(key, "ArrowRight" | "End");
+                    // Cmd with an arrow moves to the line edge on macOS
+                    let focus = match key {
+                        "Home" | "End" => prose.line_edge(focus, forward),
+                        _ if by_word => prose.step_word(focus, forward),
+                        _ if modifiers.meta && cfg!(target_os = "macos") => {
+                            prose.line_edge(focus, forward)
+                        }
+                        _ => prose.step_character(focus, forward),
+                    };
+                    Some((anchor, focus))
+                }
+                _ => None,
+            }
+        };
+        let Some((anchor, focus)) = selection else {
+            return Ok(Some(dispatch.handled));
+        };
+        self.selection_unit = None;
+        page.runtime
+            .select_document_points(anchor, focus, action == ProseKey::SelectAll)
+            .map_err(script_error)?;
+        Ok(Some(true))
     }
 
     pub fn dispatch_at(
@@ -1535,7 +1764,9 @@ impl Browser {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, NavigationError> {
-        let handled = {
+        let handled = if let Some(handled) = self.prose_key(key, modifiers)? {
+            handled
+        } else {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             page.runtime
                 .key_down_with_modifiers(key, modifiers)
@@ -4260,6 +4491,36 @@ mod tests {
         );
         assert_eq!(writes.borrow().as_slice(), ["copied"]);
         assert_eq!(text.borrow().as_str(), "copied");
+    }
+
+    #[test]
+    fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>
+                const selection = window.getSelection();
+                const a = document.getElementById("a");
+                const b = document.getElementById("b");
+                selection.setBaseAndExtent(b, 3, a, 1);
+                let report = selection.direction + "|" + (selection.anchorNode === b) + "|" + selection.anchorOffset + "|" + (selection.focusNode === a) + "|" + selection.focusOffset + "|" + selection.toString();
+                selection.extend(b, 5);
+                report = report + "|" + selection.direction + "|" + selection.anchorOffset + "|" + selection.toString();
+                selection.collapse(a, 2);
+                report = report + "|" + selection.direction;
+                document.getElementById("status").textContent = report;
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("selection page should load");
+        let document = browser.document().expect("selection document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .unwrap_or_else(|| panic!("{:?}", browser.last_navigation_failure()));
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("backward|true|3|true|1|ellowor|forward|3|ld|none")
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::navigation::{
     ResourceResponse, is_http_redirect, is_javascript, is_json, normalize_headers,
 };
 use crate::paint::CanvasCommand;
+use crate::text::{next_word_boundary, previous_word_boundary};
 use crate::wasm;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -353,6 +354,8 @@ enum Builtin {
     SelectionGetRangeAt(SelectionHandle),
     SelectionCollapse(SelectionHandle),
     SelectionToString(SelectionHandle),
+    SelectionExtend(SelectionHandle),
+    SelectionSetBaseAndExtent(SelectionHandle),
     ElementSetAttribute(ElementHandle),
     ElementRemoveAttribute(ElementHandle),
     ElementGetAttribute(ElementHandle),
@@ -718,6 +721,7 @@ pub struct ScriptRuntime {
     custom_validity: BTreeMap<NodePath, String>,
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
+    click_detail: u32,
     selection: SelectionHandle,
     ranges: Vec<WeakRangeHandle>,
     selected_files: HashMap<NodePath, Vec<FileHandle>>,
@@ -997,6 +1001,8 @@ struct EventData {
     data: String,
     modifiers: KeyModifiers,
     is_composing: bool,
+    // click count for click and dblclick, zero for other events
+    detail: u32,
     data_value: Option<Box<Value>>,
     error_message: Option<String>,
 }
@@ -1270,6 +1276,15 @@ struct RangeData {
 #[derive(Clone, Default)]
 struct SelectionData {
     range: Option<RangeHandle>,
+    // the anchor is the range end when the focus moved before it
+    backward: bool,
+}
+
+impl SelectionData {
+    fn set(&mut self, range: Option<RangeHandle>) {
+        self.range = range;
+        self.backward = false;
+    }
 }
 
 struct HeadersData {
@@ -1747,6 +1762,7 @@ impl ScriptRuntime {
             custom_validity: BTreeMap::new(),
             text_selections: HashMap::new(),
             composition: None,
+            click_detail: 1,
             selection: Rc::new(RefCell::new(SelectionData::default())),
             ranges: Vec::new(),
             selected_files: HashMap::new(),
@@ -3037,39 +3053,11 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
-        // a document-level shortcut still runs with no focused element; the
-        // keydown event targets the document element in that case
-        let document_shortcut_target = (modifiers.control || modifiers.meta)
-            && !modifiers.alt
-            && key.eq_ignore_ascii_case("c");
-        let has_copyable_prose = self
-            .selection
-            .borrow()
-            .range
-            .clone()
-            .is_some_and(|range| !self.range_is_collapsed(&range.borrow()));
-        if self.focused_element.is_none() && !(document_shortcut_target && has_copyable_prose) {
+        let Some(path) = self.focused_element.clone() else {
             return Ok(false);
-        }
-        let dispatch_target = self.focused_element.clone().or_else(|| {
-            Some(
-                self.document
-                    .borrow()
-                    .document_element_path()
-                    .unwrap_or_default(),
-            )
-        });
-        let path = match &dispatch_target {
-            Some(target) => target.clone(),
-            None => return Ok(false),
         };
-        let dispatch = self.dispatch_event_with_modifiers(
-            dispatch_target.expect("target was checked"),
-            "keydown",
-            key,
-            "",
-            modifiers,
-        )?;
+        let dispatch =
+            self.dispatch_event_with_modifiers(path.clone(), "keydown", key, "", modifiers)?;
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
@@ -3080,19 +3068,6 @@ impl ScriptRuntime {
             }
             let moved = self.move_focus_sequential(modifiers.shift)?;
             return Ok(dispatch.handled || moved);
-        }
-        // Ctrl or Cmd with C copies prose when the document selection is non-empty
-        if (modifiers.control || modifiers.meta)
-            && !modifiers.alt
-            && key.eq_ignore_ascii_case("c")
-            && let Some(range) = self.selection.borrow().range.clone()
-            && !self.range_is_collapsed(&range.borrow())
-            && let Some(clipboard) = self.clipboard_provider.clone()
-        {
-            clipboard
-                .write_text(&self.range_to_string(&range))
-                .map_err(|error| runtime_error(format!("clipboard write failed: {error}")))?;
-            return Ok(true);
         }
         if dispatch.default_prevented || !self.is_text_control_path(&path) {
             return Ok(dispatch.handled);
@@ -3137,9 +3112,12 @@ impl ScriptRuntime {
             )?;
             return Ok(true);
         }
+        let by_word = word_modifier(modifiers);
         if modifiers.shift {
             let (anchor, focus) = selection_anchor_focus(selection);
             let next_focus = match key {
+                "ArrowLeft" if by_word => previous_word_boundary(&units, focus),
+                "ArrowRight" if by_word => next_word_boundary(&units, focus),
                 "ArrowLeft" if focus > 0 => previous_utf16_boundary(&units, focus),
                 "ArrowRight" if focus < units.len() => next_utf16_boundary(&units, focus),
                 "Home" => 0,
@@ -3163,6 +3141,23 @@ impl ScriptRuntime {
         }
         let (start, end) = match key {
             "Backspace" if selection.start != selection.end => (selection.start, selection.end),
+            "Backspace" if by_word => (
+                previous_word_boundary(&units, selection.start),
+                selection.start,
+            ),
+            "Delete" if by_word && selection.start == selection.end => {
+                (selection.start, next_word_boundary(&units, selection.start))
+            }
+            "ArrowLeft" if by_word => {
+                let cursor = previous_word_boundary(&units, selection.start);
+                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                return Ok(true);
+            }
+            "ArrowRight" if by_word => {
+                let cursor = next_word_boundary(&units, selection.end);
+                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                return Ok(true);
+            }
             "Backspace" if selection.start > 0 => (
                 previous_utf16_boundary(&units, selection.start),
                 selection.start,
@@ -3240,31 +3235,165 @@ impl ScriptRuntime {
     }
 
     // document prose ranges as (text node path, start, end) for paint highlighting
-    pub(crate) fn prose_selections(&self) -> Vec<(NodePath, usize, usize)> {
+    pub(crate) fn prose_selections(&self) -> Vec<crate::layout::ProseSpan> {
         let Some(range) = self.selection.borrow().range.clone() else {
             return Vec::new();
         };
         let range = range.borrow();
-        let Some(start_node) = attached_path(&range.start.node) else {
+        let Some((start, end)) = self
+            .range_boundary_position(&range.start)
+            .zip(self.range_boundary_position(&range.end))
+        else {
             return Vec::new();
         };
-        let Some(end_node) = attached_path(&range.end.node) else {
-            return Vec::new();
+        let spans = self.document.borrow().text_node_spans(start, end);
+        spans
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, start, end))| crate::layout::ProseSpan {
+                path,
+                start,
+                end,
+                continued: index > 0,
+            })
+            .collect()
+    }
+
+    // the document selection as flat UTF-16 (anchor, focus) text positions
+    pub(crate) fn document_selection_points(&self) -> Option<(usize, usize)> {
+        let selection = self.selection.borrow();
+        let range = selection.range.as_ref()?.borrow();
+        let start = self.range_boundary_position(&range.start)?;
+        let end = self.range_boundary_position(&range.end)?;
+        Some(if selection.backward {
+            (end, start)
+        } else {
+            (start, end)
+        })
+    }
+
+    // selects between two flat text positions; a fresh selection replaces the range object
+    pub(crate) fn select_document_points(
+        &mut self,
+        anchor: usize,
+        focus: usize,
+        fresh: bool,
+    ) -> Result<bool, ScriptError> {
+        let boundary = |position: usize| -> Option<RangeBoundary> {
+            let (path, offset) = self.document.borrow().text_point(position)?;
+            Some(RangeBoundary {
+                node: attached_handle(path, &self.document)?,
+                offset,
+            })
         };
-        if start_node != end_node {
-            return Vec::new();
+        let Some((anchor, focus)) = boundary(anchor).zip(boundary(focus)) else {
+            return Ok(false);
+        };
+        let selection = self.selection.clone();
+        self.set_selection_points(&selection, anchor, focus, fresh)
+    }
+
+    pub(crate) fn clear_document_selection(&mut self) -> Result<bool, ScriptError> {
+        let changed = self.selection.borrow().range.is_some();
+        self.selection.borrow_mut().set(None);
+        if changed {
+            self.dispatch_document_selection_change()?;
         }
-        let document = self.document.borrow();
-        let length = document
-            .node_text_content(&start_node)
-            .map(|content| content.encode_utf16().count())
-            .unwrap_or_default();
-        let start = range.start.offset.min(length);
-        let end = range.end.offset.min(length);
-        if start == end {
-            return Vec::new();
+        Ok(changed)
+    }
+
+    fn set_selection_points(
+        &mut self,
+        selection: &SelectionHandle,
+        anchor: RangeBoundary,
+        focus: RangeBoundary,
+        fresh: bool,
+    ) -> Result<bool, ScriptError> {
+        let backward = self
+            .range_boundary_position(&focus)
+            .zip(self.range_boundary_position(&anchor))
+            .is_some_and(|(focus, anchor)| focus < anchor);
+        let ordered = if backward {
+            RangeData {
+                start: focus,
+                end: anchor,
+            }
+        } else {
+            RangeData {
+                start: anchor,
+                end: focus,
+            }
+        };
+        let existing = selection.borrow().range.clone();
+        let changed = existing
+            .as_ref()
+            .is_none_or(|range| *range.borrow() != ordered)
+            || selection.borrow().backward != backward;
+        match existing {
+            Some(range) if !fresh => *range.borrow_mut() = ordered,
+            _ => {
+                let range = Rc::new(RefCell::new(ordered));
+                self.track_range(&range);
+                selection.borrow_mut().range = Some(range);
+            }
         }
-        vec![(start_node, start.min(end), start.max(end))]
+        selection.borrow_mut().backward = backward;
+        if changed && Rc::ptr_eq(selection, &self.selection) {
+            self.dispatch_document_selection_change()?;
+        }
+        Ok(changed)
+    }
+
+    fn selection_anchor(&self, selection: &SelectionHandle) -> Option<RangeBoundary> {
+        let selection = selection.borrow();
+        let range = selection.range.as_ref()?.borrow();
+        Some(if selection.backward {
+            range.end.clone()
+        } else {
+            range.start.clone()
+        })
+    }
+
+    // the click count that the next host click and dblclick events report
+    pub(crate) fn set_click_detail(&mut self, detail: u32) {
+        self.click_detail = detail.max(1);
+    }
+
+    pub(crate) fn select_control_range(
+        &mut self,
+        path: NodePath,
+        start: usize,
+        end: usize,
+    ) -> Result<bool, ScriptError> {
+        let direction = if start == end {
+            SelectionDirection::None
+        } else {
+            SelectionDirection::Forward
+        };
+        self.set_text_selection(path, start, end, direction)
+    }
+
+    pub(crate) fn focused_text_control(&self) -> bool {
+        self.focused_element
+            .as_ref()
+            .is_some_and(|path| self.is_text_control_path(path))
+    }
+
+    // keydown for a document-level shortcut, aimed at the focused element or the document element
+    pub(crate) fn dispatch_shortcut_keydown(
+        &mut self,
+        key: &str,
+        modifiers: KeyModifiers,
+    ) -> Result<EventDispatch, ScriptError> {
+        let target = self.focused_element.clone().unwrap_or_else(|| {
+            self.document
+                .borrow()
+                .document_element_path()
+                .unwrap_or_default()
+        });
+        let dispatch = self.dispatch_event_with_modifiers(target, "keydown", key, "", modifiers)?;
+        self.drain_microtasks()?;
+        Ok(dispatch)
     }
 
     pub(crate) fn style_state(&self, hovered_path: Option<NodePath>) -> StyleState {
@@ -3364,41 +3493,12 @@ impl ScriptRuntime {
             .node_text_content(&node_path)
             .unwrap_or_default();
         let offset = offset.min(utf16_len(&content));
-        let boundary = RangeBoundary { node, offset };
-        let existing = self.selection.borrow().range.clone();
-        let changed = match (existing, extend) {
-            (Some(range), true) => {
-                let anchor_position = range.borrow().start.clone();
-                let anchor = self.range_boundary_position(&anchor_position);
-                let focus_position = self.range_boundary_position(&boundary);
-                let mut range_data = range.borrow_mut();
-                let previous = range_data.clone();
-                if anchor
-                    .zip(focus_position)
-                    .is_some_and(|(anchor, focus)| focus < anchor)
-                {
-                    range_data.start = boundary;
-                } else {
-                    range_data.end = boundary;
-                }
-                *range_data != previous
-            }
-            _ => {
-                let previous = self.selection.borrow().range.clone();
-                let collapsed = Rc::new(RefCell::new(RangeData {
-                    start: boundary.clone(),
-                    end: boundary,
-                }));
-                self.track_range(&collapsed);
-                let changed =
-                    previous.is_none_or(|previous| *previous.borrow() != *collapsed.borrow());
-                self.selection.borrow_mut().range.replace(collapsed);
-                changed
-            }
-        };
-        if changed {
-            self.dispatch_document_selection_change()?;
-        }
+        let focus = RangeBoundary { node, offset };
+        let selection = self.selection.clone();
+        let anchor = extend.then(|| self.selection_anchor(&selection)).flatten();
+        let fresh = anchor.is_none();
+        let anchor = anchor.unwrap_or_else(|| focus.clone());
+        self.set_selection_points(&selection, anchor, focus, fresh)?;
         // a resolved press starts the selection gesture even when the range did not move
         Ok(true)
     }
@@ -3736,6 +3836,7 @@ impl ScriptRuntime {
             data: String::new(),
             modifiers: KeyModifiers::default(),
             is_composing: false,
+            detail: 0,
             data_value: None,
             error_message: None,
         });
@@ -3776,6 +3877,7 @@ impl ScriptRuntime {
             data: String::new(),
             modifiers: KeyModifiers::default(),
             is_composing: false,
+            detail: 0,
             data_value: None,
             error_message: None,
         });
@@ -4875,11 +4977,8 @@ impl ScriptRuntime {
                         .as_ref()
                         .map(|range| {
                             let range = range.borrow();
-                            let boundary = if property == "anchorNode" {
-                                &range.start
-                            } else {
-                                &range.end
-                            };
+                            let anchor = (property == "anchorNode") != selection_data.backward;
+                            let boundary = if anchor { &range.start } else { &range.end };
                             if attached_path(&boundary.node).is_some() {
                                 Value::Element(boundary.node.clone())
                             } else {
@@ -4891,11 +4990,8 @@ impl ScriptRuntime {
                         .as_ref()
                         .map(|range| {
                             let range = range.borrow();
-                            let boundary = if property == "anchorOffset" {
-                                &range.start
-                            } else {
-                                &range.end
-                            };
+                            let anchor = (property == "anchorOffset") != selection_data.backward;
+                            let boundary = if anchor { &range.start } else { &range.end };
                             Value::Number(boundary.offset as f64)
                         })
                         .unwrap_or(Value::Number(0.0))),
@@ -4914,6 +5010,23 @@ impl ScriptRuntime {
                     "toString" => Ok(Value::Builtin(Builtin::SelectionToString(
                         selection.clone(),
                     ))),
+                    "extend" => Ok(Value::Builtin(Builtin::SelectionExtend(selection.clone()))),
+                    "setBaseAndExtent" => Ok(Value::Builtin(Builtin::SelectionSetBaseAndExtent(
+                        selection.clone(),
+                    ))),
+                    "direction" => Ok(Value::String(
+                        match range.as_ref() {
+                            Some(range) if !self.range_is_collapsed(&range.borrow()) => {
+                                if selection_data.backward {
+                                    "backward"
+                                } else {
+                                    "forward"
+                                }
+                            }
+                            _ => "none",
+                        }
+                        .to_string(),
+                    )),
                     _ => Err(runtime_error(format!(
                         "Selection has no property {property}"
                     ))),
@@ -4944,6 +5057,7 @@ impl ScriptRuntime {
                 "altKey" => Ok(Value::Bool(event.modifiers.alt)),
                 "metaKey" => Ok(Value::Bool(event.modifiers.meta)),
                 "isComposing" => Ok(Value::Bool(event.is_composing)),
+                "detail" => Ok(Value::Number(f64::from(event.detail))),
                 "data" => Ok(event
                     .data_value
                     .as_ref()
@@ -5983,6 +6097,7 @@ impl ScriptRuntime {
                             data: String::new(),
                             modifiers: KeyModifiers::default(),
                             is_composing: false,
+                            detail: 0,
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
@@ -6086,6 +6201,7 @@ impl ScriptRuntime {
                             data: String::new(),
                             modifiers: KeyModifiers::default(),
                             is_composing: false,
+                            detail: 0,
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
@@ -6121,6 +6237,7 @@ impl ScriptRuntime {
                             data: String::new(),
                             modifiers: KeyModifiers::default(),
                             is_composing: false,
+                            detail: 0,
                             data_value: None,
                             error_message: Some(message),
                         });
@@ -10146,7 +10263,7 @@ impl ScriptRuntime {
                     .as_ref()
                     .is_none_or(|current| !Rc::ptr_eq(current, &range));
                 self.track_range(&range);
-                selection.borrow_mut().range = Some(range);
+                selection.borrow_mut().set(Some(range));
                 if changed && Rc::ptr_eq(&selection, &self.selection) {
                     self.dispatch_document_selection_change()?;
                 }
@@ -10154,7 +10271,7 @@ impl ScriptRuntime {
             }
             Builtin::SelectionRemoveAllRanges(selection) => {
                 let changed = selection.borrow().range.is_some();
-                selection.borrow_mut().range = None;
+                selection.borrow_mut().set(None);
                 if changed && Rc::ptr_eq(&selection, &self.selection) {
                     self.dispatch_document_selection_change()?;
                 }
@@ -10184,7 +10301,7 @@ impl ScriptRuntime {
             Builtin::SelectionCollapse(selection) => {
                 let Some(node) = arguments.first().map(Value::resolve) else {
                     let changed = selection.borrow().range.is_some();
-                    selection.borrow_mut().range = None;
+                    selection.borrow_mut().set(None);
                     if changed && Rc::ptr_eq(&selection, &self.selection) {
                         self.dispatch_document_selection_change()?;
                     }
@@ -10192,7 +10309,7 @@ impl ScriptRuntime {
                 };
                 if matches!(node, Value::Null | Value::Undefined) {
                     let changed = selection.borrow().range.is_some();
-                    selection.borrow_mut().range = None;
+                    selection.borrow_mut().set(None);
                     if changed && Rc::ptr_eq(&selection, &self.selection) {
                         self.dispatch_document_selection_change()?;
                     }
@@ -10237,10 +10354,25 @@ impl ScriptRuntime {
                     .is_none_or(|current| *current.borrow() != range);
                 let range = Rc::new(RefCell::new(range));
                 self.track_range(&range);
-                selection.borrow_mut().range = Some(range);
+                selection.borrow_mut().set(Some(range));
                 if changed && Rc::ptr_eq(&selection, &self.selection) {
                     self.dispatch_document_selection_change()?;
                 }
+                Ok(Value::Undefined)
+            }
+            Builtin::SelectionExtend(selection) => {
+                let focus = self.range_boundary_from_arguments(&arguments)?;
+                let Some(anchor) = self.selection_anchor(&selection) else {
+                    return Err(runtime_error("Selection.extend requires an existing range"));
+                };
+                self.set_selection_points(&selection, anchor, focus, false)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::SelectionSetBaseAndExtent(selection) => {
+                let anchor = self.range_boundary_from_arguments(&arguments)?;
+                let focus =
+                    self.range_boundary_from_arguments(arguments.get(2..).unwrap_or(&[]))?;
+                self.set_selection_points(&selection, anchor, focus, true)?;
                 Ok(Value::Undefined)
             }
             Builtin::SelectionToString(selection) => {
@@ -12189,6 +12321,7 @@ impl ScriptRuntime {
             data: String::new(),
             modifiers: KeyModifiers::default(),
             is_composing: self.composition.is_some(),
+            detail: click_detail_for(event, self.click_detail),
             data_value: None,
             error_message: None,
         });
@@ -12250,6 +12383,7 @@ impl ScriptRuntime {
                 data: data.to_string(),
                 modifiers,
                 is_composing: self.composition.is_some(),
+                detail: click_detail_for(event, self.click_detail),
                 data_value: None,
                 error_message: None,
             });
@@ -16198,6 +16332,23 @@ fn normalize_file_name(value: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+// the modifier that moves the caret by words: Alt on macOS, Ctrl elsewhere
+pub(crate) fn word_modifier(modifiers: KeyModifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.alt
+    } else {
+        modifiers.control
+    }
+}
+
+fn click_detail_for(event: &str, detail: u32) -> u32 {
+    if matches!(event, "click" | "dblclick" | "auxclick") {
+        detail
+    } else {
+        0
+    }
 }
 
 fn utf16_len(value: &str) -> usize {

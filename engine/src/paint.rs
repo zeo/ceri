@@ -2,8 +2,9 @@ use crate::css::{Color, Gradient, Overflow};
 use crate::dom::NodePath;
 use crate::image::Image;
 use crate::layout::{
-    ImageLayer, LayoutBox, LayoutDocument, Rect, TextRun, paint_order, scrollbar_metrics,
-    stacking_context_entries, translate_rect, visual_offset_for, visual_rect_for,
+    ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect, TextRun, paint_order,
+    scrollbar_metrics, stacking_context_entries, translate_rect, visual_offset_for,
+    visual_rect_for,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -667,7 +668,7 @@ fn paint_box(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
-    prose_selections: &[(NodePath, usize, usize)],
+    prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
@@ -687,7 +688,7 @@ fn paint_context(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
-    prose_selections: &[(NodePath, usize, usize)],
+    prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
@@ -743,7 +744,7 @@ fn paint_non_context_children(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
-    prose_selections: &[(NodePath, usize, usize)],
+    prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
@@ -769,7 +770,7 @@ fn paint_non_context_subtree(
     layout_box: &LayoutBox,
     commands: &[CanvasCommand],
     images: &[ImageLayer],
-    prose_selections: &[(NodePath, usize, usize)],
+    prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
@@ -895,7 +896,7 @@ fn paint_box_text(
     layout_box: &LayoutBox,
     clip: Option<Rect>,
     offset: (f32, f32),
-    prose_selections: &[(NodePath, usize, usize)],
+    prose_selections: &[ProseSpan],
 ) {
     paint_control_selection(canvas, layout_box, clip, offset);
     paint_prose_selection(canvas, layout_box, prose_selections, clip, offset);
@@ -909,23 +910,20 @@ fn paint_box_text(
 fn paint_prose_selection(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
-    prose_selections: &[(NodePath, usize, usize)],
+    prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     offset: (f32, f32),
 ) {
-    for (path, start, end) in prose_selections {
+    for span in prose_selections {
         for run in &layout_box.text {
-            if run.node_path.as_deref() != Some(path) || run.text.trim().is_empty() {
+            if run.node_path.as_ref() != Some(&span.path) || run.text.trim().is_empty() {
                 continue;
             }
-            let run_units = run.text.encode_utf16().count();
-            let run_start = run.node_offset;
-            let run_end = run_start + run_units;
-            let selected_start = (*start).max(run_start);
-            let selected_end = (*end).min(run_end);
-            if selected_start >= selected_end {
+            let Some((selected_start, selected_end)) =
+                run.selected_units(span.start, span.end, span.continued)
+            else {
                 continue;
-            }
+            };
             let fonts = crate::font::active_fonts();
             let height = if fonts.is_builtin() {
                 text_advance(run.font_size) / 6.0 * 7.0
@@ -933,8 +931,8 @@ fn paint_prose_selection(
                 run.font_size.max(1.0)
             };
             // the highlight spans from the first selected glyph to the last
-            let prefix_width = width_within_run(run, selected_start - run_start, &fonts);
-            let end_width = width_within_run(run, selected_end - run_start, &fonts);
+            let prefix_width = width_within_run(run, selected_start, &fonts);
+            let end_width = width_within_run(run, selected_end, &fonts);
             let selected_width = (end_width - prefix_width).max(0.0);
             fill_rect_optional(
                 canvas,
@@ -965,15 +963,15 @@ fn width_within_run(run: &TextRun, units: usize, fonts: &crate::font::FontSet) -
 
 fn prose_selections_for_box(
     layout_box: &LayoutBox,
-    prose_selections: &[(NodePath, usize, usize)],
-) -> Vec<(NodePath, usize, usize)> {
+    prose_selections: &[ProseSpan],
+) -> Vec<ProseSpan> {
     prose_selections
         .iter()
-        .filter(|(path, _, _)| {
+        .filter(|span| {
             layout_box
                 .text
                 .iter()
-                .any(|run| run.node_path.as_deref() == Some(path))
+                .any(|run| run.node_path.as_ref() == Some(&span.path))
         })
         .cloned()
         .collect()
@@ -1514,6 +1512,7 @@ mod tests {
                     bold: false,
                     node_path: Some(vec![1, 0]),
                     node_offset: 0,
+                    source_len: 6,
                 }],
                 control_value: None,
                 control_selection: None,
@@ -1535,7 +1534,12 @@ mod tests {
                 margin: Default::default(),
             },
             images: Vec::new(),
-            prose_selections: vec![(vec![1, 0], 1, 2)],
+            prose_selections: vec![crate::layout::ProseSpan {
+                path: vec![1, 0],
+                start: 1,
+                end: 2,
+                continued: false,
+            }],
         };
 
         let canvas = paint(&document);
@@ -1660,6 +1664,7 @@ mod tests {
                     bold: false,
                     node_path: None,
                     node_offset: 0,
+                    source_len: 0,
                 }],
                 control_value: None,
                 control_selection: None,
@@ -1759,6 +1764,7 @@ mod tests {
                         bold: false,
                         node_path: None,
                         node_offset: 0,
+                        source_len: 0,
                     },
                     TextRun {
                         text: "CD".to_string(),
@@ -1772,6 +1778,7 @@ mod tests {
                         bold: false,
                         node_path: None,
                         node_offset: 0,
+                        source_len: 0,
                     },
                 ],
                 control_value: Some("ABCD".to_string()),
