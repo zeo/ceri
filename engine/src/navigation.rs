@@ -6148,6 +6148,110 @@ mod tests {
     }
 
     #[test]
+    fn rotation_moves_pixels_around_the_transform_origin() {
+        let (_, _, canvas) = image_page(
+            "<style>body { margin: 0; }</style><div style=\"margin: 20px; width: 40px; height: 20px; background: #ff0000; transform: rotate(90deg)\"></div><div style=\"margin-left: 20px; width: 40px; height: 20px; background: #0000ff; rotate: 90deg; transform-origin: left top\"></div>",
+            120.0,
+            120.0,
+        );
+        let blank = pixel_at(&canvas, 119, 119);
+        // the 40 by 20 box turns about its center (40, 30) into a 20 by 40 box
+        assert!(
+            close(pixel_at(&canvas, 40, 15), [255, 0, 0]),
+            "{:?}",
+            pixel_at(&canvas, 40, 15)
+        );
+        assert_eq!(pixel_at(&canvas, 25, 30), blank);
+        // the individual rotate property turns the second box about its top-left corner
+        assert!(
+            close(pixel_at(&canvas, 10, 75), [0, 0, 255]),
+            "{:?}",
+            pixel_at(&canvas, 10, 75)
+        );
+        assert_eq!(pixel_at(&canvas, 45, 65), blank);
+    }
+
+    #[test]
+    fn clicks_land_on_scaled_and_rotated_controls() {
+        let mut browser = Browser::new(bundle(
+            "<style>body { margin: 0; } button { display: block; width: 40px; height: 20px; border: 0; }</style><button id=\"scaled\" style=\"transform: scale(2); transform-origin: 0 0\">a</button><button id=\"turned\" style=\"position: absolute; left: 100px; top: 0; transform: rotate(90deg)\">b</button><p id=\"status\">idle</p><script>for (const id of ['scaled', 'turned']) { document.getElementById(id).addEventListener('click', () => { document.getElementById('status').textContent = id; }); }</script>",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 200.0,
+            height: 120.0,
+        };
+        let status = |browser: &Browser| {
+            let document = browser.document().expect("document");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status");
+            document.borrow().element_text_content(&status)
+        };
+        assert!(browser.click_at(viewport, 70.0, 35.0).expect("click"));
+        assert_eq!(status(&browser).as_deref(), Some("scaled"));
+        // the rotated button stands upright around its center (120, 10)
+        assert!(browser.click_at(viewport, 120.0, 25.0).expect("click"));
+        assert_eq!(status(&browser).as_deref(), Some("turned"));
+        // where the unrotated button would have been, nothing is hit
+        let layout = browser.layout(viewport).expect("layout");
+        let turned = layout.hit_test(120.0, 25.0);
+        assert_ne!(layout.hit_test(137.0, 5.0), turned);
+    }
+
+    #[test]
+    fn positioned_boxes_apply_their_transforms() {
+        let (_, _, canvas) = image_page(
+            "<style>body { margin: 0; }</style><div style=\"position: absolute; left: 10px; top: 10px; width: 20px; height: 20px; background: #0000ff; transform: translateX(30px)\"></div><div style=\"position: fixed; left: 10px; top: 60px; width: 40px; height: 10px; background: #00ff00; transform: rotate(90deg)\"></div>",
+            120.0,
+            120.0,
+        );
+        let blank = pixel_at(&canvas, 119, 119);
+        assert!(close(pixel_at(&canvas, 45, 20), [0, 0, 255]));
+        assert_eq!(pixel_at(&canvas, 15, 20), blank);
+        assert!(
+            close(pixel_at(&canvas, 30, 50), [0, 255, 0]),
+            "{:?}",
+            pixel_at(&canvas, 30, 50)
+        );
+        assert_eq!(pixel_at(&canvas, 12, 65), blank);
+    }
+
+    #[test]
+    fn perspective_foreshortens_and_hidden_back_faces_disappear() {
+        let mut browser = Browser::new(bundle(
+            "<style>body { margin: 0; } .stage { perspective: 200px; width: 100px; height: 40px; } .card { width: 100px; height: 40px; background: #ff0000; }</style><div class=\"stage\"><div class=\"card\" style=\"transform: rotateY(60deg)\"></div></div><div class=\"stage\"><div id=\"flipped\" class=\"card\" style=\"transform: rotateY(180deg); backface-visibility: hidden\"></div></div><script>document.getElementById('flipped').addEventListener('click', () => { document.title = 'hit'; });</script>",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 100.0,
+        };
+        let canvas = browser.paint(viewport).expect("paint");
+        let blank = pixel_at(&canvas, 119, 99);
+        // turned 60 degrees, the card is much narrower than its 100px layout width
+        assert!(close(pixel_at(&canvas, 50, 20), [255, 0, 0]));
+        assert_eq!(pixel_at(&canvas, 3, 20), blank);
+        assert_eq!(pixel_at(&canvas, 97, 20), blank);
+        // the flipped card shows its hidden back face, so nothing paints or takes input
+        assert_eq!(pixel_at(&canvas, 50, 60), blank);
+        let layout = browser.layout(viewport).expect("layout");
+        let hit = layout.hit_test(50.0, 60.0);
+        let flipped = browser
+            .document()
+            .expect("document")
+            .borrow()
+            .find_element_by_id("flipped")
+            .expect("flipped card");
+        assert_ne!(hit, Some(flipped));
+    }
+
+    #[test]
     fn unsupported_or_cross_origin_images_stay_out_of_the_frame() {
         let mut resources = bundle(
             r#"<img src="/fake.png" style="display: block; width: 24px; height: 24px"><img src="https://outside.invalid/icon.svg" style="display: block; width: 24px; height: 24px">"#,

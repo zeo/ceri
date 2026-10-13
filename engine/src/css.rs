@@ -205,6 +205,18 @@ impl Length {
         })
     }
 
+    pub(crate) const fn percent(value: f32) -> Self {
+        Self::Terms(LengthTerms {
+            px: 0.0,
+            em: 0.0,
+            rem: 0.0,
+            percent: value,
+            viewport_width: 0.0,
+            viewport_height: 0.0,
+            zero_width: 0.0,
+        })
+    }
+
     pub(crate) const fn em(value: f32) -> Self {
         Self::Terms(LengthTerms {
             px: 0.0,
@@ -587,6 +599,24 @@ pub(crate) struct Style {
     pub background_size: BackgroundSize,
     pub background_position: (Length, Length),
     pub background_repeat: BackgroundRepeat,
+    // anything beyond a pure translation, which keeps using the visual offset path
+    pub transform: Option<crate::transform::TransformList>,
+    pub translate_property: Option<crate::transform::TransformList>,
+    pub rotate_property: Option<crate::transform::TransformList>,
+    pub scale_property: Option<crate::transform::TransformList>,
+    pub transform_origin: (Length, Length),
+    pub perspective: Option<f32>,
+    pub perspective_origin: (Length, Length),
+    pub backface_hidden: bool,
+}
+
+impl Style {
+    pub(crate) fn has_transform(&self) -> bool {
+        self.transform.is_some()
+            || self.translate_property.is_some()
+            || self.rotate_property.is_some()
+            || self.scale_property.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -681,6 +711,14 @@ impl Style {
             background_size: BackgroundSize::Auto,
             background_position: (Length::px(0.0), Length::px(0.0)),
             background_repeat: BackgroundRepeat { x: true, y: true },
+            transform: None,
+            translate_property: None,
+            rotate_property: None,
+            scale_property: None,
+            transform_origin: (Length::percent(50.0), Length::percent(50.0)),
+            perspective: None,
+            perspective_origin: (Length::percent(50.0), Length::percent(50.0)),
+            backface_hidden: false,
         };
         match name {
             "body" => {
@@ -2666,9 +2704,62 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "transform" => {
-            if let Some(translate) = parse_translate(value) {
+            if value.trim().eq_ignore_ascii_case("none") {
+                style.translate = (Length::px(0.0), Length::px(0.0));
+                style.transform = None;
+            } else if let Some(translate) = parse_translate(value) {
                 style.translate = translate;
+                style.transform = None;
+            } else if let Some(list) = crate::transform::parse_transform_list(value)
+                .and_then(|ops| crate::transform::TransformList::intern(value.trim(), ops))
+            {
+                style.translate = (Length::px(0.0), Length::px(0.0));
+                style.transform = Some(list);
             }
+        }
+        "translate" | "rotate" | "scale" => {
+            let parsed = if value.trim().eq_ignore_ascii_case("none") {
+                Some(None)
+            } else {
+                parse_individual_transform(property, value)
+                    .and_then(|op| {
+                        crate::transform::TransformList::intern(
+                            &format!("{property}:{}", value.trim()),
+                            vec![op],
+                        )
+                    })
+                    .map(Some)
+            };
+            if let Some(list) = parsed {
+                match property {
+                    "translate" => style.translate_property = list,
+                    "rotate" => style.rotate_property = list,
+                    _ => style.scale_property = list,
+                }
+            }
+        }
+        "transform-origin" => {
+            if let Some(origin) = parse_origin(value) {
+                style.transform_origin = origin;
+            }
+        }
+        "perspective" => {
+            let value = value.trim();
+            if value.eq_ignore_ascii_case("none") {
+                style.perspective = None;
+            } else if let Some(Length::Terms(terms)) = parse_length(value)
+                && terms.px > 0.0
+            {
+                style.perspective = Some(terms.px);
+            }
+        }
+        "perspective-origin" => {
+            if let Some(origin) = parse_origin(value) {
+                style.perspective_origin = origin;
+            }
+        }
+        "backface-visibility" => {
+            style.backface_hidden = value.trim().eq_ignore_ascii_case("hidden");
         }
         "transition" => {
             style.transitions = parse_transitions(value);
@@ -2818,7 +2909,7 @@ fn parse_edges(value: &str) -> Edges {
     }
 }
 
-fn parse_length(value: &str) -> Option<Length> {
+pub(crate) fn parse_length(value: &str) -> Option<Length> {
     let value = value.trim().to_ascii_lowercase();
     if value == "auto" {
         return Some(Length::Auto);
@@ -3322,6 +3413,72 @@ fn parse_grid_track(value: &str) -> Option<GridTrack> {
         return value.parse::<f32>().ok().map(GridTrack::Percent);
     }
     None
+}
+
+// the translate, rotate and scale properties, which apply before transform in that order
+fn parse_individual_transform(
+    property: &str,
+    value: &str,
+) -> Option<crate::transform::TransformOp> {
+    use crate::transform::{TransformOp, parse_angle};
+    let words = value.split_whitespace().collect::<Vec<_>>();
+    let number = |word: &str| -> Option<f32> {
+        match word.strip_suffix('%') {
+            Some(percent) => percent.parse::<f32>().ok().map(|value| value / 100.0),
+            None => word.parse::<f32>().ok(),
+        }
+        .filter(|value| value.is_finite())
+    };
+    match (property, words.as_slice()) {
+        ("translate", [x]) => Some(TransformOp::Translate(
+            parse_length(x)?,
+            Length::px(0.0),
+            0.0,
+        )),
+        ("translate", [x, y]) => Some(TransformOp::Translate(
+            parse_length(x)?,
+            parse_length(y)?,
+            0.0,
+        )),
+        ("translate", [x, y, z]) => match parse_length(z)? {
+            Length::Terms(terms) => Some(TransformOp::Translate(
+                parse_length(x)?,
+                parse_length(y)?,
+                terms.px,
+            )),
+            _ => None,
+        },
+        ("rotate", [angle]) => Some(TransformOp::Rotate(0.0, 0.0, 1.0, parse_angle(angle)?)),
+        ("rotate", [axis, angle]) => {
+            let angle = parse_angle(angle)?;
+            match axis.to_ascii_lowercase().as_str() {
+                "x" => Some(TransformOp::Rotate(1.0, 0.0, 0.0, angle)),
+                "y" => Some(TransformOp::Rotate(0.0, 1.0, 0.0, angle)),
+                "z" => Some(TransformOp::Rotate(0.0, 0.0, 1.0, angle)),
+                _ => None,
+            }
+        }
+        ("rotate", [x, y, z, angle]) => Some(TransformOp::Rotate(
+            number(x)?,
+            number(y)?,
+            number(z)?,
+            parse_angle(angle)?,
+        )),
+        ("scale", [both]) => Some(TransformOp::Scale(number(both)?, number(both)?, 1.0)),
+        ("scale", [x, y]) => Some(TransformOp::Scale(number(x)?, number(y)?, 1.0)),
+        ("scale", [x, y, z]) => Some(TransformOp::Scale(number(x)?, number(y)?, number(z)?)),
+        _ => None,
+    }
+}
+
+// transform-origin and perspective-origin: keywords or lengths, with a centered default axis
+fn parse_origin(value: &str) -> Option<(Length, Length)> {
+    let words = value
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    parse_background_position(&words)
 }
 
 // splits on whitespace outside parentheses, so url(...) and functions stay whole

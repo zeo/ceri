@@ -14,7 +14,7 @@ CEF stays the default engine anyway, and the reason is compatibility rather than
 
 - media playback, WebGL and other GPU APIs
 - cross-origin policy beyond an operator allowlist, so there is no CORS preflight, no cookie jar and no credential mode
-- CSS transforms beyond translate, so rotation, scale, skew, and 3D transforms stay unrendered
+- `transform-style: preserve-3d`, so intersecting 3D planes are not depth sorted and each transformed element flattens on its own
 - transitions on properties outside the eleven the engine treats as animatable
 - full WebAssembly beyond the bounded i32 module path
 - multi-process renderer isolation and a per-renderer sandbox
@@ -176,7 +176,7 @@ The file-input boundary now sits beside that headless form path. A host-owned `F
 
 The clipboard boundary now sits beside it. A host-owned `ClipboardProvider` supplies text through `navigator.clipboard.readText()` and `writeText()` promises, while permission and platform failures remain typed at the embedder boundary. The renderer never receives a native clipboard object.
 
-Transform values now join the animated surface. `transform` accepts `translate()`, `translateX()`, and `translateY()` with any length units, moves the visual subtree through the same offset path as relative positioning, and participates in keyframe animations and state transitions by blending resolved pixel offsets between endpoints. Rotation, scale, skew, matrix forms, and percentage resolution against anything other than the box itself remain separate gates.
+Transforms now cover the full function list. `transform` accepts every `translate`, `scale`, `rotate`, `skew`, `matrix`, `matrix3d` and `perspective` form, the individual `translate`, `rotate` and `scale` properties apply before it in that order, and `transform-origin`, `perspective`, `perspective-origin` and `backface-visibility` are honoured. A pure translation still moves the subtree through the visual offset that relative positioning uses, so the common case costs nothing extra; any other transform makes the box a stacking context, paints its subtree into a layer at the resolution it will be shown at, up to four times the device scale so scaled text stays sharp, and composites that layer by pulling every covered pixel back through the inverse projection with bilinear sampling, which also antialiases the edges. Clicks, hover, wheel targets, scrollbar thumbs, text controls and prose selection map the pointer into the transformed space the same way, and absolute and fixed boxes now apply their transforms too. Translations still animate through keyframes and transitions; animating the other functions arrives with the interpolation work that follows.
 
 Opacity below one now fades a subtree as a group. The box becomes a stacking context, its descendants paint into a transparent premultiplied layer sized to what the subtree can reach, and the layer composites once at the box's opacity, so a child covering its parent hides the parent instead of mixing with it, nested groups multiply, and text, images, canvas output and scrollbars inside the group fade together. A single box whose own paint cannot overlap itself skips the layer and fades its fills directly, and layer buffers are pooled across frames, so the packaged app's frame time is unchanged. Inline elements with opacity still fade their own glyphs individually.
 

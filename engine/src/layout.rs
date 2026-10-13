@@ -104,6 +104,9 @@ pub struct LayoutBox {
     pub gradient: Option<Gradient>,
     pub(crate) background_image: Option<crate::css::BackgroundImage>,
     pub(crate) object_fit: crate::css::ObjectFit,
+    // the CSS transform about its origin, in coordinates relative to the border box corner
+    pub(crate) transform: Option<crate::transform::Matrix>,
+    pub(crate) backface_hidden: bool,
     pub border_radius: f32,
     pub opacity: f32,
     pub shadow: Option<ResolvedShadow>,
@@ -435,6 +438,8 @@ pub fn layout_with_state(
         gradient: None,
         background_image: None,
         object_fit: crate::css::ObjectFit::Fill,
+        transform: None,
+        backface_hidden: false,
         border_radius: 0.0,
         opacity: 1.0,
         shadow: None,
@@ -542,7 +547,7 @@ impl LayoutDocument {
     pub fn control_text_offset_at(&self, x: f32, y: f32) -> Option<(NodePath, usize)> {
         let mut found = None;
         collect_control_at(&self.root, x, y, (0.0, 0.0), &mut found);
-        let (path, runs, origin) = found?;
+        let (path, runs, origin, (x, y)) = found?;
         let mut offset = 0;
         let mut line = None;
         for run in &runs {
@@ -568,34 +573,49 @@ impl LayoutDocument {
     // maps a point over prose to the DOM text node and UTF-16 offset it lands on;
     // a snapping drag resolves points between lines or beside text to the nearest line
     pub fn prose_text_offset_at(&self, x: f32, y: f32, snap: bool) -> Option<(NodePath, usize)> {
-        let runs = self.prose_runs();
-        let within_line = |run: &ProseRun| y >= run.run.y && y < run.run.y + run.line_height();
+        let runs = self
+            .prose_runs()
+            .into_iter()
+            .filter_map(|run| run.local(x, y).map(|point| (run, point)))
+            .collect::<Vec<_>>();
+        let within_line = |(run, (_, y)): &&(ProseRun, (f32, f32))| {
+            *y >= run.run.y && *y < run.run.y + run.line_height()
+        };
         let mut line = runs
             .iter()
-            .filter(|run| within_line(run) && (snap || contains_point(run.box_rect, x, y)))
+            .filter(|entry| {
+                within_line(entry)
+                    && (snap || contains_point(entry.0.box_rect, entry.1.0, entry.1.1))
+            })
             .collect::<Vec<_>>();
         if line.is_empty() && snap {
-            let nearest = runs.iter().min_by(|left, right| {
-                left.vertical_distance(y)
-                    .total_cmp(&right.vertical_distance(y))
-            })?;
+            let nearest = runs
+                .iter()
+                .min_by(|(left, (_, left_y)), (right, (_, right_y))| {
+                    left.vertical_distance(*left_y)
+                        .total_cmp(&right.vertical_distance(*right_y))
+                })?;
             line = runs
                 .iter()
-                .filter(|run| run.run.y == nearest.run.y && run.box_path == nearest.box_path)
+                .filter(|(run, _)| {
+                    run.run.y == nearest.0.run.y && run.box_path == nearest.0.box_path
+                })
                 .collect();
         }
-        let hit = line.into_iter().min_by(|left, right| {
-            left.horizontal_distance(x)
-                .total_cmp(&right.horizontal_distance(x))
-        })?;
-        let index = offset_within_run(&hit.run, x);
+        let (hit, (x, _)) =
+            line.into_iter()
+                .min_by(|(left, (left_x, _)), (right, (right_x, _))| {
+                    left.horizontal_distance(*left_x)
+                        .total_cmp(&right.horizontal_distance(*right_x))
+                })?;
+        let index = offset_within_run(&hit.run, *x);
         Some((hit.node_path.clone(), hit.run.node_offset_at(index)))
     }
 
     // every painted prose run in tree order, translated to the viewport
     pub(crate) fn prose_runs(&self) -> Vec<ProseRun> {
         let mut runs = Vec::new();
-        collect_prose_runs(&self.root, (0.0, 0.0), &mut runs);
+        collect_prose_runs(&self.root, (0.0, 0.0), &mut Vec::new(), &mut runs);
         runs
     }
 }
@@ -616,6 +636,17 @@ pub(crate) struct ProseRun {
     pub(crate) box_path: NodePath,
     pub(crate) box_rect: Rect,
     pub(crate) run: TextRun,
+    // full transforms of transformed ancestors, outermost first
+    pub(crate) transforms: Vec<crate::transform::Matrix>,
+}
+
+impl ProseRun {
+    // the viewport point in the run's own untransformed space
+    fn local(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        self.transforms
+            .iter()
+            .try_fold((x, y), |(x, y), transform| transform.unmap_point(x, y))
+    }
 }
 
 impl ProseRun {
@@ -656,19 +687,29 @@ fn offset_within_run(run: &TextRun, x: f32) -> usize {
     offset
 }
 
-#[allow(clippy::type_complexity)]
+// a text control under the point: its runs, visual offset and the point in its own space
+type ControlHit = (NodePath, Vec<TextRun>, (f32, f32), (f32, f32));
+
 fn collect_control_at(
     layout_box: &LayoutBox,
     x: f32,
     y: f32,
     ancestor_offset: (f32, f32),
-    found: &mut Option<(NodePath, Vec<TextRun>, (f32, f32))>,
+    found: &mut Option<ControlHit>,
 ) {
+    let Some((x, y)) = local_point(layout_box, ancestor_offset, x, y) else {
+        return;
+    };
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
     let inside = x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
     if inside && layout_box.control_value.is_some() && !layout_box.text.is_empty() {
-        *found = Some((layout_box.path.clone(), layout_box.text.clone(), offset));
+        *found = Some((
+            layout_box.path.clone(),
+            layout_box.text.clone(),
+            offset,
+            (x, y),
+        ));
     }
     for child in &layout_box.children {
         collect_control_at(child, x, y, offset, found);
@@ -678,10 +719,14 @@ fn collect_control_at(
 fn collect_prose_runs(
     layout_box: &LayoutBox,
     ancestor_offset: (f32, f32),
+    transforms: &mut Vec<crate::transform::Matrix>,
     found: &mut Vec<ProseRun>,
 ) {
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let box_rect = visual_rect_for(layout_box, ancestor_offset);
+    if let Some(transform) = layout_box.transform {
+        transforms.push(transform.about(box_rect.x, box_rect.y));
+    }
     for run in &layout_box.text {
         let Some(node_path) = &run.node_path else {
             continue;
@@ -697,10 +742,14 @@ fn collect_prose_runs(
             box_path: layout_box.path.clone(),
             box_rect,
             run,
+            transforms: transforms.clone(),
         });
     }
     for child in &layout_box.children {
-        collect_prose_runs(child, offset, found);
+        collect_prose_runs(child, offset, transforms, found);
+    }
+    if layout_box.transform.is_some() {
+        transforms.pop();
     }
 }
 
@@ -945,6 +994,13 @@ fn hit_test_context(
     {
         return None;
     }
+    // inside a transform the ancestor clip has been applied, and the rest works in local space
+    let (x, y) = local_point(layout, ancestor_offset, x, y)?;
+    let clip = if layout.transform.is_some() {
+        None
+    } else {
+        clip
+    };
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
@@ -1077,6 +1133,25 @@ pub(crate) fn paint_order(children: &[LayoutBox]) -> Vec<usize> {
     order
 }
 
+// maps a point into a transformed box's untransformed space; None when the point misses
+// the projected plane or the box shows a hidden back face
+fn local_point(
+    layout: &LayoutBox,
+    ancestor_offset: (f32, f32),
+    x: f32,
+    y: f32,
+) -> Option<(f32, f32)> {
+    let Some(transform) = layout.transform else {
+        return Some((x, y));
+    };
+    let rect = visual_rect_for(layout, ancestor_offset);
+    let full = transform.about(rect.x, rect.y);
+    if layout.backface_hidden && full.shows_back() {
+        return None;
+    }
+    full.unmap_point(x, y)
+}
+
 pub(crate) fn visual_offset_for(layout: &LayoutBox, ancestor_offset: (f32, f32)) -> (f32, f32) {
     if layout.position == Position::Fixed {
         layout.visual_offset
@@ -1113,6 +1188,12 @@ fn scroll_target_box(
     {
         return None;
     }
+    let (x, y) = local_point(layout, ancestor_offset, x, y)?;
+    let clip = if layout.transform.is_some() {
+        None
+    } else {
+        clip
+    };
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
@@ -1164,6 +1245,12 @@ fn thumb_drag_box(
     {
         return None;
     }
+    let (x, y) = local_point(layout_box, ancestor_offset, x, y)?;
+    let clip = if layout_box.transform.is_some() {
+        None
+    } else {
+        clip
+    };
     let visual_offset = visual_offset_for(layout_box, ancestor_offset);
     let child_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
         || layout_box.path.is_empty()
@@ -1653,6 +1740,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         gradient: style.gradient,
         background_image: style.background_layer(),
         object_fit: style.object_fit,
+        transform: None,
+        backface_hidden: style.backface_hidden,
         border_radius: style
             .border_radius
             .resolve(content_width, font_size)
@@ -1682,9 +1771,9 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     if mode != LayoutMode::Flow {
         position_layout_box(&mut layout, style, mode, position_block, font_size);
-    } else {
-        apply_relative_offset(&mut layout, style, containing_block, font_size);
     }
+    apply_relative_offset(&mut layout, style, containing_block, font_size);
+    apply_transform(&mut layout, &style, font_size);
     let positioned_block = ContainingBlock {
         x: layout.rect.x,
         y: layout.rect.y,
@@ -2007,6 +2096,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         gradient: style.gradient,
         background_image: style.background_layer(),
         object_fit: style.object_fit,
+        transform: None,
+        backface_hidden: style.backface_hidden,
         border_radius: style
             .border_radius
             .resolve(content_width, font_size)
@@ -2046,9 +2137,9 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             },
             font_size,
         );
-    } else {
-        apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     }
+    apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
+    apply_transform(&mut layout, &style, font_size);
     let positioned_block = ContainingBlock {
         x: layout.rect.x,
         y: layout.rect.y,
@@ -2306,6 +2397,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         gradient: style.gradient,
         background_image: style.background_layer(),
         object_fit: style.object_fit,
+        transform: None,
+        backface_hidden: style.backface_hidden,
         border_radius: style
             .border_radius
             .resolve(content_width, font_size)
@@ -2345,9 +2438,9 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             },
             font_size,
         );
-    } else {
-        apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     }
+    apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
+    apply_transform(&mut layout, &style, font_size);
     let positioned_block = ContainingBlock {
         x: layout.rect.x,
         y: layout.rect.y,
@@ -2579,8 +2672,68 @@ fn positioned_z_index(style: Style) -> i32 {
 }
 
 fn creates_stacking_context(style: Style) -> bool {
-    matches!(style.position, Position::Fixed | Position::Sticky)
+    style.has_transform()
+        || style.perspective.is_some()
+        || matches!(style.position, Position::Fixed | Position::Sticky)
         || (style.position != Position::Static && style.z_index.is_some())
+}
+
+// resolves the transform properties against the border box, then lets the box's
+// perspective act on the transformed children laid out inside it
+fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
+    use crate::transform::Matrix;
+    let (width, height) = (layout.rect.width, layout.rect.height);
+    if style.has_transform() {
+        let matrix = [
+            style.translate_property,
+            style.rotate_property,
+            style.scale_property,
+            style.transform,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(Matrix::IDENTITY, |matrix, list| {
+            matrix.multiply(&list.matrix(width, height, font_size))
+        });
+        if !matrix.is_identity() {
+            let origin_x = style
+                .transform_origin
+                .0
+                .resolve(width, font_size)
+                .unwrap_or(width / 2.0);
+            let origin_y = style
+                .transform_origin
+                .1
+                .resolve(height, font_size)
+                .unwrap_or(height / 2.0);
+            layout.transform = Some(matrix.about(origin_x, origin_y));
+        }
+    }
+    if let Some(distance) = style.perspective {
+        let origin_x = style
+            .perspective_origin
+            .0
+            .resolve(width, font_size)
+            .unwrap_or(width / 2.0);
+        let origin_y = style
+            .perspective_origin
+            .1
+            .resolve(height, font_size)
+            .unwrap_or(height / 2.0);
+        let (corner_x, corner_y) = (layout.rect.x, layout.rect.y);
+        for child in &mut layout.children {
+            let Some(transform) = child.transform else {
+                continue;
+            };
+            let relative_x = corner_x + origin_x - child.rect.x;
+            let relative_y = corner_y + origin_y - child.rect.y;
+            child.transform = Some(
+                Matrix::perspective(distance)
+                    .about(relative_x, relative_y)
+                    .multiply(&transform),
+            );
+        }
+    }
 }
 
 fn apply_relative_offset(

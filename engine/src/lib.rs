@@ -15,6 +15,7 @@ mod png;
 mod script;
 mod selection;
 mod text;
+mod transform;
 mod wasm;
 #[cfg(feature = "windowed")]
 mod window;

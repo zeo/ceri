@@ -36,6 +36,8 @@ pub struct Canvas {
     scale: f32,
     background: Color,
     pixels: Vec<u8>,
+    // the layout point drawn at the surface's top-left corner, nonzero for transform layers
+    shift: (f32, f32),
 }
 
 impl Canvas {
@@ -66,6 +68,7 @@ impl Canvas {
             scale,
             background,
             pixels,
+            shift: (0.0, 0.0),
         }
     }
 
@@ -164,8 +167,8 @@ impl Canvas {
             return;
         }
         let (x, y, width, height) = (
-            x * self.scale,
-            y * self.scale,
+            (x - self.shift.0) * self.scale,
+            (y - self.shift.1) * self.scale,
             width * self.scale,
             height * self.scale,
         );
@@ -282,8 +285,8 @@ impl Canvas {
             }
             return;
         }
-        let device = shape.to_device(self.scale);
-        let clip = clip.map(|clip| Shape::from_rect(clip, 0.0).to_device(self.scale));
+        let device = self.device_shape(shape);
+        let clip = clip.map(|clip| self.device_shape(Shape::from_rect(clip, 0.0)));
         let radius = device
             .radius
             .min(device.width / 2.0)
@@ -316,6 +319,154 @@ impl Canvas {
                 self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
             }
         }
+    }
+
+    fn device_shape(&self, shape: Shape) -> Shape {
+        Shape {
+            x: shape.x - self.shift.0,
+            y: shape.y - self.shift.1,
+            ..shape
+        }
+        .to_device(self.scale)
+    }
+
+    // a transparent surface covering `bounds` in layout space at its own resolution
+    fn transparent(bounds: Rect, scale: f32) -> Canvas {
+        let width = (bounds.width * scale).ceil().max(1.0) as u32;
+        let height = (bounds.height * scale).ceil().max(1.0) as u32;
+        let mut pixels = LAYER_BUFFERS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_default();
+        pixels.clear();
+        pixels.resize(width as usize * height as usize * 4, 0);
+        Canvas {
+            width,
+            height,
+            scale,
+            background: Color::transparent(),
+            pixels,
+            shift: (bounds.x, bounds.y),
+        }
+    }
+
+    // draws a transformed layer: each covered pixel is pulled back through the inverse
+    // projection and sampled bilinearly, with transparent texels outside the layer giving
+    // antialiased edges
+    fn composite_transformed(
+        &mut self,
+        layer: Canvas,
+        transform: &crate::transform::Matrix,
+        clip: Option<Rect>,
+        opacity: f32,
+    ) {
+        let layer_rect = Rect {
+            x: layer.shift.0,
+            y: layer.shift.1,
+            width: layer.width as f32 / layer.scale,
+            height: layer.height as f32 / layer.scale,
+        };
+        let corners = [
+            (layer_rect.x, layer_rect.y),
+            (layer_rect.x + layer_rect.width, layer_rect.y),
+            (layer_rect.x, layer_rect.y + layer_rect.height),
+            (
+                layer_rect.x + layer_rect.width,
+                layer_rect.y + layer_rect.height,
+            ),
+        ]
+        .map(|(x, y)| transform.map_point(x, y));
+        // a corner behind the viewer leaves the visible part unbounded, so the clip limits it
+        let target = if corners.iter().all(Option::is_some) {
+            let points = corners.map(|corner| corner.expect("checked above"));
+            let left = points
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::INFINITY, f32::min);
+            let top = points
+                .iter()
+                .map(|point| point.1)
+                .fold(f32::INFINITY, f32::min);
+            let right = points
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let bottom = points
+                .iter()
+                .map(|point| point.1)
+                .fold(f32::NEG_INFINITY, f32::max);
+            Rect {
+                x: left - 1.0,
+                y: top - 1.0,
+                width: right - left + 2.0,
+                height: bottom - top + 2.0,
+            }
+        } else {
+            Rect {
+                x: self.shift.0,
+                y: self.shift.1,
+                width: self.width as f32 / self.scale,
+                height: self.height as f32 / self.scale,
+            }
+        };
+        let Some(bounds) = DeviceBounds::of(self, target, clip) else {
+            LAYER_BUFFERS.with(|pool| pool.borrow_mut().push(layer.pixels));
+            return;
+        };
+        let factor = opacity.clamp(0.0, 1.0);
+        for pixel_y in bounds.top..bounds.bottom {
+            for pixel_x in bounds.left..bounds.right {
+                let x = (pixel_x as f32 + 0.5) / self.scale + self.shift.0;
+                let y = (pixel_y as f32 + 0.5) / self.scale + self.shift.1;
+                let Some((local_x, local_y)) = transform.unmap_point(x, y) else {
+                    continue;
+                };
+                let u = (local_x - layer.shift.0) * layer.scale - 0.5;
+                let v = (local_y - layer.shift.1) * layer.scale - 0.5;
+                let sample = layer.sample_premultiplied(u, v);
+                if sample[3] <= 0.0 {
+                    continue;
+                }
+                let index = ((pixel_y * self.width + pixel_x) * 4) as usize;
+                let alpha = sample[3] * factor;
+                for (target, source) in self.pixels[index..index + 4].iter_mut().zip(sample) {
+                    *target = (source * factor + f32::from(*target) * (1.0 - alpha / 255.0))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        LAYER_BUFFERS.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < MAX_POOLED_LAYERS {
+                pool.push(layer.pixels);
+            }
+        });
+    }
+
+    // bilinear sample of premultiplied pixels, transparent beyond the edges
+    fn sample_premultiplied(&self, u: f32, v: f32) -> [f32; 4] {
+        let (x0, y0) = (u.floor(), v.floor());
+        let (fraction_x, fraction_y) = (u - x0, v - y0);
+        let mut sum = [0.0_f32; 4];
+        for (dy, weight_y) in [(0.0, 1.0 - fraction_y), (1.0, fraction_y)] {
+            for (dx, weight_x) in [(0.0, 1.0 - fraction_x), (1.0, fraction_x)] {
+                let (x, y) = (x0 + dx, y0 + dy);
+                let weight = weight_x * weight_y;
+                if weight == 0.0
+                    || x < 0.0
+                    || y < 0.0
+                    || x >= self.width as f32
+                    || y >= self.height as f32
+                {
+                    continue;
+                }
+                let index = ((y as u32 * self.width + x as u32) * 4) as usize;
+                for (total, value) in sum.iter_mut().zip(&self.pixels[index..index + 4]) {
+                    *total += f32::from(*value) * weight;
+                }
+            }
+        }
+        sum
     }
 
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
@@ -357,6 +508,7 @@ impl Canvas {
             scale: self.scale,
             background: Color::transparent(),
             pixels,
+            shift: self.shift,
         }
     }
 
@@ -393,6 +545,8 @@ impl Canvas {
 }
 
 const MAX_POOLED_LAYERS: usize = 8;
+// a transformed subtree larger than this renders at reduced resolution instead of failing
+const MAX_TRANSFORM_LAYER_PIXELS: f32 = 16_000_000.0;
 
 thread_local! {
     static LAYER_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -409,6 +563,11 @@ struct DeviceBounds {
 impl DeviceBounds {
     fn of(canvas: &Canvas, rect: Rect, clip: Option<Rect>) -> Option<Self> {
         let rect = intersect_clip(clip, rect)?;
+        let rect = Rect {
+            x: rect.x - canvas.shift.0,
+            y: rect.y - canvas.shift.1,
+            ..rect
+        };
         let left = (rect.x * canvas.scale)
             .floor()
             .clamp(0.0, canvas.width as f32) as u32;
@@ -840,6 +999,36 @@ fn paint_context(
 ) {
     let opacity = layout_box.opacity;
     if opacity <= 0.0 {
+        return;
+    }
+    if let Some(transform) = layout_box.transform {
+        let rect = visual_rect_for(layout_box, ancestor_offset);
+        // the stored transform is relative to the border box corner
+        let full = transform.about(rect.x, rect.y);
+        if layout_box.backface_hidden && full.shows_back() {
+            return;
+        }
+        let bounds = subtree_bounds(layout_box, ancestor_offset);
+        // scaled content renders at the scale it is shown at, up to four times, so it stays sharp
+        let mut layer_scale = canvas.scale * full.max_scale().clamp(1.0, 4.0);
+        let area = bounds.width * bounds.height * layer_scale * layer_scale;
+        if area > MAX_TRANSFORM_LAYER_PIXELS {
+            layer_scale *= (MAX_TRANSFORM_LAYER_PIXELS / area).sqrt();
+        }
+        let mut layer = Canvas::transparent(bounds, layer_scale);
+        paint_context_contents(
+            &mut layer,
+            layout_box,
+            ContextPaint {
+                commands,
+                images,
+                prose_selections,
+                clip: None,
+                ancestor_offset,
+                opacity: 1.0,
+            },
+        );
+        canvas.composite_transformed(layer, &full, clip, opacity);
         return;
     }
     // opacity fades the painted subtree as one image, so overlapping descendants do not
@@ -1527,7 +1716,8 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         return;
     }
     let scale = canvas.scale;
-    let area_device = area.to_device(scale);
+    let shift = canvas.shift;
+    let area_device = canvas.device_shape(area);
     let radius = area_device
         .radius
         .min(area_device.width / 2.0)
@@ -1562,15 +1752,18 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
     let Some(bounds) = intersect_clip(clip, bounds) else {
         return;
     };
-    let left = (bounds.x * scale).floor().max(0.0) as u32;
-    let top = (bounds.y * scale).floor().max(0.0) as u32;
-    let right = ((bounds.x + bounds.width) * scale)
+    let left = ((bounds.x - shift.0) * scale).floor().max(0.0) as u32;
+    let top = ((bounds.y - shift.1) * scale).floor().max(0.0) as u32;
+    let right = ((bounds.x - shift.0 + bounds.width) * scale)
         .ceil()
         .clamp(0.0, canvas.width as f32) as u32;
-    let bottom = ((bounds.y + bounds.height) * scale)
+    let bottom = ((bounds.y - shift.1 + bounds.height) * scale)
         .ceil()
         .clamp(0.0, canvas.height as f32) as u32;
-    let origin = (placement.x * scale, placement.y * scale);
+    let origin = (
+        (placement.x - shift.0) * scale,
+        (placement.y - shift.1) * scale,
+    );
     let step = (
         image.width as f32 / (placement.width * scale),
         image.height as f32 / (placement.height * scale),
@@ -1785,11 +1978,13 @@ fn paint_outline_text(
 ) {
     let scale = canvas.scale();
     let device_size = run.font_size * scale;
-    let baseline = (run.y + offset.1 + fonts.ascent(run.font_stack, run.font_size)) * scale;
-    let mut pen = (run.x + offset.0) * scale;
+    let shift = canvas.shift;
+    let baseline =
+        (run.y + offset.1 - shift.1 + fonts.ascent(run.font_stack, run.font_size)) * scale;
+    let mut pen = (run.x + offset.0 - shift.0) * scale;
     let device_clip = clip.map(|clip| Rect {
-        x: clip.x * scale,
-        y: clip.y * scale,
+        x: (clip.x - shift.0) * scale,
+        y: (clip.y - shift.1) * scale,
         width: clip.width * scale,
         height: clip.height * scale,
     });
@@ -1961,6 +2156,8 @@ mod tests {
                 gradient: None,
                 background_image: None,
                 object_fit: crate::css::ObjectFit::Fill,
+                transform: None,
+                backface_hidden: false,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -2115,6 +2312,8 @@ mod tests {
                 gradient: None,
                 background_image: None,
                 object_fit: crate::css::ObjectFit::Fill,
+                transform: None,
+                backface_hidden: false,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -2216,6 +2415,8 @@ mod tests {
                 gradient: None,
                 background_image: None,
                 object_fit: crate::css::ObjectFit::Fill,
+                transform: None,
+                backface_hidden: false,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -2308,6 +2509,8 @@ mod tests {
                 gradient: None,
                 background_image: None,
                 object_fit: crate::css::ObjectFit::Fill,
+                transform: None,
+                backface_hidden: false,
                 border_radius: 0.0,
                 opacity: 1.0,
                 shadow: None,
@@ -2332,6 +2535,8 @@ mod tests {
                         gradient: None,
                         background_image: None,
                         object_fit: crate::css::ObjectFit::Fill,
+                        transform: None,
+                        backface_hidden: false,
                         border_radius: 0.0,
                         opacity: 1.0,
                         shadow: None,
@@ -2370,6 +2575,8 @@ mod tests {
                         gradient: None,
                         background_image: None,
                         object_fit: crate::css::ObjectFit::Fill,
+                        transform: None,
+                        backface_hidden: false,
                         border_radius: 0.0,
                         opacity: 1.0,
                         shadow: None,
