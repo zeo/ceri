@@ -1808,7 +1808,7 @@ impl ScriptRuntime {
                 let selected = self
                     .document
                     .borrow()
-                    .element_clone(option)
+                    .element_at(option)
                     .is_some_and(|element| element.attr("selected").is_some());
                 self.option_selected.insert(option.clone(), selected);
             }
@@ -1826,7 +1826,7 @@ impl ScriptRuntime {
             let selected = self
                 .document
                 .borrow()
-                .element_clone(option)
+                .element_at(option)
                 .is_some_and(|element| element.attr("selected").is_some());
             self.option_selected.insert(option.clone(), selected);
         }
@@ -1837,7 +1837,7 @@ impl ScriptRuntime {
         let document = self.document.borrow();
         let mut selects = Vec::new();
         if document
-            .element_clone(path)
+            .element_at(path)
             .is_some_and(|element| element.name == "select")
         {
             selects.push(path.to_vec());
@@ -1864,7 +1864,7 @@ impl ScriptRuntime {
             let document = self.document.borrow();
             let mut new_selects = Vec::new();
             if document
-                .element_clone(child)
+                .element_at(child)
                 .is_some_and(|element| element.name == "select")
             {
                 new_selects.push(child.to_vec());
@@ -1873,7 +1873,7 @@ impl ScriptRuntime {
                 new_selects.extend(nested);
             }
             let ancestor = document
-                .element_clone(parent)
+                .element_at(parent)
                 .is_some_and(|element| element.name == "select")
                 .then(|| parent.to_vec())
                 .or_else(|| document.select_ancestor_path(parent));
@@ -1896,7 +1896,7 @@ impl ScriptRuntime {
             let selected = self
                 .document
                 .borrow()
-                .element_clone(&option)
+                .element_at(&option)
                 .is_some_and(|element| element.attr("selected").is_some());
             self.option_selected.insert(option.clone(), selected);
             self.dirty_options.remove(&option);
@@ -1908,7 +1908,7 @@ impl ScriptRuntime {
         let select = {
             let document = self.document.borrow();
             document
-                .element_clone(parent)
+                .element_at(parent)
                 .is_some_and(|element| element.name == "select")
                 .then(|| parent.to_vec())
                 .or_else(|| document.select_ancestor_path(parent))
@@ -2166,7 +2166,7 @@ impl ScriptRuntime {
             let mut selects = Vec::new();
             for path in [source_parent.to_vec(), child.to_vec()] {
                 if document
-                    .element_clone(&path)
+                    .element_at(&path)
                     .is_some_and(|element| element.name == "select")
                 {
                     selects.push(path.clone());
@@ -2640,7 +2640,7 @@ impl ScriptRuntime {
     fn label_activation_control(&self, path: &[usize]) -> Option<NodePath> {
         let document = self.document.borrow();
         let label_path = if document
-            .element_clone(path)
+            .element_at(path)
             .is_some_and(|element| element.name == "label")
         {
             path.to_vec()
@@ -2654,14 +2654,12 @@ impl ScriptRuntime {
         let start = label_path.len();
         if path.len() > start
             && (start + 1..=path.len()).any(|length| {
-                document
-                    .element_clone(&path[..length])
-                    .is_some_and(|element| {
-                        matches!(
-                            element.name.as_str(),
-                            "a" | "button" | "input" | "select" | "textarea"
-                        )
-                    })
+                document.element_at(&path[..length]).is_some_and(|element| {
+                    matches!(
+                        element.name.as_str(),
+                        "a" | "button" | "input" | "select" | "textarea"
+                    )
+                })
             })
         {
             return None;
@@ -3093,7 +3091,7 @@ impl ScriptRuntime {
             && self
                 .document
                 .borrow()
-                .element_clone(&path)
+                .element_at(&path)
                 .is_some_and(|element| element.name == "textarea")
         {
             if let Some(maximum) = self.user_input_max_length(&path) {
@@ -3598,18 +3596,25 @@ impl ScriptRuntime {
     }
 
     fn apply_click_default(&mut self, path: &[usize]) -> Result<(), ScriptError> {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let Some(input_type) = self
+            .with_element(path, |element| {
+                (element.name == "input").then(|| {
+                    element
+                        .attr("type")
+                        .map(|kind| kind.to_ascii_lowercase())
+                        .unwrap_or_default()
+                })
+            })
+            .flatten()
+        else {
             return Ok(());
         };
-        if element.name != "input" {
-            return Ok(());
-        }
-        let input_type = element
-            .attr("type")
-            .map(|kind| kind.to_ascii_lowercase())
-            .unwrap_or_default();
         let changed = match input_type.as_str() {
-            "file" => self.apply_file_picker(path, &element)?,
+            // an input has no children, so this copy is a single element
+            "file" => match self.with_element(path, Element::clone) {
+                Some(element) => self.apply_file_picker(path, &element)?,
+                None => false,
+            },
             "checkbox" => {
                 let checked = self.control_checked_path(path);
                 self.control_checked.insert(path.to_vec(), !checked);
@@ -3699,7 +3704,8 @@ impl ScriptRuntime {
     }
 
     fn submit_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
-        let element = self.document.borrow().element_clone(path)?;
+        let document = self.document.borrow();
+        let element = document.element_at(path)?;
         let input_type = element
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
@@ -3715,7 +3721,8 @@ impl ScriptRuntime {
     }
 
     fn reset_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
-        let element = self.document.borrow().element_clone(path)?;
+        let document = self.document.borrow();
+        let element = document.element_at(path)?;
         let input_type = element
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
@@ -3731,7 +3738,7 @@ impl ScriptRuntime {
         let bypass_validation = self
             .document
             .borrow()
-            .element_clone(&path)
+            .element_at(&path)
             .is_some_and(|form| form.attr("novalidate").is_some());
         if !bypass_validation && !self.check_validity_path(&path)? {
             return Ok(());
@@ -3757,7 +3764,7 @@ impl ScriptRuntime {
         let is_form = self
             .document
             .borrow()
-            .element_clone(path)
+            .element_at(path)
             .is_some_and(|element| element.name == "form");
         if !is_form {
             return Err(runtime_error("reset is only available on form elements"));
@@ -3786,19 +3793,19 @@ impl ScriptRuntime {
     }
 
     fn reset_form_control(&mut self, path: &[usize]) {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let Some(name) = self.with_element(path, |element| element.name.clone()) else {
             return;
         };
-        if !matches!(element.name.as_str(), "input" | "select" | "textarea") {
+        if !matches!(name.as_str(), "input" | "select" | "textarea") {
             return;
         }
-        if element.name == "select" {
+        if name == "select" {
             let options = self.option_paths(path);
             for option in &options {
                 let selected = self
                     .document
                     .borrow()
-                    .element_clone(option)
+                    .element_at(option)
                     .is_some_and(|element| element.attr("selected").is_some());
                 self.option_selected.insert(option.clone(), selected);
                 self.dirty_options.remove(option);
@@ -4792,7 +4799,7 @@ impl ScriptRuntime {
                         let is_form = self
                             .document
                             .borrow()
-                            .element_clone(&path)
+                            .element_at(&path)
                             .is_some_and(|element| element.name == "form");
                         if !is_form {
                             return Err(runtime_error(
@@ -4807,7 +4814,7 @@ impl ScriptRuntime {
                         let is_form = self
                             .document
                             .borrow()
-                            .element_clone(&path)
+                            .element_at(&path)
                             .is_some_and(|element| element.name == "form");
                         if !is_form {
                             return Err(runtime_error("reset is only available on form elements"));
@@ -4845,7 +4852,7 @@ impl ScriptRuntime {
                         let is_canvas = self
                             .document
                             .borrow()
-                            .element_clone(&path)
+                            .element_at(&path)
                             .is_some_and(|element| element.name == "canvas");
                         if !is_canvas {
                             return Err(runtime_error(
@@ -6307,10 +6314,14 @@ impl ScriptRuntime {
         if attached_is_text(handle) {
             return "#text".to_string();
         }
-        match handle.borrow().clone() {
+        match &*handle.borrow() {
             ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_clone(&path))
-                .map(|element| element.name.to_ascii_uppercase())
+                .and_then(|path| {
+                    self.document
+                        .borrow()
+                        .element_at(&path)
+                        .map(|element| element.name.to_ascii_uppercase())
+                })
                 .unwrap_or_default(),
             ElementLocation::Detached(element) => element.name.to_ascii_uppercase(),
         }
@@ -6415,7 +6426,8 @@ impl ScriptRuntime {
     }
 
     fn is_focusable_path(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         if self.is_disabled_path(path) {
@@ -6435,7 +6447,8 @@ impl ScriptRuntime {
     }
 
     fn is_text_control_path(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         match element.name.as_str() {
@@ -6456,6 +6469,11 @@ impl ScriptRuntime {
             }),
             _ => false,
         }
+    }
+
+    // reads from an element in place; the borrow ends before the caller continues
+    fn with_element<T>(&self, path: &[usize], read: impl FnOnce(&Element) -> T) -> Option<T> {
+        self.document.borrow().element_at(path).map(read)
     }
 
     fn is_disabled_path(&self, path: &[usize]) -> bool {
@@ -6503,14 +6521,11 @@ impl ScriptRuntime {
     }
 
     fn control_length_attribute(&self, path: &[usize], name: &str) -> Option<usize> {
-        self.document
-            .borrow()
-            .element_clone(path)
-            .and_then(|element| {
-                element
-                    .attr(name)
-                    .and_then(|value| value.trim().parse().ok())
-            })
+        self.document.borrow().element_at(path).and_then(|element| {
+            element
+                .attr(name)
+                .and_then(|value| value.trim().parse().ok())
+        })
     }
 
     fn mark_user_edit(&mut self, path: &[usize]) {
@@ -6519,7 +6534,8 @@ impl ScriptRuntime {
     }
 
     fn is_validation_candidate(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         if self.is_disabled_path(path) {
@@ -6546,7 +6562,8 @@ impl ScriptRuntime {
         if !self.is_validation_candidate(path) {
             return ConstraintFlags::default();
         }
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return ConstraintFlags::default();
         };
         let kind = element
@@ -6658,10 +6675,10 @@ impl ScriptRuntime {
     }
 
     fn check_validity_path(&mut self, path: &[usize]) -> Result<bool, ScriptError> {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let Some(is_form) = self.with_element(path, |element| element.name == "form") else {
             return Ok(true);
         };
-        if element.name == "form" {
+        if is_form {
             let controls = self
                 .document
                 .borrow()
@@ -6699,17 +6716,18 @@ impl ScriptRuntime {
         if let Some(value) = self.control_values.get(path) {
             return Some(value.clone());
         }
-        let element = self.document.borrow().element_clone(path)?;
+        let document = self.document.borrow();
+        let element = document.element_at(path)?;
         if element.name == "select" {
             return Some(self.select_value_path(path));
         }
         if element.name == "option" {
-            return Some(option_value(&element));
+            return Some(option_value(element));
         }
         element.attr("value").map(str::to_string).or_else(|| {
             (element.name == "textarea").then(|| {
                 let mut text = String::new();
-                collect_element_text(&element, &mut text);
+                collect_element_text(element, &mut text);
                 text
             })
         })
@@ -6747,7 +6765,8 @@ impl ScriptRuntime {
     }
 
     fn select_placeholder_path(&self, path: &[usize]) -> Option<NodePath> {
-        let element = self.document.borrow().element_clone(path)?;
+        let document = self.document.borrow();
+        let element = document.element_at(path)?;
         if element.name != "select"
             || element.attr("multiple").is_some()
             || element
@@ -6759,15 +6778,18 @@ impl ScriptRuntime {
         }
         let option = self.option_paths(path).into_iter().next()?;
         let parent = option[..option.len().saturating_sub(1)].to_vec();
-        (parent == path)
-            .then(|| self.document.borrow().element_clone(&option))
-            .flatten()
-            .filter(|option| option_value(option).is_empty())
-            .map(|_| option)
+        let empty = parent == path
+            && self
+                .document
+                .borrow()
+                .element_at(&option)
+                .is_some_and(|element| option_value(element).is_empty());
+        empty.then_some(option)
     }
 
     fn option_selected_path(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         if element.name != "option" {
@@ -6799,7 +6821,7 @@ impl ScriptRuntime {
     fn select_multiple_path(&self, path: &[usize]) -> bool {
         self.document
             .borrow()
-            .element_clone(path)
+            .element_at(path)
             .is_some_and(|element| element.name == "select" && element.attr("multiple").is_some())
     }
 
@@ -6816,8 +6838,7 @@ impl ScriptRuntime {
         self.option_paths(path)
             .into_iter()
             .find(|option| self.option_selected_path(option))
-            .and_then(|option| self.document.borrow().element_clone(&option))
-            .map(|option| option_value(&option))
+            .and_then(|option| self.document.borrow().element_at(&option).map(option_value))
             .unwrap_or_default()
     }
 
@@ -6827,12 +6848,7 @@ impl ScriptRuntime {
             .filter(|option| {
                 self.option_selected_path(option) && !self.option_disabled_path(option)
             })
-            .filter_map(|option| {
-                self.document
-                    .borrow()
-                    .element_clone(&option)
-                    .map(|element| option_value(&element))
-            })
+            .filter_map(|option| self.document.borrow().element_at(&option).map(option_value))
             .collect()
     }
 
@@ -6855,12 +6871,15 @@ impl ScriptRuntime {
     }
 
     fn element_default_selected(&self, handle: &ElementHandle) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_clone(&path))
-                .is_some_and(|element| {
-                    element.name == "option" && element.attr("selected").is_some()
-                }),
+        match &*handle.borrow() {
+            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
+                self.document
+                    .borrow()
+                    .element_at(&path)
+                    .is_some_and(|element| {
+                        element.name == "option" && element.attr("selected").is_some()
+                    })
+            }),
             ElementLocation::Detached(element) => {
                 element.name == "option" && element.attr("selected").is_some()
             }
@@ -6965,7 +6984,7 @@ impl ScriptRuntime {
         if self
             .document
             .borrow()
-            .element_clone(path)
+            .element_at(path)
             .is_none_or(|element| element.name != "select")
         {
             return false;
@@ -6986,7 +7005,7 @@ impl ScriptRuntime {
         if self
             .document
             .borrow()
-            .element_clone(path)
+            .element_at(path)
             .is_none_or(|element| element.name != "select")
         {
             return false;
@@ -6997,8 +7016,8 @@ impl ScriptRuntime {
             .find(|option| {
                 self.document
                     .borrow()
-                    .element_clone(option)
-                    .is_some_and(|element| option_value(&element) == value)
+                    .element_at(option)
+                    .is_some_and(|element| option_value(element) == value)
             })
             .cloned();
         for option in &options {
@@ -7027,7 +7046,7 @@ impl ScriptRuntime {
         if self
             .document
             .borrow()
-            .element_clone(&path)
+            .element_at(&path)
             .is_none_or(|element| element.name != "option")
         {
             return false;
@@ -7055,7 +7074,7 @@ impl ScriptRuntime {
         if self
             .document
             .borrow()
-            .element_clone(&path)
+            .element_at(&path)
             .is_none_or(|element| element.name != "option")
         {
             return false;
@@ -7098,7 +7117,7 @@ impl ScriptRuntime {
         if self
             .document
             .borrow()
-            .element_clone(&path)
+            .element_at(&path)
             .is_none_or(|element| element.name != "select")
         {
             return false;
@@ -7135,7 +7154,7 @@ impl ScriptRuntime {
         if self
             .document
             .borrow()
-            .element_clone(&path)
+            .element_at(&path)
             .is_none_or(|element| element.name != "option")
         {
             return Ok(false);
@@ -7156,22 +7175,28 @@ impl ScriptRuntime {
     }
 
     fn element_default_value(&self, handle: &ElementHandle) -> Value {
-        let value = match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_clone(&path))
-                .and_then(|element| default_value_for_element(&element)),
-            ElementLocation::Detached(element) => default_value_for_element(&element),
+        let value = match &*handle.borrow() {
+            ElementLocation::Attached { .. } => attached_path(handle).and_then(|path| {
+                self.document
+                    .borrow()
+                    .element_at(&path)
+                    .and_then(default_value_for_element)
+            }),
+            ElementLocation::Detached(element) => default_value_for_element(element),
         };
         Value::String(value.unwrap_or_default())
     }
 
     fn element_default_checked(&self, handle: &ElementHandle) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_clone(&path))
-                .is_some_and(|element| {
-                    element.name == "input" && element.attr("checked").is_some()
-                }),
+        match &*handle.borrow() {
+            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
+                self.document
+                    .borrow()
+                    .element_at(&path)
+                    .is_some_and(|element| {
+                        element.name == "input" && element.attr("checked").is_some()
+                    })
+            }),
             ElementLocation::Detached(element) => {
                 element.name == "input" && element.attr("checked").is_some()
             }
@@ -7200,11 +7225,11 @@ impl ScriptRuntime {
                 _ => false,
             });
         };
-        let Some(element) = self.document.borrow().element_clone(&path) else {
+        let Some(name) = self.with_element(&path, |element| element.name.clone()) else {
             return Ok(false);
         };
         let dirty = self.dirty_controls.contains(&path);
-        let changed = match element.name.as_str() {
+        let changed = match name.as_str() {
             "input" => self
                 .document
                 .borrow_mut()
@@ -7232,10 +7257,10 @@ impl ScriptRuntime {
             }
             return true;
         };
-        let Some(element) = self.document.borrow().element_clone(&path) else {
-            return false;
-        };
-        if element.name != "input" {
+        if !self
+            .with_element(&path, |element| element.name == "input")
+            .unwrap_or(false)
+        {
             return false;
         }
         if checked {
@@ -7254,7 +7279,8 @@ impl ScriptRuntime {
     }
 
     fn is_selection_control_path(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         match element.name.as_str() {
@@ -7918,7 +7944,7 @@ impl ScriptRuntime {
         let is_file = self
             .document
             .borrow()
-            .element_clone(&path)
+            .element_at(&path)
             .is_some_and(|element| {
                 element.name == "input"
                     && element
@@ -7952,22 +7978,24 @@ impl ScriptRuntime {
                 let Some(path) = attached_path(handle) else {
                     return false;
                 };
-                let Some(element) = self.document.borrow().element_clone(&path) else {
+                let Some((name, is_file)) = self.with_element(&path, |element| {
+                    let is_file = element.name == "input"
+                        && element
+                            .attr("type")
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("file"));
+                    (element.name.clone(), is_file)
+                }) else {
                     return false;
                 };
-                if element.name == "select" {
+                if name == "select" {
                     return self.set_select_value(&path, &value);
                 }
-                if element.name == "option" {
+                if name == "option" {
                     return self
                         .document
                         .borrow_mut()
                         .set_element_attribute(&path, "value", value);
                 }
-                let is_file = element.name == "input"
-                    && element
-                        .attr("type")
-                        .is_some_and(|kind| kind.eq_ignore_ascii_case("file"));
                 if is_file {
                     if !value.is_empty() {
                         return false;
@@ -8040,7 +8068,7 @@ impl ScriptRuntime {
         path: &NodePath,
         text: String,
     ) -> Result<bool, ScriptError> {
-        if self.document.borrow().element_clone(path).is_none() {
+        if self.document.borrow().element_at(path).is_none() {
             return Ok(false);
         }
         let selection_changed = self.adjust_ranges_for_replacement(path, utf16_len(&text));
@@ -8254,7 +8282,7 @@ impl ScriptRuntime {
                     && self
                         .document
                         .borrow()
-                        .element_clone(&path)
+                        .element_at(&path)
                         .is_some_and(|element| element.name == "select")
                 {
                     self.normalize_select_selection(&path, false);
@@ -8283,7 +8311,7 @@ impl ScriptRuntime {
                 let Some(path) = attached_path(handle) else {
                     return Err(runtime_error("element handle is no longer in the document"));
                 };
-                if self.document.borrow().element_clone(&path).is_none() {
+                if self.document.borrow().element_at(&path).is_none() {
                     return Ok(false);
                 }
                 let replacement =
@@ -8488,7 +8516,7 @@ impl ScriptRuntime {
                 let is_radio = self
                     .document
                     .borrow()
-                    .element_clone(&path)
+                    .element_at(&path)
                     .is_some_and(|element| {
                         element.name == "input"
                             && element
@@ -8626,7 +8654,7 @@ impl ScriptRuntime {
                     && self
                         .document
                         .borrow()
-                        .element_clone(&path)
+                        .element_at(&path)
                         .is_some_and(|element| element.name == "select")
                 {
                     self.normalize_select_selection(&path, false);
@@ -8697,7 +8725,7 @@ impl ScriptRuntime {
         }
         self.document
             .borrow()
-            .element_clone(path)
+            .element_at(path)
             .is_some_and(|element| element.attr("checked").is_some())
     }
 
@@ -8752,10 +8780,9 @@ impl ScriptRuntime {
             .ok_or_else(|| runtime_error("FormData constructor requires a form element"))?;
         let mut pairs = Vec::new();
         for path in paths {
-            let element = self
-                .document
-                .borrow()
-                .element_clone(&path)
+            let document = self.document.borrow();
+            let element = document
+                .element_at(&path)
                 .ok_or_else(|| runtime_error("form control is no longer in the document"))?;
             let Some(name) = element.attr("name").filter(|name| !name.is_empty()) else {
                 continue;
@@ -9190,19 +9217,20 @@ impl ScriptRuntime {
     }
 
     fn submit_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
-        let form = self
-            .document
-            .borrow()
-            .element_clone(&path)
+        // the submission reads three attributes, so the form subtree is not copied
+        let (method, enctype, action) = self
+            .with_element(&path, |form| {
+                (
+                    form.attr("method")
+                        .map(|method| method.trim().to_ascii_lowercase())
+                        .unwrap_or_else(|| "get".to_string()),
+                    form.attr("enctype")
+                        .map(|enctype| enctype.trim().to_ascii_lowercase())
+                        .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string()),
+                    form.attr("action").unwrap_or("").to_string(),
+                )
+            })
             .ok_or_else(|| runtime_error("form is no longer in the document"))?;
-        let method = form
-            .attr("method")
-            .map(|method| method.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "get".to_string());
-        let enctype = form
-            .attr("enctype")
-            .map(|enctype| enctype.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
         if !matches!(method.as_str(), "get" | "post") {
             return Err(runtime_error(
                 "only GET and POST form submission are available in the packaged engine",
@@ -9219,9 +9247,8 @@ impl ScriptRuntime {
             .base_url
             .clone()
             .ok_or_else(|| runtime_error("form submission requires a document URL"))?;
-        let action = form.attr("action").unwrap_or("");
         let url = base
-            .resolve(action)
+            .resolve(&action)
             .map_err(|error| runtime_error(error.to_string()))?;
         let pairs = form_data
             .borrow()
@@ -13171,7 +13198,7 @@ fn collect_sequential_focus_nodes(
     if node.focusable {
         let tabindex = document
             .borrow()
-            .element_clone(&node.path)
+            .element_at(&node.path)
             .and_then(|element| {
                 element
                     .attr("tabindex")
