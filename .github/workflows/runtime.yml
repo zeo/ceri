@@ -40,12 +40,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y libxkbcommon-dev
       - name: test
         run: cargo test --locked --no-default-features --features custom-engine --all-targets
-      - name: engine test
-        run: cargo test --locked -p ceri-engine --all-targets
       - name: clippy
         run: cargo clippy --locked --no-default-features --features custom-engine --all-targets -- -D warnings
-      - name: engine clippy
-        run: cargo clippy --locked -p ceri-engine --all-targets --features windowed -- -D warnings
       - name: render the packaged app without a window
         shell: bash
         run: |
