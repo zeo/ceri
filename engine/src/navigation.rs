@@ -854,6 +854,9 @@ pub struct Browser {
     hovered_path: Option<NodePath>,
     transitions: BTreeMap<(NodePath, AnimatableProperty), TransitionState>,
     declared: BTreeMap<(NodePath, AnimatableProperty), String>,
+    // each element's running keyframe animation, so it plays from when it was applied
+    animations: BTreeMap<NodePath, AnimationRun>,
+    motion_clock: Option<u64>,
     host_runtime_info: Option<HostRuntimeInfo>,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
@@ -873,6 +876,47 @@ struct SelectionUnit {
 pub struct UserPreferences {
     pub color_scheme: ColorScheme,
     pub reduced_motion: bool,
+}
+
+struct AnimationRun {
+    name: String,
+    started: u64,
+    delay: u64,
+    iteration: u64,
+    began: bool,
+    ended: bool,
+}
+
+// a transition or animation event waiting for dispatch once sampling releases the document
+struct MotionEvent {
+    path: NodePath,
+    kind: &'static str,
+    name: String,
+    elapsed: f64,
+}
+
+impl MotionEvent {
+    fn transition(
+        (path, property): &(NodePath, AnimatableProperty),
+        kind: &'static str,
+        elapsed: u64,
+    ) -> Self {
+        Self {
+            path: path.clone(),
+            kind,
+            name: property.name().to_string(),
+            elapsed: elapsed as f64 / 1000.0,
+        }
+    }
+
+    fn animation(path: &NodePath, run: &AnimationRun, kind: &'static str, clock: u64) -> Self {
+        Self {
+            path: path.clone(),
+            kind,
+            name: run.name.clone(),
+            elapsed: clock.saturating_sub(run.started + run.delay) as f64 / 1000.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -907,6 +951,8 @@ impl Browser {
             hovered_path: None,
             transitions: BTreeMap::new(),
             declared: BTreeMap::new(),
+            animations: BTreeMap::new(),
+            motion_clock: None,
             host_runtime_info: None,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
@@ -1221,12 +1267,15 @@ impl Browser {
         let Some(page) = self.page.as_ref() else {
             return Ok(false);
         };
-        if !page.stylesheet.has_transitions() || self.preferences.reduced_motion {
+        let has_motion = page.stylesheet.has_transitions() || page.animated;
+        if !has_motion || self.preferences.reduced_motion {
             self.transitions.clear();
             self.declared.clear();
+            self.animations.clear();
             return Ok(false);
         }
         let clock = page.runtime.now();
+        let previous_clock = self.motion_clock.replace(clock);
         let document = page.document.clone();
         let document = document.borrow();
         let mut state = page.runtime.style_state(self.hovered_path.clone());
@@ -1235,19 +1284,31 @@ impl Browser {
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
         state.clock = clock;
-        page.stylesheet
-            .populate_custom_properties(&document, &mut state);
 
         let mut seen = BTreeSet::new();
+        let mut seen_animations = BTreeSet::new();
+        let mut events = Vec::new();
         let mut changed = false;
-        let mut targets = Vec::new();
-        collect_transition_targets(&document.root, &mut Vec::new(), &mut targets);
-        for path in targets {
+        let mut candidates = Vec::new();
+        collect_motion_candidates(
+            &page.stylesheet,
+            &state,
+            &document.root,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut candidates,
+        );
+        // custom properties cost a document-wide pass, so only pages with moving elements pay it
+        if !candidates.is_empty() {
+            page.stylesheet
+                .populate_custom_properties(&document, &mut state);
+        }
+        for path in candidates {
             let Some(element) = document.element_at(&path) else {
                 continue;
             };
             let ancestors = ancestor_chain(&document, &path);
-            let context = || StyleContext {
+            let values = page.stylesheet.declared_values(StyleContext {
                 element,
                 path: &path,
                 ancestors: &ancestors,
@@ -1256,43 +1317,169 @@ impl Browser {
                 parent_weight: crate::css::FontWeight::Normal,
                 parent_text: Default::default(),
                 state: &state,
-            };
-            let transitions = page.stylesheet.transitions_for(context());
-            for transition in transitions.into_iter().flatten() {
-                let key = (path.clone(), transition.property);
-                seen.insert(key.clone());
-                let Some(value) = page
-                    .stylesheet
-                    .declared_value(context(), transition.property)
-                else {
-                    continue;
-                };
-                match self.declared.get(&key) {
-                    Some(previous) if previous == &value => {}
-                    Some(previous) => {
-                        self.transitions.insert(
-                            key.clone(),
-                            TransitionState {
-                                from: previous.clone(),
-                                to: value.clone(),
-                                started: clock,
-                                finishes: clock
-                                    .saturating_add(transition.delay)
-                                    .saturating_add(transition.duration),
-                            },
-                        );
-                        changed = true;
+            });
+            for transition in crate::css::transitions_from(&values).into_iter().flatten() {
+                for property in transition.property.expand() {
+                    let Some(value) = values.get(property.name()) else {
+                        continue;
+                    };
+                    let key = (path.clone(), property);
+                    seen.insert(key.clone());
+                    match self.declared.get(&key) {
+                        Some(previous) if previous == value => {}
+                        Some(previous) => {
+                            // a change while a transition runs replaces it
+                            if let Some(running) = self.transitions.get(&key)
+                                && clock <= running.finishes
+                            {
+                                events.push(MotionEvent::transition(
+                                    &key,
+                                    "transitioncancel",
+                                    clock.saturating_sub(running.started + running.delay),
+                                ));
+                            }
+                            if transition.duration > 0 {
+                                self.transitions.insert(
+                                    key.clone(),
+                                    TransitionState {
+                                        from: previous.clone(),
+                                        to: value.clone(),
+                                        started: clock,
+                                        finishes: clock
+                                            .saturating_add(transition.delay)
+                                            .saturating_add(transition.duration),
+                                        delay: transition.delay,
+                                        duration: transition.duration,
+                                        timing: transition.timing,
+                                    },
+                                );
+                                events.push(MotionEvent::transition(&key, "transitionrun", 0));
+                                if transition.delay == 0 {
+                                    events.push(MotionEvent::transition(
+                                        &key,
+                                        "transitionstart",
+                                        0,
+                                    ));
+                                }
+                                changed = true;
+                            } else {
+                                self.transitions.remove(&key);
+                            }
+                        }
+                        None => {}
                     }
-                    None => {}
+                    self.declared.insert(key, value.clone());
                 }
-                self.declared.insert(key, value);
+            }
+            if let Some(animation) = crate::css::animation_from(&values)
+                .filter(|animation| page.stylesheet.has_keyframes(&animation.name))
+            {
+                seen_animations.insert(path.clone());
+                if self
+                    .animations
+                    .get(&path)
+                    .is_some_and(|run| run.name != animation.name)
+                    && let Some(replaced) = self.animations.remove(&path)
+                    && !replaced.ended
+                {
+                    events.push(MotionEvent::animation(
+                        &path,
+                        &replaced,
+                        "animationcancel",
+                        clock,
+                    ));
+                }
+                let run = self
+                    .animations
+                    .entry(path.clone())
+                    .or_insert_with(|| AnimationRun {
+                        name: animation.name.clone(),
+                        started: clock,
+                        delay: animation.delay,
+                        iteration: 0,
+                        began: false,
+                        ended: false,
+                    });
+                let elapsed = clock.saturating_sub(run.started);
+                if !run.began && elapsed >= animation.delay {
+                    run.began = true;
+                    events.push(MotionEvent::animation(
+                        &path,
+                        run,
+                        "animationstart",
+                        run.started + run.delay,
+                    ));
+                }
+                if run.began && !run.ended && animation.duration > 0 {
+                    let active = elapsed.saturating_sub(animation.delay);
+                    let current = active / animation.duration;
+                    let finished = animation.iterations.is_some_and(|iterations| {
+                        active as f32 >= iterations * animation.duration as f32
+                    });
+                    if finished {
+                        run.ended = true;
+                        events.push(MotionEvent::animation(&path, run, "animationend", clock));
+                    } else if current > run.iteration {
+                        run.iteration = current;
+                        events.push(MotionEvent::animation(
+                            &path,
+                            run,
+                            "animationiteration",
+                            clock,
+                        ));
+                    }
+                }
+            }
+        }
+        // starts after a delay and ends are noticed as the clock passes them
+        for (key, active) in &self.transitions {
+            let start = active.started + active.delay;
+            if active.delay > 0
+                && previous_clock.is_some_and(|previous| previous < start)
+                && start <= clock
+            {
+                events.push(MotionEvent::transition(key, "transitionstart", 0));
+            }
+            if clock > active.finishes {
+                let name = if seen.contains(key) {
+                    "transitionend"
+                } else {
+                    "transitioncancel"
+                };
+                events.push(MotionEvent::transition(key, name, active.duration));
+            } else if !seen.contains(key) {
+                events.push(MotionEvent::transition(
+                    key,
+                    "transitioncancel",
+                    clock.saturating_sub(start),
+                ));
             }
         }
         // a finished transition is dropped, so the page stops asking for frames
         self.transitions
             .retain(|key, active| seen.contains(key) && clock <= active.finishes);
         self.declared.retain(|key, _| seen.contains(key));
-        Ok(changed)
+        let removed = self
+            .animations
+            .iter()
+            .filter(|(path, run)| !seen_animations.contains(*path) && !run.ended)
+            .map(|(path, run)| MotionEvent::animation(path, run, "animationcancel", clock))
+            .collect::<Vec<_>>();
+        events.extend(removed);
+        self.animations
+            .retain(|path, _| seen_animations.contains(path));
+        drop(document);
+        if events.is_empty() {
+            return Ok(changed);
+        }
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        for event in events {
+            page.runtime
+                .dispatch_motion_event(event.path, event.kind, &event.name, event.elapsed)
+                .map_err(script_error)?;
+        }
+        self.process_pending_navigation()?;
+        Ok(true)
     }
 
     // shows the engine's own recovery document, which a host uses after a failed restart
@@ -1897,6 +2084,11 @@ impl Browser {
         style_state.reduced_motion = self.preferences.reduced_motion;
         style_state.clock = page.runtime.now();
         style_state.transitions = self.transitions.clone();
+        style_state.animation_starts = self
+            .animations
+            .iter()
+            .map(|(path, run)| (path.clone(), run.started))
+            .collect();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
         if let Some(base) = self.current_url.as_ref() {
             for path in document
@@ -2392,14 +2584,27 @@ pub(crate) fn is_json(resource: &Resource) -> bool {
 }
 
 // elements are candidates in document order, which keeps sampling deterministic
-fn collect_transition_targets(element: &Element, path: &mut NodePath, targets: &mut Vec<NodePath>) {
+// elements that a transition or animation rule matches, found in one walk that carries
+// the ancestor chain instead of rebuilding it per element
+fn collect_motion_candidates<'a>(
+    stylesheet: &Stylesheet,
+    state: &crate::css::StyleState,
+    element: &'a Element,
+    path: &mut NodePath,
+    ancestors: &mut Vec<&'a Element>,
+    candidates: &mut Vec<NodePath>,
+) {
     for (index, node) in element.children.iter().enumerate() {
         let Node::Element(child) = node else {
             continue;
         };
         path.push(index);
-        targets.push(path.clone());
-        collect_transition_targets(child, path, targets);
+        if stylesheet.may_animate(child, path, ancestors, state) {
+            candidates.push(path.clone());
+        }
+        ancestors.push(child);
+        collect_motion_candidates(stylesheet, state, child, path, ancestors, candidates);
+        ancestors.pop();
         path.pop();
     }
 }

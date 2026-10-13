@@ -1800,6 +1800,128 @@ mod tests {
         worker.shutdown();
     }
 
+    fn status_text(host: &EngineHost) -> String {
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        document
+            .borrow()
+            .element_text_content(&status)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn transitions_report_run_start_end_and_cancel_in_order() {
+        let browser = Browser::new(bundle(
+            r#"<style>#box { width: 40px; height: 20px; background: #000000; transition: all 100ms linear; } #box.wide { width: 200px; transform: rotate(10deg); }</style><div id="box"></div><p id="status"></p><script>
+                const box = document.getElementById("box");
+                const status = document.getElementById("status");
+                for (const kind of ["transitionrun", "transitionstart", "transitionend", "transitioncancel"]) {
+                    box.addEventListener(kind, (event) => {
+                        if (event.propertyName === "width") {
+                            status.textContent = status.textContent + kind + ":" + event.elapsedTime + "|";
+                        }
+                    });
+                }
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let set_class = |host: &mut EngineHost, class: &str| {
+            let document = host.browser().document().expect("document");
+            let path = document.borrow().find_element_by_id("box").expect("box");
+            assert!(
+                document
+                    .borrow_mut()
+                    .set_element_attribute(&path, "class", class.to_string())
+            );
+        };
+        set_class(&mut host, "wide");
+        host.input(InputEvent::AdvanceTime(10)).expect("tick");
+        assert_eq!(status_text(&host), "transitionrun:0|transitionstart:0|");
+        // halfway the width and the rotation are both in flight
+        host.input(InputEvent::AdvanceTime(50)).expect("tick");
+        let layout = host.browser().layout(host.viewport()).expect("layout");
+        let width = layout.root.children[0].rect.width;
+        assert!(width > 60.0 && width < 180.0, "{width}");
+        assert!(layout.root.children[0].transform.is_some());
+        host.input(InputEvent::AdvanceTime(100)).expect("tick");
+        assert_eq!(
+            status_text(&host),
+            "transitionrun:0|transitionstart:0|transitionend:0.1|"
+        );
+        // reversing mid-flight cancels the running transition
+        set_class(&mut host, "");
+        host.input(InputEvent::AdvanceTime(10)).expect("tick");
+        set_class(&mut host, "wide");
+        host.input(InputEvent::AdvanceTime(30)).expect("tick");
+        assert!(
+            status_text(&host).contains("transitioncancel:"),
+            "{}",
+            status_text(&host)
+        );
+    }
+
+    #[test]
+    fn animations_start_when_applied_and_report_iterations_and_end() {
+        let browser = Browser::new(bundle(
+            r#"<style>@keyframes grow { from { width: 10px } to { width: 110px } } #bar { height: 10px; width: 10px; } #bar.run { animation: grow 100ms linear 2; }</style><div id="bar"></div><p id="status"></p><script>
+                const bar = document.getElementById("bar");
+                const status = document.getElementById("status");
+                for (const kind of ["animationstart", "animationiteration", "animationend"]) {
+                    bar.addEventListener(kind, (event) => {
+                        status.textContent = status.textContent + kind + ":" + event.animationName + "|";
+                    });
+                }
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        host.input(InputEvent::AdvanceTime(1000)).expect("tick");
+        let document = host.browser().document().expect("document");
+        let path = document.borrow().find_element_by_id("bar").expect("bar");
+        assert!(
+            document
+                .borrow_mut()
+                .set_element_attribute(&path, "class", "run".to_string())
+        );
+        host.input(InputEvent::AdvanceTime(1)).expect("tick");
+        assert_eq!(status_text(&host), "animationstart:grow|");
+        // the animation runs from when the class arrived, not from page load
+        host.input(InputEvent::AdvanceTime(49)).expect("tick");
+        let width = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout")
+            .root
+            .children[0]
+            .rect
+            .width;
+        assert!((width - 60.0).abs() < 3.0, "{width}");
+        host.input(InputEvent::AdvanceTime(60)).expect("tick");
+        host.input(InputEvent::AdvanceTime(100)).expect("tick");
+        assert_eq!(
+            status_text(&host),
+            "animationstart:grow|animationiteration:grow|animationend:grow|"
+        );
+    }
+
     struct SharedClipboard {
         text: std::cell::RefCell<String>,
     }

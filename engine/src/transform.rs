@@ -354,29 +354,52 @@ fn parse_function(name: &str, arguments: &[&str]) -> Option<TransformOp> {
 
 pub(crate) const MAX_TRANSFORM_FUNCTIONS: usize = 16;
 
-// the whole list, or None when any function is unknown or malformed
-pub(crate) fn parse_transform_list(value: &str) -> Option<Vec<TransformOp>> {
-    let mut ops = Vec::new();
+// a space-separated list of name(arguments) functions; parentheses nest, so calc() and
+// var() arguments stay whole, and arguments split only on top-level commas
+pub(crate) fn functions(value: &str) -> Option<Vec<(&str, Vec<&str>)>> {
+    let mut output = Vec::new();
     let mut rest = value.trim();
     while !rest.is_empty() {
         let open = rest.find('(')?;
-        let close = rest[open..].find(')')? + open;
-        let name = rest[..open].trim().to_ascii_lowercase();
-        let arguments = rest[open + 1..close]
-            .split(',')
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        // CSS also allows space-separated translate and scale arguments in newer syntax
-        let arguments = if arguments.len() == 1 && arguments[0].contains(' ') {
-            arguments[0].split_whitespace().collect()
-        } else {
-            arguments
-        };
-        ops.push(parse_function(&name, &arguments)?);
+        let mut depth = 0_usize;
+        let mut close = None;
+        let mut commas = Vec::new();
+        for (index, character) in rest[open..].char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + index);
+                        break;
+                    }
+                }
+                ',' if depth == 1 => commas.push(open + index),
+                _ => {}
+            }
+        }
+        let close = close?;
+        let mut arguments = Vec::new();
+        let mut start = open + 1;
+        for comma in commas {
+            arguments.push(rest[start..comma].trim());
+            start = comma + 1;
+        }
+        arguments.push(rest[start..close].trim());
+        output.push((rest[..open].trim(), arguments));
+        rest = rest[close + 1..].trim_start();
+    }
+    Some(output)
+}
+
+// the whole list, or None when any function is unknown or malformed
+pub(crate) fn parse_transform_list(value: &str) -> Option<Vec<TransformOp>> {
+    let mut ops = Vec::new();
+    for (name, arguments) in functions(value)? {
+        ops.push(parse_function(&name.to_ascii_lowercase(), &arguments)?);
         if ops.len() > MAX_TRANSFORM_FUNCTIONS {
             return None;
         }
-        rest = rest[close + 1..].trim_start();
     }
     (!ops.is_empty()).then_some(ops)
 }

@@ -722,6 +722,7 @@ pub struct ScriptRuntime {
     text_selections: HashMap<NodePath, TextSelection>,
     composition: Option<TextComposition>,
     click_detail: u32,
+    motion_detail: Option<Rc<(String, f64)>>,
     selection: SelectionHandle,
     ranges: Vec<WeakRangeHandle>,
     selected_files: HashMap<NodePath, Vec<FileHandle>>,
@@ -1003,6 +1004,8 @@ struct EventData {
     is_composing: bool,
     // click count for click and dblclick, zero for other events
     detail: u32,
+    // property or animation name and elapsed seconds for transition and animation events
+    motion: Option<Rc<(String, f64)>>,
     data_value: Option<Box<Value>>,
     error_message: Option<String>,
 }
@@ -1763,6 +1766,7 @@ impl ScriptRuntime {
             text_selections: HashMap::new(),
             composition: None,
             click_detail: 1,
+            motion_detail: None,
             selection: Rc::new(RefCell::new(SelectionData::default())),
             ranges: Vec::new(),
             selected_files: HashMap::new(),
@@ -3354,6 +3358,25 @@ impl ScriptRuntime {
         })
     }
 
+    // dispatches a bubbling transition or animation event with its name and elapsed time
+    pub(crate) fn dispatch_motion_event(
+        &mut self,
+        path: NodePath,
+        event: &str,
+        name: &str,
+        elapsed: f64,
+    ) -> Result<bool, ScriptError> {
+        if self.document.borrow().element_at(&path).is_none() {
+            return Ok(false);
+        }
+        self.motion_detail = Some(Rc::new((name.to_string(), elapsed)));
+        let dispatched = self.dispatch_event(path, event);
+        self.motion_detail = None;
+        let dispatched = dispatched?;
+        self.drain_microtasks()?;
+        Ok(dispatched.handled)
+    }
+
     // the click count that the next host click and dblclick events report
     pub(crate) fn set_click_detail(&mut self, detail: u32) {
         self.click_detail = detail.max(1);
@@ -3837,6 +3860,7 @@ impl ScriptRuntime {
             modifiers: KeyModifiers::default(),
             is_composing: false,
             detail: 0,
+            motion: None,
             data_value: None,
             error_message: None,
         });
@@ -3878,6 +3902,7 @@ impl ScriptRuntime {
             modifiers: KeyModifiers::default(),
             is_composing: false,
             detail: 0,
+            motion: None,
             data_value: None,
             error_message: None,
         });
@@ -5058,6 +5083,17 @@ impl ScriptRuntime {
                 "metaKey" => Ok(Value::Bool(event.modifiers.meta)),
                 "isComposing" => Ok(Value::Bool(event.is_composing)),
                 "detail" => Ok(Value::Number(f64::from(event.detail))),
+                "propertyName" | "animationName" => Ok(Value::String(
+                    event
+                        .motion
+                        .as_ref()
+                        .map(|motion| motion.0.clone())
+                        .unwrap_or_default(),
+                )),
+                "elapsedTime" => Ok(Value::Number(
+                    event.motion.as_ref().map_or(0.0, |motion| motion.1),
+                )),
+                "pseudoElement" => Ok(Value::String(String::new())),
                 "data" => Ok(event
                     .data_value
                     .as_ref()
@@ -6098,6 +6134,7 @@ impl ScriptRuntime {
                             modifiers: KeyModifiers::default(),
                             is_composing: false,
                             detail: 0,
+                            motion: None,
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
@@ -6202,6 +6239,7 @@ impl ScriptRuntime {
                             modifiers: KeyModifiers::default(),
                             is_composing: false,
                             detail: 0,
+                            motion: None,
                             data_value: Some(Box::new(data)),
                             error_message: None,
                         });
@@ -6238,6 +6276,7 @@ impl ScriptRuntime {
                             modifiers: KeyModifiers::default(),
                             is_composing: false,
                             detail: 0,
+                            motion: None,
                             data_value: None,
                             error_message: Some(message),
                         });
@@ -6420,10 +6459,12 @@ impl ScriptRuntime {
     }
 
     fn is_disabled_path(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         if element.name == "option" {
+            drop(document);
             return self.option_disabled_path(path);
         }
         if !matches!(
@@ -6435,34 +6476,14 @@ impl ScriptRuntime {
         if element.attr("disabled").is_some() {
             return true;
         }
-        let mut ancestor = path.to_vec();
-        while !ancestor.is_empty() {
-            ancestor.pop();
-            let Some(ancestor_element) = self.document.borrow().element_clone(&ancestor) else {
-                continue;
-            };
-            if ancestor_element.name == "fieldset"
-                && ancestor_element.attr("disabled").is_some()
-                && !self.is_inside_first_legend(&ancestor, path)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn is_inside_first_legend(&self, fieldset_path: &[usize], path: &[usize]) -> bool {
-        let Some(fieldset) = self.document.borrow().element_clone(fieldset_path) else {
-            return false;
-        };
-        for (index, child) in fieldset.children.iter().enumerate() {
-            if matches!(child, Node::Element(element) if element.name == "legend") {
-                let mut legend_path = fieldset_path.to_vec();
-                legend_path.push(index);
-                return path.starts_with(&legend_path);
-            }
-        }
-        false
+        (0..path.len()).rev().any(|depth| {
+            let ancestor = &path[..depth];
+            document.element_at(ancestor).is_some_and(|candidate| {
+                candidate.name == "fieldset"
+                    && candidate.attr("disabled").is_some()
+                    && !inside_first_legend(candidate, ancestor, path)
+            })
+        })
     }
 
     fn is_readonly_path(&self, path: &[usize]) -> bool {
@@ -6470,7 +6491,7 @@ impl ScriptRuntime {
             && self
                 .document
                 .borrow()
-                .element_clone(path)
+                .element_at(path)
                 .is_some_and(|element| element.attr("readonly").is_some())
     }
 
@@ -6702,7 +6723,8 @@ impl ScriptRuntime {
     }
 
     fn option_disabled_path(&self, path: &[usize]) -> bool {
-        let Some(element) = self.document.borrow().element_clone(path) else {
+        let document = self.document.borrow();
+        let Some(element) = document.element_at(path) else {
             return false;
         };
         if element.name != "option" {
@@ -6711,15 +6733,13 @@ impl ScriptRuntime {
         if element.attr("disabled").is_some() {
             return true;
         }
-        let mut ancestor = path.to_vec();
-        while !ancestor.is_empty() {
-            ancestor.pop();
-            let Some(element) = self.document.borrow().element_clone(&ancestor) else {
+        for depth in (0..path.len()).rev() {
+            let Some(ancestor) = document.element_at(&path[..depth]) else {
                 continue;
             };
-            match element.name.as_str() {
+            match ancestor.name.as_str() {
                 "select" => return false,
-                "optgroup" => return element.attr("disabled").is_some(),
+                "optgroup" => return ancestor.attr("disabled").is_some(),
                 _ => {}
             }
         }
@@ -12322,6 +12342,7 @@ impl ScriptRuntime {
             modifiers: KeyModifiers::default(),
             is_composing: self.composition.is_some(),
             detail: click_detail_for(event, self.click_detail),
+            motion: self.motion_detail.clone(),
             data_value: None,
             error_message: None,
         });
@@ -12384,6 +12405,7 @@ impl ScriptRuntime {
                 modifiers,
                 is_composing: self.composition.is_some(),
                 detail: click_detail_for(event, self.click_detail),
+                motion: self.motion_detail.clone(),
                 data_value: None,
                 error_message: None,
             });
@@ -16341,6 +16363,19 @@ pub(crate) fn word_modifier(modifiers: KeyModifiers) -> bool {
     } else {
         modifiers.control
     }
+}
+
+// whether a path sits inside the first legend child of a fieldset
+fn inside_first_legend(fieldset: &Element, fieldset_path: &[usize], path: &[usize]) -> bool {
+    fieldset
+        .children
+        .iter()
+        .position(|child| matches!(child, Node::Element(element) if element.name == "legend"))
+        .is_some_and(|index| {
+            let mut legend_path = fieldset_path.to_vec();
+            legend_path.push(index);
+            path.starts_with(&legend_path)
+        })
 }
 
 fn click_detail_for(event: &str, detail: u32) -> u32 {

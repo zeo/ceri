@@ -5,6 +5,7 @@ mod gif;
 mod host;
 mod image;
 mod inflate;
+mod interpolate;
 mod jpeg;
 mod layout;
 #[cfg(feature = "native-http")]

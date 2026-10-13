@@ -418,6 +418,9 @@ pub(crate) struct TransitionState {
     pub(crate) to: String,
     pub(crate) started: u64,
     pub(crate) finishes: u64,
+    pub(crate) delay: u64,
+    pub(crate) duration: u64,
+    pub(crate) timing: Timing,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -440,6 +443,8 @@ pub(crate) struct StyleState {
     pub(crate) root_path: Option<NodePath>,
     // natural pixel sizes of decoded images, keyed by their element
     pub(crate) image_sizes: BTreeMap<NodePath, (u32, u32)>,
+    // when each element's current animation began, on the page clock
+    pub(crate) animation_starts: BTreeMap<NodePath, u64>,
 }
 
 impl StyleState {
@@ -768,6 +773,24 @@ pub struct Stylesheet {
     rules: Vec<Rule>,
     keyframes: Vec<Keyframes>,
     index: RuleIndex,
+    // rules that declare a transition or an animation, checked before a full cascade
+    motion_rules: Vec<usize>,
+}
+
+fn motion_rules(rules: &[Rule]) -> Vec<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.declarations.iter().any(|declaration| {
+                matches!(
+                    declaration.property.as_str(),
+                    "transition" | "animation" | "animation-name"
+                )
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 // rules bucketed by the rightmost id, class or tag, so an element only tries plausible rules
@@ -848,92 +871,253 @@ struct KeyframeStop {
     declarations: Vec<Declaration>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Timing {
     Linear,
-    Ease,
-    Steps(u32),
+    CubicBezier(f32, f32, f32, f32),
+    Steps(u32, StepPosition),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepPosition {
+    Start,
+    End,
+    None,
+    Both,
 }
 
 impl Timing {
-    fn apply(self, progress: f32) -> f32 {
+    pub(crate) const EASE: Self = Self::CubicBezier(0.25, 0.1, 0.25, 1.0);
+
+    pub(crate) fn apply(self, progress: f32) -> f32 {
         let progress = progress.clamp(0.0, 1.0);
         match self {
             Self::Linear => progress,
-            // the cubic ease curve approximated by smoothstep, which is close enough to read as eased
-            Self::Ease => progress * progress * (3.0 - 2.0 * progress),
-            Self::Steps(count) => {
+            Self::CubicBezier(x1, y1, x2, y2) => cubic_bezier(x1, y1, x2, y2, progress),
+            Self::Steps(count, position) => {
                 let count = count.max(1) as f32;
-                (progress * count).floor().min(count - 1.0) / count
+                let (jumps, offset) = match position {
+                    StepPosition::End => (count, 0.0),
+                    StepPosition::Start => (count, 1.0),
+                    StepPosition::None => ((count - 1.0).max(1.0), 0.0),
+                    StepPosition::Both => (count + 1.0, 1.0),
+                };
+                if progress >= 1.0 {
+                    return 1.0;
+                }
+                (((progress * count).floor() + offset) / jumps).clamp(0.0, 1.0)
             }
         }
     }
 }
 
-// the properties a transition can drive in this engine, kept small so style values stay copyable
+// solves x(t) = progress on the curve from (0, 0) to (1, 1), then returns y(t)
+fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, progress: f32) -> f32 {
+    let curve = |a: f32, b: f32, t: f32| {
+        let inverse = 1.0 - t;
+        3.0 * inverse * inverse * t * a + 3.0 * inverse * t * t * b + t * t * t
+    };
+    let slope = |a: f32, b: f32, t: f32| {
+        let inverse = 1.0 - t;
+        3.0 * inverse * inverse * a + 6.0 * inverse * t * (b - a) + 3.0 * t * t * (1.0 - b)
+    };
+    let mut t = progress;
+    for _ in 0..8 {
+        let error = curve(x1, x2, t) - progress;
+        if error.abs() < 1e-6 {
+            return curve(y1, y2, t);
+        }
+        let derivative = slope(x1, x2, t);
+        if derivative.abs() < 1e-6 {
+            break;
+        }
+        t = (t - error / derivative).clamp(0.0, 1.0);
+    }
+    // bisection when Newton steps stall on a flat stretch
+    let (mut low, mut high) = (0.0_f32, 1.0_f32);
+    t = progress;
+    for _ in 0..32 {
+        let x = curve(x1, x2, t);
+        if (x - progress).abs() < 1e-6 {
+            break;
+        }
+        if x < progress {
+            low = t;
+        } else {
+            high = t;
+        }
+        t = (low + high) / 2.0;
+    }
+    curve(y1, y2, t)
+}
+
+fn parse_timing(value: &str) -> Option<Timing> {
+    let lowered = value.trim().to_ascii_lowercase();
+    let arguments = |name: &str| {
+        lowered
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .map(|inner| inner.split(',').map(str::trim).collect::<Vec<_>>())
+    };
+    Some(match lowered.as_str() {
+        "linear" => Timing::Linear,
+        "ease" => Timing::EASE,
+        "ease-in" => Timing::CubicBezier(0.42, 0.0, 1.0, 1.0),
+        "ease-out" => Timing::CubicBezier(0.0, 0.0, 0.58, 1.0),
+        "ease-in-out" => Timing::CubicBezier(0.42, 0.0, 0.58, 1.0),
+        "step-start" => Timing::Steps(1, StepPosition::Start),
+        "step-end" => Timing::Steps(1, StepPosition::End),
+        _ => {
+            if let Some(values) = arguments("cubic-bezier") {
+                let numbers = values
+                    .iter()
+                    .map(|value| value.parse::<f32>().ok().filter(|value| value.is_finite()))
+                    .collect::<Option<Vec<_>>>()?;
+                let [x1, y1, x2, y2] = numbers.as_slice() else {
+                    return None;
+                };
+                // the x coordinates must stay inside the unit interval
+                if !(0.0..=1.0).contains(x1) || !(0.0..=1.0).contains(x2) {
+                    return None;
+                }
+                Timing::CubicBezier(*x1, *y1, *x2, *y2)
+            } else if let Some(values) = arguments("steps") {
+                let count = values
+                    .first()?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|count| *count > 0)?;
+                let position = match values.get(1).copied() {
+                    None | Some("end") | Some("jump-end") => StepPosition::End,
+                    Some("start") | Some("jump-start") => StepPosition::Start,
+                    Some("jump-none") if count > 1 => StepPosition::None,
+                    Some("jump-both") => StepPosition::Both,
+                    _ => return None,
+                };
+                Timing::Steps(count, position)
+            } else {
+                return None;
+            }
+        }
+    })
+}
+
+// the properties a transition can drive in this engine; All stands for every one of them
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum AnimatableProperty {
+    All,
     Color,
+    Background,
     BackgroundColor,
+    BackgroundPosition,
+    BackgroundSize,
     BorderColor,
+    BorderRadius,
+    BorderWidth,
+    BoxShadow,
     Opacity,
     Width,
     Height,
-    BorderRadius,
-    BorderWidth,
+    Margin,
+    MarginTop,
+    MarginRight,
+    MarginBottom,
+    MarginLeft,
+    Padding,
+    PaddingTop,
+    PaddingRight,
+    PaddingBottom,
+    PaddingLeft,
+    Inset,
+    Top,
+    Right,
+    Bottom,
+    Left,
+    Gap,
+    FlexGrow,
+    ZIndex,
     LetterSpacing,
     FontSize,
+    LineHeight,
     Transform,
+    TransformOrigin,
+    Translate,
+    Rotate,
+    Scale,
+    Perspective,
 }
+
+const ANIMATABLE: [(AnimatableProperty, &str); 39] = [
+    (AnimatableProperty::Color, "color"),
+    (AnimatableProperty::Background, "background"),
+    (AnimatableProperty::BackgroundColor, "background-color"),
+    (
+        AnimatableProperty::BackgroundPosition,
+        "background-position",
+    ),
+    (AnimatableProperty::BackgroundSize, "background-size"),
+    (AnimatableProperty::BorderColor, "border-color"),
+    (AnimatableProperty::BorderRadius, "border-radius"),
+    (AnimatableProperty::BorderWidth, "border-width"),
+    (AnimatableProperty::BoxShadow, "box-shadow"),
+    (AnimatableProperty::Opacity, "opacity"),
+    (AnimatableProperty::Width, "width"),
+    (AnimatableProperty::Height, "height"),
+    (AnimatableProperty::Margin, "margin"),
+    (AnimatableProperty::MarginTop, "margin-top"),
+    (AnimatableProperty::MarginRight, "margin-right"),
+    (AnimatableProperty::MarginBottom, "margin-bottom"),
+    (AnimatableProperty::MarginLeft, "margin-left"),
+    (AnimatableProperty::Padding, "padding"),
+    (AnimatableProperty::PaddingTop, "padding-top"),
+    (AnimatableProperty::PaddingRight, "padding-right"),
+    (AnimatableProperty::PaddingBottom, "padding-bottom"),
+    (AnimatableProperty::PaddingLeft, "padding-left"),
+    (AnimatableProperty::Inset, "inset"),
+    (AnimatableProperty::Top, "top"),
+    (AnimatableProperty::Right, "right"),
+    (AnimatableProperty::Bottom, "bottom"),
+    (AnimatableProperty::Left, "left"),
+    (AnimatableProperty::Gap, "gap"),
+    (AnimatableProperty::FlexGrow, "flex-grow"),
+    (AnimatableProperty::ZIndex, "z-index"),
+    (AnimatableProperty::LetterSpacing, "letter-spacing"),
+    (AnimatableProperty::FontSize, "font-size"),
+    (AnimatableProperty::LineHeight, "line-height"),
+    (AnimatableProperty::Transform, "transform"),
+    (AnimatableProperty::TransformOrigin, "transform-origin"),
+    (AnimatableProperty::Translate, "translate"),
+    (AnimatableProperty::Rotate, "rotate"),
+    (AnimatableProperty::Scale, "scale"),
+    (AnimatableProperty::Perspective, "perspective"),
+];
 
 impl AnimatableProperty {
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Color => "color",
-            Self::BackgroundColor => "background-color",
-            Self::BorderColor => "border-color",
-            Self::Opacity => "opacity",
-            Self::Width => "width",
-            Self::Height => "height",
-            Self::BorderRadius => "border-radius",
-            Self::BorderWidth => "border-width",
-            Self::LetterSpacing => "letter-spacing",
-            Self::FontSize => "font-size",
-            Self::Transform => "transform",
-        }
+        ANIMATABLE
+            .iter()
+            .find(|(property, _)| *property == self)
+            .map_or("all", |(_, name)| name)
     }
 
     fn parse(name: &str) -> Option<Self> {
-        match name {
-            "color" => Some(Self::Color),
-            "background" | "background-color" => Some(Self::BackgroundColor),
-            "border-color" => Some(Self::BorderColor),
-            "opacity" => Some(Self::Opacity),
-            "width" => Some(Self::Width),
-            "height" => Some(Self::Height),
-            "border-radius" => Some(Self::BorderRadius),
-            "border-width" => Some(Self::BorderWidth),
-            "letter-spacing" => Some(Self::LetterSpacing),
-            "font-size" => Some(Self::FontSize),
-            "transform" => Some(Self::Transform),
-            _ => None,
+        if name == "all" {
+            return Some(Self::All);
         }
+        ANIMATABLE
+            .iter()
+            .find(|(_, candidate)| *candidate == name)
+            .map(|(property, _)| *property)
     }
 
-    pub(crate) fn all() -> [Self; 11] {
-        [
-            Self::Color,
-            Self::BackgroundColor,
-            Self::BorderColor,
-            Self::Opacity,
-            Self::Width,
-            Self::Height,
-            Self::BorderRadius,
-            Self::BorderWidth,
-            Self::LetterSpacing,
-            Self::FontSize,
-            Self::Transform,
-        ]
+    // the concrete properties this one covers
+    pub(crate) fn expand(self) -> impl Iterator<Item = Self> {
+        let all = self == Self::All;
+        ANIMATABLE
+            .iter()
+            .map(|(property, _)| *property)
+            .filter(move |property| all || *property == self)
     }
 }
 
@@ -977,10 +1161,12 @@ impl Stylesheet {
         let mut keyframes = Vec::new();
         parse_rules(&source, None, &mut rules, &mut keyframes, None)?;
         let index = RuleIndex::build(&rules);
+        let motion_rules = motion_rules(&rules);
         Ok(Self {
             rules,
             keyframes,
             index,
+            motion_rules,
         })
     }
 
@@ -998,11 +1184,13 @@ impl Stylesheet {
             Some(&mut dropped),
         );
         let index = RuleIndex::build(&rules);
+        let motion_rules = motion_rules(&rules);
         (
             Self {
                 rules,
                 keyframes,
                 index,
+                motion_rules,
             },
             dropped,
         )
@@ -1070,8 +1258,13 @@ impl Stylesheet {
                     .iter()
                     .find(|other| other.property == declaration.property);
                 let value = match target {
-                    Some(target) => interpolate_value(&declaration.value, &target.value, local)
-                        .unwrap_or_else(|| declaration.value.clone()),
+                    Some(target) => crate::interpolate::interpolate_value(
+                        &declaration.property,
+                        &declaration.value,
+                        &target.value,
+                        local,
+                    )
+                    .unwrap_or_else(|| declaration.value.clone()),
                     None => declaration.value.clone(),
                 };
                 values.push((declaration.property.clone(), value));
@@ -1241,34 +1434,37 @@ impl Stylesheet {
         }
         // a running transition replaces the declared value while it is in flight
         if !state.transitions.is_empty() && !state.reduced_motion {
-            for transition in style.transitions.into_iter().flatten() {
-                let Some(active) = state.transitions.get(&(path.to_vec(), transition.property))
-                else {
-                    continue;
-                };
+            let range = (path.to_vec(), AnimatableProperty::All)
+                ..=(path.to_vec(), AnimatableProperty::Perspective);
+            for ((_, property), active) in state.transitions.range(range) {
                 let elapsed = state.clock.saturating_sub(active.started);
-                if elapsed < transition.delay {
-                    apply_declaration(&mut style, transition.property.name(), &active.from);
+                if elapsed < active.delay {
+                    apply_declaration(&mut style, property.name(), &active.from);
                     continue;
                 }
-                let progress = if transition.duration == 0 {
+                let progress = if active.duration == 0 {
                     1.0
                 } else {
-                    ((elapsed - transition.delay) as f32 / transition.duration as f32).min(1.0)
+                    ((elapsed - active.delay) as f32 / active.duration as f32).min(1.0)
                 };
                 if progress >= 1.0 {
                     continue;
                 }
-                if let Some(value) =
-                    interpolate_value(&active.from, &active.to, transition.timing.apply(progress))
-                {
-                    apply_declaration(&mut style, transition.property.name(), &value);
+                if let Some(value) = crate::interpolate::interpolate_value(
+                    property.name(),
+                    &active.from,
+                    &active.to,
+                    active.timing.apply(progress),
+                ) {
+                    apply_declaration(&mut style, property.name(), &value);
                 }
             }
         }
         // animated values win over the normal cascade, as the animation origin requires
         if let Some(animation) = animation.filter(|_| !state.reduced_motion) {
-            for (property, value) in self.animated_values(&animation, state.clock, &base_values) {
+            let started = state.animation_starts.get(path).copied().unwrap_or(0);
+            let now = state.clock.saturating_sub(started);
+            for (property, value) in self.animated_values(&animation, now, &base_values) {
                 let Some(value) = resolve_custom_value(&value, custom_properties) else {
                     continue;
                 };
@@ -1299,12 +1495,8 @@ impl Stylesheet {
         })
     }
 
-    // the declared value of one animatable property, before any transition is applied
-    pub(crate) fn declared_value(
-        &self,
-        context: StyleContext<'_>,
-        property: AnimatableProperty,
-    ) -> Option<String> {
+    // declared values after custom property substitution, from one cascade
+    pub(crate) fn declared_values(&self, context: StyleContext<'_>) -> BTreeMap<String, String> {
         let values = self.cascaded_values(
             context.element,
             context.path,
@@ -1314,24 +1506,43 @@ impl Stylesheet {
         let empty = BTreeMap::new();
         let custom_properties =
             inherited_custom_properties(context.state, context.path).unwrap_or(&empty);
-        let (_, _, raw) = values.get(property.name())?;
-        resolve_custom_value(raw, custom_properties)
+        values
+            .into_iter()
+            .filter_map(|(property, (_, _, raw))| {
+                Some((
+                    property.into_owned(),
+                    resolve_custom_value(&raw, custom_properties)?,
+                ))
+            })
+            .collect()
     }
 
-    pub(crate) fn transitions_for(
+    // a cheap check before a full cascade: only rules that declare motion, or inline style
+    pub(crate) fn may_animate(
         &self,
-        context: StyleContext<'_>,
-    ) -> [Option<Transition>; MAX_TRANSITIONS] {
-        let values = self.cascaded_values(
-            context.element,
-            context.path,
-            context.ancestors,
-            context.state,
-        );
-        match values.get("transition") {
-            Some((_, _, raw)) => parse_transitions(raw),
-            None => [None; MAX_TRANSITIONS],
+        element: &Element,
+        path: &[usize],
+        ancestors: &[&Element],
+        state: &StyleState,
+    ) -> bool {
+        if element
+            .attr("style")
+            .is_some_and(|inline| inline.contains("transition") || inline.contains("animation"))
+        {
+            return true;
         }
+        self.motion_rules.iter().any(|&index| {
+            let rule = &self.rules[index];
+            rule.media.as_ref().is_none_or(|media| media.matches(state))
+                && rule
+                    .selectors
+                    .iter()
+                    .any(|selector| selector.matches(element, path, ancestors, state))
+        })
+    }
+
+    pub(crate) fn has_keyframes(&self, name: &str) -> bool {
+        self.keyframes.iter().any(|frames| frames.name == name)
     }
 
     pub(crate) fn has_animations(&self) -> bool {
@@ -2115,39 +2326,6 @@ fn declaration_pairs(declarations: &[Declaration]) -> Vec<(String, String)> {
 }
 
 // colors, numbers, lengths and translate transforms blend, anything else steps at the midpoint
-fn interpolate_value(from: &str, to: &str, progress: f32) -> Option<String> {
-    if let (Some(start), Some(end)) = (Color::parse(from), Color::parse(to)) {
-        let mixed = start.mix(end, progress);
-        return Some(format!(
-            "#{:02x}{:02x}{:02x}{:02x}",
-            mixed.red, mixed.green, mixed.blue, mixed.alpha
-        ));
-    }
-    if let (Ok(start), Ok(end)) = (from.trim().parse::<f32>(), to.trim().parse::<f32>()) {
-        return Some(format!("{}", start + (end - start) * progress));
-    }
-    if let (Some((start, start_unit)), Some((end, end_unit))) =
-        (split_length_unit(from.trim()), split_length_unit(to.trim()))
-        && start_unit == end_unit
-    {
-        return Some(format!("{}{start_unit}", start + (end - start) * progress));
-    }
-    if let (Some(start), Some(end)) = (
-        interpolate_translate_pair(from),
-        interpolate_translate_pair(to),
-    ) {
-        let x = start.0 + (end.0 - start.0) * progress;
-        let y = start.1 + (end.1 - start.1) * progress;
-        return Some(format!("translate({x}px, {y}px)"));
-    }
-    Some(if progress < 0.5 { from } else { to }.to_string())
-}
-
-fn interpolate_translate_pair(value: &str) -> Option<(f32, f32)> {
-    let (x, y) = parse_translate(value)?;
-    Some((x.resolve(100.0, 16.0)?, y.resolve(100.0, 16.0)?))
-}
-
 fn parse_keyframes(header: &str, body: &str) -> Option<Keyframes> {
     let name = header
         .get("@keyframes".len()..)?
@@ -2202,12 +2380,9 @@ fn parse_translate(value: &str) -> Option<(Length, Length)> {
     }
     let mut total = (Length::px(0.0), Length::px(0.0));
     let mut seen = false;
-    let mut rest = value;
-    while let Some(open) = rest.find('(') {
-        let name = rest[..open].trim().to_ascii_lowercase();
-        let close = rest[open..].find(')')? + open;
-        let arguments = &rest[open + 1..close];
-        let mut parts = arguments.split(',').map(str::trim);
+    for (name, arguments) in crate::transform::functions(value)? {
+        let name = name.to_ascii_lowercase();
+        let mut parts = arguments.into_iter();
         let first = parts.next().filter(|part| !part.is_empty())?;
         let second = parts.next();
         if parts.next().is_some() {
@@ -2226,7 +2401,6 @@ fn parse_translate(value: &str) -> Option<(Length, Length)> {
             total.1 = add_lengths(total.1, parse_length(y)?)?;
         }
         seen = true;
-        rest = rest[close + 1..].trim();
     }
     seen.then_some(total)
 }
@@ -2254,44 +2428,51 @@ fn parse_transitions(value: &str) -> [Option<Transition>; MAX_TRANSITIONS] {
     }
     let mut next = 0;
     for entry in split_top_level(value) {
-        let mut properties = Vec::new();
+        let mut property = None;
         let mut durations = Vec::new();
-        let mut timing = Timing::Ease;
-        for token in entry.split_ascii_whitespace() {
+        let mut timing = Timing::EASE;
+        for token in split_words(entry) {
             let lowered = token.to_ascii_lowercase();
             if let Some(duration) = parse_duration(&lowered) {
                 durations.push(duration);
-                continue;
-            }
-            match lowered.as_str() {
-                "linear" => timing = Timing::Linear,
-                "ease" | "ease-in" | "ease-out" | "ease-in-out" => timing = Timing::Ease,
-                "all" => properties.extend_from_slice(&AnimatableProperty::all()),
-                name => {
-                    if let Some(property) = AnimatableProperty::parse(name) {
-                        properties.push(property);
-                    }
-                }
+            } else if let Some(parsed) = parse_timing(&lowered) {
+                timing = parsed;
+            } else if let Some(parsed) = AnimatableProperty::parse(&lowered) {
+                property = Some(parsed);
             }
         }
+        // a missing property means all, as the shorthand's initial value does
+        let property = property.unwrap_or(AnimatableProperty::All);
         let Some(&duration) = durations.first() else {
             continue;
         };
-        let delay = durations.get(1).copied().unwrap_or(0);
-        for property in properties {
-            if next >= transitions.len() {
-                return transitions;
-            }
-            transitions[next] = Some(Transition {
-                property,
-                duration,
-                delay,
-                timing,
-            });
-            next += 1;
+        if next >= transitions.len() {
+            break;
         }
+        transitions[next] = Some(Transition {
+            property,
+            duration,
+            delay: durations.get(1).copied().unwrap_or(0),
+            timing,
+        });
+        next += 1;
     }
     transitions
+}
+
+pub(crate) fn animation_from(values: &BTreeMap<String, String>) -> Option<Animation> {
+    values
+        .get("animation")
+        .or_else(|| values.get("animation-name"))
+        .and_then(|value| parse_animation(value))
+}
+
+pub(crate) fn transitions_from(
+    values: &BTreeMap<String, String>,
+) -> [Option<Transition>; MAX_TRANSITIONS] {
+    values
+        .get("transition")
+        .map_or([None; MAX_TRANSITIONS], |value| parse_transitions(value))
 }
 
 fn parse_animation(value: &str) -> Option<Animation> {
@@ -2301,38 +2482,24 @@ fn parse_animation(value: &str) -> Option<Animation> {
     }
     let mut name = None;
     let mut durations = Vec::new();
-    let mut timing = Timing::Ease;
+    let mut timing = Timing::EASE;
     let mut iterations = Some(1.0);
     let mut alternate = false;
-    let mut tokens = value.split_ascii_whitespace().peekable();
-    while let Some(token) = tokens.next() {
+    for token in split_words(value) {
         let lowered = token.to_ascii_lowercase();
         if let Some(duration) = parse_duration(&lowered) {
             durations.push(duration);
             continue;
         }
+        if let Some(parsed) = parse_timing(&lowered) {
+            timing = parsed;
+            continue;
+        }
         match lowered.as_str() {
-            "linear" => timing = Timing::Linear,
-            "ease" | "ease-in" | "ease-out" | "ease-in-out" => timing = Timing::Ease,
             "infinite" => iterations = None,
-            "alternate" => alternate = true,
-            "normal" | "forwards" | "backwards" | "both" | "none" | "running" | "paused" => {}
-            other if other.starts_with("steps(") => {
-                let mut steps = other.to_string();
-                while !steps.contains(')') {
-                    let next = tokens.next()?;
-                    steps.push_str(next);
-                }
-                let inner = steps
-                    .trim_start_matches("steps(")
-                    .trim_end_matches(')')
-                    .split(',')
-                    .next()?
-                    .trim()
-                    .parse::<u32>()
-                    .ok()?;
-                timing = Timing::Steps(inner);
-            }
+            "alternate" | "alternate-reverse" => alternate = true,
+            "normal" | "reverse" | "forwards" | "backwards" | "both" | "none" | "running"
+            | "paused" => {}
             other => {
                 if let Ok(count) = other.parse::<f32>() {
                     iterations = Some(count.max(0.0));
@@ -3848,7 +4015,7 @@ mod tests {
                 .translate
         };
         assert_eq!(translate_at(250), (Length::px(20.0), Length::px(0.0)));
-        // a mixed-unit endpoint blends through the resolved pixel value
+        // percentages stay relative to the box and mixed units meet in calc()
         let stepped = Stylesheet::parse(
             "@keyframes drift { from { transform: translate(10%, 0px) } to { transform: translate(30%, 4em) } } .bar { animation: drift 1000ms linear infinite }",
         )
@@ -3867,7 +4034,7 @@ mod tests {
             },
         });
         let (x, y) = stepped.translate;
-        assert_eq!(x.resolve(200.0, 16.0), Some(20.0));
+        assert_eq!(x.resolve(200.0, 16.0), Some(40.0));
         assert_eq!(y.resolve(200.0, 16.0), Some(32.0));
 
         let transitioned = Stylesheet::parse(
@@ -3901,6 +4068,9 @@ mod tests {
                             to: "translateY(-24px)".to_string(),
                             started: 0,
                             finishes: 400,
+                            delay: 0,
+                            duration: 400,
+                            timing: Timing::Linear,
                         },
                     )]),
                     ..StyleState::default()
@@ -3910,6 +4080,63 @@ mod tests {
         let (x, y) = style_at(100, true).translate;
         assert_eq!(x.resolve(100.0, 16.0), Some(0.0));
         assert_eq!(y.resolve(100.0, 16.0), Some(-6.0));
+    }
+
+    #[test]
+    fn timing_functions_follow_their_curves_and_step_positions() {
+        let close = |left: f32, right: f32| (left - right).abs() < 1e-3;
+        assert!(
+            close(Timing::EASE.apply(0.5), 0.8024),
+            "{}",
+            Timing::EASE.apply(0.5)
+        );
+        assert!(close(parse_timing("ease-in-out").unwrap().apply(0.5), 0.5));
+        assert!(close(parse_timing("ease-in").unwrap().apply(0.25), 0.0935));
+        assert!(close(
+            parse_timing("cubic-bezier(0, 0, 1, 1)").unwrap().apply(0.3),
+            0.3
+        ));
+        // y values outside the unit range overshoot, as back-out curves do
+        assert!(
+            parse_timing("cubic-bezier(0.3, 1.5, 0.6, 1)")
+                .unwrap()
+                .apply(0.6)
+                > 1.0
+        );
+        assert!(parse_timing("cubic-bezier(1.5, 0, 0, 1)").is_none());
+        let steps = |value: &str, progress: f32| parse_timing(value).unwrap().apply(progress);
+        assert_eq!(steps("steps(4)", 0.3), 0.25);
+        assert_eq!(steps("steps(4, jump-start)", 0.3), 0.5);
+        assert_eq!(steps("steps(5, jump-none)", 0.3), 0.25);
+        assert_eq!(steps("steps(3, jump-both)", 0.0), 0.25);
+        assert_eq!(steps("step-end", 0.99), 0.0);
+        assert_eq!(steps("step-start", 0.01), 1.0);
+        assert!(parse_timing("steps(1, jump-none)").is_none());
+    }
+
+    #[test]
+    fn transition_all_is_one_entry_that_covers_every_property() {
+        let transitions = parse_transitions("all 200ms ease-out, opacity 1s 50ms steps(2)");
+        let first = transitions[0].expect("all");
+        assert_eq!(first.property, AnimatableProperty::All);
+        assert!(
+            first
+                .property
+                .expand()
+                .any(|property| property == AnimatableProperty::Transform)
+        );
+        assert!(first.property.expand().count() > 30);
+        let second = transitions[1].expect("opacity");
+        assert_eq!(
+            (second.property, second.duration, second.delay),
+            (AnimatableProperty::Opacity, 1000, 50)
+        );
+        assert_eq!(second.timing, Timing::Steps(2, StepPosition::End));
+        // a shorthand entry without a property name applies to all of them
+        assert_eq!(
+            parse_transitions("300ms")[0].expect("bare").property,
+            AnimatableProperty::All
+        );
     }
 
     #[test]
