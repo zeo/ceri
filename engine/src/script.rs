@@ -1,3 +1,10 @@
+#[cfg(test)]
+mod ast;
+#[cfg(test)]
+mod lexer;
+#[cfg(test)]
+mod parser;
+
 use crate::Color;
 use crate::css::StyleState;
 use crate::dom::{AccessibilityNode, Document, Element, Node, NodeId, NodePath, NormalizeChange};
