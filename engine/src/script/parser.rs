@@ -325,6 +325,7 @@ impl<'a> Parser<'a> {
             TokenKind::PrivateName(name) => format!("#{name}"),
             TokenKind::Punct(punct) => punct.to_string(),
             TokenKind::Number(value) => value.to_string(),
+            TokenKind::BigInt(digits) => format!("{digits}n"),
             TokenKind::String(_) => "a string".to_string(),
             TokenKind::Template { .. } => "a template".to_string(),
             TokenKind::Regex { .. } => "a regular expression".to_string(),
@@ -1642,6 +1643,10 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Expr::Number(value))
             }
+            TokenKind::BigInt(digits) => {
+                self.advance()?;
+                Ok(Expr::BigInt(digits))
+            }
             TokenKind::String(value) => {
                 self.advance()?;
                 Ok(Expr::String(value.into()))
@@ -1762,6 +1767,10 @@ impl<'a> Parser<'a> {
             TokenKind::Number(value) => {
                 self.advance()?;
                 Ok(PropertyKey::Static(number_key(value)))
+            }
+            TokenKind::BigInt(digits) => {
+                self.advance()?;
+                Ok(PropertyKey::Static(digits))
             }
             TokenKind::PrivateName(name) if allow_private => {
                 self.advance()?;

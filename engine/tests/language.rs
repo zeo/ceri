@@ -1562,3 +1562,65 @@ fn intl_formats_numbers_dates_and_plurals() {
         ),
     ]);
 }
+
+#[test]
+fn bigints_follow_the_specification() {
+    check(&[
+        (
+            "arithmetic",
+            "console.log(String(2n ** 64n), (10n / 3n) + '', String(-7n % 3n), String(123456789012345678901234567890n * 2n), typeof 1n)",
+            "18446744073709551616 3 -1 246913578024691357802469135780 bigint",
+        ),
+        (
+            "literals",
+            "console.log(String(0xffn), String(0b101n), String(0o17n), String(1_000n))",
+            "255 5 15 1000",
+        ),
+        (
+            "comparison",
+            "console.log(1n == 1, 1n === 1, 2n > 1, 1n < 1.5, 10n > '9', 0n == '', [3n, 1n, 2n].sort().join())",
+            "true false true true true true 1,2,3",
+        ),
+        (
+            "mixing throws",
+            "try { 1n + 1; } catch (e) { console.log(e.name); } try { Math.max(1n); } catch (e) { console.log(e.name); } try { +1n; } catch (e) { console.log(e.name); }",
+            "TypeError\nTypeError\nTypeError",
+        ),
+        (
+            "conversions",
+            "console.log(String(BigInt(42)), String(BigInt('0x10')), Number(2n ** 53n + 1n), `${10n}`, 5n + 'px', BigInt(true) + 0n)",
+            "42 16 9007199254740992 10 5px 1n",
+        ),
+        (
+            "conversion errors",
+            "try { BigInt(1.5); } catch (e) { console.log(e.name); } try { BigInt('x'); } catch (e) { console.log(e.name); } try { new BigInt(1); } catch (e) { console.log(e.name); }",
+            "RangeError\nSyntaxError\nTypeError",
+        ),
+        (
+            "bitwise",
+            "console.log(String(5n & 3n), String(-1n | 4n), String(~5n), String(1n << 70n), String(-9n >> 1n), String(BigInt.asIntN(8, 255n)), String(BigInt.asUintN(64, -1n)))",
+            "1 -1 -6 1180591620717411303424 -5 -1 18446744073709551615",
+        ),
+        (
+            "increment and negate",
+            "let x = 9007199254740993n; x++; x--; --x; console.log(String(x), String(-x))",
+            "9007199254740992 -9007199254740992",
+        ),
+        (
+            "methods",
+            "console.log((255n).toString(16), (-10n).toString(2), Object.prototype.toString.call(1n), (5n).valueOf() === 5n)",
+            "ff -1010 [object BigInt] true",
+        ),
+        (
+            "json",
+            "try { JSON.stringify({ n: 1n }); } catch (e) { console.log(e.name); } BigInt.prototype.toJSON = function () { return this.toString(); }; console.log(JSON.stringify({ n: 7n }))",
+            "TypeError\n{\"n\":\"7\"}",
+        ),
+        (
+            "collections and typed arrays",
+            "const m = new Map([[1n, 'a']]); const big = new BigInt64Array([-1n, 2n ** 63n]); const ubig = new BigUint64Array(1); ubig[0] = -1n; console.log(m.get(1n), String(big[0]), String(big[1]), String(ubig[0]), new DataView(big.buffer).getBigInt64(0, true) === -1n)",
+            "a -1 -9223372036854775808 18446744073709551615 true",
+        ),
+        ("console", "console.log(10n, [1n])", "10n [ 1n ]"),
+    ]);
+}

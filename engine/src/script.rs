@@ -1,5 +1,6 @@
 mod arrays;
 mod ast;
+mod bigint;
 mod collections;
 mod compiler;
 mod console;
@@ -122,6 +123,7 @@ enum Value {
     Number(f64),
     String(Rc<str>),
     Symbol(String),
+    BigInt(Rc<bigint::BigInt>),
     Binding(Rc<RefCell<Value>>, bool),
     Object(ObjectHandle),
     Array(ArrayHandle),
@@ -201,6 +203,7 @@ enum CloneValue {
     Set(Vec<CloneValue>),
     Bytes(Vec<u8>),
     TypedArray(typed::ElementKind, Vec<u8>),
+    BigInt(String),
     Blob {
         bytes: Vec<u8>,
         mime_type: String,
@@ -12845,6 +12848,7 @@ impl Value {
             Self::Bool(value) => value.to_string(),
             Self::Number(value) => number_to_string(*value),
             Self::String(value) => value.to_string(),
+            Self::BigInt(value) => value.to_string_radix(10),
             Self::Symbol(value) => {
                 format!("Symbol({})", symbol_description(value).unwrap_or_default())
             }
@@ -13175,6 +13179,7 @@ fn clone_value(
             result
         }
         Value::Symbol(_) => Err(data_clone_error("Symbol values cannot be cloned")),
+        Value::BigInt(value) => Ok(CloneValue::BigInt(value.to_string_radix(10))),
         _ => Err(data_clone_error("value is not cloneable")),
     }
 }
@@ -13221,6 +13226,10 @@ impl CloneValue {
                 Value::Object(new_object(JsObject::with_class(ObjectClass::Date(time))))
             }
             Self::Bytes(bytes) => Value::Bytes(Rc::new(RefCell::new(bytes))),
+            Self::BigInt(digits) => Value::BigInt(Rc::new(
+                bigint::BigInt::parse(&digits)
+                    .ok_or_else(|| data_clone_error("BigInt digits are invalid"))?,
+            )),
             Self::TypedArray(kind, bytes) => {
                 let end = bytes.len();
                 typed::new_typed(kind, Rc::new(RefCell::new(bytes)), 0, end)
@@ -13518,6 +13527,10 @@ fn write_clone_value(
                 write_clone_value(writer, value, depth + 1)?;
             }
         }
+        CloneValue::BigInt(digits) => {
+            writer.write_u8(17);
+            writer.write_string(digits, MAX_CLONE_STRING_BYTES, "structured clone BigInt")?;
+        }
         CloneValue::Date(time) => {
             writer.write_u8(15);
             writer.write_u64(time.to_bits());
@@ -13758,6 +13771,13 @@ fn read_clone_value(
             class_name: read_clone_string(reader, context, "structured clone Error class")?,
         }),
         15 => Ok(CloneValue::Date(f64::from_bits(reader.read_u64()?))),
+        17 => {
+            let digits = read_clone_string(reader, context, "structured clone BigInt")?;
+            if bigint::BigInt::parse(&digits).is_none() {
+                return Err(storage_invalid("structured clone BigInt is invalid"));
+            }
+            Ok(CloneValue::BigInt(digits))
+        }
         _ => Err(storage_invalid("structured clone type tag is invalid")),
     }
 }
@@ -16352,6 +16372,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Number(_) => "number",
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
+        Value::BigInt(_) => "bigint",
         Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
         Value::Builtin(_)
         | Value::ResponseConstructor
@@ -16797,6 +16818,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::BigInt(left), Value::BigInt(right)) => left == right,
         (Value::Binding(_, _), _) | (_, Value::Binding(_, _)) => {
             unreachable!("binding values resolve before comparison")
         }

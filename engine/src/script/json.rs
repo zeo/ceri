@@ -412,7 +412,7 @@ impl ScriptRuntime {
                 .unwrap_or(Value::Undefined),
             _ => self.get_property(holder, &key)?,
         };
-        if !is_primitive(&value) {
+        if !is_primitive(&value) || matches!(value, Value::BigInt(_)) {
             let to_json = self.get_property(&value, "toJSON")?;
             if is_callable(&to_json) {
                 value =
@@ -454,6 +454,9 @@ impl ScriptRuntime {
             Value::Number(number) if number.is_finite() => Some(number_to_string(number)),
             Value::Number(_) => Some("null".to_string()),
             Value::Undefined | Value::Symbol(_) | Value::Uninitialized => None,
+            Value::BigInt(_) => {
+                return Err(self.type_error("Do not know how to serialize a BigInt"));
+            }
             ref callable if is_callable(callable) => None,
             Value::Array(_) => Some(self.serialize_array(state, &value)?),
             _ => Some(self.serialize_object(state, &value)?),

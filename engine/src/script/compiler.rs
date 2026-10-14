@@ -15,6 +15,7 @@ pub(super) enum Op {
     True,
     False,
     Number(f64),
+    BigInt(u32),
     String(u32),
     Regex {
         pattern: u32,
@@ -2067,6 +2068,10 @@ impl Compiler {
         match expression {
             Expr::Number(value) => {
                 self.emit(Op::Number(*value));
+            }
+            Expr::BigInt(digits) => {
+                let index = self.name(digits);
+                self.emit(Op::BigInt(index));
             }
             Expr::String(value) => {
                 let index = self.name(value);

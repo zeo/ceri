@@ -54,6 +54,7 @@ pub(super) fn is_primitive(value: &Value) -> bool {
             | Value::Number(_)
             | Value::String(_)
             | Value::Symbol(_)
+            | Value::BigInt(_)
             | Value::Uninitialized
     )
 }
@@ -378,9 +379,162 @@ impl ScriptRuntime {
             Value::Bool(value) => Ok(if value { 1.0 } else { 0.0 }),
             Value::String(text) => Ok(string_to_number(&text)),
             Value::Symbol(_) => Err(self.type_error("Cannot convert a Symbol value to a number")),
+            Value::BigInt(_) => Err(self.type_error("Cannot convert a BigInt value to a number")),
             other => {
                 let primitive = self.coerce_primitive(other, Hint::Number)?;
                 self.coerce_number(primitive)
+            }
+        }
+    }
+
+    // ToNumeric: a Number or a BigInt
+    pub(super) fn coerce_numeric(&mut self, value: Value) -> Result<Value, ScriptError> {
+        match value {
+            Value::Number(_) | Value::BigInt(_) => Ok(value),
+            other => match self.coerce_primitive(other, Hint::Number)? {
+                Value::BigInt(value) => Ok(Value::BigInt(value)),
+                primitive => Ok(Value::Number(self.coerce_number(primitive)?)),
+            },
+        }
+    }
+
+    pub(super) fn negate_numeric(&mut self, value: Value) -> Result<Value, ScriptError> {
+        Ok(match self.coerce_numeric(value)? {
+            Value::BigInt(value) => Value::BigInt(Rc::new(value.negate())),
+            numeric => Value::Number(-self.coerce_number(numeric)?),
+        })
+    }
+
+    // ToBigInt
+    pub(super) fn coerce_bigint(
+        &mut self,
+        value: Value,
+    ) -> Result<Rc<super::bigint::BigInt>, ScriptError> {
+        match value {
+            Value::BigInt(value) => Ok(value),
+            Value::Bool(flag) => Ok(Rc::new(super::bigint::BigInt::from_i64(i64::from(flag)))),
+            Value::String(text) => {
+                match super::bigint::BigInt::parse(&text) {
+                    Some(value) => Ok(Rc::new(value)),
+                    None => Err(self
+                        .throw_error("SyntaxError", format!("Cannot convert {text} to a BigInt"))),
+                }
+            }
+            Value::Number(number) => Err(self.type_error(format!(
+                "Cannot convert {} to a BigInt",
+                number_to_string(number)
+            ))),
+            Value::Undefined | Value::Null | Value::Symbol(_) | Value::Uninitialized => Err(self
+                .type_error(format!(
+                    "Cannot convert {} to a BigInt",
+                    value.string_value()
+                ))),
+            other => {
+                let primitive = self.coerce_primitive(other, Hint::Number)?;
+                self.coerce_bigint(primitive)
+            }
+        }
+    }
+
+    fn bigint_binary(
+        &mut self,
+        operator: BinaryOperator,
+        left: &super::bigint::BigInt,
+        right: &super::bigint::BigInt,
+    ) -> Result<Value, ScriptError> {
+        use BinaryOperator as B;
+        let result = match operator {
+            B::Add => left.add(right),
+            B::Subtract => left.sub(right),
+            B::Multiply => left.mul(right),
+            B::Divide | B::Remainder => match left.divmod(right) {
+                Some((quotient, remainder)) => {
+                    if matches!(operator, B::Divide) {
+                        quotient
+                    } else {
+                        remainder
+                    }
+                }
+                None => return Err(self.range_error("Division by zero")),
+            },
+            B::Exponent => match left.pow(right) {
+                Some(value) => value,
+                None if right.is_negative() => {
+                    return Err(self.range_error("Exponent must be non-negative"));
+                }
+                None => return Err(self.range_error("Maximum BigInt size exceeded")),
+            },
+            B::BitAnd => left.bitwise(right, |a, b| a & b),
+            B::BitOr => left.bitwise(right, |a, b| a | b),
+            B::BitXor => left.bitwise(right, |a, b| a ^ b),
+            B::ShiftLeft | B::ShiftRight => {
+                let count: i64 =
+                    right
+                        .to_string_radix(10)
+                        .parse()
+                        .unwrap_or(if right.is_negative() {
+                            i64::MIN
+                        } else {
+                            i64::MAX
+                        });
+                let count = if matches!(operator, B::ShiftLeft) {
+                    count
+                } else {
+                    count.saturating_neg()
+                };
+                match left.shift(count) {
+                    Some(value) => value,
+                    None => return Err(self.range_error("Maximum BigInt size exceeded")),
+                }
+            }
+            B::ShiftRightUnsigned => {
+                return Err(self.type_error("BigInts have no unsigned right shift, use >> instead"));
+            }
+            _ => unreachable!("only arithmetic reaches here"),
+        };
+        Ok(Value::BigInt(Rc::new(result)))
+    }
+
+    // the numeric operators once both sides are numeric: BigInts only combine with BigInts
+    fn numeric_binary(
+        &mut self,
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+    ) -> Result<Value, ScriptError> {
+        use BinaryOperator as B;
+        let left = self.coerce_numeric(left)?;
+        let right = self.coerce_numeric(right)?;
+        match (&left, &right) {
+            (Value::BigInt(a), Value::BigInt(b)) => {
+                let (a, b) = (a.clone(), b.clone());
+                self.bigint_binary(operator, &a, &b)
+            }
+            (Value::BigInt(_), _) | (_, Value::BigInt(_)) => {
+                Err(self.type_error("Cannot mix BigInt and other types, use explicit conversions"))
+            }
+            _ => {
+                let a = self.coerce_number(left)?;
+                let b = self.coerce_number(right)?;
+                Ok(Value::Number(match operator {
+                    B::Add => a + b,
+                    B::Subtract => a - b,
+                    B::Multiply => a * b,
+                    B::Divide => a / b,
+                    B::Remainder => a % b,
+                    B::Exponent => power(a, b),
+                    B::ShiftLeft => {
+                        f64::from(to_int32_number(a).wrapping_shl(to_uint32_number(b) & 31))
+                    }
+                    B::ShiftRight => f64::from(to_int32_number(a) >> (to_uint32_number(b) & 31)),
+                    B::ShiftRightUnsigned => {
+                        f64::from(to_uint32_number(a) >> (to_uint32_number(b) & 31))
+                    }
+                    B::BitAnd => f64::from(to_int32_number(a) & to_int32_number(b)),
+                    B::BitOr => f64::from(to_int32_number(a) | to_int32_number(b)),
+                    B::BitXor => f64::from(to_int32_number(a) ^ to_int32_number(b)),
+                    _ => unreachable!("only arithmetic reaches here"),
+                }))
             }
         }
     }
@@ -393,6 +547,7 @@ impl ScriptRuntime {
             Value::Null => Ok("null".to_string()),
             Value::Bool(value) => Ok(value.to_string()),
             Value::Symbol(_) => Err(self.type_error("Cannot convert a Symbol value to a string")),
+            Value::BigInt(value) => Ok(value.to_string_radix(10)),
             other => {
                 let primitive = self.coerce_primitive(other, Hint::String)?;
                 self.coerce_string(primitive)
@@ -445,6 +600,10 @@ impl ScriptRuntime {
                 self.intrinsics.symbol_prototype.clone(),
                 ObjectClass::Symbol(value.clone()),
             ),
+            Value::BigInt(value) => (
+                self.intrinsics.bigint_prototype.clone(),
+                ObjectClass::BigInt(value.clone()),
+            ),
             _ => return Ok(value),
         };
         Ok(Value::Object(new_object(JsObject::with_prototype(
@@ -494,42 +653,20 @@ impl ScriptRuntime {
                     text.push_str(&self.coerce_string(right)?);
                     Value::String(text.into())
                 } else {
-                    Value::Number(self.coerce_number(left)? + self.coerce_number(right)?)
+                    self.numeric_binary(operator, left, right)?
                 }
             }
-            B::Subtract => Value::Number(self.coerce_number(left)? - self.coerce_number(right)?),
-            B::Multiply => Value::Number(self.coerce_number(left)? * self.coerce_number(right)?),
-            B::Divide => Value::Number(self.coerce_number(left)? / self.coerce_number(right)?),
-            B::Remainder => Value::Number(self.coerce_number(left)? % self.coerce_number(right)?),
-            B::Exponent => {
-                let base = self.coerce_number(left)?;
-                let exponent = self.coerce_number(right)?;
-                Value::Number(power(base, exponent))
-            }
-            B::ShiftLeft => {
-                let left = self.coerce_int32(left)?;
-                let right = self.coerce_uint32(right)?;
-                Value::Number(f64::from(left.wrapping_shl(right & 31)))
-            }
-            B::ShiftRight => {
-                let left = self.coerce_int32(left)?;
-                let right = self.coerce_uint32(right)?;
-                Value::Number(f64::from(left >> (right & 31)))
-            }
-            B::ShiftRightUnsigned => {
-                let left = self.coerce_uint32(left)?;
-                let right = self.coerce_uint32(right)?;
-                Value::Number(f64::from(left >> (right & 31)))
-            }
-            B::BitAnd => Value::Number(f64::from(
-                self.coerce_int32(left)? & self.coerce_int32(right)?,
-            )),
-            B::BitOr => Value::Number(f64::from(
-                self.coerce_int32(left)? | self.coerce_int32(right)?,
-            )),
-            B::BitXor => Value::Number(f64::from(
-                self.coerce_int32(left)? ^ self.coerce_int32(right)?,
-            )),
+            B::Subtract
+            | B::Multiply
+            | B::Divide
+            | B::Remainder
+            | B::Exponent
+            | B::ShiftLeft
+            | B::ShiftRight
+            | B::ShiftRightUnsigned
+            | B::BitAnd
+            | B::BitOr
+            | B::BitXor => self.numeric_binary(operator, left, right)?,
             B::StrictEqual => Value::Bool(strict_equals(&left, &right)),
             B::StrictNotEqual => Value::Bool(!strict_equals(&left, &right)),
             B::Equal => Value::Bool(self.loose_equals(left, right)?),
@@ -570,6 +707,38 @@ impl ScriptRuntime {
         if let (Value::String(left), Value::String(right)) = (&left, &right) {
             return Ok(Some(left.encode_utf16().lt(right.encode_utf16())));
         }
+        let bigint_of = |value: &Value| -> Option<Option<super::bigint::BigInt>> {
+            match value {
+                Value::BigInt(value) => Some(Some((**value).clone())),
+                Value::String(text) => Some(super::bigint::BigInt::parse(text)),
+                _ => None,
+            }
+        };
+        match (&left, &right) {
+            (Value::BigInt(_), Value::String(_))
+            | (Value::String(_), Value::BigInt(_))
+            | (Value::BigInt(_), Value::BigInt(_)) => {
+                return Ok(
+                    match (bigint_of(&left).flatten(), bigint_of(&right).flatten()) {
+                        (Some(a), Some(b)) => Some(a.compare(&b) == std::cmp::Ordering::Less),
+                        _ => None,
+                    },
+                );
+            }
+            (Value::BigInt(a), _) => {
+                let b = self.coerce_number(right.clone())?;
+                return Ok(a
+                    .compare_f64(b)
+                    .map(|order| order == std::cmp::Ordering::Less));
+            }
+            (_, Value::BigInt(b)) => {
+                let a = self.coerce_number(left.clone())?;
+                return Ok(b
+                    .compare_f64(a)
+                    .map(|order| order == std::cmp::Ordering::Greater));
+            }
+            _ => {}
+        }
         let left = self.coerce_number(left)?;
         let right = self.coerce_number(right)?;
         if left.is_nan() || right.is_nan() {
@@ -584,6 +753,12 @@ impl ScriptRuntime {
         Ok(match (&left, &right) {
             (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => true,
             (Value::Undefined | Value::Null, _) | (_, Value::Undefined | Value::Null) => false,
+            (Value::BigInt(a), Value::Number(b)) | (Value::Number(b), Value::BigInt(a)) => {
+                a.compare_f64(*b) == Some(std::cmp::Ordering::Equal)
+            }
+            (Value::BigInt(a), Value::String(text)) | (Value::String(text), Value::BigInt(a)) => {
+                super::bigint::BigInt::parse(text).is_some_and(|b| **a == b)
+            }
             (Value::Number(_), Value::String(text)) => {
                 strict_equals(&left, &Value::Number(string_to_number(text)))
             }
@@ -698,6 +873,7 @@ impl ScriptRuntime {
             Value::Number(_) => intrinsics.number_prototype.clone(),
             Value::String(_) => intrinsics.string_prototype.clone(),
             Value::Symbol(_) => intrinsics.symbol_prototype.clone(),
+            Value::BigInt(_) => intrinsics.bigint_prototype.clone(),
             Value::Array(_) => intrinsics.array_prototype.clone(),
             Value::Error(error) => self.error_prototype(&error.name),
             Value::Promise(_) => intrinsics.promise_prototype.clone(),
@@ -740,7 +916,7 @@ impl ScriptRuntime {
                 }
                 self.host_get(value, key)
             }
-            Value::Bool(_) | Value::Number(_) | Value::Symbol(_) => {
+            Value::Bool(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_) => {
                 if let Value::Symbol(symbol) = value
                     && key == "description"
                 {
@@ -848,7 +1024,11 @@ impl ScriptRuntime {
                 self.set_property(&inner, key, value, strict)
             }
             Value::Window => self.window_set(key, value),
-            Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Symbol(_) => {
+            Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Symbol(_)
+            | Value::BigInt(_) => {
                 if strict {
                     return Err(self.type_error(format!(
                         "Cannot create property '{}' on {} '{}'",
@@ -1043,7 +1223,7 @@ impl ScriptRuntime {
                 Value::TypedArray(array) => {
                     if number >= 0.0 && number.fract() == 0.0 {
                         let value = super::typed::read_element(&array.borrow(), number as usize);
-                        return Ok(value.map_or(Value::Undefined, Value::Number));
+                        return Ok(value.unwrap_or(Value::Undefined));
                     }
                 }
                 _ => {}

@@ -18,6 +18,7 @@ pub(super) enum KeyId {
     Number(u64),
     String(Rc<str>),
     Symbol(String),
+    BigInt(Rc<super::bigint::BigInt>),
     Node(usize),
     Address(usize),
 }
@@ -39,6 +40,7 @@ pub(super) fn key_id(value: &Value) -> KeyId {
         }
         Value::String(text) => KeyId::String(text.clone()),
         Value::Symbol(key) => KeyId::Symbol(key.clone()),
+        Value::BigInt(value) => KeyId::BigInt(value.clone()),
         Value::Binding(cell, _) => key_id(&cell.borrow()),
         Value::Element(handle)
         | Value::Style(handle)

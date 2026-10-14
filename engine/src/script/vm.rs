@@ -940,6 +940,11 @@ impl ScriptRuntime {
             Op::True => frame.stack.push(Value::Bool(true)),
             Op::False => frame.stack.push(Value::Bool(false)),
             Op::Number(value) => frame.stack.push(Value::Number(value)),
+            Op::BigInt(index) => {
+                let value = super::bigint::BigInt::parse(&frame.code.names[index as usize])
+                    .expect("the lexer produced decimal digits");
+                frame.stack.push(Value::BigInt(Rc::new(value)));
+            }
             Op::String(index) => {
                 let text = frame.code.names[index as usize].to_string();
                 frame.stack.push(Value::String(text.into()));
@@ -1609,14 +1614,10 @@ impl ScriptRuntime {
             }
             Op::Negate => {
                 let value = Self::pop(frame);
-                let number = self.coerce_number(value)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Number(-number));
+                let result = self.negate_numeric(value)?;
+                frames.last_mut().expect("frame").stack.push(result);
             }
-            Op::Plus | Op::ToNumeric => {
+            Op::Plus => {
                 let value = Self::pop(frame);
                 let number = self.coerce_number(value)?;
                 frames
@@ -1625,18 +1626,24 @@ impl ScriptRuntime {
                     .stack
                     .push(Value::Number(number));
             }
+            Op::ToNumeric => {
+                let value = Self::pop(frame);
+                let numeric = self.coerce_numeric(value)?;
+                frames.last_mut().expect("frame").stack.push(numeric);
+            }
             Op::Not => {
                 let value = Self::pop(frame);
                 frame.stack.push(Value::Bool(!value.truthy()));
             }
             Op::BitNot => {
                 let value = Self::pop(frame);
-                let number = self.coerce_int32(value)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Number(f64::from(!number)));
+                let result = match self.coerce_numeric(value)? {
+                    Value::BigInt(value) => Value::BigInt(Rc::new(value.not())),
+                    other => Value::Number(f64::from(!super::operations::to_int32_number(
+                        self.coerce_number(other)?,
+                    ))),
+                };
+                frames.last_mut().expect("frame").stack.push(result);
             }
             Op::TypeOf => {
                 let value = Self::pop(frame);
@@ -1658,20 +1665,17 @@ impl ScriptRuntime {
             }
             Op::Increment | Op::Decrement => {
                 let value = Self::pop(frame);
-                let number = match value {
-                    Value::Number(number) => number,
-                    other => self.coerce_number(other)?,
+                let delta = if matches!(op, Op::Increment) { 1 } else { -1 };
+                let result = match value {
+                    Value::Number(number) => Value::Number(number + f64::from(delta)),
+                    other => match self.coerce_numeric(other)? {
+                        Value::BigInt(value) => Value::BigInt(Rc::new(
+                            value.add(&super::bigint::BigInt::from_i64(i64::from(delta))),
+                        )),
+                        numeric => Value::Number(self.coerce_number(numeric)? + f64::from(delta)),
+                    },
                 };
-                let step = if matches!(op, Op::Increment) {
-                    1.0
-                } else {
-                    -1.0
-                };
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Number(number + step));
+                frames.last_mut().expect("frame").stack.push(result);
             }
             Op::TemplateConcat(count) => {
                 let parts = Self::pop_arguments(frame, count as usize);

@@ -113,6 +113,10 @@ pub(super) enum Native {
     // ascending numeric order, the default sort of typed arrays
     NumericCompare,
     Codec(super::encoding::CodecMethod),
+    BigIntCall,
+    BigIntAsN(bool),
+    BigIntToString,
+    BigIntValueOf,
     Intl(Rc<super::intl::IntlMethod>),
 }
 
@@ -188,6 +192,7 @@ pub(super) struct Intrinsics {
     pub(super) array_buffer_prototype: ObjectHandle,
     pub(super) data_view_prototype: ObjectHandle,
     pub(super) text_encoder_prototype: ObjectHandle,
+    pub(super) bigint_prototype: ObjectHandle,
     pub(super) text_decoder_prototype: ObjectHandle,
     // NumberFormat, DateTimeFormat, Collator, PluralRules and RelativeTimeFormat
     pub(super) intl_prototypes: Vec<ObjectHandle>,
@@ -976,6 +981,25 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     );
     globals.push(("DataView", Value::Object(data_view)));
 
+    let bigint_prototype = plain(&object_prototype);
+    build.method(&bigint_prototype, "toString", Native::BigIntToString, 0);
+    build.method(
+        &bigint_prototype,
+        "toLocaleString",
+        Native::BigIntToString,
+        0,
+    );
+    build.method(&bigint_prototype, "valueOf", Native::BigIntValueOf, 0);
+    build.value(
+        &bigint_prototype,
+        "@@toStringTag",
+        Value::String("BigInt".into()),
+    );
+    let bigint = build.constructor(Native::BigIntCall, "BigInt", 1, &bigint_prototype);
+    build.method(&bigint, "asIntN", Native::BigIntAsN(true), 2);
+    build.method(&bigint, "asUintN", Native::BigIntAsN(false), 2);
+    globals.push(("BigInt", Value::Object(bigint)));
+
     use super::encoding::CodecMethod as E;
     let text_encoder_prototype = plain(&object_prototype);
     build.method(
@@ -1154,6 +1178,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         data_view_prototype,
         text_encoder_prototype,
         text_decoder_prototype,
+        bigint_prototype,
         intl_prototypes,
     };
     (intrinsics, globals)
@@ -1993,7 +2018,10 @@ impl ScriptRuntime {
             Native::NumberConstructor => Ok(Value::Number(if arguments.is_empty() {
                 0.0
             } else {
-                self.coerce_number(first)?
+                match self.coerce_numeric(first)? {
+                    Value::BigInt(value) => value.to_f64(),
+                    numeric => self.coerce_number(numeric)?,
+                }
             })),
             Native::NumberToString => {
                 let number = self.this_number(&this, "toString")?;
@@ -2228,8 +2256,69 @@ impl ScriptRuntime {
             Native::Date(method) => self.call_date(method, this, arguments, None),
             Native::Typed(method) => self.call_typed(method, this, arguments, None),
             Native::Codec(method) => self.call_codec(method, this, arguments, None),
+            Native::BigIntCall => {
+                let primitive = self.coerce_primitive(first, super::operations::Hint::Number)?;
+                match primitive {
+                    Value::Number(number) => match super::bigint::BigInt::from_f64(number) {
+                        Some(value) => Ok(Value::BigInt(Rc::new(value))),
+                        None => Err(self.range_error(format!(
+                            "The number {} cannot be converted to a BigInt because it is not an integer",
+                            number_to_string(number)
+                        ))),
+                    },
+                    other => Ok(Value::BigInt(self.coerce_bigint(other)?)),
+                }
+            }
+            Native::BigIntAsN(signed) => {
+                let bits = self.coerce_number(first)?;
+                let bits = if bits.is_nan() { 0.0 } else { bits.trunc() };
+                if !(0.0..=9_007_199_254_740_991.0).contains(&bits) {
+                    return Err(
+                        self.range_error("Invalid value: not (convertible to) a safe integer")
+                    );
+                }
+                let value = self.coerce_bigint(argument(&arguments, 1))?;
+                Ok(Value::BigInt(Rc::new(
+                    value.as_bits(bits.min(1_048_576.0) as usize, signed),
+                )))
+            }
+            Native::BigIntToString | Native::BigIntValueOf => {
+                let value = match &this {
+                    Value::BigInt(value) => Some(value.clone()),
+                    Value::Object(object) => match &object.borrow().class {
+                        ObjectClass::BigInt(value) => Some(value.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(value) = value else {
+                    return Err(
+                        self.type_error("BigInt.prototype method requires that 'this' be a BigInt")
+                    );
+                };
+                if matches!(native, Native::BigIntValueOf) {
+                    return Ok(Value::BigInt(value));
+                }
+                let radix = match first {
+                    Value::Undefined => 10.0,
+                    radix => self.coerce_number(radix)?.trunc(),
+                };
+                if !(2.0..=36.0).contains(&radix) {
+                    return Err(self.range_error("toString() radix must be between 2 and 36"));
+                }
+                Ok(Value::String(value.to_string_radix(radix as u32).into()))
+            }
             Native::Intl(method) => self.call_intl((*method).clone(), this, arguments),
             Native::NumericCompare => {
+                if let (Value::BigInt(left), Value::BigInt(right)) =
+                    (&first, &argument(&arguments, 1))
+                {
+                    return Ok(Value::Number(match left.compare(right) {
+                        std::cmp::Ordering::Less => -1.0,
+                        std::cmp::Ordering::Equal => 0.0,
+                        std::cmp::Ordering::Greater => 1.0,
+                    }));
+                }
                 let left = self.coerce_number(first)?;
                 let right = self.coerce_number(argument(&arguments, 1))?;
                 Ok(Value::Number(match (left.is_nan(), right.is_nan()) {
@@ -2451,11 +2540,8 @@ impl ScriptRuntime {
                 "Object"
             }
         };
-        let tag = if is_primitive(this) {
-            Value::Undefined
-        } else {
-            self.get_property(this, "@@toStringTag")?
-        };
+        // primitives read the tag through their prototype, as ToObject would
+        let tag = self.get_property(this, "@@toStringTag")?;
         Ok(match tag {
             Value::String(tag) => format!("[object {tag}]"),
             _ => format!("[object {builtin}]"),

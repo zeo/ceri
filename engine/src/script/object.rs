@@ -67,6 +67,7 @@ pub(super) enum ObjectClass {
     Number(f64),
     String(String),
     Symbol(String),
+    BigInt(Rc<super::bigint::BigInt>),
     Error,
     Generator(Rc<RefCell<super::vm::GeneratorState>>),
     AsyncGenerator(Rc<RefCell<super::vm::AsyncGeneratorData>>),

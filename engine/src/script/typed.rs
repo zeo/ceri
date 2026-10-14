@@ -17,6 +17,8 @@ pub(super) enum ElementKind {
     Uint32,
     Float32,
     Float64,
+    BigInt64,
+    BigUint64,
 }
 
 pub(super) const ELEMENT_KINDS: &[(ElementKind, &str)] = &[
@@ -29,6 +31,8 @@ pub(super) const ELEMENT_KINDS: &[(ElementKind, &str)] = &[
     (ElementKind::Uint32, "Uint32Array"),
     (ElementKind::Float32, "Float32Array"),
     (ElementKind::Float64, "Float64Array"),
+    (ElementKind::BigInt64, "BigInt64Array"),
+    (ElementKind::BigUint64, "BigUint64Array"),
 ];
 
 impl ElementKind {
@@ -37,7 +41,7 @@ impl ElementKind {
             ElementKind::Int8 | ElementKind::Uint8 | ElementKind::Uint8Clamped => 1,
             ElementKind::Int16 | ElementKind::Uint16 => 2,
             ElementKind::Int32 | ElementKind::Uint32 | ElementKind::Float32 => 4,
-            ElementKind::Float64 => 8,
+            ElementKind::Float64 | ElementKind::BigInt64 | ElementKind::BigUint64 => 8,
         }
     }
 
@@ -46,6 +50,35 @@ impl ElementKind {
             .iter()
             .find(|(kind, _)| *kind == self)
             .map_or("TypedArray", |(_, name)| name)
+    }
+
+    pub(super) fn is_bigint(self) -> bool {
+        matches!(self, ElementKind::BigInt64 | ElementKind::BigUint64)
+    }
+
+    // an element as a script value: a Number, or a BigInt for the 64-bit integer kinds
+    pub(super) fn read_value(self, bytes: &[u8]) -> Value {
+        let word = || u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+        match self {
+            ElementKind::BigInt64 => {
+                Value::BigInt(Rc::new(super::bigint::BigInt::from_i64(word() as i64)))
+            }
+            ElementKind::BigUint64 => {
+                Value::BigInt(Rc::new(super::bigint::BigInt::from_u64(word())))
+            }
+            numeric => Value::Number(numeric.read(bytes)),
+        }
+    }
+
+    // the bytes for a value already converted to a Number or, for the 64-bit kinds, a BigInt
+    pub(super) fn encode_value(self, value: &Value) -> Vec<u8> {
+        match (self, value) {
+            (ElementKind::BigInt64 | ElementKind::BigUint64, Value::BigInt(value)) => {
+                value.to_u64().to_le_bytes().to_vec()
+            }
+            (kind, Value::Number(number)) => kind.encode(*number),
+            (kind, _) => vec![0; kind.size()],
+        }
     }
 
     pub(super) fn read(self, bytes: &[u8]) -> f64 {
@@ -64,6 +97,12 @@ impl ElementKind {
                 bytes[..4].try_into().expect("four bytes"),
             )),
             ElementKind::Float64 => f64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")),
+            ElementKind::BigInt64 => {
+                i64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")) as f64
+            }
+            ElementKind::BigUint64 => {
+                u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")) as f64
+            }
         }
     }
 
@@ -102,6 +141,9 @@ impl ElementKind {
             }
             ElementKind::Float32 => (number as f32).to_le_bytes().to_vec(),
             ElementKind::Float64 => number.to_le_bytes().to_vec(),
+            ElementKind::BigInt64 | ElementKind::BigUint64 => {
+                (number as i64).to_le_bytes().to_vec()
+            }
         }
     }
 }
@@ -110,7 +152,7 @@ pub(super) fn element_count(array: &TypedArrayData) -> usize {
     (array.end - array.start) / array.kind.size()
 }
 
-pub(super) fn read_element(array: &TypedArrayData, index: usize) -> Option<f64> {
+pub(super) fn read_element(array: &TypedArrayData, index: usize) -> Option<Value> {
     if index >= element_count(array) {
         return None;
     }
@@ -119,16 +161,16 @@ pub(super) fn read_element(array: &TypedArrayData, index: usize) -> Option<f64> 
     let buffer = array.buffer.borrow();
     buffer
         .get(offset..offset + size)
-        .map(|bytes| array.kind.read(bytes))
+        .map(|bytes| array.kind.read_value(bytes))
 }
 
-pub(super) fn write_element(array: &TypedArrayData, index: usize, number: f64) {
+pub(super) fn write_element(array: &TypedArrayData, index: usize, value: &Value) {
     if index >= element_count(array) {
         return;
     }
     let size = array.kind.size();
     let offset = array.start + index * size;
-    let bytes = array.kind.encode(number);
+    let bytes = array.kind.encode_value(value);
     if let Some(slot) = array.buffer.borrow_mut().get_mut(offset..offset + size) {
         slot.copy_from_slice(&bytes);
     }
@@ -137,7 +179,6 @@ pub(super) fn write_element(array: &TypedArrayData, index: usize, number: f64) {
 pub(super) fn elements(array: &TypedArrayData) -> Vec<Value> {
     (0..element_count(array))
         .filter_map(|index| read_element(array, index))
-        .map(Value::Number)
         .collect()
 }
 
@@ -250,6 +291,8 @@ pub(super) const VIEW_ACCESSORS: &[(&str, ElementKind)] = &[
     ("Uint32", ElementKind::Uint32),
     ("Float32", ElementKind::Float32),
     ("Float64", ElementKind::Float64),
+    ("BigInt64", ElementKind::BigInt64),
+    ("BigUint64", ElementKind::BigUint64),
 ];
 
 fn argument(arguments: &[Value], index: usize) -> Value {
@@ -308,15 +351,28 @@ impl ScriptRuntime {
             kind,
         };
         for (index, value) in values.into_iter().enumerate() {
-            let number = self.coerce_number(value)?;
-            write_element(&array, index, number);
+            let converted = self.typed_element_value(kind, value)?;
+            write_element(&array, index, &converted);
         }
         Ok(Value::TypedArray(Rc::new(RefCell::new(array))))
     }
 
+    // ToNumber, or ToBigInt for the 64-bit integer kinds
+    fn typed_element_value(
+        &mut self,
+        kind: ElementKind,
+        value: Value,
+    ) -> Result<Value, ScriptError> {
+        Ok(if kind.is_bigint() {
+            Value::BigInt(self.coerce_bigint(value)?)
+        } else {
+            Value::Number(self.coerce_number(value)?)
+        })
+    }
+
     pub(super) fn typed_get(&self, array: &TypedArrayHandle, key: &str) -> Option<Value> {
         let index = super::object::array_index(key)?;
-        Some(read_element(&array.borrow(), index as usize).map_or(Value::Undefined, Value::Number))
+        Some(read_element(&array.borrow(), index as usize).unwrap_or(Value::Undefined))
     }
 
     pub(super) fn typed_set(
@@ -325,8 +381,9 @@ impl ScriptRuntime {
         index: usize,
         value: Value,
     ) -> Result<(), ScriptError> {
-        let number = self.coerce_number(value)?;
-        write_element(&array.borrow(), index, number);
+        let kind = array.borrow().kind;
+        let converted = self.typed_element_value(kind, value)?;
+        write_element(&array.borrow(), index, &converted);
         Ok(())
     }
 
@@ -659,10 +716,11 @@ impl ScriptRuntime {
                             if !little {
                                 bytes.reverse();
                             }
-                            Ok(Value::Number(kind.read(&bytes)))
+                            Ok(kind.read_value(&bytes))
                         } else {
-                            let number = self.coerce_number(argument(&arguments, 1))?;
-                            let mut bytes = kind.encode(number);
+                            let converted =
+                                self.typed_element_value(kind, argument(&arguments, 1))?;
+                            let mut bytes = kind.encode_value(&converted);
                             if !little {
                                 bytes.reverse();
                             }

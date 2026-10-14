@@ -104,6 +104,7 @@ impl ScriptRuntime {
             Value::Symbol(key) => {
                 format!("Symbol({})", symbol_description(key).unwrap_or_default())
             }
+            Value::BigInt(value) => format!("{}n", value.to_string_radix(10)),
             value if is_primitive(value) => value.string_value(),
             Value::Binding(cell, _) => {
                 let inner = cell.borrow().clone();

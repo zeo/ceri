@@ -222,6 +222,7 @@ pub(super) enum Argument {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Expr {
     Number(f64),
+    BigInt(Name),
     String(Name),
     Bool(bool),
     Null,

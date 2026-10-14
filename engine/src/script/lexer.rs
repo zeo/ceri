@@ -2,6 +2,7 @@
 // expression and when a closing brace continues a template, so both are rescanned on request
 
 use super::ScriptError;
+use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TokenKind {
@@ -12,6 +13,8 @@ pub(super) enum TokenKind {
     PrivateName(String),
     Punct(&'static str),
     Number(f64),
+    // a BigInt literal, as its decimal digits
+    BigInt(Rc<str>),
     String(String),
     // cooked text is None when a tagged template holds an invalid escape
     Template {
@@ -173,7 +176,7 @@ impl<'a> Lexer<'a> {
                     .peek_char_at(1)
                     .is_some_and(|next| next.is_ascii_digit())
         {
-            TokenKind::Number(self.scan_number()?)
+            self.scan_number()?
         } else if character == '"' || character == '\'' {
             TokenKind::String(self.scan_string(character)?)
         } else if character == '`' {
@@ -364,7 +367,7 @@ impl<'a> Lexer<'a> {
         Ok(digits)
     }
 
-    fn scan_number(&mut self) -> Result<f64, ScriptError> {
+    fn scan_number(&mut self) -> Result<TokenKind, ScriptError> {
         let start = self.position;
         let prefix = self.source[self.position..]
             .get(..2)
@@ -375,12 +378,14 @@ impl<'a> Lexer<'a> {
             Some("0b") => Some(2),
             _ => None,
         };
+        let mut integer_digits: Option<(String, u32)> = None;
         let value = if let Some(radix) = radix {
             self.position += 2;
             let digits = self.scan_digits(radix, start)?;
             if digits.is_empty() {
                 return Err(self.error(start, "missing digits after a radix prefix"));
             }
+            integer_digits = Some((digits.clone(), radix));
             digits.chars().fold(0.0_f64, |value, digit| {
                 value * f64::from(radix) + f64::from(digit.to_digit(radix).expect("digit"))
             })
@@ -401,6 +406,9 @@ impl<'a> Lexer<'a> {
             }
         } else {
             let mut text = self.scan_digits(10, start)?;
+            if !matches!(self.peek_char(), Some('.' | 'e' | 'E')) {
+                integer_digits = Some((text.clone(), 10));
+            }
             if self.peek_char() == Some('.') {
                 self.bump();
                 text.push('.');
@@ -428,14 +436,22 @@ impl<'a> Lexer<'a> {
             text.parse::<f64>()
                 .map_err(|_| self.error(start, "invalid number"))?
         };
-        // BigInt literals read as numbers, which is exact up to 2^53
         if self.peek_char() == Some('n') {
+            let Some((digits, radix)) = integer_digits else {
+                return Err(self.error(start, "invalid BigInt literal"));
+            };
             self.bump();
+            if self.peek_char().is_some_and(is_identifier_start) {
+                return Err(self.error(start, "identifier starts right after a number"));
+            }
+            let value = super::bigint::BigInt::parse_radix(&digits, radix)
+                .ok_or_else(|| self.error(start, "invalid BigInt literal"))?;
+            return Ok(TokenKind::BigInt(value.to_string_radix(10).into()));
         }
         if self.peek_char().is_some_and(is_identifier_start) {
             return Err(self.error(start, "identifier starts right after a number"));
         }
-        Ok(value)
+        Ok(TokenKind::Number(value))
     }
 
     // the escape after a backslash; None for a line continuation, Err for a bad escape
@@ -617,13 +633,18 @@ mod tests {
     #[test]
     fn numbers_cover_every_literal_form() {
         assert_eq!(
-            kinds("0x1F 0o17 0b101 1_000 .5 2e3 1.5E-2 017 019 10n"),
-            [
-                31.0, 15.0, 5.0, 1000.0, 0.5, 2000.0, 0.015, 15.0, 19.0, 10.0
-            ]
-            .map(TokenKind::Number)
-            .to_vec()
+            kinds("0x1F 0o17 0b101 1_000 .5 2e3 1.5E-2 017 019"),
+            [31.0, 15.0, 5.0, 1000.0, 0.5, 2000.0, 0.015, 15.0, 19.0]
+                .map(TokenKind::Number)
+                .to_vec()
         );
+        assert_eq!(
+            kinds("10n 0xffn 0b11n"),
+            ["10", "255", "3"]
+                .map(|digits| TokenKind::BigInt(digits.into()))
+                .to_vec()
+        );
+        assert!(Lexer::new("1.5n").next_token().is_err());
         assert!(Lexer::new("1__0").next_token().is_err());
         assert!(Lexer::new("3in").next_token().is_err());
     }
