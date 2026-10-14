@@ -716,14 +716,12 @@ impl ScriptRuntime {
             Value::Window => self.window_get(key),
             Value::String(text) => {
                 if key == "length" {
-                    return Ok(Value::Number(text.chars().count() as f64));
+                    return Ok(Value::Number(super::strings::utf16_length(text) as f64));
                 }
                 if let Some(index) = array_index(key) {
-                    return Ok(text
-                        .chars()
-                        .nth(index as usize)
-                        .map(|character| Value::String(character.to_string().into()))
-                        .unwrap_or(Value::Undefined));
+                    return Ok(
+                        super::strings::unit_at(text, index as usize).unwrap_or(Value::Undefined)
+                    );
                 }
                 self.host_get(value, key)
             }
@@ -1269,7 +1267,8 @@ impl ScriptRuntime {
                         })
                         .collect();
                     if let ObjectClass::String(text) = &borrowed.class {
-                        let indices = (0..text.chars().count()).map(|index| index.to_string());
+                        let indices =
+                            (0..super::strings::utf16_length(text)).map(|index| index.to_string());
                         keys.splice(0..0, indices);
                     }
                     keys
@@ -1300,7 +1299,7 @@ impl ScriptRuntime {
                 while let Some(object) = current {
                     let borrowed = object.borrow();
                     if let ObjectClass::String(text) = &borrowed.class {
-                        for index in 0..text.chars().count() {
+                        for index in 0..super::strings::utf16_length(text) {
                             let key = index.to_string();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
@@ -1407,45 +1406,6 @@ impl ScriptRuntime {
         self.template_cache
             .insert(key, (code.clone(), strings.clone()));
         strings
-    }
-
-    pub(super) fn new_regexp(&mut self, pattern: &str, flags: &str) -> Result<Value, ScriptError> {
-        let mut object = JsObject::with_prototype(
-            Some(self.intrinsics.regexp_prototype.clone()),
-            ObjectClass::Ordinary,
-        );
-        object.define(
-            "source".to_string(),
-            Property::hidden(Value::String(pattern.to_string().into())),
-        );
-        object.define(
-            "flags".to_string(),
-            Property::hidden(Value::String(flags.to_string().into())),
-        );
-        for (flag, name) in [
-            ('g', "global"),
-            ('i', "ignoreCase"),
-            ('m', "multiline"),
-            ('s', "dotAll"),
-            ('u', "unicode"),
-            ('y', "sticky"),
-            ('d', "hasIndices"),
-        ] {
-            object.define(
-                name.to_string(),
-                Property::hidden(Value::Bool(flags.contains(flag))),
-            );
-        }
-        object.define(
-            "lastIndex".to_string(),
-            Property {
-                slot: Slot::Data(Value::Number(0.0)),
-                enumerable: false,
-                writable: true,
-                configurable: false,
-            },
-        );
-        Ok(Value::Object(new_object(object)))
     }
 
     pub(super) fn dynamic_import_promise(
@@ -1883,12 +1843,10 @@ fn exotic_own(object: &JsObject, key: &str) -> Option<Value> {
     match &object.class {
         ObjectClass::String(text) => {
             if key == "length" {
-                return Some(Value::Number(text.chars().count() as f64));
+                return Some(Value::Number(super::strings::utf16_length(text) as f64));
             }
             let index = array_index(key)?;
-            text.chars()
-                .nth(index as usize)
-                .map(|character| Value::String(character.to_string().into()))
+            super::strings::unit_at(text, index as usize)
         }
         _ => None,
     }
@@ -1912,6 +1870,14 @@ pub(super) fn strict_equals(left: &Value, right: &Value) -> bool {
             strict_equals(&left.resolve(), &right.resolve())
         }
         _ => values_equal(left, right),
+    }
+}
+
+// SameValueZero: like === except NaN equals itself
+pub(super) fn same_value_zero(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) if left.is_nan() && right.is_nan() => true,
+        _ => strict_equals(left, right),
     }
 }
 

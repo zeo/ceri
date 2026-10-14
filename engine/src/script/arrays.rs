@@ -1,0 +1,689 @@
+// Array.prototype: methods run on engine arrays directly and read array-like receivers,
+// such as arguments objects and node lists, through their indexed properties
+
+use super::operations::{is_callable, same_value_zero, strict_equals};
+use super::*;
+use std::cmp::Ordering;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ArrayMethod {
+    At,
+    Concat,
+    CopyWithin,
+    Every,
+    Fill,
+    Filter,
+    Find,
+    FindIndex,
+    FindLast,
+    FindLastIndex,
+    Flat,
+    FlatMap,
+    ForEach,
+    Includes,
+    IndexOf,
+    Join,
+    LastIndexOf,
+    Map,
+    Pop,
+    Push,
+    Reduce,
+    ReduceRight,
+    Reverse,
+    Shift,
+    Slice,
+    Some,
+    Sort,
+    Splice,
+    ToLocaleString,
+    ToReversed,
+    ToSorted,
+    ToSpliced,
+    ToString,
+    Unshift,
+    With,
+}
+
+pub(super) const ARRAY_METHODS: &[(&str, ArrayMethod, u32)] = &[
+    ("at", ArrayMethod::At, 1),
+    ("concat", ArrayMethod::Concat, 1),
+    ("copyWithin", ArrayMethod::CopyWithin, 2),
+    ("every", ArrayMethod::Every, 1),
+    ("fill", ArrayMethod::Fill, 1),
+    ("filter", ArrayMethod::Filter, 1),
+    ("find", ArrayMethod::Find, 1),
+    ("findIndex", ArrayMethod::FindIndex, 1),
+    ("findLast", ArrayMethod::FindLast, 1),
+    ("findLastIndex", ArrayMethod::FindLastIndex, 1),
+    ("flat", ArrayMethod::Flat, 0),
+    ("flatMap", ArrayMethod::FlatMap, 1),
+    ("forEach", ArrayMethod::ForEach, 1),
+    ("includes", ArrayMethod::Includes, 1),
+    ("indexOf", ArrayMethod::IndexOf, 1),
+    ("join", ArrayMethod::Join, 1),
+    ("lastIndexOf", ArrayMethod::LastIndexOf, 1),
+    ("map", ArrayMethod::Map, 1),
+    ("pop", ArrayMethod::Pop, 0),
+    ("push", ArrayMethod::Push, 1),
+    ("reduce", ArrayMethod::Reduce, 1),
+    ("reduceRight", ArrayMethod::ReduceRight, 1),
+    ("reverse", ArrayMethod::Reverse, 0),
+    ("shift", ArrayMethod::Shift, 0),
+    ("slice", ArrayMethod::Slice, 2),
+    ("some", ArrayMethod::Some, 1),
+    ("sort", ArrayMethod::Sort, 1),
+    ("splice", ArrayMethod::Splice, 2),
+    ("toLocaleString", ArrayMethod::ToLocaleString, 0),
+    ("toReversed", ArrayMethod::ToReversed, 0),
+    ("toSorted", ArrayMethod::ToSorted, 1),
+    ("toSpliced", ArrayMethod::ToSpliced, 2),
+    ("toString", ArrayMethod::ToString, 0),
+    ("unshift", ArrayMethod::Unshift, 1),
+    ("with", ArrayMethod::With, 2),
+];
+
+fn argument(arguments: &[Value], index: usize) -> Value {
+    arguments.get(index).cloned().unwrap_or(Value::Undefined)
+}
+
+// a relative index argument clamped into 0..=length, as slice and splice resolve them
+fn relative(value: f64, length: usize) -> usize {
+    let length = length as f64;
+    let position = if value < 0.0 {
+        (length + value).max(0.0)
+    } else {
+        value.min(length)
+    };
+    position as usize
+}
+
+fn check_length(length: usize) -> Result<(), ScriptError> {
+    if length > MAX_RUNTIME_ARRAY_LENGTH {
+        return Err(runtime_error(
+            "array exceeds the deterministic length limit",
+        ));
+    }
+    Ok(())
+}
+
+impl ScriptRuntime {
+    // the elements a method reads: the array itself, or an array-like receiver's items
+    fn receiver_values(&mut self, this: &Value, method: &str) -> Result<Vec<Value>, ScriptError> {
+        match this {
+            Value::Array(array) => Ok(array.borrow().clone()),
+            Value::Undefined | Value::Null => Err(self.type_error(format!(
+                "Array.prototype.{method} called on null or undefined"
+            ))),
+            Value::String(text) => Ok(text
+                .encode_utf16()
+                .map(|unit| Value::String(String::from_utf16_lossy(&[unit]).into()))
+                .collect()),
+            Value::Object(_) => self.array_like_list(this),
+            other => match self.iterate_to_vec(other.clone()) {
+                Ok(values) => Ok(values),
+                Err(_) => {
+                    self.pending_exception = None;
+                    Ok(Vec::new())
+                }
+            },
+        }
+    }
+
+    // the array a mutating method changes; generic receivers are not writable through it
+    fn receiver_array(&mut self, this: &Value, method: &str) -> Result<ArrayHandle, ScriptError> {
+        match this {
+            Value::Array(array) => Ok(array.clone()),
+            _ => Err(self.type_error(format!("Array.prototype.{method} needs an array receiver"))),
+        }
+    }
+
+    pub(super) fn array_like_list(&mut self, value: &Value) -> Result<Vec<Value>, ScriptError> {
+        let length = self.get_property(value, "length")?;
+        let length = self.coerce_number(length)?;
+        let length = if length.is_nan() || length <= 0.0 {
+            0
+        } else {
+            length.min(MAX_RUNTIME_ARRAY_LENGTH as f64) as usize
+        };
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            values.push(self.get_index(value, Value::Number(index as f64))?);
+        }
+        Ok(values)
+    }
+
+    fn callback(&mut self, arguments: &[Value], method: &str) -> Result<Value, ScriptError> {
+        let callback = argument(arguments, 0);
+        if !is_callable(&callback) {
+            return Err(self.type_error(format!(
+                "Array.prototype.{method} callback is not a function"
+            )));
+        }
+        Ok(callback)
+    }
+
+    fn integer(&mut self, value: Value, default: f64) -> Result<f64, ScriptError> {
+        if matches!(value, Value::Undefined) {
+            return Ok(default);
+        }
+        let number = self.coerce_number(value)?;
+        Ok(if number.is_nan() { 0.0 } else { number.trunc() })
+    }
+
+    // an element read during iteration: arrays may shrink while a callback runs
+    fn element(this: &Value, values: &[Value], index: usize) -> Option<Value> {
+        match this {
+            Value::Array(array) => array.borrow().get(index).cloned(),
+            _ => values.get(index).cloned(),
+        }
+    }
+
+    fn element_count(this: &Value, values: &[Value]) -> usize {
+        match this {
+            Value::Array(array) => array.borrow().len(),
+            _ => values.len(),
+        }
+    }
+
+    pub(super) fn call_array_method(
+        &mut self,
+        method: ArrayMethod,
+        this: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        use ArrayMethod as M;
+        let name = ARRAY_METHODS
+            .iter()
+            .find(|(_, candidate, _)| {
+                std::mem::discriminant(candidate) == std::mem::discriminant(&method)
+            })
+            .map_or("", |(name, _, _)| name)
+            .to_string();
+        match method {
+            M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
+                let values = self.receiver_values(&this, &name)?;
+                let callback = self.callback(&arguments, &name)?;
+                let receiver = argument(&arguments, 1);
+                let length = values.len();
+                let mut mapped = Vec::new();
+                for index in 0..length {
+                    if index >= Self::element_count(&this, &values) {
+                        break;
+                    }
+                    let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    let result = self.call_function(
+                        callback.clone(),
+                        receiver.clone(),
+                        vec![value.clone(), Value::Number(index as f64), this.clone()],
+                    )?;
+                    match method {
+                        M::Map => mapped.push(result),
+                        M::Filter if result.truthy() => mapped.push(value),
+                        M::Some if result.truthy() => return Ok(Value::Bool(true)),
+                        M::Every if !result.truthy() => return Ok(Value::Bool(false)),
+                        M::Find if result.truthy() => return Ok(value),
+                        M::FindIndex if result.truthy() => return Ok(Value::Number(index as f64)),
+                        _ => {}
+                    }
+                }
+                Ok(match method {
+                    M::Map | M::Filter => Self::new_array(mapped),
+                    M::Some => Value::Bool(false),
+                    M::Every => Value::Bool(true),
+                    M::FindIndex => Value::Number(-1.0),
+                    _ => Value::Undefined,
+                })
+            }
+            M::FindLast | M::FindLastIndex => {
+                let values = self.receiver_values(&this, &name)?;
+                let callback = self.callback(&arguments, &name)?;
+                let receiver = argument(&arguments, 1);
+                for index in (0..values.len()).rev() {
+                    let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    let result = self.call_function(
+                        callback.clone(),
+                        receiver.clone(),
+                        vec![value.clone(), Value::Number(index as f64), this.clone()],
+                    )?;
+                    if result.truthy() {
+                        return Ok(match method {
+                            M::FindLast => value,
+                            _ => Value::Number(index as f64),
+                        });
+                    }
+                }
+                Ok(match method {
+                    M::FindLast => Value::Undefined,
+                    _ => Value::Number(-1.0),
+                })
+            }
+            M::Reduce | M::ReduceRight => {
+                let values = self.receiver_values(&this, &name)?;
+                let callback = self.callback(&arguments, &name)?;
+                let indices: Vec<usize> = if matches!(method, M::Reduce) {
+                    (0..values.len()).collect()
+                } else {
+                    (0..values.len()).rev().collect()
+                };
+                let mut indices = indices.into_iter();
+                let mut accumulator = if arguments.len() >= 2 {
+                    arguments[1].clone()
+                } else {
+                    match indices.next() {
+                        Some(first) => values[first].clone(),
+                        None => {
+                            return Err(
+                                self.type_error("Reduce of empty array with no initial value")
+                            );
+                        }
+                    }
+                };
+                for index in indices {
+                    let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    accumulator = self.call_function(
+                        callback.clone(),
+                        Value::Undefined,
+                        vec![
+                            accumulator,
+                            value,
+                            Value::Number(index as f64),
+                            this.clone(),
+                        ],
+                    )?;
+                }
+                Ok(accumulator)
+            }
+            M::Includes | M::IndexOf | M::LastIndexOf => {
+                let values = self.receiver_values(&this, &name)?;
+                let target = argument(&arguments, 0);
+                let length = values.len();
+                if matches!(method, M::LastIndexOf) {
+                    let start = if arguments.len() >= 2 {
+                        let from = self.integer(arguments[1].clone(), 0.0)?;
+                        if from < 0.0 {
+                            length as f64 + from
+                        } else {
+                            from.min(length as f64 - 1.0)
+                        }
+                    } else {
+                        length as f64 - 1.0
+                    };
+                    if start < 0.0 {
+                        return Ok(Value::Number(-1.0));
+                    }
+                    for index in (0..=start as usize).rev() {
+                        if strict_equals(&values[index], &target) {
+                            return Ok(Value::Number(index as f64));
+                        }
+                    }
+                    return Ok(Value::Number(-1.0));
+                }
+                let from = self.integer(argument(&arguments, 1), 0.0)?;
+                let start = relative(from, length);
+                for (index, value) in values.iter().enumerate().skip(start) {
+                    let found = match method {
+                        M::Includes => same_value_zero(value, &target),
+                        _ => strict_equals(value, &target),
+                    };
+                    if found {
+                        return Ok(match method {
+                            M::Includes => Value::Bool(true),
+                            _ => Value::Number(index as f64),
+                        });
+                    }
+                }
+                Ok(match method {
+                    M::Includes => Value::Bool(false),
+                    _ => Value::Number(-1.0),
+                })
+            }
+            M::Join | M::ToString | M::ToLocaleString => {
+                if matches!(method, M::ToString) && !matches!(this, Value::Array(_)) {
+                    return Ok(Value::String(self.object_to_string(&this)?.into()));
+                }
+                let separator = match (method, argument(&arguments, 0)) {
+                    (M::Join, Value::Undefined) | (M::ToString | M::ToLocaleString, _) => {
+                        ",".to_string()
+                    }
+                    (_, separator) => self.coerce_string(separator)?,
+                };
+                match &this {
+                    Value::Array(array) => {
+                        let array = array.clone();
+                        Ok(Value::String(self.join_array(&array, &separator)?.into()))
+                    }
+                    _ => {
+                        let values = self.receiver_values(&this, &name)?;
+                        let array = Rc::new(RefCell::new(values));
+                        Ok(Value::String(self.join_array(&array, &separator)?.into()))
+                    }
+                }
+            }
+            M::At => {
+                let values = self.receiver_values(&this, &name)?;
+                let index = self.integer(argument(&arguments, 0), 0.0)?;
+                let index = if index < 0.0 {
+                    values.len() as f64 + index
+                } else {
+                    index
+                };
+                if index < 0.0 || index >= values.len() as f64 {
+                    return Ok(Value::Undefined);
+                }
+                Ok(values[index as usize].clone())
+            }
+            M::Concat => {
+                let mut result = self.receiver_values(&this, &name)?;
+                for value in arguments {
+                    match value {
+                        Value::Array(array) => result.extend(array.borrow().iter().cloned()),
+                        value => result.push(value),
+                    }
+                    check_length(result.len())?;
+                }
+                Ok(Self::new_array(result))
+            }
+            M::Slice => {
+                let values = self.receiver_values(&this, &name)?;
+                let length = values.len();
+                let start = self.integer(argument(&arguments, 0), 0.0)?;
+                let end = self.integer(argument(&arguments, 1), length as f64)?;
+                let start = relative(start, length);
+                let end = relative(end, length);
+                Ok(Self::new_array(if start < end {
+                    values[start..end].to_vec()
+                } else {
+                    Vec::new()
+                }))
+            }
+            M::Flat | M::FlatMap => {
+                let values = self.receiver_values(&this, &name)?;
+                let (depth, mapper) = if matches!(method, M::FlatMap) {
+                    (1.0, Some(self.callback(&arguments, &name)?))
+                } else {
+                    (self.integer(argument(&arguments, 0), 1.0)?, None)
+                };
+                let mut result = Vec::new();
+                for (index, value) in values.into_iter().enumerate() {
+                    let value = match &mapper {
+                        Some(mapper) => self.call_function(
+                            mapper.clone(),
+                            argument(&arguments, 1),
+                            vec![value, Value::Number(index as f64), this.clone()],
+                        )?,
+                        None => value,
+                    };
+                    flatten_into(&mut result, value, depth)?;
+                }
+                Ok(Self::new_array(result))
+            }
+            M::Push => {
+                let array = self.receiver_array(&this, &name)?;
+                let mut array = array.borrow_mut();
+                check_length(array.len().saturating_add(arguments.len()))?;
+                array.extend(arguments);
+                Ok(Value::Number(array.len() as f64))
+            }
+            M::Pop => {
+                let array = self.receiver_array(&this, &name)?;
+                let value = array.borrow_mut().pop();
+                Ok(value.unwrap_or(Value::Undefined))
+            }
+            M::Shift => {
+                let array = self.receiver_array(&this, &name)?;
+                let mut array = array.borrow_mut();
+                Ok(if array.is_empty() {
+                    Value::Undefined
+                } else {
+                    array.remove(0)
+                })
+            }
+            M::Unshift => {
+                let array = self.receiver_array(&this, &name)?;
+                let mut array = array.borrow_mut();
+                check_length(array.len().saturating_add(arguments.len()))?;
+                array.splice(0..0, arguments);
+                Ok(Value::Number(array.len() as f64))
+            }
+            M::Reverse => {
+                let array = self.receiver_array(&this, &name)?;
+                array.borrow_mut().reverse();
+                Ok(this)
+            }
+            M::ToReversed => {
+                let mut values = self.receiver_values(&this, &name)?;
+                values.reverse();
+                Ok(Self::new_array(values))
+            }
+            M::Fill => {
+                let array = self.receiver_array(&this, &name)?;
+                let length = array.borrow().len();
+                let value = argument(&arguments, 0);
+                let start = self.integer(argument(&arguments, 1), 0.0)?;
+                let end = self.integer(argument(&arguments, 2), length as f64)?;
+                let (start, end) = (relative(start, length), relative(end, length));
+                for slot in array.borrow_mut().iter_mut().take(end).skip(start) {
+                    *slot = value.clone();
+                }
+                Ok(this)
+            }
+            M::CopyWithin => {
+                let array = self.receiver_array(&this, &name)?;
+                let length = array.borrow().len();
+                let target = self.integer(argument(&arguments, 0), 0.0)?;
+                let start = self.integer(argument(&arguments, 1), 0.0)?;
+                let end = self.integer(argument(&arguments, 2), length as f64)?;
+                let (target, start, end) = (
+                    relative(target, length),
+                    relative(start, length),
+                    relative(end, length),
+                );
+                let count = end.saturating_sub(start).min(length - target);
+                let copy: Vec<Value> = array.borrow()[start..start + count].to_vec();
+                array.borrow_mut()[target..target + count].clone_from_slice(&copy);
+                Ok(this)
+            }
+            M::Splice | M::ToSpliced => {
+                let mut values = if matches!(method, M::Splice) {
+                    self.receiver_array(&this, &name)?.borrow().clone()
+                } else {
+                    self.receiver_values(&this, &name)?
+                };
+                let length = values.len();
+                let start = self.integer(argument(&arguments, 0), 0.0)?;
+                let start = relative(start, length);
+                let delete = match arguments.len() {
+                    0 => 0,
+                    1 => length - start,
+                    _ => {
+                        let count = self.integer(arguments[1].clone(), 0.0)?;
+                        count.clamp(0.0, (length - start) as f64) as usize
+                    }
+                };
+                let insert: Vec<Value> = arguments.iter().skip(2).cloned().collect();
+                check_length(length - delete + insert.len())?;
+                let removed: Vec<Value> = values.splice(start..start + delete, insert).collect();
+                if matches!(method, M::Splice) {
+                    let array = self.receiver_array(&this, &name)?;
+                    *array.borrow_mut() = values;
+                    Ok(Self::new_array(removed))
+                } else {
+                    Ok(Self::new_array(values))
+                }
+            }
+            M::With => {
+                let mut values = self.receiver_values(&this, &name)?;
+                let index = self.integer(argument(&arguments, 0), 0.0)?;
+                let index = if index < 0.0 {
+                    values.len() as f64 + index
+                } else {
+                    index
+                };
+                if index < 0.0 || index >= values.len() as f64 {
+                    return Err(self.range_error("Invalid index"));
+                }
+                values[index as usize] = argument(&arguments, 1);
+                Ok(Self::new_array(values))
+            }
+            M::Sort | M::ToSorted => {
+                let comparator = argument(&arguments, 0);
+                if !matches!(comparator, Value::Undefined) && !is_callable(&comparator) {
+                    return Err(self.type_error(
+                        "The comparison function must be either a function or undefined",
+                    ));
+                }
+                let values = if matches!(method, M::Sort) {
+                    self.receiver_array(&this, &name)?.borrow().clone()
+                } else {
+                    self.receiver_values(&this, &name)?
+                };
+                let sorted = self.sort_values(values, &comparator)?;
+                if matches!(method, M::Sort) {
+                    let array = self.receiver_array(&this, &name)?;
+                    *array.borrow_mut() = sorted;
+                    Ok(this)
+                } else {
+                    Ok(Self::new_array(sorted))
+                }
+            }
+        }
+    }
+
+    // a stable merge sort whose comparator may run script and throw; undefined sorts last
+    pub(super) fn sort_values(
+        &mut self,
+        values: Vec<Value>,
+        comparator: &Value,
+    ) -> Result<Vec<Value>, ScriptError> {
+        let (mut defined, undefined): (Vec<Value>, Vec<Value>) = values
+            .into_iter()
+            .partition(|value| !matches!(value, Value::Undefined));
+        // default ordering compares string forms, computed once per element
+        let keys: Option<Vec<Vec<u16>>> = if matches!(comparator, Value::Undefined) {
+            let mut keys = Vec::with_capacity(defined.len());
+            for value in &defined {
+                keys.push(self.coerce_string(value.clone())?.encode_utf16().collect());
+            }
+            Some(keys)
+        } else {
+            None
+        };
+        let mut order: Vec<usize> = (0..defined.len()).collect();
+        let mut scratch = order.clone();
+        self.merge_sort(
+            &mut order,
+            &mut scratch,
+            &defined,
+            keys.as_deref(),
+            comparator,
+        )?;
+        let mut sorted: Vec<Value> = order
+            .into_iter()
+            .map(|index| std::mem::replace(&mut defined[index], Value::Undefined))
+            .collect();
+        sorted.extend(undefined);
+        Ok(sorted)
+    }
+
+    fn compare_elements(
+        &mut self,
+        left: usize,
+        right: usize,
+        values: &[Value],
+        keys: Option<&[Vec<u16>]>,
+        comparator: &Value,
+    ) -> Result<Ordering, ScriptError> {
+        if let Some(keys) = keys {
+            return Ok(keys[left].cmp(&keys[right]));
+        }
+        let result = self.call_function(
+            comparator.clone(),
+            Value::Undefined,
+            vec![values[left].clone(), values[right].clone()],
+        )?;
+        let number = self.coerce_number(result)?;
+        Ok(if number < 0.0 {
+            Ordering::Less
+        } else if number > 0.0 {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        })
+    }
+
+    fn merge_sort(
+        &mut self,
+        order: &mut [usize],
+        scratch: &mut [usize],
+        values: &[Value],
+        keys: Option<&[Vec<u16>]>,
+        comparator: &Value,
+    ) -> Result<(), ScriptError> {
+        let length = order.len();
+        if length <= 1 {
+            return Ok(());
+        }
+        if length <= 12 {
+            // insertion sort for short runs
+            for i in 1..length {
+                let mut j = i;
+                while j > 0
+                    && self.compare_elements(order[j - 1], order[j], values, keys, comparator)?
+                        == Ordering::Greater
+                {
+                    order.swap(j - 1, j);
+                    j -= 1;
+                }
+            }
+            return Ok(());
+        }
+        let middle = length / 2;
+        {
+            let (left, right) = order.split_at_mut(middle);
+            let (left_scratch, right_scratch) = scratch.split_at_mut(middle);
+            self.merge_sort(left, left_scratch, values, keys, comparator)?;
+            self.merge_sort(right, right_scratch, values, keys, comparator)?;
+        }
+        let (mut i, mut j, mut k) = (0, middle, 0);
+        while i < middle && j < length {
+            if self.compare_elements(order[i], order[j], values, keys, comparator)?
+                == Ordering::Greater
+            {
+                scratch[k] = order[j];
+                j += 1;
+            } else {
+                scratch[k] = order[i];
+                i += 1;
+            }
+            k += 1;
+        }
+        while i < middle {
+            scratch[k] = order[i];
+            i += 1;
+            k += 1;
+        }
+        while j < length {
+            scratch[k] = order[j];
+            j += 1;
+            k += 1;
+        }
+        order.copy_from_slice(&scratch[..length]);
+        Ok(())
+    }
+}
+
+fn flatten_into(result: &mut Vec<Value>, value: Value, depth: f64) -> Result<(), ScriptError> {
+    match value {
+        Value::Array(array) if depth >= 1.0 => {
+            let items = array.borrow().clone();
+            for item in items {
+                flatten_into(result, item, depth - 1.0)?;
+            }
+        }
+        value => {
+            result.push(value);
+            check_length(result.len())?;
+        }
+    }
+    Ok(())
+}

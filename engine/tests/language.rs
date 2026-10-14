@@ -8,6 +8,9 @@ fn run(source: &str) -> Result<String, String> {
     runtime
         .execute(source)
         .map_err(|error| error.message.clone())?;
+    runtime
+        .advance_time(1000)
+        .map_err(|error| error.message.clone())?;
     Ok(runtime.logs().join("\n"))
 }
 
@@ -103,7 +106,7 @@ fn operators_follow_the_specification() {
         (
             "number formatting",
             "console.log(0.1 + 0.2, 1e21, 123456789012345680000, 1 / 3, -0, 2 ** 53, 5e-7)",
-            "0.30000000000000004 1e+21 123456789012345680000 0.3333333333333333 0 9007199254740992 5e-7",
+            "0.30000000000000004 1e+21 123456789012345680000 0.3333333333333333 -0 9007199254740992 5e-7",
         ),
         (
             "number parsing",
@@ -920,7 +923,352 @@ caught",
         (
             "console formatting",
             "console.log([1, [2, 3]], 1.50, -0, null, undefined, true)",
-            "1,2,3 1.5 0 null undefined true",
+            "[ 1, [ 2, 3 ] ] 1.5 -0 null undefined true",
+        ),
+    ]);
+}
+
+#[test]
+fn array_methods_follow_the_specification() {
+    check(&[
+        (
+            "iteration",
+            "const a = [3, 1, 2]; console.log(a.map((x) => x * 2).join(), a.filter((x) => x > 1).length, a.some((x) => x > 2), a.every((x) => x > 0), a.find((x) => x < 3), a.findIndex((x) => x === 2), a.findLast((x) => x > 0), a.findLastIndex((x) => x > 5))",
+            "6,2,4 2 true true 1 2 2 -1",
+        ),
+        (
+            "reduce",
+            "console.log([1, 2, 3].reduce((s, x) => s + x), [1, 2, 3].reduce((s, x) => s + x, 10), ['a', 'b'].reduceRight((s, x) => s + x))",
+            "6 16 ba",
+        ),
+        (
+            "searching",
+            "const a = [1, 2, NaN, 2]; console.log(a.indexOf(2), a.lastIndexOf(2), a.includes(NaN), a.indexOf(NaN), a.at(-1), [].at(0))",
+            "1 3 true -1 2 undefined",
+        ),
+        (
+            "slicing",
+            "const a = [1, 2, 3, 4, 5]; console.log(a.slice(1, -1).join(), a.slice(-2).join(), a.concat([6], 7).length)",
+            "2,3,4 4,5 7",
+        ),
+        (
+            "splice",
+            "const a = [1, 2, 3, 4]; const removed = a.splice(1, 2, 'x', 'y', 'z'); console.log(a.join(), removed.join(), a.toSpliced(0, 1).join(), a.length)",
+            "1,x,y,z,4 2,3 x,y,z,4 5",
+        ),
+        (
+            "stack and queue",
+            "const a = [1]; a.push(2, 3); a.unshift(0); console.log(a.pop(), a.shift(), a.join())",
+            "3 0 1,2",
+        ),
+        (
+            "sort",
+            "console.log([10, 9, 1, 100].sort().join(), [10, 9, 1, 100].sort((a, b) => a - b).join(), ['b', undefined, 'a'].sort().join())",
+            "1,10,100,9 1,9,10,100 a,b,",
+        ),
+        (
+            "stable sort",
+            "const items = [{k: 1, v: 'a'}, {k: 0, v: 'b'}, {k: 1, v: 'c'}, {k: 0, v: 'd'}]; console.log(items.sort((x, y) => x.k - y.k).map((i) => i.v).join(''))",
+            "bdac",
+        ),
+        (
+            "inconsistent comparator",
+            "const a = Array.from({ length: 50 }, (_, i) => i); a.sort(() => 1); console.log(a.length)",
+            "50",
+        ),
+        (
+            "reverse and fill",
+            "console.log([1, 2, 3].reverse().join(), new Array(3).fill(0).join(), [1, 2, 3, 4].fill(9, 1, 3).join(), [1, 2, 3].toReversed().join())",
+            "3,2,1 0,0,0 1,9,9,4 3,2,1",
+        ),
+        (
+            "flat",
+            "console.log([1, [2, [3, [4]]]].flat().length, [1, [2, [3, [4]]]].flat(Infinity).join(), [1, 2].flatMap((x) => [x, x * 10]).join())",
+            "3 1,2,3,4 1,10,2,20",
+        ),
+        (
+            "copyWithin and with",
+            "console.log([1, 2, 3, 4, 5].copyWithin(0, 3).join(), [1, 2, 3].with(1, 'b').join())",
+            "4,5,3,4,5 1,b,3",
+        ),
+        (
+            "array-likes",
+            "function f() { return Array.prototype.slice.call(arguments, 1).join('-'); } console.log(f(1, 2, 3), Array.prototype.map.call('abc', (c) => c.toUpperCase()).join(''))",
+            "2-3 ABC",
+        ),
+        (
+            "iteration helpers",
+            "console.log([...['a', 'b'].keys()].join(), [...['a', 'b'].values()].join(), Array.isArray([]), Array.isArray({ length: 0 }))",
+            "0,1 a,b true false",
+        ),
+        (
+            "join cycles",
+            "const a = [1]; a.push(a); console.log(a.join('-'), String([null, undefined, 1]))",
+            "1- ,,1",
+        ),
+    ]);
+}
+
+#[test]
+fn string_methods_follow_the_specification() {
+    check(&[
+        (
+            "utf16 length",
+            "const s = 'a\u{1F600}b'; console.log(s.length, s.charCodeAt(1), s.codePointAt(1), s.at(-1), [...s].length)",
+            "4 55357 128512 b 3",
+        ),
+        (
+            "slicing",
+            "const s = 'Hello, world'; console.log(s.slice(-5), s.substring(5, 0), s.substr(7, 3), s.slice(3, 1) === '')",
+            "world Hello wor true",
+        ),
+        (
+            "searching",
+            "const s = 'banana'; console.log(s.indexOf('an'), s.lastIndexOf('an'), s.includes('nan'), s.startsWith('ban'), s.endsWith('na'), s.indexOf(''), s.search(/n./))",
+            "1 3 true true true 0 2",
+        ),
+        (
+            "padding and repeat",
+            "console.log('5'.padStart(3, '0'), 'ab'.padEnd(5, 'xy'), 'ha'.repeat(3), '|' + '  x '.trim() + '|' + ' y'.trimStart() + '|' + 'z '.trimEnd() + '|')",
+            "005 abxyx hahaha |x|y|z|",
+        ),
+        (
+            "case",
+            "console.log('Straße'.toUpperCase(), 'ÀB'.toLowerCase(), 'i'.localeCompare('I'), 'a'.localeCompare('b'))",
+            "STRASSE àb -1 -1",
+        ),
+        (
+            "split",
+            "console.log('a,b,,c'.split(',').length, 'abc'.split('').join('|'), 'a1b2c3'.split(/\\d/).join(), 'a, b ,c'.split(/\\s*,\\s*/).join('|'), 'one two'.split(' ', 1).join())",
+            "4 a|b|c a,b,c, a|b|c one",
+        ),
+        (
+            "replace strings",
+            "console.log('aaa'.replace('a', 'b'), 'aaa'.replaceAll('a', 'b'), 'x-y'.replace('-', '$&$&'), 'abc'.replace('b', (m, i) => m.toUpperCase() + i))",
+            "baa bbb x--y aB1c",
+        ),
+        (
+            "replace patterns",
+            "console.log('2024-01-15'.replace(/(\\d+)-(\\d+)-(\\d+)/, '$3/$2/$1'), 'a.b.c'.replace(/\\./g, '/'), 'John Smith'.replace(/(?<first>\\w+) (?<last>\\w+)/, '$<last>, $<first>'))",
+            "15/01/2024 a/b/c Smith, John",
+        ),
+        (
+            "replace callbacks",
+            "console.log('the cat sat'.replace(/\\b(\\w)(\\w*)/g, (m, a, b) => a.toUpperCase() + b))",
+            "The Cat Sat",
+        ),
+        (
+            "match",
+            "console.log('a1b22c333'.match(/\\d+/g).join(), 'xyz'.match(/q/), 'abc'.match(/(b)(c)/).index, 'k=v'.match(/(?<key>\\w)=(?<value>\\w)/).groups.value)",
+            "1,22,333 null 1 v",
+        ),
+        (
+            "matchAll",
+            "const found = [...'a1b2'.matchAll(/[a-z](\\d)/g)].map((m) => m[1] + '@' + m.index); console.log(found.join())",
+            "1@0,2@2",
+        ),
+        (
+            "raw and fromCodePoint",
+            "console.log(String.raw`a\\nb${1}`, String.fromCodePoint(128512) === '\u{1F600}', String.fromCharCode(72, 105))",
+            "a\\nb1 true Hi",
+        ),
+        (
+            "string iteration",
+            "let n = 0; for (const ch of 'h\u{1F600}') n++; console.log(n)",
+            "2",
+        ),
+    ]);
+}
+
+#[test]
+fn regular_expressions_work() {
+    check(&[
+        (
+            "test and exec",
+            "const r = /(\\w+)@(\\w+)\\.com/; const m = r.exec('mail me@site.com now'); console.log(r.test('x@y.com'), m[0], m[1], m.index, m.input.length)",
+            "true me@site.com me 5 20",
+        ),
+        (
+            "global lastIndex",
+            "const r = /o/g; const s = 'foo boo'; const seen = []; let m; while ((m = r.exec(s))) seen.push(m.index + ':' + r.lastIndex); console.log(seen.join(), r.lastIndex)",
+            "1:2,2:3,5:6,6:7 0",
+        ),
+        (
+            "sticky",
+            "const r = /a/y; console.log(r.test('ba'), r.lastIndex, (r.lastIndex = 1, r.test('ba')), r.lastIndex)",
+            "false 0 true 2",
+        ),
+        (
+            "flags and source",
+            "const r = new RegExp('a/b', 'gi'); console.log(r.source, r.flags, r.global, r.ignoreCase, r.multiline, String(r), /x/.sticky)",
+            "a\\/b gi true true false /a\\/b/gi false",
+        ),
+        (
+            "constructor from regexp",
+            "const a = /x/g; const b = new RegExp(a, 'i'); console.log(b.flags, RegExp(a) === a, b instanceof RegExp)",
+            "i true true",
+        ),
+        (
+            "indices flag",
+            "const m = /b(c)/d.exec('abc'); console.log(m.indices[0].join(), m.indices[1].join())",
+            "1,3 2,3",
+        ),
+        (
+            "unicode",
+            "console.log(/^.$/u.test('\u{1F600}'), /^.$/.test('\u{1F600}'), /\\p{Lu}/u.test('É'), '\u{1F600}x'.match(/./gu).length)",
+            "true false true 2",
+        ),
+        (
+            "lookbehind",
+            "console.log('$4 €5 $6'.match(/(?<=\\$)\\d/g).join())",
+            "4,6",
+        ),
+        (
+            "syntax errors",
+            "try { new RegExp('('); } catch (e) { console.log(e.name); } try { new RegExp('a', 'gg'); } catch (e) { console.log(e.name); }",
+            "SyntaxError\nSyntaxError",
+        ),
+        (
+            "literal in loop",
+            "let count = 0; for (let i = 0; i < 100; i++) { if (/^\\d+$/.test(String(i))) count++; } console.log(count)",
+            "100",
+        ),
+        (
+            "split with captures",
+            "console.log('a1b2c'.split(/(\\d)/).join('|'))",
+            "a|1|b|2|c",
+        ),
+        (
+            "empty matches",
+            "console.log('abc'.replace(/x*/g, '-'), 'abc'.split(/(?:)/u).join())",
+            "-a-b-c- a,b,c",
+        ),
+    ]);
+}
+
+#[test]
+fn numbers_math_and_json_work() {
+    check(&[
+        (
+            "toFixed",
+            "console.log((1.005).toFixed(2), (2.5).toFixed(0), (1234.5678).toFixed(1), (0).toFixed(2), (-1.5).toFixed(0), (1e21).toFixed(2))",
+            "1.00 3 1234.6 0.00 -2 1e+21",
+        ),
+        (
+            "toPrecision and toExponential",
+            "console.log((123.456).toPrecision(4), (0.00001234).toPrecision(2), (123456).toExponential(2), (255).toString(2), (0.5).toString(16))",
+            "123.5 0.000012 1.23e+5 11111111 0.8",
+        ),
+        (
+            "toLocaleString",
+            "console.log((1234567.891).toLocaleString(), (0.5).toLocaleString())",
+            "1,234,567.891 0.5",
+        ),
+        (
+            "parsing",
+            "console.log(parseInt('42px'), parseInt('0x1A'), parseInt('101', 2), parseFloat('3.14abc'), parseInt(''), isNaN('abc'), isFinite('12'), Number.parseFloat === parseFloat)",
+            "42 26 5 3.14 NaN true true true",
+        ),
+        (
+            "math",
+            "console.log(Math.max(1, 5, 3), Math.min(), Math.round(-2.5), Math.round(2.5), Math.sign(-3), Math.trunc(-4.7), Math.hypot(3, 4), Math.cbrt(27), Math.clz32(1), Math.imul(3, 4))",
+            "5 Infinity -2 3 -1 -4 5 3 31 12",
+        ),
+        (
+            "random range",
+            "let ok = true; for (let i = 0; i < 1000; i++) { const r = Math.random(); if (r < 0 || r >= 1) ok = false; } console.log(ok, Math.PI.toFixed(5))",
+            "true 3.14159",
+        ),
+        (
+            "stringify",
+            "console.log(JSON.stringify({ a: [1, 'x', null, undefined, () => 1], b: undefined, c: true, d: NaN }), JSON.stringify('he said \"hi\"\\n'), JSON.stringify(undefined))",
+            "{\"a\":[1,\"x\",null,null,null],\"c\":true,\"d\":null} \"he said \\\"hi\\\"\\n\" undefined",
+        ),
+        (
+            "stringify indentation",
+            "console.log(JSON.stringify({ a: 1, b: [1, 2] }, null, 2))",
+            "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}",
+        ),
+        (
+            "stringify replacer",
+            "console.log(JSON.stringify({ a: 1, b: 2, c: { a: 3 } }, ['a', 'c']), JSON.stringify({ a: 1, b: 'x' }, (k, v) => typeof v === 'number' ? v * 10 : v))",
+            "{\"a\":1,\"c\":{\"a\":3}} {\"a\":10,\"b\":\"x\"}",
+        ),
+        (
+            "toJSON",
+            "const o = { toJSON(key) { return 'custom:' + key; } }; console.log(JSON.stringify({ o }), JSON.stringify([o]))",
+            "{\"o\":\"custom:o\"} [\"custom:0\"]",
+        ),
+        (
+            "circular",
+            "const o = {}; o.self = o; try { JSON.stringify(o); } catch (e) { console.log(e.name); }",
+            "TypeError",
+        ),
+        (
+            "reviver",
+            "const v = JSON.parse('{\"a\":1,\"b\":{\"c\":2}}', (k, v) => typeof v === 'number' ? v + 1 : v); console.log(v.a, v.b.c)",
+            "2 3",
+        ),
+    ]);
+}
+
+#[test]
+fn console_promises_and_timers_work() {
+    check(&[
+        (
+            "console inspection",
+            "console.log({ a: 1, b: 'two', c: [1, { d: null }] }, 'plain', [function named() {}], new Error('boom'))",
+            "{ a: 1, b: 'two', c: [ 1, { d: null } ] } plain [ [Function: named] ] Error: boom",
+        ),
+        (
+            "console format",
+            "console.log('%s has %d items costing %f', 'cart', 3.7, '2.5', 'extra')",
+            "cart has 3 items costing 2.5 extra",
+        ),
+        (
+            "console groups and counts",
+            "console.group('outer'); console.info('inside'); console.groupEnd(); console.count(); console.count(); console.warn('w'); console.error('e')",
+            "outer\n  inside\ndefault: 1\ndefault: 2\nw\ne",
+        ),
+        (
+            "console assert",
+            "console.assert(1 === 2, 'math is broken'); console.assert(true, 'never')",
+            "Assertion failed: math is broken",
+        ),
+        (
+            "promise all",
+            "Promise.all([1, Promise.resolve(2), new Promise((r) => setTimeout(() => r(3), 5))]).then((v) => console.log(v.join()))",
+            "1,2,3",
+        ),
+        (
+            "promise all rejects",
+            "Promise.all([Promise.resolve(1), Promise.reject(new Error('no'))]).catch((e) => console.log(e.message))",
+            "no",
+        ),
+        (
+            "allSettled",
+            "Promise.allSettled([Promise.resolve(1), Promise.reject('x')]).then((r) => console.log(r.map((s) => s.status + ':' + (s.value ?? s.reason)).join()))",
+            "fulfilled:1,rejected:x",
+        ),
+        (
+            "race and any",
+            "Promise.race([new Promise((r) => setTimeout(() => r('slow'), 10)), Promise.resolve('fast')]).then(console.log); Promise.any([Promise.reject(1), Promise.resolve('any')]).then(console.log); Promise.any([Promise.reject(1)]).catch((e) => console.log(e.name, e.errors.length))",
+            "fast\nany\nAggregateError 1",
+        ),
+        (
+            "finally",
+            "Promise.resolve('v').finally(() => console.log('cleanup')).then(console.log); Promise.reject(new Error('r')).finally(() => {}).catch((e) => console.log(e.message))",
+            "cleanup\nv\nr",
+        ),
+        (
+            "withResolvers",
+            "const { promise, resolve } = Promise.withResolvers(); promise.then(console.log); resolve('done')",
+            "done",
+        ),
+        (
+            "queueMicrotask ordering",
+            "setTimeout(() => console.log('timeout'), 0); queueMicrotask(() => console.log('micro')); Promise.resolve().then(() => console.log('promise')); console.log('sync')",
+            "sync\nmicro\npromise\ntimeout",
         ),
     ]);
 }

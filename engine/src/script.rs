@@ -1,11 +1,18 @@
+mod arrays;
 mod ast;
 mod compiler;
+mod console;
 mod json;
 mod lexer;
+mod numbers;
 mod object;
 mod operations;
 mod parser;
+mod pattern;
+mod promises;
 mod realm;
+mod regexp;
+mod strings;
 mod vm;
 
 use object::{ObjectClass, ObjectHandle};
@@ -153,8 +160,6 @@ enum Value {
     AbortController(AbortControllerHandle),
     AbortSignal(AbortSignalHandle),
     Worker(WorkerHandle),
-    Console,
-    Json,
     WebAssemblyNamespace,
     Request(RequestHandle),
     HeadersConstructor,
@@ -224,7 +229,6 @@ enum Builtin {
     DocumentGetSelection,
     DocumentAddEventListener,
     DocumentRemoveEventListener,
-    ConsoleLog,
     EventPreventDefault(Rc<RefCell<EventState>>),
     LocationAssign,
     LocationReplace,
@@ -315,11 +319,11 @@ enum Builtin {
     FileText(FileHandle),
     FileBytes(FileHandle),
     FileListItem(FileListHandle),
-    JsonParse,
-    JsonStringify,
     StructuredClone,
     SetTimeout,
     ClearTimeout,
+    SetInterval,
+    QueueMicrotask,
     RequestAnimationFrame,
     CancelAnimationFrame,
     CeriQuery,
@@ -368,24 +372,9 @@ enum Builtin {
     ElementGetAttribute(ElementHandle),
     ElementQuerySelector(ElementHandle),
     ElementQuerySelectorAll(ElementHandle),
-    ArrayMap(ArrayHandle),
-    ArrayJoin(ArrayHandle),
-    ArrayPush(ArrayHandle),
-    ArrayPop(ArrayHandle),
-    ArrayForEach(ArrayHandle),
-    ArrayFilter(ArrayHandle),
-    ArrayFind(ArrayHandle),
     Uint8ArraySet(Uint8ArrayHandle),
     Uint8ArraySlice(Uint8ArrayHandle),
     Uint8ArraySubarray(Uint8ArrayHandle),
-    StringSlice(Rc<str>),
-    StringIncludes(Rc<str>),
-    StringStartsWith(Rc<str>),
-    StringEndsWith(Rc<str>),
-    StringTrim(Rc<str>),
-    StringToLowerCase(Rc<str>),
-    StringToUpperCase(Rc<str>),
-    StringSplit(Rc<str>),
     MapGet(MapHandle),
     MapSet(MapHandle),
     MapKeys(MapHandle),
@@ -402,7 +391,6 @@ enum Builtin {
     ResponseErrorConstructor,
     ResponseJsonConstructor,
     ResponseRedirectConstructor,
-    NumberParseInt,
     NumberIsFinite,
     ArrayIsArray,
     ElementClassListAdd(ElementHandle),
@@ -571,6 +559,11 @@ pub struct ScriptRuntime {
     template_cache: HashMap<(usize, usize), (Rc<compiler::Code>, Value)>,
     array_expandos: ArrayExpandos,
     array_expando_prune_at: usize,
+    pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
+    random_state: u64,
+    console_depth: usize,
+    console_timers: HashMap<String, u64>,
+    console_counts: HashMap<String, u64>,
     host_runtime_info: Option<HostRuntimeInfo>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     loading_modules: BTreeSet<String>,
@@ -1167,8 +1160,9 @@ const MAX_CLONE_DEPTH: usize = 64;
 const MAX_CLONE_NODES: usize = 16_384;
 const MAX_CLONE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLONE_STRING_BYTES: usize = 1024 * 1024;
-const MAX_RUNTIME_ARRAY_LENGTH: usize = 16_384;
-const MAX_RUNTIME_OBJECT_PROPERTIES: usize = 16_384;
+const MAX_RUNTIME_ARRAY_LENGTH: usize = 1 << 22;
+const MAX_RUNTIME_STRING_UNITS: usize = 1 << 28;
+const MAX_RUNTIME_OBJECT_PROPERTIES: usize = 1 << 20;
 
 enum WorkerCommand {
     Message(CloneValue),
@@ -1320,6 +1314,7 @@ struct PromiseReaction {
 #[derive(Clone, Copy)]
 enum TaskKind {
     Timeout,
+    Interval(u64),
     AnimationFrame,
 }
 
@@ -1327,11 +1322,12 @@ struct ScheduledTask {
     id: u64,
     due: u64,
     callback: Value,
+    arguments: Vec<Value>,
     kind: TaskKind,
 }
 
 const MAX_TASKS_PER_ADVANCE: usize = 10_000;
-const MAX_MICROTASKS_PER_DRAIN: usize = 10_000;
+const MAX_MICROTASKS_PER_DRAIN: usize = 1 << 20;
 const RUNTIME_INFO_REQUEST: &str = r#"{"method":"runtimeInfo","version":1}"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1460,8 +1456,6 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("history".to_string(), Value::History(history.clone()));
-            values.values.insert("console".to_string(), Value::Console);
-            values.values.insert("JSON".to_string(), Value::Json);
             values.values.insert(
                 "structuredClone".to_string(),
                 Value::Builtin(Builtin::StructuredClone),
@@ -1614,6 +1608,11 @@ impl ScriptRuntime {
             template_cache: HashMap::new(),
             array_expandos: HashMap::new(),
             array_expando_prune_at: 64,
+            pattern_cache: HashMap::new(),
+            random_state: numbers::random_seed(),
+            console_depth: 0,
+            console_timers: HashMap::new(),
+            console_counts: HashMap::new(),
             host_runtime_info,
             module_cache: BTreeMap::new(),
             loading_modules: BTreeSet::new(),
@@ -3757,24 +3756,42 @@ impl ScriptRuntime {
         }
     }
 
+    // runs every task due by the new time in order, each at its own due time, with a
+    // microtask checkpoint after each; an uncaught error is reported and the clock moves on
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, ScriptError> {
-        self.clock = self.clock.saturating_add(milliseconds);
+        let target = self.clock.saturating_add(milliseconds);
         let mut executed = 0;
-        while let Some(index) = self.next_due_task() {
+        while let Some(index) = self.next_due_task(target) {
             if executed == MAX_TASKS_PER_ADVANCE {
                 return Err(runtime_error("task queue exceeded the deterministic limit"));
             }
             let task = self.tasks.remove(index);
+            self.clock = self.clock.max(task.due);
             let arguments = match task.kind {
-                TaskKind::Timeout => Vec::new(),
+                TaskKind::Timeout | TaskKind::Interval(_) => task.arguments.clone(),
                 TaskKind::AnimationFrame => vec![Value::Number(self.clock as f64)],
             };
-            self.call(task.callback, arguments)?;
+            let callback = task.callback.clone();
+            if let TaskKind::Interval(period) = task.kind {
+                self.tasks.push(ScheduledTask {
+                    due: task.due.saturating_add(period.max(1)),
+                    ..task
+                });
+            }
+            if let Err(error) = self.call(callback, arguments) {
+                self.report_exception(error);
+            }
+            self.drain_microtasks()?;
             executed += 1;
         }
+        self.clock = target;
         self.drain_microtasks()?;
         self.pump_workers()?;
         Ok(executed)
+    }
+
+    fn promise_native(function: promises::PromiseFunction) -> Value {
+        Value::Builtin(Builtin::Native(Native::Promise(Rc::new(function))))
     }
 
     fn member(&self, object: Value, property: &str) -> Result<Value, ScriptError> {
@@ -3838,14 +3855,12 @@ impl ScriptRuntime {
                     .borrow()
                     .get("indexedDB")
                     .ok_or_else(|| runtime_error("window indexedDB is unavailable")),
-                "console" => Ok(Value::Console),
                 "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
                 "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
                 "removeEventListener" => Ok(Value::Builtin(Builtin::WindowRemoveEventListener)),
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
-                "JSON" => Ok(Value::Json),
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
@@ -3853,7 +3868,9 @@ impl ScriptRuntime {
                 "Uint8Array" => Ok(Value::Uint8ArrayConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
-                "clearTimeout" => Ok(Value::Builtin(Builtin::ClearTimeout)),
+                "clearTimeout" | "clearInterval" => Ok(Value::Builtin(Builtin::ClearTimeout)),
+                "setInterval" => Ok(Value::Builtin(Builtin::SetInterval)),
+                "queueMicrotask" => Ok(Value::Builtin(Builtin::QueueMicrotask)),
                 "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
                 "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
                 "importScripts"
@@ -3903,7 +3920,6 @@ impl ScriptRuntime {
                     "SubtleCrypto has no property {property}"
                 ))),
             },
-            Value::Console if property == "log" => Ok(Value::Builtin(Builtin::ConsoleLog)),
             Value::Element(handle) => {
                 let path = attached_path(&handle);
                 let value = match property {
@@ -4895,18 +4911,6 @@ impl ScriptRuntime {
                 "set" => Ok(Value::Builtin(Builtin::HeadersSet(headers))),
                 _ => Err(runtime_error(format!("headers has no property {property}"))),
             },
-            Value::String(string) => match property {
-                "length" => Ok(Value::Number(string.chars().count() as f64)),
-                "slice" => Ok(Value::Builtin(Builtin::StringSlice(string))),
-                "includes" => Ok(Value::Builtin(Builtin::StringIncludes(string))),
-                "startsWith" => Ok(Value::Builtin(Builtin::StringStartsWith(string))),
-                "endsWith" => Ok(Value::Builtin(Builtin::StringEndsWith(string))),
-                "trim" => Ok(Value::Builtin(Builtin::StringTrim(string))),
-                "toLowerCase" => Ok(Value::Builtin(Builtin::StringToLowerCase(string))),
-                "toUpperCase" => Ok(Value::Builtin(Builtin::StringToUpperCase(string))),
-                "split" => Ok(Value::Builtin(Builtin::StringSplit(string))),
-                _ => Err(runtime_error(format!("string has no property {property}"))),
-            },
             Value::Set(set) => match property {
                 "size" => Ok(Value::Number(set.borrow().values.len() as f64)),
                 "has" => Ok(Value::Builtin(Builtin::SetHas(set))),
@@ -4939,6 +4943,13 @@ impl ScriptRuntime {
             Value::PromiseConstructor => match property {
                 "reject" => Ok(Value::Builtin(Builtin::PromiseReject)),
                 "resolve" => Ok(Value::Builtin(Builtin::PromiseResolve)),
+                "all" => Ok(Self::promise_native(promises::PromiseFunction::All)),
+                "allSettled" => Ok(Self::promise_native(promises::PromiseFunction::AllSettled)),
+                "race" => Ok(Self::promise_native(promises::PromiseFunction::Race)),
+                "any" => Ok(Self::promise_native(promises::PromiseFunction::Any)),
+                "withResolvers" => Ok(Self::promise_native(
+                    promises::PromiseFunction::WithResolvers,
+                )),
                 _ => Err(runtime_error(format!("Promise has no property {property}"))),
             },
             Value::Object(object) => Ok(object
@@ -4948,13 +4959,6 @@ impl ScriptRuntime {
                 .unwrap_or(Value::Undefined)),
             Value::Array(array) => match property {
                 "length" => Ok(Value::Number(array.borrow().len() as f64)),
-                "map" => Ok(Value::Builtin(Builtin::ArrayMap(array))),
-                "join" => Ok(Value::Builtin(Builtin::ArrayJoin(array))),
-                "push" => Ok(Value::Builtin(Builtin::ArrayPush(array))),
-                "pop" => Ok(Value::Builtin(Builtin::ArrayPop(array))),
-                "forEach" => Ok(Value::Builtin(Builtin::ArrayForEach(array))),
-                "filter" => Ok(Value::Builtin(Builtin::ArrayFilter(array))),
-                "find" => Ok(Value::Builtin(Builtin::ArrayFind(array))),
                 _ => {
                     let index = property
                         .parse::<usize>()
@@ -4993,11 +4997,6 @@ impl ScriptRuntime {
                 "entries" => Ok(Value::Builtin(Builtin::MapEntries(map))),
                 _ => Err(runtime_error(format!("Map has no property {property}"))),
             },
-            Value::Json => match property {
-                "parse" => Ok(Value::Builtin(Builtin::JsonParse)),
-                "stringify" => Ok(Value::Builtin(Builtin::JsonStringify)),
-                _ => Err(runtime_error(format!("JSON has no property {property}"))),
-            },
             Value::WebAssemblyNamespace => match property {
                 "instantiate" => Ok(Value::Builtin(Builtin::WebAssemblyInstantiate)),
                 _ => Err(runtime_error(format!(
@@ -5007,6 +5006,9 @@ impl ScriptRuntime {
             Value::Promise(promise) => match property {
                 "then" => Ok(Value::Builtin(Builtin::PromiseThen(promise))),
                 "catch" => Ok(Value::Builtin(Builtin::PromiseCatch(promise))),
+                "finally" => Ok(Self::promise_native(promises::PromiseFunction::Finally(
+                    promise,
+                ))),
                 _ => Err(runtime_error(format!("promise has no property {property}"))),
             },
             object => Err(runtime_error(format!(
@@ -5072,11 +5074,7 @@ impl ScriptRuntime {
                 if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
                     return Ok(Value::Undefined);
                 }
-                Ok(string
-                    .chars()
-                    .nth(index as usize)
-                    .map(|character| Value::String(character.to_string().into()))
-                    .unwrap_or(Value::Undefined))
+                Ok(strings::unit_at(&string, index as usize).unwrap_or(Value::Undefined))
             }
             Value::FormData(form_data) if index.property_key() == "@@iterator" => {
                 Ok(Value::Builtin(Builtin::FormDataEntries(form_data)))
@@ -8723,90 +8721,6 @@ impl ScriptRuntime {
                 Ok(Value::Range(range))
             }
             Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
-            Builtin::StringSlice(string) => {
-                let length = string.chars().count() as isize;
-                let start = arguments
-                    .first()
-                    .map(Value::number)
-                    .transpose()?
-                    .unwrap_or(0.0) as isize;
-                let end = arguments
-                    .get(1)
-                    .map(Value::number)
-                    .transpose()?
-                    .map(|value| value as isize)
-                    .unwrap_or(length);
-                let start = start.clamp(0, length) as usize;
-                let end = end.clamp(0, length) as usize;
-                let value = string
-                    .chars()
-                    .skip(start.min(end))
-                    .take(end.saturating_sub(start))
-                    .collect::<String>();
-                Ok(Value::String(value.into()))
-            }
-            Builtin::StringIncludes(string) => {
-                let needle = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_else(|| "undefined".to_string());
-                let start = arguments
-                    .get(1)
-                    .map(Value::number)
-                    .transpose()?
-                    .unwrap_or(0.0);
-                let start = if start.is_finite() && start > 0.0 {
-                    start.floor() as usize
-                } else {
-                    0
-                };
-                let haystack = string.chars().skip(start).collect::<String>();
-                Ok(Value::Bool(haystack.contains(&needle)))
-            }
-            Builtin::StringStartsWith(string) => {
-                let needle = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_else(|| "undefined".to_string());
-                Ok(Value::Bool(string.starts_with(&needle)))
-            }
-            Builtin::StringEndsWith(string) => {
-                let needle = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_else(|| "undefined".to_string());
-                Ok(Value::Bool(string.ends_with(&needle)))
-            }
-            Builtin::StringTrim(string) => Ok(Value::String(string.trim().to_string().into())),
-            Builtin::StringToLowerCase(string) => Ok(Value::String(string.to_lowercase().into())),
-            Builtin::StringToUpperCase(string) => Ok(Value::String(string.to_uppercase().into())),
-            Builtin::StringSplit(string) => {
-                let parts = match arguments.first().map(Value::resolve) {
-                    None | Some(Value::Undefined) => vec![string.to_string()],
-                    Some(separator) => {
-                        let separator = separator.string_value();
-                        if separator.is_empty() {
-                            string
-                                .chars()
-                                .map(|character| character.to_string())
-                                .collect()
-                        } else {
-                            string.split(&separator).map(str::to_string).collect()
-                        }
-                    }
-                };
-                if parts.len() > MAX_RUNTIME_ARRAY_LENGTH {
-                    return Err(runtime_error(
-                        "string split exceeds the deterministic array limit",
-                    ));
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(
-                    parts
-                        .into_iter()
-                        .map(|text| Value::String(text.into()))
-                        .collect(),
-                ))))
-            }
             Builtin::SetHas(set) => {
                 let candidate = arguments.first().cloned().unwrap_or(Value::Undefined);
                 Ok(Value::Bool(
@@ -8836,19 +8750,6 @@ impl ScriptRuntime {
                     self.resolve_promise(&promise, value)?;
                 }
                 Ok(Value::Undefined)
-            }
-            Builtin::NumberParseInt => {
-                let source = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let radix = arguments
-                    .get(1)
-                    .map(Value::number)
-                    .transpose()?
-                    .unwrap_or(10.0) as u32;
-                let parsed = parse_integer(&source, radix).unwrap_or(f64::NAN);
-                Ok(Value::Number(parsed))
             }
             Builtin::NumberIsFinite => Ok(Value::Bool(arguments.first().is_some_and(
                 |value| matches!(value, Value::Number(number) if number.is_finite()),
@@ -8929,16 +8830,6 @@ impl ScriptRuntime {
                 Ok(result
                     .map(|value| Value::Number(value as f64))
                     .unwrap_or(Value::Undefined))
-            }
-            Builtin::ConsoleLog => {
-                self.logs.push(
-                    arguments
-                        .iter()
-                        .map(Value::display_string)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
-                Ok(Value::Undefined)
             }
             Builtin::EventPreventDefault(state) => {
                 state.borrow_mut().default_prevented = true;
@@ -9206,7 +9097,7 @@ impl ScriptRuntime {
             }
             Builtin::HistoryPushState => {
                 let state = arguments.first().cloned().unwrap_or(Value::Null);
-                let state = serialize_json(&state)?;
+                let state = self.json_text(&state)?;
                 let reference = arguments
                     .get(2)
                     .map(Value::string_value)
@@ -9219,7 +9110,7 @@ impl ScriptRuntime {
             }
             Builtin::HistoryReplaceState => {
                 let state = arguments.first().cloned().unwrap_or(Value::Null);
-                let state = serialize_json(&state)?;
+                let state = self.json_text(&state)?;
                 let reference = arguments
                     .get(2)
                     .map(Value::string_value)
@@ -10240,17 +10131,6 @@ impl ScriptRuntime {
                     .map(Value::File)
                     .unwrap_or(Value::Null))
             }
-            Builtin::JsonParse => {
-                let source = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                self.parse_json(&source)
-            }
-            Builtin::JsonStringify => {
-                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                serialize_json(&value).map(|text| Value::String(text.into()))
-            }
             Builtin::StructuredClone => {
                 if arguments.len() > 1
                     && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
@@ -10492,7 +10372,7 @@ impl ScriptRuntime {
             )))),
             Builtin::ResponseJsonConstructor => {
                 let data = arguments.first().cloned().unwrap_or(Value::Undefined);
-                let body = serialize_json(&data)?;
+                let body = self.json_text(&data)?;
                 let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                 self.construct_response_parts(
                     Value::String(body.into()),
@@ -10752,6 +10632,15 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::SetTimeout => self.schedule_task(arguments, TaskKind::Timeout),
+            Builtin::SetInterval => self.schedule_task(arguments, TaskKind::Interval(0)),
+            Builtin::QueueMicrotask => {
+                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if !is_callable(&callback) {
+                    return Err(self.type_error("queueMicrotask requires a function"));
+                }
+                self.queue_internal_microtask(callback);
+                Ok(Value::Undefined)
+            }
             Builtin::ClearTimeout => {
                 let id = arguments
                     .first()
@@ -10793,7 +10682,7 @@ impl ScriptRuntime {
                 payload.insert("chromium".to_string(), Value::String(info.chromium.into()));
                 payload.insert("recovery".to_string(), Value::String(info.recovery.into()));
                 payload.insert("session".to_string(), Value::String(info.session.into()));
-                let response = serialize_json(&plain_object(payload))?;
+                let response = self.json_text(&plain_object(payload))?;
                 Ok(Value::Promise(
                     self.fulfilled_promise(Value::String(response.into())),
                 ))
@@ -11287,107 +11176,6 @@ impl ScriptRuntime {
                     .collect();
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
-            Builtin::ArrayMap(array) => {
-                let callback = array_callback(&arguments, "Array.map")?;
-                let values = array.borrow().clone();
-                let mut mapped = Vec::with_capacity(values.len());
-                for (index, value) in values.into_iter().enumerate() {
-                    mapped.push(self.call(
-                        callback.clone(),
-                        vec![
-                            value,
-                            Value::Number(index as f64),
-                            Value::Array(array.clone()),
-                        ],
-                    )?);
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(mapped))))
-            }
-            Builtin::ArrayJoin(array) => {
-                let separator = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_else(|| ",".to_string());
-                let joined = array
-                    .borrow()
-                    .iter()
-                    .map(|value| match value {
-                        Value::Undefined | Value::Null => String::new(),
-                        value => value.string_value(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(&separator);
-                Ok(Value::String(joined.into()))
-            }
-            Builtin::ArrayPush(array) => {
-                let mut array = array.borrow_mut();
-                if array.len().saturating_add(arguments.len()) > MAX_RUNTIME_ARRAY_LENGTH {
-                    return Err(runtime_error(
-                        "array exceeds the deterministic length limit",
-                    ));
-                }
-                array.extend(arguments);
-                Ok(Value::Number(array.len() as f64))
-            }
-            Builtin::ArrayPop(array) => Ok(array.borrow_mut().pop().unwrap_or(Value::Undefined)),
-            Builtin::ArrayForEach(array) => {
-                let callback = array_callback(&arguments, "Array.forEach")?;
-                let values = array.borrow().clone();
-                for (index, value) in values.into_iter().enumerate() {
-                    self.call(
-                        callback.clone(),
-                        vec![
-                            value,
-                            Value::Number(index as f64),
-                            Value::Array(array.clone()),
-                        ],
-                    )?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::ArrayFilter(array) => {
-                let callback = array_callback(&arguments, "Array.filter")?;
-                let values = array.borrow().clone();
-                let mut filtered = Vec::new();
-                for (index, value) in values.into_iter().enumerate() {
-                    let candidate = value.clone();
-                    if self
-                        .call(
-                            callback.clone(),
-                            vec![
-                                value,
-                                Value::Number(index as f64),
-                                Value::Array(array.clone()),
-                            ],
-                        )?
-                        .truthy()
-                    {
-                        filtered.push(candidate);
-                    }
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(filtered))))
-            }
-            Builtin::ArrayFind(array) => {
-                let callback = array_callback(&arguments, "Array.find")?;
-                let values = array.borrow().clone();
-                for (index, value) in values.into_iter().enumerate() {
-                    let candidate = value.clone();
-                    if self
-                        .call(
-                            callback.clone(),
-                            vec![
-                                value,
-                                Value::Number(index as f64),
-                                Value::Array(array.clone()),
-                            ],
-                        )?
-                        .truthy()
-                    {
-                        return Ok(candidate);
-                    }
-                }
-                Ok(Value::Undefined)
-            }
             Builtin::Uint8ArraySet(array) => {
                 let source = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let bytes = uint8_array_source_bytes(source)?;
@@ -11856,9 +11644,7 @@ impl ScriptRuntime {
                     let reason = self.take_thrown(error);
                     self.settle_promise(&next, PromiseOutcome::Rejected(reason));
                 }
-                (MicrotaskKind::Plain, Err(_)) => {
-                    self.pending_exception = None;
-                }
+                (MicrotaskKind::Plain, Err(error)) => self.report_exception(error),
                 (MicrotaskKind::Adopt(_) | MicrotaskKind::Plain, Ok(_)) => {}
             }
             executed += 1;
@@ -12268,12 +12054,16 @@ impl ScriptRuntime {
             return Err(runtime_error("scheduled task must be a function"));
         }
         let delay = match kind {
-            TaskKind::Timeout => arguments
+            TaskKind::Timeout | TaskKind::Interval(_) => arguments
                 .get(1)
                 .map(Value::number)
                 .transpose()?
                 .map_or(0, delay_milliseconds),
             TaskKind::AnimationFrame => 16,
+        };
+        let kind = match kind {
+            TaskKind::Interval(_) => TaskKind::Interval(delay),
+            kind => kind,
         };
         let id = self.next_task_id;
         self.next_task_id = self.next_task_id.saturating_add(1);
@@ -12281,16 +12071,17 @@ impl ScriptRuntime {
             id,
             due: self.clock.saturating_add(delay),
             callback,
+            arguments: arguments.into_iter().skip(2).collect(),
             kind,
         });
         Ok(Value::Number(id as f64))
     }
 
-    fn next_due_task(&self) -> Option<usize> {
+    fn next_due_task(&self, until: u64) -> Option<usize> {
         self.tasks
             .iter()
             .enumerate()
-            .filter(|(_, task)| task.due <= self.clock)
+            .filter(|(_, task)| task.due <= until)
             .min_by_key(|(_, task)| (task.due, task.id))
             .map(|(index, _)| index)
     }
@@ -13384,8 +13175,6 @@ impl Value {
             Self::AbortController(_) => "[object AbortController]".to_string(),
             Self::AbortSignal(_) => "[object AbortSignal]".to_string(),
             Self::Worker(_) => "[object Worker]".to_string(),
-            Self::Console => "[console]".to_string(),
-            Self::Json => "[object JSON]".to_string(),
             Self::WebAssemblyNamespace => "[object WebAssembly]".to_string(),
             Self::ResponseConstructor => "[function Response]".to_string(),
             Self::RequestConstructor => "[function Request]".to_string(),
@@ -13403,10 +13192,6 @@ impl Value {
             Self::VmIterator(_) => "[object Iterator]".to_string(),
             Self::Builtin(_) => "function () { [native code] }".to_string(),
         }
-    }
-
-    fn display_string(&self) -> String {
-        self.string_value()
     }
 
     fn property_key(&self) -> String {
@@ -15061,38 +14846,6 @@ fn read_result(value: Value, done: bool) -> Value {
     plain_object(result)
 }
 
-fn serialize_json(value: &Value) -> Result<String, ScriptError> {
-    let value = value.resolve();
-    match &value {
-        Value::Undefined => Ok("null".to_string()),
-        Value::Null => Ok("null".to_string()),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) if value.is_finite() => Ok(number_to_string(*value)),
-        Value::Number(_) => Ok("null".to_string()),
-        Value::String(value) => Ok(escape_json_string(value)),
-        Value::Array(values) => values
-            .borrow()
-            .iter()
-            .map(serialize_json)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|values| format!("[{}]", values.join(","))),
-        Value::Object(properties) => properties
-            .borrow()
-            .iter()
-            .filter(|(_, value)| !matches!(value, Value::Undefined) && !is_callable(value))
-            .map(|(key, value)| {
-                Ok(format!(
-                    "{}:{}",
-                    escape_json_string(&key),
-                    serialize_json(&value)?
-                ))
-            })
-            .collect::<Result<Vec<_>, ScriptError>>()
-            .map(|properties| format!("{{{}}}", properties.join(","))),
-        _ => Err(runtime_error("value cannot be serialized as JSON")),
-    }
-}
-
 fn canvas_number(arguments: &[Value], index: usize) -> Result<f32, ScriptError> {
     let value = arguments
         .get(index)
@@ -15120,43 +14873,6 @@ fn dataset_attribute_name(property: &str) -> String {
         }
     }
     name
-}
-
-fn parse_integer(source: &str, radix: u32) -> Option<f64> {
-    if !(2..=36).contains(&radix) {
-        return None;
-    }
-    let source = source.trim();
-    let (negative, digits) = source
-        .strip_prefix('-')
-        .map_or((false, source), |digits| (true, digits));
-    let digits = digits.strip_prefix('+').unwrap_or(digits);
-    if digits.is_empty() {
-        return None;
-    }
-    let value = i128::from_str_radix(digits, radix).ok()? as f64;
-    Some(if negative { -value } else { value })
-}
-
-fn escape_json_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + 2);
-    escaped.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character.is_control() => {
-                use std::fmt::Write;
-                let _ = write!(escaped, "\\u{:04x}", character as u32);
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped.push('"');
-    escaped
 }
 
 fn search_component(url: &AppUrl) -> String {
@@ -15334,16 +15050,6 @@ fn normalize_blob_type(value: &str) -> String {
 }
 
 const MAX_TYPED_ARRAY_BYTES: usize = 16 * 1024 * 1024;
-
-fn array_callback(arguments: &[Value], method: &str) -> Result<Value, ScriptError> {
-    let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-    if !is_callable(&callback) {
-        return Err(runtime_error(format!(
-            "{method} callback must be a function"
-        )));
-    }
-    Ok(callback)
-}
 
 fn enumerable_object_properties(value: Value) -> Result<Vec<(String, Value)>, ScriptError> {
     let properties = match value.resolve() {
@@ -16933,8 +16639,6 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::AbortController(_)
         | Value::AbortSignal(_)
         | Value::Worker(_)
-        | Value::Console
-        | Value::Json
         | Value::WebAssemblyNamespace
         | Value::Error(_) => "object",
         Value::Bool(_) => "boolean",
@@ -17426,8 +17130,6 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Navigator, Value::Navigator)
         | (Value::Document, Value::Document)
         | (Value::Window, Value::Window)
-        | (Value::Console, Value::Console)
-        | (Value::Json, Value::Json)
         | (Value::WebAssemblyNamespace, Value::WebAssemblyNamespace)
         | (Value::ResponseConstructor, Value::ResponseConstructor)
         | (Value::RequestConstructor, Value::RequestConstructor)
@@ -17674,7 +17376,8 @@ fn fetch_redirect_mode_name(mode: FetchRedirectMode) -> String {
     .to_string()
 }
 
-const MAX_USER_ITERATOR_VALUES: usize = 10_000;
+// unit tests drive an endless iterator into this limit, so they use a smaller one
+const MAX_USER_ITERATOR_VALUES: usize = if cfg!(test) { 10_000 } else { 1 << 22 };
 
 struct FetchOptions {
     method: String,
@@ -24232,7 +23935,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some(
-                "0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.filter callback must be a function"
+                "0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.prototype.filter callback is not a function"
             )
         );
     }

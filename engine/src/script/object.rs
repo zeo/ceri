@@ -72,6 +72,7 @@ pub(super) enum ObjectClass {
     AsyncGenerator(Rc<RefCell<super::vm::AsyncGeneratorData>>),
     // a function implemented by the engine, such as Object.keys
     Native(super::realm::Native),
+    RegExp(Rc<super::pattern::RegExpData>),
 }
 
 #[derive(Clone)]

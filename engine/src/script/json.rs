@@ -1,10 +1,9 @@
-// JSON.parse per ECMA-404: a strict recursive descent over the text, building plain objects
-// in source order and arrays
+// JSON.parse per ECMA-404, a strict recursive descent that builds plain objects in source
+// order, plus the reviver walk and JSON.stringify with toJSON, replacers and indentation
 
-use super::Value;
-use super::object::{JsObject, new_object};
-use std::cell::RefCell;
-use std::rc::Rc;
+use super::object::{JsObject, ObjectClass, is_private_key, is_symbol_key, new_object};
+use super::operations::{is_callable, is_primitive};
+use super::*;
 
 const MAX_DEPTH: usize = 512;
 
@@ -248,6 +247,324 @@ impl JsonParser<'_> {
             .parse::<f64>()
             .map(Value::Number)
             .map_err(|_| self.unexpected())
+    }
+}
+
+// JSON.stringify's string quoting
+pub(super) fn quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{8}' => quoted.push_str("\\b"),
+            '\u{c}' => quoted.push_str("\\f"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                quoted.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+struct Stringifier {
+    replacer: Option<Value>,
+    allowed: Option<Vec<String>>,
+    gap: String,
+    indent: String,
+    stack: Vec<usize>,
+}
+
+fn identity(value: &Value) -> Option<usize> {
+    match value {
+        Value::Object(object) => Some(Rc::as_ptr(object) as *const u8 as usize),
+        Value::Array(array) => Some(Rc::as_ptr(array) as *const u8 as usize),
+        _ => None,
+    }
+}
+
+impl ScriptRuntime {
+    pub(super) fn json_parse(&mut self, text: Value, reviver: Value) -> Result<Value, ScriptError> {
+        let text = self.coerce_string(text)?;
+        let value = parse(&text).map_err(|message| self.throw_error("SyntaxError", message))?;
+        if !is_callable(&reviver) {
+            return Ok(value);
+        }
+        let root = self.new_plain_object();
+        root.borrow_mut().insert(String::new(), value);
+        self.internalize(Value::Object(root), String::new(), &reviver)
+    }
+
+    fn internalize(
+        &mut self,
+        holder: Value,
+        key: String,
+        reviver: &Value,
+    ) -> Result<Value, ScriptError> {
+        let value = self.get_property(&holder, &key)?;
+        match &value {
+            Value::Array(array) => {
+                let length = array.borrow().len();
+                for index in 0..length {
+                    let element = self.internalize(value.clone(), index.to_string(), reviver)?;
+                    if let Some(slot) = array.borrow_mut().get_mut(index) {
+                        *slot = element;
+                    }
+                }
+            }
+            Value::Object(_) => {
+                let keys: Vec<String> = self
+                    .own_enumerable_entries(&value)?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .filter(|key| !is_symbol_key(key))
+                    .collect();
+                for name in keys {
+                    let element = self.internalize(value.clone(), name.clone(), reviver)?;
+                    if matches!(element, Value::Undefined) {
+                        self.delete_property(&value, &name, false)?;
+                    } else if let Value::Object(object) = &value {
+                        object
+                            .borrow_mut()
+                            .define(name, object::Property::data(element));
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.call_function(
+            reviver.clone(),
+            holder,
+            vec![Value::String(key.into()), value],
+        )
+    }
+
+    // JSON.stringify; None is the undefined result for values JSON cannot represent
+    pub(super) fn json_stringify(
+        &mut self,
+        value: Value,
+        replacer: Value,
+        space: Value,
+    ) -> Result<Option<String>, ScriptError> {
+        let mut stringifier = Stringifier {
+            replacer: None,
+            allowed: None,
+            gap: String::new(),
+            indent: String::new(),
+            stack: Vec::new(),
+        };
+        if is_callable(&replacer) {
+            stringifier.replacer = Some(replacer);
+        } else if let Value::Array(list) = &replacer {
+            let mut allowed = Vec::new();
+            let items = list.borrow().clone();
+            for item in items {
+                let wrapped = matches!(&item, Value::Object(object) if matches!(object.borrow().class, ObjectClass::String(_) | ObjectClass::Number(_)));
+                let key = match &item {
+                    Value::String(text) => Some(text.to_string()),
+                    Value::Number(number) => Some(number_to_string(*number)),
+                    _ if wrapped => Some(self.coerce_string(item.clone())?),
+                    _ => None,
+                };
+                if let Some(key) = key
+                    && !allowed.contains(&key)
+                {
+                    allowed.push(key);
+                }
+            }
+            stringifier.allowed = Some(allowed);
+        }
+        let space = match &space {
+            Value::Object(object) => match &object.borrow().class {
+                ObjectClass::Number(number) => Value::Number(*number),
+                ObjectClass::String(text) => Value::String(text.as_str().into()),
+                _ => space.clone(),
+            },
+            _ => space,
+        };
+        stringifier.gap = match space {
+            Value::Number(number) => " ".repeat(number.clamp(0.0, 10.0) as usize),
+            Value::String(text) => text.chars().take(10).collect(),
+            _ => String::new(),
+        };
+        let wrapper = self.new_plain_object();
+        wrapper.borrow_mut().insert(String::new(), value);
+        self.serialize_property(&mut stringifier, String::new(), &Value::Object(wrapper))
+    }
+
+    fn serialize_property(
+        &mut self,
+        state: &mut Stringifier,
+        key: String,
+        holder: &Value,
+    ) -> Result<Option<String>, ScriptError> {
+        let mut value = match holder {
+            Value::Array(array) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| array.borrow().get(index).cloned())
+                .unwrap_or(Value::Undefined),
+            _ => self.get_property(holder, &key)?,
+        };
+        if !is_primitive(&value) {
+            let to_json = self.get_property(&value, "toJSON")?;
+            if is_callable(&to_json) {
+                value =
+                    self.call_function(to_json, value, vec![Value::String(key.as_str().into())])?;
+            }
+        }
+        if let Some(replacer) = state.replacer.clone() {
+            value = self.call_function(
+                replacer,
+                holder.clone(),
+                vec![Value::String(key.as_str().into()), value],
+            )?;
+        }
+        let unwrapped = match &value {
+            Value::Object(object) => match &object.borrow().class {
+                ObjectClass::Number(_) => Some(1),
+                ObjectClass::String(_) => Some(2),
+                ObjectClass::Boolean(_) => Some(3),
+                _ => None,
+            },
+            _ => None,
+        };
+        value = match unwrapped {
+            Some(1) => Value::Number(self.coerce_number(value)?),
+            Some(2) => Value::String(self.coerce_string(value)?.into()),
+            Some(_) => match &value {
+                Value::Object(object) => match &object.borrow().class {
+                    ObjectClass::Boolean(flag) => Value::Bool(*flag),
+                    _ => Value::Undefined,
+                },
+                _ => Value::Undefined,
+            },
+            None => value,
+        };
+        Ok(match value {
+            Value::Null => Some("null".to_string()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            Value::String(text) => Some(quote(&text)),
+            Value::Number(number) if number.is_finite() => Some(number_to_string(number)),
+            Value::Number(_) => Some("null".to_string()),
+            Value::Undefined | Value::Symbol(_) | Value::Uninitialized => None,
+            ref callable if is_callable(callable) => None,
+            Value::Array(_) => Some(self.serialize_array(state, &value)?),
+            _ => Some(self.serialize_object(state, &value)?),
+        })
+    }
+
+    fn enter(&mut self, state: &mut Stringifier, value: &Value) -> Result<(), ScriptError> {
+        if let Some(address) = identity(value) {
+            if state.stack.contains(&address) {
+                return Err(self.type_error("Converting circular structure to JSON"));
+            }
+            state.stack.push(address);
+        }
+        if state.stack.len() > 1000 {
+            return Err(self.range_error("JSON nesting exceeds the depth limit"));
+        }
+        Ok(())
+    }
+
+    fn serialize_object(
+        &mut self,
+        state: &mut Stringifier,
+        value: &Value,
+    ) -> Result<String, ScriptError> {
+        self.enter(state, value)?;
+        let stepback = state.indent.clone();
+        state.indent = format!("{}{}", state.indent, state.gap);
+        let keys: Vec<String> = match &state.allowed {
+            Some(allowed) => allowed.clone(),
+            None => match value {
+                Value::Object(object) => {
+                    let borrowed = object.borrow();
+                    borrowed
+                        .ordered_keys()
+                        .into_iter()
+                        .filter(|key| !is_symbol_key(key) && !is_private_key(key))
+                        .filter(|key| {
+                            borrowed
+                                .property(key)
+                                .is_some_and(|property| property.enumerable)
+                        })
+                        .collect()
+                }
+                other => enumerable_object_properties(other.clone())?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect(),
+            },
+        };
+        let mut parts = Vec::new();
+        for key in keys {
+            if let Some(text) = self.serialize_property(state, key.clone(), value)? {
+                let separator = if state.gap.is_empty() { ":" } else { ": " };
+                parts.push(format!("{}{separator}{text}", quote(&key)));
+            }
+        }
+        let text = if parts.is_empty() {
+            "{}".to_string()
+        } else if state.gap.is_empty() {
+            format!("{{{}}}", parts.join(","))
+        } else {
+            let separator = format!(",\n{}", state.indent);
+            format!(
+                "{{\n{}{}\n{stepback}}}",
+                state.indent,
+                parts.join(&separator)
+            )
+        };
+        if identity(value).is_some() {
+            state.stack.pop();
+        }
+        state.indent = stepback;
+        Ok(text)
+    }
+
+    fn serialize_array(
+        &mut self,
+        state: &mut Stringifier,
+        value: &Value,
+    ) -> Result<String, ScriptError> {
+        self.enter(state, value)?;
+        let stepback = state.indent.clone();
+        state.indent = format!("{}{}", state.indent, state.gap);
+        let length = match value {
+            Value::Array(array) => array.borrow().len(),
+            _ => 0,
+        };
+        let mut parts = Vec::with_capacity(length);
+        for index in 0..length {
+            let text = self.serialize_property(state, index.to_string(), value)?;
+            parts.push(text.unwrap_or_else(|| "null".to_string()));
+        }
+        let text = if parts.is_empty() {
+            "[]".to_string()
+        } else if state.gap.is_empty() {
+            format!("[{}]", parts.join(","))
+        } else {
+            let separator = format!(",\n{}", state.indent);
+            format!("[\n{}{}\n{stepback}]", state.indent, parts.join(&separator))
+        };
+        state.stack.pop();
+        state.indent = stepback;
+        Ok(text)
+    }
+
+    // JSON text for host APIs such as Response.json() and history state snapshots
+    pub(super) fn json_text(&mut self, value: &Value) -> Result<String, ScriptError> {
+        match self.json_stringify(value.clone(), Value::Undefined, Value::Undefined)? {
+            Some(text) => Ok(text),
+            None => Err(self.type_error("Value is not JSON serializable")),
+        }
     }
 }
 

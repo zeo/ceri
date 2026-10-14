@@ -90,6 +90,21 @@ pub(super) enum Native {
     AsyncGeneratorThrow,
     AsyncResume(AsyncResumeHandle, bool),
     IterResultWrap(bool),
+    Array(super::arrays::ArrayMethod),
+    String(super::strings::StringMethod),
+    Math(super::numbers::MathFunction),
+    NumberFormat(super::numbers::NumberFormat),
+    RegExp(super::regexp::RegExpMethod),
+    Console(super::console::ConsoleMethod),
+    Promise(Rc<super::promises::PromiseFunction>),
+    ParseInt,
+    ParseFloat,
+    GlobalIsNaN,
+    GlobalIsFinite,
+    StringRaw,
+    StringFromCodePoint,
+    JsonParse,
+    JsonStringify,
 }
 
 impl Native {
@@ -103,6 +118,7 @@ impl Native {
                 | Native::NumberConstructor
                 | Native::StringConstructor
                 | Native::ArrayConstructor
+                | Native::RegExp(super::regexp::RegExpMethod::Constructor)
         )
     }
 }
@@ -449,8 +465,33 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     ));
     build.method(&number_prototype, "toString", Native::NumberToString, 1);
     build.method(&number_prototype, "valueOf", Native::NumberValueOf, 0);
+    for (key, format, length) in [
+        ("toFixed", super::numbers::NumberFormat::Fixed, 1),
+        ("toPrecision", super::numbers::NumberFormat::Precision, 1),
+        (
+            "toExponential",
+            super::numbers::NumberFormat::Exponential,
+            1,
+        ),
+        ("toLocaleString", super::numbers::NumberFormat::Locale, 0),
+    ] {
+        build.method(&number_prototype, key, Native::NumberFormat(format), length);
+    }
     let number = build.constructor(Native::NumberConstructor, "Number", 1, &number_prototype);
-    build.value(&number, "parseInt", Value::Builtin(Builtin::NumberParseInt));
+    let parse_int = Value::Object(build.function(Native::ParseInt, "parseInt", 2));
+    let parse_float = Value::Object(build.function(Native::ParseFloat, "parseFloat", 1));
+    build.value(&number, "parseInt", parse_int.clone());
+    build.value(&number, "parseFloat", parse_float.clone());
+    globals.push(("parseInt", parse_int));
+    globals.push(("parseFloat", parse_float));
+    globals.push((
+        "isNaN",
+        Value::Object(build.function(Native::GlobalIsNaN, "isNaN", 1)),
+    ));
+    globals.push((
+        "isFinite",
+        Value::Object(build.function(Native::GlobalIsFinite, "isFinite", 1)),
+    ));
     build.value(&number, "isFinite", Value::Builtin(Builtin::NumberIsFinite));
     build.method(&number, "isInteger", Native::NumberIsInteger, 1);
     build.method(&number, "isSafeInteger", Native::NumberIsSafeInteger, 1);
@@ -477,8 +518,13 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     ));
     build.method(&string_prototype, "toString", Native::StringToString, 0);
     build.method(&string_prototype, "valueOf", Native::StringToString, 0);
+    for (key, method, length) in super::strings::STRING_METHODS {
+        build.method(&string_prototype, key, Native::String(*method), *length);
+    }
     let string = build.constructor(Native::StringConstructor, "String", 1, &string_prototype);
     build.method(&string, "fromCharCode", Native::StringFromCharCode, 1);
+    build.method(&string, "fromCodePoint", Native::StringFromCodePoint, 1);
+    build.method(&string, "raw", Native::StringRaw, 1);
     globals.push(("String", Value::Object(string)));
 
     let iterator_prototype = plain(&object_prototype);
@@ -497,6 +543,9 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(&array_prototype, "@@iterator", array_values.clone());
     build.method(&array_prototype, "keys", Native::ArrayKeys, 0);
     build.method(&array_prototype, "entries", Native::ArrayEntries, 0);
+    for (key, method, length) in super::arrays::ARRAY_METHODS {
+        build.method(&array_prototype, key, Native::Array(*method), *length);
+    }
     let array = build.constructor(Native::ArrayConstructor, "Array", 1, &array_prototype);
     build.value(&array, "isArray", Value::Builtin(Builtin::ArrayIsArray));
     build.method(&array, "from", Native::ArrayFrom, 1);
@@ -567,6 +616,42 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         Value::String("Promise".to_string().into()),
     );
     let regexp_prototype = plain(&object_prototype);
+    for (key, method, length) in super::regexp::REGEXP_METHODS {
+        build.method(&regexp_prototype, key, Native::RegExp(*method), *length);
+    }
+    for (key, method) in super::regexp::REGEXP_GETTERS {
+        build.getter(&regexp_prototype, key, Native::RegExp(*method), None);
+    }
+    let regexp = build.constructor(
+        Native::RegExp(super::regexp::RegExpMethod::Constructor),
+        "RegExp",
+        2,
+        &regexp_prototype,
+    );
+    globals.push(("RegExp", Value::Object(regexp)));
+
+    let math = plain(&object_prototype);
+    for (key, function, length) in super::numbers::MATH_FUNCTIONS {
+        build.method(&math, key, Native::Math(*function), *length);
+    }
+    for (key, value) in super::numbers::MATH_CONSTANTS {
+        math.borrow_mut()
+            .define(key.to_string(), fixed(Value::Number(*value)));
+    }
+    build.value(&math, "@@toStringTag", Value::String("Math".into()));
+    globals.push(("Math", Value::Object(math)));
+
+    let json = plain(&object_prototype);
+    build.method(&json, "parse", Native::JsonParse, 2);
+    build.method(&json, "stringify", Native::JsonStringify, 3);
+    build.value(&json, "@@toStringTag", Value::String("JSON".into()));
+    globals.push(("JSON", Value::Object(json)));
+
+    let console = plain(&object_prototype);
+    for (key, method) in super::console::CONSOLE_METHODS {
+        build.method(&console, key, Native::Console(*method), 0);
+    }
+    globals.push(("console", Value::Object(console)));
 
     globals.push(("globalThis", Value::Window));
     globals.push(("NaN", Value::Number(f64::NAN)));
@@ -701,7 +786,7 @@ impl ScriptRuntime {
                 if let ObjectClass::String(text) = &borrowed.class
                     && !symbols
                 {
-                    let mut indices: Vec<String> = (0..text.chars().count())
+                    let mut indices: Vec<String> = (0..super::strings::utf16_length(text))
                         .map(|index| index.to_string())
                         .collect();
                     indices.push("length".to_string());
@@ -717,7 +802,7 @@ impl ScriptRuntime {
                 keys
             }
             Value::String(text) if !symbols => {
-                let mut keys: Vec<String> = (0..text.chars().count())
+                let mut keys: Vec<String> = (0..super::strings::utf16_length(text))
                     .map(|index| index.to_string())
                     .collect();
                 keys.push("length".to_string());
@@ -929,20 +1014,7 @@ impl ScriptRuntime {
         match value {
             Value::Undefined | Value::Null => Ok(Vec::new()),
             Value::Array(array) => Ok(array.borrow().clone()),
-            Value::Object(_) => {
-                let length = self.get_property(value, "length")?;
-                let length = self.coerce_number(length)?;
-                let length = if length.is_nan() || length <= 0.0 {
-                    0
-                } else {
-                    length.min(MAX_RUNTIME_ARRAY_LENGTH as f64) as usize
-                };
-                let mut values = Vec::with_capacity(length);
-                for index in 0..length {
-                    values.push(self.get_property(value, &index.to_string())?);
-                }
-                Ok(values)
-            }
+            Value::Object(_) => self.array_like_list(value),
             _ => Err(self.type_error("CreateListFromArrayLike called on non-object")),
         }
     }
@@ -1557,6 +1629,67 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Native::IterResultWrap(done) => Ok(self.iterator_result(first, done)),
+            Native::Array(method) => self.call_array_method(method, this, arguments),
+            Native::String(method) => self.call_string_method(method, this, arguments),
+            Native::Math(function) => self.call_math(function, arguments),
+            Native::NumberFormat(format) => {
+                let number = self.this_number(&this, "toFixed")?;
+                self.format_number(format, number, first)
+            }
+            Native::RegExp(method) => self.call_regexp(method, this, arguments, None),
+            Native::Console(method) => self.call_console(method, arguments),
+            Native::Promise(function) => self.call_promise_function((*function).clone(), arguments),
+            Native::ParseInt => {
+                let text = self.coerce_string(first)?;
+                let radix = self.coerce_int32(argument(&arguments, 1))?;
+                Ok(Value::Number(super::numbers::parse_int(&text, radix)))
+            }
+            Native::ParseFloat => {
+                let text = self.coerce_string(first)?;
+                Ok(Value::Number(super::numbers::parse_float(&text)))
+            }
+            Native::GlobalIsNaN => Ok(Value::Bool(self.coerce_number(first)?.is_nan())),
+            Native::GlobalIsFinite => Ok(Value::Bool(self.coerce_number(first)?.is_finite())),
+            Native::StringRaw => {
+                let strings = first;
+                let raw = self.get_property(&strings, "raw")?;
+                let parts = self.array_like_list(&raw)?;
+                let mut text = String::new();
+                for (index, part) in parts.iter().enumerate() {
+                    text.push_str(&self.coerce_string(part.clone())?);
+                    if index + 1 < parts.len()
+                        && let Some(substitution) = arguments.get(index + 1)
+                    {
+                        text.push_str(&self.coerce_string(substitution.clone())?);
+                    }
+                }
+                Ok(Value::String(text.into()))
+            }
+            Native::StringFromCodePoint => {
+                let mut text = String::with_capacity(arguments.len());
+                for value in arguments {
+                    let number = self.coerce_number(value)?;
+                    let character = (number.fract() == 0.0
+                        && (0.0..=1_114_111.0).contains(&number))
+                    .then(|| char::from_u32(number as u32).unwrap_or('\u{fffd}'));
+                    match character {
+                        Some(character) => text.push(character),
+                        None => {
+                            return Err(self.range_error(format!(
+                                "Invalid code point {}",
+                                number_to_string(number)
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::String(text.into()))
+            }
+            Native::JsonParse => self.json_parse(first, argument(&arguments, 1)),
+            Native::JsonStringify => {
+                let text =
+                    self.json_stringify(first, argument(&arguments, 1), argument(&arguments, 2))?;
+                Ok(text.map_or(Value::Undefined, |text| Value::String(text.into())))
+            }
         }
     }
 
@@ -1642,6 +1775,9 @@ impl ScriptRuntime {
                     arguments
                 };
                 Ok(Self::new_array(values))
+            }
+            Native::RegExp(method) => {
+                self.call_regexp(method, Value::Undefined, arguments, Some(new_target))
             }
             other => {
                 let name = format!("{other:?}");
@@ -1742,11 +1878,13 @@ fn to_uint32_from(value: f64) -> u32 {
 
 fn string_own_property(text: &str, key: &str) -> Option<Property> {
     if key == "length" {
-        return Some(fixed(Value::Number(text.chars().count() as f64)));
+        return Some(fixed(Value::Number(
+            super::strings::utf16_length(text) as f64
+        )));
     }
     let index = array_index(key)?;
-    text.chars().nth(index as usize).map(|character| Property {
-        slot: Slot::Data(Value::String(character.to_string().into())),
+    super::strings::unit_at(text, index as usize).map(|unit| Property {
+        slot: Slot::Data(unit),
         enumerable: true,
         writable: false,
         configurable: false,
