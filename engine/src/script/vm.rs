@@ -249,7 +249,7 @@ impl ScriptRuntime {
         object.define(
             "name".to_string(),
             Property {
-                slot: Slot::Data(Value::String(code.name.to_string())),
+                slot: Slot::Data(Value::String(code.name.to_string().into())),
                 enumerable: false,
                 writable: false,
                 configurable: true,
@@ -701,7 +701,7 @@ impl ScriptRuntime {
             let message = self.coerce_string(message.clone())?;
             object.define(
                 "message".to_string(),
-                Property::hidden(Value::String(message)),
+                Property::hidden(Value::String(message.into())),
             );
         }
         if let Some(Value::Object(options)) = arguments.get(1)
@@ -711,7 +711,7 @@ impl ScriptRuntime {
         }
         object.define(
             "stack".to_string(),
-            Property::hidden(Value::String(String::new())),
+            Property::hidden(Value::String(String::new().into())),
         );
         Ok(Value::Object(new_object(object)))
     }
@@ -895,7 +895,7 @@ impl ScriptRuntime {
             Op::Number(value) => frame.stack.push(Value::Number(value)),
             Op::String(index) => {
                 let text = frame.code.names[index as usize].to_string();
-                frame.stack.push(Value::String(text));
+                frame.stack.push(Value::String(text.into()));
             }
             Op::Regex { pattern, flags } => {
                 let pattern = frame.code.names[pattern as usize].to_string();
@@ -1051,7 +1051,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(kind.to_string()));
+                    .push(Value::String(kind.to_string().into()));
             }
             Op::SetGlobal(name) | Op::InitGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
@@ -1131,7 +1131,7 @@ impl ScriptRuntime {
                 let meta = self.new_plain_object();
                 if let Some(url) = url {
                     meta.borrow_mut()
-                        .insert("url".to_string(), Value::String(url.to_string()));
+                        .insert("url".to_string(), Value::String(url.to_string().into()));
                 }
                 frames
                     .last_mut()
@@ -1368,7 +1368,7 @@ impl ScriptRuntime {
                     "{}{}:{}",
                     PRIVATE_PREFIX, self.private_names, frame.code.names[name as usize]
                 );
-                frame.stack.push(Value::String(key));
+                frame.stack.push(Value::String(key.into()));
             }
             Op::Call(count) | Op::CallMethod(count) => {
                 let arguments = Self::pop_arguments(frame, count as usize);
@@ -1598,7 +1598,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(kind.to_string()));
+                    .push(Value::String(kind.to_string().into()));
             }
             Op::ToPropertyKey => {
                 let value = Self::pop(frame);
@@ -1607,7 +1607,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(key));
+                    .push(Value::String(key.into()));
             }
             Op::Increment | Op::Decrement => {
                 let value = Self::pop(frame);
@@ -1642,7 +1642,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(text));
+                    .push(Value::String(text.into()));
             }
             Op::Jump(target) => frame.pc = target as usize,
             Op::JumpIfFalse(target) => {
@@ -1765,7 +1765,7 @@ impl ScriptRuntime {
                         .last_mut()
                         .expect("frame")
                         .stack
-                        .push(Value::String(key)),
+                        .push(Value::String(key.into())),
                     None => frames.last_mut().expect("frame").pc = target as usize,
                 }
             }
@@ -2235,7 +2235,7 @@ impl ScriptRuntime {
                 self.settle_promise(
                     &promise,
                     PromiseOutcome::Rejected(Value::String(
-                        "yield in an async function".to_string(),
+                        "yield in an async function".to_string().into(),
                     )),
                 );
             }

@@ -71,7 +71,7 @@ impl JsonParser<'_> {
         match self.bytes.get(self.position) {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(Value::String),
+            Some(b'"') => self.string().map(|text| Value::String(text.into())),
             Some(b't') => self.literal("true", Value::Bool(true)),
             Some(b'f') => self.literal("false", Value::Bool(false)),
             Some(b'n') => self.literal("null", Value::Null),
@@ -265,7 +265,7 @@ mod tests {
         let object = object.borrow();
         assert_eq!(object.keys().collect::<Vec<_>>(), ["b", "a"]);
         assert!(
-            matches!(object.get("a"), Some(Value::String(text)) if text == "x\u{e9}\u{1f600}\n")
+            matches!(object.get("a"), Some(Value::String(text)) if &**text == "x\u{e9}\u{1f600}\n")
         );
         let Some(Value::Array(array)) = object.get("b") else {
             panic!("expected an array");

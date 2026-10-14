@@ -107,7 +107,7 @@ enum Value {
     Null,
     Bool(bool),
     Number(f64),
-    String(String),
+    String(Rc<str>),
     Symbol(String),
     Binding(Rc<RefCell<Value>>, bool),
     Object(ObjectHandle),
@@ -378,14 +378,14 @@ enum Builtin {
     Uint8ArraySet(Uint8ArrayHandle),
     Uint8ArraySlice(Uint8ArrayHandle),
     Uint8ArraySubarray(Uint8ArrayHandle),
-    StringSlice(String),
-    StringIncludes(String),
-    StringStartsWith(String),
-    StringEndsWith(String),
-    StringTrim(String),
-    StringToLowerCase(String),
-    StringToUpperCase(String),
-    StringSplit(String),
+    StringSlice(Rc<str>),
+    StringIncludes(Rc<str>),
+    StringStartsWith(Rc<str>),
+    StringEndsWith(Rc<str>),
+    StringTrim(Rc<str>),
+    StringToLowerCase(Rc<str>),
+    StringToUpperCase(Rc<str>),
+    StringSplit(Rc<str>),
     MapGet(MapHandle),
     MapSet(MapHandle),
     MapKeys(MapHandle),
@@ -2929,10 +2929,10 @@ impl ScriptRuntime {
             self.set_range_text(
                 &path,
                 &[
-                    Value::String("\n".to_string()),
+                    Value::String("\n".to_string().into()),
                     Value::Number(selection.start as f64),
                     Value::Number(selection.end as f64),
-                    Value::String("end".to_string()),
+                    Value::String("end".to_string().into()),
                 ],
             )?;
             return Ok(true);
@@ -3036,10 +3036,10 @@ impl ScriptRuntime {
             self.set_range_text(
                 &path,
                 &[
-                    Value::String(String::new()),
+                    Value::String(String::new().into()),
                     Value::Number(start as f64),
                     Value::Number(end as f64),
-                    Value::String("start".to_string()),
+                    Value::String("start".to_string().into()),
                 ],
             )?;
             return Ok(true);
@@ -3908,7 +3908,7 @@ impl ScriptRuntime {
                 let path = attached_path(&handle);
                 let value = match property {
                     "nodeType" => Value::Number(if attached_is_text(&handle) { 3.0 } else { 1.0 }),
-                    "nodeName" => Value::String(self.element_node_name(&handle)),
+                    "nodeName" => Value::String(self.element_node_name(&handle).into()),
                     "nodeValue" | "data" => self.element_node_value(&handle),
                     "splitText" if attached_is_text(&handle) => {
                         Value::Builtin(Builtin::ElementSplitText(handle.clone()))
@@ -3931,23 +3931,23 @@ impl ScriptRuntime {
                     }
                     "textContent" => self
                         .element_text_content(&handle)
-                        .map(Value::String)
+                        .map(|text| Value::String(text.into()))
                         .unwrap_or(Value::Undefined),
                     "className" => self
                         .element_attribute(&handle, "class")
-                        .map(Value::String)
-                        .unwrap_or_else(|| Value::String(String::new())),
+                        .map(|text| Value::String(text.into()))
+                        .unwrap_or_else(|| Value::String(String::new().into())),
                     "id" => self
                         .element_attribute(&handle, "id")
-                        .map(Value::String)
-                        .unwrap_or_else(|| Value::String(String::new())),
+                        .map(|text| Value::String(text.into()))
+                        .unwrap_or_else(|| Value::String(String::new().into())),
                     "innerHTML" => self
                         .element_inner_html(&handle)
-                        .map(Value::String)
-                        .unwrap_or_else(|| Value::String(String::new())),
+                        .map(|text| Value::String(text.into()))
+                        .unwrap_or_else(|| Value::String(String::new().into())),
                     "outerHTML" => self
                         .element_outer_html(&handle)
-                        .map(Value::String)
+                        .map(|text| Value::String(text.into()))
                         .unwrap_or(Value::Undefined),
                     "childNodes" => self.element_child_nodes(&handle),
                     "children" => self.element_children(&handle),
@@ -3993,8 +3993,8 @@ impl ScriptRuntime {
                     "files" => self.element_files(&handle),
                     "value" => self
                         .element_value(&handle)
-                        .map(Value::String)
-                        .unwrap_or_else(|| Value::String(String::new())),
+                        .map(|text| Value::String(text.into()))
+                        .unwrap_or_else(|| Value::String(String::new().into())),
                     "form" => self.element_form(&handle),
                     "elements" => self.element_form_elements(&handle),
                     "defaultValue" => self.element_default_value(&handle),
@@ -4019,7 +4019,8 @@ impl ScriptRuntime {
                     "text" => Value::String(
                         path.as_ref()
                             .and_then(|path| self.document.borrow().element_text_content(path))
-                            .unwrap_or_default(),
+                            .unwrap_or_default()
+                            .into(),
                     ),
                     "validity" => self.element_validity(&handle),
                     "willValidate" => Value::Bool(
@@ -4029,7 +4030,8 @@ impl ScriptRuntime {
                     "validationMessage" => Value::String(
                         path.as_ref()
                             .map(|path| self.validation_message(path))
-                            .unwrap_or_default(),
+                            .unwrap_or_default()
+                            .into(),
                     ),
                     "required" => {
                         Value::Bool(self.element_attribute(&handle, "required").is_some())
@@ -4400,7 +4402,8 @@ impl ScriptRuntime {
                             }
                             _ => "none",
                         }
-                        .to_string(),
+                        .to_string()
+                        .into(),
                     )),
                     _ => Err(runtime_error(format!(
                         "Selection has no property {property}"
@@ -4409,8 +4412,8 @@ impl ScriptRuntime {
             }
             Value::Style(handle) => Ok(self
                 .element_style_property(&handle, property)
-                .map(Value::String)
-                .unwrap_or_else(|| Value::String(String::new()))),
+                .map(|text| Value::String(text.into()))
+                .unwrap_or_else(|| Value::String(String::new().into()))),
             Value::ClassList(handle) => match property {
                 "add" => Ok(Value::Builtin(Builtin::ElementClassListAdd(handle))),
                 "remove" => Ok(Value::Builtin(Builtin::ElementClassListRemove(handle))),
@@ -4421,12 +4424,12 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Event(event) => match property {
-                "type" => Ok(Value::String(event.event_type.clone())),
+                "type" => Ok(Value::String(event.event_type.clone().into())),
                 "target" => Ok(node_value(event.target.clone(), &self.document)),
                 "currentTarget" => Ok(node_value(event.current_target.clone(), &self.document)),
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
-                "key" => Ok(Value::String(event.key.clone())),
+                "key" => Ok(Value::String(event.key.clone().into())),
                 "shiftKey" => Ok(Value::Bool(event.modifiers.shift)),
                 "ctrlKey" => Ok(Value::Bool(event.modifiers.control)),
                 "altKey" => Ok(Value::Bool(event.modifiers.alt)),
@@ -4438,21 +4441,22 @@ impl ScriptRuntime {
                         .motion
                         .as_ref()
                         .map(|motion| motion.0.clone())
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into(),
                 )),
                 "elapsedTime" => Ok(Value::Number(
                     event.motion.as_ref().map_or(0.0, |motion| motion.1),
                 )),
-                "pseudoElement" => Ok(Value::String(String::new())),
+                "pseudoElement" => Ok(Value::String(String::new().into())),
                 "data" => Ok(event
                     .data_value
                     .as_ref()
                     .map(|value| (**value).clone())
-                    .unwrap_or_else(|| Value::String(event.data.clone()))),
+                    .unwrap_or_else(|| Value::String(event.data.clone().into()))),
                 "message" => Ok(event
                     .error_message
                     .clone()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Undefined)),
                 "preventDefault" => Ok(Value::Builtin(Builtin::EventPreventDefault(
                     event.state.clone(),
@@ -4462,22 +4466,28 @@ impl ScriptRuntime {
             Value::Location(url) => {
                 let url = url.borrow();
                 match property {
-                    "href" => Ok(Value::String(url.to_string())),
-                    "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
-                    "protocol" => Ok(Value::String("https:".to_string())),
-                    "host" => Ok(Value::String("app.ceri.invalid".to_string())),
-                    "hostname" => Ok(Value::String("app.ceri.invalid".to_string())),
-                    "pathname" => Ok(Value::String(url.path().to_string())),
-                    "search" => Ok(Value::String(if url.query().is_empty() {
-                        String::new()
-                    } else {
-                        format!("?{}", url.query())
-                    })),
-                    "hash" => Ok(Value::String(if url.fragment().is_empty() {
-                        String::new()
-                    } else {
-                        format!("#{}", url.fragment())
-                    })),
+                    "href" => Ok(Value::String(url.to_string().into())),
+                    "origin" => Ok(Value::String(APP_ORIGIN.to_string().into())),
+                    "protocol" => Ok(Value::String("https:".to_string().into())),
+                    "host" => Ok(Value::String("app.ceri.invalid".to_string().into())),
+                    "hostname" => Ok(Value::String("app.ceri.invalid".to_string().into())),
+                    "pathname" => Ok(Value::String(url.path().to_string().into())),
+                    "search" => Ok(Value::String(
+                        (if url.query().is_empty() {
+                            String::new()
+                        } else {
+                            format!("?{}", url.query())
+                        })
+                        .into(),
+                    )),
+                    "hash" => Ok(Value::String(
+                        (if url.fragment().is_empty() {
+                            String::new()
+                        } else {
+                            format!("#{}", url.fragment())
+                        })
+                        .into(),
+                    )),
                     "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
                     "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
                     _ => Err(runtime_error(format!(
@@ -4496,13 +4506,13 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!("history has no property {property}"))),
             },
             Value::Url(url) => match property {
-                "href" => Ok(Value::String(url.borrow().url.to_string())),
-                "origin" => Ok(Value::String(APP_ORIGIN.to_string())),
-                "protocol" => Ok(Value::String("https:".to_string())),
-                "host" | "hostname" => Ok(Value::String("app.ceri.invalid".to_string())),
-                "pathname" => Ok(Value::String(url.borrow().url.path().to_string())),
-                "search" => Ok(Value::String(search_component(&url.borrow().url))),
-                "hash" => Ok(Value::String(fragment_component(&url.borrow().url))),
+                "href" => Ok(Value::String(url.borrow().url.to_string().into())),
+                "origin" => Ok(Value::String(APP_ORIGIN.to_string().into())),
+                "protocol" => Ok(Value::String("https:".to_string().into())),
+                "host" | "hostname" => Ok(Value::String("app.ceri.invalid".to_string().into())),
+                "pathname" => Ok(Value::String(url.borrow().url.path().to_string().into())),
+                "search" => Ok(Value::String(search_component(&url.borrow().url).into())),
+                "hash" => Ok(Value::String(fragment_component(&url.borrow().url).into())),
                 "searchParams" => Ok(Value::UrlSearchParams(self.url_search_params(&url)?)),
                 "toString" => Ok(Value::Builtin(Builtin::UrlToString(url))),
                 _ => Err(runtime_error(format!("URL has no property {property}"))),
@@ -4564,11 +4574,14 @@ impl ScriptRuntime {
             Value::IndexedDbRequest(request) => match property {
                 "result" => Ok(request.borrow().result.clone()),
                 "error" => Ok(request.borrow().error.clone().unwrap_or(Value::Null)),
-                "readyState" => Ok(Value::String(if request.borrow().done {
-                    "done".to_string()
-                } else {
-                    "pending".to_string()
-                })),
+                "readyState" => Ok(Value::String(
+                    (if request.borrow().done {
+                        "done".to_string()
+                    } else {
+                        "pending".to_string()
+                    })
+                    .into(),
+                )),
                 "transaction" => Ok(request
                     .borrow()
                     .transaction
@@ -4588,7 +4601,7 @@ impl ScriptRuntime {
                 ))),
             },
             Value::IndexedDbDatabase(database) => match property {
-                "name" => Ok(Value::String(database.borrow().name.clone())),
+                "name" => Ok(Value::String(database.borrow().name.clone().into())),
                 "version" => Ok(Value::Number(database.borrow().version as f64)),
                 "objectStoreNames" => Ok(Value::IndexedDbNameList(Rc::new(
                     database.borrow().store_order.clone(),
@@ -4613,7 +4626,7 @@ impl ScriptRuntime {
                 ))),
             },
             Value::IndexedDbTransaction(transaction) => match property {
-                "mode" => Ok(Value::String(transaction.borrow().mode.clone())),
+                "mode" => Ok(Value::String(transaction.borrow().mode.clone().into())),
                 "objectStore" => Ok(Value::Builtin(Builtin::IndexedDbTransactionObjectStore(
                     transaction,
                 ))),
@@ -4632,7 +4645,7 @@ impl ScriptRuntime {
                 ))),
             },
             Value::IndexedDbObjectStore(store) => match property {
-                "name" => Ok(Value::String(store.borrow().name.clone())),
+                "name" => Ok(Value::String(store.borrow().name.clone().into())),
                 "keyPath" => {
                     let store = store.borrow();
                     let database = store.database.borrow();
@@ -4640,7 +4653,7 @@ impl ScriptRuntime {
                         .stores
                         .get(&store.name)
                         .and_then(|store| store.key_path.clone())
-                        .map(Value::String)
+                        .map(|text| Value::String(text.into()))
                         .unwrap_or(Value::Null))
                 }
                 "autoIncrement" => {
@@ -4718,14 +4731,14 @@ impl ScriptRuntime {
                     }
                     "onmessage" => Ok(worker.onmessage.clone().unwrap_or(Value::Null)),
                     "onerror" => Ok(worker.onerror.clone().unwrap_or(Value::Null)),
-                    "url" => Ok(Value::String(worker.url.to_string())),
-                    "name" => Ok(Value::String(worker.name.clone())),
+                    "url" => Ok(Value::String(worker.url.to_string().into())),
+                    "name" => Ok(Value::String(worker.name.clone().into())),
                     _ => Err(runtime_error(format!("Worker has no property {property}"))),
                 }
             }
             Value::Blob(blob) => match property {
                 "size" => Ok(Value::Number(blob.bytes.len() as f64)),
-                "type" => Ok(Value::String(blob.mime_type.clone())),
+                "type" => Ok(Value::String(blob.mime_type.clone().into())),
                 "slice" => Ok(Value::Builtin(Builtin::BlobSlice(blob))),
                 "text" => Ok(Value::Builtin(Builtin::BlobText(blob))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::BlobBytes(blob))),
@@ -4736,8 +4749,8 @@ impl ScriptRuntime {
             }
             Value::File(file) => match property {
                 "size" => Ok(Value::Number(file.bytes.len() as f64)),
-                "type" => Ok(Value::String(file.mime_type.clone())),
-                "name" => Ok(Value::String(file.name.clone())),
+                "type" => Ok(Value::String(file.mime_type.clone().into())),
+                "name" => Ok(Value::String(file.name.clone().into())),
                 "lastModified" => Ok(Value::Number(file.last_modified as f64)),
                 "slice" => Ok(Value::Builtin(Builtin::FileSlice(file))),
                 "text" => Ok(Value::Builtin(Builtin::FileText(file))),
@@ -4751,7 +4764,7 @@ impl ScriptRuntime {
                 "Uint8Array has no property {property}"
             ))),
             Value::CanvasContext(context) => match property {
-                "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style))),
+                "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style).into())),
                 "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
                 "clearRect" => Ok(Value::Builtin(Builtin::CanvasClearRect(context))),
                 _ => Err(runtime_error(format!(
@@ -4777,13 +4790,13 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Response(response) => match property {
-                "type" => Ok(Value::String(response.response_type.clone())),
-                "url" => Ok(Value::String(response.url.clone())),
+                "type" => Ok(Value::String(response.response_type.clone().into())),
+                "url" => Ok(Value::String(response.url.clone().into())),
                 "status" => Ok(Value::Number(response.status as f64)),
                 "ok" => Ok(Value::Bool((200..300).contains(&response.status))),
                 "redirected" => Ok(Value::Bool(response.redirected)),
-                "statusText" => Ok(Value::String(response.status_text.clone())),
-                "mimeType" => Ok(Value::String(response.mime_type.clone())),
+                "statusText" => Ok(Value::String(response.status_text.clone().into())),
+                "mimeType" => Ok(Value::String(response.mime_type.clone().into())),
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
                 "body" => Ok(Value::ReadableStream(response.stream.clone())),
@@ -4806,12 +4819,16 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Request(request) => match property {
-                "url" => Ok(Value::String(request.url.to_string())),
-                "method" => Ok(Value::String(request.method.clone())),
+                "url" => Ok(Value::String(request.url.to_string().into())),
+                "method" => Ok(Value::String(request.method.clone().into())),
                 "headers" => Ok(Value::Headers(request.headers.clone())),
                 "body" => Ok(Value::ReadableStream(request.stream.clone())),
-                "cache" => Ok(Value::String(fetch_cache_mode_name(&request.cache_mode))),
-                "redirect" => Ok(Value::String(fetch_redirect_mode_name(request.redirect))),
+                "cache" => Ok(Value::String(
+                    fetch_cache_mode_name(&request.cache_mode).into(),
+                )),
+                "redirect" => Ok(Value::String(
+                    fetch_redirect_mode_name(request.redirect).into(),
+                )),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&request.body))),
                 "signal" => Ok(request
                     .signal
@@ -4910,12 +4927,12 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Error(error) => match property {
-                "name" => Ok(Value::String(error.name.clone())),
-                "message" => Ok(Value::String(error.message.clone())),
+                "name" => Ok(Value::String(error.name.clone().into())),
+                "message" => Ok(Value::String(error.message.clone().into())),
                 "code" => Ok(error
                     .code
                     .clone()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Undefined)),
                 _ => Err(runtime_error(format!("error has no property {property}"))),
             },
@@ -4965,7 +4982,7 @@ impl ScriptRuntime {
             }
             Value::Dataset(handle) => Ok(self
                 .element_attribute(&handle, &dataset_attribute_name(property))
-                .map(Value::String)
+                .map(|text| Value::String(text.into()))
                 .unwrap_or(Value::Undefined)),
             Value::Map(map) => match property {
                 "size" => Ok(Value::Number(map.borrow().entries.len() as f64)),
@@ -5047,7 +5064,7 @@ impl ScriptRuntime {
                 Ok(names
                     .get(index as usize)
                     .cloned()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Undefined))
             }
             Value::String(string) => {
@@ -5058,7 +5075,7 @@ impl ScriptRuntime {
                 Ok(string
                     .chars()
                     .nth(index as usize)
-                    .map(|character| Value::String(character.to_string()))
+                    .map(|character| Value::String(character.to_string().into()))
                     .unwrap_or(Value::Undefined))
             }
             Value::FormData(form_data) if index.property_key() == "@@iterator" => {
@@ -5648,10 +5665,10 @@ impl ScriptRuntime {
         match handle.borrow().clone() {
             ElementLocation::Attached { .. } => attached_path(handle)
                 .and_then(|path| self.document.borrow().node_text_content(&path))
-                .map(Value::String)
+                .map(|text| Value::String(text.into()))
                 .unwrap_or(Value::Null),
             ElementLocation::Detached(element) => detached_text_data(&element)
-                .map(Value::String)
+                .map(|text| Value::String(text.into()))
                 .unwrap_or(Value::Null),
         }
     }
@@ -6498,7 +6515,7 @@ impl ScriptRuntime {
             }),
             ElementLocation::Detached(element) => default_value_for_element(element),
         };
-        Value::String(value.unwrap_or_default())
+        Value::String(value.unwrap_or_default().into())
     }
 
     fn element_default_checked(&self, handle: &ElementHandle) -> bool {
@@ -6669,7 +6686,9 @@ impl ScriptRuntime {
         }
         let value = self.control_value_path(&path).unwrap_or_default();
         Ok(Value::String(
-            selection_direction_name(self.selection_for_path(&path, &value).direction).to_string(),
+            selection_direction_name(self.selection_for_path(&path, &value).direction)
+                .to_string()
+                .into(),
         ))
     }
 
@@ -8254,7 +8273,7 @@ impl ScriptRuntime {
             if let Some(value) = init.get("method").map(Value::resolve) {
                 method = match value {
                     Value::Undefined => method,
-                    Value::String(method) => method,
+                    Value::String(method) => method.to_string(),
                     _ => return Err(runtime_error("Request method must be a string")),
                 };
             }
@@ -8723,8 +8742,8 @@ impl ScriptRuntime {
                     .chars()
                     .skip(start.min(end))
                     .take(end.saturating_sub(start))
-                    .collect();
-                Ok(Value::String(value))
+                    .collect::<String>();
+                Ok(Value::String(value.into()))
             }
             Builtin::StringIncludes(string) => {
                 let needle = arguments
@@ -8758,12 +8777,12 @@ impl ScriptRuntime {
                     .unwrap_or_else(|| "undefined".to_string());
                 Ok(Value::Bool(string.ends_with(&needle)))
             }
-            Builtin::StringTrim(string) => Ok(Value::String(string.trim().to_string())),
-            Builtin::StringToLowerCase(string) => Ok(Value::String(string.to_lowercase())),
-            Builtin::StringToUpperCase(string) => Ok(Value::String(string.to_uppercase())),
+            Builtin::StringTrim(string) => Ok(Value::String(string.trim().to_string().into())),
+            Builtin::StringToLowerCase(string) => Ok(Value::String(string.to_lowercase().into())),
+            Builtin::StringToUpperCase(string) => Ok(Value::String(string.to_uppercase().into())),
             Builtin::StringSplit(string) => {
                 let parts = match arguments.first().map(Value::resolve) {
-                    None | Some(Value::Undefined) => vec![string],
+                    None | Some(Value::Undefined) => vec![string.to_string()],
                     Some(separator) => {
                         let separator = separator.string_value();
                         if separator.is_empty() {
@@ -8782,7 +8801,10 @@ impl ScriptRuntime {
                     ));
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(
-                    parts.into_iter().map(Value::String).collect(),
+                    parts
+                        .into_iter()
+                        .map(|text| Value::String(text.into()))
+                        .collect(),
                 ))))
             }
             Builtin::SetHas(set) => {
@@ -9342,11 +9364,9 @@ impl ScriptRuntime {
                 let length = utf16_len(&text);
                 let offset = Self::character_data_offset(&arguments, 0, length)?;
                 let count = Self::character_data_count(&arguments, 1)?;
-                Ok(Value::String(utf16_substring(
-                    &text,
-                    offset,
-                    offset.saturating_add(count).min(length),
-                )))
+                Ok(Value::String(
+                    utf16_substring(&text, offset, offset.saturating_add(count).min(length)).into(),
+                ))
             }
             Builtin::ElementAppendData(handle) => {
                 let text = self.text_node_data(&handle)?;
@@ -9490,7 +9510,7 @@ impl ScriptRuntime {
                 self.track_range(&clone);
                 Ok(Value::Range(clone))
             }
-            Builtin::RangeToString(range) => Ok(Value::String(self.range_to_string(&range))),
+            Builtin::RangeToString(range) => Ok(Value::String(self.range_to_string(&range).into())),
             Builtin::RangeDetach => Ok(Value::Undefined),
             Builtin::SelectionAddRange(selection) => {
                 let Some(Value::Range(range)) = arguments.first().map(Value::resolve) else {
@@ -9620,7 +9640,8 @@ impl ScriptRuntime {
                     range
                         .as_ref()
                         .map(|range| self.range_to_string(range))
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into(),
                 ))
             }
             Builtin::ElementRequestSubmit(handle) => {
@@ -9704,7 +9725,7 @@ impl ScriptRuntime {
                 });
                 Ok(Value::Undefined)
             }
-            Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string())),
+            Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string().into())),
             Builtin::UrlSearchParamsAppend(params) => {
                 let name = arguments
                     .first()
@@ -9744,7 +9765,7 @@ impl ScriptRuntime {
                     .pairs
                     .iter()
                     .find(|(entry_name, _)| entry_name == &name)
-                    .map(|(_, value)| Value::String(value.clone()))
+                    .map(|(_, value)| Value::String(value.clone().into()))
                     .unwrap_or(Value::Null))
             }
             Builtin::UrlSearchParamsGetAll(params) => {
@@ -9758,7 +9779,7 @@ impl ScriptRuntime {
                         .pairs
                         .iter()
                         .filter(|(entry_name, _)| entry_name == &name)
-                        .map(|(_, value)| Value::String(value.clone()))
+                        .map(|(_, value)| Value::String(value.clone().into()))
                         .collect(),
                 ))))
             }
@@ -9818,14 +9839,14 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::UrlSearchParamsToString(params) => Ok(Value::String(
-                serialize_form_urlencoded(&params.borrow().pairs),
+                serialize_form_urlencoded(&params.borrow().pairs).into(),
             )),
             Builtin::UrlSearchParamsKeys(params) => Ok(iterator_value(
                 params
                     .borrow()
                     .pairs
                     .iter()
-                    .map(|(name, _)| Value::String(name.clone()))
+                    .map(|(name, _)| Value::String(name.clone().into()))
                     .collect(),
             )),
             Builtin::UrlSearchParamsValues(params) => Ok(iterator_value(
@@ -9833,7 +9854,7 @@ impl ScriptRuntime {
                     .borrow()
                     .pairs
                     .iter()
-                    .map(|(_, value)| Value::String(value.clone()))
+                    .map(|(_, value)| Value::String(value.clone().into()))
                     .collect(),
             )),
             Builtin::UrlSearchParamsEntries(params) => Ok(iterator_value(
@@ -9843,8 +9864,8 @@ impl ScriptRuntime {
                     .iter()
                     .map(|(name, value)| {
                         Value::Array(Rc::new(RefCell::new(vec![
-                            Value::String(name.clone()),
-                            Value::String(value.clone()),
+                            Value::String(name.clone().into()),
+                            Value::String(value.clone().into()),
                         ])))
                     })
                     .collect(),
@@ -9861,8 +9882,8 @@ impl ScriptRuntime {
                     self.call(
                         callback.clone(),
                         vec![
-                            Value::String(value),
-                            Value::String(name),
+                            Value::String(value.into()),
+                            Value::String(name.into()),
                             Value::UrlSearchParams(params.clone()),
                         ],
                     )?;
@@ -9884,7 +9905,7 @@ impl ScriptRuntime {
                     .keys()
                     .nth(index as usize)
                     .cloned()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Null))
             }
             Builtin::StorageGetItem(storage) => {
@@ -9897,7 +9918,7 @@ impl ScriptRuntime {
                     .values
                     .get(&key)
                     .cloned()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Null))
             }
             Builtin::StorageSetItem(storage) => {
@@ -10016,7 +10037,7 @@ impl ScriptRuntime {
                         names
                             .get(index as usize)
                             .cloned()
-                            .map(Value::String)
+                            .map(|text| Value::String(text.into()))
                             .unwrap_or(Value::Null)
                     } else {
                         Value::Null
@@ -10118,7 +10139,7 @@ impl ScriptRuntime {
                     .borrow()
                     .pairs
                     .iter()
-                    .map(|(name, _)| Value::String(name.clone()))
+                    .map(|(name, _)| Value::String(name.clone().into()))
                     .collect(),
             )),
             Builtin::FormDataValues(form_data) => Ok(iterator_value(
@@ -10136,7 +10157,7 @@ impl ScriptRuntime {
                     .iter()
                     .map(|(name, value)| {
                         Value::Array(Rc::new(RefCell::new(vec![
-                            Value::String(name.clone()),
+                            Value::String(name.clone().into()),
                             form_data_entry_value(value),
                         ])))
                     })
@@ -10155,7 +10176,7 @@ impl ScriptRuntime {
                         callback.clone(),
                         vec![
                             form_data_entry_value(&value),
-                            Value::String(name),
+                            Value::String(name.into()),
                             Value::FormData(form_data.clone()),
                         ],
                     )?;
@@ -10178,7 +10199,7 @@ impl ScriptRuntime {
                 })))
             }
             Builtin::BlobText(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
-                String::from_utf8_lossy(&blob.bytes).into_owned(),
+                String::from_utf8_lossy(&blob.bytes).into_owned().into(),
             )))),
             Builtin::BlobBytes(blob) => Ok(Value::Promise(
                 self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(blob.bytes.clone())))),
@@ -10199,7 +10220,7 @@ impl ScriptRuntime {
                 })))
             }
             Builtin::FileText(file) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
-                String::from_utf8_lossy(&file.bytes).into_owned(),
+                String::from_utf8_lossy(&file.bytes).into_owned().into(),
             )))),
             Builtin::FileBytes(file) => Ok(Value::Promise(
                 self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(file.bytes.clone())))),
@@ -10228,7 +10249,7 @@ impl ScriptRuntime {
             }
             Builtin::JsonStringify => {
                 let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                serialize_json(&value).map(Value::String)
+                serialize_json(&value).map(|text| Value::String(text.into()))
             }
             Builtin::StructuredClone => {
                 if arguments.len() > 1
@@ -10249,7 +10270,9 @@ impl ScriptRuntime {
                     ))));
                 };
                 match provider.read_text() {
-                    Ok(text) => Ok(Value::Promise(self.fulfilled_promise(Value::String(text)))),
+                    Ok(text) => Ok(Value::Promise(
+                        self.fulfilled_promise(Value::String(text.into())),
+                    )),
                     Err(error) => Ok(Value::Promise(self.rejected_promise_value(dom_exception(
                         "NotAllowedError",
                         &error.to_string(),
@@ -10313,7 +10336,7 @@ impl ScriptRuntime {
             Builtin::RequestClone(request) => Ok(Value::Request(clone_request(&request)?)),
             Builtin::RequestText(request) => match self.consume_request_body(&request) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
-                    String::from_utf8_lossy(&body).into_owned(),
+                    String::from_utf8_lossy(&body).into_owned().into(),
                 )))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
@@ -10385,7 +10408,7 @@ impl ScriptRuntime {
                     .values
                     .get(&name)
                     .cloned()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Null))
             }
             Builtin::HeadersHas(headers) => {
@@ -10398,7 +10421,7 @@ impl ScriptRuntime {
                     .values
                     .keys()
                     .cloned()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .collect(),
             )),
             Builtin::HeadersValues(headers) => Ok(iterator_value(
@@ -10407,7 +10430,7 @@ impl ScriptRuntime {
                     .values
                     .values()
                     .cloned()
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .collect(),
             )),
             Builtin::HeadersEntries(headers) => Ok(iterator_value(
@@ -10417,8 +10440,8 @@ impl ScriptRuntime {
                     .iter()
                     .map(|(name, value)| {
                         Value::Array(Rc::new(RefCell::new(vec![
-                            Value::String(name.clone()),
-                            Value::String(value.clone()),
+                            Value::String(name.clone().into()),
+                            Value::String(value.clone().into()),
                         ])))
                     })
                     .collect(),
@@ -10438,8 +10461,8 @@ impl ScriptRuntime {
                     self.call(
                         callback.clone(),
                         vec![
-                            Value::String(value),
-                            Value::String(name),
+                            Value::String(value.into()),
+                            Value::String(name.into()),
                             Value::Headers(headers.clone()),
                         ],
                     )?;
@@ -10471,7 +10494,11 @@ impl ScriptRuntime {
                 let data = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let body = serialize_json(&data)?;
                 let init = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                self.construct_response_parts(Value::String(body), init, Some("application/json"))
+                self.construct_response_parts(
+                    Value::String(body.into()),
+                    init,
+                    Some("application/json"),
+                )
             }
             Builtin::ResponseRedirectConstructor => {
                 let reference = arguments
@@ -10540,7 +10567,7 @@ impl ScriptRuntime {
             }
             Builtin::ResponseText(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
-                    String::from_utf8_lossy(&body).into_owned(),
+                    String::from_utf8_lossy(&body).into_owned().into(),
                 )))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
@@ -10762,13 +10789,13 @@ impl ScriptRuntime {
                     ));
                 }
                 let mut payload = BTreeMap::new();
-                payload.insert("engine".to_string(), Value::String(info.engine));
-                payload.insert("chromium".to_string(), Value::String(info.chromium));
-                payload.insert("recovery".to_string(), Value::String(info.recovery));
-                payload.insert("session".to_string(), Value::String(info.session));
+                payload.insert("engine".to_string(), Value::String(info.engine.into()));
+                payload.insert("chromium".to_string(), Value::String(info.chromium.into()));
+                payload.insert("recovery".to_string(), Value::String(info.recovery.into()));
+                payload.insert("session".to_string(), Value::String(info.session.into()));
                 let response = serialize_json(&plain_object(payload))?;
                 Ok(Value::Promise(
-                    self.fulfilled_promise(Value::String(response)),
+                    self.fulfilled_promise(Value::String(response.into())),
                 ))
             }
             Builtin::ElementAddEventListener(handle) => {
@@ -11223,7 +11250,7 @@ impl ScriptRuntime {
                     .unwrap_or_default();
                 Ok(attached_path(&handle)
                     .and_then(|path| self.document.borrow().element_attribute(&path, &name))
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Null))
             }
             Builtin::ElementQuerySelector(handle) => {
@@ -11290,7 +11317,7 @@ impl ScriptRuntime {
                     })
                     .collect::<Vec<_>>()
                     .join(&separator);
-                Ok(Value::String(joined))
+                Ok(Value::String(joined.into()))
             }
             Builtin::ArrayPush(array) => {
                 let mut array = array.borrow_mut();
@@ -11489,7 +11516,7 @@ impl ScriptRuntime {
                     })
                     .collect::<Vec<_>>()
                     .join(&separator);
-                Ok(Value::String(joined))
+                Ok(Value::String(joined.into()))
             }
             Builtin::SetValues(set) => Ok(iterator_value(set.borrow().values.clone())),
             Builtin::ElementClassListAdd(handle) => {
@@ -12040,7 +12067,7 @@ impl ScriptRuntime {
             .cache_order
             .iter()
             .cloned()
-            .map(Value::String)
+            .map(|text| Value::String(text.into()))
             .collect();
         Ok(Value::Promise(self.fulfilled_promise(Value::Array(
             Rc::new(RefCell::new(names)),
@@ -12595,7 +12622,10 @@ impl ScriptRuntime {
             .map(|database| {
                 let database = database.borrow();
                 let mut value = BTreeMap::new();
-                value.insert("name".to_string(), Value::String(database.name.clone()));
+                value.insert(
+                    "name".to_string(),
+                    Value::String(database.name.clone().into()),
+                );
                 value.insert(
                     "version".to_string(),
                     Value::Number(database.version as f64),
@@ -12763,7 +12793,7 @@ impl ScriptRuntime {
         {
             None | Some(Value::Null) | Some(Value::Undefined) => None,
             Some(Value::String(path)) if !path.is_empty() && path.len() <= MAX_IDB_NAME_BYTES => {
-                Some(path)
+                Some(path.to_string())
             }
             Some(Value::String(_)) => {
                 return Err(runtime_error(
@@ -13297,7 +13327,7 @@ impl Value {
             Self::Null => "null".to_string(),
             Self::Bool(value) => value.to_string(),
             Self::Number(value) => number_to_string(*value),
-            Self::String(value) => value.clone(),
+            Self::String(value) => value.to_string(),
             Self::Symbol(value) => {
                 format!("Symbol({})", symbol_description(value).unwrap_or_default())
             }
@@ -13647,7 +13677,7 @@ impl CloneValue {
             Self::Null => Value::Null,
             Self::Bool(value) => Value::Bool(value),
             Self::Number(value) => Value::Number(value),
-            Self::String(value) => Value::String(value),
+            Self::String(value) => Value::String(value.into()),
             Self::Array(values) => Value::Array(Rc::new(RefCell::new(
                 values
                     .into_iter()
@@ -13728,7 +13758,10 @@ fn subtle_error_value(name: &str, message: impl Into<String>) -> Value {
 
 fn abort_event_value() -> Value {
     let mut event = BTreeMap::new();
-    event.insert("type".to_string(), Value::String("abort".to_string()));
+    event.insert(
+        "type".to_string(),
+        Value::String("abort".to_string().into()),
+    );
     event.insert("defaultPrevented".to_string(), Value::Bool(false));
     plain_object(event)
 }
@@ -14674,7 +14707,10 @@ fn dom_exception(name: &str, message: &str) -> Value {
 
 fn indexed_db_event(event_type: &str, target: Value, old_version: u64, new_version: u64) -> Value {
     let mut event = BTreeMap::new();
-    event.insert("type".to_string(), Value::String(event_type.to_string()));
+    event.insert(
+        "type".to_string(),
+        Value::String(event_type.to_string().into()),
+    );
     event.insert("target".to_string(), target);
     event.insert("oldVersion".to_string(), Value::Number(old_version as f64));
     event.insert("newVersion".to_string(), Value::Number(new_version as f64));
@@ -15228,7 +15264,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
     match value.resolve() {
         Value::Undefined | Value::Null => Ok((Vec::new(), None)),
         Value::String(body) => Ok((
-            body.into_bytes(),
+            body.as_bytes().to_vec(),
             Some("text/plain;charset=UTF-8".to_string()),
         )),
         Value::Bytes(bytes) => Ok((bytes.borrow().clone(), None)),
@@ -15326,7 +15362,7 @@ fn enumerable_object_properties(value: Value) -> Result<Vec<(String, Value)>, Sc
         Value::String(source) => source
             .chars()
             .enumerate()
-            .map(|(index, value)| (index.to_string(), Value::String(value.to_string())))
+            .map(|(index, value)| (index.to_string(), Value::String(value.to_string().into())))
             .collect(),
         Value::Undefined | Value::Null => Vec::new(),
         _ => Vec::new(),
@@ -15511,7 +15547,7 @@ fn blob_options(
     }
     if let Some(endings) = options.get("endings").map(Value::resolve) {
         let valid = matches!(endings, Value::Undefined)
-            || matches!(endings, Value::String(value) if value == "transparent");
+            || matches!(endings, Value::String(value) if &*value == "transparent");
         if !valid {
             return Err(runtime_error("Blob endings must be transparent"));
         }
@@ -16453,7 +16489,7 @@ fn form_data_entry(value: Option<&Value>, filename: Option<String>) -> FormDataE
 
 fn form_data_entry_value(entry: &FormDataEntry) -> Value {
     match entry {
-        FormDataEntry::Text(value) => Value::String(value.clone()),
+        FormDataEntry::Text(value) => Value::String(value.clone().into()),
         FormDataEntry::File(file) => Value::File(file.clone()),
     }
 }
@@ -16823,7 +16859,7 @@ fn object_display(object: &ObjectHandle) -> String {
                 while let Some(link) = current {
                     let link = link.borrow();
                     if let Some(Value::String(text)) = link.get(key) {
-                        return text.clone();
+                        return text.to_string();
                     }
                     current = link.explicit_prototype();
                 }
@@ -16928,7 +16964,7 @@ fn value_typeof(value: &Value) -> &'static str {
 fn subtle_algorithm_name(value: Option<&Value>) -> Result<String, ScriptError> {
     let value = value.ok_or_else(|| runtime_error("SubtleCrypto.digest requires an algorithm"))?;
     let name = match value.resolve() {
-        Value::String(name) => name,
+        Value::String(name) => name.to_string(),
         Value::Object(object) => object
             .borrow()
             .get("name")
@@ -17572,7 +17608,7 @@ fn parse_cache_mode(
 ) -> Result<ResourceCacheMode, ScriptError> {
     match value.map(Value::resolve) {
         None | Some(Value::Undefined) => Ok(default),
-        Some(Value::String(mode)) => match mode.as_str() {
+        Some(Value::String(mode)) => match &*mode {
             "default" => Ok(ResourceCacheMode::Default),
             "no-store" => Ok(ResourceCacheMode::NoStore),
             "reload" => Ok(ResourceCacheMode::Reload),
@@ -17593,7 +17629,7 @@ fn parse_redirect_mode(
 ) -> Result<FetchRedirectMode, ScriptError> {
     match value.map(Value::resolve) {
         None | Some(Value::Undefined) => Ok(default),
-        Some(Value::String(mode)) => match mode.as_str() {
+        Some(Value::String(mode)) => match &*mode {
             "follow" => Ok(FetchRedirectMode::Follow),
             "error" => Ok(FetchRedirectMode::Error),
             "manual" => Ok(FetchRedirectMode::Manual),
@@ -17716,7 +17752,7 @@ fn parse_fetch_options(
     }
     let method = match options.get("method").map(Value::resolve) {
         None | Some(Value::Undefined) => default_method,
-        Some(Value::String(method)) => method,
+        Some(Value::String(method)) => method.to_string(),
         Some(_) => return Err(runtime_error("fetch method must be a string")),
     };
     let headers = match options.get("headers").map(Value::resolve) {
@@ -17801,7 +17837,7 @@ fn parse_dynamic_import_type(
     let Value::String(module_type) = module_type else {
         return Err(runtime_error("dynamic import type must be a string"));
     };
-    if module_type != "json" {
+    if &**module_type != "json" {
         return Err(runtime_error(format!(
             "unsupported dynamic import type {module_type}"
         )));

@@ -208,11 +208,11 @@ impl ScriptRuntime {
             JsObject::with_prototype(Some(self.error_prototype(kind)), ObjectClass::Error);
         object.define(
             "message".to_string(),
-            Property::hidden(Value::String(message.to_string())),
+            Property::hidden(Value::String(message.to_string().into())),
         );
         object.define(
             "stack".to_string(),
-            Property::hidden(Value::String(String::new())),
+            Property::hidden(Value::String(String::new().into())),
         );
         Value::Object(new_object(object))
     }
@@ -239,7 +239,7 @@ impl ScriptRuntime {
                 while let Some(object) = current {
                     let object = object.borrow();
                     if let Some(Value::String(message)) = object.get("message") {
-                        return message.clone();
+                        return message.to_string();
                     }
                     current = object.prototype_or(&self.intrinsics.object_prototype);
                 }
@@ -301,7 +301,7 @@ impl ScriptRuntime {
                     let result = self.call_function(
                         exotic,
                         value.clone(),
-                        vec![Value::String(hint_name.to_string())],
+                        vec![Value::String(hint_name.to_string().into())],
                     )?;
                     if !is_primitive(&result) {
                         return Err(self.type_error("Cannot convert object to primitive value"));
@@ -330,15 +330,15 @@ impl ScriptRuntime {
             }
             Value::Array(array) => {
                 let array = array.clone();
-                Ok(Value::String(self.join_array(&array, ",")?))
+                Ok(Value::String(self.join_array(&array, ",")?.into()))
             }
             Value::Error(error) => Ok(Value::String(if error.message.is_empty() {
-                error.name.clone()
+                error.name.as_str().into()
             } else {
-                format!("{}: {}", error.name, error.message)
+                format!("{}: {}", error.name, error.message).into()
             })),
             value if is_primitive(value) => Ok(value.clone()),
-            other => Ok(Value::String(other.string_value())),
+            other => Ok(Value::String(other.string_value().into())),
         }
     }
 
@@ -391,7 +391,7 @@ impl ScriptRuntime {
 
     pub(super) fn coerce_string(&mut self, value: Value) -> Result<String, ScriptError> {
         match value {
-            Value::String(text) => Ok(text),
+            Value::String(text) => Ok(text.to_string()),
             Value::Number(number) => Ok(number_to_string(number)),
             Value::Undefined => Ok("undefined".to_string()),
             Value::Null => Ok("null".to_string()),
@@ -406,7 +406,7 @@ impl ScriptRuntime {
 
     pub(super) fn coerce_key(&mut self, value: Value) -> Result<String, ScriptError> {
         match value {
-            Value::String(text) => Ok(text),
+            Value::String(text) => Ok(text.to_string()),
             Value::Symbol(key) => Ok(key),
             Value::Number(number) => Ok(number_to_string(number)),
             other => {
@@ -443,7 +443,7 @@ impl ScriptRuntime {
             ),
             Value::String(value) => (
                 self.intrinsics.string_prototype.clone(),
-                ObjectClass::String(value.clone()),
+                ObjectClass::String(value.to_string()),
             ),
             Value::Symbol(value) => (
                 self.intrinsics.symbol_prototype.clone(),
@@ -496,7 +496,7 @@ impl ScriptRuntime {
                 if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
                     let mut text = self.coerce_string(left)?;
                     text.push_str(&self.coerce_string(right)?);
-                    Value::String(text)
+                    Value::String(text.into())
                 } else {
                     Value::Number(self.coerce_number(left)? + self.coerce_number(right)?)
                 }
@@ -722,7 +722,7 @@ impl ScriptRuntime {
                     return Ok(text
                         .chars()
                         .nth(index as usize)
-                        .map(|character| Value::String(character.to_string()))
+                        .map(|character| Value::String(character.to_string().into()))
                         .unwrap_or(Value::Undefined));
                 }
                 self.host_get(value, key)
@@ -732,7 +732,7 @@ impl ScriptRuntime {
                     && key == "description"
                 {
                     return Ok(symbol_description(symbol)
-                        .map(Value::String)
+                        .map(|text| Value::String(text.into()))
                         .unwrap_or(Value::Undefined));
                 }
                 let prototype = self
@@ -1389,14 +1389,15 @@ impl ScriptRuntime {
             .cooked
             .iter()
             .map(|part| {
-                part.as_ref()
-                    .map_or(Value::Undefined, |part| Value::String(part.to_string()))
+                part.as_ref().map_or(Value::Undefined, |part| {
+                    Value::String(part.to_string().into())
+                })
             })
             .collect();
         let raw = site
             .raw
             .iter()
-            .map(|part| Value::String(part.to_string()))
+            .map(|part| Value::String(part.to_string().into()))
             .collect();
         let strings = Self::new_array(cooked);
         let raw = Self::new_array(raw);
@@ -1415,11 +1416,11 @@ impl ScriptRuntime {
         );
         object.define(
             "source".to_string(),
-            Property::hidden(Value::String(pattern.to_string())),
+            Property::hidden(Value::String(pattern.to_string().into())),
         );
         object.define(
             "flags".to_string(),
-            Property::hidden(Value::String(flags.to_string())),
+            Property::hidden(Value::String(flags.to_string().into())),
         );
         for (flag, name) in [
             ('g', "global"),
@@ -1488,7 +1489,7 @@ impl ScriptRuntime {
         object.define(
             "@@toStringTag".to_string(),
             Property {
-                slot: Slot::Data(Value::String("Module".to_string())),
+                slot: Slot::Data(Value::String("Module".to_string().into())),
                 enumerable: false,
                 writable: false,
                 configurable: false,
@@ -1887,7 +1888,7 @@ fn exotic_own(object: &JsObject, key: &str) -> Option<Value> {
             let index = array_index(key)?;
             text.chars()
                 .nth(index as usize)
-                .map(|character| Value::String(character.to_string()))
+                .map(|character| Value::String(character.to_string().into()))
         }
         _ => None,
     }
@@ -1965,7 +1966,7 @@ fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
         Value::NodeList(nodes) => nodes.iter().cloned().map(Value::Element).collect(),
         Value::String(string) => string
             .chars()
-            .map(|character| Value::String(character.to_string()))
+            .map(|character| Value::String(character.to_string().into()))
             .collect(),
         Value::Uint8Array(array) => uint8_array_bytes(&array.borrow())
             .into_iter()
@@ -1988,20 +1989,35 @@ fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
             .borrow()
             .pairs
             .iter()
-            .map(|(name, value)| pair(Value::String(name.clone()), Value::String(value.clone())))
+            .map(|(name, value)| {
+                pair(
+                    Value::String(name.clone().into()),
+                    Value::String(value.clone().into()),
+                )
+            })
             .collect(),
         Value::FormData(form_data) => form_data
             .borrow()
             .pairs
             .iter()
-            .map(|(name, value)| pair(Value::String(name.clone()), form_data_entry_value(value)))
+            .map(|(name, value)| {
+                pair(
+                    Value::String(name.clone().into()),
+                    form_data_entry_value(value),
+                )
+            })
             .collect(),
         Value::FileList(files) => files.iter().cloned().map(Value::File).collect(),
         Value::Headers(headers) => headers
             .borrow()
             .values
             .iter()
-            .map(|(name, value)| pair(Value::String(name.clone()), Value::String(value.clone())))
+            .map(|(name, value)| {
+                pair(
+                    Value::String(name.clone().into()),
+                    Value::String(value.clone().into()),
+                )
+            })
             .collect(),
         _ => return None,
     })

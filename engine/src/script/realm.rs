@@ -176,7 +176,7 @@ impl Builder {
             "name".to_string(),
             Property {
                 writable: false,
-                ..Property::hidden(Value::String(name.to_string()))
+                ..Property::hidden(Value::String(name.to_string().into()))
             },
         );
         new_object(object)
@@ -326,7 +326,11 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             1,
         ))),
     );
-    build.value(&function_prototype, "name", Value::String(String::new()));
+    build.value(
+        &function_prototype,
+        "name",
+        Value::String(String::new().into()),
+    );
     let function = build.constructor(
         Native::FunctionConstructor,
         "Function",
@@ -347,7 +351,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(
         &symbol_prototype,
         "@@toStringTag",
-        Value::String("Symbol".to_string()),
+        Value::String("Symbol".to_string().into()),
     );
     let symbol = build.constructor(Native::SymbolConstructor, "Symbol", 0, &symbol_prototype);
     build.method(&symbol, "for", Native::SymbolFor, 1);
@@ -374,8 +378,16 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     globals.push(("Symbol", Value::Object(symbol)));
 
     let error_prototype = plain(&object_prototype);
-    build.value(&error_prototype, "name", Value::String("Error".to_string()));
-    build.value(&error_prototype, "message", Value::String(String::new()));
+    build.value(
+        &error_prototype,
+        "name",
+        Value::String("Error".to_string().into()),
+    );
+    build.value(
+        &error_prototype,
+        "message",
+        Value::String(String::new().into()),
+    );
     build.method(&error_prototype, "toString", Native::ErrorToString, 0);
     let error = build.constructor(
         Native::ErrorConstructor("Error"),
@@ -401,8 +413,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         "AggregateError",
     ] {
         let prototype = plain(&error_prototype);
-        build.value(&prototype, "name", Value::String(kind.to_string()));
-        build.value(&prototype, "message", Value::String(String::new()));
+        build.value(&prototype, "name", Value::String(kind.to_string().into()));
+        build.value(&prototype, "message", Value::String(String::new().into()));
         let length = if kind == "AggregateError" { 2 } else { 1 };
         let constructor =
             build.constructor(Native::ErrorConstructor(kind), kind, length, &prototype);
@@ -498,7 +510,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(
         &generator_prototype,
         "@@toStringTag",
-        Value::String("Generator".to_string()),
+        Value::String("Generator".to_string().into()),
     );
     let generator_function_prototype = plain(&function_prototype);
     generator_function_prototype.borrow_mut().define(
@@ -531,7 +543,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(
         &async_generator_prototype,
         "@@toStringTag",
-        Value::String("AsyncGenerator".to_string()),
+        Value::String("AsyncGenerator".to_string().into()),
     );
     let async_generator_function_prototype = plain(&function_prototype);
     async_generator_function_prototype.borrow_mut().define(
@@ -545,14 +557,14 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(
         &async_function_prototype,
         "@@toStringTag",
-        Value::String("AsyncFunction".to_string()),
+        Value::String("AsyncFunction".to_string().into()),
     );
 
     let promise_prototype = plain(&object_prototype);
     build.value(
         &promise_prototype,
         "@@toStringTag",
-        Value::String("Promise".to_string()),
+        Value::String("Promise".to_string().into()),
     );
     let regexp_prototype = plain(&object_prototype);
 
@@ -902,7 +914,7 @@ impl ScriptRuntime {
                 }
                 ObjectClass::Native(_) | ObjectClass::Bound { .. } => {
                     let name = match borrowed.get("name") {
-                        Some(Value::String(name)) => name.clone(),
+                        Some(Value::String(name)) => name.to_string(),
                         _ => String::new(),
                     };
                     return format!("function {name}() {{ [native code] }}");
@@ -1060,7 +1072,7 @@ impl ScriptRuntime {
                         if symbols {
                             Value::Symbol(key)
                         } else {
-                            Value::String(key)
+                            Value::String(key.into())
                         }
                     })
                     .collect();
@@ -1097,9 +1109,9 @@ impl ScriptRuntime {
                 let values = entries
                     .into_iter()
                     .map(|(key, value)| match native {
-                        Native::ObjectKeys => Value::String(key),
+                        Native::ObjectKeys => Value::String(key.into()),
                         Native::ObjectValues => value,
-                        _ => Self::new_array(vec![Value::String(key), value]),
+                        _ => Self::new_array(vec![Value::String(key.into()), value]),
                     })
                     .collect();
                 Ok(Self::new_array(values))
@@ -1194,7 +1206,7 @@ impl ScriptRuntime {
                         .is_some_and(|property| property.enumerable),
                 ))
             }
-            Native::ObjectToString => Ok(Value::String(self.object_to_string(&this)?)),
+            Native::ObjectToString => Ok(Value::String(self.object_to_string(&this)?.into())),
             Native::ObjectToLocaleString => {
                 let method = self.get_property(&this, "toString")?;
                 self.call_function(method, this, Vec::new())
@@ -1248,7 +1260,7 @@ impl ScriptRuntime {
                     _ => 0.0,
                 };
                 let target_name = match self.get_property(&this, "name")? {
-                    Value::String(name) => name,
+                    Value::String(name) => name.to_string(),
                     _ => String::new(),
                 };
                 let length = (target_length - bound.len() as f64).max(0.0);
@@ -1272,7 +1284,7 @@ impl ScriptRuntime {
                     "name".to_string(),
                     Property {
                         writable: false,
-                        ..Property::hidden(Value::String(format!("bound {target_name}")))
+                        ..Property::hidden(Value::String(format!("bound {target_name}").into()))
                     },
                 );
                 Ok(Value::Object(new_object(object)))
@@ -1283,7 +1295,7 @@ impl ScriptRuntime {
                         "Function.prototype.toString requires that 'this' be a Function",
                     ));
                 }
-                Ok(Value::String(self.function_source(&this)))
+                Ok(Value::String(self.function_source(&this).into()))
             }
             Native::FunctionHasInstance => {
                 Ok(Value::Bool(self.ordinary_has_instance(&this, &first)?))
@@ -1308,22 +1320,21 @@ impl ScriptRuntime {
                 Value::Symbol(key) => Ok(key
                     .strip_prefix(SYMBOL_PREFIX)
                     .and_then(|rest| rest.strip_prefix("for:"))
-                    .map(|description| Value::String(description.to_string()))
+                    .map(|description| Value::String(description.to_string().into()))
                     .unwrap_or(Value::Undefined)),
                 _ => Err(self.type_error("Symbol.keyFor requires a symbol")),
             },
             Native::SymbolToString => {
                 let key = self.this_symbol(&this)?;
-                Ok(Value::String(format!(
-                    "Symbol({})",
-                    symbol_description(&key).unwrap_or_default()
-                )))
+                Ok(Value::String(
+                    format!("Symbol({})", symbol_description(&key).unwrap_or_default()).into(),
+                ))
             }
             Native::SymbolValueOf => Ok(Value::Symbol(self.this_symbol(&this)?)),
             Native::SymbolDescription => {
                 let key = self.this_symbol(&this)?;
                 Ok(symbol_description(&key)
-                    .map(Value::String)
+                    .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Undefined))
             }
             Native::ErrorConstructor(kind) => {
@@ -1343,18 +1354,20 @@ impl ScriptRuntime {
                     Value::Undefined => String::new(),
                     message => self.coerce_string(message)?,
                 };
-                Ok(Value::String(match (name.is_empty(), message.is_empty()) {
+                let text = match (name.is_empty(), message.is_empty()) {
                     (_, true) => name,
                     (true, false) => message,
                     (false, false) => format!("{name}: {message}"),
-                }))
+                };
+                Ok(Value::String(text.into()))
             }
             Native::ErrorCaptureStackTrace => {
                 if let Value::Object(object) = &first {
                     let text = self.coerce_string(first.clone())?;
-                    object
-                        .borrow_mut()
-                        .define("stack".to_string(), Property::hidden(Value::String(text)));
+                    object.borrow_mut().define(
+                        "stack".to_string(),
+                        Property::hidden(Value::String(text.into())),
+                    );
                 }
                 Ok(Value::Undefined)
             }
@@ -1373,7 +1386,7 @@ impl ScriptRuntime {
                         .type_error("Boolean.prototype method requires that 'this' be a Boolean"));
                 };
                 Ok(if matches!(native, Native::BooleanToString) {
-                    Value::String(value.to_string())
+                    Value::String(value.to_string().into())
                 } else {
                     Value::Bool(value)
                 })
@@ -1392,11 +1405,12 @@ impl ScriptRuntime {
                 if !(2.0..=36.0).contains(&radix) {
                     return Err(self.range_error("toString() radix must be between 2 and 36"));
                 }
-                Ok(Value::String(if radix == 10.0 {
+                let text = if radix == 10.0 {
                     number_to_string(number)
                 } else {
                     number_to_radix(number, radix as u32)
-                }))
+                };
+                Ok(Value::String(text.into()))
             }
             Native::NumberValueOf => Ok(Value::Number(self.this_number(&this, "valueOf")?)),
             Native::NumberIsInteger => Ok(Value::Bool(
@@ -1407,18 +1421,21 @@ impl ScriptRuntime {
             Native::NumberIsNaN => Ok(Value::Bool(
                 matches!(first, Value::Number(number) if number.is_nan()),
             )),
-            Native::StringConstructor => Ok(Value::String(match first {
-                Value::Undefined if arguments.is_empty() => String::new(),
-                Value::Symbol(key) => {
-                    format!("Symbol({})", symbol_description(&key).unwrap_or_default())
-                }
-                other => self.coerce_string(other)?,
-            })),
+            Native::StringConstructor => {
+                let text = match first {
+                    Value::Undefined if arguments.is_empty() => String::new(),
+                    Value::Symbol(key) => {
+                        format!("Symbol({})", symbol_description(&key).unwrap_or_default())
+                    }
+                    other => self.coerce_string(other)?,
+                };
+                Ok(Value::String(text.into()))
+            }
             Native::StringToString => {
                 match &this {
                     Value::String(text) => Ok(Value::String(text.clone())),
                     Value::Object(object) => match &object.borrow().class {
-                        ObjectClass::String(text) => Ok(Value::String(text.clone())),
+                        ObjectClass::String(text) => Ok(Value::String(text.clone().into())),
                         _ => Err(runtime_error(
                             "String.prototype.toString requires that 'this' be a String",
                         )),
@@ -1433,7 +1450,7 @@ impl ScriptRuntime {
                 for value in arguments {
                     units.push(to_uint32_from(self.coerce_number(value)?) as u16);
                 }
-                Ok(Value::String(String::from_utf16_lossy(&units)))
+                Ok(Value::String(String::from_utf16_lossy(&units).into()))
             }
             Native::ArrayConstructor => {
                 self.construct_native(Native::ArrayConstructor, arguments, Value::Undefined)
@@ -1729,7 +1746,7 @@ fn string_own_property(text: &str, key: &str) -> Option<Property> {
     }
     let index = array_index(key)?;
     text.chars().nth(index as usize).map(|character| Property {
-        slot: Slot::Data(Value::String(character.to_string())),
+        slot: Slot::Data(Value::String(character.to_string().into())),
         enumerable: true,
         writable: false,
         configurable: false,
