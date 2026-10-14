@@ -171,6 +171,47 @@ impl ScriptRuntime {
                     ObjectClass::Boolean(_) | ObjectClass::Number(_) | ObjectClass::String(_) => {
                         return format!("[{}]", value.string_value());
                     }
+                    ObjectClass::Date(time) => {
+                        return if time.is_nan() {
+                            "Invalid Date".to_string()
+                        } else {
+                            super::dates::iso_string(time)
+                        };
+                    }
+                    ObjectClass::Map(collection) | ObjectClass::Set(collection) => {
+                        let set = matches!(object.borrow().class, ObjectClass::Set(_));
+                        if depth > INSPECT_DEPTH {
+                            return if set {
+                                "[Set]".to_string()
+                            } else {
+                                "[Map]".to_string()
+                            };
+                        }
+                        seen.push(address);
+                        let entries = collection.borrow().values();
+                        let parts: Vec<String> = entries
+                            .iter()
+                            .take(INSPECT_ITEMS)
+                            .map(|(key, value)| {
+                                if set {
+                                    self.inspect(key, depth + 1, seen)
+                                } else {
+                                    format!(
+                                        "{} => {}",
+                                        self.inspect(key, depth + 1, seen),
+                                        self.inspect(value, depth + 1, seen)
+                                    )
+                                }
+                            })
+                            .collect();
+                        seen.pop();
+                        let name = if set { "Set" } else { "Map" };
+                        return if parts.is_empty() {
+                            format!("{name}(0) {{}}")
+                        } else {
+                            format!("{name}({}) {{ {} }}", entries.len(), parts.join(", "))
+                        };
+                    }
                     _ => {}
                 }
                 if depth > INSPECT_DEPTH {
@@ -212,46 +253,6 @@ impl ScriptRuntime {
                 } else {
                     format!("{prefix}{{ {} }}", parts.join(", "))
                 }
-            }
-            Value::Map(map) => {
-                let entries = map.borrow().entries.clone();
-                let parts: Vec<String> = entries
-                    .iter()
-                    .take(INSPECT_ITEMS)
-                    .map(|(key, value)| {
-                        format!(
-                            "{} => {}",
-                            self.inspect(key, depth + 1, seen),
-                            self.inspect(value, depth + 1, seen)
-                        )
-                    })
-                    .collect();
-                format!(
-                    "Map({}) {{{}}}",
-                    entries.len(),
-                    if parts.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {} ", parts.join(", "))
-                    }
-                )
-            }
-            Value::Set(set) => {
-                let values = set.borrow().values.clone();
-                let parts: Vec<String> = values
-                    .iter()
-                    .take(INSPECT_ITEMS)
-                    .map(|value| self.inspect(value, depth + 1, seen))
-                    .collect();
-                format!(
-                    "Set({}) {{{}}}",
-                    values.len(),
-                    if parts.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {} ", parts.join(", "))
-                    }
-                )
             }
             Value::Promise(promise) => {
                 let state = match &promise.borrow().outcome {

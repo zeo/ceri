@@ -425,6 +425,25 @@ impl ScriptRuntime {
                 ObjectClass::Native(native) => {
                     return Ok(Prepared::Done(self.call_native(native, this, arguments)?));
                 }
+                ObjectClass::Proxy(proxy) => {
+                    if !proxy.callable {
+                        return Err(self.type_error("value is not a function"));
+                    }
+                    let (target, trap) = self.proxy_trap(&proxy, "apply")?;
+                    return match trap {
+                        Some(trap) => {
+                            let handler =
+                                proxy.handler.borrow().clone().unwrap_or(Value::Undefined);
+                            let list = Self::new_array(arguments);
+                            Ok(Prepared::Done(self.call_function(
+                                trap,
+                                handler,
+                                vec![target, this, list],
+                            )?))
+                        }
+                        None => self.prepare_call(target, this, arguments, None),
+                    };
+                }
                 _ => {
                     return Err(self.type_error("value is not a function"));
                 }
@@ -498,6 +517,34 @@ impl ScriptRuntime {
                     return Ok(Prepared::Done(
                         self.construct_native(native, arguments, new_target)?,
                     ));
+                }
+                ObjectClass::Proxy(proxy) => {
+                    if !proxy.constructor {
+                        return Err(self.type_error("value is not a constructor"));
+                    }
+                    let (target, trap) = self.proxy_trap(&proxy, "construct")?;
+                    let new_target = match &new_target {
+                        Value::Object(target_object) if Rc::ptr_eq(target_object, object) => {
+                            target.clone()
+                        }
+                        _ => new_target,
+                    };
+                    return match trap {
+                        Some(trap) => {
+                            let handler =
+                                proxy.handler.borrow().clone().unwrap_or(Value::Undefined);
+                            let list = Self::new_array(arguments);
+                            let result =
+                                self.call_function(trap, handler, vec![target, list, new_target])?;
+                            if super::operations::is_primitive(&result) {
+                                return Err(
+                                    self.type_error("proxy construct trap returned a non-object")
+                                );
+                            }
+                            Ok(Prepared::Done(result))
+                        }
+                        None => self.prepare_construct(target, arguments, new_target),
+                    };
                 }
                 _ => return Err(self.type_error("value is not a constructor")),
             }

@@ -1,7 +1,11 @@
 mod arrays;
 mod ast;
+mod collections;
 mod compiler;
 mod console;
+mod dates;
+mod encoding;
+mod intl;
 mod json;
 mod lexer;
 mod numbers;
@@ -11,13 +15,17 @@ mod parser;
 mod pattern;
 mod promises;
 mod realm;
+mod reflect;
 mod regexp;
 mod strings;
+mod typed;
 mod vm;
 
-use object::{ObjectClass, ObjectHandle};
+use object::{JsObject, ObjectClass, ObjectHandle, new_object};
 use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol_description};
 use realm::{Intrinsics, Native, create_intrinsics};
+
+pub use dates::TimeZone;
 
 use crate::Color;
 use crate::css::StyleState;
@@ -61,8 +69,6 @@ type ArrayHandle = Rc<RefCell<Vec<Value>>>;
 // named properties set on arrays, keyed by allocation while the array is alive
 type ArrayExpandos = HashMap<usize, (Weak<RefCell<Vec<Value>>>, Vec<(String, Value)>)>;
 type NodeListHandle = Rc<Vec<ElementHandle>>;
-type MapHandle = Rc<RefCell<MapData>>;
-type SetHandle = Rc<RefCell<SetData>>;
 type IteratorHandle = Rc<RefCell<IteratorData>>;
 type ErrorHandle = Rc<ErrorData>;
 type LocationHandle = Rc<RefCell<AppUrl>>;
@@ -80,7 +86,7 @@ type IndexedDbDatabaseHandle = Rc<RefCell<IndexedDbDatabaseData>>;
 type IndexedDbTransactionHandle = Rc<RefCell<IndexedDbTransactionData>>;
 type IndexedDbObjectStoreHandle = Rc<RefCell<IndexedDbObjectStoreData>>;
 type IndexedDbNameListHandle = Rc<Vec<String>>;
-type Uint8ArrayHandle = Rc<RefCell<Uint8ArrayData>>;
+type TypedArrayHandle = Rc<RefCell<TypedArrayData>>;
 type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
@@ -120,8 +126,6 @@ enum Value {
     Object(ObjectHandle),
     Array(ArrayHandle),
     NodeList(NodeListHandle),
-    Map(MapHandle),
-    Set(SetHandle),
     Iterator(IteratorHandle),
     Element(ElementHandle),
     Validity(ValidityHandle),
@@ -135,8 +139,7 @@ enum Value {
     Response(ResponseHandle),
     ResponseConstructor,
     Bytes(BytesHandle),
-    ArrayBufferConstructor,
-    Uint8Array(Uint8ArrayHandle),
+    TypedArray(TypedArrayHandle),
     ReadableStream(ReadableStreamHandle),
     ReadableStreamReader(ReadableStreamReaderHandle),
     Headers(HeadersHandle),
@@ -169,9 +172,6 @@ enum Value {
     FormDataConstructor,
     BlobConstructor,
     FileConstructor,
-    Uint8ArrayConstructor,
-    MapConstructor,
-    SetConstructor,
     PromiseConstructor,
     AbortControllerConstructor,
     WorkerConstructor,
@@ -197,9 +197,10 @@ enum CloneValue {
     Array(Vec<CloneValue>),
     Object(Vec<(String, CloneValue)>),
     Map(Vec<(CloneValue, CloneValue)>),
+    Date(f64),
     Set(Vec<CloneValue>),
     Bytes(Vec<u8>),
-    Uint8Array(Vec<u8>),
+    TypedArray(typed::ElementKind, Vec<u8>),
     Blob {
         bytes: Vec<u8>,
         mime_type: String,
@@ -372,18 +373,8 @@ enum Builtin {
     ElementGetAttribute(ElementHandle),
     ElementQuerySelector(ElementHandle),
     ElementQuerySelectorAll(ElementHandle),
-    Uint8ArraySet(Uint8ArrayHandle),
-    Uint8ArraySlice(Uint8ArrayHandle),
-    Uint8ArraySubarray(Uint8ArrayHandle),
-    MapGet(MapHandle),
-    MapSet(MapHandle),
-    MapKeys(MapHandle),
-    MapValues(MapHandle),
-    MapEntries(MapHandle),
     IteratorNext(IteratorHandle),
     IteratorJoin(IteratorHandle),
-    SetHas(SetHandle),
-    SetValues(SetHandle),
     PromiseReject,
     PromiseResolve,
     PromiseRejectPending(PromiseHandle),
@@ -564,6 +555,9 @@ pub struct ScriptRuntime {
     console_depth: usize,
     console_timers: HashMap<String, u64>,
     console_counts: HashMap<String, u64>,
+    // wall-clock milliseconds when the page clock started
+    time_origin: f64,
+    time_zone: Rc<dyn dates::TimeZone>,
     host_runtime_info: Option<HostRuntimeInfo>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     loading_modules: BTreeSet<String>,
@@ -1025,10 +1019,11 @@ struct FileData {
     last_modified: i64,
 }
 
-struct Uint8ArrayData {
+struct TypedArrayData {
     buffer: BytesHandle,
     start: usize,
     end: usize,
+    kind: typed::ElementKind,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1119,17 +1114,9 @@ struct HeadersData {
     mutable: bool,
 }
 
-struct MapData {
-    entries: Vec<(Value, Value)>,
-}
-
 struct IteratorData {
     values: Vec<Value>,
     index: usize,
-}
-
-struct SetData {
-    values: Vec<Value>,
 }
 
 struct ErrorData {
@@ -1472,9 +1459,6 @@ impl ScriptRuntime {
             );
             values
                 .values
-                .insert("Set".to_string(), Value::SetConstructor);
-            values
-                .values
                 .insert("URL".to_string(), Value::UrlConstructor);
             values.values.insert(
                 "URLSearchParams".to_string(),
@@ -1491,12 +1475,6 @@ impl ScriptRuntime {
                 .insert("File".to_string(), Value::FileConstructor);
             values
                 .values
-                .insert("ArrayBuffer".to_string(), Value::ArrayBufferConstructor);
-            values
-                .values
-                .insert("Uint8Array".to_string(), Value::Uint8ArrayConstructor);
-            values
-                .values
                 .insert("Worker".to_string(), Value::WorkerConstructor);
             values
                 .values
@@ -1507,9 +1485,6 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("Headers".to_string(), Value::HeadersConstructor);
-            values
-                .values
-                .insert("Map".to_string(), Value::MapConstructor);
             values.values.insert(
                 "localStorage".to_string(),
                 Value::Storage(local_storage.clone()),
@@ -1613,6 +1588,10 @@ impl ScriptRuntime {
             console_depth: 0,
             console_timers: HashMap::new(),
             console_counts: HashMap::new(),
+            time_origin: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_millis() as f64),
+            time_zone: Rc::new(dates::Utc),
             host_runtime_info,
             module_cache: BTreeMap::new(),
             loading_modules: BTreeSet::new(),
@@ -2249,6 +2228,10 @@ impl ScriptRuntime {
         outcome?;
         self.drain_microtasks()?;
         self.pump_workers().map(|_| ())
+    }
+
+    pub(crate) fn set_time_zone(&mut self, time_zone: Rc<dyn dates::TimeZone>) {
+        self.time_zone = time_zone;
     }
 
     pub(crate) fn set_file_picker(&mut self, file_picker: Option<Rc<dyn FilePicker>>) {
@@ -3864,8 +3847,6 @@ impl ScriptRuntime {
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
-                "ArrayBuffer" => Ok(Value::ArrayBufferConstructor),
-                "Uint8Array" => Ok(Value::Uint8ArrayConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
                 "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
                 "clearTimeout" | "clearInterval" => Ok(Value::Builtin(Builtin::ClearTimeout)),
@@ -4776,9 +4757,6 @@ impl ScriptRuntime {
             Value::FileConstructor => {
                 Err(runtime_error(format!("File has no property {property}")))
             }
-            Value::Uint8ArrayConstructor => Err(runtime_error(format!(
-                "Uint8Array has no property {property}"
-            ))),
             Value::CanvasContext(context) => match property {
                 "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style).into())),
                 "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
@@ -4877,28 +4855,6 @@ impl ScriptRuntime {
                     "ReadableStreamDefaultReader has no property {property}"
                 ))),
             },
-            Value::Bytes(bytes) => match property {
-                "byteLength" | "length" => Ok(Value::Number(bytes.borrow().len() as f64)),
-                _ => Err(runtime_error(format!(
-                    "ArrayBuffer has no property {property}"
-                ))),
-            },
-            Value::ArrayBufferConstructor => Err(runtime_error(format!(
-                "ArrayBuffer has no property {property}"
-            ))),
-            Value::Uint8Array(array) => match property {
-                "byteLength" | "length" => {
-                    Ok(Value::Number(uint8_array_view_len(&array.borrow()) as f64))
-                }
-                "byteOffset" => Ok(Value::Number(array.borrow().start as f64)),
-                "buffer" => Ok(Value::Bytes(array.borrow().buffer.clone())),
-                "set" => Ok(Value::Builtin(Builtin::Uint8ArraySet(array))),
-                "slice" => Ok(Value::Builtin(Builtin::Uint8ArraySlice(array))),
-                "subarray" => Ok(Value::Builtin(Builtin::Uint8ArraySubarray(array))),
-                _ => Err(runtime_error(format!(
-                    "Uint8Array has no property {property}"
-                ))),
-            },
             Value::Headers(headers) => match property {
                 "append" => Ok(Value::Builtin(Builtin::HeadersAppend(headers))),
                 "delete" => Ok(Value::Builtin(Builtin::HeadersDelete(headers))),
@@ -4910,12 +4866,6 @@ impl ScriptRuntime {
                 "forEach" => Ok(Value::Builtin(Builtin::HeadersForEach(headers))),
                 "set" => Ok(Value::Builtin(Builtin::HeadersSet(headers))),
                 _ => Err(runtime_error(format!("headers has no property {property}"))),
-            },
-            Value::Set(set) => match property {
-                "size" => Ok(Value::Number(set.borrow().values.len() as f64)),
-                "has" => Ok(Value::Builtin(Builtin::SetHas(set))),
-                "values" | "keys" => Ok(Value::Builtin(Builtin::SetValues(set))),
-                _ => Err(runtime_error(format!("Set has no property {property}"))),
             },
             Value::Iterator(iterator) => match property {
                 "length" => {
@@ -4988,15 +4938,6 @@ impl ScriptRuntime {
                 .element_attribute(&handle, &dataset_attribute_name(property))
                 .map(|text| Value::String(text.into()))
                 .unwrap_or(Value::Undefined)),
-            Value::Map(map) => match property {
-                "size" => Ok(Value::Number(map.borrow().entries.len() as f64)),
-                "get" => Ok(Value::Builtin(Builtin::MapGet(map))),
-                "set" => Ok(Value::Builtin(Builtin::MapSet(map))),
-                "keys" => Ok(Value::Builtin(Builtin::MapKeys(map))),
-                "values" => Ok(Value::Builtin(Builtin::MapValues(map))),
-                "entries" => Ok(Value::Builtin(Builtin::MapEntries(map))),
-                _ => Err(runtime_error(format!("Map has no property {property}"))),
-            },
             Value::WebAssemblyNamespace => match property {
                 "instantiate" => Ok(Value::Builtin(Builtin::WebAssemblyInstantiate)),
                 _ => Err(runtime_error(format!(
@@ -5094,7 +5035,7 @@ impl ScriptRuntime {
                     .map(|byte| Value::Number(byte as f64))
                     .unwrap_or(Value::Undefined))
             }
-            Value::Uint8Array(array) => {
+            Value::TypedArray(array) => {
                 let index = index.number()?;
                 if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
                     return Ok(Value::Undefined);
@@ -5181,7 +5122,7 @@ impl ScriptRuntime {
             Value::CanvasContext(context) if property == "fillStyle" => {
                 self.set_canvas_fill_style(&context, &value_string)
             }
-            Value::Uint8Array(array) => {
+            Value::TypedArray(array) => {
                 let Some(index) = uint8_array_property_index(property) else {
                     return Err(runtime_error(format!(
                         "Uint8Array property {property} is not writable"
@@ -7756,13 +7697,9 @@ impl ScriptRuntime {
             Value::FormDataConstructor => self.construct_form_data(arguments),
             Value::BlobConstructor => self.construct_blob(arguments),
             Value::FileConstructor => self.construct_file(arguments),
-            Value::ArrayBufferConstructor => self.construct_array_buffer(arguments),
-            Value::Uint8ArrayConstructor => self.construct_uint8_array(arguments),
             Value::HeadersConstructor => self.construct_headers(arguments),
             Value::RequestConstructor => self.construct_request(arguments),
             Value::ResponseConstructor => self.construct_response(arguments),
-            Value::MapConstructor => self.construct_map(arguments),
-            Value::SetConstructor => self.construct_set(arguments),
             Value::PromiseConstructor => self.construct_promise(arguments),
             Value::AbortControllerConstructor => Ok(self.construct_abort_controller()),
             Value::WorkerConstructor => self.construct_worker(arguments),
@@ -8129,78 +8066,6 @@ impl ScriptRuntime {
         })))
     }
 
-    fn construct_array_buffer(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let length = arguments
-            .first()
-            .map(uint8_array_length)
-            .transpose()?
-            .unwrap_or(0);
-        Ok(Value::Bytes(Rc::new(RefCell::new(vec![0; length]))))
-    }
-
-    fn construct_uint8_array(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let source = arguments
-            .first()
-            .cloned()
-            .unwrap_or(Value::Undefined)
-            .resolve();
-        let (buffer, start, end) = match source {
-            Value::Bytes(buffer) => {
-                let buffer_length = buffer.borrow().len();
-                let start = arguments
-                    .get(1)
-                    .map(|value| uint8_array_non_negative_integer(value, "Uint8Array byteOffset"))
-                    .transpose()?
-                    .unwrap_or(0);
-                if start > buffer_length {
-                    return Err(runtime_error("Uint8Array byteOffset is out of bounds"));
-                }
-                let end = match arguments.get(2) {
-                    None | Some(Value::Undefined) => buffer_length,
-                    Some(length) => {
-                        let length = uint8_array_non_negative_integer(length, "Uint8Array length")?;
-                        start
-                            .checked_add(length)
-                            .ok_or_else(|| runtime_error("Uint8Array length is out of bounds"))?
-                    }
-                };
-                if end > buffer_length {
-                    return Err(runtime_error("Uint8Array length is out of bounds"));
-                }
-                (buffer, start, end)
-            }
-            Value::Undefined | Value::Null => {
-                let buffer = Rc::new(RefCell::new(Vec::new()));
-                (buffer, 0, 0)
-            }
-            Value::Number(_) | Value::Bool(_) | Value::String(_) => {
-                let buffer = Rc::new(RefCell::new(vec![0; uint8_array_length(&source)?]));
-                let end = buffer.borrow().len();
-                (buffer, 0, end)
-            }
-            Value::Uint8Array(array) => {
-                let buffer = Rc::new(RefCell::new(uint8_array_bytes(&array.borrow())));
-                let end = buffer.borrow().len();
-                (buffer, 0, end)
-            }
-            source => {
-                let buffer = Rc::new(RefCell::new(uint8_array_source_bytes(source)?));
-                let end = buffer.borrow().len();
-                (buffer, 0, end)
-            }
-        };
-        if end - start > MAX_TYPED_ARRAY_BYTES {
-            return Err(runtime_error(
-                "Uint8Array length exceeds the deterministic limit",
-            ));
-        }
-        Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
-            buffer,
-            start,
-            end,
-        }))))
-    }
-
     fn construct_headers(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
         let init = arguments
             .first()
@@ -8395,40 +8260,6 @@ impl ScriptRuntime {
                 response_type: "default".to_string(),
             },
         ))))
-    }
-
-    fn construct_map(&self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let mut entries = Vec::new();
-        if let Some(Value::Array(sequence)) = arguments.first() {
-            for entry in sequence.borrow().iter() {
-                let Value::Array(entry) = entry else {
-                    return Err(runtime_error("Map sequence entries must be arrays"));
-                };
-                let entry = entry.borrow();
-                if entry.len() < 2 {
-                    return Err(runtime_error("Map sequence entries need two values"));
-                }
-                entries.push((entry[0].clone(), entry[1].clone()));
-            }
-        } else if !arguments.is_empty() {
-            return Err(runtime_error("Map constructor requires an array sequence"));
-        }
-        Ok(Value::Map(Rc::new(RefCell::new(MapData { entries }))))
-    }
-
-    fn construct_set(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let mut values = Vec::new();
-        if let Some(value) = arguments.first() {
-            for candidate in self.iterate_to_vec(value.clone())? {
-                if !values
-                    .iter()
-                    .any(|existing| values_equal(existing, &candidate))
-                {
-                    values.push(candidate);
-                }
-            }
-        }
-        Ok(Value::Set(Rc::new(RefCell::new(SetData { values }))))
     }
 
     fn construct_promise(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
@@ -8721,15 +8552,6 @@ impl ScriptRuntime {
                 Ok(Value::Range(range))
             }
             Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
-            Builtin::SetHas(set) => {
-                let candidate = arguments.first().cloned().unwrap_or(Value::Undefined);
-                Ok(Value::Bool(
-                    set.borrow()
-                        .values
-                        .iter()
-                        .any(|value| values_equal(value, &candidate)),
-                ))
-            }
             Builtin::PromiseReject => Ok(Value::Promise(Rc::new(RefCell::new(PromiseData {
                 outcome: PromiseOutcome::Rejected(
                     arguments.first().cloned().unwrap_or(Value::Undefined),
@@ -8762,7 +8584,7 @@ impl ScriptRuntime {
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
-                    Some(Value::Uint8Array(array)) => uint8_array_bytes(&array.borrow()),
+                    Some(Value::TypedArray(array)) => uint8_array_bytes(&array.borrow()),
                     Some(_) => {
                         return Err(runtime_error(
                             "WebAssembly.instantiate expects an ArrayBuffer or Uint8Array",
@@ -10190,7 +10012,7 @@ impl ScriptRuntime {
                 };
                 let bytes = match arguments.get(1).map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
-                    Some(Value::Uint8Array(array)) => uint8_array_bytes(&array.borrow()),
+                    Some(Value::TypedArray(array)) => uint8_array_bytes(&array.borrow()),
                     _ => {
                         return Ok(Value::Promise(self.rejected_promise_value(
                             subtle_error_value(
@@ -10557,8 +10379,14 @@ impl ScriptRuntime {
                 let end = body.cursor.saturating_add(16).min(body.bytes.len());
                 let chunk = body.bytes[body.cursor..end].to_vec();
                 body.cursor = end;
+                let length = chunk.len();
                 Ok(Value::Promise(self.fulfilled_promise(read_result(
-                    Value::Bytes(Rc::new(RefCell::new(chunk))),
+                    typed::new_typed(
+                        typed::ElementKind::Uint8,
+                        Rc::new(RefCell::new(chunk)),
+                        0,
+                        length,
+                    ),
                     false,
                 ))))
             }
@@ -11176,107 +11004,6 @@ impl ScriptRuntime {
                     .collect();
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
-            Builtin::Uint8ArraySet(array) => {
-                let source = arguments.first().cloned().unwrap_or(Value::Undefined);
-                let bytes = uint8_array_source_bytes(source)?;
-                let offset = arguments
-                    .get(1)
-                    .map(Value::number)
-                    .transpose()?
-                    .unwrap_or(0.0);
-                if !offset.is_finite() || offset < 0.0 || offset.fract() != 0.0 {
-                    return Err(runtime_error(
-                        "Uint8Array.set offset must be a non-negative integer",
-                    ));
-                }
-                let offset = offset as usize;
-                let end = offset
-                    .checked_add(bytes.len())
-                    .ok_or_else(|| runtime_error("Uint8Array.set range is out of bounds"))?;
-                let (start, view_end, buffer) = {
-                    let array = array.borrow();
-                    (array.start, array.end, array.buffer.clone())
-                };
-                if end > view_end.saturating_sub(start) {
-                    return Err(runtime_error("Uint8Array.set range is out of bounds"));
-                }
-                buffer.borrow_mut()[start + offset..start + end].copy_from_slice(&bytes);
-                Ok(Value::Undefined)
-            }
-            Builtin::Uint8ArraySlice(array) => {
-                let (view_start, view_end, buffer) = {
-                    let array = array.borrow();
-                    (array.start, array.end, array.buffer.clone())
-                };
-                let (start, end) = blob_slice_range(&arguments, (view_end - view_start) as i64)?;
-                let bytes = buffer.borrow()[view_start + start..view_start + end].to_vec();
-                Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
-                    buffer: Rc::new(RefCell::new(bytes)),
-                    start: 0,
-                    end: end - start,
-                }))))
-            }
-            Builtin::Uint8ArraySubarray(array) => {
-                let (view_start, view_end, buffer) = {
-                    let array = array.borrow();
-                    (array.start, array.end, array.buffer.clone())
-                };
-                let (start, end) = blob_slice_range(&arguments, (view_end - view_start) as i64)?;
-                Ok(Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
-                    buffer,
-                    start: view_start + start,
-                    end: view_start + end,
-                }))))
-            }
-            Builtin::MapGet(map) => {
-                let key = arguments.first().cloned().unwrap_or(Value::Undefined);
-                Ok(map
-                    .borrow()
-                    .entries
-                    .iter()
-                    .find(|(entry_key, _)| values_equal(entry_key, &key))
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or(Value::Undefined))
-            }
-            Builtin::MapSet(map) => {
-                let key = arguments.first().cloned().unwrap_or(Value::Undefined);
-                let value = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let mut map_data = map.borrow_mut();
-                if let Some((_, entry_value)) = map_data
-                    .entries
-                    .iter_mut()
-                    .find(|(entry_key, _)| values_equal(entry_key, &key))
-                {
-                    *entry_value = value;
-                } else {
-                    map_data.entries.push((key, value));
-                }
-                drop(map_data);
-                Ok(Value::Map(map))
-            }
-            Builtin::MapKeys(map) => Ok(iterator_value(
-                map.borrow()
-                    .entries
-                    .iter()
-                    .map(|(key, _)| key.clone())
-                    .collect(),
-            )),
-            Builtin::MapValues(map) => Ok(iterator_value(
-                map.borrow()
-                    .entries
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .collect(),
-            )),
-            Builtin::MapEntries(map) => Ok(iterator_value(
-                map.borrow()
-                    .entries
-                    .iter()
-                    .map(|(key, value)| {
-                        Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
-                    })
-                    .collect(),
-            )),
             Builtin::IteratorNext(iterator) => {
                 let mut iterator = iterator.borrow_mut();
                 let mut result = BTreeMap::new();
@@ -11306,7 +11033,6 @@ impl ScriptRuntime {
                     .join(&separator);
                 Ok(Value::String(joined.into()))
             }
-            Builtin::SetValues(set) => Ok(iterator_value(set.borrow().values.clone())),
             Builtin::ElementClassListAdd(handle) => {
                 for argument in arguments {
                     let class = class_name(&argument)?;
@@ -13126,8 +12852,6 @@ impl Value {
             Self::Object(object) => object_display(object),
             Self::Array(array) => array_display(array, &mut Vec::new()),
             Self::NodeList(_) => "[object NodeList]".to_string(),
-            Self::Map(_) => "[object Map]".to_string(),
-            Self::Set(_) => "[object Set]".to_string(),
             Self::Iterator(_) => "[object Iterator]".to_string(),
             Self::Element(_) => "[element]".to_string(),
             Self::Validity(_) => "[object ValidityState]".to_string(),
@@ -13142,8 +12866,7 @@ impl Value {
             Self::Request(_) => "[object Request]".to_string(),
             Self::Response(_) => "[response]".to_string(),
             Self::Bytes(_) => "[object ArrayBuffer]".to_string(),
-            Self::ArrayBufferConstructor => "[function ArrayBuffer]".to_string(),
-            Self::Uint8Array(_) => "[object Uint8Array]".to_string(),
+            Self::TypedArray(array) => format!("[object {}]", array.borrow().kind.name()),
             Self::ReadableStream(_) => "[object ReadableStream]".to_string(),
             Self::ReadableStreamReader(_) => "[object ReadableStreamDefaultReader]".to_string(),
             Self::Headers(_) => "[object Headers]".to_string(),
@@ -13183,9 +12906,6 @@ impl Value {
             Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::BlobConstructor => "[function Blob]".to_string(),
             Self::FileConstructor => "[function File]".to_string(),
-            Self::Uint8ArrayConstructor => "[function Uint8Array]".to_string(),
-            Self::MapConstructor => "[function Map]".to_string(),
-            Self::SetConstructor => "[function Set]".to_string(),
             Self::PromiseConstructor => "[function Promise]".to_string(),
             Self::AbortControllerConstructor => "[function AbortController]".to_string(),
             Self::WorkerConstructor => "[function Worker]".to_string(),
@@ -13304,6 +13024,36 @@ fn clone_value(
             if callable {
                 return Err(data_clone_error("value is not cloneable"));
             }
+            let class = object.borrow().class.clone();
+            match class {
+                ObjectClass::Map(collection) | ObjectClass::Set(collection) => {
+                    let set = matches!(object.borrow().class, ObjectClass::Set(_));
+                    context.enter(pointer)?;
+                    let entries = collection.borrow().values();
+                    let result = if set {
+                        entries
+                            .iter()
+                            .map(|(key, _)| clone_value(key, context, depth + 1))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(CloneValue::Set)
+                    } else {
+                        entries
+                            .iter()
+                            .map(|(key, value)| {
+                                Ok((
+                                    clone_value(key, context, depth + 1)?,
+                                    clone_value(value, context, depth + 1)?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, ScriptError>>()
+                            .map(CloneValue::Map)
+                    };
+                    context.leave(pointer);
+                    return result;
+                }
+                ObjectClass::Date(time) => return Ok(CloneValue::Date(time)),
+                _ => {}
+            }
             if error {
                 let read = |key: &str| {
                     let mut current = Some(object.clone());
@@ -13350,33 +13100,6 @@ fn clone_value(
             context.leave(pointer);
             result.map(CloneValue::Array)
         }
-        Value::Map(map) => {
-            let pointer = Rc::as_ptr(map) as usize;
-            context.enter(pointer)?;
-            let entries = map.borrow().entries.clone();
-            let result = entries
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        clone_value(key, context, depth + 1)?,
-                        clone_value(value, context, depth + 1)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ScriptError>>();
-            context.leave(pointer);
-            result.map(CloneValue::Map)
-        }
-        Value::Set(set) => {
-            let pointer = Rc::as_ptr(set) as usize;
-            context.enter(pointer)?;
-            let values = set.borrow().values.clone();
-            let result = values
-                .iter()
-                .map(|value| clone_value(value, context, depth + 1))
-                .collect::<Result<Vec<_>, _>>();
-            context.leave(pointer);
-            result.map(CloneValue::Set)
-        }
         Value::Bytes(bytes) => {
             let pointer = Rc::as_ptr(bytes) as usize;
             context.enter(pointer)?;
@@ -13387,19 +13110,20 @@ fn clone_value(
             context.leave(pointer);
             result
         }
-        Value::Uint8Array(array) => {
+        Value::TypedArray(array) => {
             let pointer = Rc::as_ptr(array) as usize;
             context.enter(pointer)?;
             let array = array.borrow();
+            let kind = array.kind;
             let bytes = array
                 .buffer
                 .borrow()
                 .get(array.start..array.end)
-                .ok_or_else(|| data_clone_error("Uint8Array view is out of bounds"))?
+                .ok_or_else(|| data_clone_error("typed array view is out of bounds"))?
                 .to_vec();
             let result = context
                 .account_bytes(bytes.len())
-                .map(|_| CloneValue::Uint8Array(bytes));
+                .map(|_| CloneValue::TypedArray(kind, bytes));
             drop(array);
             context.leave(pointer);
             result
@@ -13475,26 +13199,31 @@ impl CloneValue {
                     .map(|(key, value)| Ok((key, value.into_value()?)))
                     .collect::<Result<Vec<_>, ScriptError>>()?,
             ),
-            Self::Map(entries) => Value::Map(Rc::new(RefCell::new(MapData {
-                entries: entries
-                    .into_iter()
-                    .map(|(key, value)| Ok((key.into_value()?, value.into_value()?)))
-                    .collect::<Result<Vec<_>, ScriptError>>()?,
-            }))),
-            Self::Set(values) => Value::Set(Rc::new(RefCell::new(SetData {
-                values: values
-                    .into_iter()
-                    .map(Self::into_value)
-                    .collect::<Result<Vec<_>, _>>()?,
-            }))),
+            Self::Map(entries) => {
+                let mut collection = collections::Collection::new(false);
+                for (key, value) in entries {
+                    collection.set(key.into_value()?, value.into_value()?);
+                }
+                Value::Object(new_object(JsObject::with_class(ObjectClass::Map(Rc::new(
+                    RefCell::new(collection),
+                )))))
+            }
+            Self::Set(values) => {
+                let mut collection = collections::Collection::new(false);
+                for value in values {
+                    collection.set(value.into_value()?, Value::Undefined);
+                }
+                Value::Object(new_object(JsObject::with_class(ObjectClass::Set(Rc::new(
+                    RefCell::new(collection),
+                )))))
+            }
+            Self::Date(time) => {
+                Value::Object(new_object(JsObject::with_class(ObjectClass::Date(time))))
+            }
             Self::Bytes(bytes) => Value::Bytes(Rc::new(RefCell::new(bytes))),
-            Self::Uint8Array(bytes) => {
+            Self::TypedArray(kind, bytes) => {
                 let end = bytes.len();
-                Value::Uint8Array(Rc::new(RefCell::new(Uint8ArrayData {
-                    buffer: Rc::new(RefCell::new(bytes)),
-                    start: 0,
-                    end,
-                })))
+                typed::new_typed(kind, Rc::new(RefCell::new(bytes)), 0, end)
             }
             Self::Blob { bytes, mime_type } => Value::Blob(Rc::new(BlobData { bytes, mime_type })),
             Self::File {
@@ -13789,13 +13518,26 @@ fn write_clone_value(
                 write_clone_value(writer, value, depth + 1)?;
             }
         }
+        CloneValue::Date(time) => {
+            writer.write_u8(15);
+            writer.write_u64(time.to_bits());
+        }
         CloneValue::Bytes(bytes) => {
             writer.write_u8(10);
             writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone bytes")?;
         }
-        CloneValue::Uint8Array(bytes) => {
+        CloneValue::TypedArray(typed::ElementKind::Uint8, bytes) => {
             writer.write_u8(11);
             writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone Uint8Array")?;
+        }
+        CloneValue::TypedArray(kind, bytes) => {
+            writer.write_u8(16);
+            let index = typed::ELEMENT_KINDS
+                .iter()
+                .position(|(candidate, _)| candidate == kind)
+                .unwrap_or(0);
+            writer.write_u8(index as u8);
+            writer.write_bytes(bytes, MAX_IDB_VALUE_BYTES, "structured clone typed array")?;
         }
         CloneValue::Blob { bytes, mime_type } => {
             writer.write_u8(12);
@@ -13982,11 +13724,23 @@ fn read_clone_value(
             context,
             "structured clone bytes",
         )?)),
-        11 => Ok(CloneValue::Uint8Array(read_clone_bytes(
-            reader,
-            context,
-            "structured clone Uint8Array",
-        )?)),
+        11 => Ok(CloneValue::TypedArray(
+            typed::ElementKind::Uint8,
+            read_clone_bytes(reader, context, "structured clone Uint8Array")?,
+        )),
+        16 => {
+            let index = usize::from(reader.read_u8()?);
+            let (kind, _) = *typed::ELEMENT_KINDS
+                .get(index)
+                .ok_or_else(|| storage_invalid("structured clone typed array kind is invalid"))?;
+            let bytes = read_clone_bytes(reader, context, "structured clone typed array")?;
+            if bytes.len() % kind.size() != 0 {
+                return Err(storage_invalid(
+                    "structured clone typed array length is invalid",
+                ));
+            }
+            Ok(CloneValue::TypedArray(kind, bytes))
+        }
         12 => Ok(CloneValue::Blob {
             bytes: read_clone_bytes(reader, context, "structured clone Blob bytes")?,
             mime_type: read_clone_string(reader, context, "structured clone Blob type")?,
@@ -14003,6 +13757,7 @@ fn read_clone_value(
             code: read_clone_optional_string(reader, context, "structured clone Error code")?,
             class_name: read_clone_string(reader, context, "structured clone Error class")?,
         }),
+        15 => Ok(CloneValue::Date(f64::from_bits(reader.read_u64()?))),
         _ => Err(storage_invalid("structured clone type tag is invalid")),
     }
 }
@@ -14984,7 +14739,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             Some("text/plain;charset=UTF-8".to_string()),
         )),
         Value::Bytes(bytes) => Ok((bytes.borrow().clone(), None)),
-        Value::Uint8Array(array) => Ok((uint8_array_bytes(&array.borrow()), None)),
+        Value::TypedArray(array) => Ok((uint8_array_bytes(&array.borrow()), None)),
         Value::Blob(blob) => Ok((
             blob.bytes.clone(),
             (!blob.mime_type.is_empty()).then(|| blob.mime_type.clone()),
@@ -15133,32 +14888,22 @@ fn uint8_array_property_index(property: &str) -> Option<usize> {
     property.parse::<usize>().ok()
 }
 
-fn uint8_array_view_len(array: &Uint8ArrayData) -> usize {
+fn uint8_array_view_len(array: &TypedArrayData) -> usize {
     array.end - array.start
 }
 
-fn uint8_array_non_negative_integer(value: &Value, label: &str) -> Result<usize, ScriptError> {
-    let number = value.number()?;
-    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number > usize::MAX as f64 {
-        return Err(runtime_error(format!(
-            "{label} must be a non-negative integer"
-        )));
-    }
-    Ok(number as usize)
-}
-
-fn uint8_array_bytes(array: &Uint8ArrayData) -> Vec<u8> {
+fn uint8_array_bytes(array: &TypedArrayData) -> Vec<u8> {
     array.buffer.borrow()[array.start..array.end].to_vec()
 }
 
-fn uint8_array_byte(array: &Uint8ArrayData, index: usize) -> Option<u8> {
+fn uint8_array_byte(array: &TypedArrayData, index: usize) -> Option<u8> {
     if index >= uint8_array_view_len(array) {
         return None;
     }
     array.buffer.borrow().get(array.start + index).copied()
 }
 
-fn set_uint8_array_byte(array: &Uint8ArrayHandle, index: usize, byte: u8) {
+fn set_uint8_array_byte(array: &TypedArrayHandle, index: usize, byte: u8) {
     let (start, end, buffer) = {
         let array = array.borrow();
         (array.start, array.end, array.buffer.clone())
@@ -15176,42 +14921,6 @@ fn uint8_value(value: &Value) -> Result<u8, ScriptError> {
     Ok((number.trunc() as i128).rem_euclid(256) as u8)
 }
 
-fn uint8_array_length(value: &Value) -> Result<usize, ScriptError> {
-    let number = match value.resolve() {
-        Value::Undefined | Value::Null => 0.0,
-        Value::Bool(value) => f64::from(value as u8),
-        Value::Number(value) => value,
-        Value::String(value) => value.parse().unwrap_or(f64::NAN),
-        _ => return Err(runtime_error("Uint8Array length must be a number")),
-    };
-    if !number.is_finite() || number <= 0.0 {
-        return Ok(0);
-    }
-    let length = number.floor();
-    if length > MAX_TYPED_ARRAY_BYTES as f64 {
-        return Err(runtime_error(
-            "Uint8Array length exceeds the deterministic limit",
-        ));
-    }
-    Ok(length as usize)
-}
-
-fn uint8_array_source_bytes(value: Value) -> Result<Vec<u8>, ScriptError> {
-    match value.resolve() {
-        Value::Array(values) => values
-            .borrow()
-            .iter()
-            .map(uint8_value)
-            .collect::<Result<Vec<_>, _>>(),
-        Value::Bytes(bytes) => Ok(bytes.borrow().clone()),
-        Value::Uint8Array(array) => Ok(uint8_array_bytes(&array.borrow())),
-        Value::Undefined | Value::Null => Ok(Vec::new()),
-        _ => Err(runtime_error(
-            "Uint8Array source must be an Array, ArrayBuffer, or Uint8Array",
-        )),
-    }
-}
-
 fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
     let parts = match parts.map(Value::resolve) {
         None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
@@ -15222,7 +14931,7 @@ fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
     for part in parts {
         match part.resolve() {
             Value::Bytes(part) => bytes.extend_from_slice(&part.borrow()),
-            Value::Uint8Array(part) => bytes.extend_from_slice(&uint8_array_bytes(&part.borrow())),
+            Value::TypedArray(part) => bytes.extend_from_slice(&uint8_array_bytes(&part.borrow())),
             Value::Blob(part) => bytes.extend_from_slice(&part.bytes),
             Value::File(part) => bytes.extend_from_slice(&part.bytes),
             part => bytes.extend_from_slice(part.string_value().as_bytes()),
@@ -16593,8 +16302,6 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::VmIterator(_)
         | Value::Array(_)
         | Value::NodeList(_)
-        | Value::Map(_)
-        | Value::Set(_)
         | Value::Iterator(_)
         | Value::Element(_)
         | Value::Validity(_)
@@ -16607,7 +16314,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Request(_)
         | Value::Response(_)
         | Value::Bytes(_)
-        | Value::Uint8Array(_)
+        | Value::TypedArray(_)
         | Value::ReadableStream(_)
         | Value::ReadableStreamReader(_)
         | Value::Headers(_)
@@ -16650,15 +16357,11 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::ResponseConstructor
         | Value::RequestConstructor
         | Value::HeadersConstructor
-        | Value::ArrayBufferConstructor
         | Value::UrlConstructor
         | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
         | Value::BlobConstructor
         | Value::FileConstructor
-        | Value::Uint8ArrayConstructor
-        | Value::MapConstructor
-        | Value::SetConstructor
         | Value::PromiseConstructor
         | Value::AbortControllerConstructor
         | Value::WorkerConstructor => "function",
@@ -17099,8 +16802,6 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         }
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
-        (Value::Map(left), Value::Map(right)) => Rc::ptr_eq(left, right),
-        (Value::Set(left), Value::Set(right)) => Rc::ptr_eq(left, right),
         (Value::Iterator(left), Value::Iterator(right)) => Rc::ptr_eq(left, right),
         (Value::Promise(left), Value::Promise(right)) => Rc::ptr_eq(left, right),
         (Value::Element(left), Value::Element(right))
@@ -17139,16 +16840,12 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         | (Value::FormDataConstructor, Value::FormDataConstructor)
         | (Value::BlobConstructor, Value::BlobConstructor)
         | (Value::FileConstructor, Value::FileConstructor)
-        | (Value::MapConstructor, Value::MapConstructor)
-        | (Value::SetConstructor, Value::SetConstructor)
         | (Value::PromiseConstructor, Value::PromiseConstructor)
         | (Value::AbortControllerConstructor, Value::AbortControllerConstructor)
         | (Value::WorkerConstructor, Value::WorkerConstructor)
         | (Value::Clipboard, Value::Clipboard)
         | (Value::Crypto, Value::Crypto)
-        | (Value::SubtleCrypto, Value::SubtleCrypto)
-        | (Value::ArrayBufferConstructor, Value::ArrayBufferConstructor)
-        | (Value::Uint8ArrayConstructor, Value::Uint8ArrayConstructor) => true,
+        | (Value::SubtleCrypto, Value::SubtleCrypto) => true,
         (Value::Location(left), Value::Location(right)) => Rc::ptr_eq(left, right),
         (Value::History(left), Value::History(right)) => Rc::ptr_eq(left, right),
         (Value::Error(left), Value::Error(right)) => Rc::ptr_eq(left, right),
@@ -17166,7 +16863,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::AbortSignal(left), Value::AbortSignal(right)) => Rc::ptr_eq(left, right),
         (Value::Worker(left), Value::Worker(right)) => Rc::ptr_eq(left, right),
         (Value::Bytes(left), Value::Bytes(right)) => Rc::ptr_eq(left, right),
-        (Value::Uint8Array(left), Value::Uint8Array(right)) => Rc::ptr_eq(left, right),
+        (Value::TypedArray(left), Value::TypedArray(right)) => Rc::ptr_eq(left, right),
         (Value::Request(left), Value::Request(right)) => Rc::ptr_eq(left, right),
         (Value::Headers(left), Value::Headers(right)) => Rc::ptr_eq(left, right),
         (Value::ReadableStream(left), Value::ReadableStream(right)) => Rc::ptr_eq(left, right),
@@ -18214,7 +17911,7 @@ mod tests {
                   ]),
                 );
                 const status = document.getElementById("status");
-                status.textContent = checks.get("module").id + "|" + checks.size + "|" + checks.keys().length;
+                status.textContent = checks.get("module").id + "|" + checks.size + "|" + [...checks.keys()].length;
                 "##,
             )
             .expect("collection expression should execute");
@@ -18419,7 +18116,7 @@ mod tests {
                 const { value: third, done: thirdDone } = iterator.next();
                 document.getElementById("status").textContent =
                   first + "|" + firstDone + "|" + second + "|" + secondDone + "|" +
-                  thirdDone + "|" + iterator.length;
+                  thirdDone + "|" + [...iterator].length;
                 "##,
             )
             .expect("iterator records should execute");

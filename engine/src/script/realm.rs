@@ -105,6 +105,15 @@ pub(super) enum Native {
     StringFromCodePoint,
     JsonParse,
     JsonStringify,
+    Reflect(super::reflect::ReflectMethod),
+    ProxyRevoke(Rc<super::reflect::ProxyData>),
+    Collection(super::collections::CollectionMethod),
+    Date(super::dates::DateMethod),
+    Typed(super::typed::TypedMethod),
+    // ascending numeric order, the default sort of typed arrays
+    NumericCompare,
+    Codec(super::encoding::CodecMethod),
+    Intl(Rc<super::intl::IntlMethod>),
 }
 
 impl Native {
@@ -119,7 +128,21 @@ impl Native {
                 | Native::StringConstructor
                 | Native::ArrayConstructor
                 | Native::RegExp(super::regexp::RegExpMethod::Constructor)
-        )
+                | Native::Reflect(super::reflect::ReflectMethod::ProxyConstructor)
+                | Native::Collection(super::collections::CollectionMethod::Constructor(_))
+                | Native::Collection(super::collections::CollectionMethod::WeakRefConstructor)
+                | Native::Date(super::dates::DateMethod::Constructor)
+                | Native::Typed(super::typed::TypedMethod::Constructor(_))
+                | Native::Typed(super::typed::TypedMethod::BufferConstructor)
+                | Native::Typed(super::typed::TypedMethod::ViewConstructor)
+                | Native::Codec(super::encoding::CodecMethod::EncoderConstructor)
+                | Native::Codec(super::encoding::CodecMethod::DecoderConstructor)
+        ) || matches!(self, Native::Intl(method) if matches!(**method,
+            super::intl::IntlMethod::NumberFormatConstructor
+                | super::intl::IntlMethod::DateTimeFormatConstructor
+                | super::intl::IntlMethod::CollatorConstructor
+                | super::intl::IntlMethod::PluralRulesConstructor
+                | super::intl::IntlMethod::RelativeTimeFormatConstructor))
     }
 }
 
@@ -153,6 +176,21 @@ pub(super) struct Intrinsics {
     pub(super) promise_prototype: ObjectHandle,
     pub(super) regexp_prototype: ObjectHandle,
     pub(super) array_values: Value,
+    pub(super) iterator_prototype: ObjectHandle,
+    pub(super) map_prototype: ObjectHandle,
+    pub(super) set_prototype: ObjectHandle,
+    pub(super) weak_map_prototype: ObjectHandle,
+    pub(super) weak_set_prototype: ObjectHandle,
+    pub(super) weak_ref_prototype: ObjectHandle,
+    pub(super) collection_iterator_prototype: ObjectHandle,
+    pub(super) date_prototype: ObjectHandle,
+    pub(super) typed_prototypes: Vec<ObjectHandle>,
+    pub(super) array_buffer_prototype: ObjectHandle,
+    pub(super) data_view_prototype: ObjectHandle,
+    pub(super) text_encoder_prototype: ObjectHandle,
+    pub(super) text_decoder_prototype: ObjectHandle,
+    // NumberFormat, DateTimeFormat, Collator, PluralRules and RelativeTimeFormat
+    pub(super) intl_prototypes: Vec<ObjectHandle>,
 }
 
 fn plain(prototype: &ObjectHandle) -> ObjectHandle {
@@ -321,6 +359,11 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         ("preventExtensions", Native::ObjectPreventExtensions, 1),
         ("isExtensible", Native::ObjectIsExtensible, 1),
         ("hasOwn", Native::ObjectHasOwn, 2),
+        (
+            "groupBy",
+            Native::Collection(super::collections::CollectionMethod::GroupBy(false)),
+            2,
+        ),
     ] {
         build.method(&object, key, native, length);
     }
@@ -653,6 +696,423 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     }
     globals.push(("console", Value::Object(console)));
 
+    use super::collections::{CollectionKind, CollectionMethod as C, IterationKind};
+    let collection_iterator_prototype = plain(&iterator_prototype);
+    build.method(
+        &collection_iterator_prototype,
+        "next",
+        Native::Collection(C::CursorNext),
+        0,
+    );
+    build.value(
+        &collection_iterator_prototype,
+        "@@toStringTag",
+        Value::String("Map Iterator".into()),
+    );
+
+    let map_prototype = plain(&object_prototype);
+    for (key, method, length) in [
+        ("get", C::Get, 1),
+        ("set", C::Set, 2),
+        ("has", C::Has, 1),
+        ("delete", C::Delete, 1),
+        ("clear", C::Clear, 0),
+        ("forEach", C::ForEach, 1),
+        ("keys", C::Iterate(IterationKind::Keys), 0),
+        ("values", C::Iterate(IterationKind::Values), 0),
+    ] {
+        build.method(&map_prototype, key, Native::Collection(method), length);
+    }
+    let map_entries = Value::Object(build.function(
+        Native::Collection(C::Iterate(IterationKind::Entries)),
+        "entries",
+        0,
+    ));
+    build.value(&map_prototype, "entries", map_entries.clone());
+    build.value(&map_prototype, "@@iterator", map_entries);
+    build.getter(&map_prototype, "size", Native::Collection(C::Size), None);
+    build.value(&map_prototype, "@@toStringTag", Value::String("Map".into()));
+    let map = build.constructor(
+        Native::Collection(C::Constructor(CollectionKind::Map)),
+        "Map",
+        0,
+        &map_prototype,
+    );
+    build.method(&map, "groupBy", Native::Collection(C::GroupBy(true)), 2);
+    globals.push(("Map", Value::Object(map)));
+
+    let set_prototype = plain(&object_prototype);
+    for (key, method, length) in [
+        ("add", C::Add, 1),
+        ("has", C::Has, 1),
+        ("delete", C::Delete, 1),
+        ("clear", C::Clear, 0),
+        ("forEach", C::ForEach, 1),
+        ("entries", C::Iterate(IterationKind::Entries), 0),
+        ("union", C::Union, 1),
+        ("intersection", C::Intersection, 1),
+        ("difference", C::Difference, 1),
+        ("symmetricDifference", C::SymmetricDifference, 1),
+        ("isSubsetOf", C::IsSubsetOf, 1),
+        ("isSupersetOf", C::IsSupersetOf, 1),
+        ("isDisjointFrom", C::IsDisjointFrom, 1),
+    ] {
+        build.method(&set_prototype, key, Native::Collection(method), length);
+    }
+    let set_values = Value::Object(build.function(
+        Native::Collection(C::Iterate(IterationKind::Values)),
+        "values",
+        0,
+    ));
+    build.value(&set_prototype, "values", set_values.clone());
+    build.value(&set_prototype, "keys", set_values.clone());
+    build.value(&set_prototype, "@@iterator", set_values);
+    build.getter(&set_prototype, "size", Native::Collection(C::Size), None);
+    build.value(&set_prototype, "@@toStringTag", Value::String("Set".into()));
+    let set = build.constructor(
+        Native::Collection(C::Constructor(CollectionKind::Set)),
+        "Set",
+        0,
+        &set_prototype,
+    );
+    globals.push(("Set", Value::Object(set)));
+
+    let weak_map_prototype = plain(&object_prototype);
+    for (key, method, length) in [
+        ("get", C::Get, 1),
+        ("set", C::Set, 2),
+        ("has", C::Has, 1),
+        ("delete", C::Delete, 1),
+    ] {
+        build.method(&weak_map_prototype, key, Native::Collection(method), length);
+    }
+    build.value(
+        &weak_map_prototype,
+        "@@toStringTag",
+        Value::String("WeakMap".into()),
+    );
+    let weak_map = build.constructor(
+        Native::Collection(C::Constructor(CollectionKind::WeakMap)),
+        "WeakMap",
+        0,
+        &weak_map_prototype,
+    );
+    globals.push(("WeakMap", Value::Object(weak_map)));
+
+    let weak_set_prototype = plain(&object_prototype);
+    for (key, method, length) in [
+        ("add", C::Add, 1),
+        ("has", C::Has, 1),
+        ("delete", C::Delete, 1),
+    ] {
+        build.method(&weak_set_prototype, key, Native::Collection(method), length);
+    }
+    build.value(
+        &weak_set_prototype,
+        "@@toStringTag",
+        Value::String("WeakSet".into()),
+    );
+    let weak_set = build.constructor(
+        Native::Collection(C::Constructor(CollectionKind::WeakSet)),
+        "WeakSet",
+        0,
+        &weak_set_prototype,
+    );
+    globals.push(("WeakSet", Value::Object(weak_set)));
+
+    let weak_ref_prototype = plain(&object_prototype);
+    build.method(
+        &weak_ref_prototype,
+        "deref",
+        Native::Collection(C::WeakRefDeref),
+        0,
+    );
+    build.value(
+        &weak_ref_prototype,
+        "@@toStringTag",
+        Value::String("WeakRef".into()),
+    );
+    let weak_ref = build.constructor(
+        Native::Collection(C::WeakRefConstructor),
+        "WeakRef",
+        1,
+        &weak_ref_prototype,
+    );
+    globals.push(("WeakRef", Value::Object(weak_ref)));
+
+    let date_prototype = plain(&object_prototype);
+    for (key, method, length) in super::dates::DATE_METHODS {
+        build.method(&date_prototype, key, Native::Date(*method), *length);
+    }
+    date_prototype.borrow_mut().define(
+        "@@toPrimitive".to_string(),
+        Property {
+            writable: false,
+            ..Property::hidden(Value::Object(build.function(
+                Native::Date(super::dates::DateMethod::ToPrimitive),
+                "[Symbol.toPrimitive]",
+                1,
+            )))
+        },
+    );
+    let date = build.constructor(
+        Native::Date(super::dates::DateMethod::Constructor),
+        "Date",
+        7,
+        &date_prototype,
+    );
+    build.method(&date, "now", Native::Date(super::dates::DateMethod::Now), 0);
+    build.method(
+        &date,
+        "parse",
+        Native::Date(super::dates::DateMethod::Parse),
+        1,
+    );
+    build.method(&date, "UTC", Native::Date(super::dates::DateMethod::Utc), 7);
+    globals.push(("Date", Value::Object(date)));
+
+    use super::typed::{ELEMENT_KINDS, TYPED_METHODS, TypedMethod as T, VIEW_ACCESSORS};
+    let typed_prototype = plain(&object_prototype);
+    for (key, method, length) in TYPED_METHODS {
+        build.method(&typed_prototype, key, Native::Typed(*method), *length);
+    }
+    let typed_values = Value::Object(build.function(Native::Typed(T::Values), "values", 0));
+    build.value(&typed_prototype, "values", typed_values.clone());
+    build.value(&typed_prototype, "@@iterator", typed_values);
+    for (key, method) in [
+        ("buffer", T::Buffer),
+        ("byteLength", T::ByteLength),
+        ("byteOffset", T::ByteOffset),
+        ("length", T::Length),
+        ("@@toStringTag", T::ToStringTag),
+    ] {
+        build.getter(&typed_prototype, key, Native::Typed(method), None);
+    }
+    let typed_constructor = build.constructor(
+        Native::Typed(T::AbstractConstructor),
+        "TypedArray",
+        0,
+        &typed_prototype,
+    );
+    build.method(&typed_constructor, "from", Native::Typed(T::From), 1);
+    build.method(&typed_constructor, "of", Native::Typed(T::Of), 0);
+    let mut typed_prototypes = Vec::new();
+    for (kind, name) in ELEMENT_KINDS {
+        let prototype = plain(&typed_prototype);
+        prototype.borrow_mut().define(
+            "BYTES_PER_ELEMENT".to_string(),
+            fixed(Value::Number(kind.size() as f64)),
+        );
+        let constructor =
+            build.constructor(Native::Typed(T::Constructor(*kind)), name, 3, &prototype);
+        constructor
+            .borrow_mut()
+            .set_prototype(Some(typed_constructor.clone()));
+        constructor.borrow_mut().define(
+            "BYTES_PER_ELEMENT".to_string(),
+            fixed(Value::Number(kind.size() as f64)),
+        );
+        globals.push((name, Value::Object(constructor)));
+        typed_prototypes.push(prototype);
+    }
+    let array_buffer_prototype = plain(&object_prototype);
+    build.getter(
+        &array_buffer_prototype,
+        "byteLength",
+        Native::Typed(T::BufferByteLength),
+        None,
+    );
+    build.method(
+        &array_buffer_prototype,
+        "slice",
+        Native::Typed(T::BufferSlice),
+        2,
+    );
+    build.value(
+        &array_buffer_prototype,
+        "@@toStringTag",
+        Value::String("ArrayBuffer".into()),
+    );
+    let array_buffer = build.constructor(
+        Native::Typed(T::BufferConstructor),
+        "ArrayBuffer",
+        1,
+        &array_buffer_prototype,
+    );
+    build.method(&array_buffer, "isView", Native::Typed(T::BufferIsView), 1);
+    globals.push(("ArrayBuffer", Value::Object(array_buffer)));
+    let data_view_prototype = plain(&object_prototype);
+    for (key, method) in [
+        ("buffer", T::ViewBuffer),
+        ("byteLength", T::ViewByteLength),
+        ("byteOffset", T::ViewByteOffset),
+    ] {
+        build.getter(&data_view_prototype, key, Native::Typed(method), None);
+    }
+    for (name, kind) in VIEW_ACCESSORS {
+        build.method(
+            &data_view_prototype,
+            &format!("get{name}"),
+            Native::Typed(T::ViewGet(*kind)),
+            1,
+        );
+        build.method(
+            &data_view_prototype,
+            &format!("set{name}"),
+            Native::Typed(T::ViewSet(*kind)),
+            2,
+        );
+    }
+    build.value(
+        &data_view_prototype,
+        "@@toStringTag",
+        Value::String("DataView".into()),
+    );
+    let data_view = build.constructor(
+        Native::Typed(T::ViewConstructor),
+        "DataView",
+        1,
+        &data_view_prototype,
+    );
+    globals.push(("DataView", Value::Object(data_view)));
+
+    use super::encoding::CodecMethod as E;
+    let text_encoder_prototype = plain(&object_prototype);
+    build.method(
+        &text_encoder_prototype,
+        "encode",
+        Native::Codec(E::Encode),
+        0,
+    );
+    build.method(
+        &text_encoder_prototype,
+        "encodeInto",
+        Native::Codec(E::EncodeInto),
+        2,
+    );
+    build.getter(
+        &text_encoder_prototype,
+        "encoding",
+        Native::Codec(E::EncoderEncoding),
+        None,
+    );
+    let text_encoder = build.constructor(
+        Native::Codec(E::EncoderConstructor),
+        "TextEncoder",
+        0,
+        &text_encoder_prototype,
+    );
+    globals.push(("TextEncoder", Value::Object(text_encoder)));
+    let text_decoder_prototype = plain(&object_prototype);
+    build.method(
+        &text_decoder_prototype,
+        "decode",
+        Native::Codec(E::Decode),
+        0,
+    );
+    for (key, method) in [
+        ("encoding", E::DecoderEncoding),
+        ("fatal", E::DecoderFatal),
+        ("ignoreBOM", E::DecoderIgnoreBom),
+    ] {
+        build.getter(&text_decoder_prototype, key, Native::Codec(method), None);
+    }
+    let text_decoder = build.constructor(
+        Native::Codec(E::DecoderConstructor),
+        "TextDecoder",
+        0,
+        &text_decoder_prototype,
+    );
+    globals.push(("TextDecoder", Value::Object(text_decoder)));
+
+    use super::intl::IntlMethod as I;
+    let intl = plain(&object_prototype);
+    build.value(&intl, "@@toStringTag", Value::String("Intl".into()));
+    build.method(
+        &intl,
+        "getCanonicalLocales",
+        Native::Intl(Rc::new(I::GetCanonicalLocales)),
+        1,
+    );
+    let mut intl_prototypes = Vec::new();
+    for (name, constructor, extra) in [
+        ("NumberFormat", I::NumberFormatConstructor, "format"),
+        ("DateTimeFormat", I::DateTimeFormatConstructor, "format"),
+        ("Collator", I::CollatorConstructor, "compare"),
+        ("PluralRules", I::PluralRulesConstructor, "select"),
+        (
+            "RelativeTimeFormat",
+            I::RelativeTimeFormatConstructor,
+            "format",
+        ),
+    ] {
+        let prototype = plain(&object_prototype);
+        match (name, extra) {
+            ("NumberFormat" | "DateTimeFormat", _) => build.getter(
+                &prototype,
+                "format",
+                Native::Intl(Rc::new(I::FormatGetter)),
+                None,
+            ),
+            ("Collator", _) => build.getter(
+                &prototype,
+                "compare",
+                Native::Intl(Rc::new(I::CompareGetter)),
+                None,
+            ),
+            ("PluralRules", _) => {
+                build.method(&prototype, "select", Native::Intl(Rc::new(I::Select)), 1)
+            }
+            _ => build.method(
+                &prototype,
+                "format",
+                Native::Intl(Rc::new(I::RelativeFormat)),
+                2,
+            ),
+        }
+        build.method(
+            &prototype,
+            "resolvedOptions",
+            Native::Intl(Rc::new(I::ResolvedOptions)),
+            0,
+        );
+        build.value(
+            &prototype,
+            "@@toStringTag",
+            Value::String(format!("Intl.{name}").into()),
+        );
+        let function = build.constructor(Native::Intl(Rc::new(constructor)), name, 0, &prototype);
+        build.method(
+            &function,
+            "supportedLocalesOf",
+            Native::Intl(Rc::new(I::SupportedLocalesOf)),
+            1,
+        );
+        intl.borrow_mut()
+            .define(name.to_string(), Property::hidden(Value::Object(function)));
+        intl_prototypes.push(prototype);
+    }
+    globals.push(("Intl", Value::Object(intl)));
+
+    let reflect = plain(&object_prototype);
+    for (key, method, length) in super::reflect::REFLECT_METHODS {
+        build.method(&reflect, key, Native::Reflect(*method), *length);
+    }
+    build.value(&reflect, "@@toStringTag", Value::String("Reflect".into()));
+    globals.push(("Reflect", Value::Object(reflect)));
+    let proxy = build.function(
+        Native::Reflect(super::reflect::ReflectMethod::ProxyConstructor),
+        "Proxy",
+        2,
+    );
+    build.method(
+        &proxy,
+        "revocable",
+        Native::Reflect(super::reflect::ReflectMethod::ProxyRevocable),
+        2,
+    );
+    globals.push(("Proxy", Value::Object(proxy)));
+
     globals.push(("globalThis", Value::Window));
     globals.push(("NaN", Value::Number(f64::NAN)));
     globals.push(("Infinity", Value::Number(f64::INFINITY)));
@@ -681,6 +1141,20 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         promise_prototype,
         regexp_prototype,
         array_values,
+        iterator_prototype,
+        map_prototype,
+        set_prototype,
+        weak_map_prototype,
+        weak_set_prototype,
+        weak_ref_prototype,
+        collection_iterator_prototype,
+        date_prototype,
+        typed_prototypes,
+        array_buffer_prototype,
+        data_view_prototype,
+        text_encoder_prototype,
+        text_decoder_prototype,
+        intl_prototypes,
     };
     (intrinsics, globals)
 }
@@ -690,6 +1164,16 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 }
 
 impl ScriptRuntime {
+    // a native function object created at run time, such as a proxy's revoke function
+    pub(super) fn native_function(&self, native: Native, name: &str, length: u32) -> Value {
+        Value::Object(
+            Builder {
+                function_prototype: self.intrinsics.function_prototype.clone(),
+            }
+            .function(native, name, length),
+        )
+    }
+
     pub(super) fn is_constructor(value: &Value) -> bool {
         match value {
             Value::Object(object) => match &object.borrow().class {
@@ -711,7 +1195,7 @@ impl ScriptRuntime {
         }
     }
 
-    fn descriptor_object(&self, property: &Property) -> Value {
+    pub(super) fn descriptor_value(&self, property: &Property) -> Value {
         let object = self.new_plain_object();
         {
             let mut object = object.borrow_mut();
@@ -735,7 +1219,16 @@ impl ScriptRuntime {
     }
 
     // the own property of any value, as getOwnPropertyDescriptor and hasOwnProperty see it
-    fn own_property(&mut self, value: &Value, key: &str) -> Result<Option<Property>, ScriptError> {
+    pub(super) fn own_property_of(
+        &mut self,
+        value: &Value,
+        key: &str,
+    ) -> Result<Option<Property>, ScriptError> {
+        if let Value::Object(object) = value
+            && let Some(proxy) = super::reflect::proxy_of(object)
+        {
+            return self.proxy_own_property(&proxy, key);
+        }
         Ok(match value {
             Value::Object(object) => {
                 let borrowed = object.borrow();
@@ -774,6 +1267,23 @@ impl ScriptRuntime {
                 .map(|value| Property::data(value.resolve())),
             _ => None,
         })
+    }
+
+    pub(super) fn own_property_keys(
+        &mut self,
+        value: &Value,
+        symbols: bool,
+    ) -> Result<Vec<String>, ScriptError> {
+        if let Value::Object(object) = value
+            && let Some(proxy) = super::reflect::proxy_of(object)
+        {
+            let keys = self.proxy_own_keys(&proxy)?;
+            return Ok(keys
+                .into_iter()
+                .filter(|key| is_symbol_key(key) == symbols)
+                .collect());
+        }
+        Ok(self.own_keys(value, symbols))
     }
 
     fn own_keys(&self, value: &Value, symbols: bool) -> Vec<String> {
@@ -866,13 +1376,30 @@ impl ScriptRuntime {
         ))
     }
 
+    pub(super) fn descriptor_property(
+        &mut self,
+        descriptor: &Value,
+    ) -> Result<Property, ScriptError> {
+        Ok(self.descriptor_from(descriptor)?.0)
+    }
+
     // ValidateAndApplyPropertyDescriptor for ordinary objects
-    fn define_property(
+    pub(super) fn define_property_value(
         &mut self,
         target: &Value,
         key: String,
         descriptor: &Value,
     ) -> Result<(), ScriptError> {
+        if let Value::Object(object) = target
+            && let Some(proxy) = super::reflect::proxy_of(object)
+        {
+            if !self.proxy_define(&proxy, &key, descriptor)? {
+                return Err(self.type_error(format!(
+                    "'defineProperty' on proxy: trap returned falsish for property '{key}'"
+                )));
+            }
+            return Ok(());
+        }
         let (mut property, present) = self.descriptor_from(descriptor)?;
         let object = match target {
             Value::Object(object) => object.clone(),
@@ -983,7 +1510,7 @@ impl ScriptRuntime {
     fn define_properties(&mut self, target: &Value, properties: &Value) -> Result<(), ScriptError> {
         let entries = self.own_enumerable_entries(properties)?;
         for (key, descriptor) in entries {
-            self.define_property(target, key, &descriptor)?;
+            self.define_property_value(target, key, &descriptor)?;
         }
         Ok(())
     }
@@ -1095,7 +1622,7 @@ impl ScriptRuntime {
                     return Err(self.type_error("Object.defineProperty called on non-object"));
                 }
                 let key = self.coerce_key(argument(&arguments, 1))?;
-                self.define_property(&first, key, &argument(&arguments, 2))?;
+                self.define_property_value(&first, key, &argument(&arguments, 2))?;
                 Ok(first)
             }
             Native::ObjectDefineProperties => {
@@ -1110,7 +1637,7 @@ impl ScriptRuntime {
                     return Err(self.type_error("Cannot convert undefined or null to object"));
                 }
                 Ok(self
-                    .prototype_of(&first)
+                    .prototype_of_value(&first)?
                     .map(Value::Object)
                     .unwrap_or(Value::Null))
             }
@@ -1130,7 +1657,7 @@ impl ScriptRuntime {
                     }
                 };
                 if let Value::Object(object) = &first {
-                    self.set_prototype(object, prototype)?;
+                    self.set_object_prototype(object, prototype)?;
                 }
                 Ok(first)
             }
@@ -1138,7 +1665,7 @@ impl ScriptRuntime {
                 let symbols = matches!(native, Native::ObjectGetOwnPropertySymbols);
                 let target = self.coerce_object(first)?;
                 let keys = self
-                    .own_keys(&target, symbols)
+                    .own_property_keys(&target, symbols)?
                     .into_iter()
                     .map(|key| {
                         if symbols {
@@ -1153,19 +1680,19 @@ impl ScriptRuntime {
             Native::ObjectGetOwnPropertyDescriptor => {
                 let target = self.coerce_object(first)?;
                 let key = self.coerce_key(argument(&arguments, 1))?;
-                Ok(match self.own_property(&target, &key)? {
-                    Some(property) => self.descriptor_object(&property),
+                Ok(match self.own_property_of(&target, &key)? {
+                    Some(property) => self.descriptor_value(&property),
                     None => Value::Undefined,
                 })
             }
             Native::ObjectGetOwnPropertyDescriptors => {
                 let target = self.coerce_object(first)?;
                 let result = self.new_plain_object();
-                let mut keys = self.own_keys(&target, false);
-                keys.extend(self.own_keys(&target, true));
+                let mut keys = self.own_property_keys(&target, false)?;
+                keys.extend(self.own_property_keys(&target, true)?);
                 for key in keys {
-                    if let Some(property) = self.own_property(&target, &key)? {
-                        let descriptor = self.descriptor_object(&property);
+                    if let Some(property) = self.own_property_of(&target, &key)? {
+                        let descriptor = self.descriptor_value(&property);
                         result.borrow_mut().insert(key, descriptor);
                     }
                 }
@@ -1248,12 +1775,12 @@ impl ScriptRuntime {
             Native::ObjectHasOwn => {
                 let target = self.coerce_object(first)?;
                 let key = self.coerce_key(argument(&arguments, 1))?;
-                Ok(Value::Bool(self.own_property(&target, &key)?.is_some()))
+                Ok(Value::Bool(self.own_property_of(&target, &key)?.is_some()))
             }
             Native::ObjectHasOwnProperty => {
                 let key = self.coerce_key(first)?;
                 let target = self.coerce_object(this)?;
-                Ok(Value::Bool(self.own_property(&target, &key)?.is_some()))
+                Ok(Value::Bool(self.own_property_of(&target, &key)?.is_some()))
             }
             Native::ObjectIsPrototypeOf => {
                 let Value::Object(prototype) = this else {
@@ -1264,9 +1791,7 @@ impl ScriptRuntime {
                     if Rc::ptr_eq(&object, &prototype) {
                         return Ok(Value::Bool(true));
                     }
-                    current = object
-                        .borrow()
-                        .prototype_or(&self.intrinsics.object_prototype);
+                    current = object.borrow().prototype_or(&self.intrinsics);
                 }
                 Ok(Value::Bool(false))
             }
@@ -1274,7 +1799,7 @@ impl ScriptRuntime {
                 let key = self.coerce_key(first)?;
                 let target = self.coerce_object(this)?;
                 Ok(Value::Bool(
-                    self.own_property(&target, &key)?
+                    self.own_property_of(&target, &key)?
                         .is_some_and(|property| property.enumerable),
                 ))
             }
@@ -1294,8 +1819,10 @@ impl ScriptRuntime {
             Native::ObjectProtoSetter => {
                 if let Value::Object(object) = &this {
                     match first {
-                        Value::Object(prototype) => self.set_prototype(object, Some(prototype))?,
-                        Value::Null => self.set_prototype(object, None)?,
+                        Value::Object(prototype) => {
+                            self.set_object_prototype(object, Some(prototype))?
+                        }
+                        Value::Null => self.set_object_prototype(object, None)?,
                         _ => {}
                     }
                 }
@@ -1632,6 +2159,13 @@ impl ScriptRuntime {
             Native::Array(method) => self.call_array_method(method, this, arguments),
             Native::String(method) => self.call_string_method(method, this, arguments),
             Native::Math(function) => self.call_math(function, arguments),
+            Native::NumberFormat(super::numbers::NumberFormat::Locale) => {
+                let number = self.this_number(&this, "toLocaleString")?;
+                let options = self.number_options(&first, &argument(&arguments, 1))?;
+                Ok(Value::String(
+                    super::intl::format_number(&options, number).into(),
+                ))
+            }
             Native::NumberFormat(format) => {
                 let number = self.this_number(&this, "toFixed")?;
                 self.format_number(format, number, first)
@@ -1683,6 +2217,43 @@ impl ScriptRuntime {
                     }
                 }
                 Ok(Value::String(text.into()))
+            }
+            Native::Reflect(method) => self.call_reflect(method, arguments, None),
+            Native::ProxyRevoke(proxy) => {
+                *proxy.target.borrow_mut() = None;
+                *proxy.handler.borrow_mut() = None;
+                Ok(Value::Undefined)
+            }
+            Native::Collection(method) => self.call_collection(method, this, arguments, None),
+            Native::Date(method) => self.call_date(method, this, arguments, None),
+            Native::Typed(method) => self.call_typed(method, this, arguments, None),
+            Native::Codec(method) => self.call_codec(method, this, arguments, None),
+            Native::Intl(method) => self.call_intl((*method).clone(), this, arguments),
+            Native::NumericCompare => {
+                let left = self.coerce_number(first)?;
+                let right = self.coerce_number(argument(&arguments, 1))?;
+                Ok(Value::Number(match (left.is_nan(), right.is_nan()) {
+                    (true, true) => 0.0,
+                    (true, false) => 1.0,
+                    (false, true) => -1.0,
+                    _ if left < right
+                        || (left == 0.0
+                            && right == 0.0
+                            && left.is_sign_negative()
+                            && !right.is_sign_negative()) =>
+                    {
+                        -1.0
+                    }
+                    _ if left > right
+                        || (left == 0.0
+                            && right == 0.0
+                            && !left.is_sign_negative()
+                            && right.is_sign_negative()) =>
+                    {
+                        1.0
+                    }
+                    _ => 0.0,
+                }))
             }
             Native::JsonParse => self.json_parse(first, argument(&arguments, 1)),
             Native::JsonStringify => {
@@ -1779,6 +2350,20 @@ impl ScriptRuntime {
             Native::RegExp(method) => {
                 self.call_regexp(method, Value::Undefined, arguments, Some(new_target))
             }
+            Native::Reflect(method) => self.call_reflect(method, arguments, Some(new_target)),
+            Native::Collection(method) => {
+                self.call_collection(method, Value::Undefined, arguments, Some(new_target))
+            }
+            Native::Date(method) => {
+                self.call_date(method, Value::Undefined, arguments, Some(new_target))
+            }
+            Native::Typed(method) => {
+                self.call_typed(method, Value::Undefined, arguments, Some(new_target))
+            }
+            Native::Codec(method) => {
+                self.call_codec(method, Value::Undefined, arguments, Some(new_target))
+            }
+            Native::Intl(method) => self.call_intl((*method).clone(), Value::Undefined, arguments),
             other => {
                 let name = format!("{other:?}");
                 Err(self.type_error(format!("{name} is not a constructor")))
@@ -1786,17 +2371,33 @@ impl ScriptRuntime {
         }
     }
 
-    fn set_prototype(
+    pub(super) fn set_object_prototype(
         &mut self,
         object: &ObjectHandle,
         prototype: Option<ObjectHandle>,
     ) -> Result<(), ScriptError> {
-        let unchanged = match (
-            &object
-                .borrow()
-                .prototype_or(&self.intrinsics.object_prototype),
-            &prototype,
-        ) {
+        if let Some(proxy) = super::reflect::proxy_of(object) {
+            let (target, trap) = self.proxy_trap(&proxy, "setPrototypeOf")?;
+            let value = prototype.clone().map(Value::Object).unwrap_or(Value::Null);
+            return match trap {
+                Some(trap) => {
+                    let handler = proxy.handler.borrow().clone().unwrap_or(Value::Undefined);
+                    if self
+                        .call_function(trap, handler, vec![target, value])?
+                        .truthy()
+                    {
+                        Ok(())
+                    } else {
+                        Err(self.type_error("'setPrototypeOf' on proxy: trap returned falsish"))
+                    }
+                }
+                None => match &target {
+                    Value::Object(target) => self.set_object_prototype(target, prototype),
+                    _ => Ok(()),
+                },
+            };
+        }
+        let unchanged = match (&object.borrow().prototype_or(&self.intrinsics), &prototype) {
             (Some(current), Some(next)) => Rc::ptr_eq(current, next),
             (None, None) => true,
             _ => false,
@@ -1812,9 +2413,7 @@ impl ScriptRuntime {
             if Rc::ptr_eq(&link, object) {
                 return Err(self.type_error("Cyclic __proto__ value"));
             }
-            current = link
-                .borrow()
-                .prototype_or(&self.intrinsics.object_prototype);
+            current = link.borrow().prototype_or(&self.intrinsics);
         }
         object.borrow_mut().set_prototype(prototype);
         Ok(())

@@ -1272,3 +1272,293 @@ fn console_promises_and_timers_work() {
         ),
     ]);
 }
+
+#[test]
+fn collections_follow_the_specification() {
+    check(&[
+        (
+            "map basics",
+            "const m = new Map([['a', 1], [NaN, 'nan'], [0, 'zero']]); m.set('b', 2).set('a', 3); console.log(m.size, m.get('a'), m.get(NaN), m.get(-0), m.has('c'), [...m.keys()].join(), m.delete('b'), m.size)",
+            "4 3 nan zero false a,NaN,0,b true 3",
+        ),
+        (
+            "map identity keys",
+            "const k1 = {}, k2 = {}; const m = new Map(); m.set(k1, 'one').set(k2, 'two'); console.log(m.get(k1), m.get(k2), m.get({}))",
+            "one two undefined",
+        ),
+        (
+            "live iteration",
+            "const m = new Map([[1, 'a']]); const seen = []; for (const [k] of m) { seen.push(k); if (k < 3) m.set(k + 1, 'x'); } console.log(seen.join())",
+            "1,2,3",
+        ),
+        (
+            "delete during iteration",
+            "const s = new Set([1, 2, 3, 4]); const seen = []; for (const v of s) { seen.push(v); s.delete(v + 1); } console.log(seen.join(), s.size)",
+            "1,3 2",
+        ),
+        (
+            "set operations",
+            "const a = new Set([1, 2, 3]), b = new Set([2, 3, 4]); console.log([...a.union(b)].join(), [...a.intersection(b)].join(), [...a.difference(b)].join(), [...a.symmetricDifference(b)].join(), a.isSubsetOf(new Set([1, 2, 3, 4])), a.isDisjointFrom(new Set([9])))",
+            "1,2,3,4 2,3 1 1,4 true true",
+        ),
+        (
+            "forEach and entries",
+            "const out = []; new Map([['x', 1]]).forEach((v, k, map) => out.push(k + v + map.size)); new Set(['y']).forEach((v, k) => out.push(v + k)); console.log(out.join(), JSON.stringify([...new Set(['a']).entries()]))",
+            "x11,yy [[\"a\",\"a\"]]",
+        ),
+        (
+            "subclass",
+            "class Counter extends Map { inc(k) { this.set(k, (this.get(k) || 0) + 1); return this; } } const c = new Counter(); c.inc('a').inc('a'); console.log(c.get('a'), c instanceof Map, c instanceof Counter)",
+            "2 true true",
+        ),
+        (
+            "weak collections",
+            "const wm = new WeakMap(); const key = {}; wm.set(key, 'v'); const ws = new WeakSet([key]); console.log(wm.get(key), wm.has({}), ws.has(key)); try { wm.set(1, 2); } catch (e) { console.log(e.name); }",
+            "v false true\nTypeError",
+        ),
+        (
+            "weak ref",
+            "const target = { n: 1 }; const ref = new WeakRef(target); console.log(ref.deref().n)",
+            "1",
+        ),
+        (
+            "groupBy",
+            "const g = Object.groupBy([1, 2, 3, 4], (n) => n % 2 ? 'odd' : 'even'); const m = Map.groupBy(['a', 'bb', 'c'], (s) => s.length); console.log(g.odd.join(), g.even.join(), m.get(1).join())",
+            "1,3 2,4 a,c",
+        ),
+        (
+            "structured clone",
+            "const copy = structuredClone(new Map([['k', new Set([1])]])); console.log(copy instanceof Map, copy.get('k').has(1))",
+            "true true",
+        ),
+        (
+            "inspection",
+            "console.log(new Map([['a', 1]]), new Set([1, 'x']))",
+            "Map(1) { 'a' => 1 } Set(2) { 1, 'x' }",
+        ),
+    ]);
+}
+
+#[test]
+fn dates_follow_the_specification() {
+    check(&[
+        (
+            "utc fields",
+            "const d = new Date(Date.UTC(2024, 0, 15, 10, 30, 45, 123)); console.log(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCDay(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds())",
+            "2024 0 15 1 10 30 45 123",
+        ),
+        (
+            "iso",
+            "const d = new Date('2024-02-29T12:00:00Z'); console.log(d.toISOString(), d.getTime(), JSON.stringify({ d }))",
+            "2024-02-29T12:00:00.000Z 1709208000000 {\"d\":\"2024-02-29T12:00:00.000Z\"}",
+        ),
+        (
+            "local is utc without a zone",
+            "const d = new Date(2024, 0, 15, 8, 5); console.log(d.toString(), d.getTimezoneOffset(), d.getHours())",
+            "Mon Jan 15 2024 08:05:00 GMT+0000 (Coordinated Universal Time) 0 8",
+        ),
+        (
+            "setters roll over",
+            "const d = new Date(Date.UTC(2024, 0, 31)); d.setUTCMonth(1); console.log(d.toISOString()); d.setUTCDate(0); console.log(d.toISOString()); d.setUTCHours(48); console.log(d.toISOString())",
+            "2024-03-02T00:00:00.000Z\n2024-02-29T00:00:00.000Z\n2024-03-02T00:00:00.000Z",
+        ),
+        (
+            "parsing",
+            "console.log(Date.parse('2024-01-15'), Date.parse('Mon, 15 Jan 2024 00:00:00 GMT'), isNaN(Date.parse('garbage')), new Date('2024-01-15T10:00:00+02:00').toISOString())",
+            "1705276800000 1705276800000 true 2024-01-15T08:00:00.000Z",
+        ),
+        (
+            "invalid dates",
+            "const d = new Date('nope'); console.log(String(d), isNaN(d), d.getFullYear()); try { d.toISOString(); } catch (e) { console.log(e.name); }",
+            "Invalid Date true NaN\nRangeError",
+        ),
+        (
+            "arithmetic and comparison",
+            "const a = new Date(1000), b = new Date(3000); console.log(b - a, a < b, +a, `${new Date(0).toUTCString()}`)",
+            "2000 true 1000 Thu, 01 Jan 1970 00:00:00 GMT",
+        ),
+        (
+            "locale strings",
+            "const d = new Date(Date.UTC(2024, 6, 4, 15, 4, 5)); console.log(d.toLocaleDateString(), d.toLocaleTimeString(), d.toLocaleString())",
+            "7/4/2024 3:04:05 PM 7/4/2024, 3:04:05 PM",
+        ),
+        (
+            "now moves with the clock",
+            "const start = Date.now(); setTimeout(() => console.log(Date.now() - start >= 50), 50)",
+            "true",
+        ),
+        (
+            "two-digit years",
+            "console.log(new Date(99, 0).getFullYear(), new Date(Date.UTC(2024, 0)).getUTCFullYear())",
+            "1999 2024",
+        ),
+    ]);
+}
+
+#[test]
+fn proxies_and_reflect_work() {
+    check(&[
+        (
+            "get trap",
+            "const p = new Proxy({ a: 1 }, { get(t, k, r) { return k in t ? t[k] * 10 : 'missing:' + String(k); } }); console.log(p.a, p.b)",
+            "10 missing:b",
+        ),
+        (
+            "set and has traps",
+            "const log = []; const p = new Proxy({}, { set(t, k, v) { log.push(k + '=' + v); t[k] = v; return true; }, has(t, k) { return k.startsWith('x'); } }); p.x = 1; p.y = 2; console.log(log.join(), 'xyz' in p, 'abc' in p)",
+            "x=1,y=2 true false",
+        ),
+        (
+            "ownKeys",
+            "const p = new Proxy({ a: 1, b: 2 }, { ownKeys(t) { return ['b', 'a']; } }); console.log(Object.keys(p).join(), JSON.stringify(p))",
+            "b,a {\"b\":2,\"a\":1}",
+        ),
+        (
+            "deleteProperty",
+            "const t = { a: 1 }; const p = new Proxy(t, { deleteProperty(target, k) { delete target[k]; return true; } }); delete p.a; console.log('a' in t)",
+            "false",
+        ),
+        (
+            "function proxies",
+            "const f = new Proxy(function (a, b) { return a + b; }, { apply(t, thisArg, args) { return t(...args) * 2; } }); console.log(f(1, 2), typeof f)",
+            "6 function",
+        ),
+        (
+            "construct trap",
+            "class A { constructor(x) { this.x = x; } } const P = new Proxy(A, { construct(t, args) { return new t(args[0] + 1); } }); console.log(new P(1).x)",
+            "2",
+        ),
+        (
+            "forwarding",
+            "const target = { greet() { return 'hi ' + this.name; }, name: 'target' }; const p = new Proxy(target, {}); p.extra = 1; console.log(p.greet(), target.extra, Object.getPrototypeOf(p) === Object.prototype)",
+            "hi target 1 true",
+        ),
+        (
+            "reactive pattern",
+            "const deps = []; function reactive(o) { return new Proxy(o, { get(t, k, r) { deps.push(k); return Reflect.get(t, k, r); }, set(t, k, v, r) { const ok = Reflect.set(t, k, v, r); deps.push('set:' + k); return ok; } }); } const state = reactive({ count: 0 }); state.count++; console.log(state.count, deps.join())",
+            "1 count,set:count,count",
+        ),
+        (
+            "revocable",
+            "const { proxy, revoke } = Proxy.revocable({}, {}); proxy.a = 1; revoke(); try { proxy.a; } catch (e) { console.log(e.name); }",
+            "TypeError",
+        ),
+        (
+            "reflect",
+            "const o = {}; Reflect.defineProperty(o, 'x', { value: 1, enumerable: true }); console.log(Reflect.has(o, 'x'), Reflect.ownKeys({ a: 1, [Symbol.iterator]: 2 }).length, Reflect.getPrototypeOf([]) === Array.prototype, Reflect.apply(Math.max, null, [1, 3, 2]), Reflect.construct(Date, [0]).getTime())",
+            "true 2 true 3 0",
+        ),
+        (
+            "reflect set receiver",
+            "const proto = { set v(x) { this._v = x; } }; const target = Object.create(proto); const receiver = {}; Reflect.set(target, 'v', 5, receiver); console.log(receiver._v, target._v)",
+            "5 undefined",
+        ),
+    ]);
+}
+
+#[test]
+fn binary_data_and_text_encoding_work() {
+    check(&[
+        (
+            "typed array kinds",
+            "const i8 = new Int8Array([127, 128, -129]); const u8c = new Uint8ClampedArray([300, -5, 1.5]); const f32 = new Float32Array([0.1]); console.log(i8.join(), u8c.join(), f32[0] === Math.fround(0.1), Int32Array.BYTES_PER_ELEMENT)",
+            "127,-128,127 255,0,2 true 4",
+        ),
+        (
+            "shared buffers",
+            "const buffer = new ArrayBuffer(8); const bytes = new Uint8Array(buffer); const words = new Uint32Array(buffer); words[0] = 0x01020304; console.log(bytes[0], bytes[3], buffer.byteLength, new Uint16Array(buffer, 2, 1)[0])",
+            "4 1 8 258",
+        ),
+        (
+            "subarray and slice",
+            "const a = new Uint8Array([1, 2, 3, 4, 5]); const view = a.subarray(1, 3); view[0] = 9; const copy = a.slice(3); copy[0] = 0; console.log(a.join(), view.length, copy.join(), view.byteOffset)",
+            "1,9,3,4,5 2 0,5 1",
+        ),
+        (
+            "array methods",
+            "const f = new Float64Array([3, 1, 2]); console.log(f.map((x) => x * 2).join(), f.filter((x) => x > 1).length, f.reduce((s, x) => s + x), f.indexOf(2), [...f.sort()].join(), f instanceof Float64Array, Object.prototype.toString.call(f))",
+            "6,2,4 2 6 2 1,2,3 true [object Float64Array]",
+        ),
+        (
+            "from and set",
+            "const a = Int16Array.from([1, 2, 3], (x) => x * -1); const b = new Int16Array(5); b.set(a, 2); console.log(a.join(), b.join(), Uint8Array.of(1, 2).length)",
+            "-1,-2,-3 0,0,-1,-2,-3 2",
+        ),
+        (
+            "data view",
+            "const view = new DataView(new ArrayBuffer(8)); view.setInt16(0, -2); view.setFloat32(4, 1.5, true); console.log(view.getInt16(0), view.getUint8(0), view.getUint8(1), view.getFloat32(4, true), ArrayBuffer.isView(view))",
+            "-2 255 254 1.5 true",
+        ),
+        (
+            "text encoding",
+            "const bytes = new TextEncoder().encode('hé€'); console.log(bytes.length, bytes.join(), new TextDecoder().decode(bytes), new TextDecoder('latin1').decode(new Uint8Array([0x80, 0x41])))",
+            "6 104,195,169,226,130,172 hé€ €A",
+        ),
+        (
+            "streaming decode",
+            "const d = new TextDecoder(); const part = new TextEncoder().encode('€'); console.log(JSON.stringify(d.decode(part.subarray(0, 2), { stream: true }) + '|' + d.decode(part.subarray(2))))",
+            "\"|€\"",
+        ),
+        (
+            "fatal decode",
+            "try { new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xff])); } catch (e) { console.log(e.name); }",
+            "TypeError",
+        ),
+        (
+            "encodeInto",
+            "const target = new Uint8Array(4); const result = new TextEncoder().encodeInto('aé€', target); console.log(result.read, result.written, target.join())",
+            "2 3 97,195,169,0",
+        ),
+        (
+            "binary body",
+            "new Response(new Uint16Array([0x6968])).text().then(console.log)",
+            "hi",
+        ),
+    ]);
+}
+
+#[test]
+fn intl_formats_numbers_dates_and_plurals() {
+    check(&[
+        (
+            "number format",
+            "console.log(new Intl.NumberFormat('en-US').format(1234567.891), new Intl.NumberFormat('de-DE').format(1234.5), (1234.5).toLocaleString('en-US', { minimumFractionDigits: 2 }))",
+            "1,234,567.891 1.234,5 1,234.50",
+        ),
+        (
+            "currency and percent",
+            "console.log(new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(-3.5), new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(10), new Intl.NumberFormat('en', { style: 'percent' }).format(0.256), new Intl.NumberFormat('en', { style: 'currency', currency: 'JPY' }).format(1234.5))",
+            "-$3.50 10,00\u{a0}€ 26% ¥1,235",
+        ),
+        (
+            "bound format",
+            "const f = new Intl.NumberFormat('en', { maximumFractionDigits: 1 }).format; console.log([1.25, 2.04].map(f).join('|'))",
+            "1.3|2",
+        ),
+        (
+            "date format",
+            "const d = new Date(Date.UTC(2024, 0, 15, 15, 4, 5)); console.log(new Intl.DateTimeFormat('en-US', { timeZone: 'UTC' }).format(d), new Intl.DateTimeFormat('en-US', { dateStyle: 'long', timeZone: 'UTC' }).format(d), new Intl.DateTimeFormat('de-DE', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }).format(d))",
+            "1/15/2024 January 15, 2024 15. Januar 2024",
+        ),
+        (
+            "date components",
+            "const d = new Date(Date.UTC(2024, 6, 4, 9, 30)); console.log(d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }), d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }), d.toLocaleString('en-GB', { timeZone: 'UTC' }))",
+            "Thursday, Jul 4 9:30 AM 04/07/2024, 09:30:00",
+        ),
+        (
+            "plural rules",
+            "const p = new Intl.PluralRules('en-US'); const o = new Intl.PluralRules('en-US', { type: 'ordinal' }); console.log(p.select(1), p.select(2), o.select(22), o.select(13))",
+            "one other two other",
+        ),
+        (
+            "relative time",
+            "const r = new Intl.RelativeTimeFormat('en', { numeric: 'auto' }); console.log(r.format(-1, 'day'), r.format(2, 'weeks'), new Intl.RelativeTimeFormat('en').format(-3, 'month'))",
+            "yesterday in 2 weeks 3 months ago",
+        ),
+        (
+            "collator",
+            "const names = ['item10', 'Item2', 'item1']; names.sort(new Intl.Collator('en', { numeric: true, sensitivity: 'base' }).compare); console.log(names.join())",
+            "item1,Item2,item10",
+        ),
+    ]);
+}

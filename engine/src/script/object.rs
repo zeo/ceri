@@ -73,6 +73,22 @@ pub(super) enum ObjectClass {
     // a function implemented by the engine, such as Object.keys
     Native(super::realm::Native),
     RegExp(Rc<super::pattern::RegExpData>),
+    Proxy(Rc<super::reflect::ProxyData>),
+    Date(f64),
+    Map(Rc<RefCell<super::collections::Collection>>),
+    Set(Rc<RefCell<super::collections::Collection>>),
+    WeakMap(Rc<RefCell<super::collections::Collection>>),
+    WeakSet(Rc<RefCell<super::collections::Collection>>),
+    WeakRef(std::rc::Weak<RefCell<JsObject>>),
+    // a live Map or Set iterator
+    Cursor(Rc<RefCell<super::collections::Cursor>>),
+    DataView {
+        buffer: super::BytesHandle,
+        start: usize,
+        end: usize,
+    },
+    TextDecoder(Rc<RefCell<super::encoding::DecoderState>>),
+    Intl(Rc<super::intl::IntlState>),
 }
 
 #[derive(Clone)]
@@ -137,11 +153,28 @@ impl JsObject {
         }
     }
 
-    pub(super) fn prototype_or(&self, object_prototype: &ObjectHandle) -> Option<ObjectHandle> {
+    // the prototype, defaulting host-built objects to the intrinsic their class implies
+    pub(super) fn prototype_or(
+        &self,
+        intrinsics: &super::realm::Intrinsics,
+    ) -> Option<ObjectHandle> {
         match &self.prototype {
             Some(prototype) => Some(prototype.clone()),
-            None if self.orphan => Some(object_prototype.clone()),
+            None if self.orphan => Some(match &self.class {
+                ObjectClass::Map(_) => intrinsics.map_prototype.clone(),
+                ObjectClass::Set(_) => intrinsics.set_prototype.clone(),
+                ObjectClass::Date(_) => intrinsics.date_prototype.clone(),
+                _ => intrinsics.object_prototype.clone(),
+            }),
             None => None,
+        }
+    }
+
+    // a host-built object of a class, whose prototype comes from the realm that reads it
+    pub(super) fn with_class(class: ObjectClass) -> Self {
+        Self {
+            class,
+            ..Self::new()
         }
     }
 
@@ -278,10 +311,11 @@ impl JsObject {
     }
 
     pub(super) fn is_callable(&self) -> bool {
-        matches!(
-            self.class,
-            ObjectClass::Function(_) | ObjectClass::Bound { .. } | ObjectClass::Native(_)
-        )
+        match &self.class {
+            ObjectClass::Function(_) | ObjectClass::Bound { .. } | ObjectClass::Native(_) => true,
+            ObjectClass::Proxy(proxy) => proxy.callable,
+            _ => false,
+        }
     }
 }
 

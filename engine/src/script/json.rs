@@ -1,7 +1,7 @@
 // JSON.parse per ECMA-404, a strict recursive descent that builds plain objects in source
 // order, plus the reviver walk and JSON.stringify with toJSON, replacers and indentation
 
-use super::object::{JsObject, ObjectClass, is_private_key, is_symbol_key, new_object};
+use super::object::{JsObject, ObjectClass, is_symbol_key, new_object};
 use super::operations::{is_callable, is_primitive};
 use super::*;
 
@@ -483,25 +483,7 @@ impl ScriptRuntime {
         state.indent = format!("{}{}", state.indent, state.gap);
         let keys: Vec<String> = match &state.allowed {
             Some(allowed) => allowed.clone(),
-            None => match value {
-                Value::Object(object) => {
-                    let borrowed = object.borrow();
-                    borrowed
-                        .ordered_keys()
-                        .into_iter()
-                        .filter(|key| !is_symbol_key(key) && !is_private_key(key))
-                        .filter(|key| {
-                            borrowed
-                                .property(key)
-                                .is_some_and(|property| property.enumerable)
-                        })
-                        .collect()
-                }
-                other => enumerable_object_properties(other.clone())?
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect(),
-            },
+            None => self.own_enumerable_keys(value)?,
         };
         let mut parts = Vec::new();
         for key in keys {

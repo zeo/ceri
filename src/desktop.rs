@@ -1,5 +1,6 @@
 use ceri_engine::{
-    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, NavigationError, mime_type_for,
+    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, NavigationError, TimeZone,
+    mime_type_for,
 };
 use std::path::Path;
 
@@ -14,6 +15,19 @@ impl ClipboardProvider for DesktopClipboard {
 
     fn write_text(&self, text: &str) -> Result<(), NavigationError> {
         platform::write_clipboard_text(text).map_err(NavigationError::Clipboard)
+    }
+}
+
+// the operating system's time zone rules, so script Date objects show local time
+pub struct DesktopTimeZone;
+
+impl TimeZone for DesktopTimeZone {
+    fn offset_minutes(&self, utc_milliseconds: f64) -> i32 {
+        platform::local_offset_minutes(utc_milliseconds)
+    }
+
+    fn name(&self, utc_milliseconds: f64) -> Option<String> {
+        platform::zone_name(utc_milliseconds)
     }
 }
 
@@ -115,6 +129,115 @@ mod platform {
         fn GetClipboardData(format: u32) -> Handle;
         fn SetClipboardData(format: u32, data: Handle) -> Handle;
         fn IsClipboardFormatAvailable(format: u32) -> i32;
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FileTimeToSystemTime(file_time: *const FileTime, system_time: *mut SystemTime) -> i32;
+        fn SystemTimeToFileTime(system_time: *const SystemTime, file_time: *mut FileTime) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(
+            zone: *const TimeZoneInformation,
+            universal: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+        fn GetTimeZoneInformation(zone: *mut TimeZoneInformation) -> u32;
+    }
+
+    // 100-nanosecond intervals between 1601-01-01 and the Unix epoch
+    const EPOCH_IN_FILE_TIME: i64 = 116_444_736_000_000_000;
+
+    fn zone_information() -> TimeZoneInformation {
+        let mut zone = TimeZoneInformation {
+            bias: 0,
+            standard_name: [0; 32],
+            standard_date: SystemTime::default(),
+            standard_bias: 0,
+            daylight_name: [0; 32],
+            daylight_date: SystemTime::default(),
+            daylight_bias: 0,
+        };
+        // SAFETY: the structure matches TIME_ZONE_INFORMATION and lives across the call
+        unsafe { GetTimeZoneInformation(&mut zone) };
+        zone
+    }
+
+    pub(super) fn local_offset_minutes(utc_milliseconds: f64) -> i32 {
+        let fallback = || -(zone_information().bias);
+        if !utc_milliseconds.is_finite() {
+            return fallback();
+        }
+        let ticks = (utc_milliseconds as i64)
+            .saturating_mul(10_000)
+            .saturating_add(EPOCH_IN_FILE_TIME);
+        if ticks < 0 {
+            return fallback();
+        }
+        let universal_file = FileTime {
+            low: ticks as u32,
+            high: (ticks >> 32) as u32,
+        };
+        let mut universal = SystemTime::default();
+        let mut local = SystemTime::default();
+        let mut local_file = FileTime::default();
+        // SAFETY: each pointer refers to a live, correctly laid out structure for the call
+        let converted = unsafe {
+            FileTimeToSystemTime(&universal_file, &mut universal) != 0
+                && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &universal, &mut local) != 0
+                && SystemTimeToFileTime(&local, &mut local_file) != 0
+        };
+        if !converted {
+            return fallback();
+        }
+        let local_ticks = (i64::from(local_file.high) << 32) | i64::from(local_file.low);
+        // whole milliseconds were dropped from the round trip, so compare at minute precision
+        ((local_ticks - ticks) as f64 / 600_000_000.0).round() as i32
+    }
+
+    pub(super) fn zone_name(utc_milliseconds: f64) -> Option<String> {
+        let zone = zone_information();
+        let standard = -(zone.bias + zone.standard_bias);
+        let name = if local_offset_minutes(utc_milliseconds) == standard {
+            &zone.standard_name
+        } else {
+            &zone.daylight_name
+        };
+        let length = name
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(name.len());
+        let text = String::from_utf16_lossy(&name[..length]);
+        (!text.is_empty()).then_some(text)
     }
 
     #[link(name = "kernel32")]
@@ -311,6 +434,85 @@ mod platform {
 #[cfg(not(target_os = "windows"))]
 mod platform {
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    mod clock {
+        use std::ffi::{CStr, c_char, c_int, c_long};
+
+        // struct tm as glibc and the BSD libc on macOS lay it out
+        #[repr(C)]
+        struct Tm {
+            second: c_int,
+            minute: c_int,
+            hour: c_int,
+            day: c_int,
+            month: c_int,
+            year: c_int,
+            weekday: c_int,
+            year_day: c_int,
+            daylight: c_int,
+            offset: c_long,
+            zone: *const c_char,
+        }
+
+        unsafe extern "C" {
+            fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
+        }
+
+        fn local(utc_milliseconds: f64) -> Option<(i32, Option<String>)> {
+            if !utc_milliseconds.is_finite() {
+                return None;
+            }
+            let seconds = (utc_milliseconds / 1000.0).floor() as i64;
+            let mut tm = Tm {
+                second: 0,
+                minute: 0,
+                hour: 0,
+                day: 0,
+                month: 0,
+                year: 0,
+                weekday: 0,
+                year_day: 0,
+                daylight: 0,
+                offset: 0,
+                zone: std::ptr::null(),
+            };
+            // SAFETY: both pointers refer to live values for the duration of the call
+            let result = unsafe { localtime_r(&seconds, &mut tm) };
+            if result.is_null() {
+                return None;
+            }
+            let zone = (!tm.zone.is_null())
+                // SAFETY: localtime_r sets tm_zone to a static NUL-terminated abbreviation
+                .then(|| {
+                    unsafe { CStr::from_ptr(tm.zone) }
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            Some(((tm.offset / 60) as i32, zone))
+        }
+
+        pub(in super::super) fn local_offset_minutes(utc_milliseconds: f64) -> i32 {
+            local(utc_milliseconds).map_or(0, |(offset, _)| offset)
+        }
+
+        pub(in super::super) fn zone_name(utc_milliseconds: f64) -> Option<String> {
+            local(utc_milliseconds).and_then(|(_, zone)| zone)
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) use clock::{local_offset_minutes, zone_name};
+
+    #[cfg(not(unix))]
+    pub(super) fn local_offset_minutes(_utc_milliseconds: f64) -> i32 {
+        0
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn zone_name(_utc_milliseconds: f64) -> Option<String> {
+        None
+    }
 
     pub(super) fn read_clipboard_text() -> Result<String, String> {
         Err("the desktop clipboard adapter currently covers Windows only".to_string())

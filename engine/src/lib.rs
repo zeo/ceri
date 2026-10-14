@@ -42,6 +42,6 @@ pub use navigation::{
     external_url, mime_type_for,
 };
 pub use paint::Canvas;
-pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime};
+pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
 #[cfg(feature = "windowed")]
 pub use window::{WindowConfig, run as run_window};

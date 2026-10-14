@@ -66,15 +66,11 @@ pub(super) fn is_callable(value: &Value) -> bool {
         | Value::ResponseConstructor
         | Value::RequestConstructor
         | Value::HeadersConstructor
-        | Value::ArrayBufferConstructor
         | Value::UrlConstructor
         | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
         | Value::BlobConstructor
         | Value::FileConstructor
-        | Value::Uint8ArrayConstructor
-        | Value::MapConstructor
-        | Value::SetConstructor
         | Value::PromiseConstructor
         | Value::AbortControllerConstructor
         | Value::WorkerConstructor => true,
@@ -241,7 +237,7 @@ impl ScriptRuntime {
                     if let Some(Value::String(message)) = object.get("message") {
                         return message.to_string();
                     }
-                    current = object.prototype_or(&self.intrinsics.object_prototype);
+                    current = object.prototype_or(&self.intrinsics);
                 }
                 "[object Object]".to_string()
             }
@@ -664,16 +660,27 @@ impl ScriptRuntime {
         let Value::Object(prototype) = self.get_property(constructor, "prototype")? else {
             return Err(self.type_error("Function has non-object prototype in instanceof check"));
         };
-        let mut current = self.prototype_of(value);
+        let mut current = self.prototype_of_value(value)?;
         while let Some(object) = current {
             if Rc::ptr_eq(&object, &prototype) {
                 return Ok(true);
             }
-            current = object
-                .borrow()
-                .prototype_or(&self.intrinsics.object_prototype);
+            current = self.prototype_of_value(&Value::Object(object))?;
         }
         Ok(false)
+    }
+
+    // [[GetPrototypeOf]], consulting a proxy's trap
+    pub(super) fn prototype_of_value(
+        &mut self,
+        value: &Value,
+    ) -> Result<Option<ObjectHandle>, ScriptError> {
+        if let Value::Object(object) = value
+            && let Some(proxy) = super::reflect::proxy_of(object)
+        {
+            return self.proxy_prototype(&proxy);
+        }
+        Ok(self.prototype_of(value))
     }
 
     // ---- prototypes and properties ----
@@ -684,9 +691,7 @@ impl ScriptRuntime {
         Some(match value {
             Value::Undefined | Value::Null | Value::Uninitialized => return None,
             Value::Object(object) => {
-                return object
-                    .borrow()
-                    .prototype_or(&self.intrinsics.object_prototype);
+                return object.borrow().prototype_or(&self.intrinsics);
             }
             Value::Binding(cell, _) => return self.prototype_of(&cell.borrow()),
             Value::Bool(_) => intrinsics.boolean_prototype.clone(),
@@ -696,6 +701,16 @@ impl ScriptRuntime {
             Value::Array(_) => intrinsics.array_prototype.clone(),
             Value::Error(error) => self.error_prototype(&error.name),
             Value::Promise(_) => intrinsics.promise_prototype.clone(),
+            Value::Iterator(_) => intrinsics.iterator_prototype.clone(),
+            Value::TypedArray(array) => {
+                let kind = array.borrow().kind;
+                let index = super::typed::ELEMENT_KINDS
+                    .iter()
+                    .position(|(candidate, _)| *candidate == kind)
+                    .unwrap_or(0);
+                intrinsics.typed_prototypes[index].clone()
+            }
+            Value::Bytes(_) => intrinsics.array_buffer_prototype.clone(),
             value if is_callable(value) => intrinsics.function_prototype.clone(),
             _ => intrinsics.object_prototype.clone(),
         })
@@ -743,6 +758,11 @@ impl ScriptRuntime {
     }
 
     fn host_get(&mut self, value: &Value, key: &str) -> Result<Value, ScriptError> {
+        if let Value::TypedArray(array) = value
+            && let Some(element) = self.typed_get(array, key)
+        {
+            return Ok(element);
+        }
         if let Value::Array(array) = value
             && let Some(found) = self.array_expando(array, key)
         {
@@ -780,16 +800,16 @@ impl ScriptRuntime {
     ) -> Result<Value, ScriptError> {
         let mut current = object;
         loop {
+            if let Some(proxy) = super::reflect::proxy_of(&current) {
+                return self.proxy_get(&proxy, key, receiver);
+            }
             let (slot, next) = {
                 let borrowed = current.borrow();
                 match borrowed.property(key) {
                     Some(property) => (Some(property.slot.clone()), None),
                     None => match exotic_own(&borrowed, key) {
                         Some(value) => (Some(Slot::Data(value)), None),
-                        None => (
-                            None,
-                            borrowed.prototype_or(&self.intrinsics.object_prototype),
-                        ),
+                        None => (None, borrowed.prototype_or(&self.intrinsics)),
                     },
                 }
             };
@@ -839,6 +859,10 @@ impl ScriptRuntime {
                 }
                 Ok(())
             }
+            Value::TypedArray(array) => match array_index(key) {
+                Some(index) => self.typed_set(array, index as usize, value),
+                None => self.assign_member(target.clone(), key, value),
+            },
             Value::Array(array) if key != "length" && array_index(key).is_none() => {
                 self.set_array_expando(array, key, value);
                 Ok(())
@@ -896,6 +920,9 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         let mut current = object;
         loop {
+            if let Some(proxy) = super::reflect::proxy_of(&current) {
+                return self.proxy_set(&proxy, key, value, receiver, strict);
+            }
             let (found, next) = {
                 let borrowed = current.borrow();
                 match borrowed.property(key) {
@@ -906,7 +933,7 @@ impl ScriptRuntime {
                         let next = if exotic.is_some() {
                             None
                         } else {
-                            borrowed.prototype_or(&self.intrinsics.object_prototype)
+                            borrowed.prototype_or(&self.intrinsics)
                         };
                         (exotic, next)
                     }
@@ -947,6 +974,24 @@ impl ScriptRuntime {
         let Value::Object(receiver_object) = receiver else {
             return self.set_property(receiver, key, value, strict);
         };
+        // a proxy receiver takes the write through its defineProperty path
+        if let Some(proxy) = super::reflect::proxy_of(receiver_object) {
+            let existing = self.proxy_own_property(&proxy, key)?;
+            let mut entries = vec![("value".to_string(), value)];
+            if existing.is_none() {
+                for attribute in ["writable", "enumerable", "configurable"] {
+                    entries.push((attribute.to_string(), Value::Bool(true)));
+                }
+            }
+            let descriptor = self.object_from_entries(entries);
+            if !self.proxy_define(&proxy, key, &descriptor)? && strict {
+                return Err(self.type_error(format!(
+                    "'defineProperty' on proxy: trap returned falsish for property '{}'",
+                    display_key(key)
+                )));
+            }
+            return Ok(());
+        }
         let mut receiver_object = receiver_object.borrow_mut();
         if let Some(property) = receiver_object.property_mut(key) {
             if let Slot::Data(existing) = &mut property.slot {
@@ -990,10 +1035,15 @@ impl ScriptRuntime {
                 | Value::NodeList(_)
                 | Value::FileList(_)
                 | Value::IndexedDbNameList(_)
-                | Value::Bytes(_)
-                | Value::Uint8Array(_) => {
+                | Value::Bytes(_) => {
                     if number >= 0.0 && number.fract() == 0.0 {
                         return self.index(object.clone(), Value::Number(number));
+                    }
+                }
+                Value::TypedArray(array) => {
+                    if number >= 0.0 && number.fract() == 0.0 {
+                        let value = super::typed::read_element(&array.borrow(), number as usize);
+                        return Ok(value.map_or(Value::Undefined, Value::Number));
                     }
                 }
                 _ => {}
@@ -1011,12 +1061,17 @@ impl ScriptRuntime {
         strict: bool,
     ) -> Result<(), ScriptError> {
         if let Value::Number(number) = key
-            && let Value::Array(array) = object
             && number >= 0.0
             && number.fract() == 0.0
         {
-            let index = runtime_array_index(&Value::Number(number))?;
-            return set_array_element(array, index, value);
+            match object {
+                Value::Array(array) => {
+                    let index = runtime_array_index(&Value::Number(number))?;
+                    return set_array_element(array, index, value);
+                }
+                Value::TypedArray(array) => return self.typed_set(array, number as usize, value),
+                _ => {}
+            }
         }
         let key = self.coerce_key(key)?;
         self.set_property(object, &key, value, strict)
@@ -1029,6 +1084,10 @@ impl ScriptRuntime {
         strict: bool,
     ) -> Result<bool, ScriptError> {
         match target {
+            Value::Object(object) if super::reflect::proxy_of(object).is_some() => {
+                let proxy = super::reflect::proxy_of(object).expect("checked above");
+                self.proxy_delete(&proxy, key, strict)
+            }
             Value::Object(object) => {
                 let configurable = object
                     .borrow()
@@ -1074,11 +1133,14 @@ impl ScriptRuntime {
             Value::Object(object) => {
                 let mut current = Some(object.clone());
                 while let Some(object) = current {
+                    if let Some(proxy) = super::reflect::proxy_of(&object) {
+                        return self.proxy_has(&proxy, key);
+                    }
                     let borrowed = object.borrow();
                     if borrowed.contains_key(key) || exotic_own(&borrowed, key).is_some() {
                         return Ok(true);
                     }
-                    current = borrowed.prototype_or(&self.intrinsics.object_prototype);
+                    current = borrowed.prototype_or(&self.intrinsics);
                 }
                 Ok(false)
             }
@@ -1111,7 +1173,7 @@ impl ScriptRuntime {
                     if borrowed.contains_key(key) {
                         return Ok(true);
                     }
-                    current = borrowed.prototype_or(&self.intrinsics.object_prototype);
+                    current = borrowed.prototype_or(&self.intrinsics);
                 }
                 Ok(false)
             }
@@ -1128,9 +1190,7 @@ impl ScriptRuntime {
         let Value::Object(home) = home else {
             return Err(self.reference_error("'super' keyword unexpected here"));
         };
-        let prototype = home
-            .borrow()
-            .prototype_or(&self.intrinsics.object_prototype);
+        let prototype = home.borrow().prototype_or(&self.intrinsics);
         match prototype {
             Some(prototype) => self.ordinary_get(prototype, key, this),
             None => Ok(Value::Undefined),
@@ -1253,6 +1313,21 @@ impl ScriptRuntime {
         source: &Value,
     ) -> Result<Vec<(String, Value)>, ScriptError> {
         match source {
+            Value::Object(object) if super::reflect::proxy_of(object).is_some() => {
+                let proxy = super::reflect::proxy_of(object).expect("checked above");
+                let keys = self.proxy_own_keys(&proxy)?;
+                let mut entries = Vec::new();
+                for key in keys {
+                    let enumerable = self
+                        .proxy_own_property(&proxy, &key)?
+                        .is_some_and(|property| property.enumerable);
+                    if enumerable {
+                        let value = self.proxy_get(&proxy, &key, source)?;
+                        entries.push((key, value));
+                    }
+                }
+                Ok(entries)
+            }
             Value::Object(object) => {
                 let keys: Vec<String> = {
                     let borrowed = object.borrow();
@@ -1289,8 +1364,26 @@ impl ScriptRuntime {
         }
     }
 
+    // own enumerable string keys in property order, as JSON.stringify and Object.keys see them
+    pub(super) fn own_enumerable_keys(
+        &mut self,
+        value: &Value,
+    ) -> Result<Vec<String>, ScriptError> {
+        Ok(self
+            .own_enumerable_entries(value)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| !super::object::is_symbol_key(key))
+            .collect())
+    }
+
     // for-in visits enumerable string keys along the prototype chain, each name once
     pub(super) fn for_in_keys(&mut self, value: &Value) -> Result<Vec<String>, ScriptError> {
+        if let Value::Object(object) = value
+            && super::reflect::proxy_of(object).is_some()
+        {
+            return self.own_enumerable_keys(value);
+        }
         match value {
             Value::Object(object) => {
                 let mut seen = HashSet::new();
@@ -1317,7 +1410,7 @@ impl ScriptRuntime {
                             keys.push(key);
                         }
                     }
-                    current = borrowed.prototype_or(&self.intrinsics.object_prototype);
+                    current = borrowed.prototype_or(&self.intrinsics);
                 }
                 Ok(keys)
             }
@@ -1907,11 +2000,7 @@ fn host_instance_of(value: &Value, constructor: &Value) -> bool {
                 Value::File(_),
                 Value::FileConstructor | Value::BlobConstructor
             )
-            | (Value::Bytes(_), Value::ArrayBufferConstructor)
-            | (Value::Uint8Array(_), Value::Uint8ArrayConstructor)
             | (Value::Worker(_), Value::WorkerConstructor)
-            | (Value::Map(_), Value::MapConstructor)
-            | (Value::Set(_), Value::SetConstructor)
             | (Value::Promise(_), Value::PromiseConstructor)
             | (Value::Response(_), Value::ResponseConstructor)
             | (Value::Request(_), Value::RequestConstructor)
@@ -1934,23 +2023,13 @@ fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
             .chars()
             .map(|character| Value::String(character.to_string().into()))
             .collect(),
-        Value::Uint8Array(array) => uint8_array_bytes(&array.borrow())
-            .into_iter()
-            .map(|byte| Value::Number(byte as f64))
-            .collect(),
+        Value::TypedArray(array) => super::typed::elements(&array.borrow()),
         Value::Iterator(iterator) => {
             let mut iterator = iterator.borrow_mut();
             let values = iterator.values[iterator.index..].to_vec();
             iterator.index = iterator.values.len();
             values
         }
-        Value::Set(set) => set.borrow().values.clone(),
-        Value::Map(map) => map
-            .borrow()
-            .entries
-            .iter()
-            .map(|(key, value)| pair(key.clone(), value.clone()))
-            .collect(),
         Value::UrlSearchParams(params) => params
             .borrow()
             .pairs
