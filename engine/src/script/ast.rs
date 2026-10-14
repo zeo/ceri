@@ -238,8 +238,6 @@ pub(super) enum Expr {
         cooked: Vec<Option<Name>>,
         raw: Vec<Name>,
         expressions: Vec<Expr>,
-        // the same call site always receives the same strings array
-        site: usize,
     },
     Identifier(Name),
     This,

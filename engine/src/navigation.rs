@@ -4816,7 +4816,7 @@ mod tests {
             .expect("clipboard status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("clipboard failed: permission denied")
+            Some("NotAllowedError: clipboard failed: permission denied")
         );
     }
 

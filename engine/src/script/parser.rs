@@ -76,7 +76,6 @@ pub(super) struct Parser<'a> {
     position: usize,
     previous_end: usize,
     context: Context,
-    template_sites: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,7 +198,6 @@ impl<'a> Parser<'a> {
             position: 0,
             previous_end: 0,
             context: Context::default(),
-            template_sites: 0,
         }
     }
 
@@ -1592,14 +1590,11 @@ impl<'a> Parser<'a> {
 
     fn parse_tagged_template(&mut self, tag: Expr) -> Result<Expr, ScriptError> {
         let (cooked, raw, expressions) = self.parse_template_parts()?;
-        let site = self.template_sites;
-        self.template_sites += 1;
         Ok(Expr::TaggedTemplate {
             tag: Box::new(tag),
             cooked,
             raw,
             expressions,
-            site,
         })
     }
 
@@ -2379,14 +2374,14 @@ pub(super) fn parse_function_source(
     body: &str,
     is_async: bool,
     is_generator: bool,
-) -> Result<Rc<FunctionNode>, ScriptError> {
+) -> Result<(Rc<FunctionNode>, String), ScriptError> {
     let source = format!(
         "({}function{} anonymous({parameters}\n) {{\n{body}\n}})",
         if is_async { "async " } else { "" },
         if is_generator { "*" } else { "" }
     );
     match Parser::new(&source).parse_standalone_expression()? {
-        Expr::Function(function) => Ok(function),
+        Expr::Function(function) => Ok((function, source)),
         _ => Err(ScriptError {
             offset: 0,
             message: "invalid function source".to_string(),
@@ -2634,7 +2629,7 @@ mod tests {
 
     #[test]
     fn function_constructor_sources_parse() {
-        let function = parse_function_source("a, b = 2", "return a + b", false, false)
+        let (function, _) = parse_function_source("a, b = 2", "return a + b", false, false)
             .expect("function source");
         assert_eq!(function.params.len(), 2);
         assert_eq!(function.length(), 1);

@@ -1,9 +1,16 @@
-#[cfg(test)]
 mod ast;
-#[cfg(test)]
+mod compiler;
+mod json;
 mod lexer;
-#[cfg(test)]
+mod object;
+mod operations;
 mod parser;
+mod realm;
+mod vm;
+
+use object::{ObjectClass, ObjectHandle};
+use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol_description};
+use realm::{Intrinsics, Native, create_intrinsics};
 
 use crate::Color;
 use crate::css::StyleState;
@@ -29,7 +36,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 
-type EnvironmentRef = Rc<RefCell<Environment>>;
 type ElementHandle = Rc<RefCell<ElementLocation>>;
 type DetachedListener = (NodePath, Vec<EventListener>);
 type DetachedListenerState = (Weak<RefCell<ElementLocation>>, Vec<DetachedListener>);
@@ -44,14 +50,14 @@ type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
 type ReadableStreamReaderHandle = Rc<RefCell<ReadableStreamReaderData>>;
 type HeadersHandle = Rc<RefCell<HeadersData>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
-type ObjectHandle = Rc<RefCell<BTreeMap<String, Value>>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
+// named properties set on arrays, keyed by allocation while the array is alive
+type ArrayExpandos = HashMap<usize, (Weak<RefCell<Vec<Value>>>, Vec<(String, Value)>)>;
 type NodeListHandle = Rc<Vec<ElementHandle>>;
 type MapHandle = Rc<RefCell<MapData>>;
 type SetHandle = Rc<RefCell<SetData>>;
 type IteratorHandle = Rc<RefCell<IteratorData>>;
 type ErrorHandle = Rc<ErrorData>;
-type ClassHandle = Rc<ClassDefinition>;
 type LocationHandle = Rc<RefCell<AppUrl>>;
 type HistoryHandle = Rc<RefCell<HistoryData>>;
 type UrlHandle = Rc<RefCell<UrlData>>;
@@ -96,6 +102,8 @@ impl std::error::Error for ScriptError {}
 #[derive(Clone)]
 enum Value {
     Undefined,
+    // a lexical binding read before its declaration ran
+    Uninitialized,
     Null,
     Bool(bool),
     Number(f64),
@@ -116,7 +124,7 @@ enum Value {
     Error(ErrorHandle),
     Style(ElementHandle),
     ClassList(ElementHandle),
-    Event(EventData),
+    Event(Rc<EventData>),
     Response(ResponseHandle),
     ResponseConstructor,
     Bytes(BytesHandle),
@@ -133,7 +141,6 @@ enum Value {
     Clipboard,
     Crypto,
     SubtleCrypto,
-    ModuleImport(AppUrl),
     History(HistoryHandle),
     Url(UrlHandle),
     UrlSearchParams(UrlSearchParamsHandle),
@@ -160,7 +167,6 @@ enum Value {
     Uint8ArrayConstructor,
     MapConstructor,
     SetConstructor,
-    ErrorConstructor,
     PromiseConstructor,
     AbortControllerConstructor,
     WorkerConstructor,
@@ -172,13 +178,7 @@ enum Value {
     IndexedDbTransaction(IndexedDbTransactionHandle),
     IndexedDbObjectStore(IndexedDbObjectStoreHandle),
     IndexedDbNameList(IndexedDbNameListHandle),
-    NumberNamespace,
-    ArrayNamespace,
-    ObjectNamespace,
-    StringConstructor,
-    SymbolNamespace,
-    Class(ClassHandle),
-    Function(Rc<Function>),
+    VmIterator(Rc<RefCell<VmIterator>>),
     Builtin(Builtin),
 }
 
@@ -190,7 +190,7 @@ enum CloneValue {
     Number(f64),
     String(String),
     Array(Vec<CloneValue>),
-    Object(BTreeMap<String, CloneValue>),
+    Object(Vec<(String, CloneValue)>),
     Map(Vec<(CloneValue, CloneValue)>),
     Set(Vec<CloneValue>),
     Bytes(Vec<u8>),
@@ -405,11 +405,6 @@ enum Builtin {
     NumberParseInt,
     NumberIsFinite,
     ArrayIsArray,
-    ObjectFreeze,
-    ObjectKeys,
-    ObjectValues,
-    ObjectEntries,
-    ObjectAssign,
     ElementClassListAdd(ElementHandle),
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
@@ -455,13 +450,7 @@ enum Builtin {
     WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
     WebAssemblyInstantiate,
     WebAssemblyFunction(WasmFunctionHandle),
-}
-
-struct Function {
-    params: Vec<Pattern>,
-    body: Vec<Stmt>,
-    environment: EnvironmentRef,
-    is_async: bool,
+    Native(Native),
 }
 
 #[derive(Clone)]
@@ -495,197 +484,22 @@ impl PartialEq for ElementLocation {
     }
 }
 
+// the global bindings: var and function declarations of classic scripts, top-level let and
+// const, and the host globals
 #[derive(Default)]
 struct Environment {
     values: HashMap<String, Value>,
-    parent: Option<EnvironmentRef>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum Expr {
-    Literal(Literal),
-    Identifier(String),
-    Unary {
-        operator: UnaryOperator,
-        expression: Box<Expr>,
-    },
-    Binary {
-        left: Box<Expr>,
-        operator: BinaryOperator,
-        right: Box<Expr>,
-    },
-    Assignment {
-        target: Box<Expr>,
-        expression: Box<Expr>,
-    },
-    Member {
-        object: Box<Expr>,
-        property: String,
-    },
-    Index {
-        object: Box<Expr>,
-        index: Box<Expr>,
-    },
-    Conditional {
-        condition: Box<Expr>,
-        consequent: Box<Expr>,
-        alternate: Box<Expr>,
-    },
-    Object(Vec<ObjectLiteralProperty>),
-    Array(Vec<Expr>),
-    Spread(Box<Expr>),
-    Template(Vec<TemplatePart>),
-    Call {
-        callee: Box<Expr>,
-        arguments: Vec<Expr>,
-    },
-    New {
-        callee: Box<Expr>,
-        arguments: Vec<Expr>,
-    },
-    Function {
-        params: Vec<Pattern>,
-        body: Vec<Stmt>,
-        is_async: bool,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Literal {
-    Null,
-    Bool(bool),
-    Number(f64),
-    String(String),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ObjectLiteralKey {
-    Static(String),
-    Computed(Expr),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ObjectLiteralProperty {
-    Entry(ObjectLiteralKey, Expr),
-    Spread(Expr),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ObjectPatternKey {
-    Static(String),
-    Computed(Expr),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Pattern {
-    Identifier(String),
-    Default {
-        pattern: Box<Pattern>,
-        default: Box<Expr>,
-    },
-    Object {
-        properties: Vec<(ObjectPatternKey, Pattern)>,
-        rest: Option<Box<Pattern>>,
-    },
-    Array {
-        items: Vec<Option<Pattern>>,
-        rest: Option<Box<Pattern>>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Stmt {
-    Let {
-        pattern: Pattern,
-        initializer: Option<Expr>,
-    },
-    Expression(Expr),
-    Block(Vec<Stmt>),
-    If {
-        condition: Expr,
-        consequent: Box<Stmt>,
-        alternate: Option<Box<Stmt>>,
-    },
-    ForOf {
-        pattern: Pattern,
-        iterable: Expr,
-        body: Box<Stmt>,
-    },
-    TryCatch {
-        body: Box<Stmt>,
-        catch_name: Option<String>,
-        handler: Box<Stmt>,
-    },
-    Throw(Expr),
-    Class {
-        name: String,
-        extends: Option<String>,
-    },
-    Return(Option<Expr>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum TemplatePart {
-    Text(String),
-    Expression(Box<Expr>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ModuleImportBinding {
-    Named { imported: String, local: String },
-    Namespace { local: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModuleImport {
-    pub(crate) source: String,
-    pub(crate) bindings: Vec<ModuleImportBinding>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModuleExport {
-    pub(crate) local: String,
-    pub(crate) exported: String,
-}
-
-struct ModuleProgram {
-    imports: Vec<ModuleImport>,
-    star_reexports: Vec<String>,
-    statements: Vec<Stmt>,
-    exports: Vec<ModuleExport>,
+impl Environment {
+    fn get(&self, name: &str) -> Option<Value> {
+        self.values.get(name).map(Value::resolve)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DynamicImportType {
     Json,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnaryOperator {
-    Not,
-    Negative,
-    Positive,
-    TypeOf,
-    Await,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BinaryOperator {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Equal,
-    NotEqual,
-    StrictEqual,
-    StrictNotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    InstanceOf,
-    And,
-    Or,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -710,7 +524,8 @@ pub struct ScriptRuntime {
     resources: Option<ResourceBundle>,
     resource_provider: Option<Rc<dyn ResourceProvider>>,
     base_url: Option<AppUrl>,
-    global: EnvironmentRef,
+    global: Rc<RefCell<Environment>>,
+    intrinsics: Intrinsics,
     location: LocationHandle,
     history: HistoryHandle,
     listeners: HashMap<NodePath, Vec<EventListener>>,
@@ -746,7 +561,16 @@ pub struct ScriptRuntime {
     tasks: Vec<ScheduledTask>,
     microtasks: VecDeque<Microtask>,
     pending_navigation: Option<NavigationRequest>,
-    pending_exception: Option<ErrorHandle>,
+    // the value being thrown, with the message of the Rust error that carries it
+    pending_exception: Option<(Value, String)>,
+    nested_runs: usize,
+    private_names: u64,
+    symbol_counter: u64,
+    // arrays being joined, so a cycle prints as empty instead of recursing
+    joining: Vec<ArrayHandle>,
+    template_cache: HashMap<(usize, usize), (Rc<compiler::Code>, Value)>,
+    array_expandos: ArrayExpandos,
+    array_expando_prune_at: usize,
     host_runtime_info: Option<HostRuntimeInfo>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     loading_modules: BTreeSet<String>,
@@ -1322,11 +1146,6 @@ struct ErrorData {
     class_name: String,
 }
 
-struct ClassDefinition {
-    name: String,
-    extends: Option<String>,
-}
-
 struct CanvasContextData {
     path: NodePath,
     fill_style: Color,
@@ -1479,8 +1298,17 @@ struct PromiseData {
 
 struct Microtask {
     callback: Value,
-    argument: Value,
-    next: PromiseHandle,
+    this: Value,
+    arguments: Vec<Value>,
+    kind: MicrotaskKind,
+}
+
+enum MicrotaskKind {
+    // a then callback: its result resolves the derived promise
+    Reaction(PromiseHandle),
+    // a thenable's then method adopting into a promise; a throw rejects it
+    Adopt(PromiseHandle),
+    Plain,
 }
 
 struct PromiseReaction {
@@ -1598,6 +1426,12 @@ impl ScriptRuntime {
         host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
+        let (intrinsics, intrinsic_globals) = create_intrinsics();
+        global.borrow_mut().values.extend(
+            intrinsic_globals
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
         let local_storage =
             local_storage.unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
         let session_storage =
@@ -1637,15 +1471,6 @@ impl ScriptRuntime {
                 .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
             values
                 .values
-                .insert("Number".to_string(), Value::NumberNamespace);
-            values
-                .values
-                .insert("Array".to_string(), Value::ArrayNamespace);
-            values
-                .values
-                .insert("Object".to_string(), Value::ObjectNamespace);
-            values
-                .values
                 .insert("Promise".to_string(), Value::PromiseConstructor);
             values.values.insert(
                 "AbortController".to_string(),
@@ -1654,15 +1479,6 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("Set".to_string(), Value::SetConstructor);
-            values
-                .values
-                .insert("Error".to_string(), Value::ErrorConstructor);
-            values
-                .values
-                .insert("String".to_string(), Value::StringConstructor);
-            values
-                .values
-                .insert("Symbol".to_string(), Value::SymbolNamespace);
             values
                 .values
                 .insert("URL".to_string(), Value::UrlConstructor);
@@ -1755,6 +1571,7 @@ impl ScriptRuntime {
             resource_provider,
             base_url,
             global,
+            intrinsics,
             location,
             history,
             listeners: HashMap::new(),
@@ -1790,6 +1607,13 @@ impl ScriptRuntime {
             microtasks: VecDeque::new(),
             pending_navigation: None,
             pending_exception: None,
+            nested_runs: 0,
+            private_names: 0,
+            symbol_counter: 0,
+            joining: Vec::new(),
+            template_cache: HashMap::new(),
+            array_expandos: HashMap::new(),
+            array_expando_prune_at: 64,
             host_runtime_info,
             module_cache: BTreeMap::new(),
             loading_modules: BTreeSet::new(),
@@ -2417,13 +2241,15 @@ impl ScriptRuntime {
     }
 
     pub fn execute(&mut self, source: &str) -> Result<(), ScriptError> {
-        let program = Parser::new(source)?.parse_program()?;
-        match self.execute_statements(&program, self.global.clone())? {
-            Completion::Normal | Completion::Return(_) => {
-                self.drain_microtasks()?;
-                self.pump_workers().map(|_| ())
-            }
+        let script = parser::parse_script(source)?;
+        let code = compiler::Compiler::new(source).compile_script(&script)?;
+        let outcome = self.run_script_code(code);
+        if outcome.is_err() {
+            self.pending_exception = None;
         }
+        outcome?;
+        self.drain_microtasks()?;
+        self.pump_workers().map(|_| ())
     }
 
     pub(crate) fn set_file_picker(&mut self, file_picker: Option<Rc<dyn FilePicker>>) {
@@ -2528,74 +2354,64 @@ impl ScriptRuntime {
         url: AppUrl,
         loader: &mut L,
     ) -> Result<ModuleNamespace, ScriptError> {
-        let program = Parser::new(source)?.parse_module()?;
-        let environment = Rc::new(RefCell::new(Environment {
-            values: HashMap::new(),
-            parent: Some(self.global.clone()),
-        }));
-        environment
-            .borrow_mut()
-            .values
-            .insert("import".to_string(), Value::ModuleImport(url.clone()));
-        {
-            let mut values = environment.borrow_mut();
-            for export in &program.exports {
-                values
-                    .values
-                    .entry(export.local.clone())
-                    .or_insert_with(|| {
-                        Value::Binding(Rc::new(RefCell::new(Value::Undefined)), true)
-                    });
-            }
-        }
-        for import in &program.imports {
-            let (dependency_url, dependency_source) = loader.load_module(&url, &import.source)?;
-            let namespace =
-                self.execute_module_graph(&dependency_source, dependency_url, loader)?;
-            let mut values = environment.borrow_mut();
-            for binding in &import.bindings {
+        let module = parser::parse_module(source)?;
+        let compiled = compiler::Compiler::new(source).compile_module(&module)?;
+        let scope = vm::Scope::new(compiled.code.scope_size as usize, None);
+        let mut load =
+            |runtime: &mut Self, specifier: &str| -> Result<ModuleNamespace, ScriptError> {
+                let (dependency_url, dependency_source) = loader.load_module(&url, specifier)?;
+                runtime.execute_module_graph(&dependency_source, dependency_url, loader)
+            };
+        for (specifier, bindings) in &compiled.imports {
+            let namespace = load(self, specifier)?;
+            for (binding, slot) in bindings {
                 let value = match binding {
-                    ModuleImportBinding::Named { imported, .. } => {
-                        namespace.values.get(imported).cloned().ok_or_else(|| {
-                            runtime_error(format!(
-                                "module {} has no export {imported}",
-                                import.source
-                            ))
+                    ast::ImportBinding::Named { imported, .. } => {
+                        namespace.values.get(&**imported).cloned().ok_or_else(|| {
+                            runtime_error(format!("module {specifier} has no export {imported}"))
                         })?
                     }
-                    ModuleImportBinding::Namespace { .. } => namespace.object_value(),
+                    ast::ImportBinding::Namespace(_) => self.namespace_object(&namespace),
                 };
                 let value = match value {
-                    Value::Binding(binding, _) => Value::Binding(binding, false),
+                    Value::Binding(cell, _) => Value::Binding(cell, false),
                     value => value,
                 };
-                let local = match binding {
-                    ModuleImportBinding::Named { local, .. }
-                    | ModuleImportBinding::Namespace { local } => local,
-                };
-                values.values.insert(local.clone(), value);
+                scope.borrow_mut().slots[*slot as usize] = value;
             }
         }
-        let mut star_namespaces = Vec::new();
-        for source in &program.star_reexports {
-            let (dependency_url, dependency_source) = loader.load_module(&url, source)?;
-            star_namespaces.push(self.execute_module_graph(
-                &dependency_source,
-                dependency_url,
-                loader,
-            )?);
-        }
-        match self.execute_statements(&program.statements, environment.clone())? {
-            Completion::Normal | Completion::Return(_) => {}
-        }
-        let values = environment.borrow();
         let mut exports = BTreeMap::new();
-        for export in program.exports {
-            let value = values.get_raw(&export.local).ok_or_else(|| {
-                runtime_error(format!("module export {} is undefined", export.local))
-            })?;
-            exports.insert(export.exported, value);
+        for (exported, slot) in &compiled.exports {
+            let cell = {
+                let mut scope = scope.borrow_mut();
+                match &scope.slots[*slot as usize] {
+                    Value::Binding(cell, _) => cell.clone(),
+                    _ => {
+                        let cell = Rc::new(RefCell::new(Value::Undefined));
+                        scope.slots[*slot as usize] = Value::Binding(cell.clone(), true);
+                        cell
+                    }
+                }
+            };
+            exports.insert(exported.to_string(), Value::Binding(cell, false));
         }
+        for (from, imported, exported) in &compiled.reexports {
+            let namespace = load(self, from)?;
+            let value =
+                namespace.values.get(&**imported).cloned().ok_or_else(|| {
+                    runtime_error(format!("module {from} has no export {imported}"))
+                })?;
+            exports.insert(exported.to_string(), value);
+        }
+        for (from, alias) in &compiled.namespace_exports {
+            let namespace = load(self, from)?;
+            exports.insert(alias.to_string(), self.namespace_object(&namespace));
+        }
+        let mut star_namespaces = Vec::new();
+        for from in &compiled.star_exports {
+            star_namespaces.push(load(self, from)?);
+        }
+        self.run_module_code(compiled.code, scope, url.clone())?;
         for namespace in star_namespaces {
             for (name, value) in namespace.values {
                 if name != "default" {
@@ -3863,7 +3679,7 @@ impl ScriptRuntime {
 
     pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
         let callbacks = self.take_window_callbacks(event_type);
-        let event = Value::Event(EventData {
+        let event = Value::Event(Rc::new(EventData {
             event_type: event_type.to_string(),
             target: Vec::new(),
             current_target: Vec::new(),
@@ -3877,7 +3693,7 @@ impl ScriptRuntime {
             motion: None,
             data_value: None,
             error_message: None,
-        });
+        }));
         let had_callbacks = !callbacks.is_empty();
         for callback in callbacks {
             self.call(callback, vec![event.clone()])?;
@@ -3905,7 +3721,7 @@ impl ScriptRuntime {
     pub(crate) fn dispatch_popstate(&mut self, serialized: &str) -> Result<bool, ScriptError> {
         let state = self.parse_json(serialized)?;
         let callbacks = self.take_window_callbacks("popstate");
-        let event = Value::Event(EventData {
+        let event = Value::Event(Rc::new(EventData {
             event_type: "popstate".to_string(),
             target: Vec::new(),
             current_target: Vec::new(),
@@ -3919,7 +3735,7 @@ impl ScriptRuntime {
             motion: None,
             data_value: None,
             error_message: None,
-        });
+        }));
         let had_callbacks = !callbacks.is_empty();
         for callback in callbacks {
             self.call(callback, vec![event.clone()])?;
@@ -3959,486 +3775,6 @@ impl ScriptRuntime {
         self.drain_microtasks()?;
         self.pump_workers()?;
         Ok(executed)
-    }
-
-    fn execute_statements(
-        &mut self,
-        statements: &[Stmt],
-        environment: EnvironmentRef,
-    ) -> Result<Completion, ScriptError> {
-        for statement in statements {
-            let completion = self.execute_statement(statement, environment.clone())?;
-            if !matches!(completion, Completion::Normal) {
-                return Ok(completion);
-            }
-        }
-        Ok(Completion::Normal)
-    }
-
-    fn bind_pattern(
-        &mut self,
-        pattern: &Pattern,
-        value: Value,
-        environment: &EnvironmentRef,
-    ) -> Result<(), ScriptError> {
-        match pattern {
-            Pattern::Identifier(name) => {
-                let existing = environment.borrow().values.get(name).cloned();
-                if let Some(Value::Binding(binding, true)) = existing {
-                    *binding.borrow_mut() = value;
-                } else {
-                    environment.borrow_mut().values.insert(name.clone(), value);
-                }
-                Ok(())
-            }
-            Pattern::Default { pattern, default } => {
-                let value = if matches!(&value, Value::Undefined) {
-                    self.evaluate(default, environment.clone())?
-                } else {
-                    value
-                };
-                self.bind_pattern(pattern, value, environment)
-            }
-            Pattern::Object { properties, rest } => {
-                if matches!(value, Value::Null | Value::Undefined) {
-                    return Err(runtime_error("cannot destructure a nullish value"));
-                }
-                let mut consumed = BTreeSet::new();
-                let mut object_properties = BTreeMap::new();
-                if let Value::Object(object) = &value {
-                    object_properties = object.borrow().clone();
-                }
-                for (key, nested) in properties {
-                    let property = match key {
-                        ObjectPatternKey::Static(property) => property.clone(),
-                        ObjectPatternKey::Computed(expression) => self
-                            .evaluate(expression, environment.clone())?
-                            .string_value(),
-                    };
-                    consumed.insert(property.clone());
-                    let nested_value = if let Some(nested_value) = object_properties.get(&property)
-                    {
-                        nested_value.clone()
-                    } else {
-                        self.member(value.clone(), &property)
-                            .unwrap_or(Value::Undefined)
-                    };
-                    self.bind_pattern(nested, nested_value, environment)?;
-                }
-                if let Some(rest) = rest {
-                    let remaining = object_properties
-                        .into_iter()
-                        .filter(|(property, _)| !consumed.contains(property))
-                        .collect();
-                    self.bind_pattern(
-                        rest,
-                        Value::Object(Rc::new(RefCell::new(remaining))),
-                        environment,
-                    )?;
-                }
-                Ok(())
-            }
-            Pattern::Array { items, rest } => {
-                let values = self.iterable_values(value)?;
-                for (index, nested) in items.iter().enumerate() {
-                    let Some(nested) = nested else {
-                        continue;
-                    };
-                    self.bind_pattern(
-                        nested,
-                        values.get(index).cloned().unwrap_or(Value::Undefined),
-                        environment,
-                    )?;
-                }
-                if let Some(rest) = rest {
-                    let remaining = values.into_iter().skip(items.len()).collect();
-                    self.bind_pattern(
-                        rest,
-                        Value::Array(Rc::new(RefCell::new(remaining))),
-                        environment,
-                    )?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn execute_statement(
-        &mut self,
-        statement: &Stmt,
-        environment: EnvironmentRef,
-    ) -> Result<Completion, ScriptError> {
-        match statement {
-            Stmt::Let {
-                pattern,
-                initializer,
-            } => {
-                let value = initializer
-                    .as_ref()
-                    .map(|expression| self.evaluate(expression, environment.clone()))
-                    .transpose()?
-                    .unwrap_or(Value::Undefined);
-                self.bind_pattern(pattern, value, &environment)?;
-                Ok(Completion::Normal)
-            }
-            Stmt::Expression(expression) => {
-                self.evaluate(expression, environment)?;
-                Ok(Completion::Normal)
-            }
-            Stmt::Block(statements) => {
-                let block = Rc::new(RefCell::new(Environment {
-                    values: HashMap::new(),
-                    parent: Some(environment),
-                }));
-                self.execute_statements(statements, block)
-            }
-            Stmt::If {
-                condition,
-                consequent,
-                alternate,
-            } => {
-                if self.evaluate(condition, environment.clone())?.truthy() {
-                    self.execute_statement(consequent, environment)
-                } else if let Some(alternate) = alternate {
-                    self.execute_statement(alternate, environment)
-                } else {
-                    Ok(Completion::Normal)
-                }
-            }
-            Stmt::ForOf {
-                pattern,
-                iterable,
-                body,
-            } => {
-                let iterable = self.evaluate(iterable, environment.clone())?;
-                let values = self.iterable_values(iterable)?;
-                for value in values {
-                    let iteration = Rc::new(RefCell::new(Environment {
-                        values: HashMap::new(),
-                        parent: Some(environment.clone()),
-                    }));
-                    self.bind_pattern(pattern, value, &iteration)?;
-                    let completion = self.execute_statement(body, iteration)?;
-                    if !matches!(completion, Completion::Normal) {
-                        return Ok(completion);
-                    }
-                }
-                Ok(Completion::Normal)
-            }
-            Stmt::TryCatch {
-                body,
-                catch_name,
-                handler,
-            } => match self.execute_statement(body, environment.clone()) {
-                Ok(completion) => Ok(completion),
-                Err(error) => {
-                    let error_value = self
-                        .pending_exception
-                        .take()
-                        .map(Value::Error)
-                        .unwrap_or_else(|| {
-                            Value::Error(Rc::new(ErrorData {
-                                name: "Error".to_string(),
-                                message: error.message.clone(),
-                                code: None,
-                                class_name: "Error".to_string(),
-                            }))
-                        });
-                    let handler_environment = Rc::new(RefCell::new(Environment {
-                        values: HashMap::new(),
-                        parent: Some(environment),
-                    }));
-                    if let Some(name) = catch_name {
-                        handler_environment
-                            .borrow_mut()
-                            .values
-                            .insert(name.clone(), error_value);
-                    }
-                    self.execute_statement(handler, handler_environment)
-                }
-            },
-            Stmt::Throw(expression) => {
-                let value = self.evaluate(expression, environment)?;
-                let error = error_handle(&value);
-                let message = error.message.clone();
-                self.pending_exception = Some(error);
-                Err(runtime_error(message))
-            }
-            Stmt::Class { name, extends } => {
-                let class = Value::Class(Rc::new(ClassDefinition {
-                    name: name.clone(),
-                    extends: extends.clone(),
-                }));
-                let existing = environment.borrow().values.get(name).cloned();
-                if let Some(Value::Binding(binding, true)) = existing {
-                    *binding.borrow_mut() = class;
-                } else {
-                    environment.borrow_mut().values.insert(name.clone(), class);
-                }
-                Ok(Completion::Normal)
-            }
-            Stmt::Return(expression) => Ok(Completion::Return(
-                expression
-                    .as_ref()
-                    .map(|expression| self.evaluate(expression, environment))
-                    .transpose()?
-                    .unwrap_or(Value::Undefined),
-            )),
-        }
-    }
-
-    fn evaluate(
-        &mut self,
-        expression: &Expr,
-        environment: EnvironmentRef,
-    ) -> Result<Value, ScriptError> {
-        match expression {
-            Expr::Literal(literal) => Ok(literal.to_value()),
-            Expr::Identifier(name) => environment
-                .borrow()
-                .get(name)
-                .ok_or_else(|| runtime_error(format!("unknown identifier {name}"))),
-            Expr::Unary {
-                operator,
-                expression,
-            } => {
-                let value = self.evaluate(expression, environment)?;
-                match operator {
-                    UnaryOperator::Not => Ok(Value::Bool(!value.truthy())),
-                    UnaryOperator::Negative => Ok(Value::Number(-value.number()?)),
-                    UnaryOperator::Positive => Ok(Value::Number(value.number()?)),
-                    UnaryOperator::TypeOf => Ok(Value::String(value_typeof(&value).to_string())),
-                    UnaryOperator::Await => self.await_value(value),
-                }
-            }
-            Expr::Conditional {
-                condition,
-                consequent,
-                alternate,
-            } => {
-                if self.evaluate(condition, environment.clone())?.truthy() {
-                    self.evaluate(consequent, environment)
-                } else {
-                    self.evaluate(alternate, environment)
-                }
-            }
-            Expr::Binary {
-                left,
-                operator,
-                right,
-            } => {
-                let left = self.evaluate(left, environment.clone())?;
-                match operator {
-                    BinaryOperator::And => {
-                        if !left.truthy() {
-                            return Ok(left);
-                        }
-                        return self.evaluate(right, environment);
-                    }
-                    BinaryOperator::Or => {
-                        if left.truthy() {
-                            return Ok(left);
-                        }
-                        return self.evaluate(right, environment);
-                    }
-                    _ => {}
-                }
-                let right = self.evaluate(right, environment)?;
-                evaluate_binary(*operator, left, right)
-            }
-            Expr::Assignment { target, expression } => {
-                let value = self.evaluate(expression, environment.clone())?;
-                self.assign(target, value.clone(), environment)?;
-                Ok(value)
-            }
-            Expr::Member { object, property } => {
-                let object = self.evaluate(object, environment)?;
-                self.member(object, property)
-            }
-            Expr::Index { object, index } => {
-                let object = self.evaluate(object, environment.clone())?;
-                let index = self.evaluate(index, environment)?;
-                self.index(object, index)
-            }
-            Expr::Object(properties) => {
-                let mut object = BTreeMap::new();
-                for property in properties {
-                    match property {
-                        ObjectLiteralProperty::Spread(expression) => {
-                            let value = self.evaluate(expression, environment.clone())?;
-                            for (property, value) in enumerable_object_properties(value)? {
-                                object.insert(property, value);
-                            }
-                        }
-                        ObjectLiteralProperty::Entry(key, expression) => {
-                            let property = match key {
-                                ObjectLiteralKey::Static(property) => property.clone(),
-                                ObjectLiteralKey::Computed(key_expression) => self
-                                    .evaluate(key_expression, environment.clone())
-                                    .map(|value| value.property_key())?,
-                            };
-                            object
-                                .insert(property, self.evaluate(expression, environment.clone())?);
-                        }
-                    }
-                }
-                Ok(Value::Object(Rc::new(RefCell::new(object))))
-            }
-            Expr::Array(expressions) => {
-                let mut values = Vec::new();
-                for expression in expressions {
-                    if let Expr::Spread(expression) = expression {
-                        let spread = self.evaluate(expression, environment.clone())?;
-                        let spread = self.spread_values(spread)?;
-                        if values.len().saturating_add(spread.len()) > MAX_RUNTIME_ARRAY_LENGTH {
-                            return Err(runtime_error(
-                                "array exceeds the deterministic length limit",
-                            ));
-                        }
-                        values.extend(spread);
-                    } else {
-                        if values.len() == MAX_RUNTIME_ARRAY_LENGTH {
-                            return Err(runtime_error(
-                                "array exceeds the deterministic length limit",
-                            ));
-                        }
-                        values.push(self.evaluate(expression, environment.clone())?);
-                    }
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
-            }
-            Expr::Spread(_) => Err(runtime_error("spread is only valid in an array literal")),
-            Expr::Template(parts) => {
-                let mut output = String::new();
-                for part in parts {
-                    match part {
-                        TemplatePart::Text(text) => output.push_str(text),
-                        TemplatePart::Expression(expression) => output.push_str(
-                            &self
-                                .evaluate(expression, environment.clone())?
-                                .string_value(),
-                        ),
-                    }
-                }
-                Ok(Value::String(output))
-            }
-            Expr::Call { callee, arguments } => {
-                if matches!(callee.as_ref(), Expr::Identifier(name) if name == "import") {
-                    let base_url = environment
-                        .borrow()
-                        .get("import")
-                        .and_then(|value| match value {
-                            Value::ModuleImport(url) => Some(url),
-                            _ => None,
-                        })
-                        .or_else(|| self.base_url.clone());
-                    let outcome = match (base_url, arguments.first()) {
-                        (Some(base_url), Some(argument)) => {
-                            if arguments.len() > 2 {
-                                Err(runtime_error(
-                                    "dynamic import accepts at most two arguments",
-                                ))
-                            } else {
-                                self.evaluate(argument, environment.clone())
-                                    .and_then(|reference| {
-                                        let attributes = arguments
-                                            .get(1)
-                                            .map(|argument| {
-                                                self.evaluate(argument, environment.clone())
-                                            })
-                                            .transpose()?;
-                                        let attributes = attributes
-                                            .as_ref()
-                                            .filter(|value| !matches!(value, Value::Undefined));
-                                        self.dynamic_import(base_url, &reference, attributes)
-                                    })
-                            }
-                        }
-                        (None, _) => Err(runtime_error("dynamic import requires a document URL")),
-                        (_, None) => Err(runtime_error("dynamic import requires a specifier")),
-                    };
-                    return Ok(Value::Promise(match outcome {
-                        Ok(namespace) => self.fulfilled_promise(namespace.object_value()),
-                        Err(error) => self.rejected_promise(error.message),
-                    }));
-                }
-                let callee = self.evaluate(callee, environment.clone())?;
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| self.evaluate(argument, environment.clone()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.call(callee, arguments)
-            }
-            Expr::New { callee, arguments } => {
-                let callee = self.evaluate(callee, environment.clone())?;
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| self.evaluate(argument, environment.clone()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.call(callee, arguments)
-            }
-            Expr::Function {
-                params,
-                body,
-                is_async,
-            } => Ok(Value::Function(Rc::new(Function {
-                params: params.clone(),
-                body: body.clone(),
-                environment,
-                is_async: *is_async,
-            }))),
-        }
-    }
-
-    fn assign(
-        &mut self,
-        target: &Expr,
-        value: Value,
-        environment: EnvironmentRef,
-    ) -> Result<(), ScriptError> {
-        match target {
-            Expr::Identifier(name) => {
-                if name == "location" {
-                    self.request_location_navigation(value.string_value(), false);
-                    return Ok(());
-                }
-                if !environment.borrow_mut().assign(name, value.clone())? {
-                    environment.borrow_mut().values.insert(name.clone(), value);
-                }
-                Ok(())
-            }
-            Expr::Member { object, property } => {
-                let object = self.evaluate(object, environment)?;
-                self.assign_member(object, property, value)
-            }
-            Expr::Index { object, index } => {
-                let object = self.evaluate(object, environment.clone())?;
-                let index = self.evaluate(index, environment)?;
-                match object.resolve() {
-                    Value::Object(object) => {
-                        object.borrow_mut().insert(index.property_key(), value);
-                        Ok(())
-                    }
-                    Value::Array(array) => {
-                        let index = runtime_array_index(&index)?;
-                        set_array_element(&array, index, value)?;
-                        Ok(())
-                    }
-                    Value::Uint8Array(array) => {
-                        let index = index.property_key();
-                        let Some(index) = uint8_array_property_index(&index) else {
-                            return Err(runtime_error(
-                                "Uint8Array index must be a non-negative integer",
-                            ));
-                        };
-                        set_uint8_array_byte(&array, index, uint8_value(&value)?);
-                        Ok(())
-                    }
-                    _ => Err(runtime_error("indexed assignment target is not writable")),
-                }
-            }
-            _ => Err(runtime_error("assignment target is not writable")),
-        }
     }
 
     fn member(&self, object: Value, property: &str) -> Result<Value, ScriptError> {
@@ -5149,14 +4485,6 @@ impl ScriptRuntime {
                     ))),
                 }
             }
-            Value::ModuleImport(url) if property == "meta" => {
-                let mut meta = BTreeMap::new();
-                meta.insert("url".to_string(), Value::String(url.to_string()));
-                Ok(Value::Object(Rc::new(RefCell::new(meta))))
-            }
-            Value::ModuleImport(_) => {
-                Err(runtime_error(format!("import has no property {property}")))
-            }
             Value::History(history) => match property {
                 "state" => Ok(history.borrow().state.clone()),
                 "length" => Ok(Value::Number(history.borrow().length as f64)),
@@ -5596,27 +4924,6 @@ impl ScriptRuntime {
                 "resolve" => Ok(Value::Builtin(Builtin::PromiseResolve)),
                 _ => Err(runtime_error(format!("Promise has no property {property}"))),
             },
-            Value::NumberNamespace => match property {
-                "parseInt" => Ok(Value::Builtin(Builtin::NumberParseInt)),
-                "isFinite" => Ok(Value::Builtin(Builtin::NumberIsFinite)),
-                _ => Err(runtime_error(format!("Number has no property {property}"))),
-            },
-            Value::ArrayNamespace => match property {
-                "isArray" => Ok(Value::Builtin(Builtin::ArrayIsArray)),
-                _ => Err(runtime_error(format!("Array has no property {property}"))),
-            },
-            Value::ObjectNamespace => match property {
-                "freeze" => Ok(Value::Builtin(Builtin::ObjectFreeze)),
-                "keys" => Ok(Value::Builtin(Builtin::ObjectKeys)),
-                "values" => Ok(Value::Builtin(Builtin::ObjectValues)),
-                "entries" => Ok(Value::Builtin(Builtin::ObjectEntries)),
-                "assign" => Ok(Value::Builtin(Builtin::ObjectAssign)),
-                _ => Err(runtime_error(format!("Object has no property {property}"))),
-            },
-            Value::SymbolNamespace => match property {
-                "iterator" => Ok(Value::Symbol("@@iterator".to_string())),
-                _ => Err(runtime_error(format!("Symbol has no property {property}"))),
-            },
             Value::Object(object) => Ok(object
                 .borrow()
                 .get(property)
@@ -5930,7 +5237,7 @@ impl ScriptRuntime {
         value: Value,
     ) -> Result<(), ScriptError> {
         let callback = match value.resolve() {
-            Value::Function(_) => value,
+            resolved if is_callable(&resolved) => value,
             Value::Null | Value::Undefined => Value::Null,
             _ => {
                 return Err(runtime_error(format!(
@@ -5952,7 +5259,7 @@ impl ScriptRuntime {
         value: Value,
     ) -> Result<(), ScriptError> {
         let callback = match value.resolve() {
-            Value::Function(_) => Some(value),
+            resolved if is_callable(&resolved) => Some(value),
             Value::Null | Value::Undefined => None,
             _ => {
                 return Err(runtime_error(format!(
@@ -6130,14 +5437,14 @@ impl ScriptRuntime {
                         };
                         let mut callbacks = runtime.take_window_callbacks("message");
                         if let Some(callback) = runtime.global.borrow().get("onmessage")
-                            && matches!(callback.resolve(), Value::Function(_))
+                            && is_callable(&callback.resolve())
                         {
                             callbacks.push(callback);
                         }
                         if callbacks.is_empty() {
                             continue;
                         }
-                        let event = Value::Event(EventData {
+                        let event = Value::Event(Rc::new(EventData {
                             event_type: "message".to_string(),
                             target: Vec::new(),
                             current_target: Vec::new(),
@@ -6151,7 +5458,7 @@ impl ScriptRuntime {
                             motion: None,
                             data_value: Some(Box::new(data)),
                             error_message: None,
-                        });
+                        }));
                         let mut callback_failed = false;
                         for callback in callbacks {
                             if let Err(error) = runtime.call(callback, vec![event.clone()]) {
@@ -6242,7 +5549,7 @@ impl ScriptRuntime {
                         if callbacks.is_empty() {
                             continue;
                         }
-                        let event = Value::Event(EventData {
+                        let event = Value::Event(Rc::new(EventData {
                             event_type: "message".to_string(),
                             target: Vec::new(),
                             current_target: Vec::new(),
@@ -6256,7 +5563,7 @@ impl ScriptRuntime {
                             motion: None,
                             data_value: Some(Box::new(data)),
                             error_message: None,
-                        });
+                        }));
                         for callback in callbacks {
                             self.call(callback, vec![event.clone()])?;
                         }
@@ -6279,7 +5586,7 @@ impl ScriptRuntime {
                         if callbacks.is_empty() {
                             continue;
                         }
-                        let event = Value::Event(EventData {
+                        let event = Value::Event(Rc::new(EventData {
                             event_type: "error".to_string(),
                             target: Vec::new(),
                             current_target: Vec::new(),
@@ -6293,7 +5600,7 @@ impl ScriptRuntime {
                             motion: None,
                             data_value: None,
                             error_message: Some(message),
-                        });
+                        }));
                         for callback in callbacks {
                             self.call(callback, vec![event.clone()])?;
                         }
@@ -8415,45 +7722,17 @@ impl ScriptRuntime {
         }
     }
 
+    // calls a function value with an undefined this, as host callbacks are invoked
     fn call(&mut self, callee: Value, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        self.call_function(callee, Value::Undefined, arguments)
+    }
+
+    fn call_host_constructor(
+        &mut self,
+        callee: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
         match callee.resolve() {
-            Value::Function(function) => {
-                let environment = Rc::new(RefCell::new(Environment {
-                    values: HashMap::new(),
-                    parent: Some(function.environment.clone()),
-                }));
-                for (index, parameter) in function.params.iter().enumerate() {
-                    self.bind_pattern(
-                        parameter,
-                        arguments.get(index).cloned().unwrap_or(Value::Undefined),
-                        &environment,
-                    )?;
-                }
-                let outcome = self.execute_statements(&function.body, environment);
-                if function.is_async {
-                    match outcome {
-                        Ok(Completion::Normal) => {
-                            Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
-                        }
-                        Ok(Completion::Return(value)) => {
-                            Ok(Value::Promise(self.fulfilled_promise(value)))
-                        }
-                        Err(error) => {
-                            let reason = self
-                                .pending_exception
-                                .take()
-                                .map(Value::Error)
-                                .unwrap_or_else(|| Value::String(error.message));
-                            Ok(Value::Promise(self.rejected_promise_value(reason)))
-                        }
-                    }
-                } else {
-                    match outcome? {
-                        Completion::Normal => Ok(Value::Undefined),
-                        Completion::Return(value) => Ok(value),
-                    }
-                }
-            }
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
             Value::UrlConstructor => self.construct_url(arguments),
             Value::UrlSearchParamsConstructor => self.construct_url_search_params(arguments),
@@ -8467,42 +7746,10 @@ impl ScriptRuntime {
             Value::ResponseConstructor => self.construct_response(arguments),
             Value::MapConstructor => self.construct_map(arguments),
             Value::SetConstructor => self.construct_set(arguments),
-            Value::ErrorConstructor => Ok(self.construct_error(arguments)),
             Value::PromiseConstructor => self.construct_promise(arguments),
             Value::AbortControllerConstructor => Ok(self.construct_abort_controller()),
             Value::WorkerConstructor => self.construct_worker(arguments),
-            Value::StringConstructor => Ok(Value::String(
-                arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default(),
-            )),
-            Value::Class(class) => self.construct_class(class, arguments),
             _ => Err(runtime_error("value is not callable")),
-        }
-    }
-
-    fn await_value(&mut self, value: Value) -> Result<Value, ScriptError> {
-        let Value::Promise(promise) = value else {
-            return Ok(value);
-        };
-        loop {
-            let outcome = promise.borrow().outcome.clone();
-            match outcome {
-                PromiseOutcome::Fulfilled(value) => return Ok(value),
-                PromiseOutcome::Rejected(reason) => {
-                    let error = error_handle(&reason);
-                    let message = error.message.clone();
-                    self.pending_exception = Some(error);
-                    return Err(runtime_error(message));
-                }
-                PromiseOutcome::Pending => {
-                    self.drain_microtasks()?;
-                    if matches!(promise.borrow().outcome, PromiseOutcome::Pending) {
-                        return Err(runtime_error("awaited promise is still pending"));
-                    }
-                }
-            }
         }
     }
 
@@ -9155,7 +8402,7 @@ impl ScriptRuntime {
     fn construct_set(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
         let mut values = Vec::new();
         if let Some(value) = arguments.first() {
-            for candidate in self.iterable_values(value.clone())? {
+            for candidate in self.iterate_to_vec(value.clone())? {
                 if !values
                     .iter()
                     .any(|existing| values_equal(existing, &candidate))
@@ -9167,44 +8414,13 @@ impl ScriptRuntime {
         Ok(Value::Set(Rc::new(RefCell::new(SetData { values }))))
     }
 
-    fn construct_error(&self, arguments: Vec<Value>) -> Value {
-        Value::Error(Rc::new(ErrorData {
-            name: "Error".to_string(),
-            message: arguments
-                .first()
-                .map(Value::string_value)
-                .unwrap_or_default(),
-            code: None,
-            class_name: "Error".to_string(),
-        }))
-    }
-
-    fn construct_class(
-        &self,
-        class: ClassHandle,
-        arguments: Vec<Value>,
-    ) -> Result<Value, ScriptError> {
-        if class.name == "CeriBridgeError" || class.extends.as_deref() == Some("Error") {
-            return Ok(Value::Error(Rc::new(ErrorData {
-                name: class.name.clone(),
-                message: arguments
-                    .get(1)
-                    .map(Value::string_value)
-                    .unwrap_or_default(),
-                code: arguments.first().map(Value::string_value),
-                class_name: class.name.clone(),
-            })));
-        }
-        Ok(Value::Object(Rc::new(RefCell::new(BTreeMap::new()))))
-    }
-
     fn construct_promise(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
         let promise = Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Pending,
             reactions: Vec::new(),
         }));
         if let Some(executor) = arguments.first() {
-            if !matches!(executor, Value::Function(_)) {
+            if !is_callable(executor) {
                 return Err(runtime_error("Promise executor must be a function"));
             }
             let resolve = Value::Builtin(Builtin::PromiseResolvePending(promise.clone()));
@@ -9405,6 +8621,7 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match builtin {
+            Builtin::Native(native) => self.call_native(native, Value::Undefined, arguments),
             Builtin::DocumentGetElementById => {
                 let id = arguments
                     .first()
@@ -9584,7 +8801,7 @@ impl ScriptRuntime {
                 reactions: Vec::new(),
             })))),
             Builtin::PromiseResolve => Ok(Value::Promise(
-                self.fulfilled_promise(arguments.first().cloned().unwrap_or(Value::Undefined)),
+                self.promise_resolve(arguments.first().cloned().unwrap_or(Value::Undefined))?,
             )),
             Builtin::PromiseRejectPending(promise) => {
                 let reason = arguments.first().cloned().unwrap_or(Value::Undefined);
@@ -9593,7 +8810,9 @@ impl ScriptRuntime {
             }
             Builtin::PromiseResolvePending(promise) => {
                 let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                self.settle_promise(&promise, PromiseOutcome::Fulfilled(value));
+                if matches!(promise.borrow().outcome, PromiseOutcome::Pending) {
+                    self.resolve_promise(&promise, value)?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::NumberParseInt => {
@@ -9617,37 +8836,6 @@ impl ScriptRuntime {
                     .first()
                     .is_some_and(|value| matches!(value, Value::Array(_))),
             )),
-            Builtin::ObjectFreeze => Ok(arguments.first().cloned().unwrap_or(Value::Undefined)),
-            Builtin::ObjectKeys => {
-                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                reject_nullish_object_argument(&value, "Object.keys")?;
-                let keys = enumerable_object_properties(value)?
-                    .into_iter()
-                    .map(|(key, _)| Value::String(key))
-                    .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(keys))))
-            }
-            Builtin::ObjectValues => {
-                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                reject_nullish_object_argument(&value, "Object.values")?;
-                let values = enumerable_object_properties(value)?
-                    .into_iter()
-                    .map(|(_, value)| value)
-                    .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
-            }
-            Builtin::ObjectEntries => {
-                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                reject_nullish_object_argument(&value, "Object.entries")?;
-                let entries = enumerable_object_properties(value)?
-                    .into_iter()
-                    .map(|(key, value)| {
-                        Value::Array(Rc::new(RefCell::new(vec![Value::String(key), value])))
-                    })
-                    .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(entries))))
-            }
-            Builtin::ObjectAssign => object_assign(&arguments),
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
@@ -9683,17 +8871,14 @@ impl ScriptRuntime {
                         }))),
                     );
                 }
-                let instance = Value::Object(Rc::new(RefCell::new(BTreeMap::from([(
+                let instance = plain_object(BTreeMap::from([(
                     "exports".to_string(),
-                    Value::Object(Rc::new(RefCell::new(exports))),
-                )]))));
-                let source = Value::Object(Rc::new(RefCell::new(BTreeMap::from([
-                    (
-                        "module".to_string(),
-                        Value::Object(Rc::new(RefCell::new(BTreeMap::new()))),
-                    ),
+                    plain_object(exports),
+                )]));
+                let source = plain_object(BTreeMap::from([
+                    ("module".to_string(), plain_object(BTreeMap::new())),
                     ("instance".to_string(), instance),
-                ]))));
+                ]));
                 Ok(Value::Promise(self.fulfilled_promise(source)))
             }
             Builtin::WebAssemblyFunction(function) => {
@@ -9789,7 +8974,7 @@ impl ScriptRuntime {
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                 let options = listener_options(&arguments)?;
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("Worker event listener must be a function"));
                 }
                 if options
@@ -9820,7 +9005,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("Worker event listener must be a function"));
                 }
                 worker
@@ -9890,7 +9075,7 @@ impl ScriptRuntime {
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                 let options = listener_options(&arguments)?;
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("window event listener must be a function"));
                 }
                 if options
@@ -9919,7 +9104,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("window event listener must be a function"));
                 }
                 if let Some(listeners) = self.window_listeners.get_mut(&event) {
@@ -9934,7 +9119,7 @@ impl ScriptRuntime {
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                 let options = listener_options(&arguments)?;
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("document event listener must be a function"));
                 }
                 if options
@@ -9964,7 +9149,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("document event listener must be a function"));
                 }
                 if let Some(listeners) = self.listeners.get_mut(&Vec::new()) {
@@ -10666,7 +9851,7 @@ impl ScriptRuntime {
             )),
             Builtin::UrlSearchParamsForEach(params) => {
                 let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !is_callable(&callback) {
                     return Err(runtime_error(
                         "URLSearchParams.forEach callback must be a function",
                     ));
@@ -10959,7 +10144,7 @@ impl ScriptRuntime {
             )),
             Builtin::FormDataForEach(form_data) => {
                 let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !is_callable(&callback) {
                     return Err(runtime_error(
                         "FormData.forEach callback must be a function",
                     ));
@@ -11058,13 +10243,17 @@ impl ScriptRuntime {
             }
             Builtin::ClipboardReadText => {
                 let Some(provider) = self.clipboard_provider.as_ref() else {
-                    return Ok(Value::Promise(self.rejected_promise(
-                        "NotAllowedError: clipboard access is unavailable",
-                    )));
+                    return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                        "NotAllowedError",
+                        "clipboard access is unavailable",
+                    ))));
                 };
                 match provider.read_text() {
                     Ok(text) => Ok(Value::Promise(self.fulfilled_promise(Value::String(text)))),
-                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.to_string()))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                        "NotAllowedError",
+                        &error.to_string(),
+                    )))),
                 }
             }
             Builtin::ClipboardWriteText => {
@@ -11073,13 +10262,17 @@ impl ScriptRuntime {
                     .ok_or_else(|| runtime_error("Clipboard.writeText requires text"))?
                     .string_value();
                 let Some(provider) = self.clipboard_provider.as_ref() else {
-                    return Ok(Value::Promise(self.rejected_promise(
-                        "NotAllowedError: clipboard access is unavailable",
-                    )));
+                    return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                        "NotAllowedError",
+                        "clipboard access is unavailable",
+                    ))));
                 };
                 match provider.write_text(&text) {
                     Ok(()) => Ok(Value::Promise(self.fulfilled_promise(Value::Undefined))),
-                    Err(error) => Ok(Value::Promise(self.rejected_promise(error.to_string()))),
+                    Err(error) => Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                        "NotAllowedError",
+                        &error.to_string(),
+                    )))),
                 }
             }
             Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments))),
@@ -11232,7 +10425,7 @@ impl ScriptRuntime {
             )),
             Builtin::HeadersForEach(headers) => {
                 let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !is_callable(&callback) {
                     return Err(runtime_error("headers.forEach callback must be a function"));
                 }
                 let entries = headers
@@ -11516,7 +10709,7 @@ impl ScriptRuntime {
                     ));
                 }
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback, Value::Function(_)) {
+                if !is_callable(&callback) {
                     return Err(runtime_error("AbortSignal listener must be a function"));
                 }
                 if !signal.borrow().aborted {
@@ -11525,9 +10718,9 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::AbortSignalThrowIfAborted(signal) => {
-                if let Some(reason) = signal.borrow().reason.clone() {
-                    self.pending_exception = Some(error_handle(&reason));
-                    return Err(runtime_error(reason.string_value()));
+                let reason = signal.borrow().reason.clone();
+                if let Some(reason) = reason {
+                    return Err(self.throw_value(reason));
                 }
                 Ok(Value::Undefined)
             }
@@ -11573,7 +10766,7 @@ impl ScriptRuntime {
                 payload.insert("chromium".to_string(), Value::String(info.chromium));
                 payload.insert("recovery".to_string(), Value::String(info.recovery));
                 payload.insert("session".to_string(), Value::String(info.session));
-                let response = serialize_json(&Value::Object(Rc::new(RefCell::new(payload))))?;
+                let response = serialize_json(&plain_object(payload))?;
                 Ok(Value::Promise(
                     self.fulfilled_promise(Value::String(response)),
                 ))
@@ -11588,7 +10781,7 @@ impl ScriptRuntime {
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
                 let options = listener_options(&arguments)?;
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("event listener must be a function"));
                 }
                 if options
@@ -11621,7 +10814,7 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !matches!(callback.resolve(), Value::Function(_)) {
+                if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("event listener must be a function"));
                 }
                 if let Some(listeners) = self.listeners.get_mut(&path) {
@@ -12280,7 +11473,7 @@ impl ScriptRuntime {
                     result.insert("value".to_string(), Value::Undefined);
                     result.insert("done".to_string(), Value::Bool(true));
                 }
-                Ok(Value::Object(Rc::new(RefCell::new(result))))
+                Ok(plain_object(result))
             }
             Builtin::IteratorJoin(iterator) => {
                 let separator = arguments
@@ -12365,7 +11558,7 @@ impl ScriptRuntime {
     ) -> Result<EventDispatch, ScriptError> {
         let callbacks = self.take_event_callbacks(&path, event);
         let state = Rc::new(RefCell::new(EventState::default()));
-        let event_value = Value::Event(EventData {
+        let event_value = Value::Event(Rc::new(EventData {
             event_type: event.to_string(),
             target: path.clone(),
             current_target: path,
@@ -12379,7 +11572,7 @@ impl ScriptRuntime {
             motion: self.motion_detail.clone(),
             data_value: None,
             error_message: None,
-        });
+        }));
         for callback in callbacks.iter().cloned() {
             self.call(callback, vec![event_value.clone()])?;
         }
@@ -12428,7 +11621,7 @@ impl ScriptRuntime {
         loop {
             let callbacks = self.take_event_callbacks(&current, event);
             had_callbacks |= !callbacks.is_empty();
-            let event_value = Value::Event(EventData {
+            let event_value = Value::Event(Rc::new(EventData {
                 event_type: event.to_string(),
                 target: target.clone(),
                 current_target: current.clone(),
@@ -12442,7 +11635,7 @@ impl ScriptRuntime {
                 motion: self.motion_detail.clone(),
                 data_value: None,
                 error_message: None,
-            });
+            }));
             for callback in callbacks {
                 self.call(callback, vec![event_value.clone()])?;
             }
@@ -12464,8 +11657,16 @@ impl ScriptRuntime {
         }))
     }
 
+    fn pending_promise() -> PromiseHandle {
+        Rc::new(RefCell::new(PromiseData {
+            outcome: PromiseOutcome::Pending,
+            reactions: Vec::new(),
+        }))
+    }
+
+    // host APIs that fail without a more specific DOMException reject with a TypeError
     fn rejected_promise(&self, reason: impl Into<String>) -> PromiseHandle {
-        self.rejected_promise_value(Value::String(reason.into()))
+        self.rejected_promise_value(self.make_error("TypeError", &reason.into()))
     }
 
     fn rejected_promise_value(&self, reason: Value) -> PromiseHandle {
@@ -12475,24 +11676,66 @@ impl ScriptRuntime {
         }))
     }
 
+    // the resolve function of a promise: promises and thenables are adopted, anything
+    // else fulfills
+    fn resolve_promise(
+        &mut self,
+        promise: &PromiseHandle,
+        value: Value,
+    ) -> Result<(), ScriptError> {
+        match &value {
+            Value::Promise(other) if Rc::ptr_eq(other, promise) => {
+                let error = self.make_error("TypeError", "Chaining cycle detected for promise");
+                self.settle_promise(promise, PromiseOutcome::Rejected(error));
+            }
+            Value::Promise(other) => self.follow_promise(promise.clone(), other.clone()),
+            Value::Object(_) => {
+                let then = match self.get_property(&value, "then") {
+                    Ok(then) => then,
+                    Err(error) => {
+                        let reason = self.take_thrown(error);
+                        self.settle_promise(promise, PromiseOutcome::Rejected(reason));
+                        return Ok(());
+                    }
+                };
+                if is_callable(&then) {
+                    let resolve = Value::Builtin(Builtin::PromiseResolvePending(promise.clone()));
+                    let reject = Value::Builtin(Builtin::PromiseRejectPending(promise.clone()));
+                    self.microtasks.push_back(Microtask {
+                        callback: then,
+                        this: value,
+                        arguments: vec![resolve, reject],
+                        kind: MicrotaskKind::Adopt(promise.clone()),
+                    });
+                } else {
+                    self.settle_promise(promise, PromiseOutcome::Fulfilled(value));
+                }
+            }
+            _ => self.settle_promise(promise, PromiseOutcome::Fulfilled(value)),
+        }
+        Ok(())
+    }
+
+    // Promise.resolve: a promise passes through, anything else is wrapped and adopted
+    fn promise_resolve(&mut self, value: Value) -> Result<PromiseHandle, ScriptError> {
+        if let Value::Promise(promise) = value {
+            return Ok(promise);
+        }
+        let promise = Self::pending_promise();
+        self.resolve_promise(&promise, value)?;
+        Ok(promise)
+    }
+
     fn promise_then(
         &mut self,
         promise: PromiseHandle,
         fulfilled: Option<&Value>,
         rejected: Option<&Value>,
     ) -> Result<Value, ScriptError> {
-        for callback in fulfilled.iter().chain(rejected.iter()) {
-            if !matches!(callback, Value::Function(_)) {
-                return Err(runtime_error("promise callback must be a function"));
-            }
-        }
-        let next = Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Pending,
-            reactions: Vec::new(),
-        }));
+        let next = Self::pending_promise();
         let reaction = PromiseReaction {
-            fulfilled: fulfilled.cloned(),
-            rejected: rejected.cloned(),
+            fulfilled: fulfilled.filter(|callback| is_callable(callback)).cloned(),
+            rejected: rejected.filter(|callback| is_callable(callback)).cloned(),
             next: next.clone(),
         };
         let outcome = {
@@ -12519,8 +11762,9 @@ impl ScriptRuntime {
         if let Some(callback) = callback {
             self.microtasks.push_back(Microtask {
                 callback,
-                argument,
-                next: reaction.next,
+                this: Value::Undefined,
+                arguments: vec![argument],
+                kind: MicrotaskKind::Reaction(reaction.next),
             });
         } else {
             self.settle_promise(&reaction.next, outcome);
@@ -12528,14 +11772,11 @@ impl ScriptRuntime {
     }
 
     fn queue_internal_microtask(&mut self, callback: Value) {
-        let next = Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Pending,
-            reactions: Vec::new(),
-        }));
         self.microtasks.push_back(Microtask {
             callback,
-            argument: Value::Undefined,
-            next,
+            this: Value::Undefined,
+            arguments: vec![Value::Undefined],
+            kind: MicrotaskKind::Plain,
         });
     }
 
@@ -12581,18 +11822,17 @@ impl ScriptRuntime {
                     "microtask queue exceeded the deterministic limit",
                 ));
             }
-            let outcome = self.call(task.callback, vec![task.argument]);
-            match outcome {
-                Ok(Value::Promise(promise)) => self.follow_promise(task.next, promise),
-                Ok(value) => {
-                    self.settle_promise(&task.next, PromiseOutcome::Fulfilled(value));
+            let outcome = self.call_function(task.callback, task.this, task.arguments);
+            match (task.kind, outcome) {
+                (MicrotaskKind::Reaction(next), Ok(value)) => self.resolve_promise(&next, value)?,
+                (MicrotaskKind::Reaction(next) | MicrotaskKind::Adopt(next), Err(error)) => {
+                    let reason = self.take_thrown(error);
+                    self.settle_promise(&next, PromiseOutcome::Rejected(reason));
                 }
-                Err(error) => {
-                    self.settle_promise(
-                        &task.next,
-                        PromiseOutcome::Rejected(Value::String(error.to_string())),
-                    );
+                (MicrotaskKind::Plain, Err(_)) => {
+                    self.pending_exception = None;
                 }
+                (MicrotaskKind::Adopt(_) | MicrotaskKind::Plain, Ok(_)) => {}
             }
             executed += 1;
         }
@@ -12988,12 +12228,7 @@ impl ScriptRuntime {
     }
 
     fn parse_json(&mut self, source: &str) -> Result<Value, ScriptError> {
-        let mut parser = Parser::new(source)?;
-        let expression = parser.parse_expression()?;
-        if !parser.is(TokenKind::Eof) {
-            return Err(runtime_error("JSON input has trailing tokens"));
-        }
-        self.evaluate(&expression, self.global.clone())
+        json::parse(source).map_err(|message| self.throw_error("SyntaxError", message))
     }
 
     fn schedule_task(
@@ -13002,7 +12237,7 @@ impl ScriptRuntime {
         kind: TaskKind,
     ) -> Result<Value, ScriptError> {
         let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-        if !matches!(callback, Value::Function(_)) {
+        if !is_callable(&callback) {
             return Err(runtime_error("scheduled task must be a function"));
         }
         let delay = match kind {
@@ -13246,7 +12481,7 @@ impl ScriptRuntime {
                 if storage.databases.len() >= MAX_IDB_DATABASES {
                     let request = self.indexed_db_request(
                         Value::Undefined,
-                        Some(indexed_db_error(
+                        Some(dom_exception(
                             "QuotaError",
                             "IndexedDB database limit exceeded",
                         )),
@@ -13270,7 +12505,7 @@ impl ScriptRuntime {
                     old_version,
                     target_version,
                     false,
-                    Some(indexed_db_error(
+                    Some(dom_exception(
                         "VersionError",
                         "requested database version is lower than the current version",
                     )),
@@ -13365,7 +12600,7 @@ impl ScriptRuntime {
                     "version".to_string(),
                     Value::Number(database.version as f64),
                 );
-                Value::Object(Rc::new(RefCell::new(value)))
+                plain_object(value)
             })
             .collect();
         Ok(Value::Promise(self.fulfilled_promise(Value::Array(
@@ -14024,67 +13259,6 @@ fn delay_milliseconds(value: f64) -> u64 {
     }
 }
 
-enum Completion {
-    Normal,
-    Return(Value),
-}
-
-impl Environment {
-    fn get(&self, name: &str) -> Option<Value> {
-        self.get_raw(name).map(|value| value.resolve()).or_else(|| {
-            self.parent
-                .as_ref()
-                .and_then(|parent| parent.borrow().get(name))
-        })
-    }
-
-    fn get_raw(&self, name: &str) -> Option<Value> {
-        self.values.get(name).cloned().or_else(|| {
-            self.parent
-                .as_ref()
-                .and_then(|parent| parent.borrow().get_raw(name))
-        })
-    }
-
-    fn assign(&mut self, name: &str, value: Value) -> Result<bool, ScriptError> {
-        if let Some(existing) = self.values.get(name).cloned() {
-            match existing {
-                Value::Binding(binding, true) => *binding.borrow_mut() = value,
-                Value::Binding(_, false) => {
-                    return Err(runtime_error(format!(
-                        "cannot assign to imported binding {name}"
-                    )));
-                }
-                _ => {
-                    self.values.insert(name.to_string(), value);
-                }
-            }
-            Ok(true)
-        } else if let Some(parent) = &self.parent {
-            parent.borrow_mut().assign(name, value)
-        } else {
-            Ok(false)
-        }
-    }
-}
-
-impl ModuleNamespace {
-    fn object_value(&self) -> Value {
-        Value::Object(Rc::new(RefCell::new(self.values.clone())))
-    }
-}
-
-impl Literal {
-    fn to_value(&self) -> Value {
-        match self {
-            Self::Null => Value::Null,
-            Self::Bool(value) => Value::Bool(*value),
-            Self::Number(value) => Value::Number(*value),
-            Self::String(value) => Value::String(value.clone()),
-        }
-    }
-}
-
 impl Value {
     fn resolve(&self) -> Value {
         match self {
@@ -14108,27 +13282,28 @@ impl Value {
         let value = self.resolve();
         match &value {
             Self::Number(value) => Ok(*value),
-            Self::String(value) => value
-                .parse()
-                .map_err(|_| runtime_error("value is not numeric")),
+            Self::String(value) => Ok(operations::string_to_number(value)),
             Self::Bool(value) => Ok(f64::from(*value as u8)),
             _ => Err(runtime_error("value is not numeric")),
         }
     }
 
+    // a conversion for host code that cannot run script: objects with their own toString
+    // need the runtime's to_string instead
     fn string_value(&self) -> String {
         let value = self.resolve();
         match &value {
-            Self::Undefined => "undefined".to_string(),
+            Self::Undefined | Self::Uninitialized => "undefined".to_string(),
             Self::Null => "null".to_string(),
             Self::Bool(value) => value.to_string(),
-            Self::Number(value) if value.fract() == 0.0 => format!("{value:.0}"),
-            Self::Number(value) => value.to_string(),
+            Self::Number(value) => number_to_string(*value),
             Self::String(value) => value.clone(),
-            Self::Symbol(value) => format!("Symbol({value})"),
+            Self::Symbol(value) => {
+                format!("Symbol({})", symbol_description(value).unwrap_or_default())
+            }
             Self::Binding(_, _) => unreachable!("binding values resolve before formatting"),
-            Self::Object(_) => "[object Object]".to_string(),
-            Self::Array(_) => "[array]".to_string(),
+            Self::Object(object) => object_display(object),
+            Self::Array(array) => array_display(array, &mut Vec::new()),
             Self::NodeList(_) => "[object NodeList]".to_string(),
             Self::Map(_) => "[object Map]".to_string(),
             Self::Set(_) => "[object Set]".to_string(),
@@ -14138,7 +13313,8 @@ impl Value {
             Self::Range(_) => "[object Range]".to_string(),
             Self::Selection(_) => "[object Selection]".to_string(),
             Self::Dataset(_) => "[object DOMStringMap]".to_string(),
-            Self::Error(error) => error.message.clone(),
+            Self::Error(error) if error.message.is_empty() => error.name.clone(),
+            Self::Error(error) => format!("{}: {}", error.name, error.message),
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
             Self::Event(_) => "[event]".to_string(),
@@ -14158,7 +13334,6 @@ impl Value {
             Self::Crypto => "[object Crypto]".to_string(),
             Self::SubtleCrypto => "[object SubtleCrypto]".to_string(),
             Self::Location(value) => value.borrow().to_string(),
-            Self::ModuleImport(_) => "[object Module]".to_string(),
             Self::History(_) => "[object History]".to_string(),
             Self::Url(value) => value.borrow().url.to_string(),
             Self::UrlSearchParams(value) => serialize_form_urlencoded(&value.borrow().pairs),
@@ -14192,18 +13367,11 @@ impl Value {
             Self::Uint8ArrayConstructor => "[function Uint8Array]".to_string(),
             Self::MapConstructor => "[function Map]".to_string(),
             Self::SetConstructor => "[function Set]".to_string(),
-            Self::ErrorConstructor => "[function Error]".to_string(),
             Self::PromiseConstructor => "[function Promise]".to_string(),
             Self::AbortControllerConstructor => "[function AbortController]".to_string(),
             Self::WorkerConstructor => "[function Worker]".to_string(),
-            Self::NumberNamespace => "[function Number]".to_string(),
-            Self::ArrayNamespace => "[function Array]".to_string(),
-            Self::ObjectNamespace => "[function Object]".to_string(),
-            Self::StringConstructor => "[function String]".to_string(),
-            Self::SymbolNamespace => "[function Symbol]".to_string(),
-            Self::Class(class) => format!("[class {}]", class.name),
-            Self::Function(_) => "[function]".to_string(),
-            Self::Builtin(_) => "[function]".to_string(),
+            Self::VmIterator(_) => "[object Iterator]".to_string(),
+            Self::Builtin(_) => "function () { [native code] }".to_string(),
         }
     }
 
@@ -14311,8 +13479,39 @@ fn clone_value(
         Value::String(value) => Ok(CloneValue::String(clone_text(value, context, "string")?)),
         Value::Object(object) => {
             let pointer = Rc::as_ptr(object) as usize;
+            let (callable, error) = {
+                let object = object.borrow();
+                (
+                    object.is_callable(),
+                    matches!(object.class, ObjectClass::Error),
+                )
+            };
+            if callable {
+                return Err(data_clone_error("value is not cloneable"));
+            }
+            if error {
+                let read = |key: &str| {
+                    let mut current = Some(object.clone());
+                    while let Some(link) = current {
+                        let link = link.borrow();
+                        if let Some(value) = link.get(key) {
+                            return value.string_value();
+                        }
+                        current = link.explicit_prototype();
+                    }
+                    String::new()
+                };
+                let name = read("name");
+                let message = read("message");
+                return Ok(CloneValue::Error {
+                    name: clone_text(&name, context, "Error name")?,
+                    message: clone_text(&message, context, "Error message")?,
+                    code: None,
+                    class_name: clone_text(&name, context, "Error class")?,
+                });
+            }
             context.enter(pointer)?;
-            let properties = object.borrow().clone();
+            let properties: Vec<(String, Value)> = object.borrow().iter().collect();
             let result = properties
                 .into_iter()
                 .map(|(key, value)| {
@@ -14321,7 +13520,7 @@ fn clone_value(
                         clone_value(&value, context, depth + 1)?,
                     ))
                 })
-                .collect::<Result<BTreeMap<_, _>, ScriptError>>();
+                .collect::<Result<Vec<_>, ScriptError>>();
             context.leave(pointer);
             result.map(CloneValue::Object)
         }
@@ -14455,12 +13654,12 @@ impl CloneValue {
                     .map(Self::into_value)
                     .collect::<Result<Vec<_>, _>>()?,
             ))),
-            Self::Object(properties) => Value::Object(Rc::new(RefCell::new(
+            Self::Object(properties) => plain_object(
                 properties
                     .into_iter()
                     .map(|(key, value)| Ok((key, value.into_value()?)))
-                    .collect::<Result<BTreeMap<_, _>, ScriptError>>()?,
-            ))),
+                    .collect::<Result<Vec<_>, ScriptError>>()?,
+            ),
             Self::Map(entries) => Value::Map(Rc::new(RefCell::new(MapData {
                 entries: entries
                     .into_iter()
@@ -14531,7 +13730,7 @@ fn abort_event_value() -> Value {
     let mut event = BTreeMap::new();
     event.insert("type".to_string(), Value::String("abort".to_string()));
     event.insert("defaultPrevented".to_string(), Value::Bool(false));
-    Value::Object(Rc::new(RefCell::new(event)))
+    plain_object(event)
 }
 
 const MAX_CACHE_NAME_BYTES: usize = 256;
@@ -14930,13 +14129,14 @@ fn read_clone_value(
         }
         7 => {
             let count = reader.read_count(MAX_CLONE_NODES, "structured clone object")?;
-            let mut properties = BTreeMap::new();
+            let mut properties: Vec<(String, CloneValue)> = Vec::with_capacity(count);
             for _ in 0..count {
                 let key = read_clone_string(reader, context, "structured clone object key")?;
                 let value = read_clone_value(reader, context, depth + 1)?;
-                if properties.insert(key, value).is_some() {
+                if properties.iter().any(|(existing, _)| *existing == key) {
                     return Err(storage_invalid("duplicate structured clone object key"));
                 }
+                properties.push((key, value));
             }
             Ok(CloneValue::Object(properties))
         }
@@ -15463,7 +14663,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn indexed_db_error(name: &str, message: &str) -> Value {
+fn dom_exception(name: &str, message: &str) -> Value {
     Value::Error(Rc::new(ErrorData {
         name: name.to_string(),
         message: message.to_string(),
@@ -15479,7 +14679,7 @@ fn indexed_db_event(event_type: &str, target: Value, old_version: u64, new_versi
     event.insert("oldVersion".to_string(), Value::Number(old_version as f64));
     event.insert("newVersion".to_string(), Value::Number(new_version as f64));
     event.insert("defaultPrevented".to_string(), Value::Bool(false));
-    Value::Object(Rc::new(RefCell::new(event)))
+    plain_object(event)
 }
 
 fn indexed_db_name(value: Option<&Value>, kind: &str) -> Result<String, ScriptError> {
@@ -15613,13 +14813,16 @@ fn indexed_db_set_key_path(value: &mut Value, path: &str, key: Value) -> Result<
             properties.insert(segments[0].to_string(), key);
             return Ok(());
         }
-        let child = properties
-            .entry(segments[0].to_string())
-            .or_insert_with(|| Value::Object(Rc::new(RefCell::new(BTreeMap::new()))));
-        if matches!(child.resolve(), Value::Undefined | Value::Null) {
-            *child = Value::Object(Rc::new(RefCell::new(BTreeMap::new())));
-        }
-        set_value(child, &segments[1..], key)
+        let mut child = match properties.get(segments[0]).cloned() {
+            Some(child) if !matches!(child.resolve(), Value::Undefined | Value::Null) => child,
+            _ => {
+                let child = plain_object(Vec::new());
+                properties.insert(segments[0].to_string(), child.clone());
+                child
+            }
+        };
+        drop(properties);
+        set_value(&mut child, &segments[1..], key)
     }
     set_value(value, &segments, key)
 }
@@ -15646,8 +14849,8 @@ fn assign_indexed_db_callback_value(
     value: Value,
 ) -> Result<(), ScriptError> {
     match value.resolve() {
-        Value::Function(_) => {
-            *target = Some(value.resolve());
+        resolved if is_callable(&resolved) => {
+            *target = Some(resolved);
             Ok(())
         }
         Value::Null | Value::Undefined => {
@@ -15819,7 +15022,7 @@ fn read_result(value: Value, done: bool) -> Value {
     let mut result = BTreeMap::new();
     result.insert("value".to_string(), value);
     result.insert("done".to_string(), Value::Bool(done));
-    Value::Object(Rc::new(RefCell::new(result)))
+    plain_object(result)
 }
 
 fn serialize_json(value: &Value) -> Result<String, ScriptError> {
@@ -15828,11 +15031,7 @@ fn serialize_json(value: &Value) -> Result<String, ScriptError> {
         Value::Undefined => Ok("null".to_string()),
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) if value.is_finite() => Ok(if value.fract() == 0.0 {
-            format!("{value:.0}")
-        } else {
-            value.to_string()
-        }),
+        Value::Number(value) if value.is_finite() => Ok(number_to_string(*value)),
         Value::Number(_) => Ok("null".to_string()),
         Value::String(value) => Ok(escape_json_string(value)),
         Value::Array(values) => values
@@ -15844,11 +15043,12 @@ fn serialize_json(value: &Value) -> Result<String, ScriptError> {
         Value::Object(properties) => properties
             .borrow()
             .iter()
+            .filter(|(_, value)| !matches!(value, Value::Undefined) && !is_callable(value))
             .map(|(key, value)| {
                 Ok(format!(
                     "{}:{}",
-                    escape_json_string(key),
-                    serialize_json(value)?
+                    escape_json_string(&key),
+                    serialize_json(&value)?
                 ))
             })
             .collect::<Result<Vec<_>, ScriptError>>()
@@ -16099,16 +15299,9 @@ fn normalize_blob_type(value: &str) -> String {
 
 const MAX_TYPED_ARRAY_BYTES: usize = 16 * 1024 * 1024;
 
-fn reject_nullish_object_argument(value: &Value, method: &str) -> Result<(), ScriptError> {
-    if matches!(value.resolve(), Value::Undefined | Value::Null) {
-        return Err(runtime_error(format!("{method} requires an object value")));
-    }
-    Ok(())
-}
-
 fn array_callback(arguments: &[Value], method: &str) -> Result<Value, ScriptError> {
     let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
-    if !matches!(callback, Value::Function(_)) {
+    if !is_callable(&callback) {
         return Err(runtime_error(format!(
             "{method} callback must be a function"
         )));
@@ -16144,38 +15337,6 @@ fn enumerable_object_properties(value: Value) -> Result<Vec<(String, Value)>, Sc
         ));
     }
     Ok(properties)
-}
-
-fn object_assign(arguments: &[Value]) -> Result<Value, ScriptError> {
-    let target = arguments
-        .first()
-        .cloned()
-        .unwrap_or(Value::Undefined)
-        .resolve();
-    match target {
-        Value::Object(target) => {
-            for source in arguments.iter().skip(1).cloned() {
-                for (property, value) in enumerable_object_properties(source)? {
-                    target.borrow_mut().insert(property, value);
-                }
-            }
-            Ok(Value::Object(target))
-        }
-        Value::Array(target) => {
-            for source in arguments.iter().skip(1).cloned() {
-                for (property, value) in enumerable_object_properties(source)? {
-                    let Some(index) = runtime_array_property_index(&property) else {
-                        return Err(runtime_error(format!(
-                            "Object.assign cannot write array property {property}"
-                        )));
-                    };
-                    set_array_element(&target, index, value)?;
-                }
-            }
-            Ok(Value::Array(target))
-        }
-        _ => Err(runtime_error("Object.assign target must be an object")),
-    }
 }
 
 fn runtime_array_property_index(property: &str) -> Option<usize> {
@@ -16446,7 +15607,7 @@ fn validity_object(flags: ConstraintFlags) -> Value {
     values.insert("typeMismatch".to_string(), Value::Bool(flags.type_mismatch));
     values.insert("valid".to_string(), Value::Bool(flags.valid()));
     values.insert("valueMissing".to_string(), Value::Bool(flags.value_missing));
-    Value::Object(Rc::new(RefCell::new(values)))
+    plain_object(values)
 }
 
 fn valid_email_value(value: &str, multiple: bool) -> bool {
@@ -17624,59 +16785,70 @@ fn first_class_name(arguments: &[Value]) -> Result<String, ScriptError> {
         .and_then(class_name)
 }
 
-fn evaluate_binary(
-    operator: BinaryOperator,
-    left: Value,
-    right: Value,
-) -> Result<Value, ScriptError> {
-    match operator {
-        BinaryOperator::Add => {
-            if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
-                Ok(Value::String(format!(
-                    "{}{}",
-                    left.string_value(),
-                    right.string_value()
-                )))
-            } else {
-                Ok(Value::Number(left.number()? + right.number()?))
+// Array.prototype.join(",") without running script; a cycle prints as empty, as join does
+fn array_display(array: &ArrayHandle, visiting: &mut Vec<*const RefCell<Vec<Value>>>) -> String {
+    let pointer = Rc::as_ptr(array);
+    if visiting.contains(&pointer) {
+        return String::new();
+    }
+    visiting.push(pointer);
+    let text = array
+        .borrow()
+        .iter()
+        .map(|value| match value {
+            Value::Undefined | Value::Null => String::new(),
+            Value::Array(inner) => array_display(inner, visiting),
+            value => value.string_value(),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    visiting.pop();
+    text
+}
+
+// the string form of an object without running script: wrappers show their primitive,
+// errors their name and message, functions their kind
+fn object_display(object: &ObjectHandle) -> String {
+    let borrowed = object.borrow();
+    match &borrowed.class {
+        ObjectClass::String(text) => text.clone(),
+        ObjectClass::Number(number) => number_to_string(*number),
+        ObjectClass::Boolean(value) => value.to_string(),
+        ObjectClass::Function(_) | ObjectClass::Bound { .. } | ObjectClass::Native(_) => {
+            "function () { [native code] }".to_string()
+        }
+        ObjectClass::Error => {
+            let read = |key: &str| {
+                let mut current = Some(object.clone());
+                while let Some(link) = current {
+                    let link = link.borrow();
+                    if let Some(Value::String(text)) = link.get(key) {
+                        return text.clone();
+                    }
+                    current = link.explicit_prototype();
+                }
+                String::new()
+            };
+            let name = read("name");
+            let message = read("message");
+            match (name.is_empty(), message.is_empty()) {
+                (_, true) => name,
+                (true, false) => message,
+                (false, false) => format!("{name}: {message}"),
             }
         }
-        BinaryOperator::Subtract => Ok(Value::Number(left.number()? - right.number()?)),
-        BinaryOperator::Multiply => Ok(Value::Number(left.number()? * right.number()?)),
-        BinaryOperator::Divide => Ok(Value::Number(left.number()? / right.number()?)),
-        BinaryOperator::Equal | BinaryOperator::StrictEqual => {
-            Ok(Value::Bool(values_equal(&left, &right)))
-        }
-        BinaryOperator::NotEqual | BinaryOperator::StrictNotEqual => {
-            Ok(Value::Bool(!values_equal(&left, &right)))
-        }
-        BinaryOperator::Less => Ok(Value::Bool(left.number()? < right.number()?)),
-        BinaryOperator::LessEqual => Ok(Value::Bool(left.number()? <= right.number()?)),
-        BinaryOperator::Greater => Ok(Value::Bool(left.number()? > right.number()?)),
-        BinaryOperator::GreaterEqual => Ok(Value::Bool(left.number()? >= right.number()?)),
-        BinaryOperator::InstanceOf => Ok(Value::Bool(match (left, right) {
-            (Value::Error(_), Value::ErrorConstructor) => true,
-            (Value::Blob(_), Value::BlobConstructor) => true,
-            (Value::File(_), Value::FileConstructor | Value::BlobConstructor) => true,
-            (Value::Bytes(_), Value::ArrayBufferConstructor) => true,
-            (Value::Uint8Array(_), Value::Uint8ArrayConstructor) => true,
-            (Value::Worker(_), Value::WorkerConstructor) => true,
-            (Value::Error(error), Value::Class(class)) => {
-                error.class_name == class.name
-                    || (class.name == "Error" && error.class_name == "Error")
-            }
-            _ => false,
-        })),
-        BinaryOperator::And | BinaryOperator::Or => unreachable!("logical operators short-circuit"),
+        _ => "[object Object]".to_string(),
     }
 }
 
 fn value_typeof(value: &Value) -> &'static str {
     let value = value.resolve();
     match &value {
-        Value::Undefined => "undefined",
+        Value::Undefined | Value::Uninitialized => "undefined",
+        Value::Object(object) if object.borrow().is_callable() => "function",
         Value::Null
         | Value::Object(_)
+        | Value::VmIterator(_)
         | Value::Array(_)
         | Value::NodeList(_)
         | Value::Map(_)
@@ -17705,7 +16877,6 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Crypto
         | Value::SubtleCrypto
         | Value::Location(_)
-        | Value::ModuleImport(_)
         | Value::History(_)
         | Value::Url(_)
         | Value::UrlSearchParams(_)
@@ -17735,8 +16906,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
         Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
-        Value::Function(_)
-        | Value::Builtin(_)
+        Value::Builtin(_)
         | Value::ResponseConstructor
         | Value::RequestConstructor
         | Value::HeadersConstructor
@@ -17749,16 +16919,9 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Uint8ArrayConstructor
         | Value::MapConstructor
         | Value::SetConstructor
-        | Value::ErrorConstructor
         | Value::PromiseConstructor
         | Value::AbortControllerConstructor
-        | Value::WorkerConstructor
-        | Value::NumberNamespace
-        | Value::ArrayNamespace
-        | Value::ObjectNamespace
-        | Value::StringConstructor
-        | Value::SymbolNamespace
-        | Value::Class(_) => "function",
+        | Value::WorkerConstructor => "function",
     }
 }
 
@@ -18182,18 +17345,6 @@ fn sha512_digest(data: &[u8], initial_state: [u64; 8], output_words: usize) -> V
     digest
 }
 
-fn error_handle(value: &Value) -> ErrorHandle {
-    match value.resolve() {
-        Value::Error(error) => error.clone(),
-        _ => Rc::new(ErrorData {
-            name: "Error".to_string(),
-            message: value.string_value(),
-            code: None,
-            class_name: "Error".to_string(),
-        }),
-    }
-}
-
 fn values_equal(left: &Value, right: &Value) -> bool {
     let left = left.resolve();
     let right = right.resolve();
@@ -18214,7 +17365,6 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Promise(left), Value::Promise(right)) => Rc::ptr_eq(left, right),
         (Value::Element(left), Value::Element(right))
         | (Value::Style(left), Value::Style(right)) => left == right,
-        (Value::Function(left), Value::Function(right)) => Rc::ptr_eq(left, right),
         (Value::Validity(left), Value::Validity(right)) => Rc::ptr_eq(left, right),
         (Value::Range(left), Value::Range(right)) => Rc::ptr_eq(left, right),
         (Value::Selection(left), Value::Selection(right)) => Rc::ptr_eq(left, right),
@@ -18238,11 +17388,37 @@ fn values_equal(left: &Value, right: &Value) -> bool {
             Rc::ptr_eq(left, right)
         }
         (Value::Navigator, Value::Navigator)
+        | (Value::Document, Value::Document)
+        | (Value::Window, Value::Window)
+        | (Value::Console, Value::Console)
+        | (Value::Json, Value::Json)
+        | (Value::WebAssemblyNamespace, Value::WebAssemblyNamespace)
+        | (Value::ResponseConstructor, Value::ResponseConstructor)
+        | (Value::RequestConstructor, Value::RequestConstructor)
+        | (Value::HeadersConstructor, Value::HeadersConstructor)
+        | (Value::UrlConstructor, Value::UrlConstructor)
+        | (Value::UrlSearchParamsConstructor, Value::UrlSearchParamsConstructor)
+        | (Value::FormDataConstructor, Value::FormDataConstructor)
+        | (Value::BlobConstructor, Value::BlobConstructor)
+        | (Value::FileConstructor, Value::FileConstructor)
+        | (Value::MapConstructor, Value::MapConstructor)
+        | (Value::SetConstructor, Value::SetConstructor)
+        | (Value::PromiseConstructor, Value::PromiseConstructor)
+        | (Value::AbortControllerConstructor, Value::AbortControllerConstructor)
+        | (Value::WorkerConstructor, Value::WorkerConstructor)
         | (Value::Clipboard, Value::Clipboard)
         | (Value::Crypto, Value::Crypto)
         | (Value::SubtleCrypto, Value::SubtleCrypto)
         | (Value::ArrayBufferConstructor, Value::ArrayBufferConstructor)
         | (Value::Uint8ArrayConstructor, Value::Uint8ArrayConstructor) => true,
+        (Value::Location(left), Value::Location(right)) => Rc::ptr_eq(left, right),
+        (Value::History(left), Value::History(right)) => Rc::ptr_eq(left, right),
+        (Value::Error(left), Value::Error(right)) => Rc::ptr_eq(left, right),
+        (Value::Response(left), Value::Response(right)) => Rc::ptr_eq(left, right),
+        (Value::VmIterator(left), Value::VmIterator(right)) => Rc::ptr_eq(left, right),
+        (Value::Dataset(left), Value::Dataset(right))
+        | (Value::ClassList(left), Value::ClassList(right)) => left == right,
+        (Value::Event(left), Value::Event(right)) => Rc::ptr_eq(&left.state, &right.state),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),
@@ -18583,86 +17759,6 @@ fn parse_fetch_options(
     })
 }
 
-impl ScriptRuntime {
-    fn spread_values(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
-        self.iterable_values(value)
-    }
-
-    fn iterable_values(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
-        match value.resolve() {
-            Value::Array(values) => Ok(values.borrow().clone()),
-            Value::NodeList(nodes) => Ok(nodes.iter().cloned().map(Value::Element).collect()),
-            Value::String(string) => Ok(string
-                .chars()
-                .map(|character| Value::String(character.to_string()))
-                .collect()),
-            Value::Uint8Array(array) => Ok(uint8_array_bytes(&array.borrow())
-                .into_iter()
-                .map(|byte| Value::Number(byte as f64))
-                .collect()),
-            Value::Iterator(iterator) => {
-                let mut iterator = iterator.borrow_mut();
-                let values = iterator.values[iterator.index..].to_vec();
-                iterator.index = iterator.values.len();
-                Ok(values)
-            }
-            Value::Set(set) => Ok(set.borrow().values.clone()),
-            Value::Map(map) => Ok(map
-                .borrow()
-                .entries
-                .iter()
-                .map(|(key, value)| {
-                    Value::Array(Rc::new(RefCell::new(vec![key.clone(), value.clone()])))
-                })
-                .collect()),
-            Value::UrlSearchParams(params) => Ok(params
-                .borrow()
-                .pairs
-                .iter()
-                .map(|(name, value)| {
-                    Value::Array(Rc::new(RefCell::new(vec![
-                        Value::String(name.clone()),
-                        Value::String(value.clone()),
-                    ])))
-                })
-                .collect()),
-            Value::FormData(form_data) => Ok(form_data
-                .borrow()
-                .pairs
-                .iter()
-                .map(|(name, value)| {
-                    Value::Array(Rc::new(RefCell::new(vec![
-                        Value::String(name.clone()),
-                        form_data_entry_value(value),
-                    ])))
-                })
-                .collect()),
-            Value::Object(object) => {
-                let iterator = object.borrow().get("@@iterator").cloned();
-                let Some(iterator) = iterator else {
-                    return Err(runtime_error("value is not iterable"));
-                };
-                let iterator = self.call(iterator, Vec::new())?;
-                let mut values = Vec::new();
-                loop {
-                    if values.len() == MAX_USER_ITERATOR_VALUES {
-                        return Err(runtime_error(
-                            "user-defined iterator exceeded the deterministic limit",
-                        ));
-                    }
-                    let next = self.member(iterator.clone(), "next")?;
-                    let record = self.call(next, Vec::new())?;
-                    if self.member(record.clone(), "done")?.truthy() {
-                        return Ok(values);
-                    }
-                    values.push(self.member(record, "value")?);
-                }
-            }
-            _ => Err(runtime_error("value is not iterable")),
-        }
-    }
-}
-
 pub(crate) fn runtime_error(message: impl Into<String>) -> ScriptError {
     ScriptError {
         offset: 0,
@@ -18711,1347 +17807,6 @@ fn parse_dynamic_import_type(
         )));
     }
     Ok(Some(DynamicImportType::Json))
-}
-
-struct Parser {
-    tokens: Vec<Token>,
-    index: usize,
-}
-
-impl Parser {
-    fn new(source: &str) -> Result<Self, ScriptError> {
-        Ok(Self {
-            tokens: tokenize(source)?,
-            index: 0,
-        })
-    }
-
-    fn parse_program(&mut self) -> Result<Vec<Stmt>, ScriptError> {
-        let mut statements = Vec::new();
-        while !self.is(TokenKind::Eof) {
-            statements.push(self.parse_statement()?);
-        }
-        Ok(statements)
-    }
-
-    fn parse_module(&mut self) -> Result<ModuleProgram, ScriptError> {
-        let mut imports = Vec::new();
-        let mut star_reexports = Vec::new();
-        let mut statements = Vec::new();
-        let mut exports = Vec::new();
-        while !self.is(TokenKind::Eof) {
-            if self.is_identifier("import") && !self.is_next(TokenKind::Dot) {
-                imports.push(self.parse_import_declaration()?);
-            } else if self.is_identifier("export") {
-                self.advance();
-                self.parse_export_declaration(
-                    &mut imports,
-                    &mut star_reexports,
-                    &mut statements,
-                    &mut exports,
-                )?;
-            } else {
-                statements.push(self.parse_statement()?);
-            }
-        }
-        Ok(ModuleProgram {
-            imports,
-            star_reexports,
-            statements,
-            exports,
-        })
-    }
-
-    fn parse_import_declaration(&mut self) -> Result<ModuleImport, ScriptError> {
-        self.expect_identifier_value("import")?;
-        if let TokenKind::String(source) = self.peek().kind.clone() {
-            self.advance();
-            self.take(TokenKind::Semicolon);
-            return Ok(ModuleImport {
-                source,
-                bindings: Vec::new(),
-            });
-        }
-        let mut bindings = Vec::new();
-        if let TokenKind::Identifier(local) = self.peek().kind.clone() {
-            self.advance();
-            bindings.push(ModuleImportBinding::Named {
-                imported: "default".to_string(),
-                local,
-            });
-            self.take(TokenKind::Comma);
-        }
-        if self.take(TokenKind::Star) {
-            self.expect_identifier_value("as")?;
-            let local = self.expect_identifier("namespace import name")?;
-            bindings.push(ModuleImportBinding::Namespace { local });
-        } else if self.take(TokenKind::LBrace) {
-            if !self.is(TokenKind::RBrace) {
-                loop {
-                    let imported = self.expect_identifier("import name")?;
-                    let local = if self.is_identifier("as") {
-                        self.advance();
-                        self.expect_identifier("local import name")?
-                    } else {
-                        imported.clone()
-                    };
-                    bindings.push(ModuleImportBinding::Named { imported, local });
-                    if !self.take(TokenKind::Comma) {
-                        break;
-                    }
-                    if self.is(TokenKind::RBrace) {
-                        break;
-                    }
-                }
-            }
-            self.expect(TokenKind::RBrace, "named imports")?;
-        }
-        self.expect_identifier_value("from")?;
-        let source = self.expect_string("module specifier")?;
-        self.take(TokenKind::Semicolon);
-        if bindings.is_empty() {
-            return Err(self.error(
-                "module import has no bindings".to_string(),
-                self.peek().offset,
-            ));
-        }
-        Ok(ModuleImport { source, bindings })
-    }
-
-    fn parse_export_declaration(
-        &mut self,
-        imports: &mut Vec<ModuleImport>,
-        star_reexports: &mut Vec<String>,
-        statements: &mut Vec<Stmt>,
-        exports: &mut Vec<ModuleExport>,
-    ) -> Result<(), ScriptError> {
-        if self.take(TokenKind::Star) {
-            self.expect_identifier_value("from")?;
-            star_reexports.push(self.expect_string("export-star module specifier")?);
-            self.take(TokenKind::Semicolon);
-            return Ok(());
-        }
-        if self.is_identifier("default") {
-            self.advance();
-            if exports.iter().any(|export| export.exported == "default") {
-                return Err(self.error(
-                    "module has more than one default export".to_string(),
-                    self.peek().offset,
-                ));
-            }
-            let local = "__ceri_default_export".to_string();
-            let initializer = self.parse_expression()?;
-            statements.push(Stmt::Let {
-                pattern: Pattern::Identifier(local.clone()),
-                initializer: Some(initializer),
-            });
-            exports.push(ModuleExport {
-                local,
-                exported: "default".to_string(),
-            });
-            self.take(TokenKind::Semicolon);
-            return Ok(());
-        }
-        if self.is(TokenKind::Let) || self.is(TokenKind::Const) {
-            let statement = self.parse_statement()?;
-            let Stmt::Let {
-                pattern: Pattern::Identifier(name),
-                ..
-            } = &statement
-            else {
-                return Err(self.error("expected exported binding".to_string(), self.peek().offset));
-            };
-            exports.push(ModuleExport {
-                local: name.clone(),
-                exported: name.clone(),
-            });
-            statements.push(statement);
-            return Ok(());
-        }
-        if self.is(TokenKind::Function) && self.is_next_identifier() {
-            let statement = self.parse_statement()?;
-            let Stmt::Let {
-                pattern: Pattern::Identifier(name),
-                ..
-            } = &statement
-            else {
-                return Err(
-                    self.error("expected exported function".to_string(), self.peek().offset)
-                );
-            };
-            exports.push(ModuleExport {
-                local: name.clone(),
-                exported: name.clone(),
-            });
-            statements.push(statement);
-            return Ok(());
-        }
-        if self.is(TokenKind::Class) {
-            let statement = self.parse_statement()?;
-            let Stmt::Class { name, .. } = &statement else {
-                return Err(self.error("expected exported class".to_string(), self.peek().offset));
-            };
-            exports.push(ModuleExport {
-                local: name.clone(),
-                exported: name.clone(),
-            });
-            statements.push(statement);
-            return Ok(());
-        }
-        if self.take(TokenKind::LBrace) {
-            let mut bindings = Vec::new();
-            if !self.is(TokenKind::RBrace) {
-                loop {
-                    let local = self.expect_identifier("export name")?;
-                    let exported = if self.is_identifier("as") {
-                        self.advance();
-                        self.expect_identifier("export alias")?
-                    } else {
-                        local.clone()
-                    };
-                    bindings.push((local, exported));
-                    if !self.take(TokenKind::Comma) {
-                        break;
-                    }
-                    if self.is(TokenKind::RBrace) {
-                        break;
-                    }
-                }
-            }
-            self.expect(TokenKind::RBrace, "export list")?;
-            if self.is_identifier("from") {
-                self.advance();
-                let source = self.expect_string("re-export module specifier")?;
-                for (index, (imported, exported)) in bindings.into_iter().enumerate() {
-                    let local = format!("__ceri_reexport_{}_{index}", imports.len());
-                    imports.push(ModuleImport {
-                        source: source.clone(),
-                        bindings: vec![ModuleImportBinding::Named {
-                            imported,
-                            local: local.clone(),
-                        }],
-                    });
-                    exports.push(ModuleExport { local, exported });
-                }
-            } else {
-                exports.extend(
-                    bindings
-                        .into_iter()
-                        .map(|(local, exported)| ModuleExport { local, exported }),
-                );
-            }
-            self.take(TokenKind::Semicolon);
-            return Ok(());
-        }
-        Err(self.error(
-            "module export form is outside the supported subset".to_string(),
-            self.peek().offset,
-        ))
-    }
-
-    fn parse_statement(&mut self) -> Result<Stmt, ScriptError> {
-        if self.take(TokenKind::Semicolon) {
-            return Ok(Stmt::Block(Vec::new()));
-        }
-        if self.take(TokenKind::LBrace) {
-            let statements = self.parse_block_contents()?;
-            return Ok(Stmt::Block(statements));
-        }
-        if self.take(TokenKind::Let) || self.take(TokenKind::Const) {
-            let pattern = self.parse_binding_pattern_without_default("variable")?;
-            let initializer = self
-                .take(TokenKind::Assign)
-                .then(|| self.parse_expression())
-                .transpose()?;
-            self.take(TokenKind::Semicolon);
-            return Ok(Stmt::Let {
-                pattern,
-                initializer,
-            });
-        }
-        if self.take(TokenKind::If) {
-            self.expect(TokenKind::LParen, "if condition")?;
-            let condition = self.parse_expression()?;
-            self.expect(TokenKind::RParen, "if condition")?;
-            let consequent = Box::new(self.parse_statement()?);
-            let alternate = self
-                .take(TokenKind::Else)
-                .then(|| self.parse_statement().map(Box::new))
-                .transpose()?;
-            return Ok(Stmt::If {
-                condition,
-                consequent,
-                alternate,
-            });
-        }
-        if self.take(TokenKind::For) {
-            self.expect(TokenKind::LParen, "for statement")?;
-            if !self.take(TokenKind::Let) && !self.take(TokenKind::Const) {
-                return Err(self.error(
-                    "for-of binding must use let or const".to_string(),
-                    self.peek().offset,
-                ));
-            }
-            let pattern = self.parse_binding_pattern_without_default("for-of binding")?;
-            self.expect_identifier_value("of")?;
-            let iterable = self.parse_expression()?;
-            self.expect(TokenKind::RParen, "for statement")?;
-            let body = Box::new(self.parse_statement()?);
-            return Ok(Stmt::ForOf {
-                pattern,
-                iterable,
-                body,
-            });
-        }
-        if self.take(TokenKind::Return) {
-            let expression = if self.is(TokenKind::Semicolon) || self.is(TokenKind::RBrace) {
-                None
-            } else {
-                Some(self.parse_expression()?)
-            };
-            self.take(TokenKind::Semicolon);
-            return Ok(Stmt::Return(expression));
-        }
-        if self.is(TokenKind::Function) && self.is_next_identifier() {
-            self.advance();
-            let name = self.expect_identifier("function name")?;
-            let function = self.parse_function_after_name()?;
-            self.take(TokenKind::Semicolon);
-            return Ok(Stmt::Let {
-                pattern: Pattern::Identifier(name),
-                initializer: Some(function),
-            });
-        }
-        if self.take(TokenKind::Async) {
-            self.expect(TokenKind::Function, "async function")?;
-            let name = self.expect_identifier("async function name")?;
-            let function = self.parse_function_after_name_with_async(true)?;
-            self.take(TokenKind::Semicolon);
-            return Ok(Stmt::Let {
-                pattern: Pattern::Identifier(name),
-                initializer: Some(function),
-            });
-        }
-        if self.take(TokenKind::Try) {
-            let body = Box::new(self.parse_statement()?);
-            self.expect(TokenKind::Catch, "catch clause")?;
-            let catch_name = if self.take(TokenKind::LParen) {
-                let name = self.expect_identifier("catch binding")?;
-                self.expect(TokenKind::RParen, "catch clause")?;
-                Some(name)
-            } else {
-                None
-            };
-            let handler = Box::new(self.parse_statement()?);
-            return Ok(Stmt::TryCatch {
-                body,
-                catch_name,
-                handler,
-            });
-        }
-        if self.take(TokenKind::Throw) {
-            let expression = self.parse_expression()?;
-            self.take(TokenKind::Semicolon);
-            return Ok(Stmt::Throw(expression));
-        }
-        if self.take(TokenKind::Class) {
-            return self.parse_class_declaration();
-        }
-        let expression = self.parse_expression()?;
-        self.take(TokenKind::Semicolon);
-        Ok(Stmt::Expression(expression))
-    }
-
-    fn parse_block_contents(&mut self) -> Result<Vec<Stmt>, ScriptError> {
-        let mut statements = Vec::new();
-        while !self.is(TokenKind::RBrace) && !self.is(TokenKind::Eof) {
-            statements.push(self.parse_statement()?);
-        }
-        self.expect(TokenKind::RBrace, "block")?;
-        Ok(statements)
-    }
-
-    fn parse_class_declaration(&mut self) -> Result<Stmt, ScriptError> {
-        let name = self.expect_identifier("class name")?;
-        let extends = if self.is_identifier("extends") {
-            self.advance();
-            Some(self.expect_identifier("base class name")?)
-        } else {
-            None
-        };
-        self.expect(TokenKind::LBrace, "class body")?;
-        while !self.is(TokenKind::RBrace) && !self.is(TokenKind::Eof) {
-            let method = self.expect_identifier("class method name")?;
-            let _function = self.parse_function_after_name()?;
-            if method != "constructor" {
-                return Err(self.error(
-                    "only class constructors are supported".to_string(),
-                    self.peek().offset,
-                ));
-            }
-        }
-        self.expect(TokenKind::RBrace, "class body")?;
-        Ok(Stmt::Class { name, extends })
-    }
-
-    fn parse_expression(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_assignment()
-    }
-
-    fn parse_assignment(&mut self) -> Result<Expr, ScriptError> {
-        let left = self.parse_or()?;
-        if self.take(TokenKind::Question) {
-            let consequent = self.parse_expression()?;
-            self.expect(TokenKind::Colon, "conditional expression")?;
-            let alternate = self.parse_assignment()?;
-            return Ok(Expr::Conditional {
-                condition: Box::new(left),
-                consequent: Box::new(consequent),
-                alternate: Box::new(alternate),
-            });
-        }
-        if self.take(TokenKind::Assign) {
-            let expression = self.parse_assignment()?;
-            Ok(Expr::Assignment {
-                target: Box::new(left),
-                expression: Box::new(expression),
-            })
-        } else {
-            Ok(left)
-        }
-    }
-
-    fn parse_or(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_binary(Self::parse_and, &[TokenKind::OrOr], &[BinaryOperator::Or])
-    }
-
-    fn parse_and(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_binary(
-            Self::parse_equality,
-            &[TokenKind::AndAnd],
-            &[BinaryOperator::And],
-        )
-    }
-
-    fn parse_equality(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_binary(
-            Self::parse_comparison,
-            &[
-                TokenKind::EqEq,
-                TokenKind::NotEq,
-                TokenKind::StrictEq,
-                TokenKind::StrictNotEq,
-            ],
-            &[
-                BinaryOperator::Equal,
-                BinaryOperator::NotEqual,
-                BinaryOperator::StrictEqual,
-                BinaryOperator::StrictNotEqual,
-            ],
-        )
-    }
-
-    fn parse_comparison(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_binary(
-            Self::parse_term,
-            &[
-                TokenKind::Less,
-                TokenKind::LessEqual,
-                TokenKind::Greater,
-                TokenKind::GreaterEqual,
-                TokenKind::InstanceOf,
-            ],
-            &[
-                BinaryOperator::Less,
-                BinaryOperator::LessEqual,
-                BinaryOperator::Greater,
-                BinaryOperator::GreaterEqual,
-                BinaryOperator::InstanceOf,
-            ],
-        )
-    }
-
-    fn parse_term(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_binary(
-            Self::parse_factor,
-            &[TokenKind::Plus, TokenKind::Minus],
-            &[BinaryOperator::Add, BinaryOperator::Subtract],
-        )
-    }
-
-    fn parse_factor(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_binary(
-            Self::parse_unary,
-            &[TokenKind::Star, TokenKind::Slash],
-            &[BinaryOperator::Multiply, BinaryOperator::Divide],
-        )
-    }
-
-    fn parse_binary(
-        &mut self,
-        next: fn(&mut Self) -> Result<Expr, ScriptError>,
-        tokens: &[TokenKind],
-        operators: &[BinaryOperator],
-    ) -> Result<Expr, ScriptError> {
-        let mut expression = next(self)?;
-        loop {
-            let Some(index) = tokens.iter().position(|token| self.is(token.clone())) else {
-                break;
-            };
-            self.advance();
-            let right = next(self)?;
-            expression = Expr::Binary {
-                left: Box::new(expression),
-                operator: operators[index],
-                right: Box::new(right),
-            };
-        }
-        Ok(expression)
-    }
-
-    fn parse_unary(&mut self) -> Result<Expr, ScriptError> {
-        let operator = if self.take(TokenKind::Bang) {
-            Some(UnaryOperator::Not)
-        } else if self.take(TokenKind::Minus) {
-            Some(UnaryOperator::Negative)
-        } else if self.take(TokenKind::Plus) {
-            Some(UnaryOperator::Positive)
-        } else if self.take(TokenKind::TypeOf) {
-            Some(UnaryOperator::TypeOf)
-        } else if self.take(TokenKind::Await) {
-            Some(UnaryOperator::Await)
-        } else {
-            None
-        };
-        if let Some(operator) = operator {
-            Ok(Expr::Unary {
-                operator,
-                expression: Box::new(self.parse_unary()?),
-            })
-        } else {
-            self.parse_postfix()
-        }
-    }
-
-    fn parse_postfix(&mut self) -> Result<Expr, ScriptError> {
-        let mut expression = self.parse_primary()?;
-        loop {
-            if self.take(TokenKind::Dot) {
-                let property = self.expect_property_name()?;
-                expression = Expr::Member {
-                    object: Box::new(expression),
-                    property,
-                };
-            } else if self.take(TokenKind::LBracket) {
-                let index = self.parse_expression()?;
-                self.expect(TokenKind::RBracket, "index expression")?;
-                expression = Expr::Index {
-                    object: Box::new(expression),
-                    index: Box::new(index),
-                };
-            } else if self.take(TokenKind::LParen) {
-                let mut arguments = Vec::new();
-                if !self.is(TokenKind::RParen) {
-                    loop {
-                        arguments.push(self.parse_expression()?);
-                        if !self.take(TokenKind::Comma) {
-                            break;
-                        }
-                        if self.is(TokenKind::RParen) {
-                            break;
-                        }
-                    }
-                }
-                self.expect(TokenKind::RParen, "call")?;
-                expression = Expr::Call {
-                    callee: Box::new(expression),
-                    arguments,
-                };
-            } else {
-                break;
-            }
-        }
-        Ok(expression)
-    }
-
-    fn parse_primary(&mut self) -> Result<Expr, ScriptError> {
-        if let Some(function) = self.try_parse_arrow_function()? {
-            return Ok(function);
-        }
-        let token = self.advance();
-        match token.kind {
-            TokenKind::Number(value) => Ok(Expr::Literal(Literal::Number(value))),
-            TokenKind::String(value) => Ok(Expr::Literal(Literal::String(value))),
-            TokenKind::Template(value) => Ok(Expr::Template(self.parse_template_parts(&value)?)),
-            TokenKind::True => Ok(Expr::Literal(Literal::Bool(true))),
-            TokenKind::False => Ok(Expr::Literal(Literal::Bool(false))),
-            TokenKind::Null => Ok(Expr::Literal(Literal::Null)),
-            TokenKind::New => {
-                let callee = self.parse_primary()?;
-                let arguments = self.parse_argument_list("constructor")?;
-                Ok(Expr::New {
-                    callee: Box::new(callee),
-                    arguments,
-                })
-            }
-            TokenKind::Identifier(name) => {
-                if self.take(TokenKind::Arrow) {
-                    Ok(self.parse_arrow_body(vec![Pattern::Identifier(name)])?)
-                } else {
-                    Ok(Expr::Identifier(name))
-                }
-            }
-            TokenKind::Function => self.parse_function_expression(),
-            TokenKind::LBrace => self.parse_object_literal(),
-            TokenKind::LBracket => self.parse_array_literal(),
-            TokenKind::LParen => {
-                let expression = self.parse_expression()?;
-                self.expect(TokenKind::RParen, "parenthesized expression")?;
-                Ok(expression)
-            }
-            other => Err(self.error(format!("unexpected token {other:?}"), token.offset)),
-        }
-    }
-
-    fn parse_template_parts(&self, source: &str) -> Result<Vec<TemplatePart>, ScriptError> {
-        let mut parts = Vec::new();
-        let mut cursor = 0;
-        let mut text_start = 0;
-        while let Some(relative_start) = source[cursor..].find("${") {
-            let start = cursor + relative_start;
-            if start > text_start {
-                parts.push(TemplatePart::Text(source[text_start..start].to_string()));
-            }
-            let expression_start = start + 2;
-            let end = find_template_expression_end(source, expression_start).ok_or_else(|| {
-                self.error("unterminated template interpolation".to_string(), start)
-            })?;
-            let mut parser = Parser::new(&source[expression_start..end])?;
-            let expression = parser.parse_expression()?;
-            if !parser.is(TokenKind::Eof) {
-                return Err(self.error(
-                    "template interpolation contains trailing tokens".to_string(),
-                    expression_start + parser.peek().offset,
-                ));
-            }
-            parts.push(TemplatePart::Expression(Box::new(expression)));
-            cursor = end + 1;
-            text_start = cursor;
-        }
-        if text_start < source.len() {
-            parts.push(TemplatePart::Text(source[text_start..].to_string()));
-        }
-        Ok(parts)
-    }
-
-    fn parse_object_literal(&mut self) -> Result<Expr, ScriptError> {
-        let mut properties = Vec::new();
-        if !self.is(TokenKind::RBrace) {
-            loop {
-                if self.take(TokenKind::Ellipsis) {
-                    properties.push(ObjectLiteralProperty::Spread(self.parse_expression()?));
-                } else {
-                    let key = if self.take(TokenKind::LBracket) {
-                        let expression = self.parse_expression()?;
-                        self.expect(TokenKind::RBracket, "computed object property name")?;
-                        ObjectLiteralKey::Computed(expression)
-                    } else {
-                        let token = self.advance();
-                        let key = match token.kind {
-                            TokenKind::Identifier(key) | TokenKind::String(key) => key,
-                            _ => {
-                                return Err(self.error(
-                                    "expected object property name".to_string(),
-                                    token.offset,
-                                ));
-                            }
-                        };
-                        ObjectLiteralKey::Static(key)
-                    };
-                    let value = if self.take(TokenKind::Colon) {
-                        self.parse_expression()?
-                    } else if self.is(TokenKind::LParen) {
-                        self.parse_function_after_name_with_async(false)?
-                    } else {
-                        return Err(self.error(
-                            "object property needs a value or method body".to_string(),
-                            self.peek().offset,
-                        ));
-                    };
-                    properties.push(ObjectLiteralProperty::Entry(key, value));
-                }
-                if !self.take(TokenKind::Comma) {
-                    break;
-                }
-                if self.is(TokenKind::RBrace) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RBrace, "object literal")?;
-        Ok(Expr::Object(properties))
-    }
-
-    fn parse_array_literal(&mut self) -> Result<Expr, ScriptError> {
-        let mut values = Vec::new();
-        if !self.is(TokenKind::RBracket) {
-            loop {
-                let expression = if self.take(TokenKind::Ellipsis) {
-                    Expr::Spread(Box::new(self.parse_expression()?))
-                } else {
-                    self.parse_expression()?
-                };
-                values.push(expression);
-                if !self.take(TokenKind::Comma) {
-                    break;
-                }
-                if self.is(TokenKind::RBracket) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RBracket, "array literal")?;
-        Ok(Expr::Array(values))
-    }
-
-    fn parse_binding_pattern(&mut self, context: &str) -> Result<Pattern, ScriptError> {
-        self.parse_binding_pattern_with_default(context, true)
-    }
-
-    fn parse_binding_pattern_without_default(
-        &mut self,
-        context: &str,
-    ) -> Result<Pattern, ScriptError> {
-        self.parse_binding_pattern_with_default(context, false)
-    }
-
-    fn parse_binding_pattern_with_default(
-        &mut self,
-        context: &str,
-        allow_default: bool,
-    ) -> Result<Pattern, ScriptError> {
-        let pattern = match self.peek().kind.clone() {
-            TokenKind::Identifier(name) => {
-                self.advance();
-                Pattern::Identifier(name)
-            }
-            TokenKind::LBrace => {
-                self.advance();
-                let mut properties = Vec::new();
-                let mut rest = None;
-                while !self.is(TokenKind::RBrace) && !self.is(TokenKind::Eof) {
-                    if self.take(TokenKind::Ellipsis) {
-                        rest = Some(Box::new(
-                            self.parse_binding_pattern_with_default("object rest", false)?,
-                        ));
-                        self.take(TokenKind::Comma);
-                        break;
-                    }
-                    let key = if self.take(TokenKind::LBracket) {
-                        let expression = self.parse_expression()?;
-                        self.expect(TokenKind::RBracket, "computed object binding name")?;
-                        ObjectPatternKey::Computed(expression)
-                    } else {
-                        let token = self.advance();
-                        let key = match token.kind {
-                            TokenKind::Identifier(key) | TokenKind::String(key) => key,
-                            _ => {
-                                return Err(self.error(
-                                    "expected object binding name".to_string(),
-                                    token.offset,
-                                ));
-                            }
-                        };
-                        ObjectPatternKey::Static(key)
-                    };
-                    let nested = if self.take(TokenKind::Colon) {
-                        self.parse_binding_pattern("object binding")?
-                    } else {
-                        let ObjectPatternKey::Static(key) = &key else {
-                            return Err(self.error(
-                                "computed object binding needs a target".to_string(),
-                                self.peek().offset,
-                            ));
-                        };
-                        self.parse_pattern_default(Pattern::Identifier(key.clone()))?
-                    };
-                    properties.push((key, nested));
-                    if !self.take(TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.expect(TokenKind::RBrace, context)?;
-                Pattern::Object { properties, rest }
-            }
-            TokenKind::LBracket => {
-                self.advance();
-                let mut items = Vec::new();
-                let mut rest = None;
-                while !self.is(TokenKind::RBracket) && !self.is(TokenKind::Eof) {
-                    if self.take(TokenKind::Ellipsis) {
-                        rest = Some(Box::new(
-                            self.parse_binding_pattern_with_default("array rest", false)?,
-                        ));
-                        self.take(TokenKind::Comma);
-                        break;
-                    }
-                    if self.take(TokenKind::Comma) {
-                        items.push(None);
-                        continue;
-                    }
-                    items.push(Some(self.parse_binding_pattern("array binding")?));
-                    if !self.take(TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.expect(TokenKind::RBracket, context)?;
-                Pattern::Array { items, rest }
-            }
-            _ => return Err(self.error(format!("expected {context}"), self.peek().offset)),
-        };
-        if allow_default {
-            self.parse_pattern_default(pattern)
-        } else {
-            Ok(pattern)
-        }
-    }
-
-    fn parse_pattern_default(&mut self, pattern: Pattern) -> Result<Pattern, ScriptError> {
-        if self.take(TokenKind::Assign) {
-            let default = self.parse_assignment()?;
-            Ok(Pattern::Default {
-                pattern: Box::new(pattern),
-                default: Box::new(default),
-            })
-        } else {
-            Ok(pattern)
-        }
-    }
-
-    fn try_parse_arrow_function(&mut self) -> Result<Option<Expr>, ScriptError> {
-        if !self.is(TokenKind::LParen) {
-            return Ok(None);
-        }
-        let saved = self.index;
-        self.advance();
-        let mut params = Vec::new();
-        if !self.is(TokenKind::RParen) {
-            loop {
-                params.push(self.parse_binding_pattern("arrow parameter")?);
-                if !self.take(TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-        if self.take(TokenKind::RParen) && self.take(TokenKind::Arrow) {
-            return Ok(Some(self.parse_arrow_body(params)?));
-        }
-        self.index = saved;
-        Ok(None)
-    }
-
-    fn parse_arrow_body(&mut self, params: Vec<Pattern>) -> Result<Expr, ScriptError> {
-        let body = if self.take(TokenKind::LBrace) {
-            self.parse_block_contents()?
-        } else {
-            vec![Stmt::Return(Some(self.parse_expression()?))]
-        };
-        Ok(Expr::Function {
-            params,
-            body,
-            is_async: false,
-        })
-    }
-
-    fn parse_function_expression(&mut self) -> Result<Expr, ScriptError> {
-        if matches!(self.peek().kind, TokenKind::Identifier(_)) {
-            self.advance();
-        }
-        let function = self.parse_function_after_name()?;
-        let Expr::Function {
-            params,
-            body,
-            is_async,
-        } = function
-        else {
-            unreachable!("function parser returns a function expression");
-        };
-        Ok(Expr::Function {
-            params,
-            body,
-            is_async,
-        })
-    }
-
-    fn parse_function_after_name(&mut self) -> Result<Expr, ScriptError> {
-        self.parse_function_after_name_with_async(false)
-    }
-
-    fn parse_function_after_name_with_async(
-        &mut self,
-        is_async: bool,
-    ) -> Result<Expr, ScriptError> {
-        self.expect(TokenKind::LParen, "function parameters")?;
-        let mut params = Vec::new();
-        if !self.is(TokenKind::RParen) {
-            loop {
-                params.push(self.parse_binding_pattern("function parameter")?);
-                if !self.take(TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RParen, "function parameters")?;
-        self.expect(TokenKind::LBrace, "function body")?;
-        let body = self.parse_block_contents()?;
-        Ok(Expr::Function {
-            params,
-            body,
-            is_async,
-        })
-    }
-
-    fn parse_argument_list(&mut self, context: &str) -> Result<Vec<Expr>, ScriptError> {
-        self.expect(TokenKind::LParen, context)?;
-        let mut arguments = Vec::new();
-        if !self.is(TokenKind::RParen) {
-            loop {
-                arguments.push(self.parse_expression()?);
-                if !self.take(TokenKind::Comma) {
-                    break;
-                }
-                if self.is(TokenKind::RParen) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RParen, context)?;
-        Ok(arguments)
-    }
-
-    fn is_next_identifier(&self) -> bool {
-        matches!(
-            self.tokens.get(self.index + 1).map(|token| &token.kind),
-            Some(TokenKind::Identifier(_))
-        )
-    }
-
-    fn is_identifier(&self, expected: &str) -> bool {
-        matches!(&self.peek().kind, TokenKind::Identifier(name) if name == expected)
-    }
-
-    fn is_next(&self, expected: TokenKind) -> bool {
-        self.tokens
-            .get(self.index + 1)
-            .is_some_and(|token| token_matches(&token.kind, &expected))
-    }
-
-    fn expect_identifier_value(&mut self, expected: &str) -> Result<(), ScriptError> {
-        if self.is_identifier(expected) {
-            self.advance();
-            Ok(())
-        } else {
-            Err(self.error(format!("expected {expected}"), self.peek().offset))
-        }
-    }
-
-    fn expect_string(&mut self, context: &str) -> Result<String, ScriptError> {
-        let token = self.advance();
-        match token.kind {
-            TokenKind::String(value) => Ok(value),
-            _ => Err(self.error(format!("expected {context}"), token.offset)),
-        }
-    }
-
-    fn expect_identifier(&mut self, context: &str) -> Result<String, ScriptError> {
-        let token = self.advance();
-        match token.kind {
-            TokenKind::Identifier(name) => Ok(name),
-            _ => Err(self.error(format!("expected {context}"), token.offset)),
-        }
-    }
-
-    fn expect_property_name(&mut self) -> Result<String, ScriptError> {
-        let token = self.advance();
-        match token.kind {
-            TokenKind::Identifier(name) => Ok(name),
-            TokenKind::Catch => Ok("catch".to_string()),
-            _ => Err(self.error("expected property name".to_string(), token.offset)),
-        }
-    }
-
-    fn expect(&mut self, expected: TokenKind, context: &str) -> Result<(), ScriptError> {
-        if self.take(expected) {
-            Ok(())
-        } else {
-            Err(self.error(format!("expected {context}"), self.peek().offset))
-        }
-    }
-
-    fn take(&mut self, expected: TokenKind) -> bool {
-        if self.is(expected) {
-            self.advance();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn is(&self, expected: TokenKind) -> bool {
-        token_matches(&self.peek().kind, &expected)
-    }
-
-    fn peek(&self) -> &Token {
-        self.tokens
-            .get(self.index)
-            .expect("token stream always has eof")
-    }
-
-    fn advance(&mut self) -> Token {
-        let token = self.peek().clone();
-        self.index += 1;
-        token
-    }
-
-    fn error(&self, message: String, offset: usize) -> ScriptError {
-        ScriptError { offset, message }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct Token {
-    kind: TokenKind,
-    offset: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum TokenKind {
-    Eof,
-    Identifier(String),
-    Number(f64),
-    String(String),
-    Template(String),
-    True,
-    False,
-    Null,
-    Let,
-    Const,
-    If,
-    Else,
-    Return,
-    For,
-    Try,
-    Catch,
-    Throw,
-    Class,
-    Async,
-    Await,
-    TypeOf,
-    Function,
-    New,
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
-    LBracket,
-    RBracket,
-    Comma,
-    Colon,
-    Dot,
-    Semicolon,
-    Arrow,
-    Assign,
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Bang,
-    EqEq,
-    NotEq,
-    StrictEq,
-    StrictNotEq,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    AndAnd,
-    OrOr,
-    InstanceOf,
-    Question,
-    Ellipsis,
-}
-
-fn tokenize(source: &str) -> Result<Vec<Token>, ScriptError> {
-    let mut tokens = Vec::new();
-    let mut cursor = 0;
-    while cursor < source.len() {
-        let byte = source.as_bytes()[cursor];
-        if byte.is_ascii_whitespace() {
-            cursor += 1;
-            continue;
-        }
-        if source[cursor..].starts_with("//") {
-            cursor = source[cursor + 2..]
-                .find('\n')
-                .map(|offset| cursor + 2 + offset)
-                .unwrap_or(source.len());
-            continue;
-        }
-        if source[cursor..].starts_with("/*") {
-            let Some(end) = source[cursor + 2..].find("*/") else {
-                return Err(ScriptError {
-                    offset: cursor,
-                    message: "unterminated comment".to_string(),
-                });
-            };
-            cursor += 2 + end + 2;
-            continue;
-        }
-        if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$') {
-            let start = cursor;
-            cursor += 1;
-            while cursor < source.len()
-                && (source.as_bytes()[cursor].is_ascii_alphanumeric()
-                    || matches!(source.as_bytes()[cursor], b'_' | b'$'))
-            {
-                cursor += 1;
-            }
-            let identifier = &source[start..cursor];
-            let kind = match identifier {
-                "true" => TokenKind::True,
-                "false" => TokenKind::False,
-                "null" => TokenKind::Null,
-                "let" => TokenKind::Let,
-                "const" => TokenKind::Const,
-                "if" => TokenKind::If,
-                "else" => TokenKind::Else,
-                "return" => TokenKind::Return,
-                "for" => TokenKind::For,
-                "try" => TokenKind::Try,
-                "catch" => TokenKind::Catch,
-                "throw" => TokenKind::Throw,
-                "class" => TokenKind::Class,
-                "async" => TokenKind::Async,
-                "await" => TokenKind::Await,
-                "typeof" => TokenKind::TypeOf,
-                "instanceof" => TokenKind::InstanceOf,
-                "function" => TokenKind::Function,
-                "new" => TokenKind::New,
-                _ => TokenKind::Identifier(identifier.to_string()),
-            };
-            tokens.push(Token {
-                kind,
-                offset: start,
-            });
-            continue;
-        }
-        if byte.is_ascii_digit() {
-            let start = cursor;
-            cursor += 1;
-            while cursor < source.len()
-                && (source.as_bytes()[cursor].is_ascii_digit() || source.as_bytes()[cursor] == b'.')
-            {
-                cursor += 1;
-            }
-            let number = source[start..cursor].parse().map_err(|_| ScriptError {
-                offset: start,
-                message: "invalid number".to_string(),
-            })?;
-            tokens.push(Token {
-                kind: TokenKind::Number(number),
-                offset: start,
-            });
-            continue;
-        }
-        if byte == b'\'' || byte == b'"' {
-            let start = cursor;
-            let quote = byte as char;
-            cursor += 1;
-            let mut value = String::new();
-            let mut terminated = false;
-            while cursor < source.len() {
-                let character = source[cursor..]
-                    .chars()
-                    .next()
-                    .expect("cursor stays on a character boundary");
-                cursor += character.len_utf8();
-                if character == quote {
-                    terminated = true;
-                    break;
-                }
-                if character == '\\' {
-                    let Some(escaped) = source[cursor..].chars().next() else {
-                        return Err(ScriptError {
-                            offset: start,
-                            message: "unterminated string".to_string(),
-                        });
-                    };
-                    cursor += escaped.len_utf8();
-                    value.push(match escaped {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        '\\' => '\\',
-                        '\'' => '\'',
-                        '"' => '"',
-                        other => other,
-                    });
-                } else {
-                    value.push(character);
-                }
-            }
-            if !terminated {
-                return Err(ScriptError {
-                    offset: start,
-                    message: "unterminated string".to_string(),
-                });
-            }
-            tokens.push(Token {
-                kind: TokenKind::String(value),
-                offset: start,
-            });
-            continue;
-        }
-        if byte == b'`' {
-            let start = cursor;
-            cursor += 1;
-            let mut value = String::new();
-            let mut escaped = false;
-            while cursor < source.len() {
-                let character = source[cursor..]
-                    .chars()
-                    .next()
-                    .expect("cursor stays on a character boundary");
-                cursor += character.len_utf8();
-                if escaped {
-                    value.push(match character {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        other => other,
-                    });
-                    escaped = false;
-                } else if character == '\\' {
-                    escaped = true;
-                } else if character == '`' {
-                    tokens.push(Token {
-                        kind: TokenKind::Template(value),
-                        offset: start,
-                    });
-                    break;
-                } else {
-                    value.push(character);
-                }
-                if cursor == source.len() {
-                    return Err(ScriptError {
-                        offset: start,
-                        message: "unterminated template literal".to_string(),
-                    });
-                }
-            }
-            if !matches!(
-                tokens.last().map(|token| &token.kind),
-                Some(TokenKind::Template(_))
-            ) {
-                return Err(ScriptError {
-                    offset: start,
-                    message: "unterminated template literal".to_string(),
-                });
-            }
-            continue;
-        }
-        let start = cursor;
-        let (kind, width) = match source.as_bytes()[cursor..].as_ref() {
-            [b'(', ..] => (TokenKind::LParen, 1),
-            [b')', ..] => (TokenKind::RParen, 1),
-            [b'{', ..] => (TokenKind::LBrace, 1),
-            [b'}', ..] => (TokenKind::RBrace, 1),
-            [b'[', ..] => (TokenKind::LBracket, 1),
-            [b']', ..] => (TokenKind::RBracket, 1),
-            [b',', ..] => (TokenKind::Comma, 1),
-            [b':', ..] => (TokenKind::Colon, 1),
-            [b'.', b'.', b'.', ..] => (TokenKind::Ellipsis, 3),
-            [b'.', ..] => (TokenKind::Dot, 1),
-            [b';', ..] => (TokenKind::Semicolon, 1),
-            [b'+', ..] => (TokenKind::Plus, 1),
-            [b'-', ..] => (TokenKind::Minus, 1),
-            [b'*', ..] => (TokenKind::Star, 1),
-            [b'/', ..] => (TokenKind::Slash, 1),
-            [b'!', b'=', b'=', ..] => (TokenKind::StrictNotEq, 3),
-            [b'!', b'=', ..] => (TokenKind::NotEq, 2),
-            [b'!', ..] => (TokenKind::Bang, 1),
-            [b'=', b'=', b'=', ..] => (TokenKind::StrictEq, 3),
-            [b'=', b'=', ..] => (TokenKind::EqEq, 2),
-            [b'=', b'>', ..] => (TokenKind::Arrow, 2),
-            [b'=', ..] => (TokenKind::Assign, 1),
-            [b'<', b'=', ..] => (TokenKind::LessEqual, 2),
-            [b'<', ..] => (TokenKind::Less, 1),
-            [b'>', b'=', ..] => (TokenKind::GreaterEqual, 2),
-            [b'>', ..] => (TokenKind::Greater, 1),
-            [b'&', b'&', ..] => (TokenKind::AndAnd, 2),
-            [b'|', b'|', ..] => (TokenKind::OrOr, 2),
-            [b'?', ..] => (TokenKind::Question, 1),
-            _ => {
-                return Err(ScriptError {
-                    offset: start,
-                    message: format!(
-                        "unsupported character {:?}",
-                        source.as_bytes()[cursor] as char
-                    ),
-                });
-            }
-        };
-        cursor += width;
-        tokens.push(Token {
-            kind,
-            offset: start,
-        });
-    }
-    tokens.push(Token {
-        kind: TokenKind::Eof,
-        offset: source.len(),
-    });
-    Ok(tokens)
-}
-
-fn find_template_expression_end(source: &str, start: usize) -> Option<usize> {
-    let mut depth = 1;
-    let mut quote = None;
-    let mut escaped = false;
-    for (offset, character) in source[start..].char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + offset);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn token_matches(actual: &TokenKind, expected: &TokenKind) -> bool {
-    match (actual, expected) {
-        (TokenKind::Identifier(_), TokenKind::Identifier(_))
-        | (TokenKind::Number(_), TokenKind::Number(_))
-        | (TokenKind::String(_), TokenKind::String(_)) => true,
-        _ => actual == expected,
-    }
 }
 
 #[cfg(test)]
@@ -20228,6 +17983,43 @@ mod tests {
     }
 
     #[test]
+    fn modules_await_at_top_level_and_export_classes_and_generators() {
+        let document = document("<p id='status'>idle</p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut loader = StaticModuleLoader {
+            modules: BTreeMap::from([(
+                "/shapes.js".to_string(),
+                r#"export default class Square { constructor(side) { this.side = side; } get area() { return this.side ** 2; } }
+                export function* sides(count) { for (let i = 0; i < count; i++) yield i; }
+                export let version = 1;
+                export function bump() { version++; }"#
+                    .to_string(),
+            )]),
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                r#"import Square, { sides, version, bump } from "./shapes.js";
+                const ready = await new Promise((resolve) => setTimeout(() => resolve("later"), 0));
+                bump();
+                document.getElementById("status").textContent =
+                    [new Square(3).area, [...sides(3)].join(""), version, ready, import.meta.url].join("|");"#,
+                base,
+                &mut loader,
+            )
+            .expect("module graph should execute");
+        runtime.advance_time(1).expect("timers should run");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(&status).as_deref(),
+            Some("9|012|2|later|https://app.ceri.invalid/")
+        );
+    }
+
+    #[test]
     fn imports_default_exports_alongside_named_exports() {
         let document = document("<p id='status'>idle</p>");
         let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
@@ -20384,7 +18176,7 @@ mod tests {
             Ok(_) => panic!("imported bindings should be read-only"),
             Err(error) => error,
         };
-        assert_eq!(error.message, "cannot assign to imported binding count");
+        assert_eq!(error.message, "Assignment to constant variable 'count'");
     }
 
     #[test]
@@ -20489,13 +18281,14 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("unsupported dynamic import type css")
+            Some("TypeError: unsupported dynamic import type css")
         );
     }
 
     #[test]
     fn awaits_a_dynamic_import_and_reports_rejections() {
-        let document = document("<p id='status'>idle</p>");
+        let document =
+            document("<p id='status'>idle</p><p id='missing'>idle</p><p id='foreign'>idle</p>");
         let mut resources = ResourceBundle::default();
         resources
             .insert(
@@ -20518,21 +18311,29 @@ mod tests {
                     status.textContent = value;
                 });
                 import("./missing.js").catch((error) => {
-                    status.textContent = status.textContent + "|" + error;
+                    document.getElementById("missing").textContent = error.message;
                 });
                 import("https://other.invalid/dynamic.js").catch((error) => {
-                    status.textContent = status.textContent + "|" + error;
+                    document.getElementById("foreign").textContent = error.message;
                 });
                 "#,
             )
             .expect("async dynamic import should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
+        let text = |id: &str| {
+            let document = document.borrow();
+            let element = document
+                .find_element_by_id(id)
+                .expect("element should exist");
+            document.element_text_content(&element)
+        };
+        assert_eq!(text("status").as_deref(), Some("async|3"));
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
-            Some("async|3|module /missing.js was not found|URL is outside the app origin",)
+            text("missing").as_deref(),
+            Some("module /missing.js was not found")
+        );
+        assert_eq!(
+            text("foreign").as_deref(),
+            Some("URL is outside the app origin")
         );
     }
 
@@ -25594,7 +23395,9 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("302|false|https://app.ceri.invalid/redirect|fetch redirect was rejected")
+            Some(
+                "302|false|https://app.ceri.invalid/redirect|TypeError: fetch redirect was rejected"
+            )
         );
     }
 
@@ -25741,7 +23544,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("hello|true|response body is already used")
+            Some("hello|true|TypeError: response body is already used")
         );
     }
 
@@ -25840,7 +23643,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("response body is already used")
+            Some("TypeError: response body is already used")
         );
     }
 
@@ -25985,7 +23788,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("true|response body is already used")
+            Some("true|TypeError: response body is already used")
         );
     }
 
@@ -26258,7 +24061,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("ready|2|{\"count\":2,\"ok\":true}")
+            Some("ready|2|{\"ok\":true,\"count\":2}")
         );
     }
 
@@ -26356,7 +24159,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
             Some(
-                "true|a,b,old|1,override,0|a=1,b=override,old=0|01|zero,one|Object.keys requires an object value"
+                "true|old,a,b|0,1,override|old=0,a=1,b=override|01|zero,one|Cannot convert undefined or null to object"
             )
         );
     }
@@ -26500,7 +24303,7 @@ mod tests {
     fn structured_clone_rejects_cycles_functions_and_transfer_lists() {
         let document = document("<p id='status'>idle</p>");
         let mut runtime = ScriptRuntime::new(document.clone());
-        let cyclic = Rc::new(RefCell::new(BTreeMap::new()));
+        let cyclic = Rc::new(RefCell::new(object::JsObject::new()));
         cyclic
             .borrow_mut()
             .insert("self".to_string(), Value::Object(cyclic.clone()));
@@ -26822,7 +24625,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("unknown identifier missingWorkerGlobal")
+            Some("missingWorkerGlobal is not defined")
         );
     }
 
@@ -26859,7 +24662,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(&status).as_deref(),
-            Some("Worker has been terminated")
+            Some("TypeError: Worker has been terminated")
         );
     }
 
@@ -26870,6 +24673,6 @@ mod tests {
         let error = runtime
             .execute("missingValue;")
             .expect_err("unknown name should fail");
-        assert!(error.message.contains("unknown identifier"));
+        assert!(error.message.contains("is not defined"));
     }
 }
