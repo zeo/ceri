@@ -118,6 +118,8 @@ pub(super) enum Native {
     BigIntToString,
     BigIntValueOf,
     Intl(Rc<super::intl::IntlMethod>),
+    Dom(super::interfaces::DomMember),
+    DomConstructor(&'static str),
 }
 
 impl Native {
@@ -141,6 +143,7 @@ impl Native {
                 | Native::Typed(super::typed::TypedMethod::ViewConstructor)
                 | Native::Codec(super::encoding::CodecMethod::EncoderConstructor)
                 | Native::Codec(super::encoding::CodecMethod::DecoderConstructor)
+                | Native::DomConstructor(_)
         ) || matches!(self, Native::Intl(method) if matches!(**method,
             super::intl::IntlMethod::NumberFormatConstructor
                 | super::intl::IntlMethod::DateTimeFormatConstructor
@@ -196,6 +199,7 @@ pub(super) struct Intrinsics {
     pub(super) text_decoder_prototype: ObjectHandle,
     // NumberFormat, DateTimeFormat, Collator, PluralRules and RelativeTimeFormat
     pub(super) intl_prototypes: Vec<ObjectHandle>,
+    pub(super) dom: super::interfaces::DomInterfaces,
 }
 
 fn plain(prototype: &ObjectHandle) -> ObjectHandle {
@@ -214,12 +218,12 @@ fn fixed(value: Value) -> Property {
     }
 }
 
-struct Builder {
+pub(super) struct Builder {
     function_prototype: ObjectHandle,
 }
 
 impl Builder {
-    fn function(&self, native: Native, name: &str, length: u32) -> ObjectHandle {
+    pub(super) fn function(&self, native: Native, name: &str, length: u32) -> ObjectHandle {
         let mut object = JsObject::with_prototype(
             Some(self.function_prototype.clone()),
             ObjectClass::Native(native),
@@ -277,7 +281,7 @@ impl Builder {
     }
 
     // a constructor function linked both ways with its prototype object
-    fn constructor(
+    pub(super) fn constructor(
         &self,
         native: Native,
         name: &str,
@@ -1141,6 +1145,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     globals.push(("NaN", Value::Number(f64::NAN)));
     globals.push(("Infinity", Value::Number(f64::INFINITY)));
 
+    let dom = super::interfaces::create(&build, &object_prototype, &mut globals);
     let intrinsics = Intrinsics {
         object_prototype,
         function_prototype,
@@ -1180,6 +1185,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         text_decoder_prototype,
         bigint_prototype,
         intl_prototypes,
+        dom,
     };
     (intrinsics, globals)
 }
@@ -1249,6 +1255,9 @@ impl ScriptRuntime {
         value: &Value,
         key: &str,
     ) -> Result<Option<Property>, ScriptError> {
+        if let Some(object) = self.node_object(value) {
+            return self.own_property_of(&Value::Object(object), key);
+        }
         if let Value::Object(object) = value
             && let Some(proxy) = super::reflect::proxy_of(object)
         {
@@ -1299,6 +1308,9 @@ impl ScriptRuntime {
         value: &Value,
         symbols: bool,
     ) -> Result<Vec<String>, ScriptError> {
+        if let Some(object) = self.node_object(value) {
+            return self.own_property_keys(&Value::Object(object), symbols);
+        }
         if let Value::Object(object) = value
             && let Some(proxy) = super::reflect::proxy_of(object)
         {
@@ -1415,6 +1427,9 @@ impl ScriptRuntime {
         key: String,
         descriptor: &Value,
     ) -> Result<(), ScriptError> {
+        if let Some(object) = self.node_object(target) {
+            return self.define_property_value(&Value::Object(object), key, descriptor);
+        }
         if let Value::Object(object) = target
             && let Some(proxy) = super::reflect::proxy_of(object)
         {
@@ -1681,7 +1696,8 @@ impl ScriptRuntime {
                         );
                     }
                 };
-                if let Value::Object(object) = &first {
+                let target = self.node_object(&first).map(Value::Object);
+                if let Value::Object(object) = target.as_ref().unwrap_or(&first) {
                     self.set_object_prototype(object, prototype)?;
                 }
                 Ok(first)
@@ -2204,6 +2220,10 @@ impl ScriptRuntime {
             Native::Promise(function) => {
                 self.call_promise_function((*function).clone(), this, arguments)
             }
+            Native::Dom(member) => self.call_dom(member, this, arguments),
+            Native::DomConstructor(name) => Err(self.type_error(format!(
+                "Failed to construct '{name}': Please use the 'new' operator"
+            ))),
             Native::ParseInt => {
                 let text = self.coerce_string(first)?;
                 let radix = self.coerce_int32(argument(&arguments, 1))?;
@@ -2452,6 +2472,7 @@ impl ScriptRuntime {
             Native::Typed(method) => {
                 self.call_typed(method, Value::Undefined, arguments, Some(new_target))
             }
+            Native::DomConstructor(name) => self.construct_dom(name, arguments),
             Native::Codec(method) => {
                 self.call_codec(method, Value::Undefined, arguments, Some(new_target))
             }

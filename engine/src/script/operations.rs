@@ -888,6 +888,10 @@ impl ScriptRuntime {
             Value::Object(object) => {
                 return object.borrow().prototype_or(&self.intrinsics);
             }
+            Value::Element(_) | Value::Document => {
+                let object = self.node_object(value).expect("nodes have wrappers");
+                return object.borrow().prototype_or(&self.intrinsics);
+            }
             Value::Binding(cell, _) => return self.prototype_of(&cell.borrow()),
             Value::Bool(_) => intrinsics.boolean_prototype.clone(),
             Value::Number(_) => intrinsics.number_prototype.clone(),
@@ -915,6 +919,10 @@ impl ScriptRuntime {
     pub(super) fn get_property(&mut self, value: &Value, key: &str) -> Result<Value, ScriptError> {
         match value {
             Value::Object(object) => self.ordinary_get(object.clone(), key, value),
+            Value::Element(_) | Value::Document => {
+                let object = self.node_object(value).expect("nodes have wrappers");
+                self.ordinary_get(object, key, value)
+            }
             Value::Undefined | Value::Null | Value::Uninitialized => Err(self.type_error(format!(
                 "Cannot read properties of {} (reading '{}')",
                 value.string_value(),
@@ -1034,6 +1042,10 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         match target {
             Value::Object(object) => self.ordinary_set(object.clone(), key, value, target, strict),
+            Value::Element(_) | Value::Document => {
+                let object = self.node_object(target).expect("nodes have wrappers");
+                self.ordinary_set(object, key, value, target, strict)
+            }
             Value::Undefined | Value::Null | Value::Uninitialized => Err(self.type_error(format!(
                 "Cannot set properties of {} (setting '{}')",
                 target.string_value(),
@@ -1171,9 +1183,14 @@ impl ScriptRuntime {
                 },
             }
         }
-        let Value::Object(receiver_object) = receiver else {
-            return self.set_property(receiver, key, value, strict);
+        let receiver_object = match receiver {
+            Value::Object(object) => object.clone(),
+            other => match self.node_object(other) {
+                Some(object) => object,
+                None => return self.set_property(receiver, key, value, strict),
+            },
         };
+        let receiver_object = &receiver_object;
         // a proxy receiver takes the write through its defineProperty path
         if let Some(proxy) = super::reflect::proxy_of(receiver_object) {
             let existing = self.proxy_own_property(&proxy, key)?;
@@ -1283,6 +1300,9 @@ impl ScriptRuntime {
         key: &str,
         strict: bool,
     ) -> Result<bool, ScriptError> {
+        if let Some(object) = self.node_object(target) {
+            return self.delete_property(&Value::Object(object), key, strict);
+        }
         match target {
             Value::Object(object) if super::reflect::proxy_of(object).is_some() => {
                 let proxy = super::reflect::proxy_of(object).expect("checked above");
@@ -1329,6 +1349,9 @@ impl ScriptRuntime {
     }
 
     pub(super) fn has_property(&mut self, target: &Value, key: &str) -> Result<bool, ScriptError> {
+        if let Some(object) = self.node_object(target) {
+            return self.has_property(&Value::Object(object), key);
+        }
         match target {
             Value::Object(object) => {
                 let mut current = Some(object.clone());
@@ -1512,6 +1535,9 @@ impl ScriptRuntime {
         &mut self,
         source: &Value,
     ) -> Result<Vec<(String, Value)>, ScriptError> {
+        if let Some(object) = self.node_object(source) {
+            return self.own_enumerable_entries(&Value::Object(object));
+        }
         match source {
             Value::Object(object) if super::reflect::proxy_of(object).is_some() => {
                 let proxy = super::reflect::proxy_of(object).expect("checked above");
@@ -1579,6 +1605,9 @@ impl ScriptRuntime {
 
     // for-in visits enumerable string keys along the prototype chain, each name once
     pub(super) fn for_in_keys(&mut self, value: &Value) -> Result<Vec<String>, ScriptError> {
+        if let Some(object) = self.node_object(value) {
+            return self.for_in_keys(&Value::Object(object));
+        }
         if let Value::Object(object) = value
             && super::reflect::proxy_of(object).is_some()
         {

@@ -205,6 +205,11 @@ fn pinned_test262_subset_matches_its_expectations() {
     let harness = root.join("harness");
     let mut tests = Vec::new();
     collect(&root.join("test"), &mut tests);
+    // CERI_TEST262_FILTER keeps the tests whose path contains it, for focused runs
+    if let Some(filter) = std::env::var_os("CERI_TEST262_FILTER") {
+        let filter = filter.to_string_lossy().replace('\\', "/");
+        tests.retain(|path| path.to_string_lossy().replace('\\', "/").contains(&filter));
+    }
     let next = AtomicUsize::new(0);
     let failures = Mutex::new(Vec::new());
     let (passed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -219,13 +224,18 @@ fn pinned_test262_subset_matches_its_expectations() {
                         let Some(path) = tests.get(index) else {
                             break;
                         };
+                        let started = std::time::Instant::now();
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 run(path, &harness)
                             }))
                             .unwrap_or_else(|_| Outcome::Fail("the engine panicked".to_string()));
                         if std::env::var_os("CERI_TEST262_TRACE").is_some() {
-                            eprintln!("test262 done {}", path.display());
+                            eprintln!(
+                                "test262 done {} {} ms",
+                                path.display(),
+                                started.elapsed().as_millis()
+                            );
                         }
                         match outcome {
                             Outcome::Pass => {

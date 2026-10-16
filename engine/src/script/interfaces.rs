@@ -1,0 +1,1306 @@
+// the DOM interfaces as prototype objects: every node gets a wrapper object whose prototype
+// chain runs through its interfaces, so instanceof, `name in element`, prototype patching and
+// expando properties behave as pages expect
+
+use super::object::{JsObject, ObjectClass, ObjectHandle, Property, Slot, new_object};
+use super::realm::{Builder, Native};
+use super::*;
+use crate::dom::{Namespace, NodeKind};
+use std::cmp::Ordering as TreeOrdering;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Access {
+    Get,
+    Set,
+    Call,
+}
+
+// one property of one interface, carried by the native function that implements it; the
+// entry points into the static tables so the native stays two words wide
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DomMember {
+    entry: &'static (&'static str, Kind),
+    pub(super) access: Access,
+}
+
+impl DomMember {
+    fn name(self) -> &'static str {
+        self.entry.0
+    }
+
+    fn reflect(self) -> Reflect {
+        match self.entry.1 {
+            Attr(attribute) => Reflect::Text(attribute),
+            Flag(attribute) => Reflect::Flag(attribute),
+            _ => Reflect::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reflect {
+    None,
+    Text(&'static str),
+    Flag(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    ReadOnly,
+    ReadWrite,
+    Method(u32),
+    Reflect(&'static str),
+    Flag(&'static str),
+}
+
+use Kind::{Flag, Method, ReadOnly, ReadWrite, Reflect as Attr};
+
+struct Interface {
+    name: &'static str,
+    parent: &'static str,
+    members: &'static [(&'static str, Kind)],
+}
+
+static FORM_VALIDATION: &[(&str, Kind)] = &[
+    ("form", ReadOnly),
+    ("validity", ReadOnly),
+    ("willValidate", ReadOnly),
+    ("validationMessage", ReadOnly),
+    ("checkValidity", Method(0)),
+    ("reportValidity", Method(0)),
+    ("setCustomValidity", Method(1)),
+];
+
+static TEXT_SELECTION: &[(&str, Kind)] = &[
+    ("selectionStart", ReadWrite),
+    ("selectionEnd", ReadWrite),
+    ("selectionDirection", ReadWrite),
+    ("select", Method(0)),
+    ("setSelectionRange", Method(2)),
+    ("setRangeText", Method(1)),
+];
+
+// parents come before their children
+static INTERFACES: &[Interface] = &[
+    Interface {
+        name: "EventTarget",
+        parent: "",
+        members: &[
+            ("addEventListener", Method(2)),
+            ("removeEventListener", Method(2)),
+        ],
+    },
+    Interface {
+        name: "Node",
+        parent: "EventTarget",
+        members: &[
+            ("nodeType", ReadOnly),
+            ("nodeName", ReadOnly),
+            ("nodeValue", ReadWrite),
+            ("textContent", ReadWrite),
+            ("parentNode", ReadOnly),
+            ("parentElement", ReadOnly),
+            ("childNodes", ReadOnly),
+            ("firstChild", ReadOnly),
+            ("lastChild", ReadOnly),
+            ("previousSibling", ReadOnly),
+            ("nextSibling", ReadOnly),
+            ("isConnected", ReadOnly),
+            ("ownerDocument", ReadOnly),
+            ("hasChildNodes", Method(0)),
+            ("cloneNode", Method(0)),
+            ("normalize", Method(0)),
+            ("appendChild", Method(1)),
+            ("insertBefore", Method(2)),
+            ("removeChild", Method(1)),
+            ("replaceChild", Method(2)),
+            ("contains", Method(1)),
+            ("getRootNode", Method(0)),
+            ("compareDocumentPosition", Method(1)),
+            ("isSameNode", Method(1)),
+            ("isEqualNode", Method(1)),
+        ],
+    },
+    Interface {
+        name: "Element",
+        parent: "Node",
+        members: &[
+            ("tagName", ReadOnly),
+            ("localName", ReadOnly),
+            ("namespaceURI", ReadOnly),
+            ("id", ReadWrite),
+            ("className", ReadWrite),
+            ("classList", ReadOnly),
+            ("attributes", ReadOnly),
+            ("innerHTML", ReadWrite),
+            ("outerHTML", ReadWrite),
+            ("children", ReadOnly),
+            ("firstElementChild", ReadOnly),
+            ("lastElementChild", ReadOnly),
+            ("childElementCount", ReadOnly),
+            ("previousElementSibling", ReadOnly),
+            ("nextElementSibling", ReadOnly),
+            ("scrollTop", ReadWrite),
+            ("scrollLeft", ReadWrite),
+            ("slot", Attr("slot")),
+            ("getAttribute", Method(1)),
+            ("setAttribute", Method(2)),
+            ("removeAttribute", Method(1)),
+            ("hasAttribute", Method(1)),
+            ("toggleAttribute", Method(1)),
+            ("getAttributeNames", Method(0)),
+            ("hasAttributes", Method(0)),
+            ("querySelector", Method(1)),
+            ("querySelectorAll", Method(1)),
+            ("closest", Method(1)),
+            ("matches", Method(1)),
+            ("getElementsByTagName", Method(1)),
+            ("getElementsByClassName", Method(1)),
+            ("append", Method(0)),
+            ("prepend", Method(0)),
+            ("replaceChildren", Method(0)),
+            ("before", Method(0)),
+            ("after", Method(0)),
+            ("replaceWith", Method(0)),
+            ("remove", Method(0)),
+            ("insertAdjacentHTML", Method(2)),
+            ("insertAdjacentElement", Method(2)),
+            ("insertAdjacentText", Method(2)),
+        ],
+    },
+    Interface {
+        name: "CharacterData",
+        parent: "Node",
+        members: &[
+            ("data", ReadWrite),
+            ("length", ReadOnly),
+            ("previousElementSibling", ReadOnly),
+            ("nextElementSibling", ReadOnly),
+            ("substringData", Method(2)),
+            ("appendData", Method(1)),
+            ("insertData", Method(2)),
+            ("deleteData", Method(2)),
+            ("replaceData", Method(3)),
+            ("before", Method(0)),
+            ("after", Method(0)),
+            ("replaceWith", Method(0)),
+            ("remove", Method(0)),
+        ],
+    },
+    Interface {
+        name: "Text",
+        parent: "CharacterData",
+        members: &[("splitText", Method(1)), ("wholeText", ReadOnly)],
+    },
+    Interface {
+        name: "Comment",
+        parent: "CharacterData",
+        members: &[],
+    },
+    Interface {
+        name: "DocumentFragment",
+        parent: "Node",
+        members: &[
+            ("children", ReadOnly),
+            ("firstElementChild", ReadOnly),
+            ("lastElementChild", ReadOnly),
+            ("childElementCount", ReadOnly),
+            ("getElementById", Method(1)),
+            ("querySelector", Method(1)),
+            ("querySelectorAll", Method(1)),
+            ("append", Method(0)),
+            ("prepend", Method(0)),
+            ("replaceChildren", Method(0)),
+        ],
+    },
+    Interface {
+        name: "Document",
+        parent: "Node",
+        members: &[
+            ("documentElement", ReadOnly),
+            ("body", ReadOnly),
+            ("head", ReadOnly),
+            ("title", ReadWrite),
+            ("activeElement", ReadOnly),
+            ("defaultView", ReadOnly),
+            ("readyState", ReadOnly),
+            ("children", ReadOnly),
+            ("firstElementChild", ReadOnly),
+            ("lastElementChild", ReadOnly),
+            ("childElementCount", ReadOnly),
+            ("getElementById", Method(1)),
+            ("getElementsByTagName", Method(1)),
+            ("getElementsByClassName", Method(1)),
+            ("querySelector", Method(1)),
+            ("querySelectorAll", Method(1)),
+            ("createElement", Method(1)),
+            ("createElementNS", Method(2)),
+            ("createTextNode", Method(1)),
+            ("createComment", Method(1)),
+            ("createDocumentFragment", Method(0)),
+            ("createRange", Method(0)),
+            ("getSelection", Method(0)),
+            ("append", Method(0)),
+            ("prepend", Method(0)),
+            ("replaceChildren", Method(0)),
+        ],
+    },
+    Interface {
+        name: "HTMLElement",
+        parent: "Element",
+        members: &[
+            ("style", ReadOnly),
+            ("dataset", ReadOnly),
+            ("innerText", ReadWrite),
+            ("hidden", Flag("hidden")),
+            ("title", Attr("title")),
+            ("lang", Attr("lang")),
+            ("dir", Attr("dir")),
+            ("click", Method(0)),
+            ("focus", Method(0)),
+            ("blur", Method(0)),
+        ],
+    },
+    Interface {
+        name: "SVGElement",
+        parent: "Element",
+        members: &[("style", ReadOnly), ("dataset", ReadOnly)],
+    },
+    Interface {
+        name: "HTMLInputElement",
+        parent: "HTMLElement",
+        members: &[
+            ("value", ReadWrite),
+            ("defaultValue", ReadWrite),
+            ("checked", ReadWrite),
+            ("defaultChecked", ReadWrite),
+            ("disabled", ReadWrite),
+            ("readOnly", ReadWrite),
+            ("required", ReadWrite),
+            ("maxLength", ReadWrite),
+            ("minLength", ReadWrite),
+            ("files", ReadOnly),
+            ("type", Attr("type")),
+            ("name", Attr("name")),
+            ("placeholder", Attr("placeholder")),
+            ("min", Attr("min")),
+            ("max", Attr("max")),
+            ("step", Attr("step")),
+            ("pattern", Attr("pattern")),
+            ("accept", Attr("accept")),
+            ("autocomplete", Attr("autocomplete")),
+            ("multiple", Flag("multiple")),
+            ("autofocus", Flag("autofocus")),
+        ],
+    },
+    Interface {
+        name: "HTMLTextAreaElement",
+        parent: "HTMLElement",
+        members: &[
+            ("value", ReadWrite),
+            ("defaultValue", ReadWrite),
+            ("disabled", ReadWrite),
+            ("readOnly", ReadWrite),
+            ("required", ReadWrite),
+            ("maxLength", ReadWrite),
+            ("minLength", ReadWrite),
+            ("name", Attr("name")),
+            ("placeholder", Attr("placeholder")),
+            ("wrap", Attr("wrap")),
+            ("autofocus", Flag("autofocus")),
+        ],
+    },
+    Interface {
+        name: "HTMLSelectElement",
+        parent: "HTMLElement",
+        members: &[
+            ("value", ReadWrite),
+            ("selectedIndex", ReadWrite),
+            ("multiple", ReadWrite),
+            ("options", ReadOnly),
+            ("selectedOptions", ReadOnly),
+            ("disabled", ReadWrite),
+            ("required", ReadWrite),
+            ("name", Attr("name")),
+            ("autofocus", Flag("autofocus")),
+        ],
+    },
+    Interface {
+        name: "HTMLOptionElement",
+        parent: "HTMLElement",
+        members: &[
+            ("value", ReadWrite),
+            ("selected", ReadWrite),
+            ("defaultSelected", ReadWrite),
+            ("index", ReadOnly),
+            ("text", ReadWrite),
+            ("form", ReadOnly),
+            ("label", Attr("label")),
+            ("disabled", Flag("disabled")),
+        ],
+    },
+    Interface {
+        name: "HTMLButtonElement",
+        parent: "HTMLElement",
+        members: &[
+            ("value", ReadWrite),
+            ("disabled", ReadWrite),
+            ("name", Attr("name")),
+            ("type", Attr("type")),
+            ("autofocus", Flag("autofocus")),
+        ],
+    },
+    Interface {
+        name: "HTMLFormElement",
+        parent: "HTMLElement",
+        members: &[
+            ("elements", ReadOnly),
+            ("requestSubmit", Method(0)),
+            ("reset", Method(0)),
+            ("checkValidity", Method(0)),
+            ("reportValidity", Method(0)),
+            ("action", Attr("action")),
+            ("method", Attr("method")),
+            ("name", Attr("name")),
+            ("noValidate", Flag("novalidate")),
+        ],
+    },
+    Interface {
+        name: "HTMLCanvasElement",
+        parent: "HTMLElement",
+        members: &[("getContext", Method(1))],
+    },
+    Interface {
+        name: "HTMLTemplateElement",
+        parent: "HTMLElement",
+        members: &[("content", ReadOnly)],
+    },
+    Interface {
+        name: "HTMLAnchorElement",
+        parent: "HTMLElement",
+        members: &[
+            ("href", Attr("href")),
+            ("target", Attr("target")),
+            ("rel", Attr("rel")),
+            ("download", Attr("download")),
+        ],
+    },
+    Interface {
+        name: "HTMLImageElement",
+        parent: "HTMLElement",
+        members: &[("src", Attr("src")), ("alt", Attr("alt"))],
+    },
+    Interface {
+        name: "HTMLLabelElement",
+        parent: "HTMLElement",
+        members: &[("htmlFor", Attr("for"))],
+    },
+    Interface {
+        name: "HTMLScriptElement",
+        parent: "HTMLElement",
+        members: &[("src", Attr("src")), ("type", Attr("type"))],
+    },
+    Interface {
+        name: "HTMLLinkElement",
+        parent: "HTMLElement",
+        members: &[("href", Attr("href")), ("rel", Attr("rel"))],
+    },
+    Interface {
+        name: "HTMLStyleElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLDivElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLSpanElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLParagraphElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLHeadingElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLUListElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLOListElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLLIElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLBodyElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLHeadElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLHtmlElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLTableElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+    Interface {
+        name: "HTMLUnknownElement",
+        parent: "HTMLElement",
+        members: &[],
+    },
+];
+
+// the interfaces that add form validation and text selection, besides their own members
+const VALIDATING: &[&str] = &[
+    "HTMLInputElement",
+    "HTMLTextAreaElement",
+    "HTMLSelectElement",
+    "HTMLButtonElement",
+];
+const SELECTABLE: &[&str] = &["HTMLInputElement", "HTMLTextAreaElement"];
+
+// constants shared by Node and its prototype
+const NODE_CONSTANTS: &[(&str, f64)] = &[
+    ("ELEMENT_NODE", 1.0),
+    ("ATTRIBUTE_NODE", 2.0),
+    ("TEXT_NODE", 3.0),
+    ("CDATA_SECTION_NODE", 4.0),
+    ("PROCESSING_INSTRUCTION_NODE", 7.0),
+    ("COMMENT_NODE", 8.0),
+    ("DOCUMENT_NODE", 9.0),
+    ("DOCUMENT_TYPE_NODE", 10.0),
+    ("DOCUMENT_FRAGMENT_NODE", 11.0),
+    ("DOCUMENT_POSITION_DISCONNECTED", 1.0),
+    ("DOCUMENT_POSITION_PRECEDING", 2.0),
+    ("DOCUMENT_POSITION_FOLLOWING", 4.0),
+    ("DOCUMENT_POSITION_CONTAINS", 8.0),
+    ("DOCUMENT_POSITION_CONTAINED_BY", 16.0),
+    ("DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 32.0),
+];
+
+pub(super) struct DomInterfaces {
+    prototypes: HashMap<&'static str, ObjectHandle>,
+}
+
+impl DomInterfaces {
+    pub(super) fn prototype(&self, name: &str) -> ObjectHandle {
+        self.prototypes
+            .get(name)
+            .cloned()
+            .expect("every interface named by the DOM has a prototype")
+    }
+}
+
+fn define_member(build: &Builder, prototype: &ObjectHandle, entry: &'static (&'static str, Kind)) {
+    let (name, kind) = *entry;
+    let member = |access| DomMember { entry, access };
+    let (getter, setter) = match kind {
+        Method(length) => {
+            let function = build.function(Native::Dom(member(Access::Call)), name, length);
+            prototype.borrow_mut().define(
+                name.to_string(),
+                Property {
+                    enumerable: true,
+                    ..Property::data(Value::Object(function))
+                },
+            );
+            return;
+        }
+        ReadOnly => (true, false),
+        ReadWrite | Attr(_) | Flag(_) => (true, true),
+    };
+    let get = getter.then(|| {
+        Value::Object(build.function(Native::Dom(member(Access::Get)), &format!("get {name}"), 0))
+    });
+    let set = setter.then(|| {
+        Value::Object(build.function(Native::Dom(member(Access::Set)), &format!("set {name}"), 1))
+    });
+    prototype.borrow_mut().define(
+        name.to_string(),
+        Property {
+            slot: Slot::Accessor { get, set },
+            enumerable: true,
+            writable: false,
+            configurable: true,
+        },
+    );
+}
+
+pub(super) fn create(
+    build: &Builder,
+    object_prototype: &ObjectHandle,
+    globals: &mut Vec<(&'static str, Value)>,
+) -> DomInterfaces {
+    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::new();
+    for interface in INTERFACES {
+        let parent = if interface.parent.is_empty() {
+            object_prototype.clone()
+        } else {
+            prototypes[interface.parent].clone()
+        };
+        let prototype = new_object(JsObject::with_prototype(
+            Some(parent),
+            ObjectClass::Ordinary,
+        ));
+        for entry in interface.members {
+            define_member(build, &prototype, entry);
+        }
+        if VALIDATING.contains(&interface.name) {
+            for entry in FORM_VALIDATION {
+                define_member(build, &prototype, entry);
+            }
+        }
+        if SELECTABLE.contains(&interface.name) {
+            for entry in TEXT_SELECTION {
+                define_member(build, &prototype, entry);
+            }
+        }
+        prototype.borrow_mut().define(
+            "@@toStringTag".to_string(),
+            Property {
+                writable: false,
+                ..Property::hidden(Value::String(interface.name.into()))
+            },
+        );
+        let constructor = build.constructor(
+            Native::DomConstructor(interface.name),
+            interface.name,
+            0,
+            &prototype,
+        );
+        if interface.name == "Node" {
+            for &(name, value) in NODE_CONSTANTS {
+                for target in [&constructor, &prototype] {
+                    target.borrow_mut().define(
+                        name.to_string(),
+                        Property {
+                            slot: Slot::Data(Value::Number(value)),
+                            enumerable: true,
+                            writable: false,
+                            configurable: false,
+                        },
+                    );
+                }
+            }
+        }
+        globals.push((interface.name, Value::Object(constructor)));
+        prototypes.insert(interface.name, prototype);
+    }
+    DomInterfaces { prototypes }
+}
+
+// the most specific interface for a node
+pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
+    match document.kind(node) {
+        Some(NodeKind::Document) => "Document",
+        Some(NodeKind::Text(_)) => "Text",
+        Some(NodeKind::Comment(_)) => "Comment",
+        Some(NodeKind::Fragment) => "DocumentFragment",
+        Some(NodeKind::Element(element)) => match element.namespace {
+            Namespace::Svg => "SVGElement",
+            Namespace::MathMl => "Element",
+            Namespace::Html => match element.name.as_str() {
+                "input" => "HTMLInputElement",
+                "textarea" => "HTMLTextAreaElement",
+                "select" => "HTMLSelectElement",
+                "option" => "HTMLOptionElement",
+                "button" => "HTMLButtonElement",
+                "form" => "HTMLFormElement",
+                "canvas" => "HTMLCanvasElement",
+                "template" => "HTMLTemplateElement",
+                "a" => "HTMLAnchorElement",
+                "img" => "HTMLImageElement",
+                "label" => "HTMLLabelElement",
+                "script" => "HTMLScriptElement",
+                "link" => "HTMLLinkElement",
+                "style" => "HTMLStyleElement",
+                "div" => "HTMLDivElement",
+                "span" => "HTMLSpanElement",
+                "p" => "HTMLParagraphElement",
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "HTMLHeadingElement",
+                "ul" => "HTMLUListElement",
+                "ol" => "HTMLOListElement",
+                "li" => "HTMLLIElement",
+                "body" => "HTMLBodyElement",
+                "head" => "HTMLHeadElement",
+                "html" => "HTMLHtmlElement",
+                "table" => "HTMLTableElement",
+                name if is_known_html_element(name) || name.contains('-') => "HTMLElement",
+                _ => "HTMLUnknownElement",
+            },
+        },
+        None => "Node",
+    }
+}
+
+fn is_known_html_element(name: &str) -> bool {
+    matches!(
+        name,
+        "abbr"
+            | "address"
+            | "article"
+            | "aside"
+            | "b"
+            | "bdi"
+            | "bdo"
+            | "cite"
+            | "code"
+            | "dd"
+            | "dfn"
+            | "dt"
+            | "em"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "header"
+            | "hgroup"
+            | "i"
+            | "kbd"
+            | "main"
+            | "mark"
+            | "nav"
+            | "noscript"
+            | "rp"
+            | "rt"
+            | "ruby"
+            | "s"
+            | "samp"
+            | "section"
+            | "small"
+            | "strong"
+            | "sub"
+            | "summary"
+            | "sup"
+            | "u"
+            | "var"
+            | "wbr"
+            | "br"
+            | "hr"
+            | "pre"
+            | "blockquote"
+            | "dl"
+            | "fieldset"
+            | "legend"
+            | "details"
+            | "dialog"
+            | "menu"
+            | "meta"
+            | "title"
+            | "base"
+            | "iframe"
+            | "video"
+            | "audio"
+            | "source"
+            | "track"
+            | "picture"
+            | "svg"
+            | "slot"
+            | "output"
+            | "progress"
+            | "meter"
+            | "optgroup"
+            | "datalist"
+            | "caption"
+            | "colgroup"
+            | "col"
+            | "tbody"
+            | "thead"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "data"
+            | "time"
+            | "q"
+            | "del"
+            | "ins"
+            | "map"
+            | "area"
+            | "object"
+            | "embed"
+            | "param"
+    )
+}
+
+impl ScriptRuntime {
+    // the wrapper object of a node value, which holds its expandos and prototype
+    pub(super) fn node_object(&self, value: &Value) -> Option<ObjectHandle> {
+        match value {
+            Value::Element(handle) => Some(handle.object.clone()),
+            Value::Document => Some(self.node_handle(self.document_node()).object.clone()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn new_node_wrapper(&self, node: NodeId) -> ObjectHandle {
+        let interface = interface_of(&self.document.borrow(), node);
+        new_object(JsObject::with_prototype(
+            Some(self.intrinsics.dom.prototype(interface)),
+            ObjectClass::Ordinary,
+        ))
+    }
+
+    // the node a DOM method runs on, with the document standing in as its root node
+    fn this_node(&mut self, this: &Value, member: DomMember) -> Result<ElementHandle, ScriptError> {
+        match this {
+            Value::Element(handle) => Ok(handle.clone()),
+            Value::Document => Ok(self.node_handle(self.document_node())),
+            _ => Err(self.type_error(format!(
+                "Illegal invocation of '{}' on a value that is not a node",
+                member.name()
+            ))),
+        }
+    }
+
+    pub(super) fn call_dom(
+        &mut self,
+        member: DomMember,
+        this: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        let handle = self.this_node(&this, member)?;
+        let node = handle.id;
+        let first = arguments.first().cloned().unwrap_or(Value::Undefined);
+        match (member.reflect(), member.access) {
+            (Reflect::Text(attribute), Access::Get) => {
+                return Ok(Value::String(
+                    self.document
+                        .borrow()
+                        .attribute(node, attribute)
+                        .unwrap_or_default()
+                        .into(),
+                ));
+            }
+            (Reflect::Flag(attribute), Access::Get) => {
+                return Ok(Value::Bool(
+                    self.document.borrow().attribute(node, attribute).is_some(),
+                ));
+            }
+            (Reflect::Text(attribute), Access::Set) => {
+                let value = self.coerce_string(first)?;
+                self.set_element_attribute(&handle, attribute, value);
+                return Ok(Value::Undefined);
+            }
+            (Reflect::Flag(attribute), Access::Set) => {
+                if first.truthy() {
+                    self.set_element_attribute(&handle, attribute, String::new());
+                } else {
+                    self.remove_element_attribute(&handle, attribute);
+                }
+                return Ok(Value::Undefined);
+            }
+            _ => {}
+        }
+        if let Some(result) = self.call_dom_native(member, &this, &handle, &arguments)? {
+            return Ok(result);
+        }
+        // the remaining members are implemented on the host values themselves
+        let target = match (&this, member.name()) {
+            (
+                Value::Document,
+                "getElementById"
+                | "querySelector"
+                | "querySelectorAll"
+                | "createElement"
+                | "createTextNode"
+                | "createRange"
+                | "getSelection"
+                | "addEventListener"
+                | "removeEventListener"
+                | "documentElement"
+                | "activeElement",
+            ) => Value::Document,
+            _ => Value::Element(handle),
+        };
+        match member.access {
+            Access::Get => self.member(target, member.name()),
+            Access::Set => {
+                self.assign_member(target, member.name(), first)?;
+                Ok(Value::Undefined)
+            }
+            Access::Call => {
+                let method = self.member(target.clone(), member.name())?;
+                self.call_function(method, target, arguments)
+            }
+        }
+    }
+
+    fn selector_list(&mut self, source: &str) -> Result<Vec<crate::css::Selector>, ScriptError> {
+        crate::css::Selector::parse_list(source).map_err(|_| {
+            self.throw_value(dom_exception(
+                "SyntaxError",
+                &format!("'{source}' is not a valid selector."),
+            ))
+        })
+    }
+
+    fn node_list(&self, nodes: Vec<NodeId>) -> Value {
+        Value::NodeList(Rc::new(
+            nodes
+                .into_iter()
+                .map(|node| self.node_handle(node))
+                .collect(),
+        ))
+    }
+
+    fn optional_node(&self, node: Option<NodeId>) -> Value {
+        node.map_or(Value::Null, |node| self.node_value(node))
+    }
+
+    // members implemented here rather than on the host values; None hands the call on
+    fn call_dom_native(
+        &mut self,
+        member: DomMember,
+        this: &Value,
+        handle: &ElementHandle,
+        arguments: &[Value],
+    ) -> Result<Option<Value>, ScriptError> {
+        let node = handle.id;
+        let first = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let second = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+        let on_document = matches!(this, Value::Document);
+        let value = match (member.name(), member.access) {
+            ("tagName", Access::Get) | ("localName", Access::Get) => {
+                let document = self.document.borrow();
+                document.element(node).map_or(Value::Null, |element| {
+                    Value::String(
+                        if member.name() == "tagName" {
+                            element.tag_name()
+                        } else {
+                            element.name.clone()
+                        }
+                        .into(),
+                    )
+                })
+            }
+            ("namespaceURI", Access::Get) => self
+                .document
+                .borrow()
+                .element(node)
+                .map_or(Value::Null, |element| {
+                    Value::String(element.namespace.uri().into())
+                }),
+            ("ownerDocument", Access::Get) => {
+                if on_document {
+                    Value::Null
+                } else {
+                    Value::Document
+                }
+            }
+            ("textContent", Access::Get) if on_document => Value::Null,
+            ("nodeValue", Access::Get) if self.document.borrow().character_data(node).is_none() => {
+                Value::Null
+            }
+            ("length", Access::Get) => Value::Number(super::strings::utf16_length(
+                self.document
+                    .borrow()
+                    .character_data(node)
+                    .unwrap_or_default(),
+            ) as f64),
+            ("wholeText", Access::Get) => {
+                let document = self.document.borrow();
+                let siblings = document
+                    .parent(node)
+                    .map(|parent| document.children(parent).to_vec())
+                    .unwrap_or_else(|| vec![node]);
+                let index = siblings
+                    .iter()
+                    .position(|&sibling| sibling == node)
+                    .unwrap_or(0);
+                let start = siblings[..index]
+                    .iter()
+                    .rposition(|&sibling| !document.is_text(sibling))
+                    .map_or(0, |position| position + 1);
+                let end = siblings[index..]
+                    .iter()
+                    .position(|&sibling| !document.is_text(sibling))
+                    .map_or(siblings.len(), |position| index + position);
+                Value::String(
+                    siblings[start..end]
+                        .iter()
+                        .filter_map(|&sibling| document.text(sibling))
+                        .collect::<String>()
+                        .into(),
+                )
+            }
+            ("innerText", Access::Get) => {
+                Value::String(self.document.borrow().text_content(node).into())
+            }
+            ("innerText", Access::Set) => {
+                let text = self.coerce_string(first)?;
+                self.set_element_text_content(handle, text)?;
+                Value::Undefined
+            }
+            ("attributes", Access::Get) => {
+                let attributes = self
+                    .document
+                    .borrow()
+                    .element(node)
+                    .map(|element| element.attrs.clone())
+                    .unwrap_or_default();
+                let entries = attributes
+                    .into_iter()
+                    .map(|(name, value)| {
+                        self.object_from_entries(vec![
+                            ("name".to_string(), Value::String(name.clone().into())),
+                            ("localName".to_string(), Value::String(name.into())),
+                            ("value".to_string(), Value::String(value.into())),
+                            ("namespaceURI".to_string(), Value::Null),
+                            ("specified".to_string(), Value::Bool(true)),
+                        ])
+                    })
+                    .collect();
+                Self::new_array(entries)
+            }
+            ("content", Access::Get) => {
+                let content = self.document.borrow_mut().ensure_template_content(node);
+                self.optional_node(content)
+            }
+            ("body", Access::Get) => {
+                let body = self.document.borrow().body();
+                self.optional_node(body)
+            }
+            ("head", Access::Get) => {
+                let head = self.document.borrow().head();
+                self.optional_node(head)
+            }
+            ("title", Access::Get) if on_document => {
+                Value::String(self.document.borrow().title().unwrap_or_default().into())
+            }
+            ("title", Access::Set) if on_document => {
+                let title = self.coerce_string(first)?;
+                let existing = {
+                    let document = self.document.borrow();
+                    document.descendants(document.root()).find(|&candidate| {
+                        document
+                            .element(candidate)
+                            .is_some_and(|element| element.name == "title")
+                    })
+                };
+                let element = match existing {
+                    Some(element) => element,
+                    None => {
+                        let created = self.document.borrow_mut().create_element("title");
+                        let head = self.document.borrow().head();
+                        let parent = head
+                            .or_else(|| self.document.borrow().document_element())
+                            .unwrap_or_else(|| self.document_node());
+                        self.insert_node(parent, created, None)?;
+                        created
+                    }
+                };
+                let element = self.node_handle(element);
+                self.set_element_text_content(&element, title)?;
+                Value::Undefined
+            }
+            ("defaultView", Access::Get) => Value::Window,
+            ("readyState", Access::Get) => Value::String("complete".into()),
+            ("hasAttribute", Access::Call) => {
+                let name = self.coerce_string(first)?;
+                Value::Bool(self.document.borrow().attribute(node, &name).is_some())
+            }
+            ("hasAttributes", Access::Call) => Value::Bool(
+                self.document
+                    .borrow()
+                    .element(node)
+                    .is_some_and(|element| !element.attrs.is_empty()),
+            ),
+            ("getAttributeNames", Access::Call) => {
+                let names = self
+                    .document
+                    .borrow()
+                    .element(node)
+                    .map(|element| element.attrs.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                Self::new_array(
+                    names
+                        .into_iter()
+                        .map(|name| Value::String(name.into()))
+                        .collect(),
+                )
+            }
+            ("toggleAttribute", Access::Call) => {
+                let name = self.coerce_string(first)?;
+                let present = self.document.borrow().attribute(node, &name).is_some();
+                let enabled = match second {
+                    Value::Undefined => !present,
+                    force => force.truthy(),
+                };
+                if enabled && !present {
+                    self.set_element_attribute(handle, &name, String::new());
+                } else if !enabled && present {
+                    self.remove_element_attribute(handle, &name);
+                }
+                Value::Bool(enabled)
+            }
+            ("matches", Access::Call) => {
+                let source = self.coerce_string(first)?;
+                let selectors = self.selector_list(&source)?;
+                Value::Bool(self.document.borrow().matches_selectors(node, &selectors))
+            }
+            ("closest", Access::Call) => {
+                let source = self.coerce_string(first)?;
+                let selectors = self.selector_list(&source)?;
+                let found = {
+                    let document = self.document.borrow();
+                    std::iter::once(node)
+                        .chain(document.ancestors(node))
+                        .find(|&candidate| document.matches_selectors(candidate, &selectors))
+                };
+                self.optional_node(found)
+            }
+            ("getElementsByTagName", Access::Call) => {
+                let name = self.coerce_string(first)?.to_ascii_lowercase();
+                let found = {
+                    let document = self.document.borrow();
+                    document
+                        .descendants(node)
+                        .filter(|&candidate| {
+                            document
+                                .element(candidate)
+                                .is_some_and(|element| name == "*" || element.name == name)
+                        })
+                        .collect()
+                };
+                self.node_list(found)
+            }
+            ("getElementsByClassName", Access::Call) => {
+                let names = self.coerce_string(first)?;
+                let classes = names.split_ascii_whitespace().collect::<Vec<_>>();
+                let found = {
+                    let document = self.document.borrow();
+                    document
+                        .descendants(node)
+                        .filter(|&candidate| {
+                            !classes.is_empty()
+                                && document.element(candidate).is_some_and(|element| {
+                                    classes.iter().all(|class| element.has_class(class))
+                                })
+                        })
+                        .collect()
+                };
+                self.node_list(found)
+            }
+            ("getElementById", Access::Call) if !on_document => {
+                let id = self.coerce_string(first)?;
+                let found = {
+                    let document = self.document.borrow();
+                    document
+                        .descendants(node)
+                        .find(|&candidate| document.attribute(candidate, "id") == Some(id.as_str()))
+                };
+                self.optional_node(found)
+            }
+            ("contains", Access::Call) => match self.node_object_id(&first) {
+                Some(other) => {
+                    Value::Bool(self.document.borrow().is_inclusive_ancestor(node, other))
+                }
+                None => Value::Bool(false),
+            },
+            ("isSameNode", Access::Call) => Value::Bool(self.node_object_id(&first) == Some(node)),
+            ("isEqualNode", Access::Call) => match self.node_object_id(&first) {
+                Some(other) => Value::Bool(equal_nodes(&self.document.borrow(), node, other)),
+                None => Value::Bool(false),
+            },
+            ("getRootNode", Access::Call) => {
+                let root = self.document.borrow().tree_root(node);
+                self.node_value(root)
+            }
+            ("compareDocumentPosition", Access::Call) => {
+                let Some(other) = self.node_object_id(&first) else {
+                    return Err(self.type_error(
+                        "Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.",
+                    ));
+                };
+                Value::Number(f64::from(document_position(
+                    &self.document.borrow(),
+                    node,
+                    other,
+                )))
+            }
+            ("replaceChild", Access::Call) => {
+                let child = self.node_argument(arguments, 0, "replaceChild")?;
+                let old = self.node_argument(arguments, 1, "replaceChild")?;
+                if self.document.borrow().parent(old) != Some(node) {
+                    return Err(self.throw_value(dom_exception(
+                        "NotFoundError",
+                        "The node to be replaced is not a child of this node.",
+                    )));
+                }
+                if child != old {
+                    let checked = self
+                        .document
+                        .borrow()
+                        .validate_insertion(node, child, Some(old));
+                    if let Err(error) = checked {
+                        return Err(self.dom_error(error));
+                    }
+                    let next = self.document.borrow().sibling(old, true);
+                    self.remove_node(old)?;
+                    let reference = next.filter(|&next| next != child);
+                    self.insert_node(node, child, reference)?;
+                }
+                self.node_value(old)
+            }
+            ("insertAdjacentElement", Access::Call) | ("insertAdjacentText", Access::Call) => {
+                let position = self.coerce_string(first)?.to_ascii_lowercase();
+                let inserted = if member.name() == "insertAdjacentText" {
+                    let text = self.coerce_string(second)?;
+                    self.document.borrow_mut().create_text(text)
+                } else {
+                    self.node_argument(arguments, 1, "insertAdjacentElement")?
+                };
+                let (parent, reference) = {
+                    let document = self.document.borrow();
+                    match position.as_str() {
+                        "beforebegin" => (document.parent(node), Some(node)),
+                        "afterbegin" => (Some(node), document.children(node).first().copied()),
+                        "beforeend" => (Some(node), None),
+                        "afterend" => (document.parent(node), document.sibling(node, true)),
+                        _ => {
+                            drop(document);
+                            return Err(self.throw_value(dom_exception(
+                                "SyntaxError",
+                                &format!("The value provided ('{position}') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'."),
+                            )));
+                        }
+                    }
+                };
+                match parent {
+                    Some(parent) => {
+                        self.insert_node(parent, inserted, reference)?;
+                        if member.name() == "insertAdjacentText" {
+                            Value::Undefined
+                        } else {
+                            self.node_value(inserted)
+                        }
+                    }
+                    None => Value::Null,
+                }
+            }
+            ("createElementNS", Access::Call) => {
+                let namespace = match first {
+                    Value::Null | Value::Undefined => None,
+                    uri => Namespace::from_uri(&self.coerce_string(uri)?),
+                };
+                let qualified = self.coerce_string(second)?;
+                let local = qualified
+                    .split_once(':')
+                    .map_or(qualified.as_str(), |(_, local)| local)
+                    .to_string();
+                let created = match namespace {
+                    Some(namespace) => self
+                        .document
+                        .borrow_mut()
+                        .create_element_ns(namespace, &local),
+                    None => self.document.borrow_mut().create_element(&local),
+                };
+                self.node_value(created)
+            }
+            ("createComment", Access::Call) => {
+                let data = self.coerce_string(first)?;
+                let created = self.document.borrow_mut().create_comment(data);
+                self.node_value(created)
+            }
+            ("createDocumentFragment", Access::Call) => {
+                let created = self.document.borrow_mut().create_fragment();
+                self.node_value(created)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+
+    // the node behind a value, for methods that compare or take nodes
+    fn node_object_id(&self, value: &Value) -> Option<NodeId> {
+        match value.resolve() {
+            Value::Element(handle) => Some(handle.id),
+            Value::Document => Some(self.document_node()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn construct_dom(
+        &mut self,
+        interface: &'static str,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        let first = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let data = |runtime: &mut Self| match first.clone() {
+            Value::Undefined => Ok(String::new()),
+            value => runtime.coerce_string(value),
+        };
+        let node = match interface {
+            "Text" => {
+                let text = data(self)?;
+                self.document.borrow_mut().create_text(text)
+            }
+            "Comment" => {
+                let text = data(self)?;
+                self.document.borrow_mut().create_comment(text)
+            }
+            "DocumentFragment" => self.document.borrow_mut().create_fragment(),
+            _ => return Err(self.type_error("Illegal constructor")),
+        };
+        Ok(self.node_value(node))
+    }
+}
+
+fn equal_nodes(document: &Document, left: NodeId, right: NodeId) -> bool {
+    document.kind(left) == document.kind(right)
+        && document.children(left).len() == document.children(right).len()
+        && document
+            .children(left)
+            .iter()
+            .zip(document.children(right))
+            .all(|(&left, &right)| equal_nodes(document, left, right))
+}
+
+// compareDocumentPosition's bit mask
+fn document_position(document: &Document, node: NodeId, other: NodeId) -> u16 {
+    const DISCONNECTED: u16 = 1;
+    const PRECEDING: u16 = 2;
+    const FOLLOWING: u16 = 4;
+    const CONTAINS: u16 = 8;
+    const CONTAINED_BY: u16 = 16;
+    const IMPLEMENTATION_SPECIFIC: u16 = 32;
+    if node == other {
+        return 0;
+    }
+    if document.tree_root(node) != document.tree_root(other) {
+        let order = if other < node { PRECEDING } else { FOLLOWING };
+        return DISCONNECTED | IMPLEMENTATION_SPECIFIC | order;
+    }
+    if document.is_inclusive_ancestor(other, node) {
+        return CONTAINS | PRECEDING;
+    }
+    if document.is_inclusive_ancestor(node, other) {
+        return CONTAINED_BY | FOLLOWING;
+    }
+    match document.tree_order(other, node) {
+        TreeOrdering::Less => PRECEDING,
+        _ => FOLLOWING,
+    }
+}

@@ -480,7 +480,8 @@ impl ScriptRuntime {
                         );
                     }
                 };
-                let Value::Object(object) = &first else {
+                let target = self.node_object(&first).map(Value::Object);
+                let Value::Object(object) = target.as_ref().unwrap_or(&first) else {
                     return Ok(Value::Bool(false));
                 };
                 match self.set_object_prototype(object, prototype) {

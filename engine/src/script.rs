@@ -6,6 +6,7 @@ mod compiler;
 mod console;
 mod dates;
 mod encoding;
+mod interfaces;
 mod intl;
 mod json;
 mod lexer;
@@ -438,6 +439,8 @@ enum Builtin {
 // the script identity of a document node: one handle per node, so handles compare by pointer
 struct NodeHandle {
     id: NodeId,
+    // the wrapper that carries the node's prototype and expando properties
+    object: ObjectHandle,
 }
 
 // the global bindings: var and function declarations of classic scripts, top-level let and
@@ -1702,7 +1705,12 @@ impl ScriptRuntime {
         self.node_handles
             .borrow_mut()
             .entry(id)
-            .or_insert_with(|| Rc::new(NodeHandle { id }))
+            .or_insert_with(|| {
+                Rc::new(NodeHandle {
+                    id,
+                    object: self.new_node_wrapper(id),
+                })
+            })
             .clone()
     }
 
@@ -17460,9 +17468,9 @@ mod tests {
                 const last = document.getElementById("last");
                 let events = "";
                 last.addEventListener("click", () => events = events + "last");
-                const activate = last.click;
-                const setAttribute = last.setAttribute;
-                const getAttribute = last.getAttribute;
+                const activate = last.click.bind(last);
+                const setAttribute = last.setAttribute.bind(last);
+                const getAttribute = last.getAttribute.bind(last);
                 const inserted = document.createElement("p");
                 inserted.id = "inserted";
                 inserted.textContent = "inserted";
@@ -17679,6 +17687,75 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         document.element_text_content(status)
+    }
+
+    #[test]
+    fn nodes_inherit_from_their_interfaces_and_keep_expandos() {
+        let document = document(
+            r#"<html><head><title>Old</title></head><body><main id="root"><input id="name"><div id="box" class="card wide" data-x="1"><b>bold</b></div></main><p id="status">idle</p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const box = document.getElementById("box");
+                const input = document.getElementById("name");
+                box.__vnode = { key: 1 };
+                const again = document.querySelector(".card");
+                HTMLElement.prototype.shout = function () { return this.tagName + "!"; };
+                const text = new Text("hi");
+                const results = [
+                    typeof box,
+                    box instanceof HTMLDivElement,
+                    box instanceof Element,
+                    box instanceof Node,
+                    box instanceof EventTarget,
+                    input instanceof HTMLInputElement,
+                    "value" in input,
+                    "value" in box,
+                    again.__vnode.key,
+                    Object.keys(box).join(","),
+                    box.shout(),
+                    Object.getPrototypeOf(box) === HTMLDivElement.prototype,
+                    Object.prototype.toString.call(box),
+                    text instanceof Text && text instanceof CharacterData,
+                    text.nodeType === Node.TEXT_NODE,
+                    document instanceof Document,
+                    document.body.tagName,
+                    document.head.localName,
+                    box.closest("main").id,
+                    box.matches(".card.wide"),
+                    document.getElementById("root").contains(box.firstChild),
+                    box.hasAttribute("data-x"),
+                    box.toggleAttribute("hidden"),
+                    box.hidden,
+                    box.getAttributeNames().join(","),
+                    document.getElementsByTagName("b").length,
+                    document.getElementsByClassName("card wide")[0] === box,
+                    box.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_PRECEDING,
+                ];
+                const svg = document.createElementNS("http://www.w3.org/2000/svg", "linearGradient");
+                results.push(svg.tagName, svg instanceof SVGElement, svg.namespaceURI);
+                const template = document.createElement("template");
+                template.innerHTML = "<li>a</li><li>b</li>";
+                results.push(template.content.childNodes.length, template.childNodes.length);
+                const replacement = document.createElement("span");
+                box.replaceChild(replacement, box.firstChild);
+                box.insertAdjacentElement("beforebegin", document.createElement("hr"));
+                results.push(box.innerHTML, box.previousElementSibling.tagName);
+                document.title = "New";
+                results.push(document.title);
+                try { new HTMLElement(); } catch (error) { results.push(error.name); }
+                document.getElementById("status").textContent = results.join("|");
+                "#,
+            )
+            .expect("interface script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "object|true|true|true|true|true|true|false|1|__vnode|DIV!|true|[object HTMLDivElement]|true|true|true|BODY|head|root|true|true|true|true|true|class,data-x,hidden,id|1|true|2|linearGradient|true|http://www.w3.org/2000/svg|2|0|<span></span>|HR|New|TypeError"
+            )
+        );
     }
 
     #[test]
