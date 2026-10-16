@@ -96,47 +96,12 @@ impl Color {
         }
     }
 
+    // a color that needs no element: currentColor has nothing to stand for here
     pub fn parse(input: &str) -> Option<Self> {
-        let input = input.trim().to_ascii_lowercase();
-        if let Some(hex) = input.strip_prefix('#') {
-            return match hex.len() {
-                3 => Some(Self::opaque(
-                    expand_nibble(hex.as_bytes()[0])?,
-                    expand_nibble(hex.as_bytes()[1])?,
-                    expand_nibble(hex.as_bytes()[2])?,
-                )),
-                4 => Some(Self {
-                    red: expand_nibble(hex.as_bytes()[0])?,
-                    green: expand_nibble(hex.as_bytes()[1])?,
-                    blue: expand_nibble(hex.as_bytes()[2])?,
-                    alpha: expand_nibble(hex.as_bytes()[3])?,
-                }),
-                6 => Some(Self::opaque(
-                    parse_hex_byte(&hex[0..2])?,
-                    parse_hex_byte(&hex[2..4])?,
-                    parse_hex_byte(&hex[4..6])?,
-                )),
-                8 => Some(Self {
-                    red: parse_hex_byte(&hex[0..2])?,
-                    green: parse_hex_byte(&hex[2..4])?,
-                    blue: parse_hex_byte(&hex[4..6])?,
-                    alpha: parse_hex_byte(&hex[6..8])?,
-                }),
-                _ => None,
-            };
+        if input.trim().eq_ignore_ascii_case("currentcolor") {
+            return None;
         }
-        match input.as_str() {
-            "black" => Some(Self::BLACK),
-            "white" => Some(Self::WHITE),
-            "transparent" => Some(Self::transparent()),
-            "red" => Some(Self::opaque(255, 0, 0)),
-            "green" => Some(Self::opaque(0, 128, 0)),
-            "blue" => Some(Self::opaque(0, 0, 255)),
-            "yellow" => Some(Self::opaque(255, 255, 0)),
-            "gray" | "grey" => Some(Self::opaque(128, 128, 128)),
-            "rebeccapurple" => Some(Self::opaque(102, 51, 153)),
-            _ => parse_rgb(&input),
-        }
+        crate::colors::parse(input, Self::BLACK)
     }
 }
 
@@ -429,6 +394,8 @@ pub(crate) struct TransitionState {
 pub(crate) struct StyleState {
     pub(crate) hovered: Option<NodeId>,
     pub(crate) focused: Option<NodeId>,
+    // the element the primary pointer button is pressed on
+    pub(crate) active: Option<NodeId>,
     pub(crate) checked: BTreeSet<NodeId>,
     pub(crate) unchecked: BTreeSet<NodeId>,
     pub(crate) disabled: BTreeSet<NodeId>,
@@ -1402,10 +1369,16 @@ impl Stylesheet {
         let own = pseudo.is_none().then_some(node);
         let mut animation = None;
         let mut base_values = BTreeMap::new();
+        // declarations apply in cascade order, so a later shorthand overrides an earlier
+        // longhand and the reverse; color comes first for currentColor
+        let mut values = values
+            .into_iter()
+            .filter(|(property, _)| !property.starts_with("--"))
+            .collect::<Vec<_>>();
+        values.sort_unstable_by_key(|(property, (rank, order, _))| {
+            (property.as_ref() != "color", *rank, *order)
+        });
         for (property, (_, _, value)) in values {
-            if property.starts_with("--") {
-                continue;
-            }
             let Some(value) = resolve_custom_value(&value, custom_properties) else {
                 continue;
             };
@@ -1586,10 +1559,11 @@ impl Stylesheet {
             else {
                 continue;
             };
-            for declaration in &rule.declarations {
+            // later declarations in a rule follow earlier ones in the cascade order
+            for (position, declaration) in rule.declarations.iter().enumerate() {
                 let candidate = (
-                    specificity,
-                    rule.order,
+                    specificity.important(declaration.important),
+                    (rule.order << 16) | position,
                     Cow::Borrowed(declaration.value.as_str()),
                 );
                 let replace = values
@@ -1734,15 +1708,25 @@ impl Stylesheet {
         if let Some(inline) = element.attr("style").filter(|_| pseudo.is_none())
             && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
         {
-            for declaration in declarations {
-                values.insert(
-                    Cow::Owned(declaration.property),
-                    (
-                        Specificity::INLINE,
-                        usize::MAX,
-                        Cow::Owned(declaration.value),
-                    ),
-                );
+            for (position, declaration) in declarations.into_iter().enumerate() {
+                let specificity = if declaration.important {
+                    Specificity::INLINE_IMPORTANT
+                } else {
+                    Specificity::INLINE
+                };
+                let replace = values
+                    .get(declaration.property.as_str())
+                    .is_none_or(|current| specificity >= current.0);
+                if replace {
+                    values.insert(
+                        Cow::Owned(declaration.property),
+                        (
+                            specificity,
+                            (usize::MAX >> 1) | position,
+                            Cow::Owned(declaration.value),
+                        ),
+                    );
+                }
             }
         }
         values
@@ -1800,6 +1784,7 @@ impl MediaCondition {
 struct Declaration {
     property: String,
     value: String,
+    important: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1835,6 +1820,9 @@ struct CompoundSelector {
 pub(crate) enum PseudoElement {
     Before,
     After,
+    // a pseudo-element the engine does not draw, such as ::placeholder; its rules parse and
+    // never apply
+    Unrendered,
 }
 
 impl PseudoElement {
@@ -1842,6 +1830,7 @@ impl PseudoElement {
         match self {
             Self::Before => "::before",
             Self::After => "::after",
+            Self::Unrendered => "::unrendered",
         }
     }
 }
@@ -1849,7 +1838,71 @@ impl PseudoElement {
 #[derive(Clone, Debug)]
 enum AttributeSelector {
     Exists(String),
-    Equals(String, String),
+    Match {
+        name: String,
+        operator: AttributeOperator,
+        value: String,
+        // the `i` flag compares ASCII case-insensitively
+        ignore_case: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttributeOperator {
+    Equals,
+    // ~= a whitespace-separated word
+    Includes,
+    // |= the value or the value followed by a hyphen
+    DashMatch,
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+impl AttributeSelector {
+    fn matches(&self, element: &Element) -> bool {
+        match self {
+            Self::Exists(name) => element.attr(name).is_some(),
+            Self::Match {
+                name,
+                operator,
+                value,
+                ignore_case,
+            } => {
+                let Some(actual) = element.attr(name) else {
+                    return false;
+                };
+                let (actual, value) = if *ignore_case {
+                    (actual.to_ascii_lowercase(), value.to_ascii_lowercase())
+                } else {
+                    (actual.to_string(), value.clone())
+                };
+                match operator {
+                    AttributeOperator::Equals => actual == value,
+                    AttributeOperator::Includes => {
+                        !value.is_empty()
+                            && actual.split_ascii_whitespace().any(|word| word == value)
+                    }
+                    AttributeOperator::DashMatch => {
+                        actual == value
+                            || actual
+                                .strip_prefix(value.as_str())
+                                .is_some_and(|rest| rest.starts_with('-'))
+                    }
+                    AttributeOperator::Prefix => !value.is_empty() && actual.starts_with(&value),
+                    AttributeOperator::Suffix => !value.is_empty() && actual.ends_with(&value),
+                    AttributeOperator::Substring => !value.is_empty() && actual.contains(&value),
+                }
+            }
+        }
+    }
+}
+
+// a selector inside :has(), with the combinator that relates it to the anchor element
+#[derive(Clone, Debug)]
+struct RelativeSelector {
+    combinator: Combinator,
+    selector: Selector,
 }
 
 #[derive(Clone, Debug)]
@@ -1857,14 +1910,37 @@ enum PseudoClass {
     Root,
     Hover,
     Focus,
+    FocusWithin,
+    Active,
     Checked,
     Disabled,
     Enabled,
     FirstChild,
     LastChild,
     OnlyChild,
-    NthChild(NthPattern),
+    // an+b among the siblings, optionally only those matching an `of` selector list
+    NthChild(NthPattern, Vec<Selector>),
+    NthLastChild(NthPattern, Vec<Selector>),
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+    NthOfType(NthPattern),
+    NthLastOfType(NthPattern),
+    Empty,
+    PlaceholderShown,
+    Link,
+    // a :visited link never matches, so history cannot be read through style
+    Visited,
+    ReadOnly,
+    ReadWrite,
+    Required,
+    Optional,
+    Defined,
     Not(Vec<Selector>),
+    Is(Vec<Selector>),
+    // as :is() but with no specificity
+    Where(Vec<Selector>),
+    Has(Vec<RelativeSelector>),
     // the shadow host, seen from its shadow tree's styles, optionally matching a compound
     Host(Vec<Selector>),
 }
@@ -1918,8 +1994,21 @@ impl NthPattern {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Specificity(u32, u32, u32);
 
+// importance and inline style sit above every selector's specificity: normal rules, then
+// inline style, then !important rules, then !important inline style
+const IMPORTANT: u32 = 1 << 30;
+
 impl Specificity {
-    const INLINE: Self = Self(u32::MAX, u32::MAX, u32::MAX);
+    const INLINE: Self = Self(1 << 29, 0, 0);
+    const INLINE_IMPORTANT: Self = Self(u32::MAX, u32::MAX, u32::MAX);
+
+    fn important(self, important: bool) -> Self {
+        if important {
+            Self(self.0.saturating_add(IMPORTANT), self.1, self.2)
+        } else {
+            self
+        }
+    }
 }
 
 impl Selector {
@@ -1967,6 +2056,15 @@ impl Selector {
             return Err(format!("selector has no final compound: {source}"));
         }
         Ok(Self { parts })
+    }
+
+    // a forgiving list, as :is() and :where() take it: parts that do not parse drop out
+    fn parse_forgiving_list(source: &str) -> Vec<Self> {
+        split_selector_list(source)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|part| Self::parse(part).ok())
+            .collect()
     }
 
     pub(crate) fn parse_list(source: &str) -> Result<Vec<Self>, String> {
@@ -2088,10 +2186,10 @@ impl CompoundSelector {
                 .as_deref()
                 .is_none_or(|id| element.attr("id") == Some(id))
             && self.classes.iter().all(|class| element.has_class(class))
-            && self.attributes.iter().all(|attribute| match attribute {
-                AttributeSelector::Exists(name) => element.attr(name).is_some(),
-                AttributeSelector::Equals(name, value) => element.attr(name) == Some(value),
-            })
+            && self
+                .attributes
+                .iter()
+                .all(|attribute| attribute.matches(element))
             && self
                 .pseudo_classes
                 .iter()
@@ -2150,9 +2248,123 @@ impl PseudoClass {
                 document.element_sibling(node, false).is_none()
                     && document.element_sibling(node, true).is_none()
             }
-            Self::NthChild(pattern) => {
-                child_position(document, node).is_some_and(|position| pattern.matches(position))
+
+            Self::FocusWithin => state
+                .focused
+                .is_some_and(|focused| document.is_inclusive_ancestor(node, focused)),
+            Self::Active => state
+                .active
+                .is_some_and(|active| document.is_inclusive_ancestor(node, active)),
+            Self::NthChild(pattern, of) | Self::NthLastChild(pattern, of) => {
+                let last = matches!(self, Self::NthLastChild(..));
+                let counts = |candidate: NodeId| {
+                    of.is_empty()
+                        || of
+                            .iter()
+                            .any(|selector| selector.matches(document, candidate, None, state))
+                };
+                counts(node)
+                    && sibling_position(document, node, last, counts)
+                        .is_some_and(|position| pattern.matches(position))
             }
+            Self::FirstOfType | Self::LastOfType | Self::OnlyOfType => {
+                let same = |candidate: NodeId| {
+                    document
+                        .element(candidate)
+                        .is_some_and(|other| other.name == element.name)
+                };
+                let first = sibling_position(document, node, false, same) == Some(1);
+                let last = sibling_position(document, node, true, same) == Some(1);
+                match self {
+                    Self::FirstOfType => first,
+                    Self::LastOfType => last,
+                    _ => first && last,
+                }
+            }
+            Self::NthOfType(pattern) | Self::NthLastOfType(pattern) => {
+                let same = |candidate: NodeId| {
+                    document
+                        .element(candidate)
+                        .is_some_and(|other| other.name == element.name)
+                };
+                sibling_position(document, node, matches!(self, Self::NthLastOfType(_)), same)
+                    .is_some_and(|position| pattern.matches(position))
+            }
+            Self::Empty => document.children(node).iter().all(|&child| {
+                matches!(document.kind(child), Some(crate::dom::NodeKind::Comment(_)))
+            }),
+            Self::PlaceholderShown => {
+                matches!(element.name.as_str(), "input" | "textarea")
+                    && element.attr("placeholder").is_some()
+                    && state.control_values.get(&node).map_or_else(
+                        || element.attr("value").unwrap_or_default().is_empty(),
+                        String::is_empty,
+                    )
+            }
+            Self::Link => {
+                matches!(element.name.as_str(), "a" | "area") && element.attr("href").is_some()
+            }
+            Self::Visited => false,
+            Self::ReadWrite | Self::ReadOnly => {
+                let text_input = element.name == "input"
+                    && !matches!(
+                        element
+                            .attr("type")
+                            .unwrap_or("text")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "checkbox"
+                            | "radio"
+                            | "button"
+                            | "submit"
+                            | "reset"
+                            | "image"
+                            | "file"
+                            | "hidden"
+                            | "range"
+                            | "color"
+                    );
+                let editable = ((text_input || element.name == "textarea")
+                    && element.attr("readonly").is_none()
+                    && !state.is_disabled(element, node))
+                    || element.attr("contenteditable").is_some_and(|value| {
+                        value.is_empty() || value.eq_ignore_ascii_case("true")
+                    });
+                editable == matches!(self, Self::ReadWrite)
+            }
+            Self::Required | Self::Optional => {
+                let form_control = matches!(element.name.as_str(), "input" | "select" | "textarea");
+                form_control
+                    && (element.attr("required").is_some() == matches!(self, Self::Required))
+            }
+            Self::Defined => true,
+            Self::Is(selectors) | Self::Where(selectors) => selectors
+                .iter()
+                .any(|selector| selector.matches(document, node, None, state)),
+            Self::Has(relatives) => relatives.iter().any(|relative| {
+                let matching =
+                    |candidate: NodeId| relative.selector.matches(document, candidate, None, state);
+                match relative.combinator {
+                    Combinator::Descendant => document
+                        .descendants(node)
+                        .filter(|&candidate| document.is_element(candidate))
+                        .any(matching),
+                    Combinator::Child => document.element_children(node).any(matching),
+                    Combinator::NextSibling => {
+                        document.element_sibling(node, true).is_some_and(matching)
+                    }
+                    Combinator::SubsequentSibling => {
+                        let mut sibling = document.element_sibling(node, true);
+                        while let Some(candidate) = sibling {
+                            if matching(candidate) {
+                                return true;
+                            }
+                            sibling = document.element_sibling(candidate, true);
+                        }
+                        false
+                    }
+                }
+            }),
             Self::Not(selectors) => !selectors
                 .iter()
                 .any(|selector| selector.matches(document, node, None, state)),
@@ -2167,22 +2379,48 @@ impl PseudoClass {
     }
 
     fn specificity(&self) -> Specificity {
-        match self {
-            Self::Not(selectors) => selectors
+        let most = |selectors: &[Selector]| {
+            selectors
                 .iter()
                 .map(Selector::specificity)
                 .max()
+                .unwrap_or(Specificity(0, 0, 0))
+        };
+        match self {
+            Self::Not(selectors) | Self::Is(selectors) => most(selectors),
+            Self::Where(_) => Specificity(0, 0, 0),
+            Self::Has(relatives) => relatives
+                .iter()
+                .map(|relative| relative.selector.specificity())
+                .max()
                 .unwrap_or(Specificity(0, 0, 0)),
+            Self::NthChild(_, of) | Self::NthLastChild(_, of) => {
+                let of = most(of);
+                Specificity(of.0, of.1 + 1, of.2)
+            }
             _ => Specificity(0, 1, 0),
         }
     }
 }
 
-fn child_position(document: &Document, node: NodeId) -> Option<i32> {
+// the 1-based position of a node among its element siblings that count, from either end
+fn sibling_position(
+    document: &Document,
+    node: NodeId,
+    from_end: bool,
+    counts: impl Fn(NodeId) -> bool,
+) -> Option<i32> {
     let parent = document.parent(node)?;
-    document
+    let mut siblings = document
         .element_children(parent)
-        .position(|child| child == node)
+        .filter(|&child| counts(child))
+        .collect::<Vec<_>>();
+    if from_end {
+        siblings.reverse();
+    }
+    siblings
+        .iter()
+        .position(|&child| child == node)
         .map(|position| position as i32 + 1)
 }
 
@@ -2221,11 +2459,30 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                     *cursor += 1;
                 }
                 let name = parse_selector_name(source, cursor)?;
-                if let Some(element) = match name.as_str() {
+                let element = match name.as_str() {
                     "before" => Some(PseudoElement::Before),
                     "after" => Some(PseudoElement::After),
+                    "placeholder"
+                    | "selection"
+                    | "marker"
+                    | "backdrop"
+                    | "first-line"
+                    | "first-letter"
+                    | "file-selector-button"
+                    | "cue"
+                    | "spelling-error"
+                    | "grammar-error"
+                    | "target-text"
+                    | "highlight"
+                    | "part"
+                    | "slotted" => Some(PseudoElement::Unrendered),
+                    vendor if double && vendor.starts_with('-') => Some(PseudoElement::Unrendered),
                     _ => None,
-                } {
+                };
+                if let Some(element) = element {
+                    if source.as_bytes().get(*cursor) == Some(&b'(') {
+                        parse_function_argument(source, cursor)?;
+                    }
                     if selector.pseudo_element.is_some() {
                         return Err(format!("selector has two pseudo elements: {source}"));
                     }
@@ -2235,29 +2492,72 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 if double {
                     return Err(format!("unsupported pseudo element: ::{name}"));
                 }
+                let functional = source.as_bytes().get(*cursor) == Some(&b'(');
                 let pseudo = if name == "not" {
                     let argument = parse_function_argument(source, cursor)?;
                     PseudoClass::Not(Selector::parse_list(&argument)?)
+                } else if functional && matches!(name.as_str(), "is" | "matches" | "-webkit-any") {
+                    let argument = parse_function_argument(source, cursor)?;
+                    PseudoClass::Is(Selector::parse_forgiving_list(&argument))
+                } else if functional && name == "where" {
+                    let argument = parse_function_argument(source, cursor)?;
+                    PseudoClass::Where(Selector::parse_forgiving_list(&argument))
+                } else if functional && name == "has" {
+                    let argument = parse_function_argument(source, cursor)?;
+                    PseudoClass::Has(parse_relative_list(&argument)?)
+                } else if functional
+                    && matches!(
+                        name.as_str(),
+                        "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type"
+                    )
+                {
+                    let argument = parse_function_argument(source, cursor)?;
+                    let (pattern, of) = match argument.find(" of ") {
+                        Some(split) if name.ends_with("child") => (
+                            &argument[..split],
+                            Selector::parse_list(&argument[split + 4..])?,
+                        ),
+                        _ => (argument.as_str(), Vec::new()),
+                    };
+                    let pattern = NthPattern::parse(pattern)?;
+                    match name.as_str() {
+                        "nth-child" => PseudoClass::NthChild(pattern, of),
+                        "nth-last-child" => PseudoClass::NthLastChild(pattern, of),
+                        "nth-of-type" => PseudoClass::NthOfType(pattern),
+                        _ => PseudoClass::NthLastOfType(pattern),
+                    }
                 } else if name == "host" && source.as_bytes().get(*cursor) == Some(&b'(') {
                     let argument = parse_function_argument(source, cursor)?;
                     PseudoClass::Host(Selector::parse_list(&argument)?)
                 } else if name == "host" {
                     PseudoClass::Host(Vec::new())
-                } else if name == "nth-child" {
-                    let argument = parse_function_argument(source, cursor)?;
-                    PseudoClass::NthChild(NthPattern::parse(&argument)?)
                 } else {
                     match name.as_str() {
-                        "root" => PseudoClass::Root,
+                        "root" | "scope" => PseudoClass::Root,
                         "hover" => PseudoClass::Hover,
-                        "focus" => PseudoClass::Focus,
+                        // focus moved by the keyboard or by script shows a ring, so every
+                        // focus is visible focus here
+                        "focus" | "focus-visible" => PseudoClass::Focus,
+                        "focus-within" => PseudoClass::FocusWithin,
+                        "active" => PseudoClass::Active,
                         "checked" => PseudoClass::Checked,
                         "disabled" => PseudoClass::Disabled,
                         "enabled" => PseudoClass::Enabled,
-                        "focus-visible" | "focus-within" => PseudoClass::Focus,
                         "first-child" => PseudoClass::FirstChild,
                         "last-child" => PseudoClass::LastChild,
                         "only-child" => PseudoClass::OnlyChild,
+                        "first-of-type" => PseudoClass::FirstOfType,
+                        "last-of-type" => PseudoClass::LastOfType,
+                        "only-of-type" => PseudoClass::OnlyOfType,
+                        "empty" => PseudoClass::Empty,
+                        "placeholder-shown" => PseudoClass::PlaceholderShown,
+                        "link" | "any-link" => PseudoClass::Link,
+                        "visited" => PseudoClass::Visited,
+                        "read-only" => PseudoClass::ReadOnly,
+                        "read-write" => PseudoClass::ReadWrite,
+                        "required" => PseudoClass::Required,
+                        "optional" => PseudoClass::Optional,
+                        "defined" => PseudoClass::Defined,
                         _ => return Err(format!("unsupported pseudo-class: :{name}")),
                     }
                 };
@@ -2268,22 +2568,49 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 skip_selector_whitespace(source, cursor);
                 let name = parse_selector_name(source, cursor)?;
                 skip_selector_whitespace(source, cursor);
+                let name = name.to_ascii_lowercase();
                 let attribute = if *cursor < source.len() && source.as_bytes()[*cursor] == b']' {
                     *cursor += 1;
                     AttributeSelector::Exists(name)
                 } else {
-                    if *cursor >= source.len() || source.as_bytes()[*cursor] != b'=' {
+                    let rest = &source[*cursor..];
+                    let (operator, width) = if rest.starts_with('=') {
+                        (AttributeOperator::Equals, 1)
+                    } else if rest.starts_with("~=") {
+                        (AttributeOperator::Includes, 2)
+                    } else if rest.starts_with("|=") {
+                        (AttributeOperator::DashMatch, 2)
+                    } else if rest.starts_with("^=") {
+                        (AttributeOperator::Prefix, 2)
+                    } else if rest.starts_with("$=") {
+                        (AttributeOperator::Suffix, 2)
+                    } else if rest.starts_with("*=") {
+                        (AttributeOperator::Substring, 2)
+                    } else {
                         return Err(format!("unsupported attribute selector: {source}"));
-                    }
-                    *cursor += 1;
+                    };
+                    *cursor += width;
                     skip_selector_whitespace(source, cursor);
                     let value = parse_attribute_value(source, cursor)?;
                     skip_selector_whitespace(source, cursor);
+                    let mut ignore_case = false;
+                    if let Some(&flag) = source.as_bytes().get(*cursor)
+                        && matches!(flag, b'i' | b'I' | b's' | b'S')
+                    {
+                        ignore_case = matches!(flag, b'i' | b'I');
+                        *cursor += 1;
+                        skip_selector_whitespace(source, cursor);
+                    }
                     if *cursor >= source.len() || source.as_bytes()[*cursor] != b']' {
                         return Err(format!("unterminated attribute selector: {source}"));
                     }
                     *cursor += 1;
-                    AttributeSelector::Equals(name, value)
+                    AttributeSelector::Match {
+                        name,
+                        operator,
+                        value,
+                        ignore_case,
+                    }
                 };
                 selector.attributes.push(attribute);
             }
@@ -2293,7 +2620,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 if selector.tag.is_some() {
                     return Err(format!("invalid compound selector: {source}"));
                 }
-                selector.tag = Some(parse_selector_name(source, cursor)?);
+                selector.tag = Some(parse_selector_name(source, cursor)?.to_ascii_lowercase());
             }
         }
     }
@@ -2305,20 +2632,69 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
     Ok(selector)
 }
 
+// an identifier as written: ids and classes keep their case, and backslash escapes and
+// non-ASCII characters are part of the name
 fn parse_selector_name(source: &str, cursor: &mut usize) -> Result<String, String> {
-    let start = *cursor;
-    while *cursor < source.len() {
-        let byte = source.as_bytes()[*cursor];
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+    let mut name = String::new();
+    while let Some(character) = source[*cursor..].chars().next() {
+        if character.is_ascii_alphanumeric()
+            || matches!(character, '-' | '_')
+            || !character.is_ascii()
+        {
+            name.push(character);
+            *cursor += character.len_utf8();
+        } else if character == '\\' {
             *cursor += 1;
+            let hex = source[*cursor..]
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .take(6)
+                .collect::<String>();
+            if hex.is_empty() {
+                let Some(escaped) = source[*cursor..].chars().next() else {
+                    break;
+                };
+                name.push(escaped);
+                *cursor += escaped.len_utf8();
+            } else {
+                *cursor += hex.len();
+                let code = u32::from_str_radix(&hex, 16).unwrap_or(0xfffd);
+                name.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                if source[*cursor..].starts_with(' ') {
+                    *cursor += 1;
+                }
+            }
         } else {
             break;
         }
     }
-    if *cursor == start {
+    if name.is_empty() {
         return Err(format!("selector component has no name: {source}"));
     }
-    Ok(source[start..*cursor].to_ascii_lowercase())
+    Ok(name)
+}
+
+// the argument of :has(): relative selectors that may start with a combinator
+fn parse_relative_list(source: &str) -> Result<Vec<RelativeSelector>, String> {
+    split_selector_list(source)?
+        .into_iter()
+        .map(|part| {
+            let part = part.trim();
+            let (combinator, rest) = if let Some(rest) = part.strip_prefix('>') {
+                (Combinator::Child, rest)
+            } else if let Some(rest) = part.strip_prefix('+') {
+                (Combinator::NextSibling, rest)
+            } else if let Some(rest) = part.strip_prefix('~') {
+                (Combinator::SubsequentSibling, rest)
+            } else {
+                (Combinator::Descendant, part)
+            };
+            Ok(RelativeSelector {
+                combinator,
+                selector: Selector::parse(rest.trim())?,
+            })
+        })
+        .collect()
 }
 
 fn parse_attribute_value(source: &str, cursor: &mut usize) -> Result<String, String> {
@@ -2372,6 +2748,7 @@ fn with_synthesized_endpoints(keyframes: &Keyframes, base: &BTreeMap<String, Str
                 base.get(property).map(|value| Declaration {
                     property: property.clone(),
                     value: value.clone(),
+                    important: false,
                 })
             })
             .collect(),
@@ -2834,7 +3211,15 @@ fn parse_declarations(
         } else {
             property_name.to_ascii_lowercase()
         };
-        let value = chunk[colon + 1..].trim().to_string();
+        let mut value = chunk[colon + 1..].trim();
+        let mut important = false;
+        if let Some(bang) = value.rfind('!')
+            && value[bang + 1..].trim().eq_ignore_ascii_case("important")
+        {
+            important = true;
+            value = value[..bang].trim_end();
+        }
+        let value = value.to_string();
         if property.is_empty() || value.is_empty() {
             drop_or_fail(
                 dropped.as_deref_mut(),
@@ -2842,12 +3227,26 @@ fn parse_declarations(
             )?;
             continue;
         }
-        declarations.push(Declaration { property, value });
+        declarations.push(Declaration {
+            property,
+            value,
+            important,
+        });
     }
     Ok(declarations)
 }
 
+thread_local! {
+    // the element's color while its declarations apply, for currentColor
+    static CURRENT_COLOR: std::cell::Cell<Color> = const { std::cell::Cell::new(Color::BLACK) };
+}
+
+fn parse_color(value: &str) -> Option<Color> {
+    crate::colors::parse(value, CURRENT_COLOR.with(std::cell::Cell::get))
+}
+
 fn apply_declaration(style: &mut Style, property: &str, value: &str) {
+    CURRENT_COLOR.with(|current| current.set(style.color));
     match property {
         "display" => {
             style.display = match value.trim().to_ascii_lowercase().as_str() {
@@ -2908,7 +3307,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 }
                 return;
             }
-            if let Some(color) = Color::parse(value) {
+            if let Some(color) = parse_color(value) {
                 style.gradient = None;
                 style.background = color;
                 if property == "background" {
@@ -3024,7 +3423,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "box-shadow" => {
             style.shadow = parse_box_shadow(value);
         }
-        "color" => style.color = Color::parse(value).unwrap_or(style.color),
+        "color" => style.color = parse_color(value).unwrap_or(style.color),
         "font-size" => style.font_size = parse_length(value).unwrap_or(style.font_size),
         "line-height" => style.line_height = parse_line_height(value).unwrap_or(style.line_height),
         "font-weight" => {
@@ -3096,7 +3495,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 .unwrap_or(style.border_width)
                 .max(0.0);
         }
-        "border-color" => style.border_color = Color::parse(value).unwrap_or(style.border_color),
+        "border-color" => style.border_color = parse_color(value).unwrap_or(style.border_color),
         _ => {}
     }
 }
@@ -3109,7 +3508,7 @@ fn parse_border(style: &mut Style, value: &str) {
             width = parse_length(token).and_then(|length| length.resolve(0.0, 16.0));
         }
         if color.is_none() {
-            color = Color::parse(token);
+            color = parse_color(token);
         }
     }
     if let Some(width) = width {
@@ -3423,11 +3822,11 @@ fn parse_linear_gradient(value: &str) -> Option<Gradient> {
         let head = pieces.next().map(str::trim);
         let (color, position) = match (head, last.strip_suffix('%')) {
             (Some(head), Some(percent)) => (
-                Color::parse(head)?,
+                parse_color(head)?,
                 percent.trim().parse::<f32>().ok()? / 100.0,
             ),
             _ => (
-                Color::parse(entry)?,
+                parse_color(entry)?,
                 index as f32 / (entries.len() - 1) as f32,
             ),
         };
@@ -3460,7 +3859,7 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
             lengths.push(length);
             continue;
         }
-        color = Color::parse(token)?;
+        color = parse_color(token)?;
     }
     if lengths.len() < 2 || lengths.len() > 4 {
         return None;
@@ -3797,7 +4196,7 @@ fn apply_background_layer(style: &mut Style, value: &str, shorthand: bool) {
             image = crate::image::intern_image_source(url);
         } else if let Some(parsed) = parse_background_repeat(word) {
             repeat = Some(parsed);
-        } else if let Some(color) = Color::parse(word) {
+        } else if let Some(color) = parse_color(word) {
             if shorthand {
                 style.background = color;
             }
@@ -3926,29 +4325,6 @@ fn strip_comments(source: &str) -> String {
     }
     output.push_str(&source[cursor..]);
     output
-}
-
-fn parse_rgb(input: &str) -> Option<Color> {
-    let input = input.strip_prefix("rgb(")?.strip_suffix(')')?;
-    let values = input
-        .split(',')
-        .map(|value| value.trim().parse::<u8>().ok())
-        .collect::<Option<Vec<_>>>()?;
-    (values.len() == 3).then(|| Color::opaque(values[0], values[1], values[2]))
-}
-
-fn parse_hex_byte(value: &str) -> Option<u8> {
-    u8::from_str_radix(value, 16).ok()
-}
-
-fn expand_nibble(value: u8) -> Option<u8> {
-    let value = match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        b'A'..=b'F' => value - b'A' + 10,
-        _ => return None,
-    };
-    Some(value * 17)
 }
 
 #[cfg(test)]
@@ -4561,7 +4937,7 @@ mod tests {
     #[test]
     fn recovering_parse_keeps_valid_rules_and_reports_the_rest() {
         let (stylesheet, dropped) = Stylesheet::parse_recovering(
-            r#"p::first-line { color: red; } .card { color: red; } @supports (display: grid) { p { color: red } } p { color: } .last { color: blue; }"#,
+            r#"p::nonsense { color: red; } .card { color: red; } @supports (display: grid) { p { color: red } } p { color: } .last { color: blue; }"#,
         );
         assert_eq!(stylesheet.rules.len(), 3);
         assert_eq!(
@@ -4573,10 +4949,11 @@ mod tests {
             vec![1, 0, 1]
         );
         assert_eq!(dropped.len(), 3);
-        assert!(dropped[0].starts_with("p::first-line"));
+        assert!(dropped[0].starts_with("p::nonsense"));
         assert!(dropped[1].starts_with("unsupported at-rule: @supports"));
         assert!(dropped[2].contains("invalid declaration: color:"));
-        assert!(Stylesheet::parse("p::first-line { color: red; }").is_err());
+        assert!(Stylesheet::parse("p::nonsense { color: red; }").is_err());
+        assert!(Stylesheet::parse("p::first-line { color: red; }").is_ok());
         assert!(Stylesheet::parse("body::before { content: \"\"; }").is_ok());
     }
 

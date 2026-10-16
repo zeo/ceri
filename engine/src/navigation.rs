@@ -5056,6 +5056,59 @@ mod tests {
     }
 
     #[test]
+    fn cascade_honours_importance_source_order_colors_and_level_four_selectors() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0 }
+                #a { color: rgb(10 20 30 / 50%); border: 2px solid currentColor; background-color: color-mix(in srgb, red, blue) }
+                #a { margin-top: 3px; margin: 7px; }
+                #a { margin-left: 9px }
+                #a { padding-top: 1px !important } div#a { padding-top: 5px }
+                .box:is(.x, .y) { width: 10px } .box:where(#a) { width: 99px }
+                li:nth-child(2n of .odd) { color: hsl(120 100% 25%) }
+                ul:has(> li.odd) { color: rebeccapurple }
+            </style>
+            <div id="a" class="box x" data-x="one two" lang="en-GB" data-y="abc">box</div>
+            <ul id="list"><li class="odd">1</li><li>2</li><li class="odd" id="third">3</li><li></li></ul>
+            <input id="field" placeholder="type"><a id="link" href="https://ceri.example/doc.pdf">doc</a>
+            <p id="status">idle</p>
+            <script>
+                const a = document.getElementById("a");
+                const style = getComputedStyle(a);
+                const checks = [
+                    style.color, style.borderTopColor, style.backgroundColor, style.marginTop, style.marginLeft,
+                    style.paddingTop, style.width,
+                    getComputedStyle(document.getElementById("third")).color,
+                    getComputedStyle(document.getElementById("list")).color,
+                ];
+                const selectors = [
+                    ["#a", "[data-x~=two]"], ["#a", "[lang|=en]"], ["#a", "[data-y=ABC i]"], ["#a", "[data-y=ABC]"],
+                    ["#link", "[href^=https][href$='.pdf'][href*=ceri]"], ["#link", "a:any-link"], ["#link", "a:visited"],
+                    ["#field", "input:placeholder-shown:read-write:optional"], ["#list", "ul:has(> li:empty)"],
+                    ["#third", "li:last-of-type"], ["#third", "li:nth-last-child(2)"], ["#third", "li:nth-of-type(3)"],
+                    ["#list", ":not(:has(+ p))"], ["#a", "div:is(.nope, .x):not(.y)"],
+                ];
+                for (const [id, selector] of selectors) checks.push(document.querySelector(id).matches(selector));
+                document.getElementById("status").textContent = checks.join("|");
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("cascade page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document
+            .find_element_by_id("status")
+            .unwrap_or_else(|| panic!("{:?}", browser.last_navigation_failure()));
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some(
+                "rgba(10, 20, 30, 0.502)|rgba(10, 20, 30, 0.502)|rgb(128, 0, 128)|7px|9px|1px|10px|rgb(0, 128, 0)|rgb(102, 51, 153)|true|true|true|false|true|true|false|true|true|false|true|true|true|true"
+            )
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>

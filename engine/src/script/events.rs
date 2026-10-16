@@ -1609,6 +1609,11 @@ impl ScriptRuntime {
         event_type: &str,
     ) -> Result<bool, ScriptError> {
         let target = ListenerTarget::Node(node);
+        match event_type {
+            "pointerdown" if self.pointer.button == 0 => self.active_node = Some(node),
+            "pointerup" => self.active_node = None,
+            _ => {}
+        }
         let pointer = self.fire(target, event_type, HostEventFields::default())?;
         let mouse = match event_type {
             "pointerdown" => {

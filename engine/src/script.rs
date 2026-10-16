@@ -496,6 +496,8 @@ pub struct ScriptRuntime {
     click_detail: u32,
     motion_detail: Option<Rc<(String, f64)>>,
     pointer: events::PointerState,
+    // where the primary button went down, for :active
+    active_node: Option<NodeId>,
     // the physical code and auto-repeat flag of the key being dispatched, when the host knows them
     key_detail: Option<(String, bool)>,
     // set while the error event for an uncaught exception is out, so a throwing
@@ -1502,6 +1504,7 @@ impl ScriptRuntime {
             click_detail: 1,
             motion_detail: None,
             pointer: events::PointerState::default(),
+            active_node: None,
             key_detail: None,
             reporting_error: false,
             selection,
@@ -2788,6 +2791,7 @@ impl ScriptRuntime {
         let mut state = StyleState {
             hovered: hovered_path,
             focused: self.focused_element,
+            active: self.active_node,
             scroll_offsets: self.scroll_offsets.clone(),
             control_values: self.control_values.clone().into_iter().collect(),
             text_selections: self
