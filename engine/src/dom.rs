@@ -139,6 +139,9 @@ pub struct Document {
     // nodes that were created or lost their parent, so their owner can decide whether to free them
     orphans: Vec<NodeId>,
     template_contents: HashMap<NodeId, NodeId>,
+    // shadow roots by host, and each root's host and whether script may reach it from the host
+    shadow_roots: HashMap<NodeId, NodeId>,
+    shadow_hosts: HashMap<NodeId, (NodeId, bool)>,
     live_ranges: LiveRanges,
     // mutations since the observers last looked, recorded only while something observes
     mutations: Option<Vec<MutationEntry>>,
@@ -252,6 +255,8 @@ impl Document {
             version: 0,
             orphans: Vec::new(),
             template_contents: HashMap::new(),
+            shadow_roots: HashMap::new(),
+            shadow_hosts: HashMap::new(),
             live_ranges: LiveRanges::default(),
             mutations: None,
             element_changes: None,
@@ -875,8 +880,121 @@ impl Document {
         self.ancestors(id).last().unwrap_or(id)
     }
 
+    // connected through any number of shadow roots to their hosts, as the DOM's
+    // shadow-including root defines it
     pub fn is_connected(&self, id: NodeId) -> bool {
-        self.contains(id) && self.tree_root(id) == self.root
+        self.contains(id) && self.shadow_including_root(id) == self.root
+    }
+
+    pub fn shadow_including_root(&self, id: NodeId) -> NodeId {
+        let mut root = self.tree_root(id);
+        while let Some(&(host, _)) = self.shadow_hosts.get(&root) {
+            root = self.tree_root(host);
+        }
+        root
+    }
+
+    // a host's shadow root, with whether it is open
+    pub fn attach_shadow(&mut self, host: NodeId, open: bool) -> Option<NodeId> {
+        if self.element(host).is_none() || self.shadow_roots.contains_key(&host) {
+            return None;
+        }
+        let root = self.allocate(NodeKind::Fragment);
+        self.orphans.retain(|&orphan| orphan != root);
+        self.shadow_roots.insert(host, root);
+        self.shadow_hosts.insert(root, (host, open));
+        Some(root)
+    }
+
+    pub fn has_shadow_roots(&self) -> bool {
+        !self.shadow_roots.is_empty()
+    }
+
+    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        self.shadow_roots.get(&host).copied()
+    }
+
+    // the host of a shadow root and whether the root is open
+    pub fn shadow_host(&self, root: NodeId) -> Option<(NodeId, bool)> {
+        self.shadow_hosts.get(&root).copied()
+    }
+
+    // the parent, or the host for a shadow root, which events and inheritance follow
+    pub fn composed_parent(&self, id: NodeId) -> Option<NodeId> {
+        self.parent(id)
+            .or_else(|| self.shadow_host(id).map(|(host, _)| host))
+    }
+
+    // where an event goes next: a slotted node's slot, a shadow root's host, or the parent
+    pub fn event_parent(&self, id: NodeId) -> Option<NodeId> {
+        if self.has_shadow_roots()
+            && let Some(slot) = self.assigned_slot(id)
+        {
+            return Some(slot);
+        }
+        self.composed_parent(id)
+    }
+
+    // the slot inside a shadow tree that a light child of its host renders in
+    pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
+        let host = self.parent(node)?;
+        let root = self.shadow_root(host)?;
+        let name = self
+            .element(node)
+            .and_then(|element| element.attr("slot"))
+            .unwrap_or_default();
+        if self.is_text(node) && self.text(node).is_some_and(|text| text.trim().is_empty()) {
+            return None;
+        }
+        self.descendants(root).find(|&candidate| {
+            self.element(candidate).is_some_and(|element| {
+                element.name == "slot" && element.attr("name").unwrap_or_default() == name
+            })
+        })
+    }
+
+    // the light children of the host that a slot shows
+    pub fn assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        let root = self.tree_root(slot);
+        let Some((host, _)) = self.shadow_host(root) else {
+            return Vec::new();
+        };
+        self.children(host)
+            .iter()
+            .copied()
+            .filter(|&child| self.assigned_slot(child) == Some(slot))
+            .collect()
+    }
+
+    // the children a box is built from: a host shows its shadow tree, and a slot shows the
+    // nodes assigned to it, or its own children when nothing is
+    pub fn flat_children(&self, id: NodeId) -> std::borrow::Cow<'_, [NodeId]> {
+        if let Some(root) = self.shadow_root(id) {
+            return self.children(root).into();
+        }
+        let is_slot = self
+            .element(id)
+            .is_some_and(|element| element.name == "slot");
+        if is_slot && self.shadow_host(self.tree_root(id)).is_some() {
+            let assigned = self.assigned_nodes(id);
+            if !assigned.is_empty() {
+                return assigned.into();
+            }
+        }
+        self.children(id).into()
+    }
+
+    // the text of the style elements directly inside a shadow root
+    pub fn shadow_style_text(&self, root: NodeId) -> String {
+        self.children(root)
+            .iter()
+            .filter(|&&child| {
+                self.element(child)
+                    .is_some_and(|element| element.name == "style")
+            })
+            .map(|&child| self.text_content(child))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     // document order of two nodes in one tree; nodes in different trees order by id
@@ -1116,6 +1234,9 @@ impl Document {
         let freed = self.subtree(id);
         for &node in &freed {
             self.template_contents.remove(&node);
+            if let Some(root) = self.shadow_roots.remove(&node) {
+                self.shadow_hosts.remove(&root);
+            }
             let slot = &mut self.slots[node.index as usize];
             slot.node = None;
             slot.generation = slot.generation.wrapping_add(1);
@@ -1135,6 +1256,7 @@ impl Document {
             };
             pending.extend(data.children.iter().copied());
             pending.extend(self.template_content(current));
+            pending.extend(self.shadow_root(current));
             nodes.push(current);
         }
         nodes

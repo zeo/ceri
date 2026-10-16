@@ -210,6 +210,10 @@ static INTERFACES: &[Interface] = &[
             ("hasAttribute", Method(1)),
             ("toggleAttribute", Method(1)),
             ("getAttributeNames", Method(0)),
+            ("attachShadow", Method(1)),
+            ("shadowRoot", ReadOnly),
+            ("assignedSlot", ReadOnly),
+            ("slot", Attr("slot")),
             ("getBoundingClientRect", Method(0)),
             ("getClientRects", Method(0)),
             ("clientWidth", ReadOnly),
@@ -280,6 +284,15 @@ static INTERFACES: &[Interface] = &[
             ("append", Method(0)),
             ("prepend", Method(0)),
             ("replaceChildren", Method(0)),
+        ],
+    },
+    Interface {
+        name: "ShadowRoot",
+        parent: "DocumentFragment",
+        members: &[
+            ("host", ReadOnly),
+            ("mode", ReadOnly),
+            ("innerHTML", ReadWrite),
         ],
     },
     Interface {
@@ -541,6 +554,15 @@ static INTERFACES: &[Interface] = &[
         members: &[],
     },
     Interface {
+        name: "HTMLSlotElement",
+        parent: "HTMLElement",
+        members: &[
+            ("name", Attr("name")),
+            ("assignedNodes", Method(0)),
+            ("assignedElements", Method(0)),
+        ],
+    },
+    Interface {
         name: "HTMLUnknownElement",
         parent: "HTMLElement",
         members: &[],
@@ -697,6 +719,7 @@ pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
         Some(NodeKind::Document) => "Document",
         Some(NodeKind::Text(_)) => "Text",
         Some(NodeKind::Comment(_)) => "Comment",
+        Some(NodeKind::Fragment) if document.shadow_host(node).is_some() => "ShadowRoot",
         Some(NodeKind::Fragment) => "DocumentFragment",
         Some(NodeKind::Element(element)) => match element.namespace {
             Namespace::Svg => "SVGElement",
@@ -727,6 +750,7 @@ pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
                 "head" => "HTMLHeadElement",
                 "html" => "HTMLHtmlElement",
                 "table" => "HTMLTableElement",
+                "slot" => "HTMLSlotElement",
                 name if is_known_html_element(name) || name.contains('-') => "HTMLElement",
                 _ => "HTMLUnknownElement",
             },
@@ -1275,7 +1299,18 @@ impl ScriptRuntime {
                 None => Value::Bool(false),
             },
             ("getRootNode", Access::Call) => {
-                let root = self.document.borrow().tree_root(node);
+                let composed = if super::operations::is_primitive(&first) {
+                    false
+                } else {
+                    self.get_property(&first, "composed")?.truthy()
+                };
+                let document = self.document.borrow();
+                let root = if composed {
+                    document.shadow_including_root(node)
+                } else {
+                    document.tree_root(node)
+                };
+                drop(document);
                 self.node_value(root)
             }
             ("compareDocumentPosition", Access::Call) => {
@@ -1377,6 +1412,126 @@ impl ScriptRuntime {
             ("createDocumentFragment", Access::Call) => {
                 let created = self.document.borrow_mut().create_fragment();
                 self.node_value(created)
+            }
+            ("attachShadow", Access::Call) => {
+                let mode = match first.resolve() {
+                    options if !super::operations::is_primitive(&options) => {
+                        let mode = self.get_property(&options, "mode")?;
+                        self.coerce_string(mode)?
+                    }
+                    _ => String::new(),
+                };
+                if mode != "open" && mode != "closed" {
+                    return Err(self.type_error(
+                        "Failed to execute 'attachShadow' on 'Element': The provided value is not a valid enum value of type ShadowRootMode.",
+                    ));
+                }
+                let allowed = self.document.borrow().element(node).is_some_and(|element| {
+                    element.name.contains('-')
+                        || matches!(
+                            element.name.as_str(),
+                            "article"
+                                | "aside"
+                                | "blockquote"
+                                | "body"
+                                | "div"
+                                | "footer"
+                                | "h1"
+                                | "h2"
+                                | "h3"
+                                | "h4"
+                                | "h5"
+                                | "h6"
+                                | "header"
+                                | "main"
+                                | "nav"
+                                | "p"
+                                | "section"
+                                | "span"
+                        )
+                });
+                let root = allowed
+                    .then(|| {
+                        self.document
+                            .borrow_mut()
+                            .attach_shadow(node, mode == "open")
+                    })
+                    .flatten();
+                match root {
+                    Some(root) => self.node_value(root),
+                    None => {
+                        return Err(self.throw_value(dom_exception(
+                            "NotSupportedError",
+                            "Failed to execute 'attachShadow' on 'Element': This element does not support attachShadow",
+                        )));
+                    }
+                }
+            }
+            ("shadowRoot", Access::Get) => {
+                let document = self.document.borrow();
+                let open = document
+                    .shadow_root(node)
+                    .filter(|&root| document.shadow_host(root).is_some_and(|(_, open)| open));
+                drop(document);
+                self.optional_node(open)
+            }
+            ("assignedSlot", Access::Get) => {
+                let slot = self.document.borrow().assigned_slot(node);
+                self.optional_node(slot)
+            }
+            ("assignedNodes", Access::Call) | ("assignedElements", Access::Call) => {
+                let document = self.document.borrow();
+                let nodes = document
+                    .assigned_nodes(node)
+                    .into_iter()
+                    .filter(|&assigned| {
+                        member.name() == "assignedNodes" || document.element(assigned).is_some()
+                    })
+                    .collect::<Vec<_>>();
+                drop(document);
+                Self::new_array(
+                    nodes
+                        .into_iter()
+                        .map(|node| self.node_value(node))
+                        .collect(),
+                )
+            }
+            ("host", Access::Get) => {
+                let host = self
+                    .document
+                    .borrow()
+                    .shadow_host(node)
+                    .map(|(host, _)| host);
+                self.optional_node(host)
+            }
+            ("mode", Access::Get) => {
+                let open = self
+                    .document
+                    .borrow()
+                    .shadow_host(node)
+                    .map(|(_, open)| open);
+                Value::String(
+                    if open == Some(false) {
+                        "closed"
+                    } else {
+                        "open"
+                    }
+                    .into(),
+                )
+            }
+            ("innerHTML", _) if self.document.borrow().shadow_host(node).is_some() => {
+                if member.access == Access::Get {
+                    Value::String(self.document.borrow().inner_html(node).into())
+                } else {
+                    let source = self.coerce_string(first)?;
+                    let fragment = self
+                        .document
+                        .borrow_mut()
+                        .parse_fragment(&source)
+                        .map_err(|error| runtime_error(error.to_string()))?;
+                    self.replace_children_quietly(node, Some(fragment));
+                    Value::Undefined
+                }
             }
             ("createEvent", Access::Call) => {
                 let interface = self.coerce_string(first)?;

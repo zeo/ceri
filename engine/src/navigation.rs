@@ -5004,6 +5004,54 @@ mod tests {
     }
 
     #[test]
+    fn shadow_roots_render_slots_scope_styles_and_retarget_events() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } .label { color: rgb(255, 0, 0) } x-card { display: block }</style><x-card id="card"><span class="label" id="title" slot="title">Title</span><span class="label" id="text">body text</span></x-card><p id="status">idle</p><script>
+                const card = document.getElementById("card");
+                const root = card.attachShadow({ mode: "open" });
+                root.innerHTML = '<style>:host { padding: 4px } .label { color: rgb(0, 0, 255) } :host h2 { margin: 0; height: 20px }</style><h2 class="label"><slot name="title"></slot></h2><div id="inner"><slot></slot></div>';
+                const heading = root.querySelector("h2");
+                const inner = root.getElementById("inner");
+                const log = [];
+                card.addEventListener("click", (event) => log.push("host:" + event.target.id + ":" + event.composedPath().length));
+                inner.addEventListener("click", (event) => log.push("inner:" + event.target.id));
+                document.getElementById("text").click();
+                heading.click();
+                const style = (element) => getComputedStyle(element).color;
+                document.getElementById("status").textContent = [
+                    card.shadowRoot === root, root.host === card, root.mode, root instanceof ShadowRoot,
+                    card.querySelector("h2"), card.children.length,
+                    style(heading), style(document.getElementById("title")), getComputedStyle(card).paddingTop,
+                    heading.offsetHeight, inner.offsetHeight > 0,
+                    document.getElementById("title").assignedSlot === root.querySelector("slot[name=title]"),
+                    root.querySelector("slot:not([name])").assignedNodes().length,
+                    heading.getRootNode() === root, heading.getRootNode({ composed: true }) === document,
+                    log.join("|"),
+                ].join(",");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("shadow page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some(
+                "true,true,open,true,,2,rgb(0, 0, 255),rgb(255, 0, 0),4px,20,true,true,1,true,true,inner:text|host:text:7|host:card:5"
+            )
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>

@@ -286,7 +286,7 @@ impl<'a> Subject<'a> {
             })
         };
         items.extend(generated_box(PseudoElement::Before, &generated[0]));
-        for &child in self.document.children(self.node) {
+        for &child in self.document.flat_children(self.node).iter() {
             match self.document.kind(child) {
                 Some(NodeKind::Text(text)) => items.push(Child::Text(Some(child), text)),
                 Some(NodeKind::Element(_)) => {

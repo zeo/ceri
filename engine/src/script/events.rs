@@ -386,6 +386,8 @@ struct DispatchState {
     passive: bool,
     dispatching: bool,
     path: Vec<Value>,
+    // the node dispatch started at, kept for retargeting across shadow boundaries
+    origin: Option<NodeId>,
 }
 
 struct EventMeta {
@@ -773,20 +775,71 @@ impl ScriptRuntime {
     }
 
     // the targets an event visits, innermost first; the window follows a connected node
-    fn event_path(&self, target: ListenerTarget, event_type: &str) -> Vec<ListenerTarget> {
+    // the targets an event visits, innermost first; a composed event leaves a shadow tree
+    // through its host, and the window follows a connected node
+    fn event_path(
+        &self,
+        target: ListenerTarget,
+        event_type: &str,
+        composed: bool,
+    ) -> Vec<ListenerTarget> {
         let node = match target {
             ListenerTarget::Node(node) => node,
             other => return vec![other],
         };
         let document = self.document.borrow();
-        let mut path = std::iter::once(node)
-            .chain(document.ancestors(node))
-            .map(ListenerTarget::Node)
-            .collect::<Vec<_>>();
-        if document.tree_root(node) == document.root() && event_type != "load" {
+        let mut path = vec![ListenerTarget::Node(node)];
+        let mut current = node;
+        loop {
+            let next = if composed {
+                document.event_parent(current)
+            } else if document.has_shadow_roots() && document.assigned_slot(current).is_some() {
+                document.assigned_slot(current)
+            } else {
+                document.parent(current)
+            };
+            let Some(next) = next else {
+                break;
+            };
+            path.push(ListenerTarget::Node(next));
+            current = next;
+        }
+        if current == document.root() && event_type != "load" {
             path.push(ListenerTarget::Window);
         }
         path
+    }
+
+    // the target as listeners at a node see it: a node inside a shadow tree they are not
+    // part of shows up as its host
+    fn retarget(&self, origin: NodeId, listener: ListenerTarget) -> NodeId {
+        let document = self.document.borrow();
+        let mut target = origin;
+        loop {
+            let root = document.tree_root(target);
+            let Some((host, _)) = document.shadow_host(root) else {
+                return target;
+            };
+            let inside = match listener {
+                ListenerTarget::Node(node) => {
+                    let mut current = Some(node);
+                    let mut found = false;
+                    while let Some(candidate) = current {
+                        if candidate == root {
+                            found = true;
+                            break;
+                        }
+                        current = document.event_parent(candidate);
+                    }
+                    found
+                }
+                _ => false,
+            };
+            if inside {
+                return target;
+            }
+            target = host;
+        }
     }
 
     pub(super) fn add_event_listener(
@@ -1023,10 +1076,16 @@ impl ScriptRuntime {
         target: ListenerTarget,
     ) -> Result<bool, ScriptError> {
         let event_type = event.event_type();
-        let path = self.event_path(target, &event_type);
+        let path = self.event_path(target, &event_type, event.composed);
         {
             let mut state = event.state.borrow_mut();
             state.dispatching = true;
+            state.origin = match target {
+                ListenerTarget::Node(node) if self.document.borrow().has_shadow_roots() => {
+                    Some(node)
+                }
+                _ => None,
+            };
             state.target = Some(self.target_value(target));
             state.path = path.iter().map(|&item| self.target_value(item)).collect();
         }
@@ -1072,10 +1131,15 @@ impl ScriptRuntime {
         event_type: &str,
     ) -> Result<bool, ScriptError> {
         let current = self.target_value(target);
+        let origin = event.state.borrow().origin;
+        let retargeted = origin.map(|origin| self.node_value(self.retarget(origin, target)));
         {
             let mut state = event.state.borrow_mut();
             state.phase = phase;
             state.current_target = Some(current.clone());
+            if let Some(retargeted) = retargeted {
+                state.target = Some(retargeted);
+            }
         }
         let mut invoked = false;
         // a window handler or an inline attribute handler that script never replaced runs

@@ -1,6 +1,8 @@
 use crate::dom::{Document, Element, NodeId};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
@@ -772,6 +774,8 @@ pub struct Stylesheet {
     index: RuleIndex,
     // rules that declare a transition or an animation, checked before a full cascade
     motion_rules: Vec<usize>,
+    // shadow root style elements, by their text
+    shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
 }
 
 fn motion_rules(rules: &[Rule]) -> Vec<usize> {
@@ -1164,6 +1168,7 @@ impl Stylesheet {
             keyframes,
             index,
             motion_rules,
+            shadow_sheets: RefCell::default(),
         })
     }
 
@@ -1188,6 +1193,7 @@ impl Stylesheet {
                 keyframes,
                 index,
                 motion_rules,
+                shadow_sheets: RefCell::default(),
             },
             dropped,
         )
@@ -1547,6 +1553,91 @@ impl Stylesheet {
             .collect()
     }
 
+    // the winning declaration of each property among the rules that match, borrowed from
+    // this sheet
+    fn borrowed_declarations<'a>(
+        &'a self,
+        element: &Element,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+        host_only: bool,
+    ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
+        let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> = HashMap::new();
+        for position in self.index.candidates(element) {
+            let Some(rule) = self.rules.get(position) else {
+                continue;
+            };
+            if rule
+                .media
+                .as_ref()
+                .is_some_and(|media| !media.matches(state))
+            {
+                continue;
+            }
+            let Some(specificity) = rule
+                .selectors
+                .iter()
+                .filter(|selector| !host_only || selector.names_host())
+                .filter(|selector| selector.matches(document, node, pseudo, state))
+                .map(Selector::specificity)
+                .max()
+            else {
+                continue;
+            };
+            for declaration in &rule.declarations {
+                let candidate = (
+                    specificity,
+                    rule.order,
+                    Cow::Borrowed(declaration.value.as_str()),
+                );
+                let replace = values
+                    .get(declaration.property.as_str())
+                    .is_none_or(|current| (candidate.0, candidate.1) >= (current.0, current.1));
+                if replace {
+                    values.insert(Cow::Borrowed(declaration.property.as_str()), candidate);
+                }
+            }
+        }
+        values
+    }
+
+    fn matched_declarations(
+        &self,
+        element: &Element,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+        host_only: bool,
+    ) -> Vec<(String, (Specificity, usize, String))> {
+        self.borrowed_declarations(element, document, node, pseudo, state, host_only)
+            .into_iter()
+            .map(|(property, (specificity, order, value))| {
+                (
+                    property.into_owned(),
+                    (specificity, order, value.into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    // the parsed style elements of a shadow root, parsed once per distinct text
+    fn shadow_sheet(&self, document: &Document, root: NodeId) -> Option<Rc<Stylesheet>> {
+        let text = document.shadow_style_text(root);
+        if text.trim().is_empty() {
+            return None;
+        }
+        let mut sheets = self.shadow_sheets.borrow_mut();
+        if let Some(sheet) = sheets.get(&text) {
+            return Some(sheet.clone());
+        }
+        let sheet = Rc::new(Stylesheet::parse_recovering(&text).0);
+        sheets.insert(text, sheet.clone());
+        Some(sheet)
+    }
+
     // a cheap check before a full cascade: only rules that declare motion, or inline style
     pub(crate) fn may_animate(
         &self,
@@ -1598,38 +1689,45 @@ impl Stylesheet {
         let Some(element) = document.element(node) else {
             return values;
         };
-        for position in self.index.candidates(element) {
-            let Some(rule) = self.rules.get(position) else {
-                continue;
-            };
-            if rule
-                .media
-                .as_ref()
-                .is_some_and(|media| !media.matches(state))
+        // a shadow tree is styled by its own style elements, and its host also takes the
+        // :host rules there, below anything the outer document says
+        let shadows = document.has_shadow_roots();
+        let root = if shadows {
+            document.tree_root(node)
+        } else {
+            document.root()
+        };
+        let in_shadow = shadows && document.shadow_host(root).is_some();
+        values = if in_shadow {
+            self.shadow_sheet(document, root)
+                .map(|sheet| {
+                    sheet
+                        .matched_declarations(element, document, node, pseudo, state, false)
+                        .into_iter()
+                        .map(|(property, (specificity, order, value))| {
+                            (
+                                Cow::Owned(property),
+                                (specificity, order, Cow::Owned(value)),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.borrowed_declarations(element, document, node, pseudo, state, false)
+        };
+        if shadows
+            && let Some(shadow) = document.shadow_root(node)
+            && let Some(sheet) = self.shadow_sheet(document, shadow)
+        {
+            for (property, (specificity, order, value)) in
+                sheet.matched_declarations(element, document, node, pseudo, state, true)
             {
-                continue;
-            }
-            let Some(specificity) = rule
-                .selectors
-                .iter()
-                .filter(|selector| selector.matches(document, node, pseudo, state))
-                .map(Selector::specificity)
-                .max()
-            else {
-                continue;
-            };
-            for declaration in &rule.declarations {
-                let candidate = (
+                values.entry(Cow::Owned(property)).or_insert((
                     specificity,
-                    rule.order,
-                    Cow::Borrowed(declaration.value.as_str()),
-                );
-                let replace = values
-                    .get(declaration.property.as_str())
-                    .is_none_or(|current| (candidate.0, candidate.1) >= (current.0, current.1));
-                if replace {
-                    values.insert(Cow::Borrowed(declaration.property.as_str()), candidate);
-                }
+                    order,
+                    Cow::Owned(value),
+                ));
             }
         }
         let mut inline_dropped = Vec::new();
@@ -1767,6 +1865,8 @@ enum PseudoClass {
     OnlyChild,
     NthChild(NthPattern),
     Not(Vec<Selector>),
+    // the shadow host, seen from its shadow tree's styles, optionally matching a compound
+    Host(Vec<Selector>),
 }
 
 // an+b as defined by Selectors Level 4, with odd and even folded into it
@@ -1910,11 +2010,25 @@ impl Selector {
             return true;
         }
         let previous = |candidate: NodeId| self.matches_part(index - 1, document, candidate, state);
+        // from inside a shadow tree the host is reachable only through :host
+        let host = || {
+            if !document.has_shadow_roots() {
+                return None;
+            }
+            document
+                .shadow_host(document.tree_root(node))
+                .map(|(host, _)| host)
+                .filter(|_| self.parts[index - 1].compound.names_host())
+        };
         match self.parts[index].combinator {
-            Some(Combinator::Child) => document.parent_element(node).is_some_and(previous),
+            Some(Combinator::Child) => document
+                .parent_element(node)
+                .or_else(host)
+                .is_some_and(previous),
             Some(Combinator::Descendant) => document
                 .ancestors(node)
                 .filter(|&ancestor| document.is_element(ancestor))
+                .chain(host())
                 .any(previous),
             Some(Combinator::NextSibling) => {
                 document.element_sibling(node, false).is_some_and(previous)
@@ -1933,6 +2047,13 @@ impl Selector {
         }
     }
 
+    // a selector whose subject is the shadow host, as :host rules are
+    fn names_host(&self) -> bool {
+        self.parts
+            .last()
+            .is_some_and(|part| part.compound.names_host())
+    }
+
     fn specificity(&self) -> Specificity {
         self.parts
             .iter()
@@ -1948,6 +2069,12 @@ impl Selector {
 }
 
 impl CompoundSelector {
+    fn names_host(&self) -> bool {
+        self.pseudo_classes
+            .iter()
+            .any(|pseudo| matches!(pseudo, PseudoClass::Host(_)))
+    }
+
     fn matches(
         &self,
         element: &Element,
@@ -2029,6 +2156,13 @@ impl PseudoClass {
             Self::Not(selectors) => !selectors
                 .iter()
                 .any(|selector| selector.matches(document, node, None, state)),
+            Self::Host(selectors) => {
+                document.shadow_root(node).is_some()
+                    && (selectors.is_empty()
+                        || selectors
+                            .iter()
+                            .any(|selector| selector.matches(document, node, None, state)))
+            }
         }
     }
 
@@ -2104,6 +2238,11 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 let pseudo = if name == "not" {
                     let argument = parse_function_argument(source, cursor)?;
                     PseudoClass::Not(Selector::parse_list(&argument)?)
+                } else if name == "host" && source.as_bytes().get(*cursor) == Some(&b'(') {
+                    let argument = parse_function_argument(source, cursor)?;
+                    PseudoClass::Host(Selector::parse_list(&argument)?)
+                } else if name == "host" {
+                    PseudoClass::Host(Vec::new())
                 } else if name == "nth-child" {
                     let argument = parse_function_argument(source, cursor)?;
                     PseudoClass::NthChild(NthPattern::parse(&argument)?)
