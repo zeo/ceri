@@ -1,6 +1,6 @@
 use crate::css::{
     AlignItems, Color, Display, Edges, FlexDirection, FontWeight, Gradient, GridTemplate,
-    GridTrack, InheritedText, JustifyContent, Overflow, Position, PseudoElement, Style,
+    GridTrack, InheritedText, JustifyContent, Length, Overflow, Position, PseudoElement, Style,
     StyleContext, StyleState, Stylesheet, TextAlign,
 };
 use crate::dom::{Document, Element, NodeId, NodeKind};
@@ -372,6 +372,8 @@ struct FlexItem<'a> {
 }
 
 struct FlexLayoutInput<'a> {
+    // the container's own content height when it is definite
+    content_height: Option<f32>,
     parent_opacity: f32,
     node: Subject<'a>,
     style: Style,
@@ -399,6 +401,7 @@ struct GridItem<'a> {
 }
 
 struct GridLayoutInput<'a> {
+    content_height: Option<f32>,
     parent_opacity: f32,
     node: Subject<'a>,
     style: Style,
@@ -423,6 +426,8 @@ struct ElementLayoutInput<'node, 'style> {
     containing_x: f32,
     containing_y: f32,
     containing_width: f32,
+    // the containing block's height when it is definite, for percentage heights
+    containing_height: Option<f32>,
     parent: ParentStyle,
     context: LayoutContext<'style>,
 }
@@ -549,6 +554,7 @@ pub fn layout_with_state(
             containing_x: 0.0,
             containing_y: cursor_y,
             containing_width: viewport.width,
+            containing_height: Some(viewport.height),
             parent: root_parent,
             context: LayoutContext {
                 viewport,
@@ -990,11 +996,17 @@ fn append_positioned_nodes(
         } else {
             LayoutMode::Absolute
         };
+        let block = if mode == LayoutMode::Fixed {
+            viewport
+        } else {
+            containing_block
+        };
         if let Some(layout) = layout_element(ElementLayoutInput {
             node,
             containing_x: 0.0,
             containing_y: 0.0,
             containing_width: containing_block.width,
+            containing_height: (block.height > 0.0).then_some(block.height),
             parent,
             context: LayoutContext {
                 viewport: viewport_size,
@@ -1415,6 +1427,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         containing_x,
         containing_y,
         containing_width,
+        containing_height,
         parent,
         context:
             LayoutContext {
@@ -1444,16 +1457,32 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(1.0);
-    let margin = resolve_edges(style.margin, containing_width, font_size);
+    let mut margin = resolve_margins(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
     let border = style.border_width.max(0.0);
-    let horizontal_extras =
-        margin.left + margin.right + padding.left + padding.right + (border * 2.0);
+    let horizontal_inner = padding.left + padding.right + (border * 2.0);
+    let vertical_inner = padding.top + padding.bottom + (border * 2.0);
+    let horizontal_extras = margin.left + margin.right + horizontal_inner;
+    // border-box sizes include padding and border, so the content takes what is left
+    let border_box = style.box_sizing == crate::css::BoxSizing::BorderBox;
+    let inner_width = |size: f32| {
+        if border_box {
+            (size - horizontal_inner).max(0.0)
+        } else {
+            size
+        }
+    };
+    let inner_height = |size: f32| {
+        if border_box {
+            (size - vertical_inner).max(0.0)
+        } else {
+            size
+        }
+    };
     let inset = resolve_insets(style.inset, position_block, font_size);
     // an out-of-flow box with both block insets set stretches between them
-    let explicit_height = style
-        .height
-        .resolve(containing_width, font_size)
+    let explicit_height = resolve_height(style.height, containing_height, font_size)
+        .map(inner_height)
         .or_else(|| {
             (mode != LayoutMode::Flow && inset.top.is_some() && inset.bottom.is_some()).then(|| {
                 (position_block.height
@@ -1468,6 +1497,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let content_width = style
         .width
         .resolve(containing_width, font_size)
+        .map(inner_width)
         .or_else(|| {
             (mode != LayoutMode::Flow && inset.left.is_some() && inset.right.is_some()).then(|| {
                 (position_block.width
@@ -1485,8 +1515,42 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         })
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
         .max(0.0);
-    let explicit_height =
-        explicit_height.or_else(|| style.aspect_ratio.map(|ratio| content_width / ratio));
+    let min_width = style
+        .min_width
+        .resolve(containing_width, font_size)
+        .map(inner_width)
+        .unwrap_or(0.0);
+    let max_width = style
+        .max_width
+        .resolve(containing_width, font_size)
+        .map(inner_width)
+        .unwrap_or(f32::INFINITY);
+    let content_width = content_width.min(max_width).max(min_width);
+    // auto margins share the width a block leaves over, which centers it
+    if mode == LayoutMode::Flow {
+        let free = containing_width - content_width - horizontal_inner - margin.left - margin.right;
+        match (
+            style.margin.left == Length::Auto,
+            style.margin.right == Length::Auto,
+        ) {
+            (true, true) => {
+                margin.left = (free / 2.0).max(0.0);
+                margin.right = margin.left;
+            }
+            (true, false) => margin.left = free.max(0.0),
+            (false, true) => margin.right = free.max(0.0),
+            (false, false) => {}
+        }
+    }
+    let min_height = resolve_height(style.min_height, containing_height, font_size)
+        .map(inner_height)
+        .unwrap_or(0.0);
+    let max_height = resolve_height(style.max_height, containing_height, font_size)
+        .map(inner_height)
+        .unwrap_or(f32::INFINITY);
+    let explicit_height = explicit_height
+        .or_else(|| style.aspect_ratio.map(|ratio| content_width / ratio))
+        .map(|height| height.min(max_height).max(min_height));
     let border_box_width = content_width + padding.left + padding.right + (border * 2.0);
     let rect = Rect {
         x: if mode == LayoutMode::Flow {
@@ -1519,6 +1583,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let content_y = rect.y + border + padding.top;
     if style.display == Display::Flex {
         return Some(layout_flex_element(FlexLayoutInput {
+            content_height: explicit_height,
             parent_opacity: parent.opacity,
             node,
             style,
@@ -1540,6 +1605,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     }
     if style.display == Display::Grid {
         return Some(layout_grid_element(GridLayoutInput {
+            content_height: explicit_height,
             parent_opacity: parent.opacity,
             node,
             style,
@@ -1625,6 +1691,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     }
     let mut children = Vec::new();
     let mut positioned = Vec::new();
+    // the bottom margin of the last block child, which collapses with the next block's top
+    let mut pending_margin: Option<f32> = None;
     let inline_context = InlineContext {
         font_size,
         line_height,
@@ -1647,6 +1715,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     for child in node.children(&generated) {
         match child {
             Child::Text(text_node, value) if name != "textarea" => {
+                if !value.trim().is_empty()
+                    && let Some(pending) = pending_margin.take()
+                {
+                    line.y += pending;
+                }
                 let source = InlineSource {
                     node: text_node,
                     offset: 0,
@@ -1677,11 +1750,24 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         style.text_align,
                     );
                     children.append(&mut line.placed);
+                    // adjacent vertical margins collapse into the larger one
+                    let child_font_size = child_style
+                        .font_size
+                        .resolve(font_size, font_size)
+                        .unwrap_or(font_size)
+                        .max(1.0);
+                    let child_top =
+                        resolve_margins(child_style.margin, content_width, child_font_size).top;
+                    let child_y = match pending_margin.take() {
+                        Some(pending) => line.y + collapse_margins(pending, child_top) - child_top,
+                        None => line.y,
+                    };
                     if let Some(child_box) = layout_element(ElementLayoutInput {
                         node: child,
                         containing_x: content_x,
-                        containing_y: line.y,
+                        containing_y: child_y,
                         containing_width: content_width,
+                        containing_height: explicit_height,
                         parent: child_parent,
                         context: LayoutContext {
                             viewport,
@@ -1691,13 +1777,17 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                             style_state,
                         },
                     }) {
-                        line.y = child_box.rect.bottom() + child_box.margin.bottom;
+                        line.y = child_box.rect.bottom();
+                        pending_margin = Some(child_box.margin.bottom);
                         line.used = 0.0;
                         line.height = line_height;
                         line.fragments.clear();
                         children.push(child_box);
                     }
                 } else {
+                    if let Some(pending) = pending_margin.take() {
+                        line.y += pending;
+                    }
                     append_inline_element(
                         InlineElementInput {
                             node: child,
@@ -1723,8 +1813,16 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         style.text_align,
     );
     children.append(&mut line.placed);
+    if let Some(pending) = pending_margin.take() {
+        line.y += pending;
+    }
     let content_height = explicit_height
-        .unwrap_or((line.y - content_y).max(0.0))
+        .unwrap_or_else(|| {
+            (line.y - content_y)
+                .max(0.0)
+                .min(max_height)
+                .max(min_height)
+        })
         .max(0.0);
     let border_box_height = content_height + padding.top + padding.bottom + (border * 2.0);
     let rect = Rect {
@@ -1803,6 +1901,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
 
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let FlexLayoutInput {
+        content_height,
         parent_opacity,
         node,
         style,
@@ -1869,7 +1968,9 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         };
         let explicit_main = match style.flex_direction {
             FlexDirection::Row => child_style.width.resolve(content_width, child_font_size),
-            FlexDirection::Column => child_style.height.resolve(content_width, child_font_size),
+            FlexDirection::Column => {
+                resolve_height(child_style.height, content_height, child_font_size)
+            }
         };
         items.push(FlexItem {
             node: child,
@@ -1922,6 +2023,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             containing_x: 0.0,
             containing_y: 0.0,
             containing_width: child_width,
+            containing_height: content_height,
             parent: child_parent,
             context: LayoutContext {
                 viewport,
@@ -1958,7 +2060,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 .zip(items.iter())
                 .map(|(child, item)| child.rect.height + item.margin.top + item.margin.bottom)
                 .fold(0.0, f32::max);
-            let explicit_cross = style.height.resolve(content_width, font_size);
+            let explicit_cross = content_height;
             let cross_size = explicit_cross.unwrap_or(max_cross).max(0.0);
             let free = (content_width - used - gap * items.len().saturating_sub(1) as f32).max(0.0);
             let (mut cursor, gap_extra) = justify_offsets(style.justify_content, free, items.len());
@@ -1996,7 +2098,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 .zip(items.iter())
                 .map(|(child, item)| child.rect.height + item.margin.top + item.margin.bottom)
                 .sum::<f32>();
-            let explicit_main = style.height.resolve(content_width, font_size);
+            let explicit_main = content_height;
             let main_size = explicit_main
                 .unwrap_or(used + gap * items.len().saturating_sub(1) as f32)
                 .max(0.0);
@@ -2109,6 +2211,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
 
 fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let GridLayoutInput {
+        content_height,
         parent_opacity,
         node,
         style,
@@ -2205,6 +2308,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             containing_x: 0.0,
             containing_y: 0.0,
             containing_width: column_width.max(0.0),
+            containing_height: None,
             parent: child_parent,
             context: LayoutContext {
                 viewport,
@@ -2227,7 +2331,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 intrinsic_rows[row].max(child.rect.height + item.margin.top + item.margin.bottom);
         }
     }
-    let explicit_height = style.height.resolve(content_width, font_size);
+    let explicit_height = content_height;
     let row_available = explicit_height.unwrap_or_else(|| {
         intrinsic_rows.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32
     });
@@ -2893,7 +2997,7 @@ fn append_inline_text(
             letter_spacing,
         );
         let joins_previous = !line.fragments.is_empty() && (line.trailing_space || leading_space);
-        let space_width = if line.fragments.is_empty() || (first_word && !joins_previous) {
+        let mut space_width = if line.fragments.is_empty() || (first_word && !joins_previous) {
             0.0
         } else {
             measure_text(
@@ -2914,6 +3018,8 @@ fn append_inline_text(
                 context.content_width,
                 context.align,
             );
+            // the space that broke the line is not drawn at the start of the next
+            space_width = 0.0;
         }
         let prefix = if space_width > 0.0 { " " } else { "" };
         let text = format!("{prefix}{word}");
@@ -2987,6 +3093,7 @@ fn append_atomic(
         containing_x: context.content_x + line.used,
         containing_y: line.y,
         containing_width,
+        containing_height: None,
         parent,
         context: LayoutContext {
             viewport,
@@ -3082,6 +3189,31 @@ fn flush_line(
     line.y += line.height.max(1.0);
     line.used = 0.0;
     line.height = 0.0;
+}
+
+// a height, where a percentage resolves only against a definite containing height
+fn resolve_height(length: Length, containing_height: Option<f32>, font_size: f32) -> Option<f32> {
+    if length.has_percent() {
+        length.resolve(containing_height?, font_size)
+    } else {
+        length.resolve(0.0, font_size)
+    }
+}
+
+// margins may be negative, and auto reads as zero until a layout mode gives it a size
+fn resolve_margins(edges: Edges, containing_width: f32, font_size: f32) -> ResolvedEdges {
+    let side = |length: Length| length.resolve(containing_width, font_size).unwrap_or(0.0);
+    ResolvedEdges {
+        top: side(edges.top),
+        right: side(edges.right),
+        bottom: side(edges.bottom),
+        left: side(edges.left),
+    }
+}
+
+// two adjoining vertical margins: the largest positive plus the most negative
+fn collapse_margins(first: f32, second: f32) -> f32 {
+    first.max(second).max(0.0) + first.min(second).min(0.0)
 }
 
 pub(crate) fn resolve_edges(edges: Edges, containing_width: f32, font_size: f32) -> ResolvedEdges {

@@ -5109,6 +5109,52 @@ mod tests {
     }
 
     #[test]
+    fn block_layout_sizes_boxes_centers_auto_margins_and_collapses_margins() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0 }
+                #c { width: 300px }
+                .bb { box-sizing: border-box; width: 100px; padding: 10px; border: 5px solid black }
+                .center { width: 100px; margin: 0 auto }
+                .max { max-width: 120px; margin-left: auto; margin-right: auto }
+                .min { width: 10px; min-width: 50px }
+                .a { margin-bottom: 20px; height: 10px }
+                .b { margin-top: 30px; height: 10px }
+                .neg { margin-top: -5px; height: 10px }
+                #fixed { height: 200px }
+                .pct { height: 50% }
+            </style>
+            <div id="c"><div id="bb" class="bb">x</div><div id="center" class="center"></div><div id="max" class="max"></div><div id="min" class="min"></div><div id="a" class="a"></div><div id="b" class="b"></div><div id="neg" class="neg"></div></div>
+            <div id="fixed"><div id="pct" class="pct"></div></div><div id="loose"><div id="pct2" class="pct"></div></div>
+            <p id="status">idle</p>
+            <script>
+                const box = (id) => document.getElementById(id).getBoundingClientRect();
+                document.getElementById("status").textContent = [
+                    box("bb").width, box("bb").height, box("center").x, box("max").width, box("max").x,
+                    box("min").width, box("a").y, box("b").y, box("neg").y, box("pct").height, box("pct2").height,
+                ].join(",");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("box model page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("100,50,100,120,90,50,50,90,95,100,0")
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>

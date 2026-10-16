@@ -160,6 +160,20 @@ impl LengthTerms {
 }
 
 impl Length {
+    // a percentage needs a definite basis, which an auto-height parent does not give
+    pub(crate) fn has_percent(self) -> bool {
+        match self {
+            Self::Auto => false,
+            Self::Terms(terms) => terms.percent != 0.0,
+            Self::Clamp(minimum, preferred, maximum) => {
+                minimum.percent != 0.0 || preferred.percent != 0.0 || maximum.percent != 0.0
+            }
+            Self::Smallest(left, right) | Self::Largest(left, right) => {
+                left.percent != 0.0 || right.percent != 0.0
+            }
+        }
+    }
+
     pub(crate) const fn px(value: f32) -> Self {
         Self::Terms(LengthTerms {
             px: value,
@@ -342,6 +356,13 @@ impl TextTransform {
                 .collect(),
         }
     }
+}
+
+// whether width and height include padding and border
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxSizing {
+    ContentBox,
+    BorderBox,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,6 +557,11 @@ pub(crate) struct Style {
     pub overflow: Overflow,
     pub width: Length,
     pub height: Length,
+    pub min_width: Length,
+    pub max_width: Length,
+    pub min_height: Length,
+    pub max_height: Length,
+    pub box_sizing: BoxSizing,
     pub margin: Edges,
     pub padding: Edges,
     pub background: Color,
@@ -650,6 +676,11 @@ impl Style {
             overflow: Overflow::Visible,
             width: Length::Auto,
             height: Length::Auto,
+            min_width: Length::Auto,
+            max_width: Length::Auto,
+            min_height: Length::Auto,
+            max_height: Length::Auto,
+            box_sizing: BoxSizing::ContentBox,
             margin: Edges::zero(),
             padding: Edges::zero(),
             background: Color::transparent(),
@@ -3282,6 +3313,18 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "width" => style.width = parse_length(value).unwrap_or(Length::Auto),
         "height" => style.height = parse_length(value).unwrap_or(Length::Auto),
+        // none and auto both read as no limit
+        "min-width" => style.min_width = parse_length(value).unwrap_or(Length::Auto),
+        "max-width" => style.max_width = parse_length(value).unwrap_or(Length::Auto),
+        "min-height" => style.min_height = parse_length(value).unwrap_or(Length::Auto),
+        "max-height" => style.max_height = parse_length(value).unwrap_or(Length::Auto),
+        "box-sizing" => {
+            style.box_sizing = if value.trim().eq_ignore_ascii_case("border-box") {
+                BoxSizing::BorderBox
+            } else {
+                BoxSizing::ContentBox
+            };
+        }
         "margin" => style.margin = parse_edges(value),
         "margin-top" => style.margin.top = parse_length(value).unwrap_or(style.margin.top),
         "margin-right" => style.margin.right = parse_length(value).unwrap_or(style.margin.right),
