@@ -7061,7 +7061,7 @@ mod tests {
             initial.root.children[0].background,
             Color::opaque(17, 17, 17)
         );
-        assert_eq!(initial.root.children[0].border_width, 0.0);
+        assert_eq!(initial.root.children[0].border.widths.top, 0.0);
 
         assert!(
             browser
@@ -7105,7 +7105,7 @@ mod tests {
                 height: 180.0,
             })
             .expect("focused layout should build");
-        assert_eq!(focused.root.children[0].border_width, 3.0);
+        assert_eq!(focused.root.children[0].border.widths.top, 3.0);
 
         assert!(browser.click_id("check").expect("checkbox should click"));
         let checked = browser

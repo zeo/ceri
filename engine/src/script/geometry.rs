@@ -10,7 +10,9 @@ use crate::css::{
     StyleState, Stylesheet, TextAlign, TextTransform,
 };
 use crate::font::FontSet;
-use crate::layout::{BoxGeometry, LayoutDocument, Rect, Size, layout_with_state, resolve_edges};
+use crate::layout::{
+    BoxGeometry, LayoutDocument, Rect, Size, layout_with_state, resolve_edges, used_border,
+};
 
 // what the embedder adds to a layout beyond the document and the runtime's own state
 pub(crate) struct LayoutInputs {
@@ -338,14 +340,16 @@ impl ScriptRuntime {
         let (style, font_size) = inputs.stylesheet.computed_style(&document, node, &state)?;
         let padding = resolve_edges(style.padding, parent_width, font_size);
         let rect = geometry.rect;
-        let border = geometry.border * 2.0;
+        let border = geometry.border;
         Some((
             rect,
             Rect {
                 x: padding.left,
                 y: padding.top,
-                width: (rect.width - border - padding.left - padding.right).max(0.0),
-                height: (rect.height - border - padding.top - padding.bottom).max(0.0),
+                width: (rect.width - border.left - border.right - padding.left - padding.right)
+                    .max(0.0),
+                height: (rect.height - border.top - border.bottom - padding.top - padding.bottom)
+                    .max(0.0),
             },
         ))
     }
@@ -402,26 +406,31 @@ impl ScriptRuntime {
                 };
                 let border = geometry.border;
                 number(match name {
-                    "clientWidth" => (geometry.scrollport.width - border * 2.0).max(0.0),
-                    "clientHeight" => (geometry.scrollport.height - border * 2.0).max(0.0),
-                    _ => border,
+                    "clientWidth" => {
+                        (geometry.scrollport.width - border.left - border.right).max(0.0)
+                    }
+                    "clientHeight" => {
+                        (geometry.scrollport.height - border.top - border.bottom).max(0.0)
+                    }
+                    "clientTop" => border.top,
+                    _ => border.left,
                 })
             }
             "scrollWidth" | "scrollHeight" => {
                 let Some(geometry) = boxes().first().copied() else {
                     return Ok(Some(Value::Number(0.0)));
                 };
-                let client = |extent: f32| (extent - geometry.border * 2.0).max(0.0);
+                let border = geometry.border;
                 number(if name == "scrollWidth" {
                     geometry
                         .scroll_size
                         .width
-                        .max(client(geometry.scrollport.width))
+                        .max((geometry.scrollport.width - border.left - border.right).max(0.0))
                 } else {
                     geometry
                         .scroll_size
                         .height
-                        .max(client(geometry.scrollport.height))
+                        .max((geometry.scrollport.height - border.top - border.bottom).max(0.0))
                 })
             }
             "offsetWidth" | "offsetHeight" => {
@@ -440,7 +449,10 @@ impl ScriptRuntime {
                     .offset_parent(node)
                     .and_then(|parent| self.node_boxes(parent).first().copied())
                     .map_or((0.0, 0.0), |parent| {
-                        (parent.rect.x + parent.border, parent.rect.y + parent.border)
+                        (
+                            parent.rect.x + parent.border.left,
+                            parent.rect.y + parent.border.top,
+                        )
                     });
                 number(if name == "offsetTop" {
                     rect.y - origin.1
@@ -911,7 +923,14 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         inherited,
         own,
     } = *inputs;
-    let border = geometry.map_or(style.border_width, |geometry| geometry.border);
+    let border = geometry.map_or_else(|| used_border(style), |geometry| geometry.border);
+    let border_widths = [border.top, border.right, border.bottom, border.left];
+    let side_index = |name: &str| {
+        ["top", "right", "bottom", "left"].iter().position(|side| {
+            name.strip_prefix("border-")
+                .is_some_and(|rest| rest.starts_with(side))
+        })
+    };
     let length = |value: crate::css::Length, basis: f32| {
         value
             .resolve(basis, font_size)
@@ -954,11 +973,17 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         "width" | "height" => match geometry {
             Some(geometry) => {
                 let (extent, edges) = if property == "width" {
-                    (geometry.rect.width, padding.left + padding.right)
+                    (
+                        geometry.rect.width,
+                        padding.left + padding.right + border.left + border.right,
+                    )
                 } else {
-                    (geometry.rect.height, padding.top + padding.bottom)
+                    (
+                        geometry.rect.height,
+                        padding.top + padding.bottom + border.top + border.bottom,
+                    )
                 };
-                px((extent - border * 2.0 - edges).max(0.0))
+                px((extent - edges).max(0.0))
             }
             None => "auto".to_string(),
         },
@@ -970,10 +995,36 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         "padding-right" => px(padding.right),
         "padding-bottom" => px(padding.bottom),
         "padding-left" => px(padding.left),
-        side if side.ends_with("-width") => px(border),
-        side if side.ends_with("-style") => if border > 0.0 { "solid" } else { "none" }.to_string(),
-        side if side.ends_with("-color") => color_text(style.border_color),
-        corner if corner.ends_with("-radius") => length(style.border_radius, 0.0),
+        corner if corner.ends_with("-radius") => {
+            let index = match corner {
+                "border-top-left-radius" => 0,
+                "border-top-right-radius" => 1,
+                "border-bottom-right-radius" => 2,
+                _ => 3,
+            };
+            let (horizontal, vertical) = style.border_radius[index];
+            let rect = geometry.map(|geometry| geometry.rect).unwrap_or_default();
+            let (horizontal, vertical) = (
+                length(horizontal, rect.width),
+                length(vertical, rect.height),
+            );
+            if horizontal == vertical {
+                horizontal
+            } else {
+                format!("{horizontal} {vertical}")
+            }
+        }
+        side if side.ends_with("-width") => {
+            px(side_index(side).map_or(0.0, |index| border_widths[index]))
+        }
+        side if side.ends_with("-style") => side_index(side)
+            .map_or("none", |index| style.border[index].style.name())
+            .to_string(),
+        side if side.ends_with("-color") => color_text(
+            side_index(side)
+                .and_then(|index| style.border[index].color)
+                .unwrap_or(style.color),
+        ),
         "top" => length(style.inset.top, 0.0),
         "right" => length(style.inset.right, 0.0),
         "bottom" => length(style.inset.bottom, 0.0),

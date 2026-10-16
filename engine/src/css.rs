@@ -1,3 +1,4 @@
+use crate::border::{BorderSide, CornerLengths, OutlineStyle, SQUARE_CORNERS};
 use crate::dom::{Document, Element, NodeId};
 use crate::grid::{Areas, GridLine, GridPlacement, Tracks, parse_line, parse_placement};
 use std::borrow::Cow;
@@ -584,8 +585,9 @@ pub(crate) struct Style {
     pub color: Color,
     pub font_size: Length,
     pub line_height: Length,
-    pub border_width: f32,
-    pub border_color: Color,
+    // top, right, bottom and left
+    pub border: [BorderSide; 4],
+    pub outline: OutlineStyle,
     pub text_align: TextAlign,
     pub text_transform: TextTransform,
     pub letter_spacing: Length,
@@ -620,7 +622,7 @@ pub(crate) struct Style {
     pub transitions: [Option<Transition>; MAX_TRANSITIONS],
     // only translation is expressed today, which the visual offset model already carries
     pub translate: (Length, Length),
-    pub border_radius: Length,
+    pub border_radius: CornerLengths,
     pub opacity: f32,
     pub gradient: Option<Gradient>,
     pub shadow: Option<BoxShadow>,
@@ -722,8 +724,8 @@ impl Style {
             color: parent_color,
             font_size: Length::px(parent_font_size),
             line_height: Length::em(1.25),
-            border_width: 0.0,
-            border_color: Color::transparent(),
+            border: [BorderSide::INITIAL; 4],
+            outline: OutlineStyle::INITIAL,
             text_align: TextAlign::Left,
             text_transform: parent_text.transform,
             letter_spacing: parent_text.letter_spacing,
@@ -754,7 +756,7 @@ impl Style {
             justify_self: None,
             transitions: [None; MAX_TRANSITIONS],
             translate: (Length::px(0.0), Length::px(0.0)),
-            border_radius: Length::px(0.0),
+            border_radius: SQUARE_CORNERS,
             opacity: 1.0,
             gradient: None,
             shadow: None,
@@ -3505,12 +3507,6 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "transition" => {
             style.transitions = parse_transitions(value);
         }
-        "border-radius" => {
-            // the shorthand may carry four corners, and this slice paints one radius
-            if let Some(radius) = value.split_ascii_whitespace().next().and_then(parse_length) {
-                style.border_radius = radius;
-            }
-        }
         "opacity" => {
             if let Some(opacity) = parse_number(value) {
                 style.opacity = opacity.clamp(0.0, 1.0);
@@ -3705,34 +3701,9 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.letter_spacing = length;
             }
         }
-        "border" => parse_border(style, value),
-        "border-width" => {
-            style.border_width = parse_length(value)
-                .and_then(|length| length.resolve(0.0, 16.0))
-                .unwrap_or(style.border_width)
-                .max(0.0);
+        _ => {
+            crate::border::apply(style, property, value, &parse_color);
         }
-        "border-color" => style.border_color = parse_color(value).unwrap_or(style.border_color),
-        _ => {}
-    }
-}
-
-fn parse_border(style: &mut Style, value: &str) {
-    let mut width = None;
-    let mut color = None;
-    for token in value.split_ascii_whitespace() {
-        if width.is_none() {
-            width = parse_length(token).and_then(|length| length.resolve(0.0, 16.0));
-        }
-        if color.is_none() {
-            color = parse_color(token);
-        }
-    }
-    if let Some(width) = width {
-        style.border_width = width.max(0.0);
-    }
-    if let Some(color) = color {
-        style.border_color = color;
     }
 }
 
@@ -4372,7 +4343,7 @@ fn parse_origin(value: &str) -> Option<(Length, Length)> {
 }
 
 // splits on whitespace outside parentheses, so url(...) and functions stay whole
-fn split_words(value: &str) -> Vec<&str> {
+pub(crate) fn split_words(value: &str) -> Vec<&str> {
     let mut words = Vec::new();
     let mut depth = 0_usize;
     let mut start = None;
@@ -4942,7 +4913,8 @@ mod tests {
         let mut card = Element::new("div");
         card.attrs.insert("class".to_string(), "card".to_string());
         let style = stylesheet.style_for(context(&placed(&card, &[]), &StyleState::default()));
-        assert_eq!(style.border_radius.resolve(0.0, 16.0), Some(18.0));
+        assert_eq!(style.border_radius[0].0.resolve(0.0, 16.0), Some(18.0));
+        assert_eq!(style.border_radius[1].1.resolve(0.0, 16.0), Some(8.0));
         assert_eq!(style.opacity, 0.4);
         let shadow = style.shadow.expect("shadow should parse");
         assert_eq!(shadow.offset_x.resolve(0.0, 16.0), Some(0.0));
@@ -5319,8 +5291,9 @@ mod tests {
         let items = nodes("li");
         assert_eq!(style(items[0]).color, Color::opaque(0, 0, 255));
         assert_eq!(style(items[2]).color, Color::opaque(255, 255, 0));
-        assert_eq!(style(items[1]).border_width, 3.0);
-        assert_eq!(style(items[0]).border_width, 0.0);
+        assert_eq!(style(items[1]).border[0].width, 3.0);
+        assert_eq!(style(items[0]).border[0].width, 3.0);
+        assert_eq!(style(items[0]).border[0].used_width(), 0.0);
     }
 
     #[test]

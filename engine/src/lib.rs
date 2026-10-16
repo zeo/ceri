@@ -1,3 +1,4 @@
+mod border;
 mod colors;
 mod css;
 mod dom;

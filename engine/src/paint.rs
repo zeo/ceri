@@ -1,10 +1,11 @@
+use crate::border::BorderStyle;
 use crate::css::{BackgroundImage, BackgroundSize, Color, Gradient, ObjectFit, Overflow};
 use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
-    ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect, TextRun, paint_order,
-    scrollbar_metrics, stacking_context_entries, translate_rect, visual_offset_for,
-    visual_rect_for,
+    BoxBorder, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect, ResolvedEdges,
+    SQUARE_CORNERS, TextRun, overflow_clip_rect, paint_order, scrollbar_metrics,
+    stacking_context_entries, translate_rect, visual_offset_for, visual_rect_for,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -38,6 +39,8 @@ pub struct Canvas {
     pixels: Vec<u8>,
     // the layout point drawn at the surface's top-left corner, nonzero for transform layers
     shift: (f32, f32),
+    // rounded overflow clips in device space; every write is scaled by their coverage
+    masks: Vec<Shape>,
 }
 
 impl Canvas {
@@ -69,6 +72,7 @@ impl Canvas {
             background,
             pixels,
             shift: (0.0, 0.0),
+            masks: Vec::new(),
         }
     }
 
@@ -180,7 +184,7 @@ impl Canvas {
             return;
         }
         // an opaque span is a row copy, which is the hot path for backgrounds and borders
-        if color.alpha == 255 {
+        if color.alpha == 255 && self.masks.is_empty() {
             let sample = [color.red, color.green, color.blue, 255];
             let stride = self.width as usize * 4;
             for pixel_y in top..bottom {
@@ -269,7 +273,7 @@ impl Canvas {
             return;
         }
         // a square edged solid fill is the common case, and the rect path is much cheaper
-        if shape.radius <= 0.0
+        if shape.is_square()
             && let Paint::Solid(color) = paint
         {
             match clip {
@@ -286,12 +290,7 @@ impl Canvas {
             return;
         }
         let device = self.device_shape(shape);
-        let clip = clip.map(|clip| self.device_shape(Shape::from_rect(clip, 0.0)));
-        let radius = device
-            .radius
-            .min(device.width / 2.0)
-            .min(device.height / 2.0)
-            .max(0.0);
+        let clip = clip.map(|clip| self.device_shape(Shape::square(clip)));
         let left = device.x.floor().max(0.0) as u32;
         let top = device.y.floor().max(0.0) as u32;
         let right = (device.x + device.width)
@@ -304,16 +303,86 @@ impl Canvas {
             for pixel_x in left.min(self.width)..right.min(self.width) {
                 let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
                 if let Some(clip) = clip
-                    && clip.coverage(center, 0.0) <= 0.0
+                    && clip.coverage(center) <= 0.0
                 {
                     continue;
                 }
-                let coverage = device.coverage(center, radius);
+                let coverage = device.coverage(center);
                 if coverage <= 0.0 {
                     continue;
                 }
                 let color = paint.color_at(center, device);
                 if color.alpha == 0 {
+                    continue;
+                }
+                self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
+            }
+        }
+    }
+
+    // paints the ring between two shapes; each pixel takes the side it is nearest relative to
+    // that side's width, which splits each corner along the line between its two sides
+    fn fill_border(&mut self, outer: Shape, inner: Shape, sides: &BorderSides, clip: Option<Rect>) {
+        let outer = self.device_shape(outer);
+        let inner = self.device_shape(inner);
+        let clip = clip.map(|clip| self.device_shape(Shape::square(clip)));
+        let widths = sides.widths.map(|width| width * self.scale);
+        let hollow = inner.width > 0.0 && inner.height > 0.0;
+        let left = outer.x.floor().clamp(0.0, self.width as f32) as u32;
+        let top = outer.y.floor().clamp(0.0, self.height as f32) as u32;
+        let right = (outer.x + outer.width).ceil().clamp(0.0, self.width as f32) as u32;
+        let bottom = (outer.y + outer.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        for pixel_y in top..bottom {
+            for pixel_x in left..right {
+                let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+                if let Some(clip) = clip
+                    && clip.coverage(center) <= 0.0
+                {
+                    continue;
+                }
+                let mut coverage = outer.coverage(center);
+                if hollow {
+                    coverage *= 1.0 - inner.coverage(center);
+                }
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let distances = [
+                    center.1 - outer.y,
+                    outer.x + outer.width - center.0,
+                    outer.y + outer.height - center.1,
+                    center.0 - outer.x,
+                ];
+                let Some(side) =
+                    (0..4)
+                        .filter(|side| widths[*side] > 0.0)
+                        .min_by(|first, second| {
+                            (distances[*first] / widths[*first])
+                                .total_cmp(&(distances[*second] / widths[*second]))
+                        })
+                else {
+                    continue;
+                };
+                let (along, length) = if side % 2 == 0 {
+                    (center.0 - outer.x, outer.width)
+                } else {
+                    (center.1 - outer.y, outer.height)
+                };
+                let (color, pattern) = border_pixel(
+                    sides.styles[side],
+                    sides.colors[side],
+                    side,
+                    BorderSpot {
+                        along,
+                        across: distances[side],
+                        width: widths[side],
+                        length,
+                    },
+                );
+                let coverage = coverage * pattern;
+                if coverage <= 0.0 || color.alpha == 0 {
                     continue;
                 }
                 self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
@@ -346,6 +415,7 @@ impl Canvas {
             background: Color::transparent(),
             pixels,
             shift: (bounds.x, bounds.y),
+            masks: Vec::new(),
         }
     }
 
@@ -427,6 +497,11 @@ impl Canvas {
                     continue;
                 }
                 let index = ((pixel_y * self.width + pixel_x) * 4) as usize;
+                let factor = if self.masks.is_empty() {
+                    factor
+                } else {
+                    factor * self.mask_at(pixel_x, pixel_y)
+                };
                 let alpha = sample[3] * factor;
                 for (target, source) in self.pixels[index..index + 4].iter_mut().zip(sample) {
                     *target = (source * factor + f32::from(*target) * (1.0 - alpha / 255.0))
@@ -464,7 +539,33 @@ impl Canvas {
         sum
     }
 
+    fn push_mask(&mut self, shape: Shape) {
+        let device = self.device_shape(shape);
+        self.masks.push(device);
+    }
+
+    fn pop_mask(&mut self) {
+        self.masks.pop();
+    }
+
+    fn mask_at(&self, x: u32, y: u32) -> f32 {
+        let center = (x as f32 + 0.5, y as f32 + 0.5);
+        self.masks
+            .iter()
+            .map(|mask| mask.coverage(center))
+            .product()
+    }
+
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
+        let color = if self.masks.is_empty() {
+            color
+        } else {
+            let coverage = self.mask_at(x, y);
+            if coverage <= 0.0 {
+                return;
+            }
+            color.scale_alpha(coverage)
+        };
         let index = ((y * self.width + x) * 4) as usize;
         if color.alpha == 255 {
             self.pixels[index] = color.red;
@@ -507,6 +608,7 @@ impl Canvas {
                 self.shift.0 + bounds.left as f32 / self.scale,
                 self.shift.1 + bounds.top as f32 / self.scale,
             ),
+            masks: Vec::new(),
         }
     }
 
@@ -515,18 +617,34 @@ impl Canvas {
         let factor = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
         let stride = self.width as usize * 4;
         let layer_stride = layer.width as usize * 4;
+        let masked = !self.masks.is_empty();
         for (row, source_row) in
             (bounds.top..bounds.bottom).zip(layer.pixels.chunks_exact(layer_stride))
         {
             let start = row as usize * stride + bounds.left as usize * 4;
             let end = row as usize * stride + bounds.right as usize * 4;
-            for (target, source) in self.pixels[start..end]
+            for (column, (target, source)) in self.pixels[start..end]
                 .chunks_exact_mut(4)
                 .zip(source_row.chunks_exact(4))
+                .enumerate()
             {
                 if source[3] == 0 {
                     continue;
                 }
+                let factor = if masked {
+                    let center = (
+                        (bounds.left as usize + column) as f32 + 0.5,
+                        row as f32 + 0.5,
+                    );
+                    let coverage = self
+                        .masks
+                        .iter()
+                        .map(|mask| mask.coverage(center))
+                        .product::<f32>();
+                    (factor as f32 * coverage).round() as u32
+                } else {
+                    factor
+                };
                 let alpha = (u32::from(source[3]) * factor) >> 8;
                 let inverse = 255 - alpha;
                 for (target, source) in target.iter_mut().zip(source) {
@@ -647,7 +765,8 @@ fn fades_without_layer(layout_box: &LayoutBox) -> bool {
     layout_box.children.is_empty()
         && layout_box.text.is_empty()
         && layout_box.shadow.is_none()
-        && (layout_box.border_width <= 0.0 || layout_box.border_radius <= 0.0)
+        && (layout_box.border.is_none()
+            || (layout_box.background.alpha == 0 && layout_box.gradient.is_none()))
         && layout_box.background_image.is_none()
         && !matches!(layout_box.tag.as_str(), "img" | "canvas")
         && layout_box.overflow == Overflow::Visible
@@ -712,18 +831,28 @@ struct Shape {
     y: f32,
     width: f32,
     height: f32,
-    radius: f32,
+    radii: CornerRadii,
 }
 
 impl Shape {
-    fn from_rect(rect: Rect, radius: f32) -> Self {
+    fn from_rect(rect: Rect, radii: CornerRadii) -> Self {
         Self {
             x: rect.x,
             y: rect.y,
             width: rect.width,
             height: rect.height,
-            radius,
+            radii,
         }
+    }
+
+    fn square(rect: Rect) -> Self {
+        Self::from_rect(rect, SQUARE_CORNERS)
+    }
+
+    fn is_square(&self) -> bool {
+        self.radii
+            .iter()
+            .all(|(horizontal, vertical)| *horizontal <= 0.0 || *vertical <= 0.0)
     }
 
     fn to_device(self, scale: f32) -> Self {
@@ -732,36 +861,91 @@ impl Shape {
             y: self.y * scale,
             width: self.width * scale,
             height: self.height * scale,
-            radius: self.radius * scale,
+            radii: self
+                .radii
+                .map(|(horizontal, vertical)| (horizontal * scale, vertical * scale)),
         }
     }
 
-    fn inset(self, amount: f32) -> Self {
+    // each side moves in by its own width, and each corner curve shrinks with its two sides
+    fn inset(self, edges: ResolvedEdges) -> Self {
+        let [top_left, top_right, bottom_right, bottom_left] = self.radii;
+        let shrink = |(horizontal, vertical): (f32, f32), across: f32, down: f32| {
+            ((horizontal - across).max(0.0), (vertical - down).max(0.0))
+        };
         Self {
-            x: self.x + amount,
-            y: self.y + amount,
-            width: (self.width - amount * 2.0).max(0.0),
-            height: (self.height - amount * 2.0).max(0.0),
-            radius: (self.radius - amount).max(0.0),
+            x: self.x + edges.left,
+            y: self.y + edges.top,
+            width: (self.width - edges.left - edges.right).max(0.0),
+            height: (self.height - edges.top - edges.bottom).max(0.0),
+            radii: [
+                shrink(top_left, edges.left, edges.top),
+                shrink(top_right, edges.right, edges.top),
+                shrink(bottom_right, edges.right, edges.bottom),
+                shrink(bottom_left, edges.left, edges.bottom),
+            ],
+        }
+    }
+
+    // grows every side, and every rounded corner with it, as spread shadows and outlines do
+    fn outset(self, amount: f32) -> Self {
+        Self {
+            x: self.x - amount,
+            y: self.y - amount,
+            width: (self.width + amount * 2.0).max(0.0),
+            height: (self.height + amount * 2.0).max(0.0),
+            radii: self.radii.map(|(horizontal, vertical)| {
+                if horizontal > 0.0 && vertical > 0.0 {
+                    ((horizontal + amount).max(0.0), (vertical + amount).max(0.0))
+                } else {
+                    (0.0, 0.0)
+                }
+            }),
         }
     }
 
     // one pixel of feathering along the edge, which reads as antialiasing
-    fn coverage(self, point: (f32, f32), radius: f32) -> f32 {
-        let distance = self.signed_distance(point, radius);
-        (0.5 - distance).clamp(0.0, 1.0)
+    fn coverage(self, point: (f32, f32)) -> f32 {
+        (0.5 - self.signed_distance(point)).clamp(0.0, 1.0)
     }
 
-    fn signed_distance(self, point: (f32, f32), radius: f32) -> f32 {
-        let half = (self.width / 2.0, self.height / 2.0);
-        let center = (self.x + half.0, self.y + half.1);
-        let offset = (
-            (point.0 - center.0).abs() - (half.0 - radius),
-            (point.1 - center.1).abs() - (half.1 - radius),
-        );
-        let outside = (offset.0.max(0.0), offset.1.max(0.0));
-        let outer = (outside.0 * outside.0 + outside.1 * outside.1).sqrt();
-        outer + offset.0.max(offset.1).min(0.0) - radius
+    fn signed_distance(self, point: (f32, f32)) -> f32 {
+        let edge = (self.x - point.0)
+            .max(point.0 - self.x - self.width)
+            .max(self.y - point.1)
+            .max(point.1 - self.y - self.height);
+        let right = point.0 > self.x + self.width / 2.0;
+        let bottom = point.1 > self.y + self.height / 2.0;
+        let corner = match (right, bottom) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        let (radius_x, radius_y) = self.radii[corner];
+        let (radius_x, radius_y) = (radius_x.min(self.width), radius_y.min(self.height));
+        if radius_x <= 0.0 || radius_y <= 0.0 {
+            return edge;
+        }
+        let along_x = if right {
+            point.0 - (self.x + self.width - radius_x)
+        } else {
+            self.x + radius_x - point.0
+        };
+        let along_y = if bottom {
+            point.1 - (self.y + self.height - radius_y)
+        } else {
+            self.y + radius_y - point.1
+        };
+        if along_x <= 0.0 || along_y <= 0.0 {
+            return edge;
+        }
+        // the ellipse's implicit distance over its gradient approximates the true distance
+        let (normal_x, normal_y) = (along_x / radius_x, along_y / radius_y);
+        let length = (normal_x * normal_x + normal_y * normal_y).sqrt();
+        let gradient =
+            ((normal_x / radius_x).powi(2) + (normal_y / radius_y).powi(2)).sqrt() / length;
+        (length - 1.0) / gradient
     }
 }
 
@@ -795,18 +979,13 @@ fn paint_shadow(
     canvas: &mut Canvas,
     shadow: &crate::layout::ResolvedShadow,
     rect: Rect,
-    radius: f32,
+    radii: CornerRadii,
     opacity: f32,
     clip: Option<Rect>,
 ) {
-    let spread = shadow.spread;
-    let base = Shape {
-        x: rect.x + shadow.offset_x - spread,
-        y: rect.y + shadow.offset_y - spread,
-        width: rect.width + spread * 2.0,
-        height: rect.height + spread * 2.0,
-        radius: (radius + spread).max(0.0),
-    };
+    let mut base = Shape::from_rect(rect, radii).outset(shadow.spread);
+    base.x += shadow.offset_x;
+    base.y += shadow.offset_y;
     let color = shadow.color.scale_alpha(opacity);
     if shadow.blur <= 0.0 {
         canvas.fill_shape(base, &Paint::Solid(color), clip);
@@ -816,21 +995,179 @@ fn paint_shadow(
     let steps = shadow.blur.ceil().clamp(1.0, 24.0) as usize;
     let step = shadow.blur / steps as f32;
     for ring in (0..=steps).rev() {
-        let distance = step * ring as f32;
         let falloff = 1.0 - (ring as f32 / (steps as f32 + 1.0));
-        let layer = Shape {
-            x: base.x - distance,
-            y: base.y - distance,
-            width: base.width + distance * 2.0,
-            height: base.height + distance * 2.0,
-            radius: base.radius + distance,
-        };
         canvas.fill_shape(
-            layer,
+            base.outset(step * ring as f32),
             &Paint::Solid(color.scale_alpha(falloff * falloff / steps as f32 * 2.0)),
             clip,
         );
     }
+}
+
+struct BorderSides {
+    // top, right, bottom and left, in layout pixels
+    widths: [f32; 4],
+    styles: [BorderStyle; 4],
+    colors: [Color; 4],
+}
+
+// where a pixel sits on its border side, in device pixels
+struct BorderSpot {
+    along: f32,
+    // from the outer edge inward
+    across: f32,
+    width: f32,
+    length: f32,
+}
+
+// the color and pattern coverage a border style gives one pixel of a side
+fn border_pixel(style: BorderStyle, color: Color, side: usize, spot: BorderSpot) -> (Color, f32) {
+    let BorderSpot {
+        along,
+        across,
+        width,
+        length,
+    } = spot;
+    let shade = Color {
+        red: (u16::from(color.red) * 2 / 3) as u8,
+        green: (u16::from(color.green) * 2 / 3) as u8,
+        blue: (u16::from(color.blue) * 2 / 3) as u8,
+        ..color
+    };
+    // light falls on the bottom and right of an outset box
+    let lit = side == 1 || side == 2;
+    let inner_half = across > width / 2.0;
+    match style {
+        BorderStyle::Dashed => {
+            let dash = (width * 3.0).max(1.0);
+            // whole dashes fit the side, with one at each end
+            let pairs = ((length - dash) / (dash * 2.0)).round().max(0.0);
+            let period = if pairs > 0.0 {
+                (length - dash) / pairs
+            } else {
+                length.max(dash) * 2.0
+            };
+            let phase = along.rem_euclid(period);
+            let coverage = ((dash - phase + 0.5).clamp(0.0, 1.0) * (phase + 0.5).clamp(0.0, 1.0))
+                .max((phase - period + 0.5).clamp(0.0, 1.0));
+            (color, coverage)
+        }
+        BorderStyle::Dotted if width >= 2.0 => {
+            let dots = (length / (width * 2.0)).round().max(1.0);
+            let period = length / dots;
+            let dot = (along / period).floor() * period + period / 2.0;
+            let distance = ((along - dot).powi(2) + (across - width / 2.0).powi(2)).sqrt();
+            (color, (width / 2.0 - distance + 0.5).clamp(0.0, 1.0))
+        }
+        BorderStyle::Dotted => {
+            let phase = along.rem_euclid(width.max(1.0) * 2.0);
+            (color, if phase < width.max(1.0) { 1.0 } else { 0.0 })
+        }
+        BorderStyle::Double if width >= 3.0 => {
+            let third = width / 3.0;
+            let coverage = (third - across + 0.5)
+                .clamp(0.0, 1.0)
+                .max((across - third * 2.0 + 0.5).clamp(0.0, 1.0));
+            (color, coverage)
+        }
+        BorderStyle::Inset => (if lit { color } else { shade }, 1.0),
+        BorderStyle::Outset => (if lit { shade } else { color }, 1.0),
+        BorderStyle::Groove => (if lit == inner_half { shade } else { color }, 1.0),
+        BorderStyle::Ridge => (if lit == inner_half { color } else { shade }, 1.0),
+        _ => (color, 1.0),
+    }
+}
+
+fn paint_border(
+    canvas: &mut Canvas,
+    outer: Shape,
+    inner: Shape,
+    border: &BoxBorder,
+    opacity: f32,
+    clip: Option<Rect>,
+) {
+    if border.is_none() {
+        return;
+    }
+    let widths = border.widths;
+    let sides = BorderSides {
+        widths: [widths.top, widths.right, widths.bottom, widths.left],
+        styles: border.styles,
+        colors: border.colors.map(|color| color.scale_alpha(opacity)),
+    };
+    let mut drawn = (0..4).filter(|side| sides.widths[*side] > 0.0);
+    let first = drawn.clone().next().unwrap_or(0);
+    let color = sides.colors[first];
+    let plain =
+        drawn.all(|side| sides.styles[side] == BorderStyle::Solid && sides.colors[side] == color);
+    if plain && outer.is_square() {
+        // square solid borders paint as four edges, so the interior is never touched
+        let paint = Paint::Solid(color);
+        for edge in [
+            Rect {
+                x: outer.x,
+                y: outer.y,
+                width: outer.width,
+                height: widths.top,
+            },
+            Rect {
+                x: outer.x,
+                y: outer.y + outer.height - widths.bottom,
+                width: outer.width,
+                height: widths.bottom,
+            },
+            Rect {
+                x: outer.x,
+                y: outer.y + widths.top,
+                width: widths.left,
+                height: (outer.height - widths.top - widths.bottom).max(0.0),
+            },
+            Rect {
+                x: outer.x + outer.width - widths.right,
+                y: outer.y + widths.top,
+                width: widths.right,
+                height: (outer.height - widths.top - widths.bottom).max(0.0),
+            },
+        ] {
+            canvas.fill_shape(Shape::square(edge), &paint, clip);
+        }
+        return;
+    }
+    canvas.fill_border(outer, inner, &sides, clip);
+}
+
+// an outline traces the border box, pushed out by its offset, and takes no space
+fn paint_outline(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    rect: Rect,
+    opacity: f32,
+    clip: Option<Rect>,
+) {
+    let Some(outline) = layout_box.outline else {
+        return;
+    };
+    let inner = Shape::from_rect(rect, layout_box.radii).outset(outline.offset);
+    let outer = inner.outset(outline.width);
+    let width = outline.width;
+    let border = BoxBorder {
+        widths: ResolvedEdges {
+            top: width,
+            right: width,
+            bottom: width,
+            left: width,
+        },
+        styles: [outline.style; 4],
+        colors: [outline.color; 4],
+    };
+    paint_border(canvas, outer, inner, &border, opacity, clip);
+}
+
+// an overflow clip with rounded corners clips to the padding box's curves as well
+fn overflow_mask(layout_box: &LayoutBox, rect: Rect) -> Option<Shape> {
+    let clips = matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto);
+    let padding_box = Shape::from_rect(rect, layout_box.radii).inset(layout_box.border.widths);
+    (clips && !padding_box.is_square()).then_some(padding_box)
 }
 
 pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
@@ -850,13 +1187,12 @@ pub(crate) fn paint_with_commands(
     );
     // the root background paints the whole canvas, as CSS backgrounds require
     if let Some(root) = canvas_background(&document.root) {
-        let viewport = Shape {
+        let viewport = Shape::square(Rect {
             x: 0.0,
             y: 0.0,
             width: document.viewport.width,
             height: document.viewport.height,
-            radius: 0.0,
-        };
+        });
         canvas.fill_shape(viewport, &root, None);
     }
     paint_box(
@@ -1100,6 +1436,10 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
     let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
+    let mask = overflow_mask(layout_box, rect);
+    if let Some(mask) = mask {
+        canvas.push_mask(mask);
+    }
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
@@ -1141,7 +1481,11 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
             entry.ancestor_offset,
         );
     }
+    if mask.is_some() {
+        canvas.pop_mask();
+    }
     paint_scrollbars(canvas, layout_box, offset, clip);
+    paint_outline(canvas, layout_box, rect, opacity, clip);
 }
 
 fn paint_non_context_children(
@@ -1190,6 +1534,10 @@ fn paint_non_context_subtree(
         rect,
         layout_box.opacity,
     );
+    let mask = overflow_mask(layout_box, rect);
+    if let Some(mask) = mask {
+        canvas.push_mask(mask);
+    }
     paint_box_text(
         canvas,
         layout_box,
@@ -1207,7 +1555,11 @@ fn paint_non_context_subtree(
         offset,
     );
     paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
+    if mask.is_some() {
+        canvas.pop_mask();
+    }
     paint_scrollbars(canvas, layout_box, offset, clip);
+    paint_outline(canvas, layout_box, rect, layout_box.opacity, clip);
 }
 
 fn paint_box_surface(
@@ -1219,62 +1571,22 @@ fn paint_box_surface(
     rect: Rect,
     opacity: f32,
 ) -> Option<Rect> {
-    let radius = layout_box.border_radius;
+    let radii = layout_box.radii;
     if let Some(shadow) = layout_box.shadow.as_ref() {
-        paint_shadow(canvas, shadow, rect, radius, opacity, clip);
+        paint_shadow(canvas, shadow, rect, radii, opacity, clip);
     }
-    let outer = Shape::from_rect(rect, radius);
-    let border = layout_box.border_width.max(0.0);
-    if border > 0.0 && layout_box.border_color.alpha > 0 {
-        let color = layout_box.border_color.scale_alpha(opacity);
-        if radius > 0.0 {
-            canvas.fill_shape(outer, &Paint::Solid(color), clip);
-        } else {
-            // square borders paint as four edges, so the box interior is filled once
-            for edge in [
-                Rect {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: border,
-                },
-                Rect {
-                    x: rect.x,
-                    y: rect.y + rect.height - border,
-                    width: rect.width,
-                    height: border,
-                },
-                Rect {
-                    x: rect.x,
-                    y: rect.y + border,
-                    width: border,
-                    height: (rect.height - border * 2.0).max(0.0),
-                },
-                Rect {
-                    x: rect.x + rect.width - border,
-                    y: rect.y + border,
-                    width: border,
-                    height: (rect.height - border * 2.0).max(0.0),
-                },
-            ] {
-                canvas.fill_shape(Shape::from_rect(edge, 0.0), &Paint::Solid(color), clip);
-            }
-        }
-    }
-    let surface = outer.inset(border);
+    let outer = Shape::from_rect(rect, radii);
+    let surface = outer.inset(layout_box.border.widths);
     if let Some(gradient) = layout_box.gradient {
-        canvas.fill_shape(
-            surface,
-            &Paint::Gradient(gradient.scale_alpha(opacity)),
-            clip,
-        );
+        canvas.fill_shape(outer, &Paint::Gradient(gradient.scale_alpha(opacity)), clip);
     } else if layout_box.background.alpha > 0 {
         canvas.fill_shape(
-            surface,
+            outer,
             &Paint::Solid(layout_box.background.scale_alpha(opacity)),
             clip,
         );
     }
+    paint_border(canvas, outer, surface, &layout_box.border, opacity, clip);
     if let Some(background) = layout_box.background_image.as_ref()
         && let Some(layer) = images
             .iter()
@@ -1306,10 +1618,7 @@ fn paint_box_surface(
     let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
         || layout_box.is_document()
     {
-        intersect_clip(
-            clip,
-            translate_rect(scrollbar_metrics(layout_box).scrollport, offset),
-        )
+        intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
     } else {
         clip
     };
@@ -1727,11 +2036,7 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
     let scale = canvas.scale;
     let shift = canvas.shift;
     let area_device = canvas.device_shape(area);
-    let radius = area_device
-        .radius
-        .min(area_device.width / 2.0)
-        .min(area_device.height / 2.0)
-        .max(0.0);
+    let rounded = !area_device.is_square();
     let mut bounds = Rect {
         x: area.x,
         y: area.y,
@@ -1785,8 +2090,8 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
     for pixel_y in top..bottom {
         for pixel_x in left..right {
             let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
-            let coverage = if radius > 0.0 {
-                area_device.coverage(center, radius)
+            let coverage = if rounded {
+                area_device.coverage(center)
             } else {
                 1.0
             };
@@ -2174,11 +2479,11 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
-                border_radius: 0.0,
+                radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
-                border_width: 0.0,
-                border_color: Color::transparent(),
+                border: BoxBorder::NONE,
+                outline: None,
                 text: vec![TextRun {
                     text: "ABCDEF".to_string(),
                     x: 4.0,
@@ -2309,6 +2614,97 @@ mod tests {
     }
 
     #[test]
+    fn borders_paint_each_side_by_style_and_rounded_overflow_clips_children() {
+        let render = |html: &str, css: &str| {
+            let document = Document::parse(&format!("<html><body>{html}</body></html>"))
+                .expect("document should parse");
+            let stylesheet = Stylesheet::parse(css).expect("stylesheet should parse");
+            paint(&crate::layout::layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 80.0,
+                    height: 80.0,
+                },
+            ))
+        };
+        let pixel = |canvas: &Canvas, x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            canvas.rgba_pixels()[index..index + 3].to_vec()
+        };
+        let sides = render(
+            "<div id='box'></div>",
+            "html, body { margin: 0; background: #ffffff } #box { width: 20px; height: 20px; border-style: solid; border-width: 4px 8px 12px 6px; border-color: #ff0000 #00ff00 #0000ff #000000 }",
+        );
+        assert_eq!(pixel(&sides, 15, 1), vec![255, 0, 0], "top side");
+        assert_eq!(pixel(&sides, 31, 15), vec![0, 255, 0], "right side");
+        assert_eq!(pixel(&sides, 15, 30), vec![0, 0, 255], "bottom side");
+        assert_eq!(pixel(&sides, 2, 15), vec![0, 0, 0], "left side");
+        assert_eq!(
+            pixel(&sides, 15, 15),
+            vec![255, 255, 255],
+            "the inside stays clear"
+        );
+
+        let styled = render(
+            "<div id='none'></div><div id='double'></div><div id='dashed'></div>",
+            "html, body { margin: 0; background: #ffffff } div { width: 60px; height: 9px; margin-bottom: 4px } #none { border: 9px #ff0000 } #double { border-top: 9px double #000000 } #dashed { border-top: 2px dashed #000000 }",
+        );
+        assert_eq!(
+            pixel(&styled, 30, 4),
+            vec![255, 255, 255],
+            "a border with no style takes no space and paints nothing"
+        );
+        assert_eq!(
+            pixel(&styled, 30, 14),
+            vec![0, 0, 0],
+            "outer line of a double border"
+        );
+        assert_eq!(
+            pixel(&styled, 30, 17),
+            vec![255, 255, 255],
+            "gap of a double border"
+        );
+        assert_eq!(
+            pixel(&styled, 30, 21),
+            vec![0, 0, 0],
+            "inner line of a double border"
+        );
+        let dashes = (0..60)
+            .filter(|x| pixel(&styled, *x, 36) == vec![0, 0, 0])
+            .count();
+        assert!(
+            (20..45).contains(&dashes),
+            "dashes leave gaps, got {dashes} dark pixels"
+        );
+
+        let clipped = render(
+            "<div id='clip'><div id='child'></div></div><div id='outlined'></div>",
+            "html, body { margin: 0; background: #ffffff } #clip { width: 40px; height: 40px; overflow: hidden; border-radius: 20px } #child { width: 40px; height: 40px; background: #ff0000 } #outlined { width: 10px; height: 10px; margin: 10px; outline: 2px solid #0000ff; outline-offset: 2px }",
+        );
+        assert_eq!(
+            pixel(&clipped, 20, 20),
+            vec![255, 0, 0],
+            "the child shows inside"
+        );
+        assert_eq!(
+            pixel(&clipped, 1, 1),
+            vec![255, 255, 255],
+            "the rounded clip hides the child's corner"
+        );
+        assert_eq!(
+            pixel(&clipped, 7, 55),
+            vec![0, 0, 255],
+            "the outline sits outside the box"
+        );
+        assert_eq!(
+            pixel(&clipped, 9, 55),
+            vec![255, 255, 255],
+            "the offset leaves a gap"
+        );
+    }
+
+    #[test]
     fn painting_changes_pixels_and_writes_a_ppm_header() {
         let document = LayoutDocument {
             viewport: Size {
@@ -2330,11 +2726,11 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
-                border_radius: 0.0,
+                radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
-                border_width: 0.0,
-                border_color: Color::transparent(),
+                border: BoxBorder::NONE,
+                outline: None,
                 text: vec![TextRun {
                     text: "A".to_string(),
                     x: 4.0,
@@ -2433,11 +2829,11 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
-                border_radius: 0.0,
+                radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
-                border_width: 0.0,
-                border_color: Color::transparent(),
+                border: BoxBorder::NONE,
+                outline: None,
                 text: vec![
                     TextRun {
                         text: "AB".to_string(),
@@ -2527,11 +2923,11 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
-                border_radius: 0.0,
+                radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
-                border_width: 0.0,
-                border_color: Color::transparent(),
+                border: BoxBorder::NONE,
+                outline: None,
                 text: Vec::new(),
                 control_value: None,
                 control_selection: None,
@@ -2553,11 +2949,11 @@ mod tests {
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,
-                        border_radius: 0.0,
+                        radii: SQUARE_CORNERS,
                         opacity: 1.0,
                         shadow: None,
-                        border_width: 0.0,
-                        border_color: Color::transparent(),
+                        border: BoxBorder::NONE,
+                        outline: None,
                         text: Vec::new(),
                         control_value: None,
                         control_selection: None,
@@ -2593,11 +2989,11 @@ mod tests {
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,
-                        border_radius: 0.0,
+                        radii: SQUARE_CORNERS,
                         opacity: 1.0,
                         shadow: None,
-                        border_width: 0.0,
-                        border_color: Color::transparent(),
+                        border: BoxBorder::NONE,
+                        outline: None,
                         text: Vec::new(),
                         control_value: None,
                         control_selection: None,

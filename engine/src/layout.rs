@@ -1,3 +1,4 @@
+use crate::border::{BorderSide, BorderStyle, CornerLengths};
 use crate::css::{
     AlignContent, AlignItems, Color, Display, Edges, FontWeight, Gradient, InheritedText,
     JustifyContent, Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
@@ -110,11 +111,11 @@ pub struct LayoutBox {
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<crate::transform::Matrix>,
     pub(crate) backface_hidden: bool,
-    pub border_radius: f32,
+    pub(crate) radii: CornerRadii,
     pub opacity: f32,
     pub shadow: Option<ResolvedShadow>,
-    pub border_width: f32,
-    pub border_color: Color,
+    pub(crate) border: BoxBorder,
+    pub(crate) outline: Option<BoxOutline>,
     pub text: Vec<TextRun>,
     pub(crate) control_value: Option<String>,
     pub(crate) control_selection: Option<(usize, usize, bool)>,
@@ -148,6 +149,107 @@ pub(crate) struct ImageLayer {
     pub(crate) image: std::rc::Rc<Image>,
     // a CSS background rather than the element's own content
     pub(crate) background: bool,
+}
+
+// corner radii as horizontal and vertical extents, from the top-left corner clockwise
+pub(crate) type CornerRadii = [(f32, f32); 4];
+
+pub(crate) const SQUARE_CORNERS: CornerRadii = [(0.0, 0.0); 4];
+
+// a border as painted: widths, and each side's style and color from the top clockwise
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BoxBorder {
+    pub(crate) widths: ResolvedEdges,
+    pub(crate) styles: [BorderStyle; 4],
+    pub(crate) colors: [Color; 4],
+}
+
+impl BoxBorder {
+    pub(crate) const NONE: Self = Self {
+        widths: ResolvedEdges {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        },
+        styles: [BorderStyle::None; 4],
+        colors: [Color::transparent(); 4],
+    };
+
+    pub(crate) fn of(style: &Style) -> Self {
+        Self {
+            widths: used_border(style),
+            styles: style.border.map(|side| side.style),
+            colors: style.border.map(|side| side.color.unwrap_or(style.color)),
+        }
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.widths.top <= 0.0
+            && self.widths.right <= 0.0
+            && self.widths.bottom <= 0.0
+            && self.widths.left <= 0.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BoxOutline {
+    pub(crate) width: f32,
+    pub(crate) style: BorderStyle,
+    pub(crate) color: Color,
+    pub(crate) offset: f32,
+}
+
+fn box_outline(style: &Style) -> Option<BoxOutline> {
+    let side = style.outline.side;
+    (side.used_width() > 0.0).then(|| BoxOutline {
+        width: side.used_width(),
+        style: side.style,
+        color: side.color.unwrap_or(style.color),
+        offset: style.outline.offset,
+    })
+}
+
+pub(crate) fn used_border(style: &Style) -> ResolvedEdges {
+    let [top, right, bottom, left] = style.border.map(|side| side.used_width());
+    ResolvedEdges {
+        top,
+        right,
+        bottom,
+        left,
+    }
+}
+
+// percentages resolve against the border box, and radii that would overlap shrink together
+fn resolve_corner_radii(
+    radii: CornerLengths,
+    width: f32,
+    height: f32,
+    font_size: f32,
+) -> CornerRadii {
+    let mut resolved = radii.map(|(horizontal, vertical)| {
+        (
+            horizontal.resolve(width, font_size).unwrap_or(0.0).max(0.0),
+            vertical.resolve(height, font_size).unwrap_or(0.0).max(0.0),
+        )
+    });
+    let [top_left, top_right, bottom_right, bottom_left] = resolved;
+    let scale = [
+        (width, top_left.0 + top_right.0),
+        (width, bottom_left.0 + bottom_right.0),
+        (height, top_left.1 + bottom_left.1),
+        (height, top_right.1 + bottom_right.1),
+    ]
+    .into_iter()
+    .filter(|(_, sum)| *sum > 0.0)
+    .map(|(side, sum)| side.max(0.0) / sum)
+    .fold(1.0_f32, f32::min);
+    if scale < 1.0 {
+        for corner in &mut resolved {
+            *corner = (corner.0 * scale, corner.1 * scale);
+        }
+    }
+    resolved
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -372,7 +474,7 @@ struct FlexLayoutInput<'a> {
     style_state: &'a StyleState,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
-    border: f32,
+    border: ResolvedEdges,
     rect: Rect,
     content_x: f32,
     content_y: f32,
@@ -389,7 +491,7 @@ struct GridItem<'a> {
     style: Style,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
-    border: f32,
+    border: ResolvedEdges,
     // the item's tracks as (start, span), columns then rows
     area: [(usize, usize); 2],
     // a content-box width its alignment decided
@@ -406,7 +508,7 @@ struct GridLayoutInput<'a> {
     style_state: &'a StyleState,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
-    border: f32,
+    border: ResolvedEdges,
     rect: Rect,
     content_x: f32,
     content_y: f32,
@@ -507,11 +609,11 @@ pub fn layout_with_state(
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
-        border_radius: 0.0,
+        radii: SQUARE_CORNERS,
         opacity: 1.0,
         shadow: None,
-        border_width: 0.0,
-        border_color: Color::transparent(),
+        border: BoxBorder::NONE,
+        outline: None,
         text: Vec::new(),
         control_value: None,
         control_selection: None,
@@ -800,7 +902,7 @@ fn collect_prose_runs(
 pub(crate) struct BoxGeometry {
     // the border box
     pub(crate) rect: Rect,
-    pub(crate) border: f32,
+    pub(crate) border: ResolvedEdges,
     pub(crate) position: Position,
     // the border box less any scrollbar, which client sizes start from
     pub(crate) scrollport: Rect,
@@ -918,6 +1020,23 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
         scrollport,
         vertical_track,
         horizontal_track,
+    }
+}
+
+// what an overflow container clips its content to: the padding box, less any scrollbar
+pub(crate) fn overflow_clip_rect(layout: &LayoutBox) -> Rect {
+    let scrollport = scrollbar_metrics(layout).scrollport;
+    let border = layout.border.widths;
+    let rect = layout.rect;
+    let left = scrollport.x.max(rect.x + border.left);
+    let top = scrollport.y.max(rect.y + border.top);
+    let right = (scrollport.x + scrollport.width).min(rect.x + rect.width - border.right);
+    let bottom = (scrollport.y + scrollport.height).min(rect.y + rect.height - border.bottom);
+    Rect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
     }
 }
 
@@ -1043,7 +1162,7 @@ fn index_boxes(
         };
         index.entry(layout.node).or_default().push(BoxGeometry {
             rect: translate_rect(layout.rect, offset),
-            border: layout.border_width,
+            border: layout.border.widths,
             position: layout.position,
             scrollport: translate_rect(scrollbar_metrics(layout).scrollport, offset),
             scroll_size: content,
@@ -1200,7 +1319,7 @@ fn stacking_child_clip(
     if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.is_document() {
         intersect_rect(
             clip,
-            translate_rect(scrollbar_metrics(layout).scrollport, visual_offset),
+            translate_rect(overflow_clip_rect(layout), visual_offset),
         )
     } else {
         clip
@@ -1281,7 +1400,7 @@ fn scroll_target_box(
         if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.is_document() {
             intersect_rect(
                 clip,
-                translate_rect(scrollbar_metrics(layout).scrollport, visual_offset),
+                translate_rect(overflow_clip_rect(layout), visual_offset),
             )
         } else {
             clip
@@ -1337,7 +1456,7 @@ fn thumb_drag_box(
     {
         intersect_rect(
             clip,
-            translate_rect(scrollbar_metrics(layout_box).scrollport, visual_offset),
+            translate_rect(overflow_clip_rect(layout_box), visual_offset),
         )
     } else {
         clip
@@ -1461,9 +1580,9 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .max(1.0);
     let mut margin = resolve_margins(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
-    let border = style.border_width.max(0.0);
-    let horizontal_inner = padding.left + padding.right + (border * 2.0);
-    let vertical_inner = padding.top + padding.bottom + (border * 2.0);
+    let border = used_border(&style);
+    let horizontal_inner = padding.left + padding.right + border.left + border.right;
+    let vertical_inner = padding.top + padding.bottom + border.top + border.bottom;
     let horizontal_extras = margin.left + margin.right + horizontal_inner;
     // border-box sizes include padding and border, so the content takes what is left
     let border_box = style.box_sizing == crate::css::BoxSizing::BorderBox;
@@ -1490,9 +1609,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 (position_block.height
                     - inset.top.unwrap_or(0.0)
                     - inset.bottom.unwrap_or(0.0)
-                    - padding.top
-                    - padding.bottom
-                    - (border * 2.0))
+                    - vertical_inner)
                     .max(0.0)
             })
         });
@@ -1557,7 +1674,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             .or_else(|| style.aspect_ratio.map(|ratio| content_width / ratio))
             .map(|height| height.min(max_height).max(min_height))
     });
-    let border_box_width = content_width + padding.left + padding.right + (border * 2.0);
+    let border_box_width = content_width + horizontal_inner;
     let rect = Rect {
         x: if mode == LayoutMode::Flow {
             containing_x + margin.left
@@ -1577,7 +1694,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         y: rect.y,
         width: border_box_width,
         height: explicit_height
-            .map(|height| height.max(0.0) + padding.top + padding.bottom + (border * 2.0))
+            .map(|height| height.max(0.0) + vertical_inner)
             .unwrap_or(0.0),
     };
     let descendant_block = if style.position == Position::Static {
@@ -1585,8 +1702,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     } else {
         local_containing_block
     };
-    let content_x = rect.x + border + padding.left;
-    let content_y = rect.y + border + padding.top;
+    let content_x = rect.x + border.left + padding.left;
+    let content_y = rect.y + border.top + padding.top;
     if matches!(style.display, Display::Flex | Display::InlineFlex) {
         return Some(layout_flex_element(FlexLayoutInput {
             content_height: explicit_height,
@@ -1831,7 +1948,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 .max(min_height)
         })
         .max(0.0);
-    let border_box_height = content_height + padding.top + padding.bottom + (border * 2.0);
+    let border_box_height = content_height + vertical_inner;
     let rect = Rect {
         height: border_box_height,
         ..rect
@@ -1846,15 +1963,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
-        border_radius: style
-            .border_radius
-            .resolve(content_width, font_size)
-            .unwrap_or(0.0)
-            .max(0.0),
+        radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: style.opacity * parent.opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
-        border_width: border,
-        border_color: style.border_color,
+        border: BoxBorder::of(&style),
+        outline: box_outline(&style),
         text,
         control_selection: node
             .own()
@@ -1918,7 +2031,7 @@ struct FlexItem<'a> {
     font_size: f32,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
-    border: f32,
+    border: ResolvedEdges,
     // auto margins in main-start, main-end, cross-start and cross-end order
     auto_margins: [bool; 4],
     // sizes along the main axis, all content-box
@@ -1933,11 +2046,10 @@ struct FlexItem<'a> {
 
 impl FlexItem<'_> {
     fn main_inner(&self, row: bool) -> f32 {
-        let border = self.border * 2.0;
         if row {
-            self.padding.left + self.padding.right + border
+            self.padding.left + self.padding.right + self.border.left + self.border.right
         } else {
-            self.padding.top + self.padding.bottom + border
+            self.padding.top + self.padding.bottom + self.border.top + self.border.bottom
         }
     }
 
@@ -1999,11 +2111,11 @@ fn anonymous_box(
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
-        border_radius: 0.0,
+        radii: SQUARE_CORNERS,
         opacity,
         shadow: None,
-        border_width: 0.0,
-        border_color: Color::transparent(),
+        border: BoxBorder::NONE,
+        outline: None,
         text,
         control_value: None,
         control_selection: None,
@@ -2348,7 +2460,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     anonymous_style.min_height = Length::Auto;
     anonymous_style.max_height = Length::Auto;
     anonymous_style.box_sizing = crate::css::BoxSizing::ContentBox;
-    anonymous_style.border_width = 0.0;
+    anonymous_style.border = [BorderSide::INITIAL; 4];
     anonymous_style.overflow = Overflow::Visible;
     anonymous_style.flex_grow = 0.0;
     anonymous_style.flex_shrink = 1.0;
@@ -2365,11 +2477,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             .max(1.0);
         let child_margin = resolve_margins(child_style.margin, content_width, child_font_size);
         let child_padding = resolve_edges(child_style.padding, content_width, child_font_size);
-        let child_border = if matches!(source, FlexSource::Text(_)) {
-            0.0
-        } else {
-            child_style.border_width.max(0.0)
-        };
+        let child_border = used_border(&child_style);
         let auto = |length: Length| length == Length::Auto;
         let edges = child_style.margin;
         let auto_margins = if row {
@@ -2429,7 +2537,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                         width
                             + item.padding.left
                             + item.padding.right
-                            + item.border * 2.0
+                            + item.border.left
+                            + item.border.right
                             + item.margin.left
                             + item.margin.right
                     }),
@@ -2453,7 +2562,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             FlexSource::Element(child) => {
                 let extras = item.padding.left
                     + item.padding.right
-                    + item.border * 2.0
+                    + item.border.left
+                    + item.border.right
                     + item.margin.left
                     + item.margin.right;
                 let measure = |minimum: bool| {
@@ -2779,28 +2889,25 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         cross_cursor += cross_size + cross_gap + line_extra;
     }
     let content_height = if row { container_cross } else { container_main };
+    let rect = Rect {
+        height: content_height + padding.top + padding.bottom + border.top + border.bottom,
+        ..rect
+    };
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
-        rect: Rect {
-            height: content_height + padding.top + padding.bottom + (border * 2.0),
-            ..rect
-        },
+        rect,
         background: style.background,
         gradient: style.gradient,
         background_image: style.background_layer(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
-        border_radius: style
-            .border_radius
-            .resolve(content_width, font_size)
-            .unwrap_or(0.0)
-            .max(0.0),
+        radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
-        border_width: border,
-        border_color: style.border_color,
+        border: BoxBorder::of(&style),
+        outline: box_outline(&style),
         text: Vec::new(),
         control_value: None,
         control_selection: None,
@@ -2955,7 +3062,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     anonymous_style.padding = Edges::zero();
     anonymous_style.width = Length::Auto;
     anonymous_style.height = Length::Auto;
-    anonymous_style.border_width = 0.0;
+    anonymous_style.border = [BorderSide::INITIAL; 4];
     anonymous_style.order = 0;
     anonymous_style.align_self = None;
     anonymous_style.justify_self = None;
@@ -2970,11 +3077,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 .resolve(font_size, font_size)
                 .unwrap_or(font_size)
                 .max(1.0);
-            let border = if matches!(source, FlexSource::Text(_)) {
-                0.0
-            } else {
-                child_style.border_width.max(0.0)
-            };
+            let border = used_border(&child_style);
             GridItem {
                 source,
                 style: child_style,
@@ -3150,7 +3253,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     + item.margin.right
                     + item.padding.left
                     + item.padding.right
-                    + item.border * 2.0;
+                    + item.border.left
+                    + item.border.right;
                 let (minimum, maximum) = intrinsic(item);
                 let extras = if matches!(item.source, FlexSource::Text(_)) {
                     0.0
@@ -3210,7 +3314,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let cell_height = span_size(&row_offsets, &row_sizes, item.area[1]);
         let item_align = align(item);
         if item_align == AlignItems::Stretch && item.style.height == Length::Auto {
-            let inner = item.padding.top + item.padding.bottom + item.border * 2.0;
+            let inner =
+                item.padding.top + item.padding.bottom + item.border.top + item.border.bottom;
             let target = (cell_height - item.margin.top - item.margin.bottom - inner).max(0.0);
             if (child.rect.height - inner - target).abs() > 0.01 {
                 child = lay_out(item, cell_width, Some(cell_height), Some(target)).unwrap_or(child);
@@ -3226,28 +3331,25 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         translate_layout_box(&mut child, offset.0, offset.1);
         children.push(child);
     }
+    let rect = Rect {
+        height: content_height + padding.top + padding.bottom + border.top + border.bottom,
+        ..rect
+    };
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
-        rect: Rect {
-            height: content_height + padding.top + padding.bottom + border * 2.0,
-            ..rect
-        },
+        rect,
         background: style.background,
         gradient: style.gradient,
         background_image: style.background_layer(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
-        border_radius: style
-            .border_radius
-            .resolve(content_width, font_size)
-            .unwrap_or(0.0)
-            .max(0.0),
+        radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
-        border_width: border,
-        border_color: style.border_color,
+        border: BoxBorder::of(&style),
+        outline: box_outline(&style),
         text: Vec::new(),
         control_value: None,
         control_selection: None,
@@ -3346,10 +3448,14 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         + margin.right
         + padding.left
         + padding.right
-        + style.border_width.max(0.0) * 2.0;
+        + style.border[1].used_width()
+        + style.border[3].used_width();
     if own_width && let Some(width) = style.width.resolve(containing_width, font_size) {
         // a border-box width already holds the padding and border
-        let inner = padding.left + padding.right + style.border_width.max(0.0) * 2.0;
+        let inner = padding.left
+            + padding.right
+            + style.border[1].used_width()
+            + style.border[3].used_width();
         let width = if style.box_sizing == crate::css::BoxSizing::BorderBox {
             (width - inner).max(0.0)
         } else {
