@@ -97,6 +97,8 @@ pub(super) enum Op {
     SetIndex,
     DeleteProp(u32),
     DeleteIndex,
+    // [object] -> [object has]: whether a with object answers for the name
+    WithHas(u32),
     GetSuper(u32),
     GetSuperIndex,
     SetSuper(u32),
@@ -268,6 +270,8 @@ struct ScopeInfo {
     bindings: HashMap<Name, Binding>,
     size: u16,
     materialized: bool,
+    // the hidden slot holding a with statement's object
+    with_object: Option<Name>,
 }
 
 impl ScopeInfo {
@@ -277,6 +281,7 @@ impl ScopeInfo {
             bindings: HashMap::new(),
             size: 0,
             materialized,
+            with_object: None,
         }
     }
 
@@ -502,9 +507,10 @@ fn collect_var_names_in(statement: &Stmt, names: &mut Vec<Name>) {
             }
             collect_var_names_in(body, names);
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
-            collect_var_names_in(body, names)
-        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::With { body, .. } => collect_var_names_in(body, names),
         Stmt::Switch { cases, .. } => {
             for case in cases {
                 collect_var_names(&case.body, names);
@@ -885,7 +891,67 @@ impl Compiler {
         None
     }
 
+    // the with objects a name passes on its way out to where it is bound, innermost first
+    fn with_objects(&self, name: &str) -> Vec<Name> {
+        let mut objects = Vec::new();
+        // the compiler's own temporaries are never properties of anything
+        if name.starts_with('%') {
+            return objects;
+        }
+        for state in self.functions.iter().rev() {
+            for scope in state.scopes.iter().rev() {
+                if scope.bindings.contains_key(name) {
+                    return objects;
+                }
+                if let Some(object) = &scope.with_object {
+                    objects.push(object.clone());
+                }
+            }
+            if state.is_global {
+                break;
+            }
+        }
+        objects
+    }
+
+    // for each with object around a name: when the object has the name, emit `found` with
+    // the object on the stack and skip to the end; otherwise fall through without it
+    fn compile_with_lookups(
+        &mut self,
+        name: &str,
+        objects: &[Name],
+        mut found: impl FnMut(&mut Self, u32),
+    ) -> Result<Vec<usize>, ScriptError> {
+        let index = self.name(name);
+        let mut ends = Vec::new();
+        for object in objects {
+            self.compile_get_name_direct(object)?;
+            self.emit(Op::WithHas(index));
+            let missing = self.emit(Op::JumpIfFalse(0));
+            found(self, index);
+            ends.push(self.emit(Op::Jump(0)));
+            self.patch_here(missing);
+            self.emit(Op::Pop);
+        }
+        Ok(ends)
+    }
+
     fn compile_get_name(&mut self, name: &Name) -> Result<(), ScriptError> {
+        let objects = self.with_objects(name);
+        if objects.is_empty() {
+            return self.compile_get_name_direct(name);
+        }
+        let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
+            compiler.emit(Op::GetProp(index));
+        })?;
+        self.compile_get_name_direct(name)?;
+        for end in ends {
+            self.patch_here(end);
+        }
+        Ok(())
+    }
+
+    fn compile_get_name_direct(&mut self, name: &Name) -> Result<(), ScriptError> {
         if &**name == "undefined" && self.resolve(name).is_none() {
             self.emit(Op::Undefined);
             return Ok(());
@@ -920,6 +986,30 @@ impl Compiler {
 
     // stores the value on top of the stack, leaving it there
     fn compile_set_name(&mut self, name: &Name, initialize: bool) -> Result<(), ScriptError> {
+        let objects = if initialize {
+            Vec::new()
+        } else {
+            self.with_objects(name)
+        };
+        if objects.is_empty() {
+            return self.compile_set_name_direct(name, initialize);
+        }
+        let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
+            compiler.emit(Op::Swap);
+            compiler.emit(Op::SetProp(index));
+        })?;
+        self.compile_set_name_direct(name, initialize)?;
+        for end in ends {
+            self.patch_here(end);
+        }
+        Ok(())
+    }
+
+    fn compile_set_name_direct(
+        &mut self,
+        name: &Name,
+        initialize: bool,
+    ) -> Result<(), ScriptError> {
         let name_index = self.name(name);
         match self.resolve(name) {
             Some((depth, index, kind)) => {
@@ -1150,6 +1240,20 @@ impl Compiler {
                     None => self.patch_here(skip),
                 }
                 Ok(())
+            }
+            Stmt::With { object, body } => {
+                // the object sits in a hidden slot that names inside the body consult first
+                let temp = self.alloc_temp();
+                self.compile_expression(object)?;
+                self.emit(Op::RequireCoercible);
+                self.compile_set_name(&temp, true)?;
+                self.emit(Op::Pop);
+                let mut scope = ScopeInfo::new(ScopeKind::Block, false);
+                scope.with_object = Some(temp);
+                self.state().scopes.push(scope);
+                let compiled = self.compile_statement(body);
+                self.state().scopes.pop();
+                compiled
             }
             Stmt::While { test, body } => {
                 self.push_target(labels, TargetKind::Loop);
@@ -2497,6 +2601,19 @@ impl Compiler {
                 self.emit(Op::Swap);
                 self.patch_here(done);
             }
+            Expr::Identifier(name) if !self.with_objects(name).is_empty() => {
+                // a function found on a with object is called with that object as this
+                let objects = self.with_objects(name);
+                let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
+                    compiler.emit(Op::Dup);
+                    compiler.emit(Op::GetProp(index));
+                })?;
+                self.emit(Op::Undefined);
+                self.compile_get_name_direct(name)?;
+                for end in ends {
+                    self.patch_here(end);
+                }
+            }
             _ => {
                 self.emit(Op::Undefined);
                 self.compile_expression(callee)?;
@@ -2620,6 +2737,24 @@ impl Compiler {
         match operator {
             UnaryOperator::TypeOf => {
                 if let Expr::Identifier(name) = argument
+                    && !self.with_objects(name).is_empty()
+                {
+                    let objects = self.with_objects(name);
+                    let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
+                        compiler.emit(Op::GetProp(index));
+                        compiler.emit(Op::TypeOf);
+                    })?;
+                    if self.resolve(name).is_none() {
+                        let index = self.name(name);
+                        self.emit(Op::TypeofGlobal(index));
+                    } else {
+                        self.compile_get_name_direct(name)?;
+                        self.emit(Op::TypeOf);
+                    }
+                    for end in ends {
+                        self.patch_here(end);
+                    }
+                } else if let Expr::Identifier(name) = argument
                     && self.resolve(name).is_none()
                     && &**name != "arguments"
                 {
@@ -2657,6 +2792,21 @@ impl Compiler {
                     self.emit(Op::Pop);
                     self.emit(Op::True);
                     self.patch_here(done);
+                }
+                Expr::Identifier(name) if !self.with_objects(name).is_empty() => {
+                    let objects = self.with_objects(name);
+                    let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
+                        compiler.emit(Op::DeleteProp(index));
+                    })?;
+                    if self.resolve(name).is_some() {
+                        self.emit(Op::False);
+                    } else {
+                        let index = self.name(name);
+                        self.emit(Op::DeleteGlobal(index));
+                    }
+                    for end in ends {
+                        self.patch_here(end);
+                    }
                 }
                 Expr::Identifier(name) => {
                     if self.resolve(name).is_some() {
@@ -3090,7 +3240,9 @@ fn walk_statement(statement: &Stmt, visit: &mut dyn FnMut(&Expr)) {
             walk_expression(right, visit);
             walk_statement(body, visit);
         }
-        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+        Stmt::While { test, body }
+        | Stmt::DoWhile { body, test }
+        | Stmt::With { object: test, body } => {
             walk_expression(test, visit);
             walk_statement(body, visit);
         }

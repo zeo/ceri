@@ -1,7 +1,7 @@
 // Array.prototype: methods run on engine arrays directly and read array-like receivers,
 // such as arguments objects and node lists, through their indexed properties
 
-use super::operations::{is_callable, same_value_zero, strict_equals};
+use super::operations::{is_callable, same_value, same_value_zero, strict_equals};
 use super::*;
 use std::cmp::Ordering;
 
@@ -137,6 +137,122 @@ impl ScriptRuntime {
         }
     }
 
+    // a mutating method on a generic receiver such as a Proxy over an array: push and pop
+    // follow the standard's own steps, and the rest run on a copy whose changes are written
+    // back through the receiver's properties
+    fn mutate_array_like(
+        &mut self,
+        method: ArrayMethod,
+        this: Value,
+        arguments: Vec<Value>,
+        name: &str,
+    ) -> Result<Value, ScriptError> {
+        if matches!(this, Value::Undefined | Value::Null) {
+            return Err(self.type_error(format!(
+                "Array.prototype.{name} called on null or undefined"
+            )));
+        }
+        // sort rejects a comparator that is not callable before it reads anything
+        if matches!(method, ArrayMethod::Sort) {
+            let comparator = argument(&arguments, 0);
+            if !matches!(comparator, Value::Undefined) && !is_callable(&comparator) {
+                return Err(self
+                    .type_error("The comparison function must be either a function or undefined"));
+            }
+        }
+        let length_value = self.get_property(&this, "length")?;
+        let length = self.coerce_number(length_value)?;
+        let length = if length.is_nan() || length <= 0.0 {
+            0
+        } else {
+            length.min(MAX_RUNTIME_ARRAY_LENGTH as f64) as usize
+        };
+        match method {
+            ArrayMethod::Push => {
+                let new_length = length + arguments.len();
+                check_length(new_length)?;
+                for (offset, value) in arguments.into_iter().enumerate() {
+                    self.set_property(&this, &(length + offset).to_string(), value, true)?;
+                }
+                let new_length = Value::Number(new_length as f64);
+                self.set_property(&this, "length", new_length.clone(), true)?;
+                return Ok(new_length);
+            }
+            ArrayMethod::Pop => {
+                if length == 0 {
+                    self.set_property(&this, "length", Value::Number(0.0), true)?;
+                    return Ok(Value::Undefined);
+                }
+                let key = (length - 1).to_string();
+                let value = self.get_property(&this, &key)?;
+                self.delete_property(&this, &key, true)?;
+                self.set_property(&this, "length", Value::Number((length - 1) as f64), true)?;
+                return Ok(value);
+            }
+            ArrayMethod::CopyWithin => {
+                let target = self.integer(argument(&arguments, 0), 0.0)?;
+                let start = self.integer(argument(&arguments, 1), 0.0)?;
+                let end = match argument(&arguments, 2) {
+                    Value::Undefined => length as f64,
+                    value => self.integer(value, 0.0)?,
+                };
+                let (to, from, last) = (
+                    relative(target, length),
+                    relative(start, length),
+                    relative(end, length),
+                );
+                let count = last.saturating_sub(from).min(length - to);
+                let order: Vec<usize> = if from < to && to < from + count {
+                    (0..count).rev().collect()
+                } else {
+                    (0..count).collect()
+                };
+                for offset in order {
+                    let source = (from + offset).to_string();
+                    let destination = (to + offset).to_string();
+                    if self.has_property(&this, &source)? {
+                        let value = self.get_property(&this, &source)?;
+                        self.set_property(&this, &destination, value, true)?;
+                    } else {
+                        self.delete_property(&this, &destination, true)?;
+                    }
+                }
+                return Ok(this);
+            }
+            _ => {}
+        }
+        let before = self.array_like_list(&this)?;
+        let copy = Self::new_array(before.clone());
+        let result = self.call_array_method(method, copy.clone(), arguments)?;
+        let after = match &copy {
+            Value::Array(array) => array.borrow().clone(),
+            _ => unreachable!("the copy is an array"),
+        };
+        for (index, value) in after.iter().enumerate() {
+            if before
+                .get(index)
+                .is_none_or(|previous| !same_value(previous, value))
+            {
+                self.set_property(&this, &index.to_string(), value.clone(), true)?;
+            }
+        }
+        for index in after.len()..before.len() {
+            self.delete_property(&this, &index.to_string(), true)?;
+        }
+        // the methods that may change the length always write it, as the standard's steps do
+        if matches!(
+            method,
+            ArrayMethod::Shift | ArrayMethod::Unshift | ArrayMethod::Splice
+        ) {
+            self.set_property(&this, "length", Value::Number(after.len() as f64), true)?;
+        }
+        Ok(if values_equal(&result, &copy) {
+            this
+        } else {
+            result
+        })
+    }
+
     pub(super) fn array_like_list(&mut self, value: &Value) -> Result<Vec<Value>, ScriptError> {
         let length = self.get_property(value, "length")?;
         let length = self.coerce_number(length)?;
@@ -199,6 +315,21 @@ impl ScriptRuntime {
             })
             .map_or("", |(name, _, _)| name)
             .to_string();
+        let mutates = matches!(
+            method,
+            M::Push
+                | M::Pop
+                | M::Shift
+                | M::Unshift
+                | M::Splice
+                | M::Reverse
+                | M::Sort
+                | M::Fill
+                | M::CopyWithin
+        );
+        if mutates && !matches!(this, Value::Array(_)) {
+            return self.mutate_array_like(method, this, arguments, &name);
+        }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
                 let values = self.receiver_values(&this, &name)?;

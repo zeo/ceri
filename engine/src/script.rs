@@ -9,6 +9,7 @@ mod dates;
 mod encoding;
 mod events;
 mod geometry;
+mod import_map;
 mod interfaces;
 mod intl;
 mod json;
@@ -522,6 +523,7 @@ pub struct ScriptRuntime {
     construction_stack: Vec<Option<NodeId>>,
     when_defined: HashMap<String, PromiseHandle>,
     custom_registry: Value,
+    import_map: import_map::ImportMap,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1521,6 +1523,7 @@ impl ScriptRuntime {
             construction_stack: Vec::new(),
             when_defined: HashMap::new(),
             custom_registry: Value::Undefined,
+            import_map: import_map::ImportMap::default(),
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -1984,8 +1987,10 @@ impl ScriptRuntime {
         reference: &Value,
         attributes: Option<&Value>,
     ) -> Result<ModuleNamespace, ScriptError> {
+        let reference = reference.string_value();
+        let mapped = self.import_map.resolve(&reference, &base_url);
         let url = base_url
-            .resolve(&reference.string_value())
+            .resolve(mapped.as_deref().unwrap_or(&reference))
             .map_err(|error| runtime_error(error.to_string()))?;
         let import_type = parse_dynamic_import_type(attributes)?;
         if self.resources.is_none() && self.resource_provider.is_none() {
@@ -2032,6 +2037,14 @@ impl ScriptRuntime {
         }
     }
 
+    // a <script type="importmap">; one that does not parse is reported and ignored
+    pub(crate) fn add_import_map(&mut self, source: &str, base: &AppUrl) {
+        match import_map::ImportMap::parse(source, base) {
+            Ok(map) => self.import_map.merge(map),
+            Err(error) => self.report(format!("import map ignored: {error}")),
+        }
+    }
+
     fn execute_module_graph<L: ModuleSourceLoader>(
         &mut self,
         source: &str,
@@ -2063,7 +2076,9 @@ impl ScriptRuntime {
         let scope = vm::Scope::new(compiled.code.scope_size as usize, None);
         let mut load =
             |runtime: &mut Self, specifier: &str| -> Result<ModuleNamespace, ScriptError> {
-                let (dependency_url, dependency_source) = loader.load_module(&url, specifier)?;
+                let mapped = runtime.import_map.resolve(specifier, &url);
+                let (dependency_url, dependency_source) =
+                    loader.load_module(&url, mapped.as_deref().unwrap_or(specifier))?;
                 runtime.execute_module_graph(&dependency_source, dependency_url, loader)
             };
         for (specifier, bindings) in &compiled.imports {

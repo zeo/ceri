@@ -174,6 +174,7 @@ pub enum ScriptSource {
     External(String),
     InlineModule(String),
     ExternalModule(String),
+    ImportMap(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1546,9 +1547,27 @@ impl Document {
             else {
                 continue;
             };
-            let is_module = element
+            let kind = element
                 .attr("type")
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("module"));
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if kind == "importmap" {
+                scripts.push(ScriptSource::ImportMap(self.text_content(node)));
+                continue;
+            }
+            let is_module = kind == "module";
+            // a data block such as type="application/json" or a template is never run
+            let classic = matches!(
+                kind.as_str(),
+                "" | "text/javascript"
+                    | "application/javascript"
+                    | "application/ecmascript"
+                    | "text/ecmascript"
+                    | "module"
+            );
+            if !classic {
+                continue;
+            }
             scripts.push(match (element.attr("src"), is_module) {
                 (Some(source), true) => ScriptSource::ExternalModule(source.to_string()),
                 (Some(source), false) => ScriptSource::External(source.to_string()),
@@ -2241,7 +2260,7 @@ fn parse_start_tag(
             cursor += 1;
             continue;
         }
-        let Some(attr_name) = parse_name_at(raw, &mut cursor) else {
+        let Some(attr_name) = parse_attribute_name_at(raw, &mut cursor) else {
             return Err(ParseError {
                 offset: offset + cursor,
                 message: "invalid attribute name".to_string(),
@@ -2298,6 +2317,19 @@ fn parse_name(raw: &str) -> Option<&str> {
 fn parse_name_at(raw: &str, cursor: &mut usize) -> Option<String> {
     let start = *cursor;
     while *cursor < raw.len() && is_name_character(raw.as_bytes()[*cursor] as char) {
+        *cursor += 1;
+    }
+    (*cursor > start).then(|| raw[start..*cursor].to_ascii_lowercase())
+}
+
+// an attribute name runs to whitespace, '/', '>' or '=', so names such as Vue's @click
+// and :key parse as HTML does
+fn parse_attribute_name_at(raw: &str, cursor: &mut usize) -> Option<String> {
+    let start = *cursor;
+    while let Some(&byte) = raw.as_bytes().get(*cursor) {
+        if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>' | b'=') {
+            break;
+        }
         *cursor += 1;
     }
     (*cursor > start).then(|| raw[start..*cursor].to_ascii_lowercase())

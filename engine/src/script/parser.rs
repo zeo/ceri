@@ -641,7 +641,45 @@ impl<'a> Parser<'a> {
                     self.consume_semicolon()?;
                     Ok(Stmt::Debugger)
                 }
-                "with" => Err(self.error_here("with statements are not supported")),
+                "with" => {
+                    if self.context.strict {
+                        return Err(
+                            self.error_here("strict mode code may not contain with statements")
+                        );
+                    }
+                    self.advance()?;
+                    self.expect_punct("(")?;
+                    let object = self.parse_expression(true)?;
+                    self.expect_punct(")")?;
+                    let body_start = self.offset()?;
+                    let async_function = self.is_word("async")?
+                        && matches!(&self.peek_at(1)?.kind, TokenKind::Identifier(word) if word == "function")
+                        && !self.peek_at(1)?.newline_before;
+                    let body = self.parse_statement()?;
+                    // a declaration cannot be the body of a with statement
+                    let mut labelled = &body;
+                    while let Stmt::Labeled { body, .. } = labelled {
+                        labelled = body;
+                    }
+                    let declaration = async_function
+                        || match labelled {
+                            Stmt::Function(_) | Stmt::Class(_) => true,
+                            Stmt::Declaration { kind, .. } => *kind != DeclarationKind::Var,
+                            _ => false,
+                        };
+                    if declaration {
+                        return Err(ScriptError {
+                            offset: body_start,
+                            message: "a declaration cannot be the body of a with statement"
+                                .to_string(),
+                            name: "SyntaxError".to_string(),
+                        });
+                    }
+                    Ok(Stmt::With {
+                        object,
+                        body: Box::new(body),
+                    })
+                }
                 "function" => {
                     // sloppy code may declare a function as an if body
                     let start = self.offset()?;
@@ -1672,6 +1710,14 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Template {
                     quasis,
                     expressions,
+                })
+            }
+            // a rewound arrow attempt can leave the rescanned literal in the buffer
+            TokenKind::Regex { pattern, flags } => {
+                self.advance()?;
+                Ok(Expr::Regex {
+                    pattern: pattern.into(),
+                    flags: flags.into(),
                 })
             }
             TokenKind::Punct("/" | "/=") => {

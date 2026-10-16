@@ -1345,6 +1345,20 @@ impl ScriptRuntime {
                 self.set_index(&object, key, value.clone(), strict)?;
                 frames.last_mut().expect("frame").stack.push(value);
             }
+            Op::WithHas(name) => {
+                let object = Self::pop(frame);
+                let key = frame.code.names[name as usize].clone();
+                let mut has = self.has_property(&object, &key)?;
+                if has {
+                    let unscopables = self.get_property(&object, "@@unscopables")?;
+                    if !super::operations::is_primitive(&unscopables) {
+                        has = !self.get_property(&unscopables, &key)?.truthy();
+                    }
+                }
+                let stack = &mut frames.last_mut().expect("frame").stack;
+                stack.push(object);
+                stack.push(Value::Bool(has));
+            }
             Op::DeleteProp(name) => {
                 let object = Self::pop(frame);
                 let key = frame.code.names[name as usize].clone();

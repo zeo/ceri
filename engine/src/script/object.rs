@@ -51,6 +51,20 @@ impl Property {
     }
 }
 
+pub(super) struct ArrayIteration {
+    pub(super) target: Value,
+    pub(super) index: usize,
+    pub(super) kind: ArrayIterationKind,
+    pub(super) done: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayIterationKind {
+    Values,
+    Keys,
+    Entries,
+}
+
 // the internal kind of an object, which decides how it is called, printed and compared
 #[derive(Clone, Default)]
 pub(super) enum ObjectClass {
@@ -81,6 +95,8 @@ pub(super) enum ObjectClass {
     WeakMap(Rc<RefCell<super::collections::Collection>>),
     WeakSet(Rc<RefCell<super::collections::Collection>>),
     WeakRef(std::rc::Weak<RefCell<JsObject>>),
+    // an Array Iterator, which reads its target live on every step
+    ArrayIterator(Rc<RefCell<ArrayIteration>>),
     // an object that holds event listeners, keyed by this id in the runtime's registry
     EventTarget(u32),
     // a Mutation, Resize or IntersectionObserver, keyed in the runtime's registry

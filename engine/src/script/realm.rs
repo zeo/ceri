@@ -5,8 +5,8 @@
 use super::ast::FunctionKind;
 use super::compiler::Compiler;
 use super::object::{
-    JsObject, ObjectClass, ObjectHandle, Property, SYMBOL_PREFIX, Slot, array_index,
-    is_private_key, is_symbol_key, new_object,
+    ArrayIteration, ArrayIterationKind, JsObject, ObjectClass, ObjectHandle, Property,
+    SYMBOL_PREFIX, Slot, array_index, is_private_key, is_symbol_key, new_object,
 };
 use super::operations::{
     is_callable, is_primitive, number_to_string, same_value, symbol_description,
@@ -79,6 +79,7 @@ pub(super) enum Native {
     ArrayFrom,
     ArrayOf,
     ArrayValues,
+    ArrayIteratorNext,
     ArrayKeys,
     ArrayEntries,
     IteratorSelf,
@@ -200,6 +201,7 @@ pub(super) struct Intrinsics {
     pub(super) regexp_prototype: ObjectHandle,
     pub(super) array_values: Value,
     pub(super) iterator_prototype: ObjectHandle,
+    pub(super) array_iterator_prototype: ObjectHandle,
     pub(super) map_prototype: ObjectHandle,
     pub(super) set_prototype: ObjectHandle,
     pub(super) weak_map_prototype: ObjectHandle,
@@ -623,6 +625,19 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.method(&array, "from", Native::ArrayFrom, 1);
     build.method(&array, "of", Native::ArrayOf, 0);
     globals.push(("Array", Value::Object(array)));
+
+    let array_iterator_prototype = plain(&iterator_prototype);
+    build.method(
+        &array_iterator_prototype,
+        "next",
+        Native::ArrayIteratorNext,
+        0,
+    );
+    build.value(
+        &array_iterator_prototype,
+        "@@toStringTag",
+        Value::String("Array Iterator".into()),
+    );
 
     let generator_prototype = plain(&iterator_prototype);
     build.method(&generator_prototype, "next", Native::GeneratorNext, 1);
@@ -1195,6 +1210,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         regexp_prototype,
         array_values,
         iterator_prototype,
+        array_iterator_prototype,
         map_prototype,
         set_prototype,
         weak_map_prototype,
@@ -2165,32 +2181,75 @@ impl ScriptRuntime {
             }
             Native::ArrayOf => Ok(Self::new_array(arguments)),
             Native::ArrayValues | Native::ArrayKeys | Native::ArrayEntries => {
-                let values = match &this {
-                    Value::Array(array) => array.borrow().clone(),
-                    Value::Undefined | Value::Null => {
-                        return Err(
-                            self.type_error("Array.prototype.values called on null or undefined")
-                        );
-                    }
-                    other => self.array_like_values(other)?,
+                if matches!(this, Value::Undefined | Value::Null) {
+                    return Err(
+                        self.type_error("Array.prototype.values called on null or undefined")
+                    );
+                }
+                let kind = match native {
+                    Native::ArrayValues => ArrayIterationKind::Values,
+                    Native::ArrayKeys => ArrayIterationKind::Keys,
+                    _ => ArrayIterationKind::Entries,
                 };
-                let values = match native {
-                    Native::ArrayValues => values,
-                    Native::ArrayKeys => (0..values.len())
-                        .map(|index| Value::Number(index as f64))
-                        .collect(),
-                    _ => values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            Self::new_array(vec![Value::Number(index as f64), value])
-                        })
-                        .collect(),
-                };
-                Ok(Value::Iterator(Rc::new(RefCell::new(IteratorData {
-                    values,
+                let iteration = ArrayIteration {
+                    target: this,
                     index: 0,
-                }))))
+                    kind,
+                    done: false,
+                };
+                Ok(Value::Object(new_object(JsObject::with_prototype(
+                    Some(self.intrinsics.array_iterator_prototype.clone()),
+                    ObjectClass::ArrayIterator(Rc::new(RefCell::new(iteration))),
+                ))))
+            }
+            Native::ArrayIteratorNext => {
+                let iteration = match &this {
+                    Value::Object(object) => match &object.borrow().class {
+                        ObjectClass::ArrayIterator(iteration) => Some(iteration.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(iteration) = iteration else {
+                    return Err(
+                        self.type_error("next called on an object that is not an Array Iterator")
+                    );
+                };
+                let (target, index, kind, done) = {
+                    let state = iteration.borrow();
+                    (state.target.clone(), state.index, state.kind, state.done)
+                };
+                if done {
+                    return Ok(self.iterator_result(Value::Undefined, true));
+                }
+                // the length is read on every step, so the iterator sees pushes and pops
+                let length = match &target {
+                    Value::Array(array) => array.borrow().len(),
+                    other => {
+                        let length = self.get_property(other, "length")?;
+                        let length = self.coerce_number(length)?;
+                        if length.is_nan() || length <= 0.0 {
+                            0
+                        } else {
+                            length.min(9_007_199_254_740_991.0) as usize
+                        }
+                    }
+                };
+                if index >= length {
+                    iteration.borrow_mut().done = true;
+                    return Ok(self.iterator_result(Value::Undefined, true));
+                }
+                iteration.borrow_mut().index = index + 1;
+                let key = Value::Number(index as f64);
+                let value = match kind {
+                    ArrayIterationKind::Keys => key,
+                    ArrayIterationKind::Values => self.get_index(&target, key)?,
+                    ArrayIterationKind::Entries => {
+                        let element = self.get_index(&target, key.clone())?;
+                        Self::new_array(vec![key, element])
+                    }
+                };
+                Ok(self.iterator_result(value, false))
             }
             Native::IteratorSelf => Ok(this),
             Native::GeneratorNext | Native::GeneratorReturn | Native::GeneratorThrow => {

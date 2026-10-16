@@ -2,7 +2,7 @@
 // read and write elements in little-endian order with the spec's numeric conversions
 
 use super::arrays::ArrayMethod;
-use super::object::{JsObject, ObjectClass, new_object};
+use super::object::{ArrayIteration, ArrayIterationKind, JsObject, ObjectClass, new_object};
 use super::operations::is_callable;
 use super::*;
 
@@ -547,25 +547,22 @@ impl ScriptRuntime {
                 ))
             }
             M::Values | M::Keys | M::Entries => {
-                let array = self.this_typed(&this)?;
-                let values = elements(&array.borrow());
-                let values = match method {
-                    M::Values => values,
-                    M::Keys => (0..values.len())
-                        .map(|index| Value::Number(index as f64))
-                        .collect(),
-                    _ => values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            Self::new_array(vec![Value::Number(index as f64), value])
-                        })
-                        .collect(),
+                self.this_typed(&this)?;
+                let kind = match method {
+                    M::Values => ArrayIterationKind::Values,
+                    M::Keys => ArrayIterationKind::Keys,
+                    _ => ArrayIterationKind::Entries,
                 };
-                Ok(Value::Iterator(Rc::new(RefCell::new(IteratorData {
-                    values,
+                let iteration = ArrayIteration {
+                    target: this,
                     index: 0,
-                }))))
+                    kind,
+                    done: false,
+                };
+                Ok(Value::Object(new_object(JsObject::with_prototype(
+                    Some(self.intrinsics.array_iterator_prototype.clone()),
+                    ObjectClass::ArrayIterator(Rc::new(RefCell::new(iteration))),
+                ))))
             }
             M::Read(array_method) => {
                 let array = self.this_typed(&this)?;

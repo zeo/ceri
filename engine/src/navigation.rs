@@ -2524,6 +2524,10 @@ impl Browser {
                     String::from_utf8(resource.body)
                         .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?
                 }
+                ScriptSource::ImportMap(source) => {
+                    runtime.add_import_map(source, base);
+                    continue;
+                }
                 ScriptSource::InlineModule(source) => {
                     runtime
                         .execute_module(source, base.clone(), &mut module_loader)

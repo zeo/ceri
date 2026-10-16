@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>vue fixture</title>
+</head>
+<body>
+<div id="app">
+  <section>
+    <p id="count">count: {{ count }}</p>
+    <button id="increment" @click="count++">add one</button>
+  </section>
+  <section>
+    <input id="draft" v-model="draft">
+    <button id="add" @click="add">add</button>
+    <button id="drop" @click="items.shift()">drop first</button>
+    <ul id="items"><li v-for="item in items" :key="item">{{ item }}</li></ul>
+  </section>
+</div>
+<script src="./vue.global.prod.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

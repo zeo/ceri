@@ -59,6 +59,10 @@ pub(super) enum Stmt {
         body: Box<Stmt>,
         test: Expr,
     },
+    With {
+        object: Expr,
+        body: Box<Stmt>,
+    },
     Switch {
         discriminant: Expr,
         cases: Vec<SwitchCase>,
