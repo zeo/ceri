@@ -1,5 +1,5 @@
 use crate::css::Color;
-use crate::dom::{Document, Element, Node};
+use crate::dom::{Document, Element, NodeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -291,15 +291,17 @@ pub fn rasterize_icon(bytes: &[u8], size: u32) -> Option<(Vec<u8>, u32)> {
 
 pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
     let document = Document::parse(source).map_err(|error| ImageError(error.to_string()))?;
-    let root = document
-        .root
-        .children
-        .iter()
-        .find_map(|node| match node {
-            Node::Element(element) if element.name == "svg" => Some(element),
-            _ => None,
+    let root_node = document
+        .element_children(document.root())
+        .find(|&node| {
+            document
+                .element(node)
+                .is_some_and(|element| element.name == "svg")
         })
         .ok_or_else(|| ImageError("SVG has no root element".to_string()))?;
+    let root = document
+        .element(root_node)
+        .expect("the svg root is an element");
     let (view_x, view_y, view_width, view_height) = root
         .attr("viewbox")
         .and_then(parse_view_box)
@@ -338,7 +340,8 @@ pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
     let scale_y = height as f32 / view_height;
     render_element(
         &mut image,
-        root,
+        &document,
+        root_node,
         PaintStyle::default(),
         (view_x, view_y, scale_x, scale_y),
         0,
@@ -348,7 +351,8 @@ pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
 
 fn render_element(
     image: &mut Image,
-    element: &Element,
+    document: &Document,
+    node: NodeId,
     parent_style: PaintStyle,
     viewport: (f32, f32, f32, f32),
     depth: usize,
@@ -356,6 +360,9 @@ fn render_element(
     if depth > MAX_SVG_DEPTH {
         return;
     }
+    let Some(element) = document.element(node) else {
+        return;
+    };
     let style = parse_style(element, parent_style);
     let (view_x, view_y, scale_x, scale_y) = viewport;
     match element.name.as_str() {
@@ -401,10 +408,8 @@ fn render_element(
         }
         _ => {}
     }
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            render_element(image, child, style, viewport, depth + 1);
-        }
+    for child in document.element_children(node) {
+        render_element(image, document, child, style, viewport, depth + 1);
     }
 }
 

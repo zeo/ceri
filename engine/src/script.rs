@@ -30,7 +30,7 @@ pub use dates::TimeZone;
 
 use crate::Color;
 use crate::css::StyleState;
-use crate::dom::{AccessibilityNode, Document, Element, Node, NodeId, NodePath, NormalizeChange};
+use crate::dom::{AccessibilityNode, Document, DomError, Element, NodeId, NodeKind};
 use crate::navigation::{
     APP_ORIGIN, AppUrl, ClipboardProvider, FilePicker, FilePickerRequest, NavigationError,
     Resource, ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
@@ -52,10 +52,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 
-type ElementHandle = Rc<RefCell<ElementLocation>>;
-type DetachedListener = (NodePath, Vec<EventListener>);
-type DetachedListenerState = (Weak<RefCell<ElementLocation>>, Vec<DetachedListener>);
-type ValidityHandle = Rc<NodePath>;
+type ElementHandle = Rc<NodeHandle>;
+type ValidityHandle = ElementHandle;
 type RangeHandle = Rc<RefCell<RangeData>>;
 type WeakRangeHandle = Weak<RefCell<RangeData>>;
 type SelectionHandle = Rc<RefCell<SelectionData>>;
@@ -435,35 +433,9 @@ enum Builtin {
     Native(Native),
 }
 
-#[derive(Clone)]
-enum ElementLocation {
-    Attached {
-        id: NodeId,
-        document: Weak<RefCell<Document>>,
-        is_text: bool,
-    },
-    Detached(Element),
-}
-
-impl PartialEq for ElementLocation {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Attached {
-                    id: left,
-                    is_text: left_is_text,
-                    ..
-                },
-                Self::Attached {
-                    id: right,
-                    is_text: right_is_text,
-                    ..
-                },
-            ) => left == right && left_is_text == right_is_text,
-            (Self::Detached(left), Self::Detached(right)) => left == right,
-            _ => false,
-        }
-    }
+// the script identity of a document node: one handle per node, so handles compare by pointer
+struct NodeHandle {
+    id: NodeId,
 }
 
 // the global bindings: var and function declarations of classic scripts, top-level let and
@@ -510,32 +482,31 @@ pub struct ScriptRuntime {
     intrinsics: Intrinsics,
     location: LocationHandle,
     history: HistoryHandle,
-    listeners: HashMap<NodePath, Vec<EventListener>>,
-    detached_listeners: Vec<DetachedListenerState>,
+    listeners: HashMap<NodeId, Vec<EventListener>>,
     window_listeners: HashMap<String, Vec<WindowListener>>,
-    focused_element: Option<NodePath>,
-    control_values: HashMap<NodePath, String>,
-    control_checked: HashMap<NodePath, bool>,
-    dirty_checked_controls: BTreeSet<NodePath>,
-    option_selected: HashMap<NodePath, bool>,
-    dirty_options: BTreeSet<NodePath>,
-    dirty_controls: BTreeSet<NodePath>,
-    last_user_edit: BTreeSet<NodePath>,
-    resetting_forms: BTreeSet<NodePath>,
-    custom_validity: BTreeMap<NodePath, String>,
-    text_selections: HashMap<NodePath, TextSelection>,
+    focused_element: Option<NodeId>,
+    control_values: HashMap<NodeId, String>,
+    control_checked: HashMap<NodeId, bool>,
+    dirty_checked_controls: BTreeSet<NodeId>,
+    option_selected: HashMap<NodeId, bool>,
+    dirty_options: BTreeSet<NodeId>,
+    dirty_controls: BTreeSet<NodeId>,
+    last_user_edit: BTreeSet<NodeId>,
+    resetting_forms: BTreeSet<NodeId>,
+    custom_validity: BTreeMap<NodeId, String>,
+    text_selections: HashMap<NodeId, TextSelection>,
     composition: Option<TextComposition>,
     click_detail: u32,
     motion_detail: Option<Rc<(String, f64)>>,
     selection: SelectionHandle,
     ranges: Vec<WeakRangeHandle>,
-    selected_files: HashMap<NodePath, Vec<FileHandle>>,
-    file_lists: RefCell<HashMap<NodePath, FileListHandle>>,
+    selected_files: HashMap<NodeId, Vec<FileHandle>>,
+    file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
-    scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
+    scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     viewport: ViewportMetrics,
-    canvas_contexts: HashMap<NodePath, CanvasContextHandle>,
+    canvas_contexts: HashMap<NodeId, CanvasContextHandle>,
     canvas_commands: Vec<CanvasCommand>,
     logs: Vec<String>,
     clock: u64,
@@ -569,6 +540,10 @@ pub struct ScriptRuntime {
     worker_script_type: Option<WorkerScriptType>,
     worker_resource_sender: Option<SyncSender<WorkerResourceRequest>>,
     worker_resource_receiver: Option<Receiver<WorkerResourceRequest>>,
+    node_handles: RefCell<HashMap<NodeId, ElementHandle>>,
+    // detached trees that script still reached when last checked
+    retained_orphans: Vec<NodeId>,
+    orphan_recheck_at: usize,
 }
 
 pub(crate) trait ModuleSourceLoader {
@@ -815,8 +790,8 @@ struct ListenerOptions {
 #[derive(Clone)]
 struct EventData {
     event_type: String,
-    target: NodePath,
-    current_target: NodePath,
+    target: NodeId,
+    current_target: NodeId,
     state: Rc<RefCell<EventState>>,
     history_state: Rc<RefCell<Value>>,
     key: String,
@@ -1046,7 +1021,7 @@ struct TextSelection {
 
 #[derive(Clone, Debug)]
 struct TextComposition {
-    path: NodePath,
+    node: NodeId,
     start: usize,
     end: usize,
 }
@@ -1088,7 +1063,7 @@ struct RangeBoundary {
 
 impl PartialEq for RangeBoundary {
     fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset && *self.node.borrow() == *other.node.borrow()
+        self.offset == other.offset && Rc::ptr_eq(&self.node, &other.node)
     }
 }
 
@@ -1130,7 +1105,7 @@ struct ErrorData {
 }
 
 struct CanvasContextData {
-    path: NodePath,
+    node: NodeId,
     fill_style: Color,
 }
 
@@ -1547,7 +1522,6 @@ impl ScriptRuntime {
             location,
             history,
             listeners: HashMap::new(),
-            detached_listeners: Vec::new(),
             window_listeners: HashMap::new(),
             focused_element: None,
             control_values: HashMap::new(),
@@ -1603,6 +1577,9 @@ impl ScriptRuntime {
             worker_script_type: None,
             worker_resource_sender: None,
             worker_resource_receiver: None,
+            node_handles: RefCell::new(HashMap::new()),
+            retained_orphans: Vec::new(),
+            orphan_recheck_at: 64,
         };
         runtime.initialize_select_state();
         runtime
@@ -1615,438 +1592,189 @@ impl ScriptRuntime {
             .find_elements_by_selector("select")
             .unwrap_or_default();
         for select in selects {
-            let options = self.option_paths(&select);
-            for option in &options {
-                let selected = self
-                    .document
-                    .borrow()
-                    .element_at(option)
-                    .is_some_and(|element| element.attr("selected").is_some());
-                self.option_selected.insert(option.clone(), selected);
-            }
-            self.normalize_select_selection(&select, false);
+            self.rehydrate_select_state(select);
         }
     }
 
-    fn rehydrate_select_state(&mut self, select_path: &[usize]) {
-        self.option_selected
-            .retain(|path, _| !path.starts_with(select_path));
-        self.dirty_options
-            .retain(|path| !path.starts_with(select_path));
-        let options = self.option_paths(select_path);
-        for option in &options {
+    // option selectedness taken again from the selected attributes, except where script
+    // already set it
+    fn reset_option_state(&mut self, options: &[NodeId]) {
+        for &option in options {
+            if self.dirty_options.contains(&option) {
+                continue;
+            }
             let selected = self
                 .document
                 .borrow()
-                .element_at(option)
-                .is_some_and(|element| element.attr("selected").is_some());
-            self.option_selected.insert(option.clone(), selected);
+                .attribute(option, "selected")
+                .is_some();
+            self.option_selected.insert(option, selected);
         }
-        self.normalize_select_selection(select_path, false);
     }
 
-    fn select_paths_for_inner_html(&self, path: &[usize]) -> Vec<NodePath> {
+    fn rehydrate_select_state(&mut self, select: NodeId) {
+        let options = self.options_of(select);
+        self.reset_option_state(&options);
+        self.normalize_select_selection(select, false);
+    }
+
+    // the select that owns options at or below a node, if any
+    fn owning_select(&self, node: NodeId) -> Option<NodeId> {
         let document = self.document.borrow();
-        let mut selects = Vec::new();
         if document
-            .element_at(path)
+            .element(node)
             .is_some_and(|element| element.name == "select")
         {
-            selects.push(path.to_vec());
+            return Some(node);
         }
-        if let Some(nested) = document.find_elements_by_selector_within(path, "select") {
-            selects.extend(nested);
-        }
-        if let Some(ancestor) = document.select_ancestor_path(path) {
-            selects.push(ancestor);
-        }
-        selects.sort_by_key(Vec::len);
-        selects.dedup();
-        selects
+        document.select_ancestor(node)
     }
 
-    fn refresh_select_state_after_inner_html(&mut self, path: &[usize]) {
-        for select in self.select_paths_for_inner_html(path) {
-            self.rehydrate_select_state(&select);
-        }
-    }
-
-    fn refresh_select_state_after_append(&mut self, parent: &[usize], child: &[usize]) {
-        let (new_selects, ancestor) = {
-            let document = self.document.borrow();
-            let mut new_selects = Vec::new();
-            if document
-                .element_at(child)
-                .is_some_and(|element| element.name == "select")
-            {
-                new_selects.push(child.to_vec());
-            }
-            if let Some(nested) = document.find_elements_by_selector_within(child, "select") {
-                new_selects.extend(nested);
-            }
-            let ancestor = document
-                .element_at(parent)
-                .is_some_and(|element| element.name == "select")
-                .then(|| parent.to_vec())
-                .or_else(|| document.select_ancestor_path(parent));
-            new_selects.sort_by_key(Vec::len);
-            new_selects.dedup();
-            (new_selects, ancestor)
-        };
-        for select in new_selects {
-            self.rehydrate_select_state(&select);
-        }
-        let Some(select) = ancestor else {
-            return;
-        };
-        let options = self
-            .option_paths(&select)
-            .into_iter()
-            .filter(|option| option.starts_with(child))
-            .collect::<Vec<_>>();
-        for option in options {
-            let selected = self
-                .document
-                .borrow()
-                .element_at(&option)
-                .is_some_and(|element| element.attr("selected").is_some());
-            self.option_selected.insert(option.clone(), selected);
-            self.dirty_options.remove(&option);
-        }
-        self.normalize_select_selection(&select, false);
-    }
-
-    fn refresh_select_state_after_remove(&mut self, parent: &[usize]) {
-        let select = {
-            let document = self.document.borrow();
-            document
-                .element_at(parent)
-                .is_some_and(|element| element.name == "select")
-                .then(|| parent.to_vec())
-                .or_else(|| document.select_ancestor_path(parent))
-        };
-        if let Some(select) = select {
-            self.normalize_select_selection(&select, false);
-        }
-    }
-
-    fn shift_runtime_paths_for_insert(&mut self, parent: &[usize], index: usize) {
-        shift_hash_map_paths(&mut self.listeners, parent, index);
-        shift_hash_map_paths(&mut self.control_values, parent, index);
-        shift_hash_map_paths(&mut self.control_checked, parent, index);
-        shift_btree_set_paths(&mut self.dirty_checked_controls, parent, index);
-        shift_hash_map_paths(&mut self.option_selected, parent, index);
-        shift_btree_set_paths(&mut self.dirty_options, parent, index);
-        shift_btree_set_paths(&mut self.dirty_controls, parent, index);
-        shift_btree_set_paths(&mut self.last_user_edit, parent, index);
-        shift_btree_set_paths(&mut self.resetting_forms, parent, index);
-        shift_btree_map_paths(&mut self.custom_validity, parent, index);
-        shift_hash_map_paths(&mut self.text_selections, parent, index);
-        shift_hash_map_paths(&mut self.selected_files, parent, index);
-        shift_btree_map_paths(&mut self.scroll_offsets, parent, index);
-        shift_hash_map_paths(&mut self.canvas_contexts, parent, index);
-        for context in self.canvas_contexts.values() {
-            shift_path_for_insert(&mut context.borrow_mut().path, parent, index);
-        }
-        {
-            let mut file_lists = self.file_lists.borrow_mut();
-            shift_hash_map_paths(&mut file_lists, parent, index);
-        }
-        if let Some(path) = &mut self.focused_element {
-            shift_path_for_insert(path, parent, index);
-        }
-        if let Some(composition) = &mut self.composition {
-            shift_path_for_insert(&mut composition.path, parent, index);
-        }
-    }
-
-    fn shift_runtime_paths_for_remove(&mut self, parent: &[usize], index: usize) {
-        shift_hash_map_paths_for_remove(&mut self.listeners, parent, index);
-        shift_hash_map_paths_for_remove(&mut self.control_values, parent, index);
-        shift_hash_map_paths_for_remove(&mut self.control_checked, parent, index);
-        shift_btree_set_paths_for_remove(&mut self.dirty_checked_controls, parent, index);
-        shift_hash_map_paths_for_remove(&mut self.option_selected, parent, index);
-        shift_btree_set_paths_for_remove(&mut self.dirty_options, parent, index);
-        shift_btree_set_paths_for_remove(&mut self.dirty_controls, parent, index);
-        shift_btree_set_paths_for_remove(&mut self.last_user_edit, parent, index);
-        shift_btree_set_paths_for_remove(&mut self.resetting_forms, parent, index);
-        shift_btree_map_paths_for_remove(&mut self.custom_validity, parent, index);
-        shift_hash_map_paths_for_remove(&mut self.text_selections, parent, index);
-        shift_hash_map_paths_for_remove(&mut self.selected_files, parent, index);
-        shift_btree_map_paths_for_remove(&mut self.scroll_offsets, parent, index);
-        shift_hash_map_paths_for_remove(&mut self.canvas_contexts, parent, index);
-        for context in self.canvas_contexts.values() {
-            shift_path_for_remove(&mut context.borrow_mut().path, parent, index);
-        }
-        {
-            let mut file_lists = self.file_lists.borrow_mut();
-            shift_hash_map_paths_for_remove(&mut file_lists, parent, index);
-        }
-        if let Some(path) = &mut self.focused_element {
-            shift_path_for_remove(path, parent, index);
-        }
-        if let Some(composition) = &mut self.composition {
-            shift_path_for_remove(&mut composition.path, parent, index);
-        }
-    }
-
-    fn relocate_runtime_paths_for_move(&mut self, source: &[usize], destination: &[usize]) {
-        let source_parent = source[..source.len().saturating_sub(1)].to_vec();
-        let source_index = *source.last().expect("move source path is non-empty");
-        let destination_parent = destination[..destination.len().saturating_sub(1)].to_vec();
-        let destination_index = *destination
-            .last()
-            .expect("move destination path is non-empty");
-        relocate_hash_map_paths(
-            &mut self.listeners,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_hash_map_paths(
-            &mut self.control_values,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_hash_map_paths(
-            &mut self.control_checked,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_set_paths(
-            &mut self.dirty_checked_controls,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_hash_map_paths(
-            &mut self.option_selected,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_set_paths(
-            &mut self.dirty_options,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_set_paths(
-            &mut self.dirty_controls,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_set_paths(
-            &mut self.last_user_edit,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_set_paths(
-            &mut self.resetting_forms,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_map_paths(
-            &mut self.custom_validity,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_hash_map_paths(
-            &mut self.text_selections,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_hash_map_paths(
-            &mut self.selected_files,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_btree_map_paths(
-            &mut self.scroll_offsets,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        relocate_hash_map_paths(
-            &mut self.canvas_contexts,
-            source,
-            &source_parent,
-            source_index,
-            &destination_parent,
-            destination_index,
-            destination,
-        );
-        {
-            let mut file_lists = self.file_lists.borrow_mut();
-            relocate_hash_map_paths(
-                &mut file_lists,
-                source,
-                &source_parent,
-                source_index,
-                &destination_parent,
-                destination_index,
-                destination,
-            );
-        }
-        for context in self.canvas_contexts.values() {
-            let path = context.borrow().path.clone();
-            let path = relocate_path_for_move(
-                &path,
-                source,
-                &source_parent,
-                source_index,
-                &destination_parent,
-                destination_index,
-                destination,
-            );
-            context.borrow_mut().path = path;
-        }
-        if let Some(path) = &mut self.focused_element {
-            *path = relocate_path_for_move(
-                path,
-                source,
-                &source_parent,
-                source_index,
-                &destination_parent,
-                destination_index,
-                destination,
-            );
-        }
-        if let Some(composition) = &mut self.composition {
-            composition.path = relocate_path_for_move(
-                &composition.path,
-                source,
-                &source_parent,
-                source_index,
-                &destination_parent,
-                destination_index,
-                destination,
-            );
-        }
-    }
-
-    fn refresh_select_state_after_move(&mut self, source_parent: &[usize], child: &[usize]) {
-        let selects = {
-            let document = self.document.borrow();
-            let mut selects = Vec::new();
-            for path in [source_parent.to_vec(), child.to_vec()] {
-                if document
-                    .element_at(&path)
+    fn selects_within(&self, node: NodeId) -> Vec<NodeId> {
+        let document = self.document.borrow();
+        std::iter::once(node)
+            .chain(document.descendants(node))
+            .filter(|&candidate| {
+                document
+                    .element(candidate)
                     .is_some_and(|element| element.name == "select")
-                {
-                    selects.push(path.clone());
-                }
-                if let Some(ancestor) = document.select_ancestor_path(&path) {
-                    selects.push(ancestor);
-                }
-            }
-            selects.sort_by_key(Vec::len);
-            selects.dedup();
-            selects
-        };
+            })
+            .collect()
+    }
+
+    fn refresh_select_state_after_inner_html(&mut self, node: NodeId) {
+        let mut selects = self.selects_within(node);
+        selects.extend(self.owning_select(node));
+        selects.sort_unstable();
+        selects.dedup();
         for select in selects {
-            self.normalize_select_selection(&select, false);
+            self.rehydrate_select_state(select);
         }
     }
 
-    fn capture_detached_listeners(&mut self, handle: &ElementHandle, path: &[usize]) {
-        let mut detached = Vec::new();
-        let mut retained = HashMap::new();
-        for (candidate, listeners) in self.listeners.drain() {
-            if candidate.starts_with(path) {
-                detached.push((candidate[path.len()..].to_vec(), listeners));
-            } else {
-                retained.insert(candidate, listeners);
-            }
+    fn refresh_select_state_after_append(&mut self, parent: NodeId, child: NodeId) {
+        for select in self.selects_within(child) {
+            self.rehydrate_select_state(select);
         }
-        self.listeners = retained;
-        self.prune_detached_listeners();
-        let weak = Rc::downgrade(handle);
-        self.detached_listeners
-            .retain(|(candidate, _)| !Weak::ptr_eq(candidate, &weak));
-        self.detached_listeners.push((weak, detached));
-    }
-
-    fn restore_detached_listeners(&mut self, handle: &ElementHandle, path: &[usize]) {
-        self.prune_detached_listeners();
-        let weak = Rc::downgrade(handle);
-        let Some(index) = self
-            .detached_listeners
-            .iter()
-            .position(|(candidate, _)| Weak::ptr_eq(candidate, &weak))
-        else {
+        let Some(select) = self.owning_select(parent) else {
             return;
         };
-        let (_, detached) = self.detached_listeners.remove(index);
-        for (relative, listeners) in detached {
-            let mut attached = path.to_vec();
-            attached.extend(relative);
-            self.listeners.insert(attached, listeners);
+        let options = {
+            let document = self.document.borrow();
+            self.options_of(select)
+                .into_iter()
+                .filter(|&option| document.is_inclusive_ancestor(child, option))
+                .collect::<Vec<_>>()
+        };
+        self.reset_option_state(&options);
+        self.normalize_select_selection(select, false);
+    }
+
+    fn refresh_select_state_after_remove(&mut self, parent: NodeId) {
+        if let Some(select) = self.owning_select(parent) {
+            self.normalize_select_selection(select, false);
         }
     }
 
-    fn discard_detached_descendant_listeners(&mut self, handle: &ElementHandle) {
-        self.prune_detached_listeners();
-        let weak = Rc::downgrade(handle);
-        if let Some((_, listeners)) = self
-            .detached_listeners
-            .iter_mut()
-            .find(|(candidate, _)| Weak::ptr_eq(candidate, &weak))
+    fn refresh_select_state_after_move(&mut self, source_parent: NodeId, child: NodeId) {
+        let mut selects = [source_parent, child]
+            .into_iter()
+            .filter_map(|node| self.owning_select(node))
+            .collect::<Vec<_>>();
+        selects.sort_unstable();
+        selects.dedup();
+        for select in selects {
+            self.normalize_select_selection(select, false);
+        }
+    }
+
+    // the canonical handle of a node, created the first time script sees it
+    fn document_node(&self) -> NodeId {
+        self.document.borrow().root()
+    }
+
+    fn node_handle(&self, id: NodeId) -> ElementHandle {
+        self.node_handles
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| Rc::new(NodeHandle { id }))
+            .clone()
+    }
+
+    // a node as script sees it: the document object for the root, a handle otherwise
+    fn node_value(&self, id: NodeId) -> Value {
+        if id == self.document.borrow().root() {
+            Value::Document
+        } else {
+            Value::Element(self.node_handle(id))
+        }
+    }
+
+    fn is_text_node(&self, handle: &ElementHandle) -> bool {
+        self.document.borrow().is_text(handle.id)
+    }
+
+    // frees detached trees that no script value reaches, along with their runtime state
+    fn collect_detached_nodes(&mut self) {
+        let mut candidates = self.document.borrow_mut().take_orphans();
+        if self.retained_orphans.len() >= self.orphan_recheck_at {
+            candidates.append(&mut self.retained_orphans);
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut freed = Vec::new();
         {
-            listeners.retain(|(path, _)| path.is_empty());
+            let mut document = self.document.borrow_mut();
+            let handles = self.node_handles.borrow();
+            for root in candidates {
+                if !document.contains(root)
+                    || root == document.root()
+                    || document.parent(root).is_some()
+                {
+                    continue;
+                }
+                let reachable = document.subtree(root).into_iter().any(|node| {
+                    handles
+                        .get(&node)
+                        .is_some_and(|handle| Rc::strong_count(handle) > 1)
+                });
+                if reachable {
+                    self.retained_orphans.push(root);
+                } else {
+                    freed.extend(document.free_tree(root));
+                }
+            }
+        }
+        self.orphan_recheck_at = (self.retained_orphans.len() * 2).max(64);
+        if !freed.is_empty() {
+            self.forget_nodes(&freed);
         }
     }
 
-    fn prune_detached_listeners(&mut self) {
-        self.detached_listeners
-            .retain(|(handle, _)| handle.strong_count() > 0);
+    fn forget_nodes(&mut self, nodes: &[NodeId]) {
+        let nodes = nodes.iter().copied().collect::<HashSet<_>>();
+        let gone = |node: NodeId| nodes.contains(&node);
+        self.node_handles
+            .borrow_mut()
+            .retain(|node, _| !gone(*node));
+        self.listeners.retain(|node, _| !gone(*node));
+        self.control_values.retain(|node, _| !gone(*node));
+        self.control_checked.retain(|node, _| !gone(*node));
+        self.dirty_checked_controls.retain(|node| !gone(*node));
+        self.option_selected.retain(|node, _| !gone(*node));
+        self.dirty_options.retain(|node| !gone(*node));
+        self.dirty_controls.retain(|node| !gone(*node));
+        self.last_user_edit.retain(|node| !gone(*node));
+        self.resetting_forms.retain(|node| !gone(*node));
+        self.custom_validity.retain(|node, _| !gone(*node));
+        self.text_selections.retain(|node, _| !gone(*node));
+        self.selected_files.retain(|node, _| !gone(*node));
+        self.file_lists.borrow_mut().retain(|node, _| !gone(*node));
+        self.scroll_offsets.retain(|node, _| !gone(*node));
+        self.canvas_contexts.retain(|node, _| !gone(*node));
     }
 
     fn remove_event_listeners_for_signal(&mut self, signal: &AbortSignalHandle) {
@@ -2058,14 +1786,6 @@ impl ScriptRuntime {
             listeners.retain(|listener| !window_listener_uses_signal(listener, signal));
             !listeners.is_empty()
         });
-        for (_, listeners) in &mut self.detached_listeners {
-            for (_, listener_set) in listeners.iter_mut() {
-                listener_set.retain(|listener| !listener_uses_signal(listener, signal));
-            }
-            listeners.retain(|(_, listener_set)| !listener_set.is_empty());
-        }
-        self.detached_listeners
-            .retain(|(_, listeners)| !listeners.is_empty());
         for worker in &self.workers {
             worker
                 .borrow_mut()
@@ -2074,143 +1794,143 @@ impl ScriptRuntime {
         }
     }
 
-    fn clear_runtime_state_for_removed_subtree(&mut self, path: &[usize]) {
-        self.listeners
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.control_values
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.control_checked
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.dirty_checked_controls
-            .retain(|candidate| !candidate.starts_with(path));
-        self.option_selected
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.dirty_options
-            .retain(|candidate| !candidate.starts_with(path));
-        self.dirty_controls
-            .retain(|candidate| !candidate.starts_with(path));
-        self.last_user_edit
-            .retain(|candidate| !candidate.starts_with(path));
-        self.resetting_forms
-            .retain(|candidate| !candidate.starts_with(path));
-        self.custom_validity
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.text_selections
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.selected_files
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.file_lists
-            .borrow_mut()
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.scroll_offsets
-            .retain(|candidate, _| !candidate.starts_with(path));
-        self.canvas_contexts
-            .retain(|candidate, _| !candidate.starts_with(path));
-        if self
-            .composition
-            .as_ref()
-            .is_some_and(|composition| composition.path.starts_with(path))
-        {
-            self.composition = None;
-        }
+    fn dom_error(&mut self, error: DomError) -> ScriptError {
+        let exception = match error {
+            DomError::HierarchyRequest => dom_exception(
+                "HierarchyRequestError",
+                "The new child element contains the parent.",
+            ),
+            DomError::NotFound => dom_exception(
+                "NotFoundError",
+                "The node before which the new node is to be inserted is not a child of this node.",
+            ),
+        };
+        self.throw_value(exception)
     }
 
-    fn detach_child(&mut self, parent: &[usize], child: &ElementHandle) -> Result<(), ScriptError> {
-        let Some(child_path) = attached_path(child) else {
-            return Err(runtime_error("removeChild expects an attached child"));
+    // takes a node out of its parent; focus and composition inside it end first
+    fn remove_node(&mut self, node: NodeId) -> Result<(), ScriptError> {
+        let Some(parent) = self.document.borrow().parent(node) else {
+            return Ok(());
         };
-        if child_path.len() != parent.len().saturating_add(1)
-            || child_path[..parent.len()] != *parent
-        {
-            return Err(runtime_error("removeChild child is not a direct child"));
-        }
+        let inside = |document: &Document, candidate: NodeId| {
+            document.is_inclusive_ancestor(node, candidate)
+        };
         if self
             .composition
             .as_ref()
-            .is_some_and(|composition| composition.path.starts_with(&child_path))
+            .is_some_and(|composition| inside(&self.document.borrow(), composition.node))
         {
             self.composition_cancel()?;
         }
         if self
             .focused_element
-            .as_ref()
-            .is_some_and(|focused| focused.starts_with(&child_path))
+            .is_some_and(|focused| inside(&self.document.borrow(), focused))
         {
             self.blur_focused()?;
         }
-        let selection_changed = self.adjust_ranges_for_remove(parent, &child_path);
-        let removed_element = self.document.borrow_mut().remove_child(parent, &child_path);
-        let removed_text = if removed_element.is_none() {
-            self.document
-                .borrow_mut()
-                .remove_text_child(parent, &child_path)
-        } else {
-            None
-        };
-        if removed_element.is_none() && removed_text.is_none() {
-            return Err(runtime_error(
-                "removeChild child is no longer in the document",
-            ));
+        let selection_changed = self.adjust_ranges_for_remove(parent, node);
+        if self.document.borrow_mut().remove(node).is_none() {
+            return Ok(());
         }
-        self.capture_detached_listeners(child, &child_path);
-        self.clear_runtime_state_for_removed_subtree(&child_path);
         self.refresh_select_state_after_remove(parent);
-        *child.borrow_mut() = match removed_element {
-            Some(element) => ElementLocation::Detached(element),
-            None => ElementLocation::Detached(detached_text_element(
-                &removed_text.expect("removed text was checked"),
-            )),
-        };
         if selection_changed {
             self.dispatch_document_selection_change()?;
         }
         Ok(())
     }
 
-    fn insert_detached_before(
+    fn node_argument(
         &mut self,
-        parent: &[usize],
-        child: &ElementHandle,
-        reference: Option<&[usize]>,
-    ) -> Result<NodePath, ScriptError> {
-        let reference_index = reference.and_then(|path| path.last()).copied();
-        let location = child.borrow().clone();
-        let child_path = match location {
-            ElementLocation::Detached(element) if is_detached_text_element(&element) => {
-                let text = detached_text_data(&element).unwrap_or_default();
-                if let Some(reference) = reference {
-                    self.document
-                        .borrow_mut()
-                        .insert_text_node_before(parent, text, reference)
-                } else {
-                    self.document.borrow_mut().append_text_node(parent, text)
+        arguments: &[Value],
+        index: usize,
+        method: &str,
+    ) -> Result<NodeId, ScriptError> {
+        match arguments.get(index).map(Value::resolve) {
+            Some(Value::Element(handle)) => Ok(handle.id),
+            Some(Value::Document) => Ok(self.document.borrow().root()),
+            _ => Err(self.type_error(format!(
+                "Failed to execute '{method}' on 'Node': parameter {} is not of type 'Node'.",
+                index + 1
+            ))),
+        }
+    }
+
+    // the nodes among the arguments of before, after and replaceWith
+    fn argument_nodes(&self, arguments: &[Value]) -> Vec<NodeId> {
+        arguments
+            .iter()
+            .filter_map(|value| match value.resolve() {
+                Value::Element(handle) => Some(handle.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // the first following sibling that is not itself being inserted
+    fn viable_next_sibling(&self, node: NodeId, arguments: &[Value]) -> Option<NodeId> {
+        let excluded = self.argument_nodes(arguments);
+        let document = self.document.borrow();
+        let mut candidate = document.sibling(node, true);
+        while let Some(sibling) = candidate {
+            if !excluded.contains(&sibling) {
+                return Some(sibling);
+            }
+            candidate = document.sibling(sibling, true);
+        }
+        None
+    }
+
+    // the arguments of append, before and friends as one node: strings become text and
+    // several values gather in a fragment
+    fn nodes_from_arguments(&mut self, arguments: &[Value]) -> Result<NodeId, ScriptError> {
+        let nodes = arguments
+            .iter()
+            .map(|value| child_node_from_value(self, value))
+            .collect::<Vec<_>>();
+        if let [node] = nodes[..] {
+            return Ok(node);
+        }
+        let fragment = self.document.borrow_mut().create_fragment();
+        for node in nodes {
+            self.insert_node(fragment, node, None)?;
+        }
+        Ok(fragment)
+    }
+
+    // inserts a node, or the children of a fragment, before a reference or at the end; a
+    // node that moves keeps its focus, control state and the live ranges inside it
+    fn insert_node(
+        &mut self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<Vec<NodeId>, ScriptError> {
+        let checked = self
+            .document
+            .borrow()
+            .validate_insertion(parent, node, reference);
+        if let Err(error) = checked {
+            return Err(self.dom_error(error));
+        }
+        let old_parent = self.document.borrow().parent(node);
+        let inserted = self
+            .document
+            .borrow_mut()
+            .insert_before(parent, node, reference);
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(error) => return Err(self.dom_error(error)),
+        };
+        match old_parent {
+            Some(old_parent) => self.refresh_select_state_after_move(old_parent, node),
+            None => {
+                for &child in &inserted {
+                    self.refresh_select_state_after_append(parent, child);
                 }
             }
-            ElementLocation::Detached(element) => {
-                if let Some(reference) = reference {
-                    self.document
-                        .borrow_mut()
-                        .insert_element_before(parent, element, reference)
-                } else {
-                    self.document.borrow_mut().append_element(parent, element)
-                }
-            }
-            ElementLocation::Attached { .. } => {
-                return Err(runtime_error("insertBefore child handle is unavailable"));
-            }
         }
-        .ok_or_else(|| {
-            runtime_error("insertBefore parent or reference is no longer in the document")
-        })?;
-        if let Some(index) = reference_index {
-            self.shift_runtime_paths_for_insert(parent, index);
-        }
-        self.restore_detached_listeners(child, &child_path);
-        self.refresh_select_state_after_append(parent, &child_path);
-        let attached = attached_handle(child_path.clone(), &self.document)
-            .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
-        *child.borrow_mut() = attached.borrow().clone();
-        Ok(child_path)
+        Ok(inserted)
     }
 
     pub fn execute_scripts(&mut self) -> Result<(), ScriptError> {
@@ -2411,31 +2131,31 @@ impl ScriptRuntime {
         let Some(path) = self.document.borrow().find_element_by_id(id) else {
             return Ok(false);
         };
-        self.click_path(path)
+        self.click_node(path)
     }
 
-    pub fn click_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
-        if self.is_disabled_path(&path) {
+    pub fn click_node(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        if self.is_disabled(node) {
             return Ok(false);
         }
-        let focused = self.focus_path(path.clone())?;
-        let dispatch = self.dispatch_event(path.clone(), "click")?;
+        let focused = self.focus_node(node)?;
+        let dispatch = self.dispatch_event(node, "click")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented
             && self.pending_navigation.is_none()
-            && let Some(control) = self.label_activation_control(&path)
+            && let Some(control) = self.label_activation_control(node)
         {
-            let activated = self.click_path(control)?;
+            let activated = self.click_node(control)?;
             return Ok(dispatch.handled || focused || activated);
         }
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
-            self.apply_click_default(&path)?;
-            if let Some(form) = self.reset_form_for_click(&path) {
+            self.apply_click_default(node)?;
+            if let Some(form) = self.reset_form_for_click(node) {
                 self.reset_form(form)?;
-            } else if let Some(form) = self.submit_form_for_click(&path) {
+            } else if let Some(form) = self.submit_form_for_click(node) {
                 self.request_submit(form)?;
             }
-            let reference = self.document.borrow().link_reference(&path);
+            let reference = self.document.borrow().link_reference(node);
             if self.pending_navigation.is_none()
                 && let Some(reference) = reference
             {
@@ -2445,63 +2165,61 @@ impl ScriptRuntime {
         Ok(dispatch.handled || focused)
     }
 
-    fn label_activation_control(&self, path: &[usize]) -> Option<NodePath> {
+    fn label_activation_control(&self, target: NodeId) -> Option<NodeId> {
         let document = self.document.borrow();
         let label_path = if document
-            .element_at(path)
+            .element(target)
             .is_some_and(|element| element.name == "label")
         {
-            path.to_vec()
+            target
         } else {
-            document.label_ancestor_path(path)?
+            document.label_ancestor(target)?
         };
-        let control = document.label_control_path(&label_path)?;
-        if path.starts_with(&control) {
+        let control = document.label_control(label_path)?;
+        if document.is_inclusive_ancestor(control, target) {
             return None;
         }
-        let start = label_path.len();
-        if path.len() > start
-            && (start + 1..=path.len()).any(|length| {
-                document.element_at(&path[..length]).is_some_and(|element| {
+        // an interactive element between the label and the clicked node takes the click
+        let interactive = std::iter::once(target)
+            .chain(document.ancestors(target))
+            .take_while(|&node| node != label_path)
+            .any(|node| {
+                document.element(node).is_some_and(|element| {
                     matches!(
                         element.name.as_str(),
                         "a" | "button" | "input" | "select" | "textarea"
                     )
                 })
-            })
-        {
+            });
+        if interactive {
             return None;
         }
         Some(control)
     }
 
-    pub fn dispatch_path_event(
-        &mut self,
-        path: NodePath,
-        event: &str,
-    ) -> Result<bool, ScriptError> {
-        let dispatch = self.dispatch_event(path, event)?;
+    pub fn dispatch_node_event(&mut self, node: NodeId, event: &str) -> Result<bool, ScriptError> {
+        let dispatch = self.dispatch_event(node, event)?;
         self.drain_microtasks()?;
         Ok(dispatch.handled)
     }
 
-    pub(crate) fn focus_path(&mut self, path: NodePath) -> Result<bool, ScriptError> {
-        if !self.is_focusable_path(&path) || self.focused_element.as_ref() == Some(&path) {
+    pub(crate) fn focus_node(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        if !self.is_focusable(node) || self.focused_element.as_ref() == Some(&node) {
             return Ok(false);
         }
         if self.composition.is_some() {
             self.composition_cancel()?;
         }
-        let previous = self.focused_element.replace(path.clone());
+        let previous = self.focused_element.replace(node);
         if let Some(previous) = previous {
             self.dispatch_event(previous, "blur")?;
             self.drain_microtasks()?;
         }
-        if self.is_selection_control_path(&path) && !self.text_selections.contains_key(&path) {
-            let value = self.control_value_path(&path).unwrap_or_default();
+        if self.is_selection_control(node) && !self.text_selections.contains_key(&node) {
+            let value = self.control_value(node).unwrap_or_default();
             let cursor = utf16_len(&value);
             self.text_selections.insert(
-                path.clone(),
+                node,
                 TextSelection {
                     start: cursor,
                     end: cursor,
@@ -2509,7 +2227,7 @@ impl ScriptRuntime {
                 },
             );
         }
-        self.dispatch_event(path, "focus")?;
+        self.dispatch_event(node, "focus")?;
         self.drain_microtasks()?;
         Ok(true)
     }
@@ -2528,9 +2246,9 @@ impl ScriptRuntime {
         if self.focused_element.is_some() {
             return Ok(false);
         }
-        let candidates = self.document.borrow().autofocus_paths();
+        let candidates = self.document.borrow().autofocus_candidates();
         for path in candidates {
-            if self.focus_path(path)? {
+            if self.focus_node(path)? {
                 return Ok(true);
             }
         }
@@ -2561,36 +2279,27 @@ impl ScriptRuntime {
             .as_ref()
             .and_then(|focused| paths.iter().position(|path| path == focused))
         {
-            Some(index) if backwards => paths[(index + paths.len() - 1) % paths.len()].clone(),
-            Some(index) => paths[(index + 1) % paths.len()].clone(),
-            None if backwards => paths.last().cloned().unwrap_or_default(),
-            None => paths.first().cloned().unwrap_or_default(),
+            Some(index) if backwards => paths[(index + paths.len() - 1) % paths.len()],
+            Some(index) => paths[(index + 1) % paths.len()],
+            None if backwards => paths[paths.len() - 1],
+            None => paths[0],
         };
-        self.focus_path(next)
+        self.focus_node(next)
     }
 
     // select all, copy, cut and paste inside a text control, through the host clipboard
-    fn run_editing_shortcut(
-        &mut self,
-        path: &NodePath,
-        shortcut: &str,
-    ) -> Result<bool, ScriptError> {
-        let value = self.control_value_path(path).unwrap_or_default();
+    fn run_editing_shortcut(&mut self, node: NodeId, shortcut: &str) -> Result<bool, ScriptError> {
+        let value = self.control_value(node).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
-        let selection = self.selection_for_path(path, &value);
+        let selection = self.selection_for(node, &value);
         if shortcut == "a" {
-            return self.set_text_selection(
-                path.clone(),
-                0,
-                units.len(),
-                SelectionDirection::Forward,
-            );
+            return self.set_text_selection(node, 0, units.len(), SelectionDirection::Forward);
         }
         let Some(clipboard) = self.clipboard_provider.clone() else {
             return Ok(false);
         };
         if shortcut == "v" {
-            if self.is_readonly_path(path) {
+            if self.is_readonly(node) {
                 return Ok(false);
             }
             let text = clipboard
@@ -2606,19 +2315,19 @@ impl ScriptRuntime {
         clipboard
             .write_text(&selected)
             .map_err(|error| runtime_error(format!("clipboard write failed: {error}")))?;
-        if shortcut == "c" || self.is_readonly_path(path) {
+        if shortcut == "c" || self.is_readonly(node) {
             return Ok(true);
         }
         self.insert_text("\u{8}")?;
-        let value = self.control_value_path(path).unwrap_or_default();
+        let value = self.control_value(node).unwrap_or_default();
         let mut remaining = value.encode_utf16().collect::<Vec<_>>();
-        // the backspace path leaves the cut range removed, so drop the sentinel it inserted
+        // the backspace node leaves the cut range removed, so drop the sentinel it inserted
         if remaining.last() == Some(&8) {
             remaining.pop();
         }
         let cleaned: Vec<u16> = remaining.into_iter().filter(|unit| *unit != 8).collect();
         self.control_values
-            .insert(path.clone(), String::from_utf16_lossy(&cleaned));
+            .insert(node, String::from_utf16_lossy(&cleaned));
         Ok(true)
     }
 
@@ -2629,19 +2338,19 @@ impl ScriptRuntime {
         if text.is_empty() {
             return Ok(false);
         }
-        let Some(path) = self.focused_element.clone() else {
+        let Some(control) = self.focused_element else {
             return Ok(false);
         };
-        if !self.is_text_control_path(&path) {
+        if !self.is_text_control(control) {
             return Ok(false);
         }
-        if self.is_readonly_path(&path) {
+        if self.is_readonly(control) {
             return Ok(false);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(control).unwrap_or_default();
         let value_units = value.encode_utf16().collect::<Vec<_>>();
-        let mut selection = self.selection_for_path(&path, &value);
-        if !self.text_selections.contains_key(&path) {
+        let mut selection = self.selection_for(control, &value);
+        if !self.text_selections.contains_key(&control) {
             let cursor = value_units.len();
             selection = TextSelection {
                 start: cursor,
@@ -2650,7 +2359,7 @@ impl ScriptRuntime {
             };
         }
         let replacement_text = self
-            .user_input_max_length(&path)
+            .user_input_max_length(control)
             .map(|maximum| {
                 let occupied = value_units
                     .len()
@@ -2673,37 +2382,37 @@ impl ScriptRuntime {
         next_units.extend_from_slice(&value_units[selection.end..]);
         let value = String::from_utf16_lossy(&next_units);
         let cursor = selection.start.saturating_add(replacement.len());
-        self.control_values.insert(path.clone(), value);
-        self.mark_user_edit(&path);
+        self.control_values.insert(control, value);
+        self.mark_user_edit(control);
         self.text_selections.insert(
-            path.clone(),
+            control,
             TextSelection {
                 start: cursor,
                 end: cursor,
                 direction: SelectionDirection::None,
             },
         );
-        let dispatch = self.dispatch_event_with_details(path, "input", "", &replacement_text)?;
+        let dispatch = self.dispatch_event_with_details(control, "input", "", &replacement_text)?;
         self.drain_microtasks()?;
         Ok(dispatch.handled || !replacement_text.is_empty())
     }
 
-    fn begin_composition(&mut self) -> Result<Option<NodePath>, ScriptError> {
+    fn begin_composition(&mut self) -> Result<Option<NodeId>, ScriptError> {
         if let Some(composition) = &self.composition {
-            return Ok(Some(composition.path.clone()));
+            return Ok(Some(composition.node));
         }
-        let Some(path) = self.focused_element.clone() else {
+        let Some(control) = self.focused_element else {
             return Ok(None);
         };
-        if !self.is_selection_control_path(&path) {
+        if !self.is_selection_control(control) {
             return Ok(None);
         }
-        if self.is_readonly_path(&path) {
+        if self.is_readonly(control) {
             return Ok(None);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
-        let mut selection = self.selection_for_path(&path, &value);
-        if !self.text_selections.contains_key(&path) {
+        let value = self.control_value(control).unwrap_or_default();
+        let mut selection = self.selection_for(control, &value);
+        if !self.text_selections.contains_key(&control) {
             let cursor = utf16_len(&value);
             selection = TextSelection {
                 start: cursor,
@@ -2711,18 +2420,17 @@ impl ScriptRuntime {
                 direction: SelectionDirection::None,
             };
         }
-        let dispatch =
-            self.dispatch_event_with_details(path.clone(), "compositionstart", "", "")?;
+        let dispatch = self.dispatch_event_with_details(control, "compositionstart", "", "")?;
         self.drain_microtasks()?;
         if dispatch.default_prevented {
             return Ok(None);
         }
         self.composition = Some(TextComposition {
-            path: path.clone(),
+            node: control,
             start: selection.start,
             end: selection.end,
         });
-        Ok(Some(path))
+        Ok(Some(control))
     }
 
     pub(crate) fn composition_update(
@@ -2730,45 +2438,44 @@ impl ScriptRuntime {
         text: &str,
         _cursor: Option<(usize, usize)>,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = self.begin_composition()? else {
+        let Some(control) = self.begin_composition()? else {
             return Ok(false);
         };
         let Some(composition) = self.composition.clone() else {
             return Ok(false);
         };
-        let update =
-            self.dispatch_event_with_details(path.clone(), "compositionupdate", "", text)?;
+        let update = self.dispatch_event_with_details(control, "compositionupdate", "", text)?;
         self.drain_microtasks()?;
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(control).unwrap_or_default();
         let length = utf16_len(&value);
         let start = composition.start.min(length);
         let end = composition.end.min(length).max(start);
         let replacement_text = self
-            .user_input_max_length(&path)
+            .user_input_max_length(control)
             .map(|maximum| {
                 let occupied = length.saturating_sub(end.saturating_sub(start));
                 truncate_utf16(text, maximum.saturating_sub(occupied))
             })
             .unwrap_or_else(|| text.to_string());
         let (value, selection_end) = replace_utf16_range(&value, start, end, &replacement_text);
-        self.control_values.insert(path.clone(), value);
+        self.control_values.insert(control, value);
         if start != end || !replacement_text.is_empty() {
-            self.mark_user_edit(&path);
+            self.mark_user_edit(control);
         }
         self.composition = Some(TextComposition {
-            path: path.clone(),
+            node: control,
             start,
             end: selection_end,
         });
         self.text_selections.insert(
-            path.clone(),
+            control,
             TextSelection {
                 start: selection_end,
                 end: selection_end,
                 direction: SelectionDirection::None,
             },
         );
-        let input = self.dispatch_event_with_details(path, "input", "", &replacement_text)?;
+        let input = self.dispatch_event_with_details(control, "input", "", &replacement_text)?;
         self.drain_microtasks()?;
         Ok(update.handled || input.handled || start != end || !replacement_text.is_empty())
     }
@@ -2777,45 +2484,44 @@ impl ScriptRuntime {
         let Some(composition) = self.composition.clone() else {
             return self.insert_text(text);
         };
-        let path = composition.path;
-        if !self.is_selection_control_path(&path) {
+        let control = composition.node;
+        if !self.is_selection_control(control) {
             self.composition = None;
             return Ok(false);
         }
-        if self.is_readonly_path(&path) {
+        if self.is_readonly(control) {
             self.composition = None;
             return Ok(false);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(control).unwrap_or_default();
         let length = utf16_len(&value);
         let start = composition.start.min(length);
         let end = composition.end.min(length).max(start);
         let replacement_text = self
-            .user_input_max_length(&path)
+            .user_input_max_length(control)
             .map(|maximum| {
                 let occupied = length.saturating_sub(end.saturating_sub(start));
                 truncate_utf16(text, maximum.saturating_sub(occupied))
             })
             .unwrap_or_else(|| text.to_string());
         let (value, cursor) = replace_utf16_range(&value, start, end, &replacement_text);
-        self.control_values.insert(path.clone(), value);
+        self.control_values.insert(control, value);
         if start != end || !replacement_text.is_empty() {
-            self.mark_user_edit(&path);
+            self.mark_user_edit(control);
         }
         self.text_selections.insert(
-            path.clone(),
+            control,
             TextSelection {
                 start: cursor,
                 end: cursor,
                 direction: SelectionDirection::None,
             },
         );
-        let input =
-            self.dispatch_event_with_details(path.clone(), "input", "", &replacement_text)?;
+        let input = self.dispatch_event_with_details(control, "input", "", &replacement_text)?;
         self.drain_microtasks()?;
         self.composition = None;
         let end_event =
-            self.dispatch_event_with_details(path, "compositionend", "", &replacement_text)?;
+            self.dispatch_event_with_details(control, "compositionend", "", &replacement_text)?;
         self.drain_microtasks()?;
         Ok(input.handled || end_event.handled || start != end || !replacement_text.is_empty())
     }
@@ -2824,22 +2530,22 @@ impl ScriptRuntime {
         let Some(composition) = self.composition.clone() else {
             return Ok(false);
         };
-        let path = composition.path;
-        if !self.is_selection_control_path(&path) {
+        let control = composition.node;
+        if !self.is_selection_control(control) {
             self.composition = None;
             return Ok(false);
         }
-        let update = self.dispatch_event_with_details(path.clone(), "compositionupdate", "", "")?;
+        let update = self.dispatch_event_with_details(control, "compositionupdate", "", "")?;
         self.drain_microtasks()?;
         self.composition = None;
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(control).unwrap_or_default();
         let length = utf16_len(&value);
         let start = composition.start.min(length);
         let end = composition.end.min(length).max(start);
         let (value, cursor) = replace_utf16_range(&value, start, end, "");
-        self.control_values.insert(path.clone(), value);
+        self.control_values.insert(control, value);
         self.text_selections.insert(
-            path.clone(),
+            control,
             TextSelection {
                 start: cursor,
                 end: cursor,
@@ -2847,13 +2553,13 @@ impl ScriptRuntime {
             },
         );
         let input = if start != end {
-            let input = self.dispatch_event_with_details(path.clone(), "input", "", "")?;
+            let input = self.dispatch_event_with_details(control, "input", "", "")?;
             self.drain_microtasks()?;
             input.handled
         } else {
             false
         };
-        let end_event = self.dispatch_event_with_details(path, "compositionend", "", "")?;
+        let end_event = self.dispatch_event_with_details(control, "compositionend", "", "")?;
         self.drain_microtasks()?;
         Ok(update.handled || input || end_event.handled || start != end)
     }
@@ -2863,11 +2569,11 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = self.focused_element.clone() else {
+        let Some(focused) = self.focused_element else {
             return Ok(false);
         };
         let dispatch =
-            self.dispatch_event_with_modifiers(path.clone(), "keydown", key, "", modifiers)?;
+            self.dispatch_event_with_modifiers(focused, "keydown", key, "", modifiers)?;
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
@@ -2879,30 +2585,30 @@ impl ScriptRuntime {
             let moved = self.move_focus_sequential(modifiers.shift)?;
             return Ok(dispatch.handled || moved);
         }
-        if dispatch.default_prevented || !self.is_text_control_path(&path) {
+        if dispatch.default_prevented || !self.is_text_control(focused) {
             return Ok(dispatch.handled);
         }
         if (modifiers.control || modifiers.meta) && !modifiers.alt {
             let shortcut = key.to_ascii_lowercase();
             if matches!(shortcut.as_str(), "a" | "c" | "x" | "v") {
-                let handled = self.run_editing_shortcut(&path, &shortcut)?;
+                let handled = self.run_editing_shortcut(focused, &shortcut)?;
                 return Ok(dispatch.handled || handled);
             }
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(focused).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
-        let selection = self.selection_for_path(&path, &value);
-        if self.is_readonly_path(&path) && matches!(key, "Backspace" | "Delete" | "Enter") {
+        let selection = self.selection_for(focused, &value);
+        if self.is_readonly(focused) && matches!(key, "Backspace" | "Delete" | "Enter") {
             return Ok(dispatch.handled);
         }
         if key == "Enter"
             && self
                 .document
                 .borrow()
-                .element_at(&path)
+                .element(focused)
                 .is_some_and(|element| element.name == "textarea")
         {
-            if let Some(maximum) = self.user_input_max_length(&path) {
+            if let Some(maximum) = self.user_input_max_length(focused) {
                 let occupied = units
                     .len()
                     .saturating_sub(selection.end.saturating_sub(selection.start));
@@ -2910,9 +2616,9 @@ impl ScriptRuntime {
                     return Ok(dispatch.handled);
                 }
             }
-            self.mark_user_edit(&path);
+            self.mark_user_edit(focused);
             self.set_range_text(
-                &path,
+                focused,
                 &[
                     Value::String("\n".to_string().into()),
                     Value::Number(selection.start as f64),
@@ -2942,7 +2648,7 @@ impl ScriptRuntime {
                 SelectionDirection::None
             };
             self.set_text_selection(
-                path,
+                focused,
                 anchor.min(next_focus),
                 anchor.max(next_focus),
                 direction,
@@ -2960,12 +2666,12 @@ impl ScriptRuntime {
             }
             "ArrowLeft" if by_word => {
                 let cursor = previous_word_boundary(&units, selection.start);
-                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                self.set_text_selection(focused, cursor, cursor, SelectionDirection::None)?;
                 return Ok(true);
             }
             "ArrowRight" if by_word => {
                 let cursor = next_word_boundary(&units, selection.end);
-                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                self.set_text_selection(focused, cursor, cursor, SelectionDirection::None)?;
                 return Ok(true);
             }
             "Backspace" if selection.start > 0 => (
@@ -2979,7 +2685,7 @@ impl ScriptRuntime {
             ),
             "ArrowLeft" if selection.start != selection.end => {
                 self.set_text_selection(
-                    path,
+                    focused,
                     selection.start,
                     selection.start,
                     SelectionDirection::None,
@@ -2988,12 +2694,12 @@ impl ScriptRuntime {
             }
             "ArrowLeft" if selection.start > 0 => {
                 let cursor = previous_utf16_boundary(&units, selection.start);
-                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                self.set_text_selection(focused, cursor, cursor, SelectionDirection::None)?;
                 return Ok(true);
             }
             "ArrowRight" if selection.start != selection.end => {
                 self.set_text_selection(
-                    path,
+                    focused,
                     selection.end,
                     selection.end,
                     SelectionDirection::None,
@@ -3002,24 +2708,24 @@ impl ScriptRuntime {
             }
             "ArrowRight" if selection.end < units.len() => {
                 let cursor = next_utf16_boundary(&units, selection.end);
-                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                self.set_text_selection(focused, cursor, cursor, SelectionDirection::None)?;
                 return Ok(true);
             }
             "Home" => {
-                self.set_text_selection(path, 0, 0, SelectionDirection::None)?;
+                self.set_text_selection(focused, 0, 0, SelectionDirection::None)?;
                 return Ok(true);
             }
             "End" => {
                 let cursor = units.len();
-                self.set_text_selection(path, cursor, cursor, SelectionDirection::None)?;
+                self.set_text_selection(focused, cursor, cursor, SelectionDirection::None)?;
                 return Ok(true);
             }
             _ => return Ok(dispatch.handled),
         };
         if start != end {
-            self.mark_user_edit(&path);
+            self.mark_user_edit(focused);
             self.set_range_text(
-                &path,
+                focused,
                 &[
                     Value::String(String::new().into()),
                     Value::Number(start as f64),
@@ -3044,7 +2750,7 @@ impl ScriptRuntime {
         &self.canvas_commands
     }
 
-    // document prose ranges as (text node path, start, end) for paint highlighting
+    // document prose ranges as (text node, start, end) for paint highlighting
     pub(crate) fn prose_selections(&self) -> Vec<crate::layout::ProseSpan> {
         let Some(range) = self.selection.borrow().range.clone() else {
             return Vec::new();
@@ -3061,7 +2767,7 @@ impl ScriptRuntime {
             .into_iter()
             .enumerate()
             .map(|(index, (path, start, end))| crate::layout::ProseSpan {
-                path,
+                node: path,
                 start,
                 end,
                 continued: index > 0,
@@ -3090,9 +2796,9 @@ impl ScriptRuntime {
         fresh: bool,
     ) -> Result<bool, ScriptError> {
         let boundary = |position: usize| -> Option<RangeBoundary> {
-            let (path, offset) = self.document.borrow().text_point(position)?;
+            let (text_node, offset) = self.document.borrow().text_point(position)?;
             Some(RangeBoundary {
-                node: attached_handle(path, &self.document)?,
+                node: self.node_handle(text_node),
                 offset,
             })
         };
@@ -3167,16 +2873,16 @@ impl ScriptRuntime {
     // dispatches a bubbling transition or animation event with its name and elapsed time
     pub(crate) fn dispatch_motion_event(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         event: &str,
         name: &str,
         elapsed: f64,
     ) -> Result<bool, ScriptError> {
-        if self.document.borrow().element_at(&path).is_none() {
+        if self.document.borrow().element(node).is_none() {
             return Ok(false);
         }
         self.motion_detail = Some(Rc::new((name.to_string(), elapsed)));
-        let dispatched = self.dispatch_event(path, event);
+        let dispatched = self.dispatch_event(node, event);
         self.motion_detail = None;
         let dispatched = dispatched?;
         self.drain_microtasks()?;
@@ -3190,7 +2896,7 @@ impl ScriptRuntime {
 
     pub(crate) fn select_control_range(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         start: usize,
         end: usize,
     ) -> Result<bool, ScriptError> {
@@ -3199,13 +2905,13 @@ impl ScriptRuntime {
         } else {
             SelectionDirection::Forward
         };
-        self.set_text_selection(path, start, end, direction)
+        self.set_text_selection(node, start, end, direction)
     }
 
     pub(crate) fn focused_text_control(&self) -> bool {
         self.focused_element
             .as_ref()
-            .is_some_and(|path| self.is_text_control_path(path))
+            .is_some_and(|path| self.is_text_control(*path))
     }
 
     // keydown for a document-level shortcut, aimed at the focused element or the document element
@@ -3214,29 +2920,27 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<EventDispatch, ScriptError> {
-        let target = self.focused_element.clone().unwrap_or_else(|| {
-            self.document
-                .borrow()
-                .document_element_path()
-                .unwrap_or_default()
+        let target = self.focused_element.unwrap_or_else(|| {
+            let document = self.document.borrow();
+            document.document_element().unwrap_or(document.root())
         });
         let dispatch = self.dispatch_event_with_modifiers(target, "keydown", key, "", modifiers)?;
         self.drain_microtasks()?;
         Ok(dispatch)
     }
 
-    pub(crate) fn style_state(&self, hovered_path: Option<NodePath>) -> StyleState {
+    pub(crate) fn style_state(&self, hovered_path: Option<NodeId>) -> StyleState {
         let mut state = StyleState {
-            hovered_path,
-            focused_path: self.focused_element.clone(),
+            hovered: hovered_path,
+            focused: self.focused_element,
             scroll_offsets: self.scroll_offsets.clone(),
             control_values: self.control_values.clone().into_iter().collect(),
             text_selections: self
                 .text_selections
                 .iter()
-                .map(|(path, selection)| {
+                .map(|(control, selection)| {
                     (
-                        path.clone(),
+                        *control,
                         (
                             selection.start,
                             selection.end,
@@ -3247,11 +2951,11 @@ impl ScriptRuntime {
                 .collect(),
             ..StyleState::default()
         };
-        for (path, checked) in &self.control_checked {
+        for (control, checked) in &self.control_checked {
             if *checked {
-                state.checked_paths.insert(path.clone());
+                state.checked.insert(*control);
             } else {
-                state.unchecked_paths.insert(path.clone());
+                state.unchecked.insert(*control);
             }
         }
         let disabled_paths = self
@@ -3261,34 +2965,34 @@ impl ScriptRuntime {
                 "button, input, select, textarea, optgroup, option, fieldset",
             )
             .unwrap_or_default();
-        for path in disabled_paths {
-            if self.is_disabled_path(&path) {
-                state.disabled_paths.insert(path);
+        for control in disabled_paths {
+            if self.is_disabled(control) {
+                state.disabled.insert(control);
             }
         }
         state
     }
 
-    pub(crate) fn scroll_offset(&self, path: &[usize]) -> (f32, f32) {
-        self.scroll_offsets.get(path).copied().unwrap_or_default()
+    pub(crate) fn scroll_offset(&self, node: NodeId) -> (f32, f32) {
+        self.scroll_offsets.get(&node).copied().unwrap_or_default()
     }
 
     // a pointer press or drag inside a text control moves or extends its selection
     pub(crate) fn select_control_offset(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         offset: usize,
         extend: bool,
     ) -> Result<bool, ScriptError> {
-        if !self.is_selection_control_path(&path) {
+        if !self.is_selection_control(node) {
             return Ok(false);
         }
-        let focused = self.focus_path(path.clone())?;
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let focused = self.focus_node(node)?;
+        let value = self.control_value(node).unwrap_or_default();
         let length = utf16_len(&value);
         let offset = offset.min(length);
         let (start, end, direction) = if extend {
-            let current = self.selection_for_path(&path, &value);
+            let current = self.selection_for(node, &value);
             let anchor = match current.direction {
                 SelectionDirection::Backward => current.end,
                 _ => current.start,
@@ -3301,25 +3005,22 @@ impl ScriptRuntime {
         } else {
             (offset, offset, SelectionDirection::None)
         };
-        let moved = self.set_text_selection(path, start, end, direction)?;
+        let moved = self.set_text_selection(node, start, end, direction)?;
         Ok(focused || moved)
     }
 
     // a pointer press or drag over prose moves or extends the document selection
     pub(crate) fn select_prose_offset(
         &mut self,
-        path: NodePath,
+        text_node: NodeId,
         offset: usize,
         extend: bool,
     ) -> Result<bool, ScriptError> {
-        let Some(node) = attached_handle(path, &self.document) else {
-            return Ok(false);
-        };
-        let node_path = attached_path(&node).unwrap_or_default();
+        let node = self.node_handle(text_node);
         let content = self
             .document
             .borrow()
-            .node_text_content(&node_path)
+            .node_text_content(text_node)
             .unwrap_or_default();
         let offset = offset.min(utf16_len(&content));
         let focus = RangeBoundary { node, offset };
@@ -3332,19 +3033,15 @@ impl ScriptRuntime {
         Ok(true)
     }
 
-    pub(crate) fn control_value(&self, path: &[usize]) -> Option<String> {
-        self.control_value_path(path)
-    }
-
     pub(crate) fn set_viewport_metrics(&mut self, viewport: ViewportMetrics) {
         self.viewport = viewport;
     }
 
     pub(crate) fn document_scroll_offset(&self) -> (f32, f32) {
-        self.scroll_offset(&[])
+        self.scroll_offset(self.document.borrow().root())
     }
 
-    pub(crate) fn set_scroll_offset(&mut self, path: NodePath, offset: (f32, f32)) -> bool {
+    pub(crate) fn set_scroll_offset(&mut self, node: NodeId, offset: (f32, f32)) -> bool {
         let offset = (
             if offset.0.is_finite() {
                 offset.0.max(0.0)
@@ -3357,15 +3054,16 @@ impl ScriptRuntime {
                 0.0
             },
         );
-        let changed = self.scroll_offset(&path) != offset;
+        let changed = self.scroll_offset(node) != offset;
         if changed {
-            self.scroll_offsets.insert(path, offset);
+            self.scroll_offsets.insert(node, offset);
         }
         changed
     }
 
     pub(crate) fn set_document_scroll_offset(&mut self, offset: (f32, f32)) -> bool {
-        self.set_scroll_offset(Vec::new(), offset)
+        let root = self.document.borrow().root();
+        self.set_scroll_offset(root, offset)
     }
 
     fn set_scroll_offset_property(
@@ -3374,10 +3072,8 @@ impl ScriptRuntime {
         axis: usize,
         value: f64,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(false);
-        };
-        let mut offset = self.scroll_offset(&path);
+        let node = handle.id;
+        let mut offset = self.scroll_offset(node);
         let value = if value.is_finite() {
             (value as f32).max(0.0)
         } else {
@@ -3388,9 +3084,9 @@ impl ScriptRuntime {
         } else {
             offset.1 = value;
         }
-        let changed = self.set_scroll_offset(path.clone(), offset);
+        let changed = self.set_scroll_offset(node, offset);
         if changed {
-            self.dispatch_path_event(path, "scroll")?;
+            self.dispatch_node_event(node, "scroll")?;
         }
         Ok(changed)
     }
@@ -3403,9 +3099,9 @@ impl ScriptRuntime {
         self.clock
     }
 
-    fn apply_click_default(&mut self, path: &[usize]) -> Result<(), ScriptError> {
+    fn apply_click_default(&mut self, node: NodeId) -> Result<(), ScriptError> {
         let Some(input_type) = self
-            .with_element(path, |element| {
+            .with_element(node, |element| {
                 (element.name == "input").then(|| {
                     element
                         .attr("type")
@@ -3419,48 +3115,44 @@ impl ScriptRuntime {
         };
         let changed = match input_type.as_str() {
             // an input has no children, so this copy is a single element
-            "file" => match self.with_element(path, Element::clone) {
-                Some(element) => self.apply_file_picker(path, &element)?,
+            "file" => match self.with_element(node, Element::clone) {
+                Some(element) => self.apply_file_picker(node, &element)?,
                 None => false,
             },
             "checkbox" => {
-                let checked = self.control_checked_path(path);
-                self.control_checked.insert(path.to_vec(), !checked);
-                self.dirty_checked_controls.insert(path.to_vec());
+                let checked = self.is_control_checked(node);
+                self.control_checked.insert(node, !checked);
+                self.dirty_checked_controls.insert(node);
                 true
             }
             "radio" => {
-                let was_checked = self.control_checked_path(path);
-                if let Some(group) = self.document.borrow().radio_group_paths(path) {
+                let was_checked = self.is_control_checked(node);
+                if let Some(group) = self.document.borrow().radio_group(node) {
                     for candidate in group {
-                        if candidate != path && self.control_checked_path(&candidate) {
-                            self.control_checked.insert(candidate.clone(), false);
+                        if candidate != node && self.is_control_checked(candidate) {
+                            self.control_checked.insert(candidate, false);
                             self.dirty_checked_controls.insert(candidate);
                         }
                     }
                 }
-                self.control_checked.insert(path.to_vec(), true);
+                self.control_checked.insert(node, true);
                 if !was_checked {
-                    self.dirty_checked_controls.insert(path.to_vec());
+                    self.dirty_checked_controls.insert(node);
                 }
                 !was_checked
             }
             _ => false,
         };
         if changed {
-            self.dispatch_event(path.to_vec(), "input")?;
+            self.dispatch_event(node, "input")?;
             self.drain_microtasks()?;
-            self.dispatch_event(path.to_vec(), "change")?;
+            self.dispatch_event(node, "change")?;
             self.drain_microtasks()?;
         }
         Ok(())
     }
 
-    fn apply_file_picker(
-        &mut self,
-        path: &[usize],
-        element: &Element,
-    ) -> Result<bool, ScriptError> {
+    fn apply_file_picker(&mut self, node: NodeId, element: &Element) -> Result<bool, ScriptError> {
         let Some(file_picker) = self.file_picker.clone() else {
             return Ok(false);
         };
@@ -3491,7 +3183,7 @@ impl ScriptRuntime {
                 })
             })
             .collect::<Vec<_>>();
-        let changed = match self.selected_files.get(path) {
+        let changed = match self.selected_files.get(&node) {
             Some(current) => !file_lists_equal(current, &files),
             None => !files.is_empty(),
         };
@@ -3502,18 +3194,16 @@ impl ScriptRuntime {
             .first()
             .map(|file| format!("C:\\fakepath\\{}", file.name))
             .unwrap_or_default();
-        self.selected_files.insert(path.to_vec(), files);
-        let files = self.selected_files.get(path).cloned().unwrap_or_default();
-        self.file_lists
-            .borrow_mut()
-            .insert(path.to_vec(), Rc::new(files));
-        self.control_values.insert(path.to_vec(), value);
+        self.selected_files.insert(node, files);
+        let files = self.selected_files.get(&node).cloned().unwrap_or_default();
+        self.file_lists.borrow_mut().insert(node, Rc::new(files));
+        self.control_values.insert(node, value);
         Ok(true)
     }
 
-    fn submit_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
+    fn submit_form_for_click(&self, node: NodeId) -> Option<NodeId> {
         let document = self.document.borrow();
-        let element = document.element_at(path)?;
+        let element = document.element(node)?;
         let input_type = element
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
@@ -3524,13 +3214,13 @@ impl ScriptRuntime {
             _ => false,
         };
         is_submit
-            .then(|| self.document.borrow().form_ancestor_path(path))
+            .then(|| self.document.borrow().form_ancestor(node))
             .flatten()
     }
 
-    fn reset_form_for_click(&self, path: &[usize]) -> Option<NodePath> {
+    fn reset_form_for_click(&self, node: NodeId) -> Option<NodeId> {
         let document = self.document.borrow();
-        let element = document.element_at(path)?;
+        let element = document.element(node)?;
         let input_type = element
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
@@ -3538,46 +3228,46 @@ impl ScriptRuntime {
         let is_reset =
             (element.name == "button" || element.name == "input") && input_type == "reset";
         is_reset
-            .then(|| self.document.borrow().form_ancestor_path(path))
+            .then(|| self.document.borrow().form_ancestor(node))
             .flatten()
     }
 
-    fn request_submit(&mut self, path: NodePath) -> Result<(), ScriptError> {
+    fn request_submit(&mut self, node: NodeId) -> Result<(), ScriptError> {
         let bypass_validation = self
             .document
             .borrow()
-            .element_at(&path)
+            .element(node)
             .is_some_and(|form| form.attr("novalidate").is_some());
-        if !bypass_validation && !self.check_validity_path(&path)? {
+        if !bypass_validation && !self.check_validity(node)? {
             return Ok(());
         }
-        let dispatch = self.dispatch_event(path.clone(), "submit")?;
+        let dispatch = self.dispatch_event(node, "submit")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented {
-            self.submit_form(path)?;
+            self.submit_form(node)?;
         }
         Ok(())
     }
 
-    fn reset_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
-        if !self.resetting_forms.insert(path.clone()) {
+    fn reset_form(&mut self, node: NodeId) -> Result<(), ScriptError> {
+        if !self.resetting_forms.insert(node) {
             return Ok(());
         }
-        let outcome = self.reset_form_contents(&path);
-        self.resetting_forms.remove(&path);
+        let outcome = self.reset_form_contents(node);
+        self.resetting_forms.remove(&node);
         outcome
     }
 
-    fn reset_form_contents(&mut self, path: &[usize]) -> Result<(), ScriptError> {
+    fn reset_form_contents(&mut self, node: NodeId) -> Result<(), ScriptError> {
         let is_form = self
             .document
             .borrow()
-            .element_at(path)
+            .element(node)
             .is_some_and(|element| element.name == "form");
         if !is_form {
             return Err(runtime_error("reset is only available on form elements"));
         }
-        let dispatch = self.dispatch_event(path.to_vec(), "reset")?;
+        let dispatch = self.dispatch_event(node, "reset")?;
         self.drain_microtasks()?;
         if dispatch.default_prevented {
             return Ok(());
@@ -3585,49 +3275,49 @@ impl ScriptRuntime {
         let controls = self
             .document
             .borrow()
-            .form_control_paths(path)
+            .form_controls(node)
             .unwrap_or_default();
         if self
             .composition
             .as_ref()
-            .is_some_and(|composition| controls.iter().any(|control| control == &composition.path))
+            .is_some_and(|composition| controls.iter().any(|control| control == &composition.node))
         {
             self.composition = None;
         }
         for control in controls {
-            self.reset_form_control(&control);
+            self.reset_form_control(control);
         }
         Ok(())
     }
 
-    fn reset_form_control(&mut self, path: &[usize]) {
-        let Some(name) = self.with_element(path, |element| element.name.clone()) else {
+    fn reset_form_control(&mut self, node: NodeId) {
+        let Some(name) = self.with_element(node, |element| element.name.clone()) else {
             return;
         };
         if !matches!(name.as_str(), "input" | "select" | "textarea") {
             return;
         }
         if name == "select" {
-            let options = self.option_paths(path);
+            let options = self.options_of(node);
             for option in &options {
                 let selected = self
                     .document
                     .borrow()
-                    .element_at(option)
+                    .element(*option)
                     .is_some_and(|element| element.attr("selected").is_some());
-                self.option_selected.insert(option.clone(), selected);
+                self.option_selected.insert(*option, selected);
                 self.dirty_options.remove(option);
             }
-            self.normalize_select_selection(path, false);
+            self.normalize_select_selection(node, false);
         }
-        self.control_values.remove(path);
-        self.control_checked.remove(path);
-        self.dirty_controls.remove(path);
-        self.last_user_edit.remove(path);
-        self.dirty_checked_controls.remove(path);
-        self.text_selections.remove(path);
-        self.selected_files.remove(path);
-        self.file_lists.borrow_mut().remove(path);
+        self.control_values.remove(&node);
+        self.control_checked.remove(&node);
+        self.dirty_controls.remove(&node);
+        self.last_user_edit.remove(&node);
+        self.dirty_checked_controls.remove(&node);
+        self.text_selections.remove(&node);
+        self.selected_files.remove(&node);
+        self.file_lists.borrow_mut().remove(&node);
     }
 
     pub fn pending_task_count(&self) -> usize {
@@ -3658,16 +3348,16 @@ impl ScriptRuntime {
         history.index = index;
     }
 
-    pub(crate) fn active_element(&self) -> Option<NodePath> {
-        self.focused_element.clone()
+    pub(crate) fn active_element(&self) -> Option<NodeId> {
+        self.focused_element
     }
 
     pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
         let callbacks = self.take_window_callbacks(event_type);
         let event = Value::Event(Rc::new(EventData {
             event_type: event_type.to_string(),
-            target: Vec::new(),
-            current_target: Vec::new(),
+            target: self.document_node(),
+            current_target: self.document_node(),
             state: Rc::new(RefCell::new(EventState::default())),
             history_state: Rc::new(RefCell::new(Value::Null)),
             key: String::new(),
@@ -3708,8 +3398,8 @@ impl ScriptRuntime {
         let callbacks = self.take_window_callbacks("popstate");
         let event = Value::Event(Rc::new(EventData {
             event_type: "popstate".to_string(),
-            target: Vec::new(),
-            current_target: Vec::new(),
+            target: self.document_node(),
+            current_target: self.document_node(),
             state: Rc::new(RefCell::new(EventState::default())),
             history_state: Rc::new(RefCell::new(state)),
             key: String::new(),
@@ -3795,15 +3485,11 @@ impl ScriptRuntime {
                 "documentElement" => Ok(self
                     .document
                     .borrow()
-                    .document_element_path()
-                    .and_then(|path| attached_handle(path, &self.document))
-                    .map(Value::Element)
-                    .unwrap_or(Value::Null)),
+                    .document_element()
+                    .map_or(Value::Null, |node| self.node_value(node))),
                 "activeElement" => Ok(self
                     .active_element()
-                    .and_then(|path| attached_handle(path, &self.document))
-                    .map(Value::Element)
-                    .unwrap_or(Value::Null)),
+                    .map_or(Value::Null, |node| self.node_value(node))),
                 _ => Err(runtime_error(format!(
                     "document has no property {property}"
                 ))),
@@ -3905,146 +3591,118 @@ impl ScriptRuntime {
                 ))),
             },
             Value::Element(handle) => {
-                let path = attached_path(&handle);
+                let node = handle.id;
+                let is_text = self.is_text_node(&handle);
+                let character_data = self.document.borrow().character_data(node).is_some();
+                let element_name = self
+                    .document
+                    .borrow()
+                    .element(node)
+                    .map(|element| element.name.clone());
+                let is_named = |name: &str| element_name.as_deref() == Some(name);
+                let bound =
+                    |builtin: fn(ElementHandle) -> Builtin| Value::Builtin(builtin(handle.clone()));
+                let related = |related: Option<NodeId>| {
+                    related.map_or(Value::Null, |related| self.node_value(related))
+                };
                 let value = match property {
-                    "nodeType" => Value::Number(if attached_is_text(&handle) { 3.0 } else { 1.0 }),
+                    "nodeType" => Value::Number(match self.document.borrow().kind(node) {
+                        Some(NodeKind::Text(_)) => 3.0,
+                        Some(NodeKind::Comment(_)) => 8.0,
+                        Some(NodeKind::Fragment) => 11.0,
+                        Some(NodeKind::Document) => 9.0,
+                        _ => 1.0,
+                    }),
                     "nodeName" => Value::String(self.element_node_name(&handle).into()),
                     "nodeValue" | "data" => self.element_node_value(&handle),
-                    "splitText" if attached_is_text(&handle) => {
-                        Value::Builtin(Builtin::ElementSplitText(handle.clone()))
+                    "splitText" if is_text => bound(Builtin::ElementSplitText),
+                    "normalize" => bound(Builtin::ElementNormalize),
+                    "substringData" if character_data => bound(Builtin::ElementSubstringData),
+                    "appendData" if character_data => bound(Builtin::ElementAppendData),
+                    "insertData" if character_data => bound(Builtin::ElementInsertData),
+                    "deleteData" if character_data => bound(Builtin::ElementDeleteData),
+                    "replaceData" if character_data => bound(Builtin::ElementReplaceData),
+                    "textContent" => {
+                        Value::String(self.document.borrow().text_content(node).into())
                     }
-                    "normalize" => Value::Builtin(Builtin::ElementNormalize(handle.clone())),
-                    "substringData" if attached_is_text(&handle) => {
-                        Value::Builtin(Builtin::ElementSubstringData(handle.clone()))
+                    "className" => Value::String(
+                        self.element_attribute(&handle, "class")
+                            .unwrap_or_default()
+                            .into(),
+                    ),
+                    "id" => Value::String(
+                        self.element_attribute(&handle, "id")
+                            .unwrap_or_default()
+                            .into(),
+                    ),
+                    "innerHTML" if element_name.is_some() => {
+                        Value::String(self.document.borrow().inner_html(node).into())
                     }
-                    "appendData" if attached_is_text(&handle) => {
-                        Value::Builtin(Builtin::ElementAppendData(handle.clone()))
+                    "outerHTML" if element_name.is_some() => {
+                        Value::String(self.document.borrow().outer_html(node).into())
                     }
-                    "insertData" if attached_is_text(&handle) => {
-                        Value::Builtin(Builtin::ElementInsertData(handle.clone()))
-                    }
-                    "deleteData" if attached_is_text(&handle) => {
-                        Value::Builtin(Builtin::ElementDeleteData(handle.clone()))
-                    }
-                    "replaceData" if attached_is_text(&handle) => {
-                        Value::Builtin(Builtin::ElementReplaceData(handle.clone()))
-                    }
-                    "textContent" => self
-                        .element_text_content(&handle)
-                        .map(|text| Value::String(text.into()))
-                        .unwrap_or(Value::Undefined),
-                    "className" => self
-                        .element_attribute(&handle, "class")
-                        .map(|text| Value::String(text.into()))
-                        .unwrap_or_else(|| Value::String(String::new().into())),
-                    "id" => self
-                        .element_attribute(&handle, "id")
-                        .map(|text| Value::String(text.into()))
-                        .unwrap_or_else(|| Value::String(String::new().into())),
-                    "innerHTML" => self
-                        .element_inner_html(&handle)
-                        .map(|text| Value::String(text.into()))
-                        .unwrap_or_else(|| Value::String(String::new().into())),
-                    "outerHTML" => self
-                        .element_outer_html(&handle)
-                        .map(|text| Value::String(text.into()))
-                        .unwrap_or(Value::Undefined),
                     "childNodes" => self.element_child_nodes(&handle),
                     "children" => self.element_children(&handle),
-                    "firstChild" => self.element_child(&handle, true),
-                    "lastChild" => self.element_child(&handle, false),
-                    "firstElementChild" => self.element_element_child(&handle, true),
-                    "lastElementChild" => self.element_element_child(&handle, false),
-                    "childElementCount" => self.element_child_element_count(&handle),
-                    "previousSibling" | "nextSibling" => path
-                        .as_ref()
-                        .and_then(|path| {
-                            self.document
-                                .borrow()
-                                .sibling_path(path, property == "nextSibling")
-                        })
-                        .and_then(|path| attached_handle(path, &self.document))
-                        .map(Value::Element)
-                        .unwrap_or(Value::Null),
-                    "previousElementSibling" | "nextElementSibling" => path
-                        .as_ref()
-                        .and_then(|path| {
-                            self.document
-                                .borrow()
-                                .element_sibling_path(path, property == "nextElementSibling")
-                        })
-                        .and_then(|path| attached_handle(path, &self.document))
-                        .map(Value::Element)
-                        .unwrap_or(Value::Null),
-                    "hasChildNodes" => {
-                        Value::Builtin(Builtin::ElementHasChildNodes(handle.clone()))
+                    "firstChild" => related(self.document.borrow().children(node).first().copied()),
+                    "lastChild" => related(self.document.borrow().children(node).last().copied()),
+                    "firstElementChild" => {
+                        related(self.document.borrow().element_children(node).next())
                     }
-                    "cloneNode" => Value::Builtin(Builtin::ElementCloneNode(handle.clone())),
-                    "isConnected" => Value::Bool(
-                        path.as_ref()
-                            .is_some_and(|path| self.document.borrow().node_is_connected(path)),
+                    "lastElementChild" => {
+                        related(self.document.borrow().element_children(node).last())
+                    }
+                    "childElementCount" => {
+                        Value::Number(self.document.borrow().element_children(node).count() as f64)
+                    }
+                    "previousSibling" | "nextSibling" => related(
+                        self.document
+                            .borrow()
+                            .sibling(node, property == "nextSibling"),
                     ),
-                    "parentNode" | "parentElement" => path
-                        .as_ref()
-                        .and_then(|path| self.document.borrow().parent_path(path))
-                        .and_then(|path| attached_handle(path, &self.document))
-                        .map(Value::Element)
-                        .unwrap_or(Value::Null),
+                    "previousElementSibling" | "nextElementSibling" => related(
+                        self.document
+                            .borrow()
+                            .element_sibling(node, property == "nextElementSibling"),
+                    ),
+                    "hasChildNodes" => bound(Builtin::ElementHasChildNodes),
+                    "cloneNode" => bound(Builtin::ElementCloneNode),
+                    "isConnected" => Value::Bool(self.document.borrow().is_connected(node)),
+                    "parentNode" => related(self.document.borrow().parent(node)),
+                    "parentElement" => related(self.document.borrow().parent_element(node)),
                     "files" => self.element_files(&handle),
-                    "value" => self
-                        .element_value(&handle)
-                        .map(|text| Value::String(text.into()))
-                        .unwrap_or_else(|| Value::String(String::new().into())),
+                    "value" => {
+                        Value::String(self.element_value(&handle).unwrap_or_default().into())
+                    }
                     "form" => self.element_form(&handle),
                     "elements" => self.element_form_elements(&handle),
                     "defaultValue" => self.element_default_value(&handle),
                     "selected" => Value::Bool(self.element_selected(&handle)),
                     "defaultSelected" => Value::Bool(self.element_default_selected(&handle)),
-                    "selectedIndex" => Value::Number(
-                        path.as_ref()
-                            .map(|path| self.select_selected_index(path) as f64)
-                            .unwrap_or(-1.0),
-                    ),
+                    "selectedIndex" => Value::Number(self.select_selected_index(node) as f64),
                     "multiple" => {
                         Value::Bool(self.element_attribute(&handle, "multiple").is_some())
                     }
                     "options" => self.element_options(&handle, false),
                     "selectedOptions" => self.element_options(&handle, true),
                     "index" => Value::Number(
-                        path.as_ref()
-                            .and_then(|path| self.option_index(path))
+                        self.option_index(node)
                             .map(|index| index as f64)
                             .unwrap_or(-1.0),
                     ),
-                    "text" => Value::String(
-                        path.as_ref()
-                            .and_then(|path| self.document.borrow().element_text_content(path))
-                            .unwrap_or_default()
-                            .into(),
-                    ),
+                    "text" => Value::String(self.document.borrow().text_content(node).into()),
                     "validity" => self.element_validity(&handle),
-                    "willValidate" => Value::Bool(
-                        path.as_ref()
-                            .is_some_and(|path| self.is_validation_candidate(path)),
-                    ),
-                    "validationMessage" => Value::String(
-                        path.as_ref()
-                            .map(|path| self.validation_message(path))
-                            .unwrap_or_default()
-                            .into(),
-                    ),
+                    "willValidate" => Value::Bool(self.is_validation_candidate(node)),
+                    "validationMessage" => Value::String(self.validation_message(node).into()),
                     "required" => {
                         Value::Bool(self.element_attribute(&handle, "required").is_some())
                     }
                     "maxLength" => Value::Number(
-                        path.as_ref()
-                            .and_then(|path| self.control_length_attribute(path, "maxlength"))
+                        self.control_length_attribute(node, "maxlength")
                             .map(|length| length as f64)
                             .unwrap_or(-1.0),
                     ),
                     "minLength" => Value::Number(
-                        path.as_ref()
-                            .and_then(|path| self.control_length_attribute(path, "minlength"))
+                        self.control_length_attribute(node, "minlength")
                             .map(|length| length as f64)
                             .unwrap_or(-1.0),
                     ),
@@ -4059,226 +3717,47 @@ impl ScriptRuntime {
                     "readOnly" => {
                         Value::Bool(self.element_attribute(&handle, "readonly").is_some())
                     }
-                    "scrollLeft" => Value::Number(
-                        path.as_ref()
-                            .map(|path| self.scroll_offset(path).0 as f64)
-                            .unwrap_or(0.0),
-                    ),
-                    "scrollTop" => Value::Number(
-                        path.as_ref()
-                            .map(|path| self.scroll_offset(path).1 as f64)
-                            .unwrap_or(0.0),
-                    ),
+                    "scrollLeft" => Value::Number(self.scroll_offset(node).0 as f64),
+                    "scrollTop" => Value::Number(self.scroll_offset(node).1 as f64),
                     "dataset" => Value::Dataset(handle.clone()),
                     "style" => Value::Style(handle),
                     "classList" => Value::ClassList(handle),
-                    "querySelector" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot query descendants"));
-                        }
-                        Value::Builtin(Builtin::ElementQuerySelector(handle.clone()))
-                    }
-                    "querySelectorAll" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot query descendants"));
-                        }
-                        Value::Builtin(Builtin::ElementQuerySelectorAll(handle.clone()))
-                    }
-                    "addEventListener" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot receive events"));
-                        }
-                        Value::Builtin(Builtin::ElementAddEventListener(handle.clone()))
-                    }
-                    "removeEventListener" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element cannot remove event listeners",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementRemoveEventListener(handle.clone()))
-                    }
-                    "click" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot be clicked"));
-                        }
-                        Value::Builtin(Builtin::ElementClick(handle.clone()))
-                    }
-                    "focus" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot receive focus"));
-                        }
-                        Value::Builtin(Builtin::ElementFocus(handle.clone()))
-                    }
-                    "blur" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot lose focus"));
-                        }
-                        Value::Builtin(Builtin::ElementBlur(handle.clone()))
-                    }
-                    "select" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot be selected"));
-                        }
-                        Value::Builtin(Builtin::ElementSelect(handle.clone()))
-                    }
-                    "setSelectionRange" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element cannot set a selection range",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementSetSelectionRange(handle.clone()))
-                    }
-                    "setRangeText" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element cannot replace selected text",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementSetRangeText(handle.clone()))
-                    }
-                    "requestSubmit" => {
-                        let path =
-                            path.ok_or_else(|| runtime_error("detached element cannot submit"))?;
-                        let is_form = self
-                            .document
-                            .borrow()
-                            .element_at(&path)
-                            .is_some_and(|element| element.name == "form");
-                        if !is_form {
-                            return Err(runtime_error(
-                                "requestSubmit is only available on form elements",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementRequestSubmit(handle.clone()))
-                    }
-                    "reset" => {
-                        let path =
-                            path.ok_or_else(|| runtime_error("detached element cannot reset"))?;
-                        let is_form = self
-                            .document
-                            .borrow()
-                            .element_at(&path)
-                            .is_some_and(|element| element.name == "form");
-                        if !is_form {
-                            return Err(runtime_error("reset is only available on form elements"));
-                        }
-                        Value::Builtin(Builtin::ElementReset(handle.clone()))
-                    }
-                    "checkValidity" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element cannot validate constraints",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementCheckValidity(handle.clone()))
-                    }
-                    "reportValidity" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element cannot validate constraints",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementReportValidity(handle.clone()))
-                    }
-                    "setCustomValidity" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element cannot set custom validity",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementSetCustomValidity(handle.clone()))
-                    }
-                    "getContext" => {
-                        let path = path.ok_or_else(|| {
-                            runtime_error("detached element cannot create a canvas context")
-                        })?;
-                        let is_canvas = self
-                            .document
-                            .borrow()
-                            .element_at(&path)
-                            .is_some_and(|element| element.name == "canvas");
-                        if !is_canvas {
-                            return Err(runtime_error(
-                                "getContext is only available on canvas elements",
-                            ));
-                        }
-                        Value::Builtin(Builtin::CanvasGetContext(handle.clone()))
-                    }
-                    "appendChild" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot receive children"));
-                        }
-                        Value::Builtin(Builtin::ElementAppendChild(handle.clone()))
-                    }
-                    "append" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot receive children"));
-                        }
-                        Value::Builtin(Builtin::ElementAppend(handle.clone()))
-                    }
-                    "prepend" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot receive children"));
-                        }
-                        Value::Builtin(Builtin::ElementPrepend(handle.clone()))
-                    }
-                    "replaceChildren" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot replace children"));
-                        }
-                        Value::Builtin(Builtin::ElementReplaceChildren(handle.clone()))
-                    }
-                    "before" => Value::Builtin(Builtin::ElementBefore(handle.clone())),
-                    "after" => Value::Builtin(Builtin::ElementAfter(handle.clone())),
-                    "replaceWith" => Value::Builtin(Builtin::ElementReplaceWith(handle.clone())),
-                    "insertAdjacentHTML" => {
-                        Value::Builtin(Builtin::ElementInsertAdjacentHtml(handle.clone()))
-                    }
-                    "removeChild" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot remove children"));
-                        }
-                        Value::Builtin(Builtin::ElementRemoveChild(handle.clone()))
-                    }
-                    "insertBefore" => {
-                        if path.is_none() {
-                            return Err(runtime_error("detached element cannot insert children"));
-                        }
-                        Value::Builtin(Builtin::ElementInsertBefore(handle.clone()))
-                    }
-                    "remove" => Value::Builtin(Builtin::ElementRemove(handle.clone())),
-                    "setAttribute" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element has no document attributes",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementSetAttribute(handle.clone()))
-                    }
-                    "removeAttribute" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element has no document attributes",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementRemoveAttribute(handle.clone()))
-                    }
-                    "getAttribute" => {
-                        if path.is_none() {
-                            return Err(runtime_error(
-                                "detached element has no document attributes",
-                            ));
-                        }
-                        Value::Builtin(Builtin::ElementGetAttribute(handle.clone()))
-                    }
+                    "querySelector" => bound(Builtin::ElementQuerySelector),
+                    "querySelectorAll" => bound(Builtin::ElementQuerySelectorAll),
+                    "addEventListener" => bound(Builtin::ElementAddEventListener),
+                    "removeEventListener" => bound(Builtin::ElementRemoveEventListener),
+                    "click" => bound(Builtin::ElementClick),
+                    "focus" => bound(Builtin::ElementFocus),
+                    "blur" => bound(Builtin::ElementBlur),
+                    "select" => bound(Builtin::ElementSelect),
+                    "setSelectionRange" => bound(Builtin::ElementSetSelectionRange),
+                    "setRangeText" => bound(Builtin::ElementSetRangeText),
+                    "requestSubmit" if is_named("form") => bound(Builtin::ElementRequestSubmit),
+                    "reset" if is_named("form") => bound(Builtin::ElementReset),
+                    "checkValidity" => bound(Builtin::ElementCheckValidity),
+                    "reportValidity" => bound(Builtin::ElementReportValidity),
+                    "setCustomValidity" => bound(Builtin::ElementSetCustomValidity),
+                    "getContext" if is_named("canvas") => bound(Builtin::CanvasGetContext),
+                    "appendChild" => bound(Builtin::ElementAppendChild),
+                    "append" => bound(Builtin::ElementAppend),
+                    "prepend" => bound(Builtin::ElementPrepend),
+                    "replaceChildren" => bound(Builtin::ElementReplaceChildren),
+                    "before" => bound(Builtin::ElementBefore),
+                    "after" => bound(Builtin::ElementAfter),
+                    "replaceWith" => bound(Builtin::ElementReplaceWith),
+                    "insertAdjacentHTML" => bound(Builtin::ElementInsertAdjacentHtml),
+                    "removeChild" => bound(Builtin::ElementRemoveChild),
+                    "insertBefore" => bound(Builtin::ElementInsertBefore),
+                    "remove" => bound(Builtin::ElementRemove),
+                    "setAttribute" => bound(Builtin::ElementSetAttribute),
+                    "removeAttribute" => bound(Builtin::ElementRemoveAttribute),
+                    "getAttribute" => bound(Builtin::ElementGetAttribute),
                     _ => return Err(runtime_error(format!("element has no property {property}"))),
                 };
                 Ok(value)
             }
-            Value::Validity(path) => {
-                let flags = self.constraint_flags(path.as_slice());
+            Value::Validity(node) => {
+                let flags = self.constraint_flags(node.id);
                 match property {
                     "badInput" => Ok(Value::Bool(flags.bad_input)),
                     "customError" => Ok(Value::Bool(flags.custom_error)),
@@ -4299,34 +3778,17 @@ impl ScriptRuntime {
             Value::Range(range) => {
                 let range_data = range.borrow();
                 match property {
-                    "startContainer" => Ok(if attached_path(&range_data.start.node).is_some() {
-                        Value::Element(range_data.start.node.clone())
-                    } else {
-                        Value::Null
-                    }),
+                    "startContainer" => Ok(self.range_container(&range_data.start)),
                     "startOffset" => Ok(Value::Number(range_data.start.offset as f64)),
-                    "endContainer" => Ok(if attached_path(&range_data.end.node).is_some() {
-                        Value::Element(range_data.end.node.clone())
-                    } else {
-                        Value::Null
-                    }),
+                    "endContainer" => Ok(self.range_container(&range_data.end)),
                     "endOffset" => Ok(Value::Number(range_data.end.offset as f64)),
                     "collapsed" => Ok(Value::Bool(self.range_is_collapsed(&range_data))),
                     "commonAncestorContainer" => {
-                        let Some(start_path) = attached_path(&range_data.start.node) else {
-                            return Ok(Value::Null);
-                        };
-                        let Some(end_path) = attached_path(&range_data.end.node) else {
-                            return Ok(Value::Null);
-                        };
-                        let path = common_path(&start_path, &end_path);
-                        Ok(if path.is_empty() {
-                            Value::Document
-                        } else {
-                            Value::Element(attached_handle(path, &self.document).ok_or_else(
-                                || runtime_error("range ancestor is no longer in the document"),
-                            )?)
-                        })
+                        let ancestor = self
+                            .document
+                            .borrow()
+                            .common_ancestor(range_data.start.node.id, range_data.end.node.id);
+                        Ok(ancestor.map_or(Value::Null, |ancestor| self.node_value(ancestor)))
                     }
                     "setStart" => Ok(Value::Builtin(Builtin::RangeSetStart(range.clone()))),
                     "setEnd" => Ok(Value::Builtin(Builtin::RangeSetEnd(range.clone()))),
@@ -4356,11 +3818,7 @@ impl ScriptRuntime {
                             let range = range.borrow();
                             let anchor = (property == "anchorNode") != selection_data.backward;
                             let boundary = if anchor { &range.start } else { &range.end };
-                            if attached_path(&boundary.node).is_some() {
-                                Value::Element(boundary.node.clone())
-                            } else {
-                                Value::Null
-                            }
+                            self.range_container(boundary)
                         })
                         .unwrap_or(Value::Null)),
                     "anchorOffset" | "focusOffset" => Ok(range
@@ -4425,8 +3883,8 @@ impl ScriptRuntime {
             },
             Value::Event(event) => match property {
                 "type" => Ok(Value::String(event.event_type.clone().into())),
-                "target" => Ok(node_value(event.target.clone(), &self.document)),
-                "currentTarget" => Ok(node_value(event.current_target.clone(), &self.document)),
+                "target" => Ok(self.node_value(event.target)),
+                "currentTarget" => Ok(self.node_value(event.current_target)),
                 "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
                 "state" => Ok(event.history_state.borrow().clone()),
                 "key" => Ok(Value::String(event.key.clone().into())),
@@ -5078,10 +4536,10 @@ impl ScriptRuntime {
                 true
             }
             Value::Element(handle) => match property {
-                "nodeValue" | "data" if attached_is_text(&handle) => {
+                "nodeValue" | "data" if self.is_text_node(&handle) => {
                     self.set_text_node_data(&handle, value_string)?
                 }
-                "textContent" if attached_is_text(&handle) => {
+                "textContent" if self.is_text_node(&handle) => {
                     self.set_text_node_data(&handle, value_string)?
                 }
                 "textContent" => self.set_element_text_content(&handle, value_string)?,
@@ -5405,8 +4863,8 @@ impl ScriptRuntime {
                         }
                         let event = Value::Event(Rc::new(EventData {
                             event_type: "message".to_string(),
-                            target: Vec::new(),
-                            current_target: Vec::new(),
+                            target: runtime.document_node(),
+                            current_target: runtime.document_node(),
                             state: Rc::new(RefCell::new(EventState::default())),
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
@@ -5510,8 +4968,8 @@ impl ScriptRuntime {
                         }
                         let event = Value::Event(Rc::new(EventData {
                             event_type: "message".to_string(),
-                            target: Vec::new(),
-                            current_target: Vec::new(),
+                            target: self.document_node(),
+                            current_target: self.document_node(),
                             state: Rc::new(RefCell::new(EventState::default())),
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
@@ -5547,8 +5005,8 @@ impl ScriptRuntime {
                         }
                         let event = Value::Event(Rc::new(EventData {
                             event_type: "error".to_string(),
-                            target: Vec::new(),
-                            current_target: Vec::new(),
+                            target: self.document_node(),
+                            current_target: self.document_node(),
                             state: Rc::new(RefCell::new(EventState::default())),
                             history_state: Rc::new(RefCell::new(Value::Null)),
                             key: String::new(),
@@ -5571,139 +5029,55 @@ impl ScriptRuntime {
         Ok(processed)
     }
 
-    fn element_text_content(&self, handle: &ElementHandle) -> Option<String> {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().node_text_content(&path)),
-            ElementLocation::Detached(element) => {
-                let mut text = String::new();
-                collect_element_text(&element, &mut text);
-                Some(text)
-            }
-        }
-    }
-
     fn element_node_name(&self, handle: &ElementHandle) -> String {
-        if attached_is_text(handle) {
-            return "#text".to_string();
-        }
-        match &*handle.borrow() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| {
-                    self.document
-                        .borrow()
-                        .element_at(&path)
-                        .map(|element| element.name.to_ascii_uppercase())
-                })
-                .unwrap_or_default(),
-            ElementLocation::Detached(element) => element.name.to_ascii_uppercase(),
+        let document = self.document.borrow();
+        match document.kind(handle.id) {
+            Some(NodeKind::Element(element)) => element.tag_name(),
+            Some(NodeKind::Text(_)) => "#text".to_string(),
+            Some(NodeKind::Comment(_)) => "#comment".to_string(),
+            Some(NodeKind::Fragment) => "#document-fragment".to_string(),
+            Some(NodeKind::Document) => "#document".to_string(),
+            None => String::new(),
         }
     }
 
     fn element_node_value(&self, handle: &ElementHandle) -> Value {
-        if !attached_is_text(handle) {
-            return Value::Null;
-        }
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().node_text_content(&path))
-                .map(|text| Value::String(text.into()))
-                .unwrap_or(Value::Null),
-            ElementLocation::Detached(element) => detached_text_data(&element)
-                .map(|text| Value::String(text.into()))
-                .unwrap_or(Value::Null),
-        }
+        self.document
+            .borrow()
+            .character_data(handle.id)
+            .map_or(Value::Null, |text| Value::String(text.into()))
     }
 
     fn element_child_nodes(&self, handle: &ElementHandle) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::NodeList(Rc::new(Vec::new()));
-        };
-        let nodes = self
-            .document
-            .borrow()
-            .child_paths(&path)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|path| attached_handle(path, &self.document))
-            .collect();
-        Value::NodeList(Rc::new(nodes))
+        let children = self.document.borrow().children(handle.id).to_vec();
+        Value::NodeList(Rc::new(
+            children
+                .into_iter()
+                .map(|child| self.node_handle(child))
+                .collect(),
+        ))
     }
 
     fn element_children(&self, handle: &ElementHandle) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::NodeList(Rc::new(Vec::new()));
-        };
-        let nodes = self
+        let children = self
             .document
             .borrow()
-            .element_child_paths(&path)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|path| attached_handle(path, &self.document))
-            .collect();
-        Value::NodeList(Rc::new(nodes))
+            .element_children(handle.id)
+            .collect::<Vec<_>>();
+        Value::NodeList(Rc::new(
+            children
+                .into_iter()
+                .map(|child| self.node_handle(child))
+                .collect(),
+        ))
     }
 
-    fn element_child(&self, handle: &ElementHandle, first: bool) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::Null;
-        };
-        let Some(child_path) = self.document.borrow().child_paths(&path).and_then(|paths| {
-            if first {
-                paths.into_iter().next()
-            } else {
-                paths.into_iter().next_back()
-            }
-        }) else {
-            return Value::Null;
-        };
-        attached_handle(child_path, &self.document)
-            .map(Value::Element)
-            .unwrap_or(Value::Null)
-    }
-
-    fn element_element_child(&self, handle: &ElementHandle, first: bool) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::Null;
-        };
-        let Some(child_path) =
-            self.document
-                .borrow()
-                .element_child_paths(&path)
-                .and_then(|paths| {
-                    if first {
-                        paths.into_iter().next()
-                    } else {
-                        paths.into_iter().next_back()
-                    }
-                })
-        else {
-            return Value::Null;
-        };
-        attached_handle(child_path, &self.document)
-            .map(Value::Element)
-            .unwrap_or(Value::Null)
-    }
-
-    fn element_child_element_count(&self, handle: &ElementHandle) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::Number(0.0);
-        };
-        Value::Number(
-            self.document
-                .borrow()
-                .element_child_paths(&path)
-                .map_or(0, |children| children.len()) as f64,
-        )
-    }
-
-    fn is_focusable_path(&self, path: &[usize]) -> bool {
+    fn is_focusable(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
-        if self.is_disabled_path(path) {
+        if self.is_disabled(node) {
             return false;
         }
         if element.attr("tabindex").is_some() {
@@ -5719,9 +5093,9 @@ impl ScriptRuntime {
         }
     }
 
-    fn is_text_control_path(&self, path: &[usize]) -> bool {
+    fn is_text_control(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
         match element.name.as_str() {
@@ -5745,18 +5119,18 @@ impl ScriptRuntime {
     }
 
     // reads from an element in place; the borrow ends before the caller continues
-    fn with_element<T>(&self, path: &[usize], read: impl FnOnce(&Element) -> T) -> Option<T> {
-        self.document.borrow().element_at(path).map(read)
+    fn with_element<T>(&self, node: NodeId, read: impl FnOnce(&Element) -> T) -> Option<T> {
+        self.document.borrow().element(node).map(read)
     }
 
-    fn is_disabled_path(&self, path: &[usize]) -> bool {
+    fn is_disabled(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
         if element.name == "option" {
             drop(document);
-            return self.option_disabled_path(path);
+            return self.is_option_disabled(node);
         }
         if !matches!(
             element.name.as_str(),
@@ -5767,55 +5141,54 @@ impl ScriptRuntime {
         if element.attr("disabled").is_some() {
             return true;
         }
-        (0..path.len()).rev().any(|depth| {
-            let ancestor = &path[..depth];
-            document.element_at(ancestor).is_some_and(|candidate| {
+        document.ancestors(node).any(|ancestor| {
+            document.element(ancestor).is_some_and(|candidate| {
                 candidate.name == "fieldset"
                     && candidate.attr("disabled").is_some()
-                    && !inside_first_legend(candidate, ancestor, path)
+                    && !inside_first_legend(&document, ancestor, node)
             })
         })
     }
 
-    fn is_readonly_path(&self, path: &[usize]) -> bool {
-        self.is_selection_control_path(path)
+    fn is_readonly(&self, node: NodeId) -> bool {
+        self.is_selection_control(node)
             && self
                 .document
                 .borrow()
-                .element_at(path)
+                .element(node)
                 .is_some_and(|element| element.attr("readonly").is_some())
     }
 
-    fn user_input_max_length(&self, path: &[usize]) -> Option<usize> {
-        if !self.is_selection_control_path(path) {
+    fn user_input_max_length(&self, node: NodeId) -> Option<usize> {
+        if !self.is_selection_control(node) {
             return None;
         }
-        self.control_length_attribute(path, "maxlength")
+        self.control_length_attribute(node, "maxlength")
     }
 
-    fn control_length_attribute(&self, path: &[usize], name: &str) -> Option<usize> {
-        self.document.borrow().element_at(path).and_then(|element| {
+    fn control_length_attribute(&self, node: NodeId, name: &str) -> Option<usize> {
+        self.document.borrow().element(node).and_then(|element| {
             element
                 .attr(name)
                 .and_then(|value| value.trim().parse().ok())
         })
     }
 
-    fn mark_user_edit(&mut self, path: &[usize]) {
-        self.dirty_controls.insert(path.to_vec());
-        self.last_user_edit.insert(path.to_vec());
+    fn mark_user_edit(&mut self, node: NodeId) {
+        self.dirty_controls.insert(node);
+        self.last_user_edit.insert(node);
     }
 
-    fn is_validation_candidate(&self, path: &[usize]) -> bool {
+    fn is_validation_candidate(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
-        if self.is_disabled_path(path) {
+        if self.is_disabled(node) {
             return false;
         }
         match element.name.as_str() {
-            "textarea" => !self.is_readonly_path(path),
+            "textarea" => !self.is_readonly(node),
             "select" => true,
             "input" => {
                 let kind = element
@@ -5825,67 +5198,67 @@ impl ScriptRuntime {
                 !(matches!(
                     kind.as_str(),
                     "button" | "hidden" | "image" | "reset" | "submit"
-                ) || element.attr("readonly").is_some() && self.is_selection_control_path(path))
+                ) || element.attr("readonly").is_some() && self.is_selection_control(node))
             }
             _ => false,
         }
     }
 
-    fn constraint_flags(&self, path: &[usize]) -> ConstraintFlags {
-        if !self.is_validation_candidate(path) {
+    fn constraint_flags(&self, node: NodeId) -> ConstraintFlags {
+        if !self.is_validation_candidate(node) {
             return ConstraintFlags::default();
         }
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return ConstraintFlags::default();
         };
         let kind = element
             .attr("type")
             .map(|kind| kind.to_ascii_lowercase())
             .unwrap_or_else(|| "text".to_string());
-        let value = self.control_value_path(path).unwrap_or_default();
+        let value = self.control_value(node).unwrap_or_default();
         let empty = if element.name == "select" {
             let selected = self
-                .option_paths(path)
+                .options_of(node)
                 .into_iter()
-                .filter(|option| self.option_selected_path(option))
+                .filter(|option| self.is_option_selected(*option))
                 .collect::<Vec<_>>();
             selected.is_empty()
                 || (selected.len() == 1
                     && self
-                        .select_placeholder_path(path)
+                        .select_placeholder(node)
                         .is_some_and(|placeholder| selected[0] == placeholder))
         } else {
             match kind.as_str() {
-                "checkbox" => !self.control_checked_path(path),
+                "checkbox" => !self.is_control_checked(node),
                 "radio" => self
                     .document
                     .borrow()
-                    .radio_group_paths(path)
+                    .radio_group(node)
                     .map(|group| {
                         group
                             .iter()
-                            .all(|candidate| !self.control_checked_path(candidate))
+                            .all(|candidate| !self.is_control_checked(*candidate))
                     })
-                    .unwrap_or_else(|| !self.control_checked_path(path)),
-                "file" => self.selected_files.get(path).is_none_or(Vec::is_empty),
+                    .unwrap_or_else(|| !self.is_control_checked(node)),
+                "file" => self.selected_files.get(&node).is_none_or(Vec::is_empty),
                 _ => value.is_empty(),
             }
         };
-        let dirty = self.dirty_controls.contains(path);
+        let dirty = self.dirty_controls.contains(&node);
         let length = utf16_len(&value);
         let too_long = dirty
-            && self.last_user_edit.contains(path)
-            && self.is_selection_control_path(path)
+            && self.last_user_edit.contains(&node)
+            && self.is_selection_control(node)
             && self
-                .control_length_attribute(path, "maxlength")
+                .control_length_attribute(node, "maxlength")
                 .is_some_and(|maximum| length > maximum);
         let too_short = dirty
-            && self.last_user_edit.contains(path)
+            && self.last_user_edit.contains(&node)
             && !empty
-            && self.is_selection_control_path(path)
+            && self.is_selection_control(node)
             && self
-                .control_length_attribute(path, "minlength")
+                .control_length_attribute(node, "minlength")
                 .is_some_and(|minimum| length < minimum);
         let value_missing = element.attr("required").is_some() && empty;
         let type_mismatch = !empty
@@ -5907,25 +5280,22 @@ impl ScriptRuntime {
             too_short,
             custom_error: self
                 .custom_validity
-                .get(path)
+                .get(&node)
                 .is_some_and(|message| !message.is_empty()),
             ..ConstraintFlags::default()
         }
     }
 
     fn element_validity(&self, handle: &ElementHandle) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return validity_object(ConstraintFlags::default());
-        };
-        Value::Validity(Rc::new(path))
+        Value::Validity(handle.clone())
     }
 
-    fn validation_message(&self, path: &[usize]) -> String {
-        let flags = self.constraint_flags(path);
+    fn validation_message(&self, node: NodeId) -> String {
+        let flags = self.constraint_flags(node);
         if flags.custom_error {
             let message = self
                 .custom_validity
-                .get(path)
+                .get(&node)
                 .expect("custom validity flag has a message");
             return message.clone();
         }
@@ -5947,75 +5317,72 @@ impl ScriptRuntime {
         String::new()
     }
 
-    fn check_validity_path(&mut self, path: &[usize]) -> Result<bool, ScriptError> {
-        let Some(is_form) = self.with_element(path, |element| element.name == "form") else {
+    fn check_validity(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        let Some(is_form) = self.with_element(node, |element| element.name == "form") else {
             return Ok(true);
         };
         if is_form {
             let controls = self
                 .document
                 .borrow()
-                .form_control_paths(path)
+                .form_controls(node)
                 .unwrap_or_default();
             let mut valid = true;
             for control in controls {
-                if !self.check_validity_path(&control)? {
+                if !self.check_validity(control)? {
                     valid = false;
                 }
             }
             return Ok(valid);
         }
-        if !self.is_validation_candidate(path) {
+        if !self.is_validation_candidate(node) {
             return Ok(true);
         }
-        let flags = self.constraint_flags(path);
+        let flags = self.constraint_flags(node);
         if flags.valid() {
             return Ok(true);
         }
-        self.dispatch_non_bubbling_event(path.to_vec(), "invalid")?;
+        self.dispatch_non_bubbling_event(node, "invalid")?;
         self.drain_microtasks()?;
         Ok(false)
     }
 
-    fn set_custom_validity(&mut self, path: NodePath, message: String) {
+    fn set_custom_validity(&mut self, node: NodeId, message: String) {
         if message.is_empty() {
-            self.custom_validity.remove(&path);
+            self.custom_validity.remove(&node);
         } else {
-            self.custom_validity.insert(path, message);
+            self.custom_validity.insert(node, message);
         }
     }
 
-    fn control_value_path(&self, path: &[usize]) -> Option<String> {
-        if let Some(value) = self.control_values.get(path) {
+    pub(crate) fn control_value(&self, node: NodeId) -> Option<String> {
+        if let Some(value) = self.control_values.get(&node) {
             return Some(value.clone());
         }
         let document = self.document.borrow();
-        let element = document.element_at(path)?;
+        let element = document.element(node)?;
         if element.name == "select" {
-            return Some(self.select_value_path(path));
+            return Some(self.select_value(node));
         }
         if element.name == "option" {
-            return Some(option_value(element));
+            return Some(option_value(&document, node));
         }
-        element.attr("value").map(str::to_string).or_else(|| {
-            (element.name == "textarea").then(|| {
-                let mut text = String::new();
-                collect_element_text(element, &mut text);
-                text
-            })
-        })
+        element
+            .attr("value")
+            .map(str::to_string)
+            .or_else(|| (element.name == "textarea").then(|| document.text_content(node)))
     }
 
-    fn option_paths(&self, select_path: &[usize]) -> Vec<NodePath> {
+    fn options_of(&self, select_node: NodeId) -> Vec<NodeId> {
         self.document
             .borrow()
-            .option_paths(select_path)
+            .options(select_node)
             .unwrap_or_default()
     }
 
-    fn option_disabled_path(&self, path: &[usize]) -> bool {
+    fn is_option_disabled(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
         if element.name != "option" {
@@ -6024,8 +5391,8 @@ impl ScriptRuntime {
         if element.attr("disabled").is_some() {
             return true;
         }
-        for depth in (0..path.len()).rev() {
-            let Some(ancestor) = document.element_at(&path[..depth]) else {
+        for ancestor in document.ancestors(node) {
+            let Some(ancestor) = document.element(ancestor) else {
                 continue;
             };
             match ancestor.name.as_str() {
@@ -6037,9 +5404,9 @@ impl ScriptRuntime {
         false
     }
 
-    fn select_placeholder_path(&self, path: &[usize]) -> Option<NodePath> {
+    fn select_placeholder(&self, node: NodeId) -> Option<NodeId> {
         let document = self.document.borrow();
-        let element = document.element_at(path)?;
+        let element = document.element(node)?;
         if element.name != "select"
             || element.attr("multiple").is_some()
             || element
@@ -6049,305 +5416,248 @@ impl ScriptRuntime {
         {
             return None;
         }
-        let option = self.option_paths(path).into_iter().next()?;
-        let parent = option[..option.len().saturating_sub(1)].to_vec();
-        let empty = parent == path
-            && self
-                .document
-                .borrow()
-                .element_at(&option)
-                .is_some_and(|element| option_value(element).is_empty());
+        let option = self.options_of(node).into_iter().next()?;
+        let empty =
+            document.parent(option) == Some(node) && option_value(&document, option).is_empty();
         empty.then_some(option)
     }
 
-    fn option_selected_path(&self, path: &[usize]) -> bool {
+    fn is_option_selected(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
         if element.name != "option" {
             return false;
         }
-        if let Some(selected) = self.option_selected.get(path) {
+        if let Some(selected) = self.option_selected.get(&node) {
             return *selected;
         }
         if element.attr("selected").is_some() {
             return true;
         }
-        let Some(select_path) = self.document.borrow().select_ancestor_path(path) else {
+        let Some(select_node) = self.document.borrow().select_ancestor(node) else {
             return false;
         };
         if self
             .document
             .borrow()
-            .element_attribute(&select_path, "multiple")
+            .attribute(select_node, "multiple")
+            .map(str::to_string)
             .is_some()
         {
             return false;
         }
-        self.option_paths(&select_path)
+        self.options_of(select_node)
             .into_iter()
-            .find(|candidate| !self.option_disabled_path(candidate))
-            .is_some_and(|candidate| candidate == path)
+            .find(|candidate| !self.is_option_disabled(*candidate))
+            .is_some_and(|candidate| candidate == node)
     }
 
-    fn select_multiple_path(&self, path: &[usize]) -> bool {
+    fn is_select_multiple(&self, node: NodeId) -> bool {
         self.document
             .borrow()
-            .element_at(path)
+            .element(node)
             .is_some_and(|element| element.name == "select" && element.attr("multiple").is_some())
     }
 
-    fn select_selected_index(&self, path: &[usize]) -> i32 {
-        self.option_paths(path)
+    fn select_selected_index(&self, node: NodeId) -> i32 {
+        self.options_of(node)
             .into_iter()
             .enumerate()
-            .find(|(_, option)| self.option_selected_path(option))
+            .find(|(_, option)| self.is_option_selected(*option))
             .map(|(index, _)| index as i32)
             .unwrap_or(-1)
     }
 
-    fn select_value_path(&self, path: &[usize]) -> String {
-        self.option_paths(path)
+    fn select_value(&self, node: NodeId) -> String {
+        self.options_of(node)
             .into_iter()
-            .find(|option| self.option_selected_path(option))
-            .and_then(|option| self.document.borrow().element_at(&option).map(option_value))
+            .find(|option| self.is_option_selected(*option))
+            .map(|option| option_value(&self.document.borrow(), option))
             .unwrap_or_default()
     }
 
-    fn select_selected_values(&self, path: &[usize]) -> Vec<String> {
-        self.option_paths(path)
+    fn select_selected_values(&self, node: NodeId) -> Vec<String> {
+        self.options_of(node)
             .into_iter()
-            .filter(|option| {
-                self.option_selected_path(option) && !self.option_disabled_path(option)
-            })
-            .filter_map(|option| self.document.borrow().element_at(&option).map(option_value))
+            .filter(|option| self.is_option_selected(*option) && !self.is_option_disabled(*option))
+            .map(|option| option_value(&self.document.borrow(), option))
             .collect()
     }
 
-    fn option_index(&self, path: &[usize]) -> Option<usize> {
-        let select_path = self.document.borrow().select_ancestor_path(path)?;
-        self.option_paths(&select_path)
+    fn option_index(&self, node: NodeId) -> Option<usize> {
+        let select_node = self.document.borrow().select_ancestor(node)?;
+        self.options_of(select_node)
             .into_iter()
-            .position(|option| option == path)
+            .position(|option| option == node)
     }
 
     fn element_selected(&self, handle: &ElementHandle) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                attached_path(handle).is_some_and(|path| self.option_selected_path(&path))
-            }
-            ElementLocation::Detached(element) => {
-                element.name == "option" && element.attr("selected").is_some()
-            }
-        }
+        self.is_option_selected(handle.id)
     }
 
     fn element_default_selected(&self, handle: &ElementHandle) -> bool {
-        match &*handle.borrow() {
-            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
-                self.document
-                    .borrow()
-                    .element_at(&path)
-                    .is_some_and(|element| {
-                        element.name == "option" && element.attr("selected").is_some()
-                    })
-            }),
-            ElementLocation::Detached(element) => {
-                element.name == "option" && element.attr("selected").is_some()
-            }
-        }
+        let node = handle.id;
+        self.document
+            .borrow()
+            .element(node)
+            .is_some_and(|element| element.name == "option" && element.attr("selected").is_some())
     }
 
     fn element_options(&self, handle: &ElementHandle, selected: bool) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::NodeList(Rc::new(Vec::new()));
-        };
+        let node = handle.id;
         let nodes = self
-            .option_paths(&path)
+            .options_of(node)
             .into_iter()
-            .filter(|option| !selected || self.option_selected_path(option))
-            .filter_map(|option| attached_handle(option, &self.document))
+            .filter(|option| !selected || self.is_option_selected(*option))
+            .map(|option| self.node_handle(option))
             .collect();
         Value::NodeList(Rc::new(nodes))
     }
 
     fn element_form(&self, handle: &ElementHandle) -> Value {
-        attached_path(handle)
-            .and_then(|path| self.document.borrow().form_owner_path(&path))
-            .and_then(|path| attached_handle(path, &self.document))
-            .map(Value::Element)
-            .unwrap_or(Value::Null)
+        let node = handle.id;
+        self.document
+            .borrow()
+            .form_owner(node)
+            .map_or(Value::Null, |node| self.node_value(node))
     }
 
     fn element_form_elements(&self, handle: &ElementHandle) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::NodeList(Rc::new(Vec::new()));
-        };
+        let node = handle.id;
         let nodes = self
             .document
             .borrow()
-            .form_control_paths(&path)
+            .form_controls(node)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|path| attached_handle(path, &self.document))
+            .map(|node| self.node_handle(node))
             .collect();
         Value::NodeList(Rc::new(nodes))
     }
 
-    fn set_option_selected_state(&mut self, path: &[usize], selected: bool, dirty: bool) {
-        let Some(select_path) = self.document.borrow().select_ancestor_path(path) else {
+    fn set_option_selected_state(&mut self, node: NodeId, selected: bool, dirty: bool) {
+        let Some(select_node) = self.document.borrow().select_ancestor(node) else {
+            self.set_option_selected_raw(node, selected, dirty);
             return;
         };
-        let options = self.option_paths(&select_path);
-        let multiple = self.select_multiple_path(&select_path);
+        let options = self.options_of(select_node);
+        let multiple = self.is_select_multiple(select_node);
         if selected && !multiple {
             for option in &options {
-                if option != path && self.option_selected_path(option) {
-                    self.set_option_selected_raw(option, false, dirty);
+                if *option != node && self.is_option_selected(*option) {
+                    self.set_option_selected_raw(*option, false, dirty);
                 }
             }
         }
-        self.set_option_selected_raw(path, selected, dirty);
+        self.set_option_selected_raw(node, selected, dirty);
         if !selected
             && !multiple
             && !options
                 .iter()
-                .any(|option| self.option_selected_path(option))
+                .any(|option| self.is_option_selected(*option))
             && let Some(first) = options
                 .iter()
-                .find(|option| !self.option_disabled_path(option))
+                .find(|option| !self.is_option_disabled(**option))
         {
-            self.set_option_selected_state(first, true, dirty);
+            self.set_option_selected_state(*first, true, dirty);
         }
     }
 
-    fn set_option_selected_raw(&mut self, path: &[usize], selected: bool, dirty: bool) {
-        let changed = self.option_selected_path(path) != selected;
-        self.option_selected.insert(path.to_vec(), selected);
+    fn set_option_selected_raw(&mut self, node: NodeId, selected: bool, dirty: bool) {
+        let changed = self.is_option_selected(node) != selected;
+        self.option_selected.insert(node, selected);
         if dirty && changed {
-            self.dirty_options.insert(path.to_vec());
+            self.dirty_options.insert(node);
         }
     }
 
-    fn normalize_select_selection(&mut self, path: &[usize], dirty: bool) {
-        if self.select_multiple_path(path) {
+    fn normalize_select_selection(&mut self, node: NodeId, dirty: bool) {
+        if self.is_select_multiple(node) {
             return;
         }
-        let options = self.option_paths(path);
+        let options = self.options_of(node);
         let selected = options
             .iter()
-            .filter(|option| self.option_selected_path(option))
+            .filter(|option| self.is_option_selected(**option))
             .cloned()
             .collect::<Vec<_>>();
         if let Some(last) = selected.last() {
             for option in &selected[..selected.len().saturating_sub(1)] {
-                self.set_option_selected_raw(option, false, dirty);
+                self.set_option_selected_raw(*option, false, dirty);
             }
-            self.set_option_selected_raw(last, true, dirty);
+            self.set_option_selected_raw(*last, true, dirty);
         } else if let Some(first) = options
             .iter()
-            .find(|option| !self.option_disabled_path(option))
+            .find(|option| !self.is_option_disabled(**option))
         {
-            self.set_option_selected_raw(first, true, dirty);
+            self.set_option_selected_raw(*first, true, dirty);
         }
     }
 
-    fn set_select_selected_index(&mut self, path: &[usize], index: i32) -> bool {
+    fn set_select_selected_index(&mut self, node: NodeId, index: i32) -> bool {
         if self
             .document
             .borrow()
-            .element_at(path)
+            .element(node)
             .is_none_or(|element| element.name != "select")
         {
             return false;
         }
-        let options = self.option_paths(path);
+        let options = self.options_of(node);
         let selected = if index >= 0 {
             options.get(index as usize).cloned()
         } else {
             None
         };
         for option in &options {
-            self.set_option_selected_raw(option, Some(option) == selected.as_ref(), true);
+            self.set_option_selected_raw(*option, Some(option) == selected.as_ref(), true);
         }
         true
     }
 
-    fn set_select_value(&mut self, path: &[usize], value: &str) -> bool {
+    fn set_select_value(&mut self, node: NodeId, value: &str) -> bool {
         if self
             .document
             .borrow()
-            .element_at(path)
+            .element(node)
             .is_none_or(|element| element.name != "select")
         {
             return false;
         }
-        let options = self.option_paths(path);
+        let options = self.options_of(node);
         let matching = options
             .iter()
-            .find(|option| {
-                self.document
-                    .borrow()
-                    .element_at(option)
-                    .is_some_and(|element| option_value(element) == value)
-            })
-            .cloned();
+            .find(|&&option| option_value(&self.document.borrow(), option) == value)
+            .copied();
         for option in &options {
             let selected = matching.as_ref().is_some_and(|matching| matching == option);
-            self.set_option_selected_raw(option, selected, true);
+            self.set_option_selected_raw(*option, selected, true);
         }
         true
     }
 
     fn set_element_selected(&mut self, handle: &ElementHandle, selected: bool) -> bool {
-        let Some(path) = attached_path(handle) else {
-            let mut location = handle.borrow_mut();
-            let ElementLocation::Detached(element) = &mut *location else {
-                return false;
-            };
-            if element.name != "option" {
-                return false;
-            }
-            if selected {
-                element.attrs.insert("selected".to_string(), String::new());
-            } else {
-                element.attrs.remove("selected");
-            }
-            return true;
-        };
+        let node = handle.id;
         if self
             .document
             .borrow()
-            .element_at(&path)
+            .element(node)
             .is_none_or(|element| element.name != "option")
         {
             return false;
         }
-        self.set_option_selected_state(&path, selected, true);
+        self.set_option_selected_state(node, selected, true);
         true
     }
 
     fn set_element_default_selected(&mut self, handle: &ElementHandle, selected: bool) -> bool {
-        let Some(path) = attached_path(handle) else {
-            let mut location = handle.borrow_mut();
-            let ElementLocation::Detached(element) = &mut *location else {
-                return false;
-            };
-            if element.name != "option" {
-                return false;
-            }
-            if selected {
-                element.attrs.insert("selected".to_string(), String::new());
-            } else {
-                element.attrs.remove("selected");
-            }
-            return true;
-        };
+        let node = handle.id;
         if self
             .document
             .borrow()
-            .element_at(&path)
+            .element(node)
             .is_none_or(|element| element.name != "option")
         {
             return false;
@@ -6355,14 +5665,14 @@ impl ScriptRuntime {
         if selected {
             self.document
                 .borrow_mut()
-                .set_element_attribute(&path, "selected", String::new());
+                .set_attribute(node, "selected", String::new());
         } else {
             self.document
                 .borrow_mut()
-                .remove_element_attribute(&path, "selected");
+                .remove_attribute(node, "selected");
         }
-        if !self.dirty_options.contains(&path) {
-            self.set_option_selected_state(&path, selected, false);
+        if !self.dirty_options.contains(&node) {
+            self.set_option_selected_state(node, selected, false);
         }
         true
     }
@@ -6375,22 +5685,15 @@ impl ScriptRuntime {
         if !index.is_finite() || index.fract() != 0.0 {
             return Ok(false);
         }
-        Ok(
-            self.set_select_selected_index(
-                &attached_path(handle).unwrap_or_default(),
-                index as i32,
-            ),
-        )
+        Ok(self.set_select_selected_index(handle.id, index as i32))
     }
 
     fn set_element_multiple(&mut self, handle: &ElementHandle, multiple: bool) -> bool {
-        let Some(path) = attached_path(handle) else {
-            return false;
-        };
+        let node = handle.id;
         if self
             .document
             .borrow()
-            .element_at(&path)
+            .element(node)
             .is_none_or(|element| element.name != "select")
         {
             return false;
@@ -6398,12 +5701,12 @@ impl ScriptRuntime {
         if multiple {
             self.document
                 .borrow_mut()
-                .set_element_attribute(&path, "multiple", String::new());
+                .set_attribute(node, "multiple", String::new());
         } else {
             self.document
                 .borrow_mut()
-                .remove_element_attribute(&path, "multiple");
-            self.normalize_select_selection(&path, false);
+                .remove_attribute(node, "multiple");
+            self.normalize_select_selection(node, false);
         }
         true
     }
@@ -6413,67 +5716,33 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         text: String,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            let mut location = handle.borrow_mut();
-            let ElementLocation::Detached(element) = &mut *location else {
-                return Ok(false);
-            };
-            if element.name != "option" {
-                return Ok(false);
-            }
-            element.children = vec![Node::Text(text)];
-            return Ok(true);
-        };
+        let node = handle.id;
         if self
             .document
             .borrow()
-            .element_at(&path)
+            .element(node)
             .is_none_or(|element| element.name != "option")
         {
             return Ok(false);
         }
-        self.replace_element_text_content_at(&path, text)
+        self.replace_element_text_content_at(node, text)
     }
 
     fn element_value(&self, handle: &ElementHandle) -> Option<String> {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                attached_path(handle).and_then(|path| self.control_value_path(&path))
-            }
-            ElementLocation::Detached(element) => match element.name.as_str() {
-                "option" => Some(option_value(&element)),
-                _ => element.attr("value").map(str::to_string),
-            },
-        }
+        self.control_value(handle.id)
     }
 
     fn element_default_value(&self, handle: &ElementHandle) -> Value {
-        let value = match &*handle.borrow() {
-            ElementLocation::Attached { .. } => attached_path(handle).and_then(|path| {
-                self.document
-                    .borrow()
-                    .element_at(&path)
-                    .and_then(default_value_for_element)
-            }),
-            ElementLocation::Detached(element) => default_value_for_element(element),
-        };
+        let value = default_value_for_element(&self.document.borrow(), handle.id);
         Value::String(value.unwrap_or_default().into())
     }
 
     fn element_default_checked(&self, handle: &ElementHandle) -> bool {
-        match &*handle.borrow() {
-            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
-                self.document
-                    .borrow()
-                    .element_at(&path)
-                    .is_some_and(|element| {
-                        element.name == "input" && element.attr("checked").is_some()
-                    })
-            }),
-            ElementLocation::Detached(element) => {
-                element.name == "input" && element.attr("checked").is_some()
-            }
-        }
+        let node = handle.id;
+        self.document
+            .borrow()
+            .element(node)
+            .is_some_and(|element| element.name == "input" && element.attr("checked").is_some())
     }
 
     fn set_element_default_value(
@@ -6481,57 +5750,30 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         value: String,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            let mut location = handle.borrow_mut();
-            let ElementLocation::Detached(element) = &mut *location else {
-                return Ok(false);
-            };
-            return Ok(match element.name.as_str() {
-                "input" => {
-                    element.attrs.insert("value".to_string(), value);
-                    true
-                }
-                "textarea" => {
-                    element.children = vec![Node::Text(value)];
-                    true
-                }
-                _ => false,
-            });
-        };
-        let Some(name) = self.with_element(&path, |element| element.name.clone()) else {
+        let node = handle.id;
+        let Some(name) = self.with_element(node, |element| element.name.clone()) else {
             return Ok(false);
         };
-        let dirty = self.dirty_controls.contains(&path);
+        let dirty = self.dirty_controls.contains(&node);
         let changed = match name.as_str() {
             "input" => self
                 .document
                 .borrow_mut()
-                .set_element_attribute(&path, "value", value),
-            "textarea" => self.replace_element_text_content_at(&path, value)?,
+                .set_attribute(node, "value", value),
+            "textarea" => self.replace_element_text_content_at(node, value)?,
             _ => false,
         };
         if changed && !dirty {
-            self.control_values.remove(&path);
-            self.text_selections.remove(&path);
+            self.control_values.remove(&node);
+            self.text_selections.remove(&node);
         }
         Ok(changed)
     }
 
     fn set_element_default_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
-        let Some(path) = attached_path(handle) else {
-            let mut location = handle.borrow_mut();
-            let ElementLocation::Detached(element) = &mut *location else {
-                return false;
-            };
-            if checked {
-                element.attrs.insert("checked".to_string(), String::new());
-            } else {
-                element.attrs.remove("checked");
-            }
-            return true;
-        };
+        let node = handle.id;
         if !self
-            .with_element(&path, |element| element.name == "input")
+            .with_element(node, |element| element.name == "input")
             .unwrap_or(false)
         {
             return false;
@@ -6539,21 +5781,19 @@ impl ScriptRuntime {
         if checked {
             self.document
                 .borrow_mut()
-                .set_element_attribute(&path, "checked", String::new());
+                .set_attribute(node, "checked", String::new());
         } else {
-            self.document
-                .borrow_mut()
-                .remove_element_attribute(&path, "checked");
+            self.document.borrow_mut().remove_attribute(node, "checked");
         }
-        if !self.dirty_checked_controls.contains(&path) {
-            self.control_checked.insert(path, checked);
+        if !self.dirty_checked_controls.contains(&node) {
+            self.control_checked.insert(node, checked);
         }
         true
     }
 
-    fn is_selection_control_path(&self, path: &[usize]) -> bool {
+    fn is_selection_control(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
-        let Some(element) = document.element_at(path) else {
+        let Some(element) = document.element(node) else {
             return false;
         };
         match element.name.as_str() {
@@ -6583,9 +5823,9 @@ impl ScriptRuntime {
         }
     }
 
-    fn selection_for_path(&self, path: &[usize], value: &str) -> TextSelection {
+    fn selection_for(&self, node: NodeId, value: &str) -> TextSelection {
         let length = utf16_len(value);
-        let selection = self.text_selections.get(path).copied().unwrap_or_default();
+        let selection = self.text_selections.get(&node).copied().unwrap_or_default();
         TextSelection {
             start: selection.start.min(length),
             end: selection.end.min(length),
@@ -6594,41 +5834,31 @@ impl ScriptRuntime {
     }
 
     fn element_selection_start(&self, handle: &ElementHandle) -> Result<Value, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(Value::Null);
-        };
-        if !self.is_selection_control_path(&path) {
+        let node = handle.id;
+        if !self.is_selection_control(node) {
             return Ok(Value::Null);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
-        Ok(Value::Number(
-            self.selection_for_path(&path, &value).start as f64,
-        ))
+        let value = self.control_value(node).unwrap_or_default();
+        Ok(Value::Number(self.selection_for(node, &value).start as f64))
     }
 
     fn element_selection_end(&self, handle: &ElementHandle) -> Result<Value, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(Value::Null);
-        };
-        if !self.is_selection_control_path(&path) {
+        let node = handle.id;
+        if !self.is_selection_control(node) {
             return Ok(Value::Null);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
-        Ok(Value::Number(
-            self.selection_for_path(&path, &value).end as f64,
-        ))
+        let value = self.control_value(node).unwrap_or_default();
+        Ok(Value::Number(self.selection_for(node, &value).end as f64))
     }
 
     fn element_selection_direction(&self, handle: &ElementHandle) -> Result<Value, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(Value::Null);
-        };
-        if !self.is_selection_control_path(&path) {
+        let node = handle.id;
+        if !self.is_selection_control(node) {
             return Ok(Value::Null);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(node).unwrap_or_default();
         Ok(Value::String(
-            selection_direction_name(self.selection_for_path(&path, &value).direction)
+            selection_direction_name(self.selection_for(node, &value).direction)
                 .to_string()
                 .into(),
         ))
@@ -6639,16 +5869,14 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         start: f64,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(false);
-        };
-        if !self.is_selection_control_path(&path) {
+        let node = handle.id;
+        if !self.is_selection_control(node) {
             return Ok(false);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
-        let selection = self.selection_for_path(&path, &value);
+        let value = self.control_value(node).unwrap_or_default();
+        let selection = self.selection_for(node, &value);
         let start = selection_offset(start);
-        self.set_text_selection(path, start, selection.end.max(start), selection.direction)
+        self.set_text_selection(node, start, selection.end.max(start), selection.direction)
     }
 
     fn set_element_selection_end(
@@ -6656,16 +5884,14 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         end: f64,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(false);
-        };
-        if !self.is_selection_control_path(&path) {
+        let node = handle.id;
+        if !self.is_selection_control(node) {
             return Ok(false);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
-        let selection = self.selection_for_path(&path, &value);
+        let value = self.control_value(node).unwrap_or_default();
+        let selection = self.selection_for(node, &value);
         self.set_text_selection(
-            path,
+            node,
             selection.start,
             selection_offset(end),
             selection.direction,
@@ -6677,16 +5903,14 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         direction: &str,
     ) -> Result<bool, ScriptError> {
-        let Some(path) = attached_path(handle) else {
-            return Ok(false);
-        };
-        if !self.is_selection_control_path(&path) {
+        let node = handle.id;
+        if !self.is_selection_control(node) {
             return Ok(false);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
-        let selection = self.selection_for_path(&path, &value);
+        let value = self.control_value(node).unwrap_or_default();
+        let selection = self.selection_for(node, &value);
         self.set_text_selection(
-            path,
+            node,
             selection.start,
             selection.end,
             selection_direction(direction),
@@ -6695,15 +5919,15 @@ impl ScriptRuntime {
 
     fn set_text_selection(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         start: usize,
         end: usize,
         direction: SelectionDirection,
     ) -> Result<bool, ScriptError> {
-        if !self.is_selection_control_path(&path) {
+        if !self.is_selection_control(node) {
             return Ok(false);
         }
-        let value = self.control_value_path(&path).unwrap_or_default();
+        let value = self.control_value(node).unwrap_or_default();
         let length = utf16_len(&value);
         let start = start.min(length);
         let end = end.min(length);
@@ -6717,24 +5941,24 @@ impl ScriptRuntime {
             end,
             direction,
         };
-        let previous = self.text_selections.get(&path).copied().unwrap_or_default();
+        let previous = self.text_selections.get(&node).copied().unwrap_or_default();
         if previous == next {
             return Ok(false);
         }
-        self.text_selections.insert(path.clone(), next);
-        self.dispatch_event(path.clone(), "select")?;
-        self.dispatch_event(path, "selectionchange")?;
+        self.text_selections.insert(node, next);
+        self.dispatch_event(node, "select")?;
+        self.dispatch_event(node, "selectionchange")?;
         self.drain_microtasks()?;
         Ok(true)
     }
 
-    fn set_range_text(&mut self, path: &NodePath, arguments: &[Value]) -> Result<(), ScriptError> {
-        if !self.is_selection_control_path(path) {
+    fn set_range_text(&mut self, node: NodeId, arguments: &[Value]) -> Result<(), ScriptError> {
+        if !self.is_selection_control(node) {
             return Ok(());
         }
-        let value = self.control_value_path(path).unwrap_or_default();
+        let value = self.control_value(node).unwrap_or_default();
         let units = value.encode_utf16().collect::<Vec<_>>();
-        let current = self.selection_for_path(path, &value);
+        let current = self.selection_for(node, &value);
         let has_range = arguments.len() >= 3;
         let replacement = arguments
             .first()
@@ -6770,7 +5994,7 @@ impl ScriptRuntime {
         next_units.extend_from_slice(&replacement_units);
         next_units.extend_from_slice(&units[end..]);
         self.control_values
-            .insert(path.clone(), String::from_utf16_lossy(&next_units));
+            .insert(node, String::from_utf16_lossy(&next_units));
 
         let new_end = start.saturating_add(replacement_units.len());
         let (selection_start, selection_end) = match mode.as_str() {
@@ -6785,12 +6009,12 @@ impl ScriptRuntime {
             _ => unreachable!("setRangeText mode was validated above"),
         };
         self.set_text_selection(
-            path.clone(),
+            node,
             selection_start,
             selection_end,
             SelectionDirection::None,
         )?;
-        self.dispatch_event_with_details(path.clone(), "input", "", &replacement)?;
+        self.dispatch_event_with_details(node, "input", "", &replacement)?;
         self.drain_microtasks()?;
         Ok(())
     }
@@ -6802,13 +6026,11 @@ impl ScriptRuntime {
         let Some(Value::Element(handle)) = arguments.first().map(Value::resolve) else {
             return Err(runtime_error("Range boundary requires an Element"));
         };
-        let Some(path) = attached_path(&handle) else {
-            return Err(runtime_error("Range boundary requires an attached Element"));
-        };
+        let container = handle.id;
         let value = self
             .document
             .borrow()
-            .node_text_content(&path)
+            .node_text_content(container)
             .ok_or_else(|| runtime_error("Range boundary node no longer exists"))?;
         let offset = arguments
             .get(1)
@@ -6824,11 +6046,20 @@ impl ScriptRuntime {
     }
 
     fn range_boundary_position(&self, boundary: &RangeBoundary) -> Option<usize> {
-        let path = attached_path(&boundary.node)?;
+        let node = boundary.node.id;
         let document = self.document.borrow();
-        let content = document.node_text_content(&path)?;
-        let prefix = document.node_text_offset(&path)?;
+        let content = document.node_text_content(node)?;
+        let prefix = document.node_text_offset(node)?;
         Some(prefix.saturating_add(boundary.offset.min(utf16_len(&content))))
+    }
+
+    // a boundary container, which script sees only while it is in the document
+    fn range_container(&self, boundary: &RangeBoundary) -> Value {
+        if self.document.borrow().is_connected(boundary.node.id) {
+            Value::Element(boundary.node.clone())
+        } else {
+            Value::Null
+        }
     }
 
     fn range_is_collapsed(&self, range: &RangeData) -> bool {
@@ -6848,7 +6079,7 @@ impl ScriptRuntime {
         if start > end {
             return String::new();
         }
-        let value = self.document.borrow().text_content();
+        let value = self.document.borrow().document_text();
         utf16_substring(&value, start, end)
     }
 
@@ -6864,523 +6095,304 @@ impl ScriptRuntime {
         }
     }
 
-    fn adjust_ranges_for_remove(&mut self, parent: &[usize], child: &[usize]) -> bool {
-        let Some(parent_handle) = attached_handle(parent.to_vec(), &self.document) else {
-            return false;
-        };
-        let (parent_prefix, child_prefix, removed_length) = {
-            let document = self.document.borrow();
-            let Some(parent_prefix) = document.element_text_offset(parent) else {
-                return false;
-            };
-            let Some(child_prefix) = document.element_text_offset(child) else {
-                return false;
-            };
-            let removed_length = document
-                .element_text_content(child)
-                .map(|text| utf16_len(&text))
-                .unwrap_or_default();
-            (parent_prefix, child_prefix, removed_length)
-        };
-        let child_start = child_prefix.saturating_sub(parent_prefix);
-        let document = self.document.clone();
+    // applies a boundary update to every live range, reporting whether the selection moved
+    fn adjust_ranges(&mut self, adjust: impl Fn(&mut RangeBoundary, &Document)) -> bool {
         let selected = self.selection.borrow().range.clone();
+        let document = self.document.borrow();
+        self.ranges.retain(|weak| weak.strong_count() != 0);
         let mut selection_changed = false;
-        let mut active = Vec::with_capacity(self.ranges.len());
-        for weak in self.ranges.drain(..) {
-            let Some(range) = weak.upgrade() else {
-                continue;
-            };
-            let changed = {
-                let mut range_data = range.borrow_mut();
-                let previous = range_data.clone();
-                adjust_range_boundary_for_remove(
-                    &mut range_data.start,
-                    parent,
-                    child,
-                    child_start,
-                    removed_length,
-                    &parent_handle,
-                    &document,
-                );
-                adjust_range_boundary_for_remove(
-                    &mut range_data.end,
-                    parent,
-                    child,
-                    child_start,
-                    removed_length,
-                    &parent_handle,
-                    &document,
-                );
-                *range_data != previous
-            };
-            if changed
+        for range in self.ranges.iter().filter_map(Weak::upgrade) {
+            let mut range_data = range.borrow_mut();
+            let previous = range_data.clone();
+            adjust(&mut range_data.start, &document);
+            adjust(&mut range_data.end, &document);
+            if *range_data != previous
                 && selected
                     .as_ref()
                     .is_some_and(|current| Rc::ptr_eq(current, &range))
             {
                 selection_changed = true;
             }
-            active.push(Rc::downgrade(&range));
         }
-        self.ranges = active;
         selection_changed
     }
 
-    fn adjust_ranges_for_replacement(&mut self, target: &[usize], new_length: usize) -> bool {
-        let Some(target_handle) = attached_handle(target.to_vec(), &self.document) else {
-            return false;
+    fn adjust_ranges_for_remove(&mut self, parent: NodeId, child: NodeId) -> bool {
+        let (child_start, removed_length) = {
+            let document = self.document.borrow();
+            let Some(parent_prefix) = document.node_text_offset(parent) else {
+                return false;
+            };
+            let Some(child_prefix) = document.node_text_offset(child) else {
+                return false;
+            };
+            (
+                child_prefix.saturating_sub(parent_prefix),
+                utf16_len(&document.text_content(child)),
+            )
         };
+        let parent_handle = self.node_handle(parent);
+        self.adjust_ranges(|boundary, document| {
+            adjust_range_boundary_for_remove(
+                boundary,
+                child,
+                child_start,
+                removed_length,
+                &parent_handle,
+                document,
+            )
+        })
+    }
+
+    fn adjust_ranges_for_replacement(&mut self, target: NodeId, new_length: usize) -> bool {
         let (target_start, old_length) = {
             let document = self.document.borrow();
             let Some(target_start) = document.node_text_offset(target) else {
                 return false;
             };
-            let Some(old_length) = document
-                .node_text_content(target)
-                .map(|text| utf16_len(&text))
-            else {
-                return false;
-            };
-            (target_start, old_length)
+            (target_start, utf16_len(&document.text_content(target)))
         };
-        let document = self.document.clone();
-        let selected = self.selection.borrow().range.clone();
-        let mut selection_changed = false;
-        let mut active = Vec::with_capacity(self.ranges.len());
-        for weak in self.ranges.drain(..) {
-            let Some(range) = weak.upgrade() else {
-                continue;
-            };
-            let changed = {
-                let mut range_data = range.borrow_mut();
-                let previous = range_data.clone();
-                adjust_range_boundary_for_replacement(
-                    &mut range_data.start,
-                    target,
-                    target_start,
-                    old_length,
-                    new_length,
-                    &target_handle,
-                    &document,
-                );
-                adjust_range_boundary_for_replacement(
-                    &mut range_data.end,
-                    target,
-                    target_start,
-                    old_length,
-                    new_length,
-                    &target_handle,
-                    &document,
-                );
-                *range_data != previous
-            };
-            if changed
-                && selected
-                    .as_ref()
-                    .is_some_and(|current| Rc::ptr_eq(current, &range))
-            {
-                selection_changed = true;
-            }
-            active.push(Rc::downgrade(&range));
-        }
-        self.ranges = active;
-        selection_changed
+        let target_handle = self.node_handle(target);
+        self.adjust_ranges(|boundary, document| {
+            adjust_range_boundary_for_replacement(
+                boundary,
+                target,
+                target_start,
+                old_length,
+                new_length,
+                &target_handle,
+                document,
+            )
+        })
     }
 
     fn adjust_ranges_for_character_data_edit(
         &mut self,
-        target: &[usize],
+        target: NodeId,
         replacement_start: usize,
         old_length: usize,
         new_length: usize,
     ) -> bool {
-        if attached_handle(target.to_vec(), &self.document).is_none() {
-            return false;
-        }
         let Some(target_start) = self.document.borrow().node_text_offset(target) else {
             return false;
         };
-        let document = self.document.clone();
-        let selected = self.selection.borrow().range.clone();
-        let mut selection_changed = false;
-        let mut active = Vec::with_capacity(self.ranges.len());
-        for weak in self.ranges.drain(..) {
-            let Some(range) = weak.upgrade() else {
-                continue;
-            };
-            let changed = {
-                let mut range_data = range.borrow_mut();
-                let previous = range_data.clone();
-                adjust_range_boundary_for_character_data_edit(
-                    &mut range_data.start,
-                    target,
-                    target_start,
-                    replacement_start,
-                    old_length,
-                    new_length,
-                    &document,
-                );
-                adjust_range_boundary_for_character_data_edit(
-                    &mut range_data.end,
-                    target,
-                    target_start,
-                    replacement_start,
-                    old_length,
-                    new_length,
-                    &document,
-                );
-                *range_data != previous
-            };
-            if changed
-                && selected
-                    .as_ref()
-                    .is_some_and(|current| Rc::ptr_eq(current, &range))
-            {
-                selection_changed = true;
-            }
-            active.push(Rc::downgrade(&range));
-        }
-        self.ranges = active;
-        selection_changed
+        self.adjust_ranges(|boundary, document| {
+            adjust_range_boundary_for_character_data_edit(
+                boundary,
+                target,
+                target_start,
+                replacement_start,
+                old_length,
+                new_length,
+                document,
+            )
+        })
     }
 
     fn adjust_ranges_for_split_text(
         &mut self,
-        target: &[usize],
+        target: NodeId,
         offset: usize,
         right: &ElementHandle,
     ) -> bool {
-        let selected = self.selection.borrow().range.clone();
-        let mut selection_changed = false;
-        let mut active = Vec::with_capacity(self.ranges.len());
-        for weak in self.ranges.drain(..) {
-            let Some(range) = weak.upgrade() else {
-                continue;
-            };
-            let changed = {
-                let mut range_data = range.borrow_mut();
-                let previous = range_data.clone();
-                adjust_range_boundary_for_split_text(&mut range_data.start, target, offset, right);
-                adjust_range_boundary_for_split_text(&mut range_data.end, target, offset, right);
-                *range_data != previous
-            };
-            if changed
-                && selected
-                    .as_ref()
-                    .is_some_and(|current| Rc::ptr_eq(current, &range))
-            {
-                selection_changed = true;
-            }
-            active.push(Rc::downgrade(&range));
-        }
-        self.ranges = active;
-        selection_changed
+        self.adjust_ranges(|boundary, _| {
+            adjust_range_boundary_for_split_text(boundary, target, offset, right)
+        })
     }
 
-    fn adjust_ranges_for_normalize_change(
-        &mut self,
-        change: &NormalizeChange,
-        parent: Option<&ElementHandle>,
-        first: Option<&ElementHandle>,
-    ) -> bool {
-        let selected = self.selection.borrow().range.clone();
-        let mut selection_changed = false;
-        let mut active = Vec::with_capacity(self.ranges.len());
-        for weak in self.ranges.drain(..) {
-            let Some(range) = weak.upgrade() else {
-                continue;
-            };
-            let changed = {
-                let mut range_data = range.borrow_mut();
-                let previous = range_data.clone();
-                match change {
-                    NormalizeChange::RemoveEmpty {
-                        child_id,
-                        parent_offset,
-                        ..
-                    } => {
-                        let parent = parent.expect("normalize removal parent handle");
-                        adjust_range_boundary_for_normalize_empty(
-                            &mut range_data.start,
-                            *child_id,
-                            parent,
-                            *parent_offset,
-                        );
-                        adjust_range_boundary_for_normalize_empty(
-                            &mut range_data.end,
-                            *child_id,
-                            parent,
-                            *parent_offset,
-                        );
-                    }
-                    NormalizeChange::MergeText {
-                        child_id,
-                        first_length,
-                        ..
-                    } => {
-                        let first = first.expect("normalize merge first handle");
-                        adjust_range_boundary_for_normalize_merge(
-                            &mut range_data.start,
-                            *child_id,
-                            first,
-                            *first_length,
-                        );
-                        adjust_range_boundary_for_normalize_merge(
-                            &mut range_data.end,
-                            *child_id,
-                            first,
-                            *first_length,
-                        );
-                    }
-                }
-                *range_data != previous
-            };
-            if changed
-                && selected
-                    .as_ref()
-                    .is_some_and(|current| Rc::ptr_eq(current, &range))
-            {
-                selection_changed = true;
+    // moves live range boundaries off a text node that normalize removes
+    fn retarget_ranges(&mut self, from: NodeId, to: &ElementHandle, base: usize) -> bool {
+        self.adjust_ranges(|boundary, _| {
+            if boundary.node.id == from {
+                boundary.node = to.clone();
+                boundary.offset = base.saturating_add(boundary.offset);
             }
-            active.push(Rc::downgrade(&range));
-        }
-        self.ranges = active;
-        selection_changed
+        })
     }
 
+    // drops empty text nodes and merges adjacent ones below a node, keeping live ranges on
+    // the text they covered
     fn normalize_element_handle(&mut self, handle: &ElementHandle) -> Result<(), ScriptError> {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Detached(mut element) => {
-                if is_detached_text_element(&element) {
-                    return Ok(());
+        let texts = {
+            let document = self.document.borrow();
+            document
+                .descendants(handle.id)
+                .filter(|&node| document.is_text(node))
+                .collect::<Vec<_>>()
+        };
+        let mut selection_changed = false;
+        for text in texts {
+            let (data, parent) = {
+                let document = self.document.borrow();
+                match (document.text(text), document.parent(text)) {
+                    (Some(data), Some(parent)) => (data.to_string(), parent),
+                    _ => continue,
                 }
-                element.normalize();
-                *handle.borrow_mut() = ElementLocation::Detached(element);
-                Ok(())
-            }
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return Ok(());
+            };
+            if data.is_empty() {
+                let base = {
+                    let document = self.document.borrow();
+                    document
+                        .node_text_offset(text)
+                        .zip(document.node_text_offset(parent))
+                        .map_or(0, |(child, parent)| child.saturating_sub(parent))
                 };
-                if attached_is_text(handle) {
-                    return Ok(());
-                }
-                loop {
-                    let Some(change) = self.document.borrow().next_normalize_change(&path) else {
-                        break;
-                    };
-                    let (parent, child, child_index) = match &change {
-                        NormalizeChange::RemoveEmpty { parent, child, .. }
-                        | NormalizeChange::MergeText { parent, child, .. } => {
-                            let child_index =
-                                *child.last().expect("normalize child path is non-empty");
-                            (parent.clone(), child.clone(), child_index)
-                        }
-                    };
-                    self.clear_runtime_state_for_removed_subtree(&child);
-                    let parent_handle = match &change {
-                        NormalizeChange::RemoveEmpty { .. } => Some(
-                            attached_handle(parent.clone(), &self.document)
-                                .ok_or_else(|| runtime_error("normalize parent is detached"))?,
-                        ),
-                        NormalizeChange::MergeText { .. } => None,
-                    };
-                    let first_handle = match &change {
-                        NormalizeChange::MergeText { first, .. } => Some(
-                            attached_handle(first.clone(), &self.document)
-                                .ok_or_else(|| runtime_error("normalize first text is detached"))?,
-                        ),
-                        NormalizeChange::RemoveEmpty { .. } => None,
-                    };
-                    if !self.document.borrow_mut().apply_normalize_change(&change) {
-                        return Err(runtime_error("normalize change became stale"));
-                    }
-                    self.shift_runtime_paths_for_remove(&parent, child_index);
-                    let selection_changed = self.adjust_ranges_for_normalize_change(
-                        &change,
-                        parent_handle.as_ref(),
-                        first_handle.as_ref(),
-                    );
-                    if selection_changed {
-                        self.dispatch_document_selection_change()?;
-                    }
-                }
-                Ok(())
+                let parent_handle = self.node_handle(parent);
+                selection_changed |= self.retarget_ranges(text, &parent_handle, base);
+                self.document.borrow_mut().remove(text);
+                continue;
+            }
+            let mut merged = data;
+            loop {
+                let next = {
+                    let document = self.document.borrow();
+                    document
+                        .sibling(text, true)
+                        .filter(|&sibling| document.is_text(sibling))
+                };
+                let Some(next) = next else {
+                    break;
+                };
+                let addition = self
+                    .document
+                    .borrow()
+                    .text(next)
+                    .unwrap_or_default()
+                    .to_string();
+                let base = utf16_len(&merged);
+                merged.push_str(&addition);
+                self.document
+                    .borrow_mut()
+                    .set_character_data(text, merged.clone());
+                let first = self.node_handle(text);
+                selection_changed |= self.retarget_ranges(next, &first, base);
+                self.document.borrow_mut().remove(next);
             }
         }
+        if selection_changed {
+            self.dispatch_document_selection_change()?;
+        }
+        Ok(())
     }
 
     fn element_files(&self, handle: &ElementHandle) -> Value {
-        let Some(path) = attached_path(handle) else {
-            return Value::Null;
-        };
-        let is_file = self
-            .document
-            .borrow()
-            .element_at(&path)
-            .is_some_and(|element| {
-                element.name == "input"
-                    && element
-                        .attr("type")
-                        .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
-            });
+        let node = handle.id;
+        let is_file = self.document.borrow().element(node).is_some_and(|element| {
+            element.name == "input"
+                && element
+                    .attr("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("file"))
+        });
         if !is_file {
             return Value::Null;
         }
         let mut file_lists = self.file_lists.borrow_mut();
         let files = file_lists
-            .entry(path.clone())
-            .or_insert_with(|| Rc::new(self.selected_files.get(&path).cloned().unwrap_or_default()))
+            .entry(node)
+            .or_insert_with(|| Rc::new(self.selected_files.get(&node).cloned().unwrap_or_default()))
             .clone();
         Value::FileList(files)
     }
 
     fn element_checked(&self, handle: &ElementHandle) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                attached_path(handle).is_some_and(|path| self.control_checked_path(&path))
-            }
-            ElementLocation::Detached(element) => element.attr("checked").is_some(),
-        }
+        self.is_control_checked(handle.id)
     }
 
     fn set_element_value(&mut self, handle: &ElementHandle, value: String) -> bool {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                let Some((name, is_file)) = self.with_element(&path, |element| {
-                    let is_file = element.name == "input"
-                        && element
-                            .attr("type")
-                            .is_some_and(|kind| kind.eq_ignore_ascii_case("file"));
-                    (element.name.clone(), is_file)
-                }) else {
-                    return false;
-                };
-                if name == "select" {
-                    return self.set_select_value(&path, &value);
-                }
-                if name == "option" {
-                    return self
-                        .document
-                        .borrow_mut()
-                        .set_element_attribute(&path, "value", value);
-                }
-                if is_file {
-                    if !value.is_empty() {
-                        return false;
-                    }
-                    self.selected_files.remove(&path);
-                    self.file_lists
-                        .borrow_mut()
-                        .insert(path.clone(), Rc::new(Vec::new()));
-                }
-                let value_length = utf16_len(&value);
-                self.control_values.insert(path.clone(), value);
-                self.dirty_controls.insert(path.clone());
-                self.last_user_edit.remove(&path);
-                if self.is_selection_control_path(&path)
-                    && let Some(selection) = self.text_selections.get_mut(&path)
-                {
-                    selection.start = selection.start.min(value_length);
-                    selection.end = selection.end.min(value_length).max(selection.start);
-                }
-                true
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                element.attrs.insert("value".to_string(), value);
-                true
-            }
+        let node = handle.id;
+        let Some((name, is_file)) = self.with_element(node, |element| {
+            let is_file = element.name == "input"
+                && element
+                    .attr("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("file"));
+            (element.name.clone(), is_file)
+        }) else {
+            return false;
+        };
+        if name == "select" {
+            return self.set_select_value(node, &value);
         }
+        if name == "option" {
+            return self
+                .document
+                .borrow_mut()
+                .set_attribute(node, "value", value);
+        }
+        if is_file {
+            if !value.is_empty() {
+                return false;
+            }
+            self.selected_files.remove(&node);
+            self.file_lists
+                .borrow_mut()
+                .insert(node, Rc::new(Vec::new()));
+        }
+        let value_length = utf16_len(&value);
+        self.control_values.insert(node, value);
+        self.dirty_controls.insert(node);
+        self.last_user_edit.remove(&node);
+        if self.is_selection_control(node)
+            && let Some(selection) = self.text_selections.get_mut(&node)
+        {
+            selection.start = selection.start.min(value_length);
+            selection.end = selection.end.min(value_length).max(selection.start);
+        }
+        true
     }
 
     fn element_attribute(&self, handle: &ElementHandle, name: &str) -> Option<String> {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_attribute(&path, name)),
-            ElementLocation::Detached(element) => element.attr(name).map(str::to_string),
-        }
-    }
-
-    fn element_inner_html(&self, handle: &ElementHandle) -> Option<String> {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_inner_html(&path)),
-            ElementLocation::Detached(element) => Some(element.inner_html()),
-        }
-    }
-
-    fn element_outer_html(&self, handle: &ElementHandle) -> Option<String> {
-        if attached_is_text(handle) {
-            return None;
-        }
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().element_outer_html(&path)),
-            ElementLocation::Detached(element) => Some(element.outer_html()),
-        }
+        let node = handle.id;
+        self.document
+            .borrow()
+            .attribute(node, name)
+            .map(str::to_string)
     }
 
     fn element_style_property(&self, handle: &ElementHandle, property: &str) -> Option<String> {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => attached_path(handle)
-                .and_then(|path| self.document.borrow().style_property(&path, property)),
-            ElementLocation::Detached(element) => element.style_property(property),
-        }
+        self.document.borrow().style_property(handle.id, property)
     }
 
     fn replace_element_text_content_at(
         &mut self,
-        path: &NodePath,
+        node: NodeId,
         text: String,
     ) -> Result<bool, ScriptError> {
-        if self.document.borrow().element_at(path).is_none() {
+        if self.document.borrow().element(node).is_none() {
             return Ok(false);
         }
-        let selection_changed = self.adjust_ranges_for_replacement(path, utf16_len(&text));
-        let changed = self
-            .document
-            .borrow_mut()
-            .set_element_text_content(path, text);
-        if changed && selection_changed {
+        let selection_changed = self.adjust_ranges_for_replacement(node, utf16_len(&text));
+        let text = (!text.is_empty()).then(|| self.document.borrow_mut().create_text(text));
+        self.replace_children_quietly(node, text);
+        if selection_changed {
             self.dispatch_document_selection_change()?;
         }
-        Ok(changed)
+        Ok(true)
     }
 
     fn replace_text_node_data_at(
         &mut self,
-        path: &NodePath,
+        node: NodeId,
         text: String,
     ) -> Result<bool, ScriptError> {
         let old_length = self
             .document
             .borrow()
-            .node_text_content(path)
+            .node_text_content(node)
             .map(|text| utf16_len(&text));
         let Some(old_length) = old_length else {
             return Ok(false);
         };
-        self.replace_text_node_data_range(path, 0, old_length, &text)
+        self.replace_text_node_data_range(node, 0, old_length, &text)
     }
 
     fn replace_text_node_data_range(
         &mut self,
-        path: &NodePath,
+        node: NodeId,
         start: usize,
         end: usize,
         replacement: &str,
     ) -> Result<bool, ScriptError> {
-        let Some(current) = self.document.borrow().node_text_content(path) else {
+        let Some(current) = self.document.borrow().node_text_content(node) else {
             return Ok(false);
         };
         let length = utf16_len(&current);
@@ -7388,12 +6400,12 @@ impl ScriptRuntime {
         let end = end.min(length).max(start);
         let (updated, _) = replace_utf16_range(&current, start, end, replacement);
         let selection_changed = self.adjust_ranges_for_character_data_edit(
-            path,
+            node,
             start,
             end.saturating_sub(start),
             utf16_len(replacement),
         );
-        let changed = self.document.borrow_mut().set_text_node_data(path, updated);
+        let changed = self.document.borrow_mut().set_character_data(node, updated);
         if changed && selection_changed {
             self.dispatch_document_selection_change()?;
         }
@@ -7405,40 +6417,18 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         text: String,
     ) -> Result<bool, ScriptError> {
-        if !attached_is_text(handle) {
+        if self.document.borrow().character_data(handle.id).is_none() {
             return Ok(false);
         }
-        if attached_path(handle).is_none() {
-            let mut location = handle.borrow_mut();
-            let ElementLocation::Detached(element) = &mut *location else {
-                return Ok(false);
-            };
-            let Some(current) = detached_text_data_mut(element) else {
-                return Ok(false);
-            };
-            *current = text;
-            return Ok(true);
-        }
-        let path = attached_path(handle).expect("attached text path was checked");
-        self.replace_text_node_data_at(&path, text)
+        self.replace_text_node_data_at(handle.id, text)
     }
 
     fn text_node_data(&self, handle: &ElementHandle) -> Result<String, ScriptError> {
-        if !attached_is_text(handle) {
-            return Err(runtime_error("CharacterData method requires a text node"));
-        }
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                let path = attached_path(handle)
-                    .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
-                self.document
-                    .borrow()
-                    .node_text_content(&path)
-                    .ok_or_else(|| runtime_error("text node is no longer in the document"))
-            }
-            ElementLocation::Detached(element) => detached_text_data(&element)
-                .ok_or_else(|| runtime_error("text node is no longer in the document")),
-        }
+        self.document
+            .borrow()
+            .character_data(handle.id)
+            .map(str::to_string)
+            .ok_or_else(|| runtime_error("CharacterData method requires a text node"))
     }
 
     fn replace_text_node_data_for_handle(
@@ -7448,28 +6438,10 @@ impl ScriptRuntime {
         end: usize,
         replacement: &str,
     ) -> Result<bool, ScriptError> {
-        if !attached_is_text(handle) {
+        if self.document.borrow().character_data(handle.id).is_none() {
             return Ok(false);
         }
-        if let Some(path) = attached_path(handle) {
-            return self.replace_text_node_data_range(&path, start, end, replacement);
-        }
-        let mut location = handle.borrow_mut();
-        let ElementLocation::Detached(element) = &mut *location else {
-            return Ok(false);
-        };
-        let Some(current) = detached_text_data(element) else {
-            return Ok(false);
-        };
-        let length = utf16_len(&current);
-        let start = start.min(length);
-        let end = end.min(length).max(start);
-        let (updated, _) = replace_utf16_range(&current, start, end, replacement);
-        let Some(data) = detached_text_data_mut(element) else {
-            return Ok(false);
-        };
-        *data = updated;
-        Ok(true)
+        self.replace_text_node_data_range(handle.id, start, end, replacement)
     }
 
     fn character_data_offset(
@@ -7503,76 +6475,36 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         text: String,
     ) -> Result<bool, ScriptError> {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return Ok(false);
-                };
-                self.replace_element_text_content_at(&path, text)
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return Ok(false);
-                };
-                element.children = vec![Node::Text(text)];
-                Ok(true)
-            }
-        }
+        self.replace_element_text_content_at(handle.id, text)
     }
 
     fn set_element_attribute(&mut self, handle: &ElementHandle, name: &str, value: String) -> bool {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                let changed = self
-                    .document
-                    .borrow_mut()
-                    .set_element_attribute(&path, name, value);
-                if changed
-                    && name.eq_ignore_ascii_case("checked")
-                    && !self.dirty_checked_controls.contains(&path)
-                {
-                    self.control_checked.insert(path.clone(), true);
-                }
-                if changed
-                    && name.eq_ignore_ascii_case("value")
-                    && !self.dirty_controls.contains(&path)
-                {
-                    self.control_values.remove(&path);
-                    self.text_selections.remove(&path);
-                }
-                if changed
-                    && name.eq_ignore_ascii_case("selected")
-                    && !self.dirty_options.contains(&path)
-                {
-                    self.set_option_selected_state(&path, true, false);
-                }
-                if changed
-                    && name.eq_ignore_ascii_case("multiple")
-                    && self
-                        .document
-                        .borrow()
-                        .element_at(&path)
-                        .is_some_and(|element| element.name == "select")
-                {
-                    self.normalize_select_selection(&path, false);
-                }
-                changed
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                element.attrs.insert(name.to_ascii_lowercase(), value);
-                true
-            }
+        let node = handle.id;
+        let changed = self.document.borrow_mut().set_attribute(node, name, value);
+        if changed
+            && name.eq_ignore_ascii_case("checked")
+            && !self.dirty_checked_controls.contains(&node)
+        {
+            self.control_checked.insert(node, true);
         }
+        if changed && name.eq_ignore_ascii_case("value") && !self.dirty_controls.contains(&node) {
+            self.control_values.remove(&node);
+            self.text_selections.remove(&node);
+        }
+        if changed && name.eq_ignore_ascii_case("selected") && !self.dirty_options.contains(&node) {
+            self.set_option_selected_state(node, true, false);
+        }
+        if changed
+            && name.eq_ignore_ascii_case("multiple")
+            && self
+                .document
+                .borrow()
+                .element(node)
+                .is_some_and(|element| element.name == "select")
+        {
+            self.normalize_select_selection(node, false);
+        }
+        changed
     }
 
     fn set_element_inner_html(
@@ -7580,51 +6512,41 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         source: String,
     ) -> Result<bool, ScriptError> {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return Err(runtime_error("element handle is no longer in the document"));
-                };
-                if self.document.borrow().element_at(&path).is_none() {
-                    return Ok(false);
-                }
-                let replacement =
-                    Document::parse(&source).map_err(|error| runtime_error(error.to_string()))?;
-                let replacement_length = utf16_len(&replacement.text_content());
-                let selection_changed =
-                    self.adjust_ranges_for_replacement(&path, replacement_length);
-                let changed = self
-                    .document
-                    .borrow_mut()
-                    .set_element_inner_html(&path, &source)
-                    .map_err(|error| runtime_error(error.to_string()))?;
-                if changed {
-                    self.refresh_select_state_after_inner_html(&path);
-                    if selection_changed {
-                        self.dispatch_document_selection_change()?;
-                    }
-                }
-                Ok(changed)
-            }
-            ElementLocation::Detached(_) => {
-                let changed = {
-                    let mut location = handle.borrow_mut();
-                    let ElementLocation::Detached(element) = &mut *location else {
-                        return Err(runtime_error(
-                            "element handle changed during innerHTML update",
-                        ));
-                    };
-                    element
-                        .set_inner_html(&source)
-                        .map(|()| true)
-                        .map_err(|error| runtime_error(error.to_string()))?
-                };
-                if changed {
-                    self.discard_detached_descendant_listeners(handle);
-                }
-                Ok(changed)
-            }
+        let node = handle.id;
+        if self.document.borrow().element(node).is_none() {
+            return Ok(false);
+        }
+        let fragment = self
+            .document
+            .borrow_mut()
+            .parse_fragment(&source)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let replacement_length = utf16_len(&self.document.borrow().text_content(fragment));
+        let selection_changed = self.adjust_ranges_for_replacement(node, replacement_length);
+        let target = self
+            .document
+            .borrow_mut()
+            .ensure_template_content(node)
+            .unwrap_or(node);
+        self.replace_children_quietly(target, Some(fragment));
+        self.refresh_select_state_after_inner_html(node);
+        if selection_changed {
+            self.dispatch_document_selection_change()?;
+        }
+        Ok(true)
+    }
+
+    // swaps every child of a node for one node or fragment, the way innerHTML and
+    // textContent replace content without firing removal steps for each child
+    fn replace_children_quietly(&mut self, parent: NodeId, replacement: Option<NodeId>) {
+        let mut document = self.document.borrow_mut();
+        for child in document.children(parent).to_vec() {
+            document.remove(child);
+        }
+        if let Some(replacement) = replacement {
+            document
+                .append_child(parent, replacement)
+                .expect("a new node always fits under an element");
         }
     }
 
@@ -7633,30 +6555,25 @@ impl ScriptRuntime {
         handle: &ElementHandle,
         source: String,
     ) -> Result<bool, ScriptError> {
-        if attached_is_text(handle) {
-            return Ok(false);
-        }
-        let path = attached_path(handle)
-            .ok_or_else(|| runtime_error("outerHTML element has no parent node"))?;
+        let target = handle.id;
         let parent = self
             .document
             .borrow()
-            .parent_path(&path)
+            .parent(target)
             .ok_or_else(|| runtime_error("outerHTML element has no parent node"))?;
-        if parent.is_empty() {
-            return Err(runtime_error(
+        if parent == self.document_node() {
+            return Err(self.throw_value(dom_exception(
+                "NoModificationAllowedError",
                 "outerHTML cannot replace a direct child of the document",
-            ));
+            )));
         }
-        let fragment =
-            Document::parse(&source).map_err(|error| runtime_error(error.to_string()))?;
-        for node in fragment.root.children {
-            let child = detached_handle_from_node(node);
-            let reference = attached_path(handle)
-                .ok_or_else(|| runtime_error("outerHTML element is no longer in the document"))?;
-            self.insert_detached_before(&parent, &child, Some(&reference))?;
-        }
-        self.detach_child(&parent, handle)?;
+        let fragment = self
+            .document
+            .borrow_mut()
+            .parse_fragment(&source)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        self.insert_node(parent, fragment, Some(target))?;
+        self.remove_node(target)?;
         Ok(true)
     }
 
@@ -7666,21 +6583,9 @@ impl ScriptRuntime {
         property: &str,
         value: String,
     ) -> bool {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => attached_path(handle).is_some_and(|path| {
-                self.document
-                    .borrow_mut()
-                    .set_style_property(&path, property, value)
-            }),
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                element.set_style_property(property, value)
-            }
-        }
+        self.document
+            .borrow_mut()
+            .set_style_property(handle.id, property, value)
     }
 
     // calls a function value with an undefined this, as host callbacks are invoked
@@ -7719,199 +6624,94 @@ impl ScriptRuntime {
     }
 
     fn set_element_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                let is_radio = self
-                    .document
-                    .borrow()
-                    .element_at(&path)
-                    .is_some_and(|element| {
-                        element.name == "input"
-                            && element
-                                .attr("type")
-                                .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
-                    });
-                if checked
-                    && is_radio
-                    && let Some(group) = self.document.borrow().radio_group_paths(&path)
-                {
-                    for candidate in group {
-                        if candidate != path && self.control_checked_path(&candidate) {
-                            self.control_checked.insert(candidate.clone(), false);
-                            self.dirty_checked_controls.insert(candidate);
-                        }
-                    }
+        let node = handle.id;
+        let is_radio = self.document.borrow().element(node).is_some_and(|element| {
+            element.name == "input"
+                && element
+                    .attr("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
+        });
+        if checked
+            && is_radio
+            && let Some(group) = self.document.borrow().radio_group(node)
+        {
+            for candidate in group {
+                if candidate != node && self.is_control_checked(candidate) {
+                    self.control_checked.insert(candidate, false);
+                    self.dirty_checked_controls.insert(candidate);
                 }
-                self.control_checked.insert(path.clone(), checked);
-                self.dirty_checked_controls.insert(path);
-                true
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                if checked {
-                    element.attrs.insert("checked".to_string(), String::new());
-                } else {
-                    element.attrs.remove("checked");
-                }
-                true
             }
         }
+        self.control_checked.insert(node, checked);
+        self.dirty_checked_controls.insert(node);
+        true
     }
 
     fn set_element_disabled(&mut self, handle: &ElementHandle, disabled: bool) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                if disabled {
-                    self.document.borrow_mut().set_element_attribute(
-                        &path,
-                        "disabled",
-                        String::new(),
-                    )
-                } else {
-                    self.document
-                        .borrow_mut()
-                        .remove_element_attribute(&path, "disabled")
-                }
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                if disabled {
-                    element.attrs.insert("disabled".to_string(), String::new());
-                } else {
-                    element.attrs.remove("disabled");
-                }
-                true
-            }
+        let node = handle.id;
+        if disabled {
+            self.document
+                .borrow_mut()
+                .set_attribute(node, "disabled", String::new())
+        } else {
+            self.document
+                .borrow_mut()
+                .remove_attribute(node, "disabled")
         }
     }
 
     fn set_element_readonly(&mut self, handle: &ElementHandle, readonly: bool) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                if readonly {
-                    self.document.borrow_mut().set_element_attribute(
-                        &path,
-                        "readonly",
-                        String::new(),
-                    )
-                } else {
-                    self.document
-                        .borrow_mut()
-                        .remove_element_attribute(&path, "readonly")
-                }
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                if readonly {
-                    element.attrs.insert("readonly".to_string(), String::new());
-                } else {
-                    element.attrs.remove("readonly");
-                }
-                true
-            }
+        let node = handle.id;
+        if readonly {
+            self.document
+                .borrow_mut()
+                .set_attribute(node, "readonly", String::new())
+        } else {
+            self.document
+                .borrow_mut()
+                .remove_attribute(node, "readonly")
         }
     }
 
     fn remove_element_attribute(&mut self, handle: &ElementHandle, name: &str) -> bool {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                let changed = self
-                    .document
-                    .borrow_mut()
-                    .remove_element_attribute(&path, name);
-                if changed
-                    && name.eq_ignore_ascii_case("checked")
-                    && !self.dirty_checked_controls.contains(&path)
-                {
-                    self.control_checked.insert(path.clone(), false);
-                }
-                if changed
-                    && name.eq_ignore_ascii_case("value")
-                    && !self.dirty_controls.contains(&path)
-                {
-                    self.control_values.remove(&path);
-                    self.text_selections.remove(&path);
-                }
-                if changed
-                    && name.eq_ignore_ascii_case("selected")
-                    && !self.dirty_options.contains(&path)
-                {
-                    self.set_option_selected_state(&path, false, false);
-                }
-                if changed
-                    && name.eq_ignore_ascii_case("multiple")
-                    && self
-                        .document
-                        .borrow()
-                        .element_at(&path)
-                        .is_some_and(|element| element.name == "select")
-                {
-                    self.normalize_select_selection(&path, false);
-                }
-                changed
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                element.attrs.remove(&name.to_ascii_lowercase()).is_some()
-            }
+        let node = handle.id;
+        let changed = self.document.borrow_mut().remove_attribute(node, name);
+        if changed
+            && name.eq_ignore_ascii_case("checked")
+            && !self.dirty_checked_controls.contains(&node)
+        {
+            self.control_checked.insert(node, false);
         }
+        if changed && name.eq_ignore_ascii_case("value") && !self.dirty_controls.contains(&node) {
+            self.control_values.remove(&node);
+            self.text_selections.remove(&node);
+        }
+        if changed && name.eq_ignore_ascii_case("selected") && !self.dirty_options.contains(&node) {
+            self.set_option_selected_state(node, false, false);
+        }
+        if changed
+            && name.eq_ignore_ascii_case("multiple")
+            && self
+                .document
+                .borrow()
+                .element(node)
+                .is_some_and(|element| element.name == "select")
+        {
+            self.normalize_select_selection(node, false);
+        }
+        changed
     }
 
     fn set_element_required(&mut self, handle: &ElementHandle, required: bool) -> bool {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => {
-                let Some(path) = attached_path(handle) else {
-                    return false;
-                };
-                if required {
-                    self.document.borrow_mut().set_element_attribute(
-                        &path,
-                        "required",
-                        String::new(),
-                    )
-                } else {
-                    self.document
-                        .borrow_mut()
-                        .remove_element_attribute(&path, "required")
-                }
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return false;
-                };
-                if required {
-                    element.attrs.insert("required".to_string(), String::new());
-                } else {
-                    element.attrs.remove("required");
-                }
-                true
-            }
+        let node = handle.id;
+        if required {
+            self.document
+                .borrow_mut()
+                .set_attribute(node, "required", String::new())
+        } else {
+            self.document
+                .borrow_mut()
+                .remove_attribute(node, "required")
         }
     }
 
@@ -7930,13 +6730,13 @@ impl ScriptRuntime {
         Ok(self.set_element_attribute(handle, name, value.to_string()))
     }
 
-    fn control_checked_path(&self, path: &[usize]) -> bool {
-        if let Some(checked) = self.control_checked.get(path) {
+    fn is_control_checked(&self, node: NodeId) -> bool {
+        if let Some(checked) = self.control_checked.get(&node) {
             return *checked;
         }
         self.document
             .borrow()
-            .element_at(path)
+            .element(node)
             .is_some_and(|element| element.attr("checked").is_some())
     }
 
@@ -7982,23 +6782,22 @@ impl ScriptRuntime {
                 "FormData constructor requires a form element",
             ));
         };
-        let path = attached_path(handle)
-            .ok_or_else(|| runtime_error("FormData constructor requires an attached form"))?;
-        let paths = self
+        let node = handle.id;
+        let controls = self
             .document
             .borrow()
-            .form_control_paths(&path)
+            .form_controls(node)
             .ok_or_else(|| runtime_error("FormData constructor requires a form element"))?;
         let mut pairs = Vec::new();
-        for path in paths {
+        for node in controls {
             let document = self.document.borrow();
             let element = document
-                .element_at(&path)
+                .element(node)
                 .ok_or_else(|| runtime_error("form control is no longer in the document"))?;
             let Some(name) = element.attr("name").filter(|name| !name.is_empty()) else {
                 continue;
             };
-            if self.is_disabled_path(&path) {
+            if self.is_disabled(node) {
                 continue;
             }
             let input_type = element
@@ -8007,7 +6806,7 @@ impl ScriptRuntime {
                 .unwrap_or_default();
             if matches!(input_type.as_str(), "button" | "file" | "reset" | "submit") {
                 if input_type == "file" {
-                    let files = self.selected_files.get(&path).cloned().unwrap_or_default();
+                    let files = self.selected_files.get(&node).cloned().unwrap_or_default();
                     if files.is_empty() {
                         pairs.push((
                             name.to_string(),
@@ -8026,19 +6825,18 @@ impl ScriptRuntime {
                 }
                 continue;
             }
-            if matches!(input_type.as_str(), "checkbox" | "radio")
-                && !self.control_checked_path(&path)
+            if matches!(input_type.as_str(), "checkbox" | "radio") && !self.is_control_checked(node)
             {
                 continue;
             }
             if element.name == "select" {
-                for value in self.select_selected_values(&path) {
+                for value in self.select_selected_values(node) {
                     pairs.push((name.to_string(), FormDataEntry::Text(value)));
                 }
                 continue;
             }
             let value = self
-                .control_value_path(&path)
+                .control_value(node)
                 .or_else(|| element.attr("value").map(str::to_string))
                 .unwrap_or_default();
             pairs.push((name.to_string(), FormDataEntry::Text(value)));
@@ -8290,10 +7088,10 @@ impl ScriptRuntime {
         Value::AbortController(Rc::new(RefCell::new(AbortControllerData { signal })))
     }
 
-    fn submit_form(&mut self, path: NodePath) -> Result<(), ScriptError> {
+    fn submit_form(&mut self, node: NodeId) -> Result<(), ScriptError> {
         // the submission reads three attributes, so the form subtree is not copied
         let (method, enctype, action) = self
-            .with_element(&path, |form| {
+            .with_element(node, |form| {
                 (
                     form.attr("method")
                         .map(|method| method.trim().to_ascii_lowercase())
@@ -8310,10 +7108,8 @@ impl ScriptRuntime {
                 "only GET and POST form submission are available in the packaged engine",
             ));
         }
-        let Value::FormData(form_data) = self.construct_form_data(vec![Value::Element(
-            attached_handle(path, &self.document)
-                .ok_or_else(|| runtime_error("form is no longer in the document"))?,
-        )])?
+        let Value::FormData(form_data) =
+            self.construct_form_data(vec![Value::Element(self.node_handle(node))])?
         else {
             unreachable!("form data constructor returns form data");
         };
@@ -8482,9 +7278,7 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .find_element_by_id(&id)
-                    .and_then(|path| attached_handle(path, &self.document))
-                    .map(Value::Element)
-                    .unwrap_or(Value::Null))
+                    .map_or(Value::Null, |node| self.node_value(node)))
             }
             Builtin::DocumentQuerySelector => {
                 let selector = arguments
@@ -8495,9 +7289,7 @@ impl ScriptRuntime {
                     .document
                     .borrow()
                     .find_element_by_selector(&selector)
-                    .and_then(|path| attached_handle(path, &self.document))
-                    .map(Value::Element)
-                    .unwrap_or(Value::Null))
+                    .map_or(Value::Null, |node| self.node_value(node)))
             }
             Builtin::DocumentQuerySelectorAll => {
                 let selector = arguments
@@ -8510,7 +7302,7 @@ impl ScriptRuntime {
                     .find_elements_by_selector(&selector)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|path| attached_handle(path, &self.document))
+                    .map(|node| self.node_handle(node))
                     .collect();
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
@@ -8522,27 +7314,24 @@ impl ScriptRuntime {
                 if name.is_empty() {
                     return Err(runtime_error("element name must not be empty"));
                 }
-                Ok(Value::Element(Rc::new(RefCell::new(
-                    ElementLocation::Detached(Element::new(&name)),
-                ))))
+                let node = self.document.borrow_mut().create_element(&name);
+                Ok(self.node_value(node))
             }
             Builtin::DocumentCreateTextNode => {
                 let text = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                Ok(Value::Element(Rc::new(RefCell::new(
-                    ElementLocation::Detached(detached_text_element(&text)),
-                ))))
+                let node = self.document.borrow_mut().create_text(text);
+                Ok(self.node_value(node))
             }
             Builtin::DocumentCreateRange => {
-                let path = self
+                let root = self
                     .document
                     .borrow()
-                    .document_element_path()
-                    .unwrap_or_default();
-                let node = attached_handle(path, &self.document)
+                    .document_element()
                     .ok_or_else(|| runtime_error("document has no range boundary element"))?;
+                let node = self.node_handle(root);
                 let range = RangeData {
                     start: RangeBoundary {
                         node: node.clone(),
@@ -8867,7 +7656,8 @@ impl ScriptRuntime {
                 {
                     return Ok(Value::Undefined);
                 }
-                let listeners = self.listeners.entry(Vec::new()).or_default();
+                let document_node = self.document_node();
+                let listeners = self.listeners.entry(document_node).or_default();
                 if !listeners
                     .iter()
                     .any(|listener| event_listener_matches(listener, &event, &callback))
@@ -8890,7 +7680,8 @@ impl ScriptRuntime {
                 if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("document event listener must be a function"));
                 }
-                if let Some(listeners) = self.listeners.get_mut(&Vec::new()) {
+                let document_node = self.document_node();
+                if let Some(listeners) = self.listeners.get_mut(&document_node) {
                     listeners
                         .retain(|listener| !event_listener_matches(listener, &event, &callback));
                 }
@@ -8967,14 +7758,14 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementFocus(handle) => {
-                if let Some(path) = attached_path(&handle) {
-                    self.focus_path(path)?;
-                }
+                let node = handle.id;
+                self.focus_node(node)?;
+
                 Ok(Value::Undefined)
             }
             Builtin::ElementBlur(handle) => {
-                if let Some(path) = attached_path(&handle)
-                    && self.focused_element.as_ref() == Some(&path)
+                if let Some(node) = Some(handle.id)
+                    && self.focused_element.as_ref() == Some(&node)
                 {
                     self.blur_focused()?;
                 }
@@ -8982,15 +7773,13 @@ impl ScriptRuntime {
             }
             Builtin::WindowGetSelection => Ok(Value::Selection(self.selection.clone())),
             Builtin::ElementSelect(handle) => {
-                if let Some(path) = attached_path(&handle) {
-                    self.set_text_selection(path, 0, usize::MAX, SelectionDirection::None)?;
-                }
+                let node = handle.id;
+                self.set_text_selection(node, 0, usize::MAX, SelectionDirection::None)?;
+
                 Ok(Value::Undefined)
             }
             Builtin::ElementSetSelectionRange(handle) => {
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::Undefined);
-                };
+                let node = handle.id;
                 let start = arguments
                     .first()
                     .map(Value::number)
@@ -9007,47 +7796,20 @@ impl ScriptRuntime {
                     .get(2)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                self.set_text_selection(path, start, end, selection_direction(&direction))?;
+                self.set_text_selection(node, start, end, selection_direction(&direction))?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementSetRangeText(handle) => {
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::Undefined);
-                };
-                self.set_range_text(&path, &arguments)?;
+                let node = handle.id;
+                self.set_range_text(node, &arguments)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementSplitText(handle) => {
-                if !attached_is_text(&handle) {
+                if !self.is_text_node(&handle) {
                     return Err(runtime_error("splitText requires a text node"));
                 }
-                let Some(path) = attached_path(&handle) else {
-                    let ElementLocation::Detached(element) = handle.borrow().clone() else {
-                        return Err(runtime_error("text node is no longer in the document"));
-                    };
-                    let text = detached_text_data(&element)
-                        .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
-                    let length = utf16_len(&text);
-                    let offset = arguments
-                        .first()
-                        .map(Value::number)
-                        .transpose()?
-                        .map(selection_offset)
-                        .unwrap_or_default()
-                        .min(length);
-                    let left = utf16_substring(&text, 0, offset);
-                    let right = utf16_substring(&text, offset, length);
-                    *handle.borrow_mut() = ElementLocation::Detached(detached_text_element(&left));
-                    return Ok(Value::Element(Rc::new(RefCell::new(
-                        ElementLocation::Detached(detached_text_element(&right)),
-                    ))));
-                };
-                let length = self
-                    .document
-                    .borrow()
-                    .node_text_content(&path)
-                    .map(|text| utf16_len(&text))
-                    .ok_or_else(|| runtime_error("text node is no longer in the document"))?;
+                let node = handle.id;
+                let length = utf16_len(&self.text_node_data(&handle)?);
                 let offset = arguments
                     .first()
                     .map(Value::number)
@@ -9055,17 +7817,13 @@ impl ScriptRuntime {
                     .map(selection_offset)
                     .unwrap_or_default()
                     .min(length);
-                let parent = path[..path.len().saturating_sub(1)].to_vec();
-                let index = *path.last().expect("text node path is non-empty");
-                let new_path = self
+                let new_node = self
                     .document
                     .borrow_mut()
-                    .split_text_node(&path, offset)
+                    .split_text(node, offset)
                     .ok_or_else(|| runtime_error("text node could not be split"))?;
-                self.shift_runtime_paths_for_insert(&parent, index.saturating_add(1));
-                let right = attached_handle(new_path, &self.document)
-                    .ok_or_else(|| runtime_error("splitText failed to assign node identity"))?;
-                let selection_changed = self.adjust_ranges_for_split_text(&path, offset, &right);
+                let right = self.node_handle(new_node);
+                let selection_changed = self.adjust_ranges_for_split_text(node, offset, &right);
                 if selection_changed {
                     self.dispatch_document_selection_change()?;
                 }
@@ -9197,10 +7955,7 @@ impl ScriptRuntime {
                 let length = self
                     .document
                     .borrow()
-                    .node_text_content(
-                        &attached_path(&boundary.node)
-                            .ok_or_else(|| runtime_error("Range boundary is no longer attached"))?,
-                    )
+                    .node_text_content(boundary.node.id)
                     .map(|text| utf16_len(&text))
                     .unwrap_or(0);
                 let changed = {
@@ -9295,15 +8050,10 @@ impl ScriptRuntime {
                         "Selection.collapse expects an Element or null",
                     ));
                 };
-                let Some(path) = attached_path(&handle) else {
-                    return Err(runtime_error(
-                        "Selection.collapse requires an attached Element",
-                    ));
-                };
                 let value = self
                     .document
                     .borrow()
-                    .node_text_content(&path)
+                    .node_text_content(handle.id)
                     .unwrap_or_default();
                 let offset = arguments
                     .get(1)
@@ -9361,20 +8111,19 @@ impl ScriptRuntime {
                 ))
             }
             Builtin::ElementRequestSubmit(handle) => {
-                if let Some(path) = attached_path(&handle) {
-                    self.request_submit(path)?;
-                }
+                let node = handle.id;
+                self.request_submit(node)?;
+
                 Ok(Value::Undefined)
             }
             Builtin::ElementReset(handle) => {
-                if let Some(path) = attached_path(&handle) {
-                    self.reset_form(path)?;
-                }
+                let node = handle.id;
+                self.reset_form(node)?;
+
                 Ok(Value::Undefined)
             }
             Builtin::ElementCheckValidity(handle) | Builtin::ElementReportValidity(handle) => {
-                let valid = attached_path(&handle)
-                    .map(|path| self.check_validity_path(&path))
+                let valid = Some(self.check_validity(handle.id))
                     .transpose()?
                     .unwrap_or(false);
                 Ok(Value::Bool(valid))
@@ -9384,15 +8133,11 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                if let Some(path) = attached_path(&handle) {
-                    self.set_custom_validity(path, message);
-                }
+                self.set_custom_validity(handle.id, message);
                 Ok(Value::Undefined)
             }
             Builtin::CanvasGetContext(handle) => {
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::Null);
-                };
+                let node = handle.id;
                 let kind = arguments
                     .first()
                     .map(Value::string_value)
@@ -9402,10 +8147,10 @@ impl ScriptRuntime {
                 }
                 let context = self
                     .canvas_contexts
-                    .entry(path.clone())
+                    .entry(node)
                     .or_insert_with(|| {
                         Rc::new(RefCell::new(CanvasContextData {
-                            path,
+                            node,
                             fill_style: Color::BLACK,
                         }))
                     })
@@ -9418,7 +8163,7 @@ impl ScriptRuntime {
                 let width = canvas_number(&arguments, 2)?;
                 let height = canvas_number(&arguments, 3)?;
                 self.canvas_commands.push(CanvasCommand::FillRect {
-                    path: context.borrow().path.clone(),
+                    node: context.borrow().node,
                     x,
                     y,
                     width,
@@ -9433,7 +8178,7 @@ impl ScriptRuntime {
                 let width = canvas_number(&arguments, 2)?;
                 let height = canvas_number(&arguments, 3)?;
                 self.canvas_commands.push(CanvasCommand::ClearRect {
-                    path: context.borrow().path.clone(),
+                    node: context.borrow().node,
                     x,
                     y,
                     width,
@@ -10519,9 +9264,7 @@ impl ScriptRuntime {
                 ))
             }
             Builtin::ElementAddEventListener(handle) => {
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::Undefined);
-                };
+                let node = handle.id;
                 let event = arguments
                     .first()
                     .map(Value::string_value)
@@ -10538,7 +9281,7 @@ impl ScriptRuntime {
                 {
                     return Ok(Value::Undefined);
                 }
-                let listeners = self.listeners.entry(path).or_default();
+                let listeners = self.listeners.entry(node).or_default();
                 if !listeners
                     .iter()
                     .any(|listener| event_listener_matches(listener, &event, &callback))
@@ -10553,9 +9296,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::ElementRemoveEventListener(handle) => {
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::Undefined);
-                };
+                let node = handle.id;
                 let event = arguments
                     .first()
                     .map(Value::string_value)
@@ -10564,202 +9305,107 @@ impl ScriptRuntime {
                 if !is_callable(&callback.resolve()) {
                     return Err(runtime_error("event listener must be a function"));
                 }
-                if let Some(listeners) = self.listeners.get_mut(&path) {
+                if let Some(listeners) = self.listeners.get_mut(&node) {
                     listeners
                         .retain(|listener| !event_listener_matches(listener, &event, &callback));
                 }
                 Ok(Value::Undefined)
             }
             Builtin::ElementClick(handle) => {
-                if let Some(path) = attached_path(&handle) {
-                    self.click_path(path)?;
-                }
+                self.click_node(handle.id)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementAppendChild(parent) => {
-                let parent_path = attached_path(&parent).ok_or_else(|| {
-                    runtime_error("appendChild parent is no longer in the document")
-                })?;
-                let child = match arguments.first() {
-                    Some(Value::Element(handle)) => handle.clone(),
-                    _ => return Err(runtime_error("appendChild expects an element")),
-                };
-                if let Some(source_path) = attached_path(&child) {
-                    let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
-                    let child_path = self
-                        .document
-                        .borrow_mut()
-                        .move_node_before(&source_path, &parent_path, None)
-                        .ok_or_else(|| {
-                            runtime_error("appendChild cannot move the node into the parent")
-                        })?;
-                    if child_path != source_path {
-                        self.relocate_runtime_paths_for_move(&source_path, &child_path);
-                        self.refresh_select_state_after_move(&source_parent, &child_path);
-                    }
-                    let attached =
-                        attached_handle(child_path, &self.document).ok_or_else(|| {
-                            runtime_error("appendChild failed to preserve node identity")
-                        })?;
-                    *child.borrow_mut() = attached.borrow().clone();
-                    return Ok(Value::Element(child));
-                }
-                let location = child.borrow().clone();
-                let child_path = match location {
-                    ElementLocation::Detached(element) if is_detached_text_element(&element) => {
-                        self.document.borrow_mut().append_text_node(
-                            &parent_path,
-                            detached_text_data(&element).unwrap_or_default(),
-                        )
-                    }
-                    ElementLocation::Detached(element) => self
-                        .document
-                        .borrow_mut()
-                        .append_element(&parent_path, element),
-                    ElementLocation::Attached { .. } => {
-                        return Err(runtime_error("appendChild child handle is unavailable"));
-                    }
-                }
-                .ok_or_else(|| runtime_error("appendChild parent is no longer in the document"))?;
-                self.restore_detached_listeners(&child, &child_path);
-                self.refresh_select_state_after_append(&parent_path, &child_path);
-                let attached = attached_handle(child_path, &self.document)
-                    .ok_or_else(|| runtime_error("appendChild failed to assign node identity"))?;
-                *child.borrow_mut() = attached.borrow().clone();
-                Ok(Value::Element(child))
+                let child = self.node_argument(&arguments, 0, "appendChild")?;
+                self.insert_node(parent.id, child, None)?;
+                Ok(self.node_value(child))
             }
             Builtin::ElementAppend(parent) => {
-                for argument in &arguments {
-                    let child = child_handle_from_value(argument);
-                    self.call_builtin(
-                        Builtin::ElementAppendChild(parent.clone()),
-                        vec![Value::Element(child)],
-                    )?;
-                }
+                let node = self.nodes_from_arguments(&arguments)?;
+                self.insert_node(parent.id, node, None)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementPrepend(parent) => {
-                for argument in arguments.iter().rev() {
-                    let child = child_handle_from_value(argument);
-                    let reference = attached_path(&parent)
-                        .and_then(|path| self.document.borrow().child_paths(&path))
-                        .and_then(|children| children.into_iter().next())
-                        .and_then(|path| attached_handle(path, &self.document))
-                        .map(Value::Element)
-                        .unwrap_or(Value::Null);
-                    self.call_builtin(
-                        Builtin::ElementInsertBefore(parent.clone()),
-                        vec![Value::Element(child), reference],
-                    )?;
-                }
+                let node = self.nodes_from_arguments(&arguments)?;
+                let first = self.document.borrow().children(parent.id).first().copied();
+                self.insert_node(parent.id, node, first)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementReplaceChildren(parent) => {
-                let parent_path = attached_path(&parent).ok_or_else(|| {
-                    runtime_error("replaceChildren parent is no longer in the document")
-                })?;
-                let children = arguments
-                    .iter()
-                    .map(child_handle_from_value)
-                    .collect::<Vec<_>>();
-                for child in &children {
-                    let Some(path) = attached_path(child) else {
-                        continue;
-                    };
-                    if path.len() == parent_path.len().saturating_add(1)
-                        && path[..parent_path.len()] == parent_path
-                    {
-                        self.detach_child(&parent_path, child)?;
-                    }
-                }
-                let old_paths = self
+                let node = self.nodes_from_arguments(&arguments)?;
+                let checked = self
                     .document
                     .borrow()
-                    .child_paths(&parent_path)
-                    .unwrap_or_default();
-                for path in old_paths {
-                    let Some(child) = attached_handle(path, &self.document) else {
-                        continue;
-                    };
-                    self.detach_child(&parent_path, &child)?;
+                    .validate_insertion(parent.id, node, None);
+                if let Err(error) = checked {
+                    return Err(self.dom_error(error));
                 }
-                if !self
-                    .document
-                    .borrow_mut()
-                    .replace_element_children(&parent_path, Vec::new())
-                {
-                    return Err(runtime_error(
-                        "replaceChildren parent is no longer in the document",
-                    ));
+                let old_children = self.document.borrow().children(parent.id).to_vec();
+                for child in old_children {
+                    self.remove_node(child)?;
                 }
-                self.refresh_select_state_after_inner_html(&parent_path);
-                for child in children {
-                    self.call_builtin(
-                        Builtin::ElementAppendChild(parent.clone()),
-                        vec![Value::Element(child)],
-                    )?;
-                }
+                self.insert_node(parent.id, node, None)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementBefore(anchor) => {
-                let Some(anchor_path) = attached_path(&anchor) else {
+                let Some(parent) = self.document.borrow().parent(anchor.id) else {
                     return Ok(Value::Undefined);
                 };
-                let Some(parent_path) = self.document.borrow().parent_path(&anchor_path) else {
-                    return Ok(Value::Undefined);
+                let excluded = self.argument_nodes(&arguments);
+                let viable_previous = {
+                    let document = self.document.borrow();
+                    let siblings = document.children(parent);
+                    let index = siblings
+                        .iter()
+                        .position(|&sibling| sibling == anchor.id)
+                        .unwrap_or(0);
+                    siblings[..index]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|sibling| !excluded.contains(sibling))
                 };
-                let parent = attached_handle(parent_path, &self.document)
-                    .ok_or_else(|| runtime_error("before parent is no longer in the document"))?;
-                for argument in &arguments {
-                    let child = child_handle_from_value(argument);
-                    self.call_builtin(
-                        Builtin::ElementInsertBefore(parent.clone()),
-                        vec![Value::Element(child), Value::Element(anchor.clone())],
-                    )?;
-                }
+                let node = self.nodes_from_arguments(&arguments)?;
+                let reference = {
+                    let document = self.document.borrow();
+                    match viable_previous {
+                        Some(previous) => document.sibling(previous, true),
+                        None => document.children(parent).first().copied(),
+                    }
+                };
+                self.insert_node(parent, node, reference)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementAfter(anchor) => {
-                let Some(anchor_path) = attached_path(&anchor) else {
+                let Some(parent) = self.document.borrow().parent(anchor.id) else {
                     return Ok(Value::Undefined);
                 };
-                let Some(parent_path) = self.document.borrow().parent_path(&anchor_path) else {
-                    return Ok(Value::Undefined);
-                };
-                let parent = attached_handle(parent_path, &self.document)
-                    .ok_or_else(|| runtime_error("after parent is no longer in the document"))?;
-                let reference = self
-                    .document
-                    .borrow()
-                    .sibling_path(&anchor_path, true)
-                    .and_then(|path| attached_handle(path, &self.document))
-                    .map(Value::Element)
-                    .unwrap_or(Value::Null);
-                let append = matches!(&reference, Value::Null);
-                for argument in &arguments {
-                    let child = child_handle_from_value(argument);
-                    let builtin = if append {
-                        Builtin::ElementAppendChild(parent.clone())
-                    } else {
-                        Builtin::ElementInsertBefore(parent.clone())
-                    };
-                    let mut call_arguments = vec![Value::Element(child)];
-                    if !append {
-                        call_arguments.push(reference.clone());
-                    }
-                    self.call_builtin(builtin, call_arguments)?;
-                }
+                let reference = self.viable_next_sibling(anchor.id, &arguments);
+                let node = self.nodes_from_arguments(&arguments)?;
+                self.insert_node(parent, node, reference)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementReplaceWith(anchor) => {
-                let Some(anchor_path) = attached_path(&anchor) else {
+                let Some(parent) = self.document.borrow().parent(anchor.id) else {
                     return Ok(Value::Undefined);
                 };
-                let Some(parent_path) = self.document.borrow().parent_path(&anchor_path) else {
-                    return Ok(Value::Undefined);
-                };
-                self.call_builtin(Builtin::ElementBefore(anchor.clone()), arguments.clone())?;
-                self.detach_child(&parent_path, &anchor)?;
+                let reference = self.viable_next_sibling(anchor.id, &arguments);
+                let node = self.nodes_from_arguments(&arguments)?;
+                if self.document.borrow().parent(anchor.id) == Some(parent) {
+                    let checked =
+                        self.document
+                            .borrow()
+                            .validate_insertion(parent, node, Some(anchor.id));
+                    if let Err(error) = checked {
+                        return Err(self.dom_error(error));
+                    }
+                    let next = self.document.borrow().sibling(anchor.id, true);
+                    self.remove_node(anchor.id)?;
+                    let reference = next.filter(|&next| next != node);
+                    self.insert_node(parent, node, reference)?;
+                } else {
+                    self.insert_node(parent, node, reference)?;
+                }
                 Ok(Value::Undefined)
             }
             Builtin::ElementInsertAdjacentHtml(anchor) => {
@@ -10778,164 +9424,72 @@ impl ScriptRuntime {
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let fragment =
-                    Document::parse(&source).map_err(|error| runtime_error(error.to_string()))?;
-                let Some(anchor_path) = attached_path(&anchor) else {
+                let (parent, reference) = {
+                    let document = self.document.borrow();
+                    match position.as_str() {
+                        "afterbegin" => (
+                            Some(anchor.id),
+                            document.children(anchor.id).first().copied(),
+                        ),
+                        "beforeend" => (Some(anchor.id), None),
+                        "beforebegin" => (document.parent(anchor.id), Some(anchor.id)),
+                        _ => (
+                            document.parent(anchor.id),
+                            document.sibling(anchor.id, true),
+                        ),
+                    }
+                };
+                let Some(parent) = parent else {
                     return Ok(Value::Undefined);
                 };
-                let parent_path = if matches!(position.as_str(), "afterbegin" | "beforeend") {
-                    anchor_path.clone()
-                } else {
-                    let Some(parent) = self.document.borrow().parent_path(&anchor_path) else {
-                        return Ok(Value::Undefined);
-                    };
-                    parent
-                };
-                let parent = attached_handle(parent_path, &self.document)
-                    .ok_or_else(|| runtime_error("insertAdjacentHTML parent is unavailable"))?;
-                let reference = match position.as_str() {
-                    "beforebegin" => Some(anchor.clone()),
-                    "afterbegin" => self
-                        .document
-                        .borrow()
-                        .child_paths(&anchor_path)
-                        .and_then(|children| children.into_iter().next())
-                        .and_then(|path| attached_handle(path, &self.document)),
-                    "afterend" => self
-                        .document
-                        .borrow()
-                        .sibling_path(&anchor_path, true)
-                        .and_then(|path| attached_handle(path, &self.document)),
-                    "beforeend" => None,
-                    _ => unreachable!("insertAdjacentHTML position was validated"),
-                };
-                for node in fragment.root.children {
-                    let child = detached_handle_from_node(node);
-                    if let Some(reference) = &reference {
-                        self.call_builtin(
-                            Builtin::ElementInsertBefore(parent.clone()),
-                            vec![Value::Element(child), Value::Element(reference.clone())],
-                        )?;
-                    } else {
-                        self.call_builtin(
-                            Builtin::ElementAppendChild(parent.clone()),
-                            vec![Value::Element(child)],
-                        )?;
-                    }
-                }
+                let fragment = self
+                    .document
+                    .borrow_mut()
+                    .parse_fragment(&source)
+                    .map_err(|error| runtime_error(error.to_string()))?;
+                self.insert_node(parent, fragment, reference)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementInsertBefore(parent) => {
-                let parent_path = attached_path(&parent).ok_or_else(|| {
-                    runtime_error("insertBefore parent is no longer in the document")
-                })?;
-                let child = match arguments.first() {
-                    Some(Value::Element(handle)) => handle.clone(),
-                    _ => return Err(runtime_error("insertBefore expects an element")),
-                };
-                let reference_path = match arguments.get(1).map(Value::resolve) {
+                let child = self.node_argument(&arguments, 0, "insertBefore")?;
+                let reference = match arguments.get(1).map(Value::resolve) {
                     None | Some(Value::Null) | Some(Value::Undefined) => None,
-                    Some(Value::Element(reference)) => {
-                        Some(attached_path(&reference).ok_or_else(|| {
-                            runtime_error("insertBefore reference is no longer in the document")
-                        })?)
-                    }
+                    Some(Value::Element(reference)) => Some(reference.id),
                     Some(_) => {
-                        return Err(runtime_error(
-                            "insertBefore reference must be an element or null",
+                        return Err(self.type_error(
+                            "Failed to execute 'insertBefore' on 'Node': parameter 2 is not of type 'Node'.",
                         ));
                     }
                 };
-                let child_path = if let Some(source_path) = attached_path(&child) {
-                    let source_parent = source_path[..source_path.len().saturating_sub(1)].to_vec();
-                    let child_path = self
-                        .document
-                        .borrow_mut()
-                        .move_node_before(&source_path, &parent_path, reference_path.as_deref())
-                        .ok_or_else(|| {
-                            runtime_error(
-                                "insertBefore cannot move the node into the requested parent",
-                            )
-                        })?;
-                    if child_path != source_path {
-                        self.relocate_runtime_paths_for_move(&source_path, &child_path);
-                        self.refresh_select_state_after_move(&source_parent, &child_path);
-                    }
-                    child_path
-                } else {
-                    self.insert_detached_before(&parent_path, &child, reference_path.as_deref())?
-                };
-                let attached = attached_handle(child_path, &self.document)
-                    .ok_or_else(|| runtime_error("insertBefore failed to assign node identity"))?;
-                *child.borrow_mut() = attached.borrow().clone();
-                Ok(Value::Element(child))
+                self.insert_node(parent.id, child, reference)?;
+                Ok(self.node_value(child))
             }
             Builtin::ElementRemoveChild(parent) => {
-                let child = match arguments.first() {
-                    Some(Value::Element(handle)) => handle.clone(),
-                    _ => return Err(runtime_error("removeChild expects an element")),
-                };
-                let parent_path = attached_path(&parent).ok_or_else(|| {
-                    runtime_error("removeChild parent is no longer in the document")
-                })?;
-                self.detach_child(&parent_path, &child)?;
-                Ok(Value::Element(child))
+                let child = self.node_argument(&arguments, 0, "removeChild")?;
+                if self.document.borrow().parent(child) != Some(parent.id) {
+                    return Err(self.throw_value(dom_exception(
+                        "NotFoundError",
+                        "The node to be removed is not a child of this node.",
+                    )));
+                }
+                self.remove_node(child)?;
+                Ok(self.node_value(child))
             }
             Builtin::ElementRemove(handle) => {
-                let Some(child_path) = attached_path(&handle) else {
-                    return Ok(Value::Undefined);
-                };
-                let Some(parent) = self.document.borrow().parent_path(&child_path) else {
-                    return Ok(Value::Undefined);
-                };
-                self.detach_child(&parent, &handle)?;
+                self.remove_node(handle.id)?;
                 Ok(Value::Undefined)
             }
-            Builtin::ElementHasChildNodes(handle) => {
-                Ok(Value::Bool(match handle.borrow().clone() {
-                    ElementLocation::Attached { .. } => {
-                        if attached_is_text(&handle) {
-                            false
-                        } else {
-                            attached_path(&handle)
-                                .and_then(|path| self.document.borrow().child_paths(&path))
-                                .is_some_and(|children| !children.is_empty())
-                        }
-                    }
-                    ElementLocation::Detached(element) => {
-                        !is_detached_text_element(&element) && !element.children.is_empty()
-                    }
-                }))
-            }
+            Builtin::ElementHasChildNodes(handle) => Ok(Value::Bool(
+                !self.document.borrow().children(handle.id).is_empty(),
+            )),
             Builtin::ElementCloneNode(handle) => {
                 let deep = arguments.first().is_some_and(Value::truthy);
-                let node = match handle.borrow().clone() {
-                    ElementLocation::Attached { .. } => {
-                        let path = attached_path(&handle)
-                            .ok_or_else(|| runtime_error("node is no longer in the document"))?;
-                        self.document
-                            .borrow()
-                            .node_clone(&path, deep)
-                            .ok_or_else(|| runtime_error("node is no longer in the document"))?
-                    }
-                    ElementLocation::Detached(mut element) => {
-                        if is_detached_text_element(&element) {
-                            Node::Text(detached_text_data(&element).unwrap_or_default())
-                        } else {
-                            if !deep {
-                                element.children.clear();
-                            }
-                            Node::Element(element)
-                        }
-                    }
-                };
-                let element = match node {
-                    Node::Element(element) => element,
-                    Node::Text(text) => detached_text_element(&text),
-                };
-                Ok(Value::Element(Rc::new(RefCell::new(
-                    ElementLocation::Detached(element),
-                ))))
+                let copy = self
+                    .document
+                    .borrow_mut()
+                    .clone_node(handle.id, deep)
+                    .ok_or_else(|| runtime_error("node is no longer in the document"))?;
+                Ok(self.node_value(copy))
             }
             Builtin::ElementSetAttribute(handle) => {
                 let name = arguments
@@ -10946,9 +9500,6 @@ impl ScriptRuntime {
                     .get(1)
                     .map(Value::string_value)
                     .unwrap_or_default();
-                if attached_path(&handle).is_none() {
-                    return Err(runtime_error("element is no longer in the document"));
-                }
                 self.set_element_attribute(&handle, &name, value);
                 Ok(Value::Undefined)
             }
@@ -10957,9 +9508,6 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                if attached_path(&handle).is_none() {
-                    return Err(runtime_error("element is no longer in the document"));
-                }
                 self.remove_element_attribute(&handle, &name);
                 Ok(Value::Undefined)
             }
@@ -10968,8 +9516,11 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                Ok(attached_path(&handle)
-                    .and_then(|path| self.document.borrow().element_attribute(&path, &name))
+                Ok(self
+                    .document
+                    .borrow()
+                    .attribute(handle.id, &name)
+                    .map(str::to_string)
                     .map(|text| Value::String(text.into()))
                     .unwrap_or(Value::Null))
             }
@@ -10978,32 +9529,26 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::Null);
-                };
+                let node = handle.id;
                 Ok(self
                     .document
                     .borrow()
-                    .find_element_by_selector_within(&path, &selector)
-                    .and_then(|path| attached_handle(path, &self.document))
-                    .map(Value::Element)
-                    .unwrap_or(Value::Null))
+                    .find_element_by_selector_within(node, &selector)
+                    .map_or(Value::Null, |node| self.node_value(node)))
             }
             Builtin::ElementQuerySelectorAll(handle) => {
                 let selector = arguments
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                let Some(path) = attached_path(&handle) else {
-                    return Ok(Value::NodeList(Rc::new(Vec::new())));
-                };
+                let node = handle.id;
                 let nodes = self
                     .document
                     .borrow()
-                    .find_elements_by_selector_within(&path, &selector)
+                    .find_elements_by_selector_within(node, &selector)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|path| attached_handle(path, &self.document))
+                    .map(|node| self.node_handle(node))
                     .collect();
                 Ok(Value::NodeList(Rc::new(nodes)))
             }
@@ -11062,8 +9607,8 @@ impl ScriptRuntime {
         }
     }
 
-    fn take_event_callbacks(&mut self, path: &[usize], event: &str) -> Vec<Value> {
-        let Some(listeners) = self.listeners.get_mut(path) else {
+    fn take_event_callbacks(&mut self, node: NodeId, event: &str) -> Vec<Value> {
+        let Some(listeners) = self.listeners.get_mut(&node) else {
             return Vec::new();
         };
         let callbacks = listeners
@@ -11087,25 +9632,21 @@ impl ScriptRuntime {
         callbacks
     }
 
-    fn dispatch_event(
-        &mut self,
-        path: NodePath,
-        event: &str,
-    ) -> Result<EventDispatch, ScriptError> {
-        self.dispatch_event_with_details(path, event, "", "")
+    fn dispatch_event(&mut self, node: NodeId, event: &str) -> Result<EventDispatch, ScriptError> {
+        self.dispatch_event_with_details(node, event, "", "")
     }
 
     fn dispatch_non_bubbling_event(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         event: &str,
     ) -> Result<EventDispatch, ScriptError> {
-        let callbacks = self.take_event_callbacks(&path, event);
+        let callbacks = self.take_event_callbacks(node, event);
         let state = Rc::new(RefCell::new(EventState::default()));
         let event_value = Value::Event(Rc::new(EventData {
             event_type: event.to_string(),
-            target: path.clone(),
-            current_target: path,
+            target: node,
+            current_target: node,
             state: state.clone(),
             history_state: Rc::new(RefCell::new(Value::Null)),
             key: String::new(),
@@ -11135,40 +9676,42 @@ impl ScriptRuntime {
     }
 
     fn dispatch_document_selection_change(&mut self) -> Result<(), ScriptError> {
-        self.dispatch_event(Vec::new(), "selectionchange")?;
+        self.dispatch_event(self.document_node(), "selectionchange")?;
         self.drain_microtasks()?;
         Ok(())
     }
 
     fn dispatch_event_with_details(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         event: &str,
         key: &str,
         data: &str,
     ) -> Result<EventDispatch, ScriptError> {
-        self.dispatch_event_with_modifiers(path, event, key, data, KeyModifiers::default())
+        self.dispatch_event_with_modifiers(node, event, key, data, KeyModifiers::default())
     }
 
     fn dispatch_event_with_modifiers(
         &mut self,
-        path: NodePath,
+        node: NodeId,
         event: &str,
         key: &str,
         data: &str,
         modifiers: KeyModifiers,
     ) -> Result<EventDispatch, ScriptError> {
-        let target = path.clone();
-        let mut current = path;
+        let target = node;
+        let propagation = std::iter::once(node)
+            .chain(self.document.borrow().ancestors(node))
+            .collect::<Vec<_>>();
         let mut had_callbacks = false;
         let state = Rc::new(RefCell::new(EventState::default()));
-        loop {
-            let callbacks = self.take_event_callbacks(&current, event);
+        for current in propagation {
+            let callbacks = self.take_event_callbacks(current, event);
             had_callbacks |= !callbacks.is_empty();
             let event_value = Value::Event(Rc::new(EventData {
                 event_type: event.to_string(),
-                target: target.clone(),
-                current_target: current.clone(),
+                target,
+                current_target: current,
                 state: state.clone(),
                 history_state: Rc::new(RefCell::new(Value::Null)),
                 key: key.to_string(),
@@ -11183,10 +9726,6 @@ impl ScriptRuntime {
             for callback in callbacks {
                 self.call(callback, vec![event_value.clone()])?;
             }
-            if current.is_empty() {
-                break;
-            }
-            current.pop();
         }
         Ok(EventDispatch {
             handled: had_callbacks,
@@ -11378,6 +9917,7 @@ impl ScriptRuntime {
             }
             executed += 1;
         }
+        self.collect_detached_nodes();
         Ok(())
     }
 
@@ -11816,51 +10356,19 @@ impl ScriptRuntime {
     }
 
     fn has_class(&self, handle: &ElementHandle, class: &str) -> Result<bool, ScriptError> {
-        match handle.borrow().clone() {
-            ElementLocation::Attached { .. } => Ok(attached_path(handle)
-                .is_some_and(|path| self.document.borrow().element_has_class(&path, class))),
-            ElementLocation::Detached(element) => Ok(element.has_class(class)),
-        }
+        Ok(self.document.borrow().has_class(handle.id, class))
     }
 
     fn add_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                if let Some(path) = attached_path(handle) {
-                    self.document.borrow_mut().add_element_class(&path, class);
-                }
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return Err(runtime_error("element handle changed during classList.add"));
-                };
-                element.add_class(class);
-            }
+        if let Some(element) = self.document.borrow_mut().element_mut(handle.id) {
+            element.add_class(class);
         }
         Ok(())
     }
 
     fn remove_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
-        let location = handle.borrow().clone();
-        match location {
-            ElementLocation::Attached { .. } => {
-                if let Some(path) = attached_path(handle) {
-                    self.document
-                        .borrow_mut()
-                        .remove_element_class(&path, class);
-                }
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return Err(runtime_error(
-                        "element handle changed during classList.remove",
-                    ));
-                };
-                element.remove_class(class);
-            }
+        if let Some(element) = self.document.borrow_mut().element_mut(handle.id) {
+            element.remove_class(class);
         }
         Ok(())
     }
@@ -11871,130 +10379,42 @@ impl ScriptRuntime {
         class: &str,
         force: Option<bool>,
     ) -> Result<bool, ScriptError> {
-        let location = handle.borrow().clone();
-        Ok(match location {
-            ElementLocation::Attached { .. } => {
-                let path = attached_path(handle)
-                    .ok_or_else(|| runtime_error("element handle is no longer in the document"))?;
-                self.document
-                    .borrow_mut()
-                    .toggle_element_class(&path, class, force)
-                    .ok_or_else(|| runtime_error("element handle is no longer in the document"))?
-            }
-            ElementLocation::Detached(_) => {
-                let mut location = handle.borrow_mut();
-                let ElementLocation::Detached(element) = &mut *location else {
-                    return Err(runtime_error(
-                        "element handle changed during classList.toggle",
-                    ));
-                };
-                element.toggle_class(class, force)
-            }
-        })
+        self.document
+            .borrow_mut()
+            .element_mut(handle.id)
+            .map(|element| element.toggle_class(class, force))
+            .ok_or_else(|| runtime_error("classList requires an element"))
     }
 }
 
-fn attached_handle(path: NodePath, document: &Rc<RefCell<Document>>) -> Option<ElementHandle> {
-    let document_ref = document.borrow();
-    let id = document_ref.node_id(&path)?;
-    let is_text = document_ref.node_is_text(&path)?;
-    drop(document_ref);
-    Some(Rc::new(RefCell::new(ElementLocation::Attached {
-        id,
-        document: Rc::downgrade(document),
-        is_text,
-    })))
-}
-
-fn detached_text_element(text: &str) -> Element {
-    Element {
-        name: "#text".to_string(),
-        attrs: BTreeMap::new(),
-        children: vec![Node::Text(text.to_string())],
-    }
-}
-
-fn child_handle_from_value(value: &Value) -> ElementHandle {
+// a script value as a node to insert: nodes as they are, anything else as new text
+fn child_node_from_value(runtime: &ScriptRuntime, value: &Value) -> NodeId {
     match value.resolve() {
-        Value::Element(handle) => handle,
-        value => Rc::new(RefCell::new(ElementLocation::Detached(
-            detached_text_element(&value.string_value()),
-        ))),
-    }
-}
-
-fn detached_handle_from_node(node: Node) -> ElementHandle {
-    let element = match node {
-        Node::Element(element) => element,
-        Node::Text(text) => detached_text_element(&text),
-    };
-    Rc::new(RefCell::new(ElementLocation::Detached(element)))
-}
-
-fn is_detached_text_element(element: &Element) -> bool {
-    element.name == "#text"
-}
-
-fn detached_text_data(element: &Element) -> Option<String> {
-    if !is_detached_text_element(element) {
-        return None;
-    }
-    match element.children.first()? {
-        Node::Text(text) => Some(text.clone()),
-        Node::Element(_) => None,
-    }
-}
-
-fn detached_text_data_mut(element: &mut Element) -> Option<&mut String> {
-    if !is_detached_text_element(element) {
-        return None;
-    }
-    match element.children.first_mut()? {
-        Node::Text(text) => Some(text),
-        Node::Element(_) => None,
-    }
-}
-
-fn attached_path(handle: &ElementHandle) -> Option<NodePath> {
-    match &*handle.borrow() {
-        ElementLocation::Attached { id, document, .. } => {
-            document.upgrade()?.borrow().path_for_id(*id)
-        }
-        ElementLocation::Detached(_) => None,
-    }
-}
-
-fn attached_node_id(handle: &ElementHandle) -> Option<NodeId> {
-    match &*handle.borrow() {
-        ElementLocation::Attached { id, .. } => Some(*id),
-        ElementLocation::Detached(_) => None,
-    }
-}
-
-fn attached_is_text(handle: &ElementHandle) -> bool {
-    match &*handle.borrow() {
-        ElementLocation::Attached { is_text, .. } => *is_text,
-        ElementLocation::Detached(element) => is_detached_text_element(element),
+        Value::Element(handle) => handle.id,
+        value => runtime
+            .document
+            .borrow_mut()
+            .create_text(value.string_value()),
     }
 }
 
 fn collect_sequential_focus_nodes(
     node: &AccessibilityNode,
     order: &mut usize,
-    entries: &mut Vec<(i32, usize, NodePath)>,
+    entries: &mut Vec<(i32, usize, NodeId)>,
     document: &Rc<RefCell<Document>>,
 ) {
     if node.focusable {
         let tabindex = document
             .borrow()
-            .element_at(&node.path)
+            .element(node.node)
             .and_then(|element| {
                 element
                     .attr("tabindex")
                     .and_then(|value| value.parse().ok())
             })
             .unwrap_or(0);
-        entries.push((tabindex, *order, node.path.clone()));
+        entries.push((tabindex, *order, node.node));
         *order += 1;
     }
     for child in &node.children {
@@ -12769,36 +11189,20 @@ impl ScriptRuntime {
     }
 }
 
-fn collect_element_text(element: &Element, output: &mut String) {
-    for child in &element.children {
-        match child {
-            Node::Element(child) => collect_element_text(child, output),
-            Node::Text(text) => output.push_str(text),
-        }
-    }
-}
-
-fn default_value_for_element(element: &Element) -> Option<String> {
+fn default_value_for_element(document: &Document, node: NodeId) -> Option<String> {
+    let element = document.element(node)?;
     match element.name.as_str() {
         "input" => Some(element.attr("value").unwrap_or_default().to_string()),
-        "textarea" => {
-            let mut value = String::new();
-            collect_element_text(element, &mut value);
-            Some(value)
-        }
+        "textarea" => Some(document.text_content(node)),
         _ => None,
     }
 }
 
-fn option_value(element: &Element) -> String {
-    element
-        .attr("value")
+fn option_value(document: &Document, option: NodeId) -> String {
+    document
+        .attribute(option, "value")
         .map(str::to_string)
-        .unwrap_or_else(|| {
-            let mut value = String::new();
-            collect_element_text(element, &mut value);
-            value
-        })
+        .unwrap_or_else(|| document.text_content(option))
 }
 
 fn delay_milliseconds(value: f64) -> u64 {
@@ -15031,17 +13435,16 @@ pub(crate) fn word_modifier(modifiers: KeyModifiers) -> bool {
     }
 }
 
-// whether a path sits inside the first legend child of a fieldset
-fn inside_first_legend(fieldset: &Element, fieldset_path: &[usize], path: &[usize]) -> bool {
-    fieldset
-        .children
-        .iter()
-        .position(|child| matches!(child, Node::Element(element) if element.name == "legend"))
-        .is_some_and(|index| {
-            let mut legend_path = fieldset_path.to_vec();
-            legend_path.push(index);
-            path.starts_with(&legend_path)
+// whether a node sits inside the first legend child of a fieldset
+fn inside_first_legend(document: &Document, fieldset: NodeId, node: NodeId) -> bool {
+    document
+        .element_children(fieldset)
+        .find(|&child| {
+            document
+                .element(child)
+                .is_some_and(|element| element.name == "legend")
         })
+        .is_some_and(|legend| document.is_inclusive_ancestor(legend, node))
 }
 
 fn click_detail_for(event: &str, detail: u32) -> u32 {
@@ -15054,31 +13457,6 @@ fn click_detail_for(event: &str, detail: u32) -> u32 {
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
-}
-
-fn validity_object(flags: ConstraintFlags) -> Value {
-    let mut values = BTreeMap::new();
-    values.insert("badInput".to_string(), Value::Bool(flags.bad_input));
-    values.insert("customError".to_string(), Value::Bool(flags.custom_error));
-    values.insert(
-        "patternMismatch".to_string(),
-        Value::Bool(flags.pattern_mismatch),
-    );
-    values.insert(
-        "rangeOverflow".to_string(),
-        Value::Bool(flags.range_overflow),
-    );
-    values.insert(
-        "rangeUnderflow".to_string(),
-        Value::Bool(flags.range_underflow),
-    );
-    values.insert("stepMismatch".to_string(), Value::Bool(flags.step_mismatch));
-    values.insert("tooLong".to_string(), Value::Bool(flags.too_long));
-    values.insert("tooShort".to_string(), Value::Bool(flags.too_short));
-    values.insert("typeMismatch".to_string(), Value::Bool(flags.type_mismatch));
-    values.insert("valid".to_string(), Value::Bool(flags.valid()));
-    values.insert("valueMissing".to_string(), Value::Bool(flags.value_missing));
-    plain_object(values)
 }
 
 fn valid_email_value(value: &str, multiple: bool) -> bool {
@@ -15452,40 +13830,27 @@ fn selection_direction_name(direction: SelectionDirection) -> &'static str {
     }
 }
 
-fn common_path(start: &[usize], end: &[usize]) -> NodePath {
-    start
-        .iter()
-        .zip(end)
-        .take_while(|(left, right)| left == right)
-        .map(|(value, _)| *value)
-        .collect()
-}
-
 fn adjust_range_boundary_for_remove(
     boundary: &mut RangeBoundary,
-    _parent: &[usize],
-    child: &[usize],
+    child: NodeId,
     child_start: usize,
     removed_length: usize,
     parent_handle: &ElementHandle,
-    document: &Rc<RefCell<Document>>,
+    document: &Document,
 ) {
-    let Some(path) = attached_path(&boundary.node) else {
-        return;
-    };
-    if path.starts_with(child) {
+    let node = boundary.node.id;
+    if document.is_inclusive_ancestor(child, node) {
         boundary.node = parent_handle.clone();
         boundary.offset = child_start;
         return;
     }
-    if !child.starts_with(&path) {
+    if !document.is_inclusive_ancestor(node, child) {
         return;
     }
-    let document = document.borrow();
-    let Some(ancestor_start) = document.element_text_offset(&path) else {
+    let Some(ancestor_start) = document.node_text_offset(node) else {
         return;
     };
-    let Some(removed_start) = document.element_text_offset(child) else {
+    let Some(removed_start) = document.node_text_offset(child) else {
         return;
     };
     let removed_start = removed_start.saturating_sub(ancestor_start);
@@ -15502,26 +13867,23 @@ fn adjust_range_boundary_for_remove(
 
 fn adjust_range_boundary_for_replacement(
     boundary: &mut RangeBoundary,
-    target: &[usize],
+    target: NodeId,
     target_start: usize,
     old_length: usize,
     new_length: usize,
     target_handle: &ElementHandle,
-    document: &Rc<RefCell<Document>>,
+    document: &Document,
 ) {
-    let Some(path) = attached_path(&boundary.node) else {
-        return;
-    };
-    if path.len() > target.len() && path.starts_with(target) {
+    let node = boundary.node.id;
+    if node != target && document.is_inclusive_ancestor(target, node) {
         boundary.node = target_handle.clone();
         boundary.offset = 0;
         return;
     }
-    if path == target || !target.starts_with(&path) {
+    if node == target || !document.is_inclusive_ancestor(node, target) {
         return;
     }
-    let document = document.borrow();
-    let Some(ancestor_start) = document.node_text_offset(&path) else {
+    let Some(ancestor_start) = document.node_text_offset(node) else {
         return;
     };
     let replacement_start = target_start.saturating_sub(ancestor_start);
@@ -15531,26 +13893,23 @@ fn adjust_range_boundary_for_replacement(
 
 fn adjust_range_boundary_for_character_data_edit(
     boundary: &mut RangeBoundary,
-    target: &[usize],
+    target: NodeId,
     target_start: usize,
     replacement_start: usize,
     old_length: usize,
     new_length: usize,
-    document: &Rc<RefCell<Document>>,
+    document: &Document,
 ) {
-    let Some(path) = attached_path(&boundary.node) else {
-        return;
-    };
-    if path == target {
+    let node = boundary.node.id;
+    if node == target {
         boundary.offset =
             remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
         return;
     }
-    if !target.starts_with(&path) {
+    if !document.is_inclusive_ancestor(node, target) {
         return;
     }
-    let document = document.borrow();
-    let Some(ancestor_start) = document.node_text_offset(&path) else {
+    let Some(ancestor_start) = document.node_text_offset(node) else {
         return;
     };
     let replacement_start = target_start
@@ -15562,37 +13921,13 @@ fn adjust_range_boundary_for_character_data_edit(
 
 fn adjust_range_boundary_for_split_text(
     boundary: &mut RangeBoundary,
-    target: &[usize],
+    target: NodeId,
     offset: usize,
     right: &ElementHandle,
 ) {
-    if attached_path(&boundary.node).as_deref() == Some(target) && boundary.offset > offset {
+    if boundary.node.id == target && boundary.offset > offset {
         boundary.node = right.clone();
         boundary.offset -= offset;
-    }
-}
-
-fn adjust_range_boundary_for_normalize_empty(
-    boundary: &mut RangeBoundary,
-    child_id: NodeId,
-    parent: &ElementHandle,
-    parent_offset: usize,
-) {
-    if attached_node_id(&boundary.node) == Some(child_id) {
-        boundary.node = parent.clone();
-        boundary.offset = parent_offset;
-    }
-}
-
-fn adjust_range_boundary_for_normalize_merge(
-    boundary: &mut RangeBoundary,
-    child_id: NodeId,
-    first: &ElementHandle,
-    first_length: usize,
-) {
-    if attached_node_id(&boundary.node) == Some(child_id) {
-        boundary.node = first.clone();
-        boundary.offset = first_length.saturating_add(boundary.offset);
     }
 }
 
@@ -15618,210 +13953,6 @@ fn remap_range_offset(
             replacement_start
         }
     }
-}
-
-fn node_value(path: NodePath, document: &Rc<RefCell<Document>>) -> Value {
-    if path.is_empty() {
-        Value::Document
-    } else {
-        attached_handle(path, document)
-            .map(Value::Element)
-            .unwrap_or(Value::Null)
-    }
-}
-
-fn shift_path_for_insert(path: &mut NodePath, parent: &[usize], index: usize) {
-    if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] >= index {
-        path[parent.len()] += 1;
-    }
-}
-
-fn shift_hash_map_paths<V>(paths: &mut HashMap<NodePath, V>, parent: &[usize], index: usize) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|(mut path, value)| {
-            shift_path_for_insert(&mut path, parent, index);
-            (path, value)
-        })
-        .collect();
-}
-
-fn shift_btree_map_paths<V>(paths: &mut BTreeMap<NodePath, V>, parent: &[usize], index: usize) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|(mut path, value)| {
-            shift_path_for_insert(&mut path, parent, index);
-            (path, value)
-        })
-        .collect();
-}
-
-fn shift_btree_set_paths(paths: &mut BTreeSet<NodePath>, parent: &[usize], index: usize) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|mut path| {
-            shift_path_for_insert(&mut path, parent, index);
-            path
-        })
-        .collect();
-}
-
-fn shift_hash_map_paths_for_remove<V>(
-    paths: &mut HashMap<NodePath, V>,
-    parent: &[usize],
-    index: usize,
-) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|(mut path, value)| {
-            shift_path_for_remove(&mut path, parent, index);
-            (path, value)
-        })
-        .collect();
-}
-
-fn shift_btree_map_paths_for_remove<V>(
-    paths: &mut BTreeMap<NodePath, V>,
-    parent: &[usize],
-    index: usize,
-) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|(mut path, value)| {
-            shift_path_for_remove(&mut path, parent, index);
-            (path, value)
-        })
-        .collect();
-}
-
-fn shift_btree_set_paths_for_remove(
-    paths: &mut BTreeSet<NodePath>,
-    parent: &[usize],
-    index: usize,
-) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|mut path| {
-            shift_path_for_remove(&mut path, parent, index);
-            path
-        })
-        .collect();
-}
-
-fn relocate_path_for_move(
-    path: &NodePath,
-    source: &[usize],
-    source_parent: &[usize],
-    source_index: usize,
-    destination_parent: &[usize],
-    destination_index: usize,
-    destination: &[usize],
-) -> NodePath {
-    if path.starts_with(source) {
-        let mut relocated = destination.to_vec();
-        relocated.extend_from_slice(&path[source.len()..]);
-        return relocated;
-    }
-    let mut relocated = path.clone();
-    shift_path_for_remove(&mut relocated, source_parent, source_index);
-    shift_path_for_insert(&mut relocated, destination_parent, destination_index);
-    relocated
-}
-
-fn shift_path_for_remove(path: &mut NodePath, parent: &[usize], index: usize) {
-    if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] > index {
-        path[parent.len()] -= 1;
-    }
-}
-
-fn relocate_hash_map_paths<V>(
-    paths: &mut HashMap<NodePath, V>,
-    source: &[usize],
-    source_parent: &[usize],
-    source_index: usize,
-    destination_parent: &[usize],
-    destination_index: usize,
-    destination: &[usize],
-) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|(path, value)| {
-            (
-                relocate_path_for_move(
-                    &path,
-                    source,
-                    source_parent,
-                    source_index,
-                    destination_parent,
-                    destination_index,
-                    destination,
-                ),
-                value,
-            )
-        })
-        .collect();
-}
-
-fn relocate_btree_map_paths<V>(
-    paths: &mut BTreeMap<NodePath, V>,
-    source: &[usize],
-    source_parent: &[usize],
-    source_index: usize,
-    destination_parent: &[usize],
-    destination_index: usize,
-    destination: &[usize],
-) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|(path, value)| {
-            (
-                relocate_path_for_move(
-                    &path,
-                    source,
-                    source_parent,
-                    source_index,
-                    destination_parent,
-                    destination_index,
-                    destination,
-                ),
-                value,
-            )
-        })
-        .collect();
-}
-
-fn relocate_btree_set_paths(
-    paths: &mut BTreeSet<NodePath>,
-    source: &[usize],
-    source_parent: &[usize],
-    source_index: usize,
-    destination_parent: &[usize],
-    destination_index: usize,
-    destination: &[usize],
-) {
-    let current = std::mem::take(paths);
-    *paths = current
-        .into_iter()
-        .map(|path| {
-            relocate_path_for_move(
-                &path,
-                source,
-                source_parent,
-                source_index,
-                destination_parent,
-                destination_index,
-                destination,
-            )
-        })
-        .collect();
 }
 
 fn selection_anchor_focus(selection: TextSelection) -> (usize, usize) {
@@ -16827,7 +14958,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Iterator(left), Value::Iterator(right)) => Rc::ptr_eq(left, right),
         (Value::Promise(left), Value::Promise(right)) => Rc::ptr_eq(left, right),
         (Value::Element(left), Value::Element(right))
-        | (Value::Style(left), Value::Style(right)) => left == right,
+        | (Value::Style(left), Value::Style(right)) => Rc::ptr_eq(left, right),
         (Value::Validity(left), Value::Validity(right)) => Rc::ptr_eq(left, right),
         (Value::Range(left), Value::Range(right)) => Rc::ptr_eq(left, right),
         (Value::Selection(left), Value::Selection(right)) => Rc::ptr_eq(left, right),
@@ -16874,7 +15005,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Response(left), Value::Response(right)) => Rc::ptr_eq(left, right),
         (Value::VmIterator(left), Value::VmIterator(right)) => Rc::ptr_eq(left, right),
         (Value::Dataset(left), Value::Dataset(right))
-        | (Value::ClassList(left), Value::ClassList(right)) => left == right,
+        | (Value::ClassList(left), Value::ClassList(right)) => Rc::ptr_eq(left, right),
         (Value::Event(left), Value::Event(right)) => Rc::ptr_eq(&left.state, &right.state),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
@@ -17427,7 +15558,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("from module ready|from module")
         );
         assert_eq!(
@@ -17472,7 +15603,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("9|012|2|later|https://app.ceri.invalid/")
         );
     }
@@ -17500,7 +15631,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("primary|secondary")
         );
     }
@@ -17534,7 +15665,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("re-exported")
         );
     }
@@ -17568,7 +15699,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("explicit|2")
         );
     }
@@ -17610,7 +15741,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|1|2|2")
         );
     }
@@ -17672,7 +15803,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("loaded|2")
         );
     }
@@ -17705,7 +15836,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("json|2")
         );
     }
@@ -17738,7 +15869,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("TypeError: unsupported dynamic import type css")
         );
     }
@@ -17782,7 +15913,7 @@ mod tests {
             let element = document
                 .find_element_by_id(id)
                 .expect("element should exist");
-            document.element_text_content(&element)
+            document.element_text_content(element)
         };
         assert_eq!(text("status").as_deref(), Some("async|3"));
         assert_eq!(
@@ -17836,7 +15967,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready 3|3")
         );
     }
@@ -17862,7 +15993,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("loaded /entry.js")
         );
     }
@@ -17886,7 +16017,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&path).as_deref(),
+            document.borrow().element_text_content(path).as_deref(),
             Some("before changed")
         );
         assert_eq!(runtime.logs(), &["before changed"]);
@@ -17912,7 +16043,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("inside")
         );
     }
@@ -17942,7 +16073,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("module|2|2")
         );
     }
@@ -17968,7 +16099,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("module|storage|")
         );
     }
@@ -17998,7 +16129,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready|a|2|kept|c|1|x1y2")
         );
     }
@@ -18030,7 +16161,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("fallback|2|yes|one|one second|fourth|guest|Ceri|missing|present|")
         );
     }
@@ -18056,7 +16187,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready|2|yes|undefined|undefined")
         );
     }
@@ -18097,7 +16228,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("abc")
         );
     }
@@ -18147,7 +16278,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("module|false|storage|false|true|0")
         );
     }
@@ -18175,7 +16306,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1,2|a1,b2|a,b")
         );
     }
@@ -18204,7 +16335,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("new|<p class=\"replacement\">new</p>")
         );
         let mount = document
@@ -18212,7 +16343,7 @@ mod tests {
             .find_element_by_id("mount")
             .expect("mount should exist");
         assert_eq!(
-            document.borrow().element_inner_html(&mount).as_deref(),
+            Some(document.borrow().inner_html(mount).as_str()),
             Some("<p class=\"replacement\">new</p>")
         );
     }
@@ -18239,14 +16370,11 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
         assert_eq!(
-            document
-                .borrow()
-                .style_property(&status, "color")
-                .as_deref(),
+            document.borrow().style_property(status, "color").as_deref(),
             Some("#42d3b4")
         );
     }
@@ -18281,7 +16409,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|0")
         );
     }
@@ -18313,7 +16441,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("0")
         );
     }
@@ -18347,7 +16475,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("2|1")
         );
     }
@@ -18382,7 +16510,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1")
         );
     }
@@ -18424,7 +16552,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("0|0")
         );
     }
@@ -18452,7 +16580,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("0")
         );
     }
@@ -18484,7 +16612,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("0")
         );
     }
@@ -18517,12 +16645,12 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("click:label:button|root")
         );
         assert!(runtime.click_id("label").expect("click should dispatch"));
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("click:label:button|root")
         );
     }
@@ -18548,7 +16676,7 @@ mod tests {
             document
                 .borrow()
                 .element_text_content(
-                    &document
+                    document
                         .borrow()
                         .find_element_by_id("status")
                         .expect("status should exist"),
@@ -18589,7 +16717,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready")
         );
     }
@@ -18619,7 +16747,7 @@ mod tests {
             .borrow()
             .find_element_by_id("name")
             .expect("input should exist");
-        assert!(runtime.focus_path(input_path).expect("input should focus"));
+        assert!(runtime.focus_node(input_path).expect("input should focus"));
         assert!(runtime.insert_text("ust").expect("text should insert"));
         assert!(
             runtime
@@ -18632,7 +16760,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(":Rus|blur:null")
         );
     }
@@ -18648,7 +16776,10 @@ mod tests {
                 .apply_autofocus()
                 .expect("autofocus should focus the first valid candidate")
         );
-        assert_eq!(runtime.active_element(), Some(vec![2]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[2]))
+        );
         assert!(
             !runtime
                 .apply_autofocus()
@@ -18661,13 +16792,19 @@ mod tests {
         manual_runtime
             .execute("document.getElementById(\"second\").focus();")
             .expect("script focus should execute");
-        assert_eq!(manual_runtime.active_element(), Some(vec![1]));
+        assert_eq!(
+            manual_runtime.active_element(),
+            Some(manual_runtime.document().borrow().node_at(&[1]))
+        );
         assert!(
             !manual_runtime
                 .apply_autofocus()
                 .expect("autofocus should preserve script focus")
         );
-        assert_eq!(manual_runtime.active_element(), Some(vec![1]));
+        assert_eq!(
+            manual_runtime.active_element(),
+            Some(manual_runtime.document().borrow().node_at(&[1]))
+        );
     }
 
     #[test]
@@ -18689,7 +16826,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|rust")
         );
         let code_path = document
@@ -18698,7 +16835,7 @@ mod tests {
             .expect("code input should exist");
         assert!(
             runtime
-                .focus_path(code_path.clone())
+                .focus_node(code_path)
                 .expect("readonly input should remain focusable")
         );
         assert!(
@@ -18716,7 +16853,10 @@ mod tests {
                 .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
                 .expect("readonly input should allow selection movement")
         );
-        assert_eq!(runtime.active_element(), Some(vec![0]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[0]))
+        );
         runtime
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").selectionStart + \"|\" + document.getElementById(\"code\").selectionEnd;")
             .expect("readonly selection should remain script-visible");
@@ -18726,7 +16866,7 @@ mod tests {
                 .expect("readonly input should reject composition")
         );
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("3|3")
         );
         let note_path = document
@@ -18735,7 +16875,7 @@ mod tests {
             .expect("readonly textarea should exist");
         assert!(
             runtime
-                .focus_path(note_path)
+                .focus_node(note_path)
                 .expect("readonly textarea should remain focusable")
         );
         assert!(
@@ -18747,12 +16887,12 @@ mod tests {
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"note\").value;")
             .expect("readonly textarea value should remain script-visible");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("draft")
         );
         assert!(
             runtime
-                .focus_path(code_path)
+                .focus_node(code_path)
                 .expect("code input should regain focus")
         );
         runtime
@@ -18767,7 +16907,7 @@ mod tests {
             .execute("document.getElementById(\"status\").textContent = document.getElementById(\"code\").value;")
             .expect("script should read the updated value");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("scr!ipt")
         );
     }
@@ -18798,21 +16938,21 @@ mod tests {
                 .expect("host text should insert up to maxlength")
         );
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("😀|ab😀")
         );
         runtime
             .execute("code.value = \"script-long\"; status.textContent = code.value;")
             .expect("script value writes should remain unrestricted");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("script-long")
         );
         runtime
             .execute("status.textContent = code.value + \"|\" + code.validity.tooLong;")
             .expect("script value validity should remain separate from user edits");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("script-long|false")
         );
 
@@ -18822,7 +16962,7 @@ mod tests {
             .expect("IME input should exist");
         assert!(
             runtime
-                .focus_path(ime_path.clone())
+                .focus_node(ime_path)
                 .expect("IME input should focus")
         );
         assert!(
@@ -18830,19 +16970,13 @@ mod tests {
                 .composition_update("😀x", None)
                 .expect("composition should fit whole UTF-16 characters")
         );
-        assert_eq!(
-            runtime.control_value_path(&ime_path).as_deref(),
-            Some("abc😀")
-        );
+        assert_eq!(runtime.control_value(ime_path).as_deref(), Some("abc😀"));
         assert!(
             runtime
                 .composition_commit("xy")
                 .expect("composition should commit within maxlength")
         );
-        assert_eq!(
-            runtime.control_value_path(&ime_path).as_deref(),
-            Some("abcxy")
-        );
+        assert_eq!(runtime.control_value(ime_path).as_deref(), Some("abcxy"));
 
         let note_path = document
             .borrow()
@@ -18850,7 +16984,7 @@ mod tests {
             .expect("textarea should exist");
         assert!(
             runtime
-                .focus_path(note_path.clone())
+                .focus_node(note_path)
                 .expect("textarea should focus")
         );
         assert!(
@@ -18858,19 +16992,13 @@ mod tests {
                 .key_down_with_modifiers("Enter", KeyModifiers::default())
                 .expect("Enter should use the last available UTF-16 unit")
         );
-        assert_eq!(
-            runtime.control_value_path(&note_path).as_deref(),
-            Some("abc\n")
-        );
+        assert_eq!(runtime.control_value(note_path).as_deref(), Some("abc\n"));
         assert!(
             !runtime
                 .key_down_with_modifiers("Enter", KeyModifiers::default())
                 .expect("Enter should stop at maxlength")
         );
-        assert_eq!(
-            runtime.control_value_path(&note_path).as_deref(),
-            Some("abc\n")
-        );
+        assert_eq!(runtime.control_value(note_path).as_deref(), Some("abc\n"));
     }
 
     #[test]
@@ -18900,7 +17028,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true:true:false:value missing:false:2")
         );
 
@@ -18910,7 +17038,7 @@ mod tests {
             .expect("name input should exist");
         assert!(
             runtime
-                .focus_path(name_path)
+                .focus_node(name_path)
                 .expect("name input should focus")
         );
         assert!(
@@ -18922,7 +17050,7 @@ mod tests {
             .execute("status.textContent = name.value + \"|\" + validity.tooShort + \"|\" + name.checkValidity() + \"|\" + form.checkValidity() + \"|\" + submits;")
             .expect("short value validity should be readable");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("x|true|false|false|0")
         );
         assert!(
@@ -18934,7 +17062,7 @@ mod tests {
             .execute("name.setCustomValidity(\"custom\"); status.textContent = validity.customError + \"|\" + name.validationMessage + \"|\" + name.checkValidity() + \"|\" + submits; name.setCustomValidity(\"\"); form.requestSubmit(); status.textContent = name.value + \"|\" + validity.valid + \"|\" + submits;")
             .expect("custom validity and valid submission should execute");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("xyz|true|1")
         );
     }
@@ -18964,7 +17092,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|false|true|blocked|false|true|false|live|false|true|live")
         );
     }
@@ -18991,7 +17119,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|true|true|true|type mismatch")
         );
         runtime
@@ -19002,7 +17130,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|true|true")
         );
     }
@@ -19043,7 +17171,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("updated|updated|false|false|draft|1")
         );
         assert!(
@@ -19056,7 +17184,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should remain attached");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("reset:profile:profile")
         );
     }
@@ -19091,7 +17219,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("changed|later|false|false|edited")
         );
     }
@@ -19126,7 +17254,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("3|true|true|false|true|1|e|external-form|true|false|true|0|legend")
         );
         let blocked_path = document
@@ -19138,8 +17266,8 @@ mod tests {
             .find_element_by_id("legend")
             .expect("legend control should exist");
         let style_state = runtime.style_state(None);
-        assert!(style_state.disabled_paths.contains(&blocked_path));
-        assert!(!style_state.disabled_paths.contains(&legend_path));
+        assert!(style_state.disabled.contains(&blocked_path));
+        assert!(!style_state.disabled.contains(&legend_path));
     }
 
     #[test]
@@ -19179,7 +17307,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("|0|3|1|false|1|Pro|1|0|pro|1|a|2|true|pro|a,b|pro|1|a|1|true|true")
         );
     }
@@ -19203,7 +17331,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("b|1|false|true|1")
         );
     }
@@ -19235,7 +17363,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("b|1|2|false|true|d|1|2|false|true")
         );
     }
@@ -19269,7 +17397,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|2|v|true")
         );
     }
@@ -19301,7 +17429,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|last|gone|last|1")
         );
     }
@@ -19341,20 +17469,20 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("inserted|middle shifted|last shifted|mount|last|survived")
         );
         assert_eq!(
             document.borrow().find_element_by_id("inserted"),
-            Some(vec![0, 1])
+            Some(document.borrow().node_at(&[0, 1]))
         );
         assert_eq!(
             document.borrow().find_element_by_id("middle"),
-            Some(vec![0, 2])
+            Some(document.borrow().node_at(&[0, 2]))
         );
         assert_eq!(
             document.borrow().find_element_by_id("last"),
-            Some(vec![0, 3])
+            Some(document.borrow().node_at(&[0, 3]))
         );
     }
 
@@ -19388,20 +17516,20 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("target|stay shifted|reference shifted|1")
         );
         assert_eq!(
             document.borrow().find_element_by_id("move"),
-            Some(vec![1, 0])
+            Some(document.borrow().node_at(&[1, 0]))
         );
         assert_eq!(
             document.borrow().find_element_by_id("stay"),
-            Some(vec![0, 0])
+            Some(document.borrow().node_at(&[0, 0]))
         );
         assert_eq!(
             document.borrow().find_element_by_id("reference"),
-            Some(vec![1, 1])
+            Some(document.borrow().node_at(&[1, 1]))
         );
     }
 
@@ -19430,16 +17558,16 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("target|move|1")
         );
         assert_eq!(
             document.borrow().find_element_by_id("move"),
-            Some(vec![1, 2])
+            Some(document.borrow().node_at(&[1, 2]))
         );
         assert_eq!(
             document.borrow().find_element_by_id("stay"),
-            Some(vec![0, 0])
+            Some(document.borrow().node_at(&[0, 0]))
         );
     }
 
@@ -19467,8 +17595,9 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
-            Some("a|0|1|a|0|2")
+            document.borrow().element_text_content(status).as_deref(),
+            // the re-inserted option kept its selectedness, and the last selected option wins
+            Some("a|0|1|b|1|2")
         );
     }
 
@@ -19501,7 +17630,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|0")
         );
     }
@@ -19527,9 +17656,116 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("mount:mount|true|last")
         );
+    }
+
+    fn status_text(document: &Rc<RefCell<Document>>) -> Option<String> {
+        let document = document.borrow();
+        let status = document
+            .find_element_by_id("status")
+            .expect("status should exist");
+        document.element_text_content(status)
+    }
+
+    #[test]
+    fn builds_detached_trees_and_keeps_one_handle_per_node() {
+        let document = document(r#"<ul id="list"></ul><p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const list = document.getElementById("list");
+                const item = document.createElement("li");
+                item.setAttribute("data-kind", "row");
+                const label = document.createElement("span");
+                label.textContent = "first";
+                item.appendChild(label);
+                const detached = item.parentNode === null && label.parentNode === item;
+                list.append(item, "second", document.createElement("li"));
+                document.getElementById("status").textContent = [
+                    detached,
+                    list.childNodes.length,
+                    list.firstChild === item,
+                    list.querySelector("span") === label,
+                    document.getElementById("list") === list,
+                    list.innerHTML,
+                ].join("|");
+                "#,
+            )
+            .expect("detached trees should build and insert");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                r#"true|3|true|true|true|<li data-kind="row"><span>first</span></li>second<li></li>"#
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_errors_and_missing_references_as_dom_exceptions() {
+        let document = document(
+            r#"<main id="outer"><section id="inner"></section></main><p id="status"></p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const outer = document.getElementById("outer");
+                const inner = document.getElementById("inner");
+                const results = [];
+                try { inner.appendChild(outer); } catch (error) { results.push(error.name); }
+                try { inner.insertBefore(document.createElement("b"), outer); } catch (error) { results.push(error.name); }
+                try { inner.removeChild(outer); } catch (error) { results.push(error.name); }
+                try { inner.appendChild("text"); } catch (error) { results.push(error.name); }
+                results.push(outer.parentNode !== null);
+                document.getElementById("status").textContent = results.join("|");
+                "#,
+            )
+            .expect("dom errors should be catchable");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("HierarchyRequestError|NotFoundError|NotFoundError|TypeError|true")
+        );
+    }
+
+    #[test]
+    fn frees_removed_subtrees_once_script_drops_them() {
+        let document =
+            document(r#"<main id="mount"><p id="kept">kept</p><p id="dropped">dropped</p></main>"#);
+        let (kept, dropped, dropped_text) = {
+            let document = document.borrow();
+            let dropped = document
+                .find_element_by_id("dropped")
+                .expect("dropped exists");
+            (
+                document.find_element_by_id("kept").expect("kept exists"),
+                dropped,
+                document.children(dropped)[0],
+            )
+        };
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                globalThis.held = document.getElementById("kept");
+                held.remove();
+                document.getElementById("dropped").remove();
+                "#,
+            )
+            .expect("removal should execute");
+        let document = document.borrow();
+        assert!(
+            document.contains(kept),
+            "a node script still holds survives"
+        );
+        assert!(!document.is_connected(kept));
+        assert!(
+            !document.contains(dropped),
+            "an unreachable subtree is freed"
+        );
+        assert!(!document.contains(dropped_text));
     }
 
     #[test]
@@ -19555,7 +17791,7 @@ mod tests {
             .expect("first input should exist");
         assert!(
             runtime
-                .focus_path(first_path)
+                .focus_node(first_path)
                 .expect("first input should focus")
         );
         assert!(
@@ -19563,7 +17799,10 @@ mod tests {
                 .key_down_with_modifiers("Tab", KeyModifiers::default())
                 .expect("Tab should move focus")
         );
-        assert_eq!(runtime.active_element(), Some(vec![1]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[1]))
+        );
         assert_eq!(
             runtime.execute("document.getElementById(\"status\").textContent = events;"),
             Ok(())
@@ -19573,7 +17812,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("first-blur|second-focus|")
         );
         assert!(
@@ -19587,7 +17826,10 @@ mod tests {
                 )
                 .expect("Shift+Tab should move focus backward")
         );
-        assert_eq!(runtime.active_element(), Some(vec![0]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[0]))
+        );
         assert!(
             runtime
                 .key_down_with_modifiers(
@@ -19599,7 +17841,10 @@ mod tests {
                 )
                 .expect("Shift+Tab should reach positive tabindex entries")
         );
-        assert_eq!(runtime.active_element(), Some(vec![3]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[3]))
+        );
         assert!(
             runtime
                 .key_down_with_modifiers(
@@ -19611,7 +17856,10 @@ mod tests {
                 )
                 .expect("Shift+Tab should follow positive tabindex ordering")
         );
-        assert_eq!(runtime.active_element(), Some(vec![4]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[4]))
+        );
         let skipped_path = document
             .borrow()
             .find_element_by_id("skip")
@@ -19649,7 +17897,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1:4:backward|hio:2:2:none|hi:0:2|null|2:2")
         );
 
@@ -19657,7 +17905,7 @@ mod tests {
             .borrow()
             .find_element_by_id("name")
             .expect("input should exist");
-        assert!(runtime.focus_path(input_path).expect("input should focus"));
+        assert!(runtime.focus_node(input_path).expect("input should focus"));
         runtime
             .execute("document.getElementById(\"name\").setSelectionRange(1, 2);")
             .expect("selection should update");
@@ -19689,7 +17937,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("!ho")
         );
     }
@@ -19704,7 +17952,7 @@ mod tests {
             .expect("textarea should exist");
         assert!(
             runtime
-                .focus_path(note_path)
+                .focus_node(note_path)
                 .expect("textarea should focus")
         );
         assert!(
@@ -19712,13 +17960,23 @@ mod tests {
                 .key_down_with_modifiers("Enter", KeyModifiers::default())
                 .expect("Enter should insert a line break")
         );
-        assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("AB\n"));
+        assert_eq!(
+            runtime
+                .control_value(runtime.document().borrow().node_at(&[0]))
+                .as_deref(),
+            Some("AB\n")
+        );
         assert!(
             runtime
                 .key_down_with_modifiers("Backspace", KeyModifiers::default())
                 .expect("Backspace should remove the line break")
         );
-        assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("AB"));
+        assert_eq!(
+            runtime
+                .control_value(runtime.document().borrow().node_at(&[0]))
+                .as_deref(),
+            Some("AB")
+        );
         assert!(
             runtime
                 .key_down_with_modifiers("ArrowLeft", KeyModifiers::default())
@@ -19729,7 +17987,12 @@ mod tests {
                 .key_down_with_modifiers("Delete", KeyModifiers::default())
                 .expect("Delete should remove the final character")
         );
-        assert_eq!(runtime.control_value_path(&[0]).as_deref(), Some("A"));
+        assert_eq!(
+            runtime
+                .control_value(runtime.document().borrow().node_at(&[0]))
+                .as_deref(),
+            Some("A")
+        );
     }
 
     #[test]
@@ -19773,7 +18036,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|3|backward|true:true:false:true")
         );
         assert!(
@@ -19794,7 +18057,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("3|3|none")
         );
     }
@@ -19829,7 +18092,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("hello|hello|ell|0:5:false:copy|1:copy:0:5|true::1:2")
         );
     }
@@ -19864,7 +18127,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("llowor|llowor|first:2|second:3|root")
         );
     }
@@ -19908,7 +18171,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("3:#text:hello:first:target:1:true|true|elloignoredwor|#text:1:#text:3:root")
         );
     }
@@ -19940,7 +18203,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("elloworl|first|target")
         );
     }
@@ -19978,7 +18241,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("!|worldtailhello|true:true:true:true|hello:1:hello:4:ell")
         );
     }
@@ -20013,16 +18276,16 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("world|second|second|x|5")
         );
         assert_eq!(
             document.borrow().find_element_by_id("second"),
-            Some(vec![0, 2])
+            Some(document.borrow().node_at(&[0, 2]))
         );
         assert_eq!(
             document.borrow().find_element_by_id("first"),
-            Some(vec![0, 0])
+            Some(document.borrow().node_at(&[0, 0]))
         );
     }
 
@@ -20069,7 +18332,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("first:0|first:0||6:14:newafter|1|first:0|first:0||6:18:longer!after|3")
         );
     }
@@ -20118,7 +18381,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true:new|0:0:|6:14:newafter|1|true:longer|0:0:|6:17:longerafter|3")
         );
     }
@@ -20154,7 +18417,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("he:llo:true:true|he:1:llo:2:ell|1")
         );
     }
@@ -20188,8 +18451,8 @@ mod tests {
                 status.textContent = text.data + "|" + first.childNodes.length + "|" +
                     (first.childNodes[0] === text) + "|" + range.startContainer.data + ":" +
                     range.startOffset + ":" + range.endContainer.data + ":" + range.endOffset + ":" +
-                    range.toString() + "|" + clicks + "|" + changes + "|" + (right.data === null) +
-                    "|" + (empty.data === null);
+                    range.toString() + "|" + clicks + "|" + changes + "|" + (right.parentNode === null) +
+                    "|" + (empty.parentNode === null);
                 "#,
             )
             .expect("normalize should execute");
@@ -20198,8 +18461,8 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
-            Some("hello|2|true|hello:3:hello:5:lo|1|2|true|true")
+            document.borrow().element_text_content(status).as_deref(),
+            Some("hello|2|true|hello:3:hello:5:lo|1|1|true|true")
         );
     }
 
@@ -20221,7 +18484,7 @@ mod tests {
                 const status = document.getElementById("status");
                 status.textContent = first.textContent + "|" + first.childNodes.length + "|" +
                     (first.firstChild === right) + "|" + (range.startContainer === first) + ":" +
-                    range.startOffset + ":" + range.endOffset + "|" + (text.data === null);
+                    range.startOffset + ":" + range.endOffset + "|" + (text.parentNode === null);
                 "#,
             )
             .expect("normalize should remove empty text");
@@ -20230,7 +18493,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("hello|1|true|true:0:0|true")
         );
     }
@@ -20283,7 +18546,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "ell|heXllo:1:5:eXll|1:6:eXllo|hllo:1:3:ll|1:4:llo|hYYo:1:3:YY|1:4:YYo|hYYo!:1:3:YY|1:4:YYo|2|😀"
             )
@@ -20322,7 +18585,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true:true:true:true:true:true:false:true|true:true:true")
         );
     }
@@ -20361,7 +18624,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("2:2:true:true|true:true:true:true:true:true|1:true:true:true")
         );
     }
@@ -20398,7 +18661,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true:source:false:true:insidetail:true:tail:0:true")
         );
     }
@@ -20427,7 +18690,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined"
             )
@@ -20465,7 +18728,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("new!tail:true:true:true|new!tailold:1:true:true")
         );
     }
@@ -20502,7 +18765,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "keep|true:true:true|outerHTML element has no parent node|outerHTML cannot replace a direct child of the document"
             )
@@ -20538,7 +18801,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("startprefix middleleft bold tail42|2:true:true:true:true:true")
         );
     }
@@ -20573,7 +18836,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("startoldfreshend|true:true:true:1:2:true")
         );
     }
@@ -20610,7 +18873,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("onepre!post1post2boldtailend|2:true:true:true:true:true:true")
         );
     }
@@ -20645,7 +18908,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("oneprereplacementposttail|true:true:true:true:true:")
         );
     }
@@ -20679,7 +18942,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("startheadonepre!posttailendtail2|5:true:true:true:true")
         );
     }
@@ -20720,7 +18983,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|start hello! world|true:true:true:3:#text:true|true:true|a:bc:3:false")
         );
     }
@@ -20752,7 +19015,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("😀|Ax😀B|AQ:B!|3:#text:true:false")
         );
     }
@@ -20791,7 +19054,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("root:6|root:6||6:11:after|1")
         );
     }
@@ -20815,7 +19078,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("AxB|1|2")
         );
     }
@@ -20863,7 +19126,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "a安b|2|compositionstart:|compositionupdate:x:ab:true|x:axb:true|compositionupdate:xy:axb:true|xy:axyb:true|安:a安b:true|compositionend:安:a安b|"
             )
@@ -20899,7 +19162,7 @@ mod tests {
         assert_eq!(
             cancel_document
                 .borrow()
-                .element_text_content(&status_path)
+                .element_text_content(status_path)
                 .as_deref(),
             Some("ab")
         );
@@ -20927,7 +19190,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("12:34:event:34")
         );
     }
@@ -20955,7 +19218,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("12:34|15:38|event:38")
         );
     }
@@ -20987,7 +19250,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "/search|browser engine|2|q=browser+engine&tag=two&tag=three|https://app.ceri.invalid/search?q=browser+engine&tag=two&tag=three",
             )
@@ -21035,7 +19298,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "mode|mode|one|two|mode|one|mode=one;mode=two;tag=rust;|3|?mode=one&mode=two&tag=rust&mode=three|?mode=one&mode=two&mode=three&tag=rust|mode=one",
             )
@@ -21067,7 +19330,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("2:night:count:1:open:0:0")
         );
     }
@@ -21116,7 +19379,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "first|offline|true|1|https://app.ceri.invalid/data.txt|203|yes|cached|203|true|true:true:false",
             )
@@ -21158,7 +19421,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("rejected|rejected")
         );
     }
@@ -21196,7 +19459,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|hello|1:true")
         );
     }
@@ -21250,7 +19513,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("one:two|1:2|2|true")
         );
     }
@@ -21286,7 +19549,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ephemeral:1|1|0")
         );
     }
@@ -21327,7 +19590,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true:true")
         );
     }
@@ -21364,7 +19627,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("Updated|one|3|true|false|3|ok")
         );
     }
@@ -21401,7 +19664,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("|application/octet-stream|0")
         );
 
@@ -21437,7 +19700,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|true|true|true|true")
         );
     }
@@ -21464,13 +19727,16 @@ mod tests {
                 .click_id("explicit")
                 .expect("explicit label should activate its control")
         );
-        assert_eq!(runtime.active_element(), Some(vec![1]));
+        assert_eq!(
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[1]))
+        );
         let status = document
             .borrow()
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("focused:name")
         );
         assert!(
@@ -21478,9 +19744,12 @@ mod tests {
                 .click_id("caption")
                 .expect("wrapped label should activate its control")
         );
-        assert_eq!(runtime.active_element(), Some(vec![2, 1]));
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            runtime.active_element(),
+            Some(runtime.document().borrow().node_at(&[2, 1]))
+        );
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
             Some("checked:true")
         );
     }
@@ -21515,7 +19784,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("false")
         );
     }
@@ -21542,7 +19811,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("false|true|second")
         );
     }
@@ -21571,7 +19840,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("#ff0000")
         );
     }
@@ -21594,7 +19863,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("https://app.ceri.invalid/next.html?x=1|https://app.ceri.invalid|?x=1")
         );
 
@@ -21626,7 +19895,7 @@ mod tests {
             document
                 .borrow()
                 .element_text_content(
-                    &document
+                    document
                         .borrow()
                         .find_element_by_id("status")
                         .expect("status should exist"),
@@ -21665,7 +19934,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("two")
         );
     }
@@ -21691,7 +19960,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("later")
         );
     }
@@ -21715,7 +19984,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("16")
         );
     }
@@ -21739,7 +20008,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("idle")
         );
     }
@@ -21766,13 +20035,13 @@ mod tests {
             .find_element_by_selector(".created")
             .expect("created element should be attached");
         assert_eq!(
-            document.borrow().element_text_content(&created).as_deref(),
+            document.borrow().element_text_content(created).as_deref(),
             Some("created after append")
         );
         assert_eq!(
             document
                 .borrow()
-                .style_property(&created, "color")
+                .style_property(created, "color")
                 .as_deref(),
             Some("#42d3b4")
         );
@@ -21808,12 +20077,13 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&status, "class")
+                .attribute(status, "class")
+                .map(str::to_string)
                 .as_deref(),
             Some("active selected")
         );
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("active selected")
         );
         let created = document
@@ -21823,7 +20093,8 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&created, "class")
+                .attribute(created, "class")
+                .map(str::to_string)
                 .as_deref(),
             Some("")
         );
@@ -21859,7 +20130,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "200|true|application/json|https://app.ceri.invalid/data.json|{\"message\":\"hello\"}"
             )
@@ -21903,7 +20174,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "true|false|content-type,x-alpha,x-zed|content-type=text/plain|content-type=text/plain;x-alpha=first;x-zed=last;"
             )
@@ -21952,7 +20223,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("null|headers are immutable")
         );
         let requests = requests.borrow();
@@ -22024,7 +20295,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "POST|https://app.ceri.invalid/headers|reload|manual|PUT|yes|true|false|false|true|request body is already used"
             )
@@ -22034,7 +20305,7 @@ mod tests {
             .find_element_by_id("body")
             .expect("body status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&body).as_deref(),
+            document.borrow().element_text_content(body).as_deref(),
             Some("override body|true")
         );
         let requests = requests.borrow();
@@ -22094,7 +20365,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "default||201|Created|true|yes|null|false|true|created|response body is already used|202|Accepted|application/json|application/json|{\"answer\":42}|Response status must be an integer between 200 and 599|Response body is not allowed for this status"
             )
@@ -22133,7 +20404,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "error|0|false||default|307||https://app.ceri.invalid/next|false|headers are immutable|Response redirect status is invalid"
             )
@@ -22177,7 +20448,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready")
         );
         let requests = requests.borrow();
@@ -22236,7 +20507,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("hello world|2|yes|42|2|true")
         );
         assert_eq!(requests.borrow().len(), 1);
@@ -22329,7 +20600,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true:true|20|32|48|64|SubtleCrypto.digest does not support algorithm MD5")
         );
         runtime
@@ -22343,7 +20614,7 @@ mod tests {
             )
             .expect("digest should reject non-ArrayBuffer input");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("SubtleCrypto.digest expects an ArrayBuffer or Uint8Array")
         );
     }
@@ -22384,7 +20655,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("3:1:9:8|3:1:9:8|2:9:8|3:1:8|32:133:4|true:false|2:7:true:true:true")
         );
     }
@@ -22419,7 +20690,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("0:9:7:0|1:2:9:7|1:2:4:true:true|5:9")
         );
     }
@@ -22463,7 +20734,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("11|11|text/plain|5|application/test|world|ready|text/plain|5|true")
         );
         let requests = requests.borrow();
@@ -22513,7 +20784,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("report.txt|1234|6|text/plain|report|6|4|application/part|port|ready|true|true")
         );
         let requests = requests.borrow();
@@ -22560,7 +20831,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("done")
         );
         let requests = requests.borrow();
@@ -22609,7 +20880,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("done")
         );
         let requests = requests.borrow();
@@ -22670,7 +20941,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("blob|application/blob|custom.bin|application/file|1")
         );
         let requests = requests.borrow();
@@ -22728,7 +20999,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("two|2|blob|application/blob|custom.bin|application/file|file-bytes")
         );
         assert_eq!(requests.borrow().len(), 1);
@@ -22768,7 +21039,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("first|file|one|name.txt|first|one|first;file;first;|3|first|name.txt")
         );
     }
@@ -22806,7 +21077,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("200|true|https://app.ceri.invalid/final|followed")
         );
         assert_eq!(
@@ -22852,7 +21123,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "302|false|https://app.ceri.invalid/redirect|TypeError: fetch redirect was rejected"
             )
@@ -22890,7 +21161,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("submitted")
         );
         let requests = requests.borrow();
@@ -22935,7 +21206,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "abort|true|AbortError|The operation was aborted|AbortError|The operation was aborted|AbortError|The operation was aborted"
             )
@@ -22967,7 +21238,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready|false")
         );
     }
@@ -23001,7 +21272,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("hello|true|TypeError: response body is already used")
         );
     }
@@ -23035,7 +21306,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|false|true")
         );
     }
@@ -23069,7 +21340,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("hello|hello|200|https://app.ceri.invalid/data.txt")
         );
     }
@@ -23100,7 +21371,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("TypeError: response body is already used")
         );
     }
@@ -23142,7 +21413,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|true|16|10|true")
         );
     }
@@ -23180,7 +21451,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|4|4|true")
         );
     }
@@ -23211,7 +21482,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("4|8|true")
         );
     }
@@ -23245,7 +21516,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|TypeError: response body is already used")
         );
     }
@@ -23316,7 +21587,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("POST|refused")
         );
     }
@@ -23349,7 +21620,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("404|false|0|false")
         );
     }
@@ -23384,7 +21655,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("hello|4|2")
         );
     }
@@ -23413,7 +21684,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("invalid")
         );
     }
@@ -23439,7 +21710,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("caught")
         );
     }
@@ -23469,7 +21740,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("start|sync|callback")
         );
     }
@@ -23494,7 +21765,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready!")
         );
     }
@@ -23518,7 +21789,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready|2|{\"ok\":true,\"count\":2}")
         );
     }
@@ -23550,7 +21821,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("2|ok|true|1,4,6,7|5|4")
         );
     }
@@ -23580,7 +21851,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("base|copy|3|2|xy|ok|true")
         );
     }
@@ -23615,7 +21886,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "true|old,a,b|0,1,override|old=0,a=1,b=override|01|zero,one|Cannot convert undefined or null to object"
             )
@@ -23652,7 +21923,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "0:1:true;1:2:true;2:3:true;3:4:true;|2,3,4|3|Array.prototype.filter callback is not a function"
             )
@@ -23680,7 +21951,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|true|true|true|Ceri Engine|  CERI ENGINE  |ceri,engine|a")
         );
     }
@@ -23710,7 +21981,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true|DataCloneError: cyclic values are not supported in this slice")
         );
     }
@@ -23752,7 +22023,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|1|1|2|3|10|5|8|2|4:text/plain|report.txt|oops")
         );
     }
@@ -23796,7 +22067,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some(
                 "DataCloneError: value is not cloneable|structuredClone transfer lists are not supported in this slice",
             )
@@ -23852,7 +22123,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("9|1|2|1|text/plain|report.txt")
         );
     }
@@ -23922,7 +22193,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("echo|greeting|hello!|4|text/plain|1")
         );
     }
@@ -23965,7 +22236,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("remote!")
         );
         assert_eq!(requests.borrow().as_slice(), ["/worker.js"]);
@@ -24044,7 +22315,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("module!")
         );
     }
@@ -24082,7 +22353,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("missingWorkerGlobal is not defined")
         );
     }
@@ -24119,7 +22390,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("TypeError: Worker has been terminated")
         );
     }

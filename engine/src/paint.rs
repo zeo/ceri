@@ -1,5 +1,5 @@
 use crate::css::{BackgroundImage, BackgroundSize, Color, Gradient, ObjectFit, Overflow};
-use crate::dom::NodePath;
+use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
     ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect, TextRun, paint_order,
@@ -13,7 +13,7 @@ use std::path::Path;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CanvasCommand {
     FillRect {
-        path: NodePath,
+        node: NodeId,
         x: f32,
         y: f32,
         width: f32,
@@ -21,7 +21,7 @@ pub(crate) enum CanvasCommand {
         color: Color,
     },
     ClearRect {
-        path: NodePath,
+        node: NodeId,
         x: f32,
         y: f32,
         width: f32,
@@ -941,9 +941,9 @@ fn paint_canvas_command(
     clip: Option<Rect>,
     rect: Rect,
 ) {
-    let (path, x, y, width, height) = match command {
+    let (node, x, y, width, height) = match command {
         CanvasCommand::FillRect {
-            path,
+            node,
             x,
             y,
             width,
@@ -951,14 +951,14 @@ fn paint_canvas_command(
             ..
         }
         | CanvasCommand::ClearRect {
-            path,
+            node,
             x,
             y,
             width,
             height,
-        } => (path, *x, *y, *width, *height),
+        } => (node, *x, *y, *width, *height),
     };
-    if path != &canvas_box.path {
+    if *node != canvas_box.node {
         return;
     }
     let color = match command {
@@ -1278,7 +1278,7 @@ fn paint_box_surface(
     if let Some(background) = layout_box.background_image.as_ref()
         && let Some(layer) = images
             .iter()
-            .find(|layer| layer.background && layer.path == layout_box.path)
+            .find(|layer| layer.background && layer.node == layout_box.node)
     {
         let area = Rect {
             x: surface.x,
@@ -1304,7 +1304,7 @@ fn paint_box_surface(
         );
     }
     let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
-        || layout_box.path.is_empty()
+        || layout_box.is_document()
     {
         intersect_clip(
             clip,
@@ -1316,7 +1316,7 @@ fn paint_box_surface(
     if layout_box.tag == "img"
         && let Some(layer) = images
             .iter()
-            .find(|layer| !layer.background && layer.path == layout_box.path)
+            .find(|layer| !layer.background && layer.node == layout_box.node)
     {
         let content = Rect {
             x: surface.x,
@@ -1364,7 +1364,7 @@ fn paint_prose_selection(
 ) {
     for span in prose_selections {
         for run in &layout_box.text {
-            if run.node_path.as_ref() != Some(&span.path) || run.text.trim().is_empty() {
+            if run.node != Some(span.node) || run.text.trim().is_empty() {
                 continue;
             }
             let Some((selected_start, selected_end)) =
@@ -1419,7 +1419,7 @@ fn prose_selections_for_box(
             layout_box
                 .text
                 .iter()
-                .any(|run| run.node_path.as_ref() == Some(&span.path))
+                .any(|run| run.node == Some(span.node))
         })
         .cloned()
         .collect()
@@ -2141,6 +2141,13 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // node ids for hand-built layout trees, taken from one fixed document shape
+    fn node(path: &[usize]) -> NodeId {
+        crate::dom::Document::parse("<i></i><i><i></i></i>")
+            .expect("fixture parses")
+            .node_at(path)
+    }
     use crate::css::Stylesheet;
     use crate::dom::Document;
     use crate::layout::{LayoutBox, LayoutDocument, Rect, Size};
@@ -2153,8 +2160,8 @@ mod tests {
                 height: 24.0,
             },
             root: LayoutBox {
-                path: Vec::new(),
-                tag: "root".to_string(),
+                node: node(&[]),
+                tag: "#document".to_string(),
                 rect: Rect {
                     x: 0.0,
                     y: 0.0,
@@ -2182,7 +2189,7 @@ mod tests {
                     font_stack: crate::font::FontStack::default(),
                     color: Color::BLACK,
                     bold: false,
-                    node_path: Some(vec![1, 0]),
+                    node: Some(node(&[1, 0])),
                     node_offset: 0,
                     source_len: 6,
                 }],
@@ -2207,7 +2214,7 @@ mod tests {
             },
             images: Vec::new(),
             prose_selections: vec![crate::layout::ProseSpan {
-                path: vec![1, 0],
+                node: node(&[1, 0]),
                 start: 1,
                 end: 2,
                 continued: false,
@@ -2309,8 +2316,8 @@ mod tests {
                 height: 24.0,
             },
             root: LayoutBox {
-                path: Vec::new(),
-                tag: "root".to_string(),
+                node: node(&[]),
+                tag: "#document".to_string(),
                 rect: Rect {
                     x: 2.0,
                     y: 3.0,
@@ -2338,7 +2345,7 @@ mod tests {
                     font_stack: crate::font::FontStack::default(),
                     color: Color::WHITE,
                     bold: false,
-                    node_path: None,
+                    node: None,
                     node_offset: 0,
                     source_len: 0,
                 }],
@@ -2412,7 +2419,7 @@ mod tests {
                 height: 40.0,
             },
             root: LayoutBox {
-                path: Vec::new(),
+                node: node(&[]),
                 tag: "textarea".to_string(),
                 rect: Rect {
                     x: 2.0,
@@ -2442,7 +2449,7 @@ mod tests {
                         font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
                         bold: false,
-                        node_path: None,
+                        node: None,
                         node_offset: 0,
                         source_len: 0,
                     },
@@ -2456,7 +2463,7 @@ mod tests {
                         font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
                         bold: false,
-                        node_path: None,
+                        node: None,
                         node_offset: 0,
                         source_len: 0,
                     },
@@ -2506,8 +2513,8 @@ mod tests {
                 height: 20.0,
             },
             root: LayoutBox {
-                path: Vec::new(),
-                tag: "root".to_string(),
+                node: node(&[]),
+                tag: "#document".to_string(),
                 rect: Rect {
                     x: 0.0,
                     y: 0.0,
@@ -2532,7 +2539,7 @@ mod tests {
                 control_text_origin: None,
                 children: vec![
                     LayoutBox {
-                        path: vec![0],
+                        node: node(&[0]),
                         tag: "canvas".to_string(),
                         rect: Rect {
                             x: 0.0,
@@ -2572,7 +2579,7 @@ mod tests {
                         margin: Default::default(),
                     },
                     LayoutBox {
-                        path: vec![1],
+                        node: node(&[1]),
                         tag: "div".to_string(),
                         rect: Rect {
                             x: 0.0,
@@ -2630,7 +2637,7 @@ mod tests {
             prose_selections: Vec::new(),
         };
         let commands = [CanvasCommand::FillRect {
-            path: vec![0],
+            node: node(&[0]),
             x: 0.0,
             y: 0.0,
             width: 10.0,

@@ -784,7 +784,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
     }
@@ -826,7 +826,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("idle")
         );
         let scroll = host
@@ -974,7 +974,7 @@ mod tests {
                 .borrow()
                 .find_element_by_id("status")
                 .expect("status should exist");
-            if document.borrow().element_text_content(&status).as_deref() == Some("ready!") {
+            if document.borrow().element_text_content(status).as_deref() == Some("ready!") {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1061,7 +1061,7 @@ mod tests {
                 .document()
                 .expect("document should exist")
                 .borrow()
-                .element_text_content(&status)
+                .element_text_content(status)
                 .as_deref(),
             Some("down up click")
         );
@@ -1150,7 +1150,7 @@ mod tests {
             .find_element_by_id("name")
             .expect("input should exist");
         assert_eq!(
-            host.browser().control_value(&path).as_deref(),
+            host.browser().control_value(path).as_deref(),
             Some(""),
             "cutting the selection empties the control"
         );
@@ -1164,7 +1164,7 @@ mod tests {
         };
         assert!(host.input(paste).expect("paste should be handled").handled);
         assert_eq!(
-            host.browser().control_value(&path).as_deref(),
+            host.browser().control_value(path).as_deref(),
             Some("hello world")
         );
     }
@@ -1420,7 +1420,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("640x480@1.5")
         );
     }
@@ -1475,7 +1475,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
     }
@@ -1519,7 +1519,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("high")
         );
     }
@@ -1563,7 +1563,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("Rus")
         );
     }
@@ -1613,7 +1613,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("0|3|backward|true:true:false:true")
         );
     }
@@ -1662,7 +1662,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("start|update:ab|input:abx|input:ab安|end:ab安")
         );
     }
@@ -1808,7 +1808,7 @@ mod tests {
             .expect("status should exist");
         document
             .borrow()
-            .element_text_content(&status)
+            .element_text_content(status)
             .unwrap_or_default()
     }
 
@@ -1842,7 +1842,7 @@ mod tests {
             assert!(
                 document
                     .borrow_mut()
-                    .set_element_attribute(&path, "class", class.to_string())
+                    .set_attribute(path, "class", class.to_string())
             );
         };
         set_class(&mut host, "wide");
@@ -1899,7 +1899,7 @@ mod tests {
         assert!(
             document
                 .borrow_mut()
-                .set_element_attribute(&path, "class", "run".to_string())
+                .set_attribute(path, "class", "run".to_string())
         );
         host.input(InputEvent::AdvanceTime(1)).expect("tick");
         assert_eq!(status_text(&host), "animationstart:grow|");
@@ -2094,7 +2094,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("dbl2:12")
         );
         press(&mut host, point);

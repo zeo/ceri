@@ -1,4 +1,4 @@
-use crate::dom::{Document, Element, Node, NodePath};
+use crate::dom::{Document, Element, NodeId};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -425,59 +425,56 @@ pub(crate) struct TransitionState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StyleState {
-    pub(crate) hovered_path: Option<NodePath>,
-    pub(crate) focused_path: Option<NodePath>,
-    pub(crate) checked_paths: BTreeSet<NodePath>,
-    pub(crate) unchecked_paths: BTreeSet<NodePath>,
-    pub(crate) disabled_paths: BTreeSet<NodePath>,
-    pub(crate) scroll_offsets: BTreeMap<NodePath, (f32, f32)>,
-    pub(crate) control_values: BTreeMap<NodePath, String>,
-    pub(crate) text_selections: BTreeMap<NodePath, (usize, usize, bool)>,
+    pub(crate) hovered: Option<NodeId>,
+    pub(crate) focused: Option<NodeId>,
+    pub(crate) checked: BTreeSet<NodeId>,
+    pub(crate) unchecked: BTreeSet<NodeId>,
+    pub(crate) disabled: BTreeSet<NodeId>,
+    pub(crate) scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
+    pub(crate) control_values: BTreeMap<NodeId, String>,
+    pub(crate) text_selections: BTreeMap<NodeId, (usize, usize, bool)>,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
     pub(crate) color_scheme: ColorScheme,
     pub(crate) reduced_motion: bool,
     pub(crate) clock: u64,
-    pub(crate) transitions: BTreeMap<(NodePath, AnimatableProperty), TransitionState>,
-    pub(crate) custom_properties: BTreeMap<NodePath, BTreeMap<String, String>>,
-    pub(crate) root_path: Option<NodePath>,
+    pub(crate) transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
+    pub(crate) custom_properties: HashMap<NodeId, BTreeMap<String, String>>,
+    pub(crate) root: Option<NodeId>,
     // natural pixel sizes of decoded images, keyed by their element
-    pub(crate) image_sizes: BTreeMap<NodePath, (u32, u32)>,
+    pub(crate) image_sizes: BTreeMap<NodeId, (u32, u32)>,
     // when each element's current animation began, on the page clock
-    pub(crate) animation_starts: BTreeMap<NodePath, u64>,
+    pub(crate) animation_starts: BTreeMap<NodeId, u64>,
 }
 
 impl StyleState {
-    fn is_hovered(&self, path: &[usize]) -> bool {
-        self.hovered_path
-            .as_deref()
-            .is_some_and(|hovered| hovered.starts_with(path))
+    fn is_hovered(&self, document: &Document, node: NodeId) -> bool {
+        self.hovered
+            .is_some_and(|hovered| document.is_inclusive_ancestor(node, hovered))
     }
 
-    fn is_focused(&self, path: &[usize]) -> bool {
-        self.focused_path.as_deref() == Some(path)
-    }
-
-    fn is_checked(&self, element: &Element, path: &[usize]) -> bool {
-        if self.checked_paths.contains(path) {
+    fn is_checked(&self, element: &Element, node: NodeId) -> bool {
+        if self.checked.contains(&node) {
             return true;
         }
-        if self.unchecked_paths.contains(path) {
+        if self.unchecked.contains(&node) {
             false
         } else {
             element.attr("checked").is_some()
         }
     }
 
-    fn is_disabled(&self, element: &Element, path: &[usize]) -> bool {
-        self.disabled_paths.contains(path) || element.attrs.contains_key("disabled")
+    fn is_disabled(&self, element: &Element, node: NodeId) -> bool {
+        self.disabled.contains(&node) || element.attrs.contains_key("disabled")
     }
 }
 
+// the element being styled, or the generated box of one of its pseudo-elements
+#[derive(Clone, Copy)]
 pub(crate) struct StyleContext<'a> {
-    pub(crate) element: &'a Element,
-    pub(crate) path: &'a [usize],
-    pub(crate) ancestors: &'a [&'a Element],
+    pub(crate) document: &'a Document,
+    pub(crate) node: NodeId,
+    pub(crate) pseudo: Option<PseudoElement>,
     pub(crate) parent_font_size: f32,
     pub(crate) parent_color: Color,
     pub(crate) parent_weight: FontWeight,
@@ -1276,62 +1273,47 @@ impl Stylesheet {
 
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
         state.custom_properties.clear();
-        state.root_path = document
-            .root
-            .children
+        let top = document
+            .element_children(document.root())
+            .collect::<Vec<_>>();
+        state.root = top
             .iter()
-            .enumerate()
-            .find_map(|(index, node)| match node {
-                Node::Element(element) if element.name == "html" => Some(vec![index]),
-                _ => None,
+            .copied()
+            .find(|&node| {
+                document
+                    .element(node)
+                    .is_some_and(|element| element.name == "html")
             })
             .or_else(|| {
-                document
-                    .root
-                    .children
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, node)| match node {
-                        Node::Element(element)
-                            if !matches!(
-                                element.name.as_str(),
-                                "head" | "style" | "script" | "link" | "meta" | "title"
-                            ) =>
-                        {
-                            Some(vec![index])
-                        }
-                        _ => None,
+                top.iter().copied().find(|&node| {
+                    document.element(node).is_some_and(|element| {
+                        !matches!(
+                            element.name.as_str(),
+                            "head" | "style" | "script" | "link" | "meta" | "title"
+                        )
                     })
+                })
             });
         let inherited = BTreeMap::new();
-        let ancestors = Vec::new();
-        for (index, node) in document.root.children.iter().enumerate() {
-            let Node::Element(element) = node else {
-                continue;
-            };
-            self.populate_element_custom_properties(
-                element,
-                &[index],
-                &ancestors,
-                &inherited,
-                state,
-            );
+        for node in top {
+            self.populate_element_custom_properties(document, node, &inherited, state);
         }
     }
 
     fn populate_element_custom_properties(
         &self,
-        element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+        document: &Document,
+        node: NodeId,
         inherited: &BTreeMap<String, String>,
         state: &mut StyleState,
     ) {
         let mut properties = inherited.clone();
-        for (property, (_, _, value)) in self.cascaded_values(element, path, ancestors, state) {
+        let mut changed = false;
+        for (property, (_, _, value)) in self.cascaded_values(document, node, None, state) {
             if !property.starts_with("--") {
                 continue;
             }
+            changed = true;
             match value.trim().to_ascii_lowercase().as_str() {
                 "initial" => {
                     properties.remove(property.as_ref());
@@ -1342,24 +1324,11 @@ impl Stylesheet {
                 }
             }
         }
-        state
-            .custom_properties
-            .insert(path.to_vec(), properties.clone());
-        let mut child_ancestors = ancestors.to_vec();
-        child_ancestors.push(element);
-        for (index, node) in element.children.iter().enumerate() {
-            let Node::Element(child) = node else {
-                continue;
-            };
-            let mut child_path = path.to_vec();
-            child_path.push(index);
-            self.populate_element_custom_properties(
-                child,
-                &child_path,
-                &child_ancestors,
-                &properties,
-                state,
-            );
+        if changed || inherited.is_empty() {
+            state.custom_properties.insert(node, properties.clone());
+        }
+        for child in document.element_children(node).collect::<Vec<_>>() {
+            self.populate_element_custom_properties(document, child, &properties, state);
         }
     }
 
@@ -1369,14 +1338,15 @@ impl Stylesheet {
             return None;
         }
         let values = self.cascaded_values(
-            context.element,
-            context.path,
-            context.ancestors,
+            context.document,
+            context.node,
+            context.pseudo,
             context.state,
         );
         let empty = BTreeMap::new();
         let custom_properties =
-            inherited_custom_properties(context.state, context.path).unwrap_or(&empty);
+            inherited_custom_properties(context.state, context.document, context.node)
+                .unwrap_or(&empty);
         let (_, _, raw) = values.get("content")?;
         let resolved = resolve_custom_value(raw, custom_properties)?;
         let resolved = resolved.trim();
@@ -1396,26 +1366,34 @@ impl Stylesheet {
 
     pub(crate) fn style_for(&self, context: StyleContext<'_>) -> Style {
         let StyleContext {
-            element,
-            path,
-            ancestors,
+            document,
+            node,
+            pseudo,
             parent_font_size,
             parent_color,
             parent_weight,
             parent_text,
             state,
         } = context;
+        let name = match pseudo {
+            Some(pseudo) => pseudo.tag(),
+            None => document
+                .element(node)
+                .map_or("", |element| element.name.as_str()),
+        };
         let mut style = Style::default_for(
-            &element.name,
+            name,
             parent_font_size,
             parent_color,
             parent_weight,
             parent_text,
         );
-        let values = self.cascaded_values(element, path, ancestors, state);
+        let values = self.cascaded_values(document, node, pseudo, state);
         let empty_properties = BTreeMap::new();
         let custom_properties =
-            inherited_custom_properties(state, path).unwrap_or(&empty_properties);
+            inherited_custom_properties(state, document, node).unwrap_or(&empty_properties);
+        // motion state belongs to the element itself, not to its generated boxes
+        let own = pseudo.is_none().then_some(node);
         let mut animation = None;
         let mut base_values = BTreeMap::new();
         for (property, (_, _, value)) in values {
@@ -1433,9 +1411,11 @@ impl Stylesheet {
             base_values.insert(property.into_owned(), value);
         }
         // a running transition replaces the declared value while it is in flight
-        if !state.transitions.is_empty() && !state.reduced_motion {
-            let range = (path.to_vec(), AnimatableProperty::All)
-                ..=(path.to_vec(), AnimatableProperty::Perspective);
+        if let Some(node) = own
+            && !state.transitions.is_empty()
+            && !state.reduced_motion
+        {
+            let range = (node, AnimatableProperty::All)..=(node, AnimatableProperty::Perspective);
             for ((_, property), active) in state.transitions.range(range) {
                 let elapsed = state.clock.saturating_sub(active.started);
                 if elapsed < active.delay {
@@ -1462,7 +1442,9 @@ impl Stylesheet {
         }
         // animated values win over the normal cascade, as the animation origin requires
         if let Some(animation) = animation.filter(|_| !state.reduced_motion) {
-            let started = state.animation_starts.get(path).copied().unwrap_or(0);
+            let started = own
+                .and_then(|node| state.animation_starts.get(&node).copied())
+                .unwrap_or(0);
             let now = state.clock.saturating_sub(started);
             for (property, value) in self.animated_values(&animation, now, &base_values) {
                 let Some(value) = resolve_custom_value(&value, custom_properties) else {
@@ -1473,8 +1455,8 @@ impl Stylesheet {
         }
         // an image with no declared size takes its natural size; with one side
         // declared, the other follows the natural ratio
-        if let Some(&(width, height)) = state.image_sizes.get(path)
-            && element.name == "img"
+        if let Some(&(width, height)) = own.and_then(|node| state.image_sizes.get(&node))
+            && name == "img"
         {
             style
                 .aspect_ratio
@@ -1498,14 +1480,15 @@ impl Stylesheet {
     // declared values after custom property substitution, from one cascade
     pub(crate) fn declared_values(&self, context: StyleContext<'_>) -> BTreeMap<String, String> {
         let values = self.cascaded_values(
-            context.element,
-            context.path,
-            context.ancestors,
+            context.document,
+            context.node,
+            context.pseudo,
             context.state,
         );
         let empty = BTreeMap::new();
         let custom_properties =
-            inherited_custom_properties(context.state, context.path).unwrap_or(&empty);
+            inherited_custom_properties(context.state, context.document, context.node)
+                .unwrap_or(&empty);
         values
             .into_iter()
             .filter_map(|(property, (_, _, raw))| {
@@ -1520,11 +1503,13 @@ impl Stylesheet {
     // a cheap check before a full cascade: only rules that declare motion, or inline style
     pub(crate) fn may_animate(
         &self,
-        element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+        document: &Document,
+        node: NodeId,
         state: &StyleState,
     ) -> bool {
+        let Some(element) = document.element(node) else {
+            return false;
+        };
         if element
             .attr("style")
             .is_some_and(|inline| inline.contains("transition") || inline.contains("animation"))
@@ -1537,7 +1522,7 @@ impl Stylesheet {
                 && rule
                     .selectors
                     .iter()
-                    .any(|selector| selector.matches(element, path, ancestors, state))
+                    .any(|selector| selector.matches(document, node, None, state))
         })
     }
 
@@ -1554,21 +1539,19 @@ impl Stylesheet {
             })
     }
 
-    fn cascaded_values(
-        &self,
-        element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+    fn cascaded_values<'a>(
+        &'a self,
+        document: &'a Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
         state: &StyleState,
-    ) -> HashMap<Cow<'_, str>, (Specificity, usize, Cow<'_, str>)> {
-        let mut values: HashMap<Cow<'_, str>, (Specificity, usize, Cow<'_, str>)> = HashMap::new();
+    ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
+        let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> = HashMap::new();
         // a generated box carries the id, classes and tag of the element that owns it
-        let subject = if element.name.starts_with("::") {
-            ancestors.last().copied().unwrap_or(element)
-        } else {
-            element
+        let Some(element) = document.element(node) else {
+            return values;
         };
-        for position in self.index.candidates(subject) {
+        for position in self.index.candidates(element) {
             let Some(rule) = self.rules.get(position) else {
                 continue;
             };
@@ -1582,7 +1565,7 @@ impl Stylesheet {
             let Some(specificity) = rule
                 .selectors
                 .iter()
-                .filter(|selector| selector.matches(element, path, ancestors, state))
+                .filter(|selector| selector.matches(document, node, pseudo, state))
                 .map(Selector::specificity)
                 .max()
             else {
@@ -1603,7 +1586,7 @@ impl Stylesheet {
             }
         }
         let mut inline_dropped = Vec::new();
-        if let Some(inline) = element.attr("style")
+        if let Some(inline) = element.attr("style").filter(|_| pseudo.is_none())
             && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
         {
             for declaration in declarations {
@@ -1618,27 +1601,6 @@ impl Stylesheet {
             }
         }
         values
-    }
-
-    #[cfg(test)]
-    pub(crate) fn style_for_inherited_with_ancestors(
-        &self,
-        element: &Element,
-        ancestors: &[&Element],
-        parent_font_size: f32,
-        parent_color: Color,
-        parent_weight: FontWeight,
-    ) -> Style {
-        self.style_for(StyleContext {
-            element,
-            path: &[],
-            ancestors,
-            parent_font_size,
-            parent_color,
-            parent_weight,
-            parent_text: InheritedText::default(),
-            state: &StyleState::default(),
-        })
     }
 }
 
@@ -1735,14 +1697,6 @@ impl PseudoElement {
         match self {
             Self::Before => "::before",
             Self::After => "::after",
-        }
-    }
-
-    fn from_tag(tag: &str) -> Option<Self> {
-        match tag {
-            "::before" => Some(Self::Before),
-            "::after" => Some(Self::After),
-            _ => None,
         }
     }
 }
@@ -1877,112 +1831,56 @@ impl Selector {
 
     pub(crate) fn matches(
         &self,
-        element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
         state: &StyleState,
     ) -> bool {
         let Some(last) = self.parts.last() else {
             return false;
         };
-        let generated = PseudoElement::from_tag(&element.name);
-        if last.compound.pseudo_element != generated {
-            return false;
-        }
-        if generated.is_some() {
-            // a generated box matches through the element that owns it
-            let Some((origin, ancestors)) = ancestors.split_last() else {
-                return false;
-            };
-            return self.matches_part(
-                self.parts.len() - 1,
-                &last.compound,
-                origin,
-                &path[..path.len().saturating_sub(1)],
-                ancestors,
-                state,
-            );
-        }
-        self.matches_part(
-            self.parts.len() - 1,
-            &last.compound,
-            element,
-            path,
-            ancestors,
-            state,
-        )
+        last.compound.pseudo_element == pseudo
+            && self.matches_part(self.parts.len() - 1, document, node, state)
     }
 
     fn matches_part(
         &self,
         index: usize,
-        compound: &CompoundSelector,
-        element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+        document: &Document,
+        node: NodeId,
         state: &StyleState,
     ) -> bool {
-        if !compound.matches(element, path, ancestors, state) {
+        let Some(element) = document.element(node) else {
+            return false;
+        };
+        if !self.parts[index]
+            .compound
+            .matches(element, document, node, state)
+        {
             return false;
         }
         if index == 0 {
             return true;
         }
+        let previous = |candidate: NodeId| self.matches_part(index - 1, document, candidate, state);
         match self.parts[index].combinator {
-            Some(Combinator::Child) => ancestors.last().is_some_and(|parent| {
-                self.matches_part(
-                    index - 1,
-                    &self.parts[index - 1].compound,
-                    parent,
-                    &path[..path.len().saturating_sub(1)],
-                    &ancestors[..ancestors.len() - 1],
-                    state,
-                )
-            }),
-            Some(Combinator::Descendant) => {
-                ancestors
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .any(|(parent_index, parent)| {
-                        self.matches_part(
-                            index - 1,
-                            &self.parts[index - 1].compound,
-                            parent,
-                            &path[..(parent_index + 1).min(path.len())],
-                            &ancestors[..parent_index],
-                            state,
-                        )
-                    })
+            Some(Combinator::Child) => document.parent_element(node).is_some_and(previous),
+            Some(Combinator::Descendant) => document
+                .ancestors(node)
+                .filter(|&ancestor| document.is_element(ancestor))
+                .any(previous),
+            Some(Combinator::NextSibling) => {
+                document.element_sibling(node, false).is_some_and(previous)
             }
-            Some(Combinator::NextSibling) | Some(Combinator::SubsequentSibling) => {
-                let immediate = self.parts[index].combinator == Some(Combinator::NextSibling);
-                let Some(parent) = ancestors.last() else {
-                    return false;
-                };
-                let Some((&position, parent_path)) = path.split_last() else {
-                    return false;
-                };
-                let mut siblings = element_children(parent)
-                    .into_iter()
-                    .take_while(|(child_index, _)| *child_index < position)
-                    .collect::<Vec<_>>();
-                siblings.reverse();
-                if immediate {
-                    siblings.truncate(1);
+            Some(Combinator::SubsequentSibling) => {
+                let mut sibling = document.element_sibling(node, false);
+                while let Some(candidate) = sibling {
+                    if previous(candidate) {
+                        return true;
+                    }
+                    sibling = document.element_sibling(candidate, false);
                 }
-                siblings.into_iter().any(|(child_index, sibling)| {
-                    let mut sibling_path = parent_path.to_vec();
-                    sibling_path.push(child_index);
-                    self.matches_part(
-                        index - 1,
-                        &self.parts[index - 1].compound,
-                        sibling,
-                        &sibling_path,
-                        ancestors,
-                        state,
-                    )
-                })
+                false
             }
             None => false,
         }
@@ -2006,8 +1904,8 @@ impl CompoundSelector {
     fn matches(
         &self,
         element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+        document: &Document,
+        node: NodeId,
         state: &StyleState,
     ) -> bool {
         self.tag.as_deref().is_none_or(|tag| tag == element.name)
@@ -2023,7 +1921,7 @@ impl CompoundSelector {
             && self
                 .pseudo_classes
                 .iter()
-                .all(|pseudo| pseudo.matches(element, path, ancestors, state))
+                .all(|pseudo| pseudo.matches(element, document, node, state))
     }
 
     fn specificity(&self) -> Specificity {
@@ -2052,33 +1950,38 @@ impl PseudoClass {
     fn matches(
         &self,
         element: &Element,
-        path: &[usize],
-        ancestors: &[&Element],
+        document: &Document,
+        node: NodeId,
         state: &StyleState,
     ) -> bool {
         match self {
-            Self::Root => state.root_path.as_deref() == Some(path),
-            Self::Hover => state.is_hovered(path),
-            Self::Focus => state.is_focused(path),
+            Self::Root => state.root.map_or_else(
+                || document.document_element() == Some(node),
+                |root| root == node,
+            ),
+            Self::Hover => state.is_hovered(document, node),
+            Self::Focus => state.focused == Some(node),
             Self::Checked => {
                 element.name == "input"
                     && element.attr("type").is_some_and(|kind| {
                         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
                     })
-                    && state.is_checked(element, path)
+                    && state.is_checked(element, node)
             }
-            Self::Disabled => state.is_disabled(element, path),
-            Self::Enabled => !state.is_disabled(element, path),
-            Self::FirstChild => child_position(path, ancestors) == Some(1),
-            Self::LastChild => child_position(path, ancestors)
-                .is_some_and(|position| position == element_child_count(ancestors).unwrap_or(0)),
-            Self::OnlyChild => element_child_count(ancestors) == Some(1),
+            Self::Disabled => state.is_disabled(element, node),
+            Self::Enabled => !state.is_disabled(element, node),
+            Self::FirstChild => document.element_sibling(node, false).is_none(),
+            Self::LastChild => document.element_sibling(node, true).is_none(),
+            Self::OnlyChild => {
+                document.element_sibling(node, false).is_none()
+                    && document.element_sibling(node, true).is_none()
+            }
             Self::NthChild(pattern) => {
-                child_position(path, ancestors).is_some_and(|position| pattern.matches(position))
+                child_position(document, node).is_some_and(|position| pattern.matches(position))
             }
             Self::Not(selectors) => !selectors
                 .iter()
-                .any(|selector| selector.matches(element, path, ancestors, state)),
+                .any(|selector| selector.matches(document, node, None, state)),
         }
     }
 
@@ -2094,30 +1997,11 @@ impl PseudoClass {
     }
 }
 
-fn element_children(parent: &Element) -> Vec<(usize, &Element)> {
-    parent
-        .children
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| match node {
-            Node::Element(child) => Some((index, child)),
-            Node::Text(_) => None,
-        })
-        .collect()
-}
-
-fn element_child_count(ancestors: &[&Element]) -> Option<i32> {
-    ancestors
-        .last()
-        .map(|parent| element_children(parent).len() as i32)
-}
-
-fn child_position(path: &[usize], ancestors: &[&Element]) -> Option<i32> {
-    let parent = ancestors.last()?;
-    let &index = path.last()?;
-    element_children(parent)
-        .into_iter()
-        .position(|(child_index, _)| child_index == index)
+fn child_position(document: &Document, node: NodeId) -> Option<i32> {
+    let parent = document.parent(node)?;
+    document
+        .element_children(parent)
+        .position(|child| child == node)
         .map(|position| position as i32 + 1)
 }
 
@@ -3427,19 +3311,15 @@ fn parse_number(value: &str) -> Option<f32> {
     value.trim().parse().ok()
 }
 
-// a path without its own entry, such as a generated box, reads its ancestor's properties
+// an element without its own entry reads its nearest ancestor's properties
 fn inherited_custom_properties<'a>(
     state: &'a StyleState,
-    path: &[usize],
+    document: &Document,
+    node: NodeId,
 ) -> Option<&'a BTreeMap<String, String>> {
-    let mut candidate = path;
-    loop {
-        if let Some(properties) = state.custom_properties.get(candidate) {
-            return Some(properties);
-        }
-        let (_, parent) = candidate.split_last()?;
-        candidate = parent;
-    }
+    std::iter::once(node)
+        .chain(document.ancestors(node))
+        .find_map(|candidate| state.custom_properties.get(&candidate))
 }
 
 fn resolve_custom_value(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
@@ -3880,6 +3760,58 @@ fn expand_nibble(value: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    // an element placed under its ancestors, outermost first, in a fresh document
+    fn placed(element: &Element, ancestors: &[&Element]) -> (Document, NodeId) {
+        let mut document = Document::new();
+        let mut parent = document.root();
+        for element in ancestors.iter().copied().chain(std::iter::once(element)) {
+            let node = document.adopt_element(element.clone());
+            document
+                .append_child(parent, node)
+                .expect("an element fits under its parent");
+            parent = node;
+        }
+        (document, parent)
+    }
+
+    fn context<'a>(placed: &'a (Document, NodeId), state: &'a StyleState) -> StyleContext<'a> {
+        document_context(&placed.0, placed.1, state)
+    }
+
+    fn document_context<'a>(
+        document: &'a Document,
+        node: NodeId,
+        state: &'a StyleState,
+    ) -> StyleContext<'a> {
+        StyleContext {
+            document,
+            node,
+            pseudo: None,
+            parent_font_size: 16.0,
+            parent_color: Color::BLACK,
+            parent_weight: FontWeight::Normal,
+            parent_text: InheritedText::default(),
+            state,
+        }
+    }
+
+    fn style_within(
+        stylesheet: &Stylesheet,
+        element: &Element,
+        ancestors: &[&Element],
+        parent_font_size: f32,
+        parent_color: Color,
+        parent_weight: FontWeight,
+    ) -> Style {
+        let placed = placed(element, ancestors);
+        stylesheet.style_for(StyleContext {
+            parent_font_size,
+            parent_color,
+            parent_weight,
+            ..context(&placed, &StyleState::default())
+        })
+    }
+
     #[test]
     fn parses_colors_and_lengths() {
         assert_eq!(Color::parse("#42d3b4"), Some(Color::opaque(66, 211, 180)));
@@ -3918,20 +3850,14 @@ mod tests {
         let mut bar = Element::new("div");
         bar.attrs.insert("class".to_string(), "bar".to_string());
         let style_at = |clock: u64, reduced_motion: bool| {
-            stylesheet.style_for(StyleContext {
-                element: &bar,
-                path: &[0],
-                ancestors: &[],
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::Normal,
-                parent_text: InheritedText::default(),
-                state: &StyleState {
+            stylesheet.style_for(context(
+                &placed(&bar, &[]),
+                &StyleState {
                     clock,
                     reduced_motion,
                     ..StyleState::default()
                 },
-            })
+            ))
         };
 
         assert_eq!(style_at(0, false).width.resolve(0.0, 16.0), Some(40.0));
@@ -3951,19 +3877,13 @@ mod tests {
         .expect("stylesheet should parse");
         let opacity_at = |clock: u64| {
             stepped
-                .style_for(StyleContext {
-                    element: &bar,
-                    path: &[0],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &StyleState {
+                .style_for(context(
+                    &placed(&bar, &[]),
+                    &StyleState {
                         clock,
                         ..StyleState::default()
                     },
-                })
+                ))
                 .opacity
         };
         assert_eq!(opacity_at(100), 1.0);
@@ -3973,19 +3893,13 @@ mod tests {
             "@keyframes grow { from { width: 10px } to { width: 20px } } .bar { animation: grow 100ms linear }",
         )
         .expect("stylesheet should parse");
-        let ended = once.style_for(StyleContext {
-            element: &bar,
-            path: &[0],
-            ancestors: &[],
-            parent_font_size: 16.0,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: &StyleState {
+        let ended = once.style_for(context(
+            &placed(&bar, &[]),
+            &StyleState {
                 clock: 5_000,
                 ..StyleState::default()
             },
-        });
+        ));
         assert_eq!(ended.width.resolve(0.0, 16.0), Some(20.0));
     }
 
@@ -3999,19 +3913,13 @@ mod tests {
         bar.attrs.insert("class".to_string(), "bar".to_string());
         let translate_at = |clock: u64| {
             stylesheet
-                .style_for(StyleContext {
-                    element: &bar,
-                    path: &[0],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &StyleState {
+                .style_for(context(
+                    &placed(&bar, &[]),
+                    &StyleState {
                         clock,
                         ..StyleState::default()
                     },
-                })
+                ))
                 .translate
         };
         assert_eq!(translate_at(250), (Length::px(20.0), Length::px(0.0)));
@@ -4020,19 +3928,10 @@ mod tests {
             "@keyframes drift { from { transform: translate(10%, 0px) } to { transform: translate(30%, 4em) } } .bar { animation: drift 1000ms linear infinite }",
         )
         .expect("stylesheet should parse")
-        .style_for(StyleContext {
-            element: &bar,
-            path: &[0],
-            ancestors: &[],
-            parent_font_size: 16.0,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: &StyleState {
+        .style_for(context(&placed(&bar, &[]), &StyleState {
                 clock: 500,
                 ..StyleState::default()
-            },
-        });
+            }));
         let (x, y) = stepped.translate;
         assert_eq!(x.resolve(200.0, 16.0), Some(40.0));
         assert_eq!(y.resolve(200.0, 16.0), Some(32.0));
@@ -4044,6 +3943,8 @@ mod tests {
         let mut card = Element::new("div");
         card.attrs.insert("class".to_string(), "card".to_string());
         card.attrs.insert("id".to_string(), "hero".to_string());
+        // a lone element lands on the same node in every fresh document
+        let card_node = placed(&card, &[]).1;
         let mut style_at = |clock: u64, lifted: bool| {
             if lifted {
                 card.attrs
@@ -4051,18 +3952,12 @@ mod tests {
             } else {
                 card.attrs.insert("class".to_string(), "card".to_string());
             }
-            transitioned.style_for(StyleContext {
-                element: &card,
-                path: &[0],
-                ancestors: &[],
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::Normal,
-                parent_text: InheritedText::default(),
-                state: &StyleState {
+            transitioned.style_for(context(
+                &placed(&card, &[]),
+                &StyleState {
                     clock,
                     transitions: BTreeMap::from([(
-                        (vec![0], AnimatableProperty::Transform),
+                        (card_node, AnimatableProperty::Transform),
                         TransitionState {
                             from: "translate(0px, 0px)".to_string(),
                             to: "translateY(-24px)".to_string(),
@@ -4075,7 +3970,7 @@ mod tests {
                     )]),
                     ..StyleState::default()
                 },
-            })
+            ))
         };
         let (x, y) = style_at(100, true).translate;
         assert_eq!(x.resolve(100.0, 16.0), Some(0.0));
@@ -4147,16 +4042,7 @@ mod tests {
         .expect("stylesheet should parse");
         let mut card = Element::new("div");
         card.attrs.insert("class".to_string(), "card".to_string());
-        let style = stylesheet.style_for(StyleContext {
-            element: &card,
-            path: &[0],
-            ancestors: &[],
-            parent_font_size: 16.0,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: &StyleState::default(),
-        });
+        let style = stylesheet.style_for(context(&placed(&card, &[]), &StyleState::default()));
         assert_eq!(style.border_radius.resolve(0.0, 16.0), Some(18.0));
         assert_eq!(style.opacity, 0.4);
         let shadow = style.shadow.expect("shadow should parse");
@@ -4172,16 +4058,7 @@ mod tests {
 
         let none = Stylesheet::parse(".card { box-shadow: none; background: #101010; }")
             .expect("stylesheet should parse")
-            .style_for(StyleContext {
-                element: &card,
-                path: &[0],
-                ancestors: &[],
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::Normal,
-                parent_text: InheritedText::default(),
-                state: &StyleState::default(),
-            });
+            .style_for(context(&placed(&card, &[]), &StyleState::default()));
         assert!(none.shadow.is_none());
         assert!(none.gradient.is_none());
         assert_eq!(none.background, Color::opaque(16, 16, 16));
@@ -4228,15 +4105,15 @@ mod tests {
             .insert("class".to_string(), "accent".to_string());
         element.attrs.insert("id".to_string(), "hero".to_string());
         assert_eq!(
-            stylesheet
-                .style_for_inherited_with_ancestors(
-                    &element,
-                    &[],
-                    16.0,
-                    Color::BLACK,
-                    FontWeight::Normal
-                )
-                .color,
+            style_within(
+                &stylesheet,
+                &element,
+                &[],
+                16.0,
+                Color::BLACK,
+                FontWeight::Normal
+            )
+            .color,
             Color::opaque(66, 211, 180)
         );
     }
@@ -4250,35 +4127,15 @@ mod tests {
         let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
         let mut state = StyleState::default();
         stylesheet.populate_custom_properties(&document, &mut state);
-        let theme = match &document.root.children[0] {
-            Node::Element(element) => element,
-            Node::Text(_) => panic!("theme should be an element"),
-        };
-        let card = match &theme.children[0] {
-            Node::Element(element) => element,
-            Node::Text(_) => panic!("card should be an element"),
-        };
-        let ancestors = [theme];
-        let style = stylesheet.style_for(StyleContext {
-            element: card,
-            path: &[0, 0],
-            ancestors: &ancestors,
-            parent_font_size: 16.0,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: &state,
-        });
+        let card = document.find_element_by_id("card").expect("card exists");
+        let style = stylesheet.style_for(document_context(&document, card, &state));
         assert_eq!(style.background, Color::opaque(0, 255, 0));
         assert_eq!(style.color, Color::opaque(0, 0, 255));
         assert_eq!(style.padding, Edges::all(Length::px(8.0)));
         assert_eq!(
             resolve_custom_value(
                 "var(--loop, #abcdef)",
-                state
-                    .custom_properties
-                    .get(&vec![0, 0])
-                    .expect("card variables")
+                state.custom_properties.get(&card).expect("card variables")
             ),
             Some("#123456".to_string())
         );
@@ -4294,24 +4151,8 @@ mod tests {
         .expect("stylesheet should parse");
         let mut state = StyleState::default();
         stylesheet.populate_custom_properties(&document, &mut state);
-        let html = match &document.root.children[0] {
-            Node::Element(element) => element,
-            Node::Text(_) => panic!("html should be an element"),
-        };
-        let card = match &html.children[0] {
-            Node::Element(element) => element,
-            Node::Text(_) => panic!("card should be an element"),
-        };
-        let style = stylesheet.style_for(StyleContext {
-            element: card,
-            path: &[0, 0],
-            ancestors: &[html],
-            parent_font_size: 16.0,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: &state,
-        });
+        let card = document.find_element_by_id("card").expect("card exists");
+        let style = stylesheet.style_for(document_context(&document, card, &state));
         assert_eq!(style.width.resolve(100.0, 16.0), Some(80.0));
         assert_eq!(style.color, Color::opaque(0, 255, 0));
     }
@@ -4332,7 +4173,8 @@ mod tests {
         )
         .expect("stylesheet should parse");
         let element = Element::new("div");
-        let style = stylesheet.style_for_inherited_with_ancestors(
+        let style = style_within(
+            &stylesheet,
             &element,
             &[],
             16.0,
@@ -4342,7 +4184,8 @@ mod tests {
         assert_eq!(style.display, Display::Block);
         let mut element = Element::new("div");
         element.attrs.insert("class".to_string(), "row".to_string());
-        let style = stylesheet.style_for_inherited_with_ancestors(
+        let style = style_within(
+            &stylesheet,
             &element,
             &[],
             16.0,
@@ -4367,7 +4210,8 @@ mod tests {
         element
             .attrs
             .insert("class".to_string(), "overlay".to_string());
-        let style = stylesheet.style_for_inherited_with_ancestors(
+        let style = style_within(
+            &stylesheet,
             &element,
             &[],
             16.0,
@@ -4388,14 +4232,7 @@ mod tests {
             .attrs
             .insert("class".to_string(), "scroll".to_string());
         assert_eq!(
-            auto.style_for_inherited_with_ancestors(
-                &scroll,
-                &[],
-                16.0,
-                Color::BLACK,
-                FontWeight::Normal,
-            )
-            .overflow,
+            style_within(&auto, &scroll, &[], 16.0, Color::BLACK, FontWeight::Normal,).overflow,
             Overflow::Auto
         );
         let sticky = Stylesheet::parse(".sticky { position: sticky; top: 4px; }")
@@ -4404,7 +4241,8 @@ mod tests {
         sticky_element
             .attrs
             .insert("class".to_string(), "sticky".to_string());
-        let sticky_style = sticky.style_for_inherited_with_ancestors(
+        let sticky_style = style_within(
+            &sticky,
             &sticky_element,
             &[],
             16.0,
@@ -4425,7 +4263,8 @@ mod tests {
         element
             .attrs
             .insert("class".to_string(), "grid".to_string());
-        let style = stylesheet.style_for_inherited_with_ancestors(
+        let style = style_within(
+            &stylesheet,
             &element,
             &[],
             16.0,
@@ -4453,14 +4292,16 @@ mod tests {
         direct
             .attrs
             .insert("class".to_string(), "direct".to_string());
-        let card_style = stylesheet.style_for_inherited_with_ancestors(
+        let card_style = style_within(
+            &stylesheet,
             &card,
             &[&shell],
             16.0,
             Color::BLACK,
             FontWeight::Normal,
         );
-        let direct_style = stylesheet.style_for_inherited_with_ancestors(
+        let direct_style = style_within(
+            &stylesheet,
             &direct,
             &[&shell],
             16.0,
@@ -4479,7 +4320,8 @@ mod tests {
         .expect("selector list should parse");
         let mut card = Element::new("div");
         card.attrs.insert("class".to_string(), "card".to_string());
-        let card_style = stylesheet.style_for_inherited_with_ancestors(
+        let card_style = style_within(
+            &stylesheet,
             &card,
             &[],
             16.0,
@@ -4492,7 +4334,8 @@ mod tests {
         muted
             .attrs
             .insert("class".to_string(), "card muted".to_string());
-        let muted_style = stylesheet.style_for_inherited_with_ancestors(
+        let muted_style = style_within(
+            &stylesheet,
             &muted,
             &[],
             16.0,
@@ -4503,7 +4346,8 @@ mod tests {
 
         let mut panel = Element::new("section");
         panel.attrs.insert("class".to_string(), "panel".to_string());
-        let panel_style = stylesheet.style_for_inherited_with_ancestors(
+        let panel_style = style_within(
+            &stylesheet,
             &panel,
             &[],
             16.0,
@@ -4547,45 +4391,31 @@ mod tests {
             "p + p { color: red; } h1 ~ p { background-color: green; } li:first-child { color: blue; } li:last-child { color: yellow; } li:nth-child(2n) { border-width: 3px; }",
         )
         .expect("stylesheet should parse");
-        let mut list = Element::new("ul");
-        for _ in 0..3 {
-            list.children.push(Node::Element(Element::new("li")));
-        }
-        let mut section = Element::new("section");
-        section.children.push(Node::Element(Element::new("h1")));
-        section.children.push(Node::Text(" ".to_string()));
-        section.children.push(Node::Element(Element::new("p")));
-        section.children.push(Node::Element(Element::new("p")));
+        let document = Document::parse(
+            "<ul><li></li><li></li><li></li></ul><section><h1></h1> <p></p><p></p></section>",
+        )
+        .expect("document should parse");
         let state = StyleState::default();
-        let style = |element: &Element, path: &[usize], ancestors: &[&Element]| {
-            stylesheet.style_for(StyleContext {
-                element,
-                path,
-                ancestors,
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::Normal,
-                parent_text: InheritedText::default(),
-                state: &state,
-            })
+        let nodes = |selector: &str| {
+            document
+                .find_elements_by_selector(selector)
+                .expect("selector parses")
         };
+        let style = |node: NodeId| stylesheet.style_for(document_context(&document, node, &state));
 
-        let paragraph = Element::new("p");
-        let first_paragraph = style(&paragraph, &[2], &[&section]);
+        let paragraphs = nodes("p");
+        let first_paragraph = style(paragraphs[0]);
         assert_eq!(first_paragraph.color, Color::BLACK);
         assert_eq!(first_paragraph.background, Color::opaque(0, 128, 0));
-        let second_paragraph = style(&paragraph, &[3], &[&section]);
+        let second_paragraph = style(paragraphs[1]);
         assert_eq!(second_paragraph.color, Color::opaque(255, 0, 0));
         assert_eq!(second_paragraph.background, Color::opaque(0, 128, 0));
 
-        let item = Element::new("li");
-        assert_eq!(style(&item, &[0], &[&list]).color, Color::opaque(0, 0, 255));
-        assert_eq!(
-            style(&item, &[2], &[&list]).color,
-            Color::opaque(255, 255, 0)
-        );
-        assert_eq!(style(&item, &[1], &[&list]).border_width, 3.0);
-        assert_eq!(style(&item, &[0], &[&list]).border_width, 0.0);
+        let items = nodes("li");
+        assert_eq!(style(items[0]).color, Color::opaque(0, 0, 255));
+        assert_eq!(style(items[2]).color, Color::opaque(255, 255, 0));
+        assert_eq!(style(items[1]).border_width, 3.0);
+        assert_eq!(style(items[0]).border_width, 0.0);
     }
 
     #[test]
@@ -4595,18 +4425,8 @@ mod tests {
         )
         .expect("stylesheet should parse");
         let paragraph = Element::new("p");
-        let style_with = |state: &StyleState| {
-            stylesheet.style_for(StyleContext {
-                element: &paragraph,
-                path: &[0],
-                ancestors: &[],
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::Normal,
-                parent_text: InheritedText::default(),
-                state,
-            })
-        };
+        let style_with =
+            |state: &StyleState| stylesheet.style_for(context(&placed(&paragraph, &[]), state));
 
         let light = StyleState::default();
         assert_eq!(style_with(&light).color, Color::BLACK);
@@ -4628,94 +4448,29 @@ mod tests {
             "button:hover { color: red; } button:disabled { color: yellow; } button:enabled { background-color: green; } input:checked { color: blue; } input:disabled { color: yellow; }",
         )
         .expect("stylesheet should parse");
-        let button = Element::new("button");
-        let mut input = Element::new("input");
-        input
-            .attrs
-            .insert("type".to_string(), "checkbox".to_string());
-        input.attrs.insert("checked".to_string(), String::new());
+        let document = Document::parse(
+            "<button id='hovered'></button><input id='box' type='checkbox' checked><button id='off'></button>",
+        )
+        .expect("document should parse");
+        let id = |value: &str| document.find_element_by_id(value).expect("element exists");
+        let (button, input, disabled_button) = (id("hovered"), id("box"), id("off"));
         let mut state = StyleState {
-            hovered_path: Some(vec![0]),
+            hovered: Some(button),
             ..StyleState::default()
         };
-        let disabled_button = Element::new("button");
-        state.disabled_paths.insert(vec![2]);
+        state.disabled.insert(disabled_button);
+        let style = |node: NodeId, state: &StyleState| {
+            stylesheet.style_for(document_context(&document, node, state))
+        };
+        assert_eq!(style(button, &state).color, Color::opaque(255, 0, 0));
+        assert_eq!(style(input, &state).color, Color::opaque(0, 0, 255));
         assert_eq!(
-            stylesheet
-                .style_for(StyleContext {
-                    element: &button,
-                    path: &[0],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &state,
-                })
-                .color,
-            Color::opaque(255, 0, 0)
-        );
-        assert_eq!(
-            stylesheet
-                .style_for(StyleContext {
-                    element: &input,
-                    path: &[1],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &state,
-                })
-                .color,
-            Color::opaque(0, 0, 255)
-        );
-        assert_eq!(
-            stylesheet
-                .style_for(StyleContext {
-                    element: &disabled_button,
-                    path: &[2],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &state,
-                })
-                .color,
+            style(disabled_button, &state).color,
             Color::opaque(255, 255, 0)
         );
-        assert_eq!(
-            stylesheet
-                .style_for(StyleContext {
-                    element: &button,
-                    path: &[3],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &state,
-                })
-                .background,
-            Color::opaque(0, 128, 0)
-        );
-        state.unchecked_paths.insert(vec![1]);
-        assert_eq!(
-            stylesheet
-                .style_for(StyleContext {
-                    element: &input,
-                    path: &[1],
-                    ancestors: &[],
-                    parent_font_size: 16.0,
-                    parent_color: Color::BLACK,
-                    parent_weight: FontWeight::Normal,
-                    parent_text: InheritedText::default(),
-                    state: &state,
-                })
-                .color,
-            Color::BLACK
-        );
+        assert_eq!(style(button, &state).background, Color::opaque(0, 128, 0));
+        state.unchecked.insert(input);
+        assert_eq!(style(input, &state).color, Color::BLACK);
     }
 
     #[test]
@@ -4728,7 +4483,8 @@ mod tests {
         element
             .attrs
             .insert("data-check".to_string(), "module".to_string());
-        let style = stylesheet.style_for_inherited_with_ancestors(
+        let style = style_within(
+            &stylesheet,
             &element,
             &[],
             16.0,

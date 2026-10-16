@@ -1,7 +1,5 @@
 use crate::css::{AnimatableProperty, ColorScheme, StyleContext, Stylesheet, TransitionState};
-use crate::dom::{
-    AccessibilityNode, Document, Element, Node, NodePath, ScriptSource, StylesheetSource,
-};
+use crate::dom::{AccessibilityNode, Document, NodeId, ScriptSource, StylesheetSource};
 use crate::font::FontSet;
 use crate::image::Image;
 use crate::layout::{
@@ -852,11 +850,11 @@ pub struct Browser {
     next_document_id: u64,
     local_storage: StorageHandle,
     session_storage: StorageHandle,
-    hovered_path: Option<NodePath>,
-    transitions: BTreeMap<(NodePath, AnimatableProperty), TransitionState>,
-    declared: BTreeMap<(NodePath, AnimatableProperty), String>,
+    hovered_node: Option<NodeId>,
+    transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
+    declared: BTreeMap<(NodeId, AnimatableProperty), String>,
     // each element's running keyframe animation, so it plays from when it was applied
-    animations: BTreeMap<NodePath, AnimationRun>,
+    animations: BTreeMap<NodeId, AnimationRun>,
     motion_clock: Option<u64>,
     host_runtime_info: Option<HostRuntimeInfo>,
     viewport: ViewportMetrics,
@@ -890,7 +888,7 @@ struct AnimationRun {
 
 // a transition or animation event waiting for dispatch once sampling releases the document
 struct MotionEvent {
-    path: NodePath,
+    node: NodeId,
     kind: &'static str,
     name: String,
     elapsed: f64,
@@ -898,21 +896,21 @@ struct MotionEvent {
 
 impl MotionEvent {
     fn transition(
-        (path, property): &(NodePath, AnimatableProperty),
+        (node, property): &(NodeId, AnimatableProperty),
         kind: &'static str,
         elapsed: u64,
     ) -> Self {
         Self {
-            path: path.clone(),
+            node: *node,
             kind,
             name: property.name().to_string(),
             elapsed: elapsed as f64 / 1000.0,
         }
     }
 
-    fn animation(path: &NodePath, run: &AnimationRun, kind: &'static str, clock: u64) -> Self {
+    fn animation(node: &NodeId, run: &AnimationRun, kind: &'static str, clock: u64) -> Self {
         Self {
-            path: path.clone(),
+            node: *node,
             kind,
             name: run.name.clone(),
             elapsed: clock.saturating_sub(run.started + run.delay) as f64 / 1000.0,
@@ -950,7 +948,7 @@ impl Browser {
             next_document_id: 1,
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
-            hovered_path: None,
+            hovered_node: None,
             transitions: BTreeMap::new(),
             declared: BTreeMap::new(),
             animations: BTreeMap::new(),
@@ -1248,7 +1246,7 @@ impl Browser {
             images: RefCell::default(),
         });
         self.last_navigation_failure = None;
-        self.hovered_path = None;
+        self.hovered_node = None;
         self.commit_new_document(url, commit);
         if let Some(request) = pending_navigation {
             return self.follow_navigation(request, redirect_depth);
@@ -1289,7 +1287,7 @@ impl Browser {
         let previous_clock = self.motion_clock.replace(clock);
         let document = page.document.clone();
         let document = document.borrow();
-        let mut state = page.runtime.style_state(self.hovered_path.clone());
+        let mut state = page.runtime.style_state(self.hovered_node);
         state.viewport_width = viewport.width;
         state.viewport_height = viewport.height;
         state.color_scheme = self.preferences.color_scheme;
@@ -1300,29 +1298,17 @@ impl Browser {
         let mut seen_animations = BTreeSet::new();
         let mut events = Vec::new();
         let mut changed = false;
-        let mut candidates = Vec::new();
-        collect_motion_candidates(
-            &page.stylesheet,
-            &state,
-            &document.root,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &mut candidates,
-        );
+        let candidates = collect_motion_candidates(&page.stylesheet, &state, &document);
         // custom properties cost a document-wide pass, so only pages with moving elements pay it
         if !candidates.is_empty() {
             page.stylesheet
                 .populate_custom_properties(&document, &mut state);
         }
-        for path in candidates {
-            let Some(element) = document.element_at(&path) else {
-                continue;
-            };
-            let ancestors = ancestor_chain(&document, &path);
+        for node in candidates {
             let values = page.stylesheet.declared_values(StyleContext {
-                element,
-                path: &path,
-                ancestors: &ancestors,
+                document: &document,
+                node,
+                pseudo: None,
                 parent_font_size: 16.0,
                 parent_color: crate::css::Color::BLACK,
                 parent_weight: crate::css::FontWeight::Normal,
@@ -1334,8 +1320,8 @@ impl Browser {
                     let Some(value) = values.get(property.name()) else {
                         continue;
                     };
-                    let key = (path.clone(), property);
-                    seen.insert(key.clone());
+                    let key = (node, property);
+                    seen.insert(key);
                     match self.declared.get(&key) {
                         Some(previous) if previous == value => {}
                         Some(previous) => {
@@ -1351,7 +1337,7 @@ impl Browser {
                             }
                             if transition.duration > 0 {
                                 self.transitions.insert(
-                                    key.clone(),
+                                    key,
                                     TransitionState {
                                         from: previous.clone(),
                                         to: value.clone(),
@@ -1385,37 +1371,34 @@ impl Browser {
             if let Some(animation) = crate::css::animation_from(&values)
                 .filter(|animation| page.stylesheet.has_keyframes(&animation.name))
             {
-                seen_animations.insert(path.clone());
+                seen_animations.insert(node);
                 if self
                     .animations
-                    .get(&path)
+                    .get(&node)
                     .is_some_and(|run| run.name != animation.name)
-                    && let Some(replaced) = self.animations.remove(&path)
+                    && let Some(replaced) = self.animations.remove(&node)
                     && !replaced.ended
                 {
                     events.push(MotionEvent::animation(
-                        &path,
+                        &node,
                         &replaced,
                         "animationcancel",
                         clock,
                     ));
                 }
-                let run = self
-                    .animations
-                    .entry(path.clone())
-                    .or_insert_with(|| AnimationRun {
-                        name: animation.name.clone(),
-                        started: clock,
-                        delay: animation.delay,
-                        iteration: 0,
-                        began: false,
-                        ended: false,
-                    });
+                let run = self.animations.entry(node).or_insert_with(|| AnimationRun {
+                    name: animation.name.clone(),
+                    started: clock,
+                    delay: animation.delay,
+                    iteration: 0,
+                    began: false,
+                    ended: false,
+                });
                 let elapsed = clock.saturating_sub(run.started);
                 if !run.began && elapsed >= animation.delay {
                     run.began = true;
                     events.push(MotionEvent::animation(
-                        &path,
+                        &node,
                         run,
                         "animationstart",
                         run.started + run.delay,
@@ -1429,11 +1412,11 @@ impl Browser {
                     });
                     if finished {
                         run.ended = true;
-                        events.push(MotionEvent::animation(&path, run, "animationend", clock));
+                        events.push(MotionEvent::animation(&node, run, "animationend", clock));
                     } else if current > run.iteration {
                         run.iteration = current;
                         events.push(MotionEvent::animation(
-                            &path,
+                            &node,
                             run,
                             "animationiteration",
                             clock,
@@ -1473,12 +1456,12 @@ impl Browser {
         let removed = self
             .animations
             .iter()
-            .filter(|(path, run)| !seen_animations.contains(*path) && !run.ended)
-            .map(|(path, run)| MotionEvent::animation(path, run, "animationcancel", clock))
+            .filter(|(node, run)| !seen_animations.contains(*node) && !run.ended)
+            .map(|(node, run)| MotionEvent::animation(node, run, "animationcancel", clock))
             .collect::<Vec<_>>();
         events.extend(removed);
         self.animations
-            .retain(|path, _| seen_animations.contains(path));
+            .retain(|node, _| seen_animations.contains(node));
         drop(document);
         if events.is_empty() {
             return Ok(changed);
@@ -1486,7 +1469,7 @@ impl Browser {
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         for event in events {
             page.runtime
-                .dispatch_motion_event(event.path, event.kind, &event.name, event.elapsed)
+                .dispatch_motion_event(event.node, event.kind, &event.name, event.elapsed)
                 .map_err(script_error)?;
         }
         self.process_pending_navigation()?;
@@ -1505,10 +1488,10 @@ impl Browser {
         self.install_error_page(&url, status, detail);
     }
 
-    pub fn control_value(&self, path: &[usize]) -> Option<String> {
+    pub fn control_value(&self, node: NodeId) -> Option<String> {
         self.page
             .as_ref()
-            .and_then(|page| page.runtime.control_value(path))
+            .and_then(|page| page.runtime.control_value(node))
     }
 
     pub fn title(&self) -> Option<String> {
@@ -1549,14 +1532,14 @@ impl Browser {
     }
 
     pub fn click_id(&mut self, id: &str) -> Result<bool, NavigationError> {
-        let path = {
+        let node = {
             let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
             page.document.borrow().find_element_by_id(id)
         };
-        let Some(path) = path else {
+        let Some(node) = node else {
             return Ok(false);
         };
-        self.activate_path(path)
+        self.activate_node(node)
     }
 
     pub fn click_at(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
@@ -1571,21 +1554,19 @@ impl Browser {
         y: f32,
         count: u32,
     ) -> Result<bool, NavigationError> {
-        let path = self.layout(viewport)?.hit_test(x, y);
-        let Some(path) = path else {
+        let node = self.layout(viewport)?.hit_test(x, y);
+        let Some(node) = node else {
             return Ok(false);
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime.set_click_detail(count);
-        let clicked = self.activate_path(path.clone());
+        let clicked = self.activate_node(node);
         let double = match self.page.as_mut() {
             Some(page)
-                if count == 2
-                    && clicked.is_ok()
-                    && page.document.borrow().node_is_connected(&path) =>
+                if count == 2 && clicked.is_ok() && page.document.borrow().is_connected(node) =>
             {
                 page.runtime
-                    .dispatch_path_event(path, "dblclick")
+                    .dispatch_node_event(node, "dblclick")
                     .map_err(script_error)
             }
             _ => Ok(false),
@@ -1618,15 +1599,15 @@ impl Browser {
         }
         let changed = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            let changed = page.runtime.set_scroll_offset(target.path.clone(), offset);
+            let changed = page.runtime.set_scroll_offset(target.node, offset);
             if changed {
-                if target.path.is_empty() {
+                if target.node == page.document.borrow().root() {
                     page.runtime
                         .dispatch_window_event("scroll")
                         .map_err(|error| NavigationError::Script(error.to_string()))?;
                 } else {
                     page.runtime
-                        .dispatch_path_event(target.path, "scroll")
+                        .dispatch_node_event(target.node, "scroll")
                         .map_err(|error| NavigationError::Script(error.to_string()))?;
                 }
             }
@@ -1685,15 +1666,15 @@ impl Browser {
         }
         let changed = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            let changed = page.runtime.set_scroll_offset(drag.path.clone(), offset);
+            let changed = page.runtime.set_scroll_offset(drag.node, offset);
             if changed {
-                if drag.path.is_empty() {
+                if drag.node == page.document.borrow().root() {
                     page.runtime
                         .dispatch_window_event("scroll")
                         .map_err(|error| NavigationError::Script(error.to_string()))?;
                 } else {
                     page.runtime
-                        .dispatch_path_event(drag.path.clone(), "scroll")
+                        .dispatch_node_event(drag.node, "scroll")
                         .map_err(|error| NavigationError::Script(error.to_string()))?;
                 }
             }
@@ -1722,15 +1703,15 @@ impl Browser {
         if !extend {
             self.selection_unit = None;
         }
-        if let Some((path, offset)) = layout.control_text_offset_at(x, y) {
+        if let Some((node, offset)) = layout.control_text_offset_at(x, y) {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             return page
                 .runtime
-                .select_control_offset(path, offset, extend)
+                .select_control_offset(node, offset, extend)
                 .map_err(script_error);
         }
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-        let Some((path, offset)) = layout.prose_text_offset_at(x, y, extend) else {
+        let Some((node, offset)) = layout.prose_text_offset_at(x, y, extend) else {
             if !extend {
                 page.runtime
                     .clear_document_selection()
@@ -1741,18 +1722,17 @@ impl Browser {
         let Some(unit) = self.selection_unit.filter(|_| extend) else {
             return page
                 .runtime
-                .select_prose_offset(path, offset, extend)
+                .select_prose_offset(node, offset, extend)
                 .map_err(script_error);
         };
         // a drag after a multi-click grows by whole units from the clicked one
         let (anchor, focus) = {
             let document = page.document.borrow();
-            let Some(position) = document.node_text_offset(&path).map(|start| start + offset)
-            else {
+            let Some(position) = document.node_text_offset(node).map(|start| start + offset) else {
                 return Ok(false);
             };
             let (word_start, word_end) = if unit.words {
-                crate::selection::word_around(&document, &path, offset)
+                crate::selection::word_around(&document, node, offset)
                     .unwrap_or((position, position))
             } else {
                 (position, position)
@@ -1782,8 +1762,8 @@ impl Browser {
             self.layout(viewport)?
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-        if let Some((path, offset)) = layout.control_text_offset_at(x, y) {
-            let value = page.runtime.control_value(&path).unwrap_or_default();
+        if let Some((node, offset)) = layout.control_text_offset_at(x, y) {
+            let value = page.runtime.control_value(node).unwrap_or_default();
             let units = value.encode_utf16().collect::<Vec<_>>();
             let (start, end) = if clicks == 2 {
                 crate::text::word_at(&units, offset)
@@ -1792,19 +1772,19 @@ impl Browser {
             };
             return page
                 .runtime
-                .select_control_range(path, start, end)
+                .select_control_range(node, start, end)
                 .map_err(script_error);
         }
-        let Some((path, offset)) = layout.prose_text_offset_at(x, y, false) else {
+        let Some((node, offset)) = layout.prose_text_offset_at(x, y, false) else {
             return Ok(false);
         };
         let bounds = {
             let document = page.document.borrow();
             if clicks == 2 {
-                crate::selection::word_around(&document, &path, offset)
+                crate::selection::word_around(&document, node, offset)
             } else {
                 document
-                    .node_text_offset(&path)
+                    .node_text_offset(node)
                     .map(|start| start + offset)
                     .and_then(|position| {
                         crate::selection::ProseText::new(&layout, &document).block_around(position)
@@ -1924,28 +1904,28 @@ impl Browser {
         y: f32,
         event: &str,
     ) -> Result<bool, NavigationError> {
-        let path = self.layout(viewport)?.hit_test(x, y);
-        let hover_changed = if event == "pointermove" && self.hovered_path != path {
-            self.hovered_path = path.clone();
+        let node = self.layout(viewport)?.hit_test(x, y);
+        let hover_changed = if event == "pointermove" && self.hovered_node != node {
+            self.hovered_node = node;
             true
         } else {
             false
         };
-        let Some(path) = path else {
+        let Some(node) = node else {
             return Ok(hover_changed);
         };
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             let focused = if event == "pointerdown" {
                 page.runtime
-                    .focus_path(path.clone())
+                    .focus_node(node)
                     .map_err(|error| NavigationError::Script(error.to_string()))?
             } else {
                 false
             };
             let dispatched = page
                 .runtime
-                .dispatch_path_event(path, event)
+                .dispatch_node_event(node, event)
                 .map_err(|error| NavigationError::Script(error.to_string()))?;
             focused || dispatched
         };
@@ -2088,7 +2068,7 @@ impl Browser {
         let document = page.document.clone();
         let document = document.borrow();
         let stylesheet = &page.stylesheet;
-        let mut style_state = page.runtime.style_state(self.hovered_path.clone());
+        let mut style_state = page.runtime.style_state(self.hovered_node);
         style_state.viewport_width = viewport.width;
         style_state.viewport_height = viewport.height;
         style_state.color_scheme = self.preferences.color_scheme;
@@ -2098,21 +2078,21 @@ impl Browser {
         style_state.animation_starts = self
             .animations
             .iter()
-            .map(|(path, run)| (path.clone(), run.started))
+            .map(|(node, run)| (*node, run.started))
             .collect();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
         if let Some(base) = self.current_url.as_ref() {
-            for path in document
+            for node in document
                 .find_elements_by_selector("img")
                 .unwrap_or_default()
             {
                 let image = document
-                    .element_attribute(&path, "src")
-                    .and_then(|source| self.image_for(page, base, &source));
+                    .attribute(node, "src")
+                    .and_then(|source| self.image_for(page, base, source));
                 if let Some(image) = image {
                     style_state
                         .image_sizes
-                        .insert(path, (image.width, image.height));
+                        .insert(node, (image.width, image.height));
                 }
             }
         }
@@ -2160,10 +2140,10 @@ impl Browser {
     ) {
         let mut sources = Vec::new();
         collect_image_sources(&layout.root, &mut sources);
-        for (path, background) in sources {
+        for (node, background) in sources {
             let reference = match background {
                 Some(source) => crate::image::image_source_url(source).map(|url| url.to_string()),
-                None => document.element_attribute(&path, "src"),
+                None => document.attribute(node, "src").map(str::to_string),
             };
             let Some(image) =
                 reference.and_then(|reference| self.image_for(page, base, &reference))
@@ -2171,7 +2151,7 @@ impl Browser {
                 continue;
             };
             layout.images.push(ImageLayer {
-                path,
+                node,
                 image,
                 background: background.is_some(),
             });
@@ -2204,11 +2184,11 @@ impl Browser {
         decoded
     }
 
-    fn activate_path(&mut self, path: Vec<usize>) -> Result<bool, NavigationError> {
+    fn activate_node(&mut self, node: NodeId) -> Result<bool, NavigationError> {
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             page.runtime
-                .click_path(path)
+                .click_node(node)
                 .map_err(|error| NavigationError::Script(error.to_string()))?
         };
         if self.process_pending_navigation()?.is_some() {
@@ -2600,52 +2580,27 @@ pub(crate) fn is_json(resource: &Resource) -> bool {
 // elements are candidates in document order, which keeps sampling deterministic
 // elements that a transition or animation rule matches, found in one walk that carries
 // the ancestor chain instead of rebuilding it per element
-fn collect_motion_candidates<'a>(
+fn collect_motion_candidates(
     stylesheet: &Stylesheet,
     state: &crate::css::StyleState,
-    element: &'a Element,
-    path: &mut NodePath,
-    ancestors: &mut Vec<&'a Element>,
-    candidates: &mut Vec<NodePath>,
-) {
-    for (index, node) in element.children.iter().enumerate() {
-        let Node::Element(child) = node else {
-            continue;
-        };
-        path.push(index);
-        if stylesheet.may_animate(child, path, ancestors, state) {
-            candidates.push(path.clone());
-        }
-        ancestors.push(child);
-        collect_motion_candidates(stylesheet, state, child, path, ancestors, candidates);
-        ancestors.pop();
-        path.pop();
-    }
-}
-
-fn ancestor_chain<'a>(document: &'a Document, path: &[usize]) -> Vec<&'a Element> {
-    let mut chain = Vec::with_capacity(path.len());
-    let mut current = &document.root;
-    for &index in &path[..path.len().saturating_sub(1)] {
-        let Some(Node::Element(next)) = current.children.get(index) else {
-            return chain;
-        };
-        chain.push(next);
-        current = next;
-    }
-    chain
+    document: &Document,
+) -> Vec<NodeId> {
+    document
+        .descendants(document.root())
+        .filter(|&node| stylesheet.may_animate(document, node, state))
+        .collect()
 }
 
 // image elements and boxes with background images, in tree order
 fn collect_image_sources(
     layout: &crate::layout::LayoutBox,
-    sources: &mut Vec<(NodePath, Option<crate::image::ImageSource>)>,
+    sources: &mut Vec<(NodeId, Option<crate::image::ImageSource>)>,
 ) {
     if let Some(background) = layout.background_image {
-        sources.push((layout.path.clone(), Some(background.source)));
+        sources.push((layout.node, Some(background.source)));
     }
     if layout.tag == "img" {
-        sources.push((layout.path.clone(), None));
+        sources.push((layout.node, None));
     }
     for child in &layout.children {
         collect_image_sources(child, sources);
@@ -3373,7 +3328,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready!")
         );
     }
@@ -3422,7 +3377,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("provider!")
         );
     }
@@ -3489,7 +3444,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("provider!:remote")
         );
     }
@@ -3545,7 +3500,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("classic!")
         );
     }
@@ -3590,7 +3545,7 @@ mod tests {
             let ready = browser.document().ok().and_then(|document| {
                 let document = document.borrow();
                 let status = document.find_element_by_id("status")?;
-                (document.element_text_content(&status).as_deref() == Some("5")).then_some(())
+                (document.element_text_content(status).as_deref() == Some("5")).then_some(())
             });
             if ready.is_some() {
                 break;
@@ -3603,7 +3558,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("5")
         );
     }
@@ -3794,12 +3749,12 @@ mod tests {
         assert_eq!(browser.current_url().unwrap().path(), "/");
         assert_eq!(browser.history().len(), 1);
         assert_eq!(
-            browser
-                .document()
-                .unwrap()
-                .borrow()
-                .element_text_content(&[0])
-                .as_deref(),
+            {
+                let document = browser.document().unwrap();
+                let document = document.borrow();
+                document.element_text_content(document.node_at(&[0]))
+            }
+            .as_deref(),
             Some("home")
         );
 
@@ -3883,7 +3838,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("about")
         );
     }
@@ -3912,7 +3867,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("focused:name")
         );
     }
@@ -3935,7 +3890,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("focused:name")
         );
     }
@@ -3973,7 +3928,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("focused")
         );
     }
@@ -4007,7 +3962,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("😀|ab😀")
         );
     }
@@ -4045,7 +4000,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("invalid")
         );
         assert!(browser.click_id("name").expect("name input should focus"));
@@ -4086,7 +4041,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("true")
         );
     }
@@ -4195,7 +4150,7 @@ mod tests {
                 .document()
                 .expect("SPA document should exist")
                 .borrow()
-                .element_text_content(&status)
+                .element_text_content(status)
                 .as_deref(),
             Some("/details|details/2")
         );
@@ -4212,7 +4167,7 @@ mod tests {
                 .document()
                 .expect("SPA document should exist")
                 .borrow()
-                .element_text_content(&status)
+                .element_text_content(status)
                 .as_deref(),
             Some("/|none")
         );
@@ -4223,7 +4178,7 @@ mod tests {
                 .document()
                 .expect("SPA document should exist")
                 .borrow()
-                .element_text_content(&status)
+                .element_text_content(status)
                 .as_deref(),
             Some("/details|details")
         );
@@ -4256,7 +4211,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("settings/1")
         );
     }
@@ -4290,7 +4245,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("home")
         );
         assert!(browser.forward().expect("history forward should run"));
@@ -4301,7 +4256,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("about")
         );
     }
@@ -4336,7 +4291,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready|open")
         );
     }
@@ -4377,7 +4332,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("203|stored")
         );
     }
@@ -4428,7 +4383,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("yes")
         );
     }
@@ -4513,7 +4468,7 @@ mod tests {
                 .find_element_by_id("status")
                 .expect("status should exist");
             assert_eq!(
-                document.borrow().element_text_content(&status).as_deref(),
+                document.borrow().element_text_content(status).as_deref(),
                 Some("disk|db|2|1|text/plain|report.txt|207:cached")
             );
         }
@@ -4567,7 +4522,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("?q=rust+browser")
         );
     }
@@ -4595,7 +4550,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("posted")
         );
 
@@ -4634,7 +4589,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("multipart status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("multipart posted")
         );
 
@@ -4686,7 +4641,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("1|report.txt|text/plain|123")
         );
         let picker_requests = picker_requests.borrow();
@@ -4703,7 +4658,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("upload result status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("uploaded")
         );
         let requests = requests.borrow();
@@ -4750,7 +4705,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("clipboard status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("object|true|copied")
         );
         assert_eq!(writes.borrow().as_slice(), ["copied"]);
@@ -4782,7 +4737,7 @@ mod tests {
             .find_element_by_id("status")
             .unwrap_or_else(|| panic!("{:?}", browser.last_navigation_failure()));
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("backward|true|3|true|1|ellowor|forward|3|ld|none")
         );
     }
@@ -4805,7 +4760,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("clipboard status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("NotAllowedError: clipboard access is unavailable")
         );
     }
@@ -4829,7 +4784,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("clipboard status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("NotAllowedError: clipboard failed: permission denied")
         );
     }
@@ -4862,7 +4817,8 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&recovery, "data-status")
+                .attribute(recovery, "data-status")
+                .map(str::to_string)
                 .as_deref(),
             Some("503")
         );
@@ -4891,7 +4847,10 @@ mod tests {
         assert_eq!(browser.current_url().unwrap().path(), "/projects/ceri");
         let document = browser.document().unwrap();
         assert_eq!(
-            document.borrow().element_text_content(&[0]).as_deref(),
+            document
+                .borrow()
+                .element_text_content(document.borrow().node_at(&[0]))
+                .as_deref(),
             Some("shell")
         );
     }
@@ -4913,7 +4872,8 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&recovery, "data-status"),
+                .attribute(recovery, "data-status")
+                .map(str::to_string),
             Some("404".to_string())
         );
         let failure = browser
@@ -4995,7 +4955,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("login")
         );
     }
@@ -5050,7 +5010,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("redirected")
         );
     }
@@ -5085,7 +5045,8 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&recovery, "data-status"),
+                .attribute(recovery, "data-status")
+                .map(str::to_string),
             Some("500".to_string())
         );
     }
@@ -5115,14 +5076,11 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
         assert_eq!(
-            document
-                .borrow()
-                .style_property(&status, "color")
-                .as_deref(),
+            document.borrow().style_property(status, "color").as_deref(),
             Some("#42d3b4")
         );
     }
@@ -5157,7 +5115,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
     }
@@ -5197,7 +5155,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("overlay clicked")
         );
     }
@@ -5247,7 +5205,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("relative")
         );
         assert!(
@@ -5263,7 +5221,7 @@ mod tests {
                 .expect("top z-index click should dispatch")
         );
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("high")
         );
     }
@@ -5309,7 +5267,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("high")
         );
     }
@@ -5354,7 +5312,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("scroll:30:0")
         );
         let layout = browser
@@ -5440,7 +5398,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("sticky")
         );
     }
@@ -5490,7 +5448,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("sticky")
         );
     }
@@ -5627,7 +5585,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("window:30:30")
         );
         let layout = browser
@@ -5663,7 +5621,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("ready")
         );
     }
@@ -5690,7 +5648,7 @@ mod tests {
             .find_element_by_selector(".created")
             .expect("created element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&created).as_deref(),
+            document.borrow().element_text_content(created).as_deref(),
             Some("after")
         );
     }
@@ -5727,7 +5685,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("external script ready")
         );
         let layout = browser
@@ -5791,7 +5749,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("provider|ready")
         );
         let layout = browser
@@ -5838,7 +5796,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("201|yes|{\"ok\":true}")
         );
         let request = requests
@@ -5888,7 +5846,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("from module ready|from module")
         );
     }
@@ -5919,7 +5877,8 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&recovery, "data-status"),
+                .attribute(recovery, "data-status")
+                .map(str::to_string),
             Some("500".to_string())
         );
     }
@@ -5949,7 +5908,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status element should exist");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("200 {\"message\":\"from bundle\"}")
         );
     }
@@ -5973,7 +5932,8 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_attribute(&recovery, "data-status"),
+                .attribute(recovery, "data-status")
+                .map(str::to_string),
             Some("500".to_string())
         );
     }
@@ -6361,7 +6321,7 @@ mod tests {
             .find_element_by_id("status")
             .expect("status");
         assert_eq!(
-            document.borrow().element_text_content(&status).as_deref(),
+            document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
     }
@@ -6408,7 +6368,7 @@ mod tests {
                 .borrow()
                 .find_element_by_id("status")
                 .expect("status");
-            document.borrow().element_text_content(&status)
+            document.borrow().element_text_content(status)
         };
         assert!(browser.click_at(viewport, 70.0, 35.0).expect("click"));
         assert_eq!(status(&browser).as_deref(), Some("scaled"));

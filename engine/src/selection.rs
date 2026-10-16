@@ -1,16 +1,15 @@
 // document selection over rendered prose: the text a reader sees, in document
 // order, with flat UTF-16 positions that map back to the DOM text nodes
 
-use crate::dom::{Document, NodePath};
+use crate::dom::{Document, NodeId};
 use crate::layout::{LayoutDocument, TextRun};
 use crate::text::{next_word_boundary, previous_word_boundary, word_at};
-use std::collections::HashMap;
 
 struct Segment {
     start: usize,
     end: usize,
     node_start: usize,
-    box_path: NodePath,
+    box_node: NodeId,
     run: TextRun,
 }
 
@@ -23,35 +22,32 @@ pub(crate) struct ProseText {
 
 impl ProseText {
     pub(crate) fn new(layout: &LayoutDocument, document: &Document) -> Self {
-        let mut node_starts = HashMap::new();
+        let node_starts = document.text_node_offsets();
         let mut segments = layout
             .prose_runs()
             .into_iter()
             .filter_map(|prose| {
-                let node_start = *node_starts
-                    .entry(prose.node_path.clone())
-                    .or_insert_with(|| document.node_text_offset(&prose.node_path))
-                    .as_ref()?;
+                let node_start = *node_starts.get(&prose.node)?;
                 let start = node_start + prose.run.node_offset;
                 Some(Segment {
                     start,
                     end: start + prose.run.source_len,
                     node_start,
-                    box_path: prose.box_path,
+                    box_node: prose.box_node,
                     run: prose.run,
                 })
             })
             .collect::<Vec<_>>();
         segments.sort_by_key(|segment| segment.start);
-        let text = document.text_content().encode_utf16().collect::<Vec<_>>();
+        let text = document.document_text().encode_utf16().collect::<Vec<_>>();
         let mut units = Vec::new();
         let mut positions = Vec::new();
         let mut previous: Option<&Segment> = None;
         for segment in &segments {
             if let Some(previous) = previous
-                && (segment.start > previous.end || segment.box_path != previous.box_path)
+                && (segment.start > previous.end || segment.box_node != previous.box_node)
             {
-                units.push(if segment.box_path == previous.box_path {
+                units.push(if segment.box_node == previous.box_node {
                     u16::from(b' ')
                 } else {
                     u16::from(b'\n')
@@ -136,7 +132,7 @@ impl ProseText {
         let line = self
             .segments
             .iter()
-            .filter(|segment| segment.box_path == holder.box_path && segment.run.y == holder.run.y);
+            .filter(|segment| segment.box_node == holder.box_node && segment.run.y == holder.run.y);
         if forward {
             line.map(|segment| segment.end).max().unwrap_or(position)
         } else {
@@ -153,7 +149,7 @@ impl ProseText {
         let block = self
             .segments
             .iter()
-            .filter(|segment| segment.box_path == holder.box_path);
+            .filter(|segment| segment.box_node == holder.box_node);
         let start = block.clone().map(|segment| segment.start).min()?;
         let end = block.map(|segment| segment.end).max()?;
         Some((start, end))
@@ -180,7 +176,7 @@ impl ProseText {
             let units = segment.run.text.encode_utf16().collect::<Vec<_>>();
             let piece = String::from_utf16_lossy(&units[from..to]);
             if let Some(previous) = previous {
-                if previous.box_path != segment.box_path {
+                if previous.box_node != segment.box_node {
                     output.push('\n');
                 } else if previous.run.y != segment.run.y && !piece.starts_with(' ') {
                     output.push(' ');
@@ -196,12 +192,12 @@ impl ProseText {
 // the word around a node offset, as flat positions
 pub(crate) fn word_around(
     document: &Document,
-    node_path: &NodePath,
+    node: NodeId,
     offset: usize,
 ) -> Option<(usize, usize)> {
-    let node_start = document.node_text_offset(node_path)?;
+    let node_start = document.node_text_offset(node)?;
     let units = document
-        .node_text_content(node_path)?
+        .character_data(node)?
         .encode_utf16()
         .collect::<Vec<_>>();
     let (start, end) = word_at(&units, offset);

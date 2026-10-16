@@ -1,12 +1,83 @@
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+// a node in one document arena; the generation tells a reused slot apart from a freed node
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId {
+    index: u32,
+    generation: u32,
+}
+
+impl NodeId {
+    pub fn raw(self) -> u64 {
+        (u64::from(self.generation) << 32) | u64::from(self.index)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Namespace {
+    #[default]
+    Html,
+    Svg,
+    MathMl,
+}
+
+impl Namespace {
+    pub fn uri(self) -> &'static str {
+        match self {
+            Self::Html => "http://www.w3.org/1999/xhtml",
+            Self::Svg => "http://www.w3.org/2000/svg",
+            Self::MathMl => "http://www.w3.org/1998/Math/MathML",
+        }
+    }
+
+    pub fn from_uri(uri: &str) -> Option<Self> {
+        [Self::Html, Self::Svg, Self::MathMl]
+            .into_iter()
+            .find(|namespace| namespace.uri() == uri)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Element {
+    pub name: String,
+    pub namespace: Namespace,
+    pub attrs: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    Document,
+    Element(Element),
+    Text(String),
+    Comment(String),
+    Fragment,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeData {
+    pub kind: NodeKind,
+    parent: Option<NodeId>,
+    children: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+struct Slot {
+    generation: u32,
+    node: Option<NodeData>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Document {
-    pub root: Element,
-    node_ids: BTreeMap<NodePath, NodeId>,
-    paths: BTreeMap<NodeId, NodePath>,
-    next_node_id: NodeId,
+    slots: Vec<Slot>,
+    free: Vec<u32>,
+    root: NodeId,
+    // bumped by every change to the tree, an attribute or character data
+    version: u64,
+    // nodes that were created or lost their parent, so their owner can decide whether to free them
+    orphans: Vec<NodeId>,
+    template_contents: HashMap<NodeId, NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,42 +85,18 @@ pub struct AccessibilityNode {
     pub role: String,
     pub name: String,
     pub value: Option<String>,
-    pub path: NodePath,
+    pub node: NodeId,
     pub disabled: bool,
     pub focusable: bool,
     pub children: Vec<Self>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Element {
-    pub name: String,
-    pub attrs: BTreeMap<String, String>,
-    pub children: Vec<Node>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Node {
-    Element(Element),
-    Text(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NormalizeChange {
-    RemoveEmpty {
-        parent: NodePath,
-        child: NodePath,
-        child_id: NodeId,
-        parent_offset: usize,
-    },
-    MergeText {
-        parent: NodePath,
-        first: NodePath,
-        child: NodePath,
-        first_id: NodeId,
-        child_id: NodeId,
-        first_length: usize,
-        child_length: usize,
-    },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomError {
+    // the insertion would make an invalid tree, such as a node inside itself
+    HierarchyRequest,
+    // the reference child does not belong to the parent
+    NotFound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,9 +112,6 @@ pub enum StylesheetSource {
     Inline(String),
     External(String),
 }
-
-pub type NodePath = Vec<usize>;
-pub type NodeId = u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
@@ -87,156 +131,984 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+// preorder walk of the nodes below a root, not including the root
+pub struct Descendants<'a> {
+    document: &'a Document,
+    stack: Vec<(&'a [NodeId], usize)>,
+}
+
+impl Iterator for Descendants<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        loop {
+            let (children, index) = self.stack.last_mut()?;
+            if let Some(&child) = children.get(*index) {
+                *index += 1;
+                self.stack.push((self.document.children(child), 0));
+                return Some(child);
+            }
+            self.stack.pop();
+        }
+    }
+}
+
+pub struct Ancestors<'a> {
+    document: &'a Document,
+    next: Option<NodeId>,
+}
+
+impl Iterator for Ancestors<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        let current = self.next?;
+        self.next = self.document.parent(current);
+        Some(current)
+    }
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Document {
+    pub fn new() -> Self {
+        let mut document = Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            root: NodeId {
+                index: 0,
+                generation: 0,
+            },
+            version: 0,
+            orphans: Vec::new(),
+            template_contents: HashMap::new(),
+        };
+        document.root = document.allocate(NodeKind::Document);
+        document.orphans.clear();
+        document
+    }
+
     pub fn parse(source: &str) -> Result<Self, ParseError> {
+        let mut document = Self::new();
+        let root = document.root;
+        document.parse_into(root, source)?;
+        document.orphans.clear();
+        Ok(document)
+    }
+
+    // parses markup into a new fragment of this document
+    pub fn parse_fragment(&mut self, source: &str) -> Result<NodeId, ParseError> {
+        let fragment = self.create_fragment();
+        if let Err(error) = self.parse_into(fragment, source) {
+            self.free_tree(fragment);
+            return Err(error);
+        }
+        Ok(fragment)
+    }
+
+    fn parse_into(&mut self, parent: NodeId, source: &str) -> Result<(), ParseError> {
         let tokens = tokenize(source)?;
-        let mut root = Element::new("#document");
-        let mut stack = Vec::new();
-        for token in tokens {
-            match token {
-                Token::Start {
-                    name,
-                    attrs,
-                    self_closing,
-                } => {
-                    let element = Element {
+        // open elements by name, with the node their children go into
+        let mut stack: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut created = Vec::new();
+        let result = (|| {
+            for token in tokens {
+                let target = stack.last().map_or(parent, |&(_, target)| target);
+                match token {
+                    Token::Start {
                         name,
                         attrs,
-                        children: Vec::new(),
-                    };
-                    if self_closing || is_void_element(&element.name) {
-                        append_node(&mut root, &mut stack, Node::Element(element));
-                    } else {
-                        stack.push(element);
-                    }
-                }
-                Token::End { name, offset } => {
-                    let Some(index) = stack.iter().rposition(|element| element.name == name) else {
-                        return Err(ParseError {
-                            offset,
-                            message: format!("closing tag </{name}> has no open element"),
+                        self_closing,
+                    } => {
+                        let in_svg = stack.iter().any(|&(open, _)| {
+                            self.element(open)
+                                .is_some_and(|element| element.namespace == Namespace::Svg)
                         });
-                    };
-                    while stack.len() > index {
-                        let element = stack.pop().expect("stack index was checked");
-                        append_node(&mut root, &mut stack, Node::Element(element));
+                        let namespace = if name == "svg" || in_svg {
+                            Namespace::Svg
+                        } else if name == "math" {
+                            Namespace::MathMl
+                        } else {
+                            Namespace::Html
+                        };
+                        let void = is_void_element(&name);
+                        let template = name == "template";
+                        let id = self.allocate(NodeKind::Element(Element {
+                            name,
+                            namespace,
+                            attrs,
+                        }));
+                        created.push(id);
+                        self.append_raw(target, id);
+                        if !(self_closing || void) {
+                            let content = if template {
+                                let content = self.allocate(NodeKind::Fragment);
+                                self.template_contents.insert(id, content);
+                                content
+                            } else {
+                                id
+                            };
+                            stack.push((id, content));
+                        }
+                    }
+                    Token::End { name, offset } => {
+                        let Some(index) = stack.iter().rposition(|&(open, _)| {
+                            self.element(open)
+                                .is_some_and(|element| element.name == name)
+                        }) else {
+                            return Err(ParseError {
+                                offset,
+                                message: format!("closing tag </{name}> has no open element"),
+                            });
+                        };
+                        stack.truncate(index);
+                    }
+                    Token::Text(text) => {
+                        if !text.is_empty() {
+                            let id = self.allocate(NodeKind::Text(text));
+                            created.push(id);
+                            self.append_raw(target, id);
+                        }
+                    }
+                    Token::Comment(text) => {
+                        let id = self.allocate(NodeKind::Comment(text));
+                        created.push(id);
+                        self.append_raw(target, id);
                     }
                 }
-                Token::Text(text) => {
-                    if !text.is_empty() {
-                        append_node(&mut root, &mut stack, Node::Text(text));
+            }
+            Ok(())
+        })();
+        let created_set: std::collections::HashSet<NodeId> = created.iter().copied().collect();
+        self.orphans.retain(|id| !created_set.contains(id));
+        if result.is_err() {
+            for child in self.children(parent).to_vec() {
+                if created_set.contains(&child) {
+                    self.detach_raw(child);
+                    self.free_tree(child);
+                }
+            }
+        }
+        result
+    }
+
+    fn allocate(&mut self, kind: NodeKind) -> NodeId {
+        let node = NodeData {
+            kind,
+            parent: None,
+            children: Vec::new(),
+        };
+        self.version += 1;
+        let id = if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
+            slot.node = Some(node);
+            NodeId {
+                index,
+                generation: slot.generation,
+            }
+        } else {
+            let index = u32::try_from(self.slots.len()).expect("node arena exceeds u32 slots");
+            self.slots.push(Slot {
+                generation: 0,
+                node: Some(node),
+            });
+            NodeId {
+                index,
+                generation: 0,
+            }
+        };
+        self.orphans.push(id);
+        id
+    }
+
+    fn data(&self, id: NodeId) -> Option<&NodeData> {
+        let slot = self.slots.get(id.index as usize)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        slot.node.as_ref()
+    }
+
+    fn data_mut(&mut self, id: NodeId) -> Option<&mut NodeData> {
+        let slot = self.slots.get_mut(id.index as usize)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        slot.node.as_mut()
+    }
+
+    fn append_raw(&mut self, parent: NodeId, child: NodeId) {
+        if let Some(data) = self.data_mut(child) {
+            data.parent = Some(parent);
+        }
+        if let Some(data) = self.data_mut(parent) {
+            data.children.push(child);
+        }
+    }
+
+    // unlinks a node from its parent, returning the parent and the index it had
+    fn detach_raw(&mut self, id: NodeId) -> Option<(NodeId, usize)> {
+        let parent = self.data(id)?.parent?;
+        let siblings = &mut self.data_mut(parent)?.children;
+        let index = siblings.iter().position(|&child| child == id)?;
+        siblings.remove(index);
+        self.data_mut(id)?.parent = None;
+        self.version += 1;
+        Some((parent, index))
+    }
+
+    // the node reached by child indices from the root, for tests written against tree shape
+    #[cfg(test)]
+    pub(crate) fn node_at(&self, path: &[usize]) -> NodeId {
+        path.iter().fold(self.root, |node, &index| {
+            *self
+                .children(node)
+                .get(index)
+                .unwrap_or_else(|| panic!("no node at {path:?}"))
+        })
+    }
+
+    pub fn root(&self) -> NodeId {
+        self.root
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.data(id).is_some()
+    }
+
+    pub fn kind(&self, id: NodeId) -> Option<&NodeKind> {
+        self.data(id).map(|data| &data.kind)
+    }
+
+    pub fn element(&self, id: NodeId) -> Option<&Element> {
+        match self.kind(id)? {
+            NodeKind::Element(element) => Some(element),
+            _ => None,
+        }
+    }
+
+    pub fn element_mut(&mut self, id: NodeId) -> Option<&mut Element> {
+        self.version += 1;
+        match &mut self.data_mut(id)?.kind {
+            NodeKind::Element(element) => Some(element),
+            _ => None,
+        }
+    }
+
+    pub fn is_element(&self, id: NodeId) -> bool {
+        self.element(id).is_some()
+    }
+
+    pub fn is_text(&self, id: NodeId) -> bool {
+        matches!(self.kind(id), Some(NodeKind::Text(_)))
+    }
+
+    // text of a Text node only
+    pub fn text(&self, id: NodeId) -> Option<&str> {
+        match self.kind(id)? {
+            NodeKind::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    // data of a Text or Comment node
+    pub fn character_data(&self, id: NodeId) -> Option<&str> {
+        match self.kind(id)? {
+            NodeKind::Text(text) | NodeKind::Comment(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn set_character_data(&mut self, id: NodeId, data: String) -> bool {
+        let Some(node) = self.data_mut(id) else {
+            return false;
+        };
+        match &mut node.kind {
+            NodeKind::Text(text) | NodeKind::Comment(text) => {
+                *text = data;
+                self.version += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.data(id)?.parent
+    }
+
+    pub fn parent_element(&self, id: NodeId) -> Option<NodeId> {
+        self.parent(id).filter(|&parent| self.is_element(parent))
+    }
+
+    pub fn children(&self, id: NodeId) -> &[NodeId] {
+        self.data(id).map_or(&[], |data| data.children.as_slice())
+    }
+
+    pub fn element_children(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.children(id)
+            .iter()
+            .copied()
+            .filter(|&child| self.is_element(child))
+    }
+
+    pub fn index_in_parent(&self, id: NodeId) -> Option<usize> {
+        let parent = self.parent(id)?;
+        self.children(parent).iter().position(|&child| child == id)
+    }
+
+    pub fn sibling(&self, id: NodeId, next: bool) -> Option<NodeId> {
+        let parent = self.parent(id)?;
+        let siblings = self.children(parent);
+        let index = siblings.iter().position(|&child| child == id)?;
+        if next {
+            siblings.get(index + 1).copied()
+        } else {
+            index.checked_sub(1).map(|previous| siblings[previous])
+        }
+    }
+
+    pub fn element_sibling(&self, id: NodeId, next: bool) -> Option<NodeId> {
+        let parent = self.parent(id)?;
+        let siblings = self.children(parent);
+        let index = siblings.iter().position(|&child| child == id)?;
+        if next {
+            siblings[index + 1..]
+                .iter()
+                .copied()
+                .find(|&sibling| self.is_element(sibling))
+        } else {
+            siblings[..index]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&sibling| self.is_element(sibling))
+        }
+    }
+
+    // the parent chain, starting at the parent
+    pub fn ancestors(&self, id: NodeId) -> Ancestors<'_> {
+        Ancestors {
+            document: self,
+            next: self.parent(id),
+        }
+    }
+
+    pub fn descendants(&self, id: NodeId) -> Descendants<'_> {
+        Descendants {
+            document: self,
+            stack: vec![(self.children(id), 0)],
+        }
+    }
+
+    pub fn is_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        ancestor == node || self.ancestors(node).any(|candidate| candidate == ancestor)
+    }
+
+    pub fn common_ancestor(&self, left: NodeId, right: NodeId) -> Option<NodeId> {
+        std::iter::once(left)
+            .chain(self.ancestors(left))
+            .find(|&candidate| self.is_inclusive_ancestor(candidate, right))
+    }
+
+    pub fn tree_root(&self, id: NodeId) -> NodeId {
+        self.ancestors(id).last().unwrap_or(id)
+    }
+
+    pub fn is_connected(&self, id: NodeId) -> bool {
+        self.contains(id) && self.tree_root(id) == self.root
+    }
+
+    // document order of two nodes in one tree; nodes in different trees order by id
+    pub fn tree_order(&self, left: NodeId, right: NodeId) -> Ordering {
+        if left == right {
+            return Ordering::Equal;
+        }
+        let chain = |node: NodeId| {
+            let mut chain = std::iter::once(node)
+                .chain(self.ancestors(node))
+                .collect::<Vec<_>>();
+            chain.reverse();
+            chain
+        };
+        let (left_chain, right_chain) = (chain(left), chain(right));
+        if left_chain[0] != right_chain[0] {
+            return left_chain[0].cmp(&right_chain[0]);
+        }
+        let shared = left_chain
+            .iter()
+            .zip(&right_chain)
+            .take_while(|(a, b)| a == b)
+            .count();
+        match (left_chain.get(shared), right_chain.get(shared)) {
+            (None, _) => Ordering::Less,
+            (_, None) => Ordering::Greater,
+            (Some(&a), Some(&b)) => {
+                let siblings = self.children(left_chain[shared - 1]);
+                let position = |node| siblings.iter().position(|&child| child == node);
+                position(a).cmp(&position(b))
+            }
+        }
+    }
+
+    pub fn template_content(&self, id: NodeId) -> Option<NodeId> {
+        self.template_contents.get(&id).copied()
+    }
+
+    // the template content of a template element, created on first use for scripted templates
+    pub fn ensure_template_content(&mut self, id: NodeId) -> Option<NodeId> {
+        if let Some(content) = self.template_content(id) {
+            return Some(content);
+        }
+        if self.element(id)?.name != "template" {
+            return None;
+        }
+        let content = self.allocate(NodeKind::Fragment);
+        self.orphans.retain(|&orphan| orphan != content);
+        self.template_contents.insert(id, content);
+        Some(content)
+    }
+
+    pub fn document_element(&self) -> Option<NodeId> {
+        self.element_children(self.root).next()
+    }
+
+    fn document_child_named(&self, name: &str) -> Option<NodeId> {
+        let html = self.document_element()?;
+        self.element_children(html).find(|&child| {
+            self.element(child)
+                .is_some_and(|element| element.name == name)
+        })
+    }
+
+    pub fn body(&self) -> Option<NodeId> {
+        self.document_child_named("body")
+    }
+
+    pub fn head(&self) -> Option<NodeId> {
+        self.document_child_named("head")
+    }
+
+    pub fn title(&self) -> Option<String> {
+        let title = self.descendants(self.root).find(|&id| {
+            self.element(id)
+                .is_some_and(|element| element.name == "title")
+        })?;
+        let text = self.text_content(title);
+        let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!title.is_empty()).then_some(title)
+    }
+
+    pub fn create_element(&mut self, name: &str) -> NodeId {
+        self.allocate(NodeKind::Element(Element::new(name)))
+    }
+
+    pub fn create_element_ns(&mut self, namespace: Namespace, name: &str) -> NodeId {
+        let name = if namespace == Namespace::Html {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_string()
+        };
+        self.allocate(NodeKind::Element(Element {
+            name,
+            namespace,
+            attrs: BTreeMap::new(),
+        }))
+    }
+
+    pub fn create_text(&mut self, data: impl Into<String>) -> NodeId {
+        self.allocate(NodeKind::Text(data.into()))
+    }
+
+    pub fn create_comment(&mut self, data: impl Into<String>) -> NodeId {
+        self.allocate(NodeKind::Comment(data.into()))
+    }
+
+    pub fn create_fragment(&mut self) -> NodeId {
+        self.allocate(NodeKind::Fragment)
+    }
+
+    pub fn adopt_element(&mut self, element: Element) -> NodeId {
+        self.allocate(NodeKind::Element(element))
+    }
+
+    fn can_have_children(&self, id: NodeId) -> bool {
+        matches!(
+            self.kind(id),
+            Some(NodeKind::Document | NodeKind::Element(_) | NodeKind::Fragment)
+        )
+    }
+
+    // inserts a node, or the children of a fragment, before the reference or at the end;
+    // returns the nodes that were inserted
+    pub fn insert_before(
+        &mut self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<Vec<NodeId>, DomError> {
+        self.validate_insertion(parent, node, reference)?;
+        let inserted = match self.kind(node) {
+            Some(NodeKind::Fragment) => self.children(node).to_vec(),
+            _ => vec![node],
+        };
+        let reference = match reference {
+            Some(reference) if inserted.contains(&reference) => {
+                let mut candidate = self.sibling(reference, true);
+                while let Some(next) = candidate {
+                    if !inserted.contains(&next) {
+                        break;
+                    }
+                    candidate = self.sibling(next, true);
+                }
+                candidate
+            }
+            other => other,
+        };
+        for &child in &inserted {
+            self.detach_raw(child);
+        }
+        let index = match reference {
+            Some(reference) => self
+                .children(parent)
+                .iter()
+                .position(|&child| child == reference)
+                .ok_or(DomError::NotFound)?,
+            None => self.children(parent).len(),
+        };
+        for &child in &inserted {
+            if let Some(data) = self.data_mut(child) {
+                data.parent = Some(parent);
+            }
+        }
+        if let Some(data) = self.data_mut(parent) {
+            data.children.splice(index..index, inserted.iter().copied());
+        }
+        self.version += 1;
+        Ok(inserted)
+    }
+
+    // the checks insert_before makes before it changes anything
+    pub fn validate_insertion(
+        &self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<(), DomError> {
+        if !self.can_have_children(parent)
+            || !self.contains(node)
+            || matches!(self.kind(node), Some(NodeKind::Document))
+            || self.is_inclusive_ancestor(node, parent)
+        {
+            return Err(DomError::HierarchyRequest);
+        }
+        if let Some(reference) = reference
+            && self.parent(reference) != Some(parent)
+        {
+            return Err(DomError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn append_child(&mut self, parent: NodeId, node: NodeId) -> Result<Vec<NodeId>, DomError> {
+        self.insert_before(parent, node, None)
+    }
+
+    // removes a node from its parent, keeping it in the arena; returns the parent and index
+    pub fn remove(&mut self, id: NodeId) -> Option<(NodeId, usize)> {
+        let removed = self.detach_raw(id)?;
+        self.orphans.push(id);
+        Some(removed)
+    }
+
+    pub fn take_orphans(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.orphans)
+    }
+
+    // frees a parentless node and everything below it, including template contents
+    pub fn free_tree(&mut self, id: NodeId) -> Vec<NodeId> {
+        if id == self.root || self.parent(id).is_some() || !self.contains(id) {
+            return Vec::new();
+        }
+        let freed = self.subtree(id);
+        for &node in &freed {
+            self.template_contents.remove(&node);
+            let slot = &mut self.slots[node.index as usize];
+            slot.node = None;
+            slot.generation = slot.generation.wrapping_add(1);
+            self.free.push(node.index);
+        }
+        self.version += 1;
+        freed
+    }
+
+    // a node, everything below it and the contents of templates among them
+    pub fn subtree(&self, root: NodeId) -> Vec<NodeId> {
+        let mut nodes = Vec::new();
+        let mut pending = vec![root];
+        while let Some(current) = pending.pop() {
+            let Some(data) = self.data(current) else {
+                continue;
+            };
+            pending.extend(data.children.iter().copied());
+            pending.extend(self.template_content(current));
+            nodes.push(current);
+        }
+        nodes
+    }
+
+    pub fn set_attribute(&mut self, id: NodeId, name: &str, value: String) -> bool {
+        let Some(element) = self.element_mut(id) else {
+            return false;
+        };
+        let name = if element.namespace == Namespace::Html {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_string()
+        };
+        element.attrs.insert(name, value);
+        true
+    }
+
+    pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> bool {
+        let Some(element) = self.element_mut(id) else {
+            return false;
+        };
+        let name = if element.namespace == Namespace::Html {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_string()
+        };
+        element.attrs.remove(&name).is_some()
+    }
+
+    pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
+        self.element(id)?.attr(name)
+    }
+
+    pub fn has_class(&self, id: NodeId, class: &str) -> bool {
+        self.element(id)
+            .is_some_and(|element| element.has_class(class))
+    }
+
+    pub fn style_property(&self, id: NodeId, property: &str) -> Option<String> {
+        self.element(id)?.style_property(property)
+    }
+
+    pub fn set_style_property(&mut self, id: NodeId, property: &str, value: String) -> bool {
+        self.element_mut(id)
+            .is_some_and(|element| element.set_style_property(property, value))
+    }
+
+    // copies a node, and with deep its descendants and template contents, as a new orphan
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> Option<NodeId> {
+        let kind = self.kind(id)?.clone();
+        let kind = match kind {
+            NodeKind::Document => NodeKind::Fragment,
+            other => other,
+        };
+        let copy = self.allocate(kind);
+        if deep {
+            for child in self.children(id).to_vec() {
+                if let Some(child_copy) = self.clone_node(child, true) {
+                    self.orphans.retain(|&orphan| orphan != child_copy);
+                    self.append_raw(copy, child_copy);
+                }
+            }
+            if let Some(content) = self.template_content(id) {
+                let content_copy = self.ensure_template_content(copy)?;
+                for child in self.children(content).to_vec() {
+                    if let Some(child_copy) = self.clone_node(child, true) {
+                        self.orphans.retain(|&orphan| orphan != child_copy);
+                        self.append_raw(content_copy, child_copy);
                     }
                 }
             }
         }
-        while let Some(element) = stack.pop() {
-            append_node(&mut root, &mut stack, Node::Element(element));
+        Some(copy)
+    }
+
+    // splits a text node at a UTF-16 offset; the tail follows it in the parent, if any
+    pub fn split_text(&mut self, id: NodeId, offset: usize) -> Option<NodeId> {
+        let text = self.text(id)?.to_string();
+        let (head, tail) = split_utf16(&text, offset);
+        self.set_character_data(id, head);
+        let created = self.create_text(tail);
+        if let Some(parent) = self.parent(id) {
+            let next = self.sibling(id, true);
+            self.insert_before(parent, created, next).ok()?;
+            self.orphans.retain(|&orphan| orphan != created);
         }
-        let mut document = Self {
-            root,
-            node_ids: BTreeMap::new(),
-            paths: BTreeMap::new(),
-            next_node_id: 1,
-        };
-        document.assign_ids_for_document();
-        Ok(document)
+        Some(created)
     }
 
-    pub fn node_id(&self, path: &[usize]) -> Option<NodeId> {
-        self.node_ids.get(path).copied()
+    pub fn element_text_content(&self, id: NodeId) -> Option<String> {
+        self.element(id)?;
+        Some(self.text_content(id))
     }
 
-    pub fn path_for_id(&self, id: NodeId) -> Option<NodePath> {
-        self.paths.get(&id).cloned()
+    // textContent: the data of character data, or every descendant text node joined
+    pub fn text_content(&self, id: NodeId) -> String {
+        if let Some(data) = self.character_data(id) {
+            return data.to_string();
+        }
+        self.descendants(id)
+            .filter_map(|node| self.text(node))
+            .collect()
+    }
+
+    pub fn node_text_content(&self, id: NodeId) -> Option<String> {
+        self.contains(id).then(|| self.text_content(id))
+    }
+
+    pub fn document_text(&self) -> String {
+        self.text_content(self.root)
+    }
+
+    // the flat UTF-16 offset of a node in the document's concatenated text
+    pub fn node_text_offset(&self, id: NodeId) -> Option<usize> {
+        if !self.is_connected(id) {
+            return None;
+        }
+        let mut offset = 0;
+        for node in self.descendants(self.root) {
+            if node == id {
+                return Some(offset);
+            }
+            if let Some(text) = self.text(node) {
+                offset += text.encode_utf16().count();
+            }
+        }
+        None
+    }
+
+    // the flat UTF-16 offset of every connected text node, from one walk
+    pub fn text_node_offsets(&self) -> HashMap<NodeId, usize> {
+        let mut offsets = HashMap::new();
+        let mut position = 0;
+        for node in self.descendants(self.root) {
+            if let Some(text) = self.text(node) {
+                offsets.insert(node, position);
+                position += text.encode_utf16().count();
+            }
+        }
+        offsets
+    }
+
+    // text nodes overlapping the flat UTF-16 range [start, end), as node-local spans
+    pub fn text_node_spans(&self, start: usize, end: usize) -> Vec<(NodeId, usize, usize)> {
+        let mut spans = Vec::new();
+        if start >= end {
+            return spans;
+        }
+        let mut position = 0;
+        for node in self.descendants(self.root) {
+            if position >= end {
+                break;
+            }
+            let Some(text) = self.text(node) else {
+                continue;
+            };
+            let length = text.encode_utf16().count();
+            let from = start.max(position);
+            let to = end.min(position + length);
+            if from < to {
+                spans.push((node, from - position, to - position));
+            }
+            position += length;
+        }
+        spans
+    }
+
+    // the text node and offset at a flat UTF-16 position, preferring the node that starts there
+    pub fn text_point(&self, position: usize) -> Option<(NodeId, usize)> {
+        if let Some((node, start, _)) = self.text_node_spans(position, position + 1).pop() {
+            return Some((node, start));
+        }
+        let (node, _, end) = self
+            .text_node_spans(position.checked_sub(1)?, position)
+            .pop()?;
+        Some((node, end))
+    }
+
+    pub fn inner_html(&self, id: NodeId) -> String {
+        let mut output = String::new();
+        let source = self.template_content(id).unwrap_or(id);
+        let raw = self
+            .element(id)
+            .is_some_and(|element| is_raw_text_element(&element.name));
+        for &child in self.children(source) {
+            self.serialize(child, raw, &mut output);
+        }
+        output
+    }
+
+    pub fn outer_html(&self, id: NodeId) -> String {
+        let mut output = String::new();
+        self.serialize(id, false, &mut output);
+        output
+    }
+
+    fn serialize(&self, id: NodeId, raw_text: bool, output: &mut String) {
+        match self.kind(id) {
+            Some(NodeKind::Element(element)) => {
+                output.push('<');
+                output.push_str(&element.name);
+                for (name, value) in &element.attrs {
+                    output.push(' ');
+                    output.push_str(name);
+                    output.push_str("=\"");
+                    escape_html_attribute(value, output);
+                    output.push('"');
+                }
+                output.push('>');
+                if is_void_element(&element.name) {
+                    return;
+                }
+                output.push_str(&self.inner_html(id));
+                output.push_str("</");
+                output.push_str(&element.name);
+                output.push('>');
+            }
+            Some(NodeKind::Text(text)) if raw_text => output.push_str(text),
+            Some(NodeKind::Text(text)) => escape_html(text, output),
+            Some(NodeKind::Comment(text)) => {
+                output.push_str("<!--");
+                output.push_str(text);
+                output.push_str("-->");
+            }
+            Some(NodeKind::Document | NodeKind::Fragment) => {
+                for &child in self.children(id) {
+                    self.serialize(child, false, output);
+                }
+            }
+            None => {}
+        }
     }
 
     pub fn style_text(&self) -> String {
         let mut output = String::new();
-        collect_style_text(&self.root, &mut output);
+        for node in self.descendants(self.root) {
+            if self
+                .element(node)
+                .is_some_and(|element| element.name == "style")
+            {
+                output.push_str(&self.text_content(node));
+            }
+        }
         output
     }
 
     pub fn script_text(&self) -> Vec<String> {
-        let mut scripts = Vec::new();
-        collect_script_text(&self.root, &mut scripts);
-        scripts
+        self.descendants(self.root)
+            .filter(|&node| {
+                self.element(node).is_some_and(|element| {
+                    element.name == "script" && element.attr("src").is_none()
+                })
+            })
+            .map(|node| self.text_content(node))
+            .collect()
     }
 
     pub fn script_sources(&self) -> Vec<ScriptSource> {
         let mut scripts = Vec::new();
-        collect_script_sources(&self.root, &mut scripts);
+        for node in self.descendants(self.root) {
+            let Some(element) = self
+                .element(node)
+                .filter(|element| element.name == "script")
+            else {
+                continue;
+            };
+            let is_module = element
+                .attr("type")
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("module"));
+            scripts.push(match (element.attr("src"), is_module) {
+                (Some(source), true) => ScriptSource::ExternalModule(source.to_string()),
+                (Some(source), false) => ScriptSource::External(source.to_string()),
+                (None, true) => ScriptSource::InlineModule(self.text_content(node)),
+                (None, false) => ScriptSource::Inline(self.text_content(node)),
+            });
+        }
         scripts
     }
 
     pub fn stylesheet_sources(&self) -> Vec<StylesheetSource> {
         let mut stylesheets = Vec::new();
-        collect_stylesheet_sources(&self.root, &mut stylesheets);
+        for node in self.descendants(self.root) {
+            let Some(element) = self.element(node) else {
+                continue;
+            };
+            if element.name == "style" {
+                stylesheets.push(StylesheetSource::Inline(self.text_content(node)));
+            } else if element.name == "link"
+                && element.attr("rel").is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                })
+                && let Some(href) = element.attr("href")
+            {
+                stylesheets.push(StylesheetSource::External(href.to_string()));
+            }
+        }
         stylesheets
     }
 
-    pub fn accessibility_tree(&self) -> AccessibilityNode {
-        let children = self
-            .root
-            .children
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| match node {
-                Node::Element(element) => accessibility_node(element, vec![index]),
-                Node::Text(_) => None,
-            })
-            .collect();
-        AccessibilityNode {
-            role: "document".to_string(),
-            name: String::new(),
-            value: None,
-            path: Vec::new(),
-            disabled: false,
-            focusable: false,
-            children,
+    fn connected_elements(&self) -> impl Iterator<Item = (NodeId, &Element)> + '_ {
+        self.descendants(self.root)
+            .filter_map(|node| self.element(node).map(|element| (node, element)))
+    }
+
+    pub fn find_element_by_id(&self, id: &str) -> Option<NodeId> {
+        self.connected_elements()
+            .find(|(_, element)| element.attr("id") == Some(id))
+            .map(|(node, _)| node)
+    }
+
+    pub fn autofocus_candidates(&self) -> Vec<NodeId> {
+        self.connected_elements()
+            .filter(|(_, element)| element.attrs.contains_key("autofocus"))
+            .map(|(node, _)| node)
+            .collect()
+    }
+
+    fn elements_named(&self, id: NodeId, name: &str) -> bool {
+        self.element(id).is_some_and(|element| element.name == name)
+    }
+
+    fn closest_named(&self, id: NodeId, name: &str) -> Option<NodeId> {
+        self.ancestors(id)
+            .find(|&ancestor| self.elements_named(ancestor, name))
+    }
+
+    pub fn form_controls(&self, form: NodeId) -> Option<Vec<NodeId>> {
+        if !self.elements_named(form, "form") {
+            return None;
         }
+        let scope = self.tree_root(form);
+        Some(
+            self.descendants(scope)
+                .filter(|&node| {
+                    self.element(node).is_some_and(|element| {
+                        matches!(
+                            element.name.as_str(),
+                            "button" | "input" | "select" | "textarea"
+                        )
+                    }) && self.form_owner(node) == Some(form)
+                })
+                .collect(),
+        )
     }
 
-    pub fn find_element_by_id(&self, id: &str) -> Option<NodePath> {
-        find_element_by_id(&self.root, id, &mut Vec::new())
-    }
-
-    pub fn autofocus_paths(&self) -> Vec<NodePath> {
-        let mut paths = Vec::new();
-        let mut path = Vec::new();
-        collect_autofocus_paths(&self.root, &mut path, &mut paths);
-        paths
-    }
-
-    pub fn title(&self) -> Option<String> {
-        let element = first_element_named(&self.root, "title")?;
-        let mut text = String::new();
-        collect_text_nodes(element, &mut text);
-        let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!title.is_empty()).then_some(title)
-    }
-
-    pub fn document_element_path(&self) -> Option<NodePath> {
-        self.root
-            .children
-            .iter()
-            .enumerate()
-            .find_map(|(index, node)| matches!(node, Node::Element(_)).then_some(vec![index]))
-    }
-
-    pub fn form_control_paths(&self, form_path: &[usize]) -> Option<Vec<NodePath>> {
-        let form = self.element_at(form_path)?;
-        (form.name == "form").then(|| {
-            let mut paths = Vec::new();
-            collect_form_control_paths(&self.root, &mut Vec::new(), &mut paths);
-            paths
-                .into_iter()
-                .filter(|path| self.form_owner_path(path).as_deref() == Some(form_path))
-                .collect()
-        })
-    }
-
-    pub fn form_owner_path(&self, path: &[usize]) -> Option<NodePath> {
-        let element = self.element_at(path)?;
+    pub fn form_owner(&self, id: NodeId) -> Option<NodeId> {
+        let element = self.element(id)?;
         if !matches!(
             element.name.as_str(),
             "button" | "input" | "select" | "textarea"
@@ -244,929 +1116,213 @@ impl Document {
             return None;
         }
         if let Some(form_id) = element.attr("form") {
+            if !self.is_connected(id) {
+                return None;
+            }
             let candidate = self.find_element_by_id(form_id)?;
-            return self
-                .element_at(&candidate)
-                .is_some_and(|element| element.name == "form")
-                .then_some(candidate);
+            return self.elements_named(candidate, "form").then_some(candidate);
         }
-        self.form_ancestor_path(path)
+        self.form_ancestor(id)
     }
 
-    pub fn form_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
-        let mut candidate = path.to_vec();
-        while !candidate.is_empty() {
-            candidate.pop();
-            if self
-                .element_at(&candidate)
-                .is_some_and(|element| element.name == "form")
-            {
-                return Some(candidate);
-            }
-        }
-        None
+    pub fn form_ancestor(&self, id: NodeId) -> Option<NodeId> {
+        self.closest_named(id, "form")
     }
 
-    pub fn option_paths(&self, select_path: &[usize]) -> Option<Vec<NodePath>> {
-        let select = self.element_at(select_path)?;
-        (select.name == "select").then(|| {
-            let mut paths = Vec::new();
-            let mut path = select_path.to_vec();
-            collect_option_paths(select, &mut path, &mut paths);
-            paths
-        })
+    pub fn select_ancestor(&self, id: NodeId) -> Option<NodeId> {
+        self.closest_named(id, "select")
     }
 
-    pub fn parent_path(&self, path: &[usize]) -> Option<NodePath> {
-        if path.is_empty() {
+    pub fn label_ancestor(&self, id: NodeId) -> Option<NodeId> {
+        self.closest_named(id, "label")
+    }
+
+    // the option elements of a select, skipping options of nested selects
+    pub fn options(&self, select: NodeId) -> Option<Vec<NodeId>> {
+        if !self.elements_named(select, "select") {
             return None;
         }
-        let parent = path[..path.len() - 1].to_vec();
-        self.node_at(path).is_some().then_some(parent)
-    }
-
-    pub fn select_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
-        let mut candidate = path.to_vec();
-        while !candidate.is_empty() {
-            candidate.pop();
-            if self
-                .element_at(&candidate)
-                .is_some_and(|element| element.name == "select")
-            {
-                return Some(candidate);
+        fn collect(document: &Document, parent: NodeId, options: &mut Vec<NodeId>) {
+            for child in document.element_children(parent) {
+                match document.element(child).map(|element| element.name.as_str()) {
+                    Some("option") => options.push(child),
+                    Some("select") => {}
+                    _ => collect(document, child, options),
+                }
             }
         }
-        None
+        let mut options = Vec::new();
+        collect(self, select, &mut options);
+        Some(options)
     }
 
-    pub fn label_ancestor_path(&self, path: &[usize]) -> Option<NodePath> {
-        let mut candidate = path.to_vec();
-        while !candidate.is_empty() {
-            candidate.pop();
-            if self
-                .element_at(&candidate)
-                .is_some_and(|element| element.name == "label")
-            {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
-    pub fn label_control_path(&self, label_path: &[usize]) -> Option<NodePath> {
-        let label = self.element_at(label_path)?;
-        if label.name != "label" {
+    pub fn label_control(&self, label: NodeId) -> Option<NodeId> {
+        let element = self.element(label)?;
+        if element.name != "label" {
             return None;
         }
-        if let Some(id) = label.attr("for") {
+        if let Some(id) = element.attr("for") {
             let candidate = self.find_element_by_id(id)?;
             return self
-                .element_at(&candidate)
-                .filter(|element| is_labelable(element))
-                .map(|_| candidate);
+                .element(candidate)
+                .is_some_and(is_labelable)
+                .then_some(candidate);
         }
-        let mut path = label_path.to_vec();
-        find_first_labelable_descendant(label, &mut path)
+        self.descendants(label)
+            .find(|&node| self.element(node).is_some_and(is_labelable))
     }
 
-    pub fn radio_group_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
-        let radio = self.element_at(path)?;
-        if radio.name != "input"
-            || !radio
-                .attr("type")
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
-        {
-            return None;
-        }
+    pub fn radio_group(&self, id: NodeId) -> Option<Vec<NodeId>> {
+        let is_radio = |element: &Element| {
+            element.name == "input"
+                && element
+                    .attr("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
+        };
+        let radio = self.element(id).filter(|element| is_radio(element))?;
         let name = radio.attr("name")?;
-        let form = self.form_owner_path(path)?;
+        let form = self.form_owner(id)?;
         Some(
-            self.form_control_paths(&form)?
+            self.form_controls(form)?
                 .into_iter()
-                .filter(|candidate| {
-                    self.element_at(candidate).is_some_and(|element| {
-                        element.name == "input"
-                            && element
-                                .attr("type")
-                                .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
-                            && element.attr("name") == Some(name)
+                .filter(|&candidate| {
+                    self.element(candidate).is_some_and(|element| {
+                        is_radio(element) && element.attr("name") == Some(name)
                     })
                 })
                 .collect(),
         )
     }
 
-    pub fn link_reference(&self, path: &[usize]) -> Option<String> {
-        let mut candidate = path.to_vec();
-        loop {
-            let element = self.element_at(&candidate)?;
-            if element.name == "a"
-                && let Some(href) = element.attr("href")
-            {
-                return Some(href.to_string());
-            }
-            candidate.pop()?;
-        }
+    pub fn link_reference(&self, id: NodeId) -> Option<String> {
+        std::iter::once(id)
+            .chain(self.ancestors(id))
+            .find_map(|node| {
+                let element = self.element(node)?;
+                (element.name == "a")
+                    .then(|| element.attr("href").map(str::to_string))
+                    .flatten()
+            })
     }
 
-    pub fn find_element_by_selector(&self, selector: &str) -> Option<NodePath> {
-        self.find_element_by_selector_within(&[], selector)
+    pub fn find_element_by_selector(&self, selector: &str) -> Option<NodeId> {
+        self.find_element_by_selector_within(self.root, selector)
     }
 
-    pub fn find_elements_by_selector(&self, selector: &str) -> Option<Vec<NodePath>> {
-        self.find_elements_by_selector_within(&[], selector)
+    pub fn find_elements_by_selector(&self, selector: &str) -> Option<Vec<NodeId>> {
+        self.find_elements_by_selector_within(self.root, selector)
     }
 
-    pub fn find_element_by_selector_within(
-        &self,
-        parent: &[usize],
-        selector: &str,
-    ) -> Option<NodePath> {
+    pub fn find_element_by_selector_within(&self, scope: NodeId, selector: &str) -> Option<NodeId> {
         let selectors = crate::css::Selector::parse_list(selector).ok()?;
-        let parent_element = self.element_at(parent)?;
-        let mut ancestors = self.ancestors_for_path(parent)?;
-        let mut path = parent.to_vec();
-        find_element_by_selector(parent_element, &selectors, &mut ancestors, &mut path)
+        self.descendants(scope)
+            .find(|&node| self.matches_selectors(node, &selectors))
     }
 
     pub fn find_elements_by_selector_within(
         &self,
-        parent: &[usize],
+        scope: NodeId,
         selector: &str,
-    ) -> Option<Vec<NodePath>> {
+    ) -> Option<Vec<NodeId>> {
         let selectors = crate::css::Selector::parse_list(selector).ok()?;
-        let parent_element = self.element_at(parent)?;
-        let mut ancestors = self.ancestors_for_path(parent)?;
-        let mut path = parent.to_vec();
-        let mut matches = Vec::new();
-        collect_elements_by_selector(
-            parent_element,
-            &selectors,
-            &mut ancestors,
-            &mut path,
-            &mut matches,
-        );
-        Some(matches)
+        Some(
+            self.descendants(scope)
+                .filter(|&node| self.matches_selectors(node, &selectors))
+                .collect(),
+        )
     }
 
-    pub fn element_text_content(&self, path: &[usize]) -> Option<String> {
-        let element = self.element_at(path)?;
-        let mut text = String::new();
-        collect_text_nodes(element, &mut text);
-        Some(text)
+    pub(crate) fn matches_selectors(
+        &self,
+        node: NodeId,
+        selectors: &[crate::css::Selector],
+    ) -> bool {
+        self.is_element(node)
+            && selectors.iter().any(|selector| {
+                selector.matches(self, node, None, &crate::css::StyleState::default())
+            })
     }
 
-    pub fn text_content(&self) -> String {
-        let mut text = String::new();
-        collect_text_nodes(&self.root, &mut text);
-        text
-    }
-
-    pub fn element_text_offset(&self, path: &[usize]) -> Option<usize> {
-        self.node_text_offset(path)
-    }
-
-    pub fn node_text_offset(&self, path: &[usize]) -> Option<usize> {
-        let mut element = &self.root;
-        let mut offset = 0;
-        for (depth, &index) in path.iter().enumerate() {
-            let child = element.children.get(index)?;
-            for preceding in element.children.iter().take(index) {
-                offset += text_utf16_len(preceding);
-            }
-            element = match child {
-                Node::Element(child) => child,
-                Node::Text(_) if depth + 1 == path.len() => return Some(offset),
-                Node::Text(_) => return None,
-            };
-        }
-        Some(offset)
-    }
-
-    // text nodes overlapping the flat UTF-16 range [start, end), as node-local spans
-    pub fn text_node_spans(&self, start: usize, end: usize) -> Vec<(NodePath, usize, usize)> {
-        fn walk(
-            element: &Element,
-            path: &mut NodePath,
-            position: &mut usize,
-            range: (usize, usize),
-            spans: &mut Vec<(NodePath, usize, usize)>,
-        ) {
-            for (index, child) in element.children.iter().enumerate() {
-                if *position >= range.1 {
-                    return;
-                }
-                path.push(index);
-                match child {
-                    Node::Element(child) => walk(child, path, position, range, spans),
-                    Node::Text(text) => {
-                        let length = text.encode_utf16().count();
-                        let from = range.0.max(*position);
-                        let to = range.1.min(*position + length);
-                        if from < to {
-                            spans.push((path.clone(), from - *position, to - *position));
-                        }
-                        *position += length;
-                    }
-                }
-                path.pop();
-            }
-        }
-        let mut spans = Vec::new();
-        if start < end {
-            walk(
-                &self.root,
-                &mut Vec::new(),
-                &mut 0,
-                (start, end),
-                &mut spans,
-            );
-        }
-        spans
-    }
-
-    // the text node and offset at a flat UTF-16 position, preferring the node that starts there
-    pub fn text_point(&self, position: usize) -> Option<(NodePath, usize)> {
-        if let Some((path, start, _)) = self.text_node_spans(position, position + 1).pop() {
-            return Some((path, start));
-        }
-        let (path, _, end) = self
-            .text_node_spans(position.checked_sub(1)?, position)
-            .pop()?;
-        Some((path, end))
-    }
-
-    pub fn node_text_content(&self, path: &[usize]) -> Option<String> {
-        match self.node_at(path)? {
-            Node::Element(element) => {
-                let mut text = String::new();
-                collect_text_nodes(element, &mut text);
-                Some(text)
-            }
-            Node::Text(text) => Some(text.clone()),
+    pub fn accessibility_tree(&self) -> AccessibilityNode {
+        AccessibilityNode {
+            role: "document".to_string(),
+            name: String::new(),
+            value: None,
+            node: self.root,
+            disabled: false,
+            focusable: false,
+            children: self
+                .element_children(self.root)
+                .filter_map(|child| self.accessibility_node(child))
+                .collect(),
         }
     }
 
-    pub fn set_text_node_data(&mut self, path: &[usize], text: String) -> bool {
-        let Some(Node::Text(current)) = self.node_at_mut(path) else {
-            return false;
-        };
-        *current = text;
-        true
-    }
-
-    pub fn split_text_node(&mut self, path: &[usize], offset: usize) -> Option<NodePath> {
-        if path.is_empty() {
+    fn accessibility_node(&self, id: NodeId) -> Option<AccessibilityNode> {
+        let element = self.element(id)?;
+        if is_accessibility_hidden(element) {
             return None;
         }
-        let parent = path[..path.len() - 1].to_vec();
-        let index = *path.last()?;
-        let text = match self.node_at(path)? {
-            Node::Text(text) => text.clone(),
-            Node::Element(_) => return None,
-        };
-        let (left, right) = split_utf16(&text, offset);
-        self.shift_paths_for_insert(&parent, index.saturating_add(1));
-        let parent_element = self.element_at_mut(&parent)?;
-        let Node::Text(current) = parent_element.children.get_mut(index)? else {
-            return None;
-        };
-        *current = left;
-        parent_element
-            .children
-            .insert(index.saturating_add(1), Node::Text(right));
-        let mut new_path = path.to_vec();
-        *new_path.last_mut()? = index.saturating_add(1);
-        self.assign_ids_below(&new_path);
-        Some(new_path)
-    }
-
-    pub fn next_normalize_change(&self, path: &[usize]) -> Option<NormalizeChange> {
-        let element = self.element_at(path)?;
-        let (parent, index) = find_normalize_candidate(element, path.to_vec())?;
-        let child = child_path(&parent, index);
-        match self.node_at(&child)? {
-            Node::Text(text) if text.is_empty() => Some(NormalizeChange::RemoveEmpty {
-                parent_offset: self
-                    .node_text_offset(&child)?
-                    .saturating_sub(self.node_text_offset(&parent)?),
-                child_id: self.node_id(&child)?,
-                parent,
-                child,
-            }),
-            Node::Text(_) => {
-                let next = child_path(&parent, index.saturating_add(1));
-                let Node::Text(_) = self.node_at(&next)? else {
-                    return None;
-                };
-                Some(NormalizeChange::MergeText {
-                    first_id: self.node_id(&child)?,
-                    child_id: self.node_id(&next)?,
-                    first_length: text_utf16_len(self.node_at(&child)?),
-                    child_length: text_utf16_len(self.node_at(&next)?),
-                    parent,
-                    first: child,
-                    child: next,
-                })
-            }
-            Node::Element(_) => None,
-        }
-    }
-
-    pub fn apply_normalize_change(&mut self, change: &NormalizeChange) -> bool {
-        match change {
-            NormalizeChange::RemoveEmpty {
-                parent,
-                child,
-                child_id,
-                ..
-            } => {
-                if self.node_id(child) != Some(*child_id)
-                    || !matches!(self.node_at(child), Some(Node::Text(text)) if text.is_empty())
-                {
-                    return false;
-                }
-                let index = *child.last().unwrap_or(&usize::MAX);
-                let Some(parent_element) = self.element_at_mut(parent) else {
-                    return false;
-                };
-                if !matches!(parent_element.children.get(index), Some(Node::Text(text)) if text.is_empty())
-                {
-                    return false;
-                }
-                parent_element.children.remove(index);
-                self.remove_ids_at_or_below(child);
-                self.shift_paths_for_remove(parent, index);
-                true
-            }
-            NormalizeChange::MergeText {
-                parent,
-                first,
-                child,
-                first_id,
-                child_id,
-                first_length,
-                child_length,
-            } => {
-                if self.node_id(first) != Some(*first_id)
-                    || self.node_id(child) != Some(*child_id)
-                    || *child_length
-                        != self
-                            .node_at(child)
-                            .map(text_utf16_len)
-                            .unwrap_or(usize::MAX)
-                    || *first_length
-                        != self
-                            .node_at(first)
-                            .map(text_utf16_len)
-                            .unwrap_or(usize::MAX)
-                {
-                    return false;
-                }
-                let first_index = *first.last().unwrap_or(&usize::MAX);
-                let child_index = *child.last().unwrap_or(&usize::MAX);
-                if first.len() != parent.len().saturating_add(1)
-                    || child.len() != parent.len().saturating_add(1)
-                    || first[..parent.len()] != *parent
-                    || child[..parent.len()] != *parent
-                    || child_index != first_index.saturating_add(1)
-                {
-                    return false;
-                }
-                let removed = {
-                    let Some(parent_element) = self.element_at(parent) else {
-                        return false;
-                    };
-                    let Some(Node::Text(removed)) = parent_element.children.get(child_index) else {
-                        return false;
-                    };
-                    removed.clone()
-                };
-                let Some(parent_element) = self.element_at_mut(parent) else {
-                    return false;
-                };
-                parent_element.children.remove(child_index);
-                let Some(Node::Text(first_text)) = parent_element.children.get_mut(first_index)
-                else {
-                    return false;
-                };
-                first_text.push_str(&removed);
-                self.remove_ids_at_or_below(child);
-                self.shift_paths_for_remove(parent, child_index);
-                true
-            }
-        }
-    }
-
-    pub fn child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
-        match self.node_at(path)? {
-            Node::Element(element) => Some(
-                (0..element.children.len())
-                    .map(|index| {
-                        let mut child = path.to_vec();
-                        child.push(index);
-                        child
-                    })
-                    .collect(),
-            ),
-            Node::Text(_) => Some(Vec::new()),
-        }
-    }
-
-    pub fn element_child_paths(&self, path: &[usize]) -> Option<Vec<NodePath>> {
-        self.child_paths(path).map(|children| {
-            children
-                .into_iter()
-                .filter(|child| matches!(self.node_at(child), Some(Node::Element(_))))
-                .collect()
+        Some(AccessibilityNode {
+            role: accessibility_role(element),
+            name: self.accessibility_name(id, element),
+            value: self.accessibility_value(id, element),
+            node: id,
+            disabled: is_accessibility_disabled(element),
+            focusable: is_accessibility_focusable(element),
+            children: self
+                .element_children(id)
+                .filter_map(|child| self.accessibility_node(child))
+                .collect(),
         })
     }
 
-    pub fn node_is_text(&self, path: &[usize]) -> Option<bool> {
-        self.node_at(path).map(|node| matches!(node, Node::Text(_)))
-    }
-
-    pub fn sibling_path(&self, path: &[usize], next: bool) -> Option<NodePath> {
-        let mut sibling_index = *path.last()?;
-        let parent = path[..path.len().saturating_sub(1)].to_vec();
-        loop {
-            sibling_index = if next {
-                sibling_index.checked_add(1)?
-            } else {
-                sibling_index.checked_sub(1)?
-            };
-            let sibling = child_path(&parent, sibling_index);
-            if self.node_id(&sibling).is_some() {
-                return Some(sibling);
-            }
-            self.node_at(&sibling)?;
-        }
-    }
-
-    pub fn element_sibling_path(&self, path: &[usize], next: bool) -> Option<NodePath> {
-        let mut sibling_index = *path.last()?;
-        let parent = path[..path.len().saturating_sub(1)].to_vec();
-        loop {
-            sibling_index = if next {
-                sibling_index.checked_add(1)?
-            } else {
-                sibling_index.checked_sub(1)?
-            };
-            let sibling = child_path(&parent, sibling_index);
-            if self.node_id(&sibling).is_some()
-                && matches!(self.node_at(&sibling), Some(Node::Element(_)))
-            {
-                return Some(sibling);
-            }
-            self.node_at(&sibling)?;
-        }
-    }
-
-    pub fn node_is_connected(&self, path: &[usize]) -> bool {
-        self.node_at(path).is_some()
-    }
-
-    pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
-        if path.is_empty() {
-            return None;
-        }
-        let mut element = &self.root;
-        for (depth, &index) in path.iter().enumerate() {
-            let child = element.children.get(index)?;
-            if depth + 1 == path.len() {
-                return Some(child);
-            }
-            element = match child {
-                Node::Element(child) => child,
-                Node::Text(_) => return None,
-            };
-        }
-        None
-    }
-
-    fn node_at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
-        if path.is_empty() {
-            return None;
-        }
-        let mut element = &mut self.root;
-        for (depth, &index) in path.iter().enumerate() {
-            let child = element.children.get_mut(index)?;
-            if depth + 1 == path.len() {
-                return Some(child);
-            }
-            element = match child {
-                Node::Element(child) => child,
-                Node::Text(_) => return None,
-            };
-        }
-        None
-    }
-
-    pub fn element_inner_html(&self, path: &[usize]) -> Option<String> {
-        self.element_at(path).map(Element::inner_html)
-    }
-
-    pub fn element_outer_html(&self, path: &[usize]) -> Option<String> {
-        self.element_at(path).map(Element::outer_html)
-    }
-
-    pub fn set_element_inner_html(
-        &mut self,
-        path: &[usize],
-        source: &str,
-    ) -> Result<bool, ParseError> {
-        let fragment = Self::parse(source)?;
-        self.remove_descendant_ids(path);
-        let Some(element) = self.element_at_mut(path) else {
-            return Ok(false);
-        };
-        element.children = fragment.root.children;
-        self.assign_ids_below(path);
-        Ok(true)
-    }
-
-    pub fn replace_element_children(&mut self, path: &[usize], children: Vec<Node>) -> bool {
-        self.remove_descendant_ids(path);
-        let Some(element) = self.element_at_mut(path) else {
-            return false;
-        };
-        element.children = children;
-        self.assign_ids_below(path);
-        true
-    }
-
-    pub fn set_element_text_content(&mut self, path: &[usize], text: String) -> bool {
-        self.remove_descendant_ids(path);
+    fn accessibility_name(&self, id: NodeId, element: &Element) -> String {
+        if let Some(label) = element
+            .attr("aria-label")
+            .filter(|label| !label.trim().is_empty())
         {
-            let Some(element) = self.element_at_mut(path) else {
-                return false;
-            };
-            element.children = vec![Node::Text(text)];
+            return label.trim().to_string();
         }
-        self.assign_ids_below(path);
-        true
-    }
-
-    pub fn append_element(&mut self, parent: &[usize], element: Element) -> Option<NodePath> {
-        let mut path = parent.to_vec();
-        let parent = self.element_at_mut(parent)?;
-        let index = parent.children.len();
-        parent.children.push(Node::Element(element));
-        path.push(index);
-        self.assign_ids_below(&path);
-        Some(path)
-    }
-
-    pub fn append_text_node(&mut self, parent: &[usize], text: String) -> Option<NodePath> {
-        let mut path = parent.to_vec();
-        let parent = self.element_at_mut(parent)?;
-        let index = parent.children.len();
-        parent.children.push(Node::Text(text));
-        path.push(index);
-        self.assign_ids_below(&path);
-        Some(path)
-    }
-
-    pub fn insert_element_before(
-        &mut self,
-        parent: &[usize],
-        element: Element,
-        reference: &[usize],
-    ) -> Option<NodePath> {
-        if reference.len() != parent.len().saturating_add(1) || reference[..parent.len()] != *parent
+        if element.name == "img"
+            && let Some(alt) = element.attr("alt")
         {
-            return None;
+            return alt.to_string();
         }
-        let index = *reference.last()?;
-        self.element_at(parent)?.children.get(index)?;
-        self.shift_paths_for_insert(parent, index);
-        let mut path = parent.to_vec();
-        let parent = self.element_at_mut(parent)?;
-        parent.children.insert(index, Node::Element(element));
-        path.push(index);
-        self.assign_ids_below(&path);
-        Some(path)
-    }
-
-    pub fn insert_text_node_before(
-        &mut self,
-        parent: &[usize],
-        text: String,
-        reference: &[usize],
-    ) -> Option<NodePath> {
-        if reference.len() != parent.len().saturating_add(1) || reference[..parent.len()] != *parent
+        if let Some(title) = element
+            .attr("title")
+            .filter(|title| !title.trim().is_empty())
         {
-            return None;
+            return title.trim().to_string();
         }
-        let index = *reference.last()?;
-        self.node_at(reference)?;
-        self.shift_paths_for_insert(parent, index);
-        let mut path = parent.to_vec();
-        let parent = self.element_at_mut(parent)?;
-        parent.children.insert(index, Node::Text(text));
-        path.push(index);
-        self.assign_ids_below(&path);
-        Some(path)
-    }
-
-    pub fn move_element_before(
-        &mut self,
-        source: &[usize],
-        parent: &[usize],
-        reference: Option<&[usize]>,
-    ) -> Option<NodePath> {
-        if !matches!(self.node_at(source), Some(Node::Element(_))) {
-            return None;
+        if matches!(
+            element.name.as_str(),
+            "a" | "button" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "label" | "li" | "option"
+        ) || self.element_children(id).next().is_none()
+        {
+            return self.text_content(id).trim().to_string();
         }
-        self.move_node_before(source, parent, reference)
-    }
-
-    pub fn move_node_before(
-        &mut self,
-        source: &[usize],
-        parent: &[usize],
-        reference: Option<&[usize]>,
-    ) -> Option<NodePath> {
-        if source.is_empty() || source == parent || parent.starts_with(source) {
-            return None;
+        if matches!(element.name.as_str(), "input" | "textarea") {
+            return element
+                .attr("placeholder")
+                .or_else(|| element.attr("value"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
         }
-        let source_parent = source[..source.len() - 1].to_vec();
-        let source_index = *source.last()?;
-        self.node_at(source)?;
-        if let Some(reference) = reference {
-            if reference.len() != parent.len().saturating_add(1)
-                || reference[..parent.len()] != *parent
-                || self.node_at(reference).is_none()
-            {
-                return None;
-            }
-            if reference == source {
-                return Some(source.to_vec());
-            }
-            if reference.starts_with(source) {
-                return None;
-            }
-        }
-        let moved_ids = self
-            .paths
-            .iter()
-            .filter(|(_, path)| path.starts_with(source))
-            .map(|(id, path)| (*id, path[source.len()..].to_vec()))
-            .collect::<Vec<_>>();
-        let moved_node = {
-            let source_parent_element = self.element_at_mut(&source_parent)?;
-            source_parent_element.children.remove(source_index)
-        };
-        self.paths.retain(|_, path| !path.starts_with(source));
-        self.shift_paths_for_remove(&source_parent, source_index);
-        let parent = path_after_remove(parent, &source_parent, source_index)?;
-        let reference = if let Some(reference) = reference {
-            Some(path_after_remove(reference, &source_parent, source_index)?)
-        } else {
-            None
-        };
-        let index = reference
-            .as_ref()
-            .map(|reference| *reference.last().expect("reference path is non-empty"))
-            .unwrap_or_else(|| {
-                self.element_at(&parent)
-                    .map_or(0, |element| element.children.len())
-            });
-        if index > self.element_at(&parent)?.children.len() {
-            return None;
-        }
-        self.shift_paths_for_insert(&parent, index);
-        let mut path = parent.clone();
-        let parent_element = self.element_at_mut(&parent)?;
-        if index > parent_element.children.len() {
-            return None;
-        }
-        parent_element.children.insert(index, moved_node);
-        path.push(index);
-        for (id, relative) in moved_ids {
-            let mut moved_path = path.clone();
-            moved_path.extend(relative);
-            self.paths.insert(id, moved_path);
-        }
-        self.rebuild_path_index();
-        Some(path)
+        String::new()
     }
 
-    pub fn remove_child(&mut self, parent: &[usize], child: &[usize]) -> Option<Element> {
-        if child.len() != parent.len().saturating_add(1) || child[..parent.len()] != *parent {
-            return None;
-        }
-        let index = *child.last()?;
-        if !matches!(self.node_at(child), Some(Node::Element(_))) {
-            return None;
-        }
-        let removed = {
-            let parent = self.element_at_mut(parent)?;
-            let node = parent.children.get_mut(index)?;
-            std::mem::replace(node, Node::Text(String::new()))
-        };
-        let Node::Element(element) = removed else {
-            return None;
-        };
-        self.remove_ids_at_or_below(child);
-        Some(element)
-    }
-
-    pub fn remove_text_child(&mut self, parent: &[usize], child: &[usize]) -> Option<String> {
-        if child.len() != parent.len().saturating_add(1) || child[..parent.len()] != *parent {
-            return None;
-        }
-        let index = *child.last()?;
-        if !matches!(self.node_at(child), Some(Node::Text(_))) {
-            return None;
-        }
-        let removed = {
-            let parent = self.element_at_mut(parent)?;
-            let node = parent.children.get_mut(index)?;
-            std::mem::replace(node, Node::Text(String::new()))
-        };
-        let Node::Text(text) = removed else {
-            return None;
-        };
-        self.remove_ids_at_or_below(child);
-        Some(text)
-    }
-
-    pub fn element_clone(&self, path: &[usize]) -> Option<Element> {
-        self.element_at(path).cloned()
-    }
-
-    pub fn node_clone(&self, path: &[usize], deep: bool) -> Option<Node> {
-        match self.node_at(path)? {
-            Node::Element(element) => {
-                let mut clone = element.clone();
-                if !deep {
-                    clone.children.clear();
-                }
-                Some(Node::Element(clone))
-            }
-            Node::Text(text) => Some(Node::Text(text.clone())),
-        }
-    }
-
-    pub fn element_attribute(&self, path: &[usize], name: &str) -> Option<String> {
-        self.element_at(path)
-            .and_then(|element| element.attr(name).map(str::to_string))
-    }
-
-    pub fn set_element_attribute(&mut self, path: &[usize], name: &str, value: String) -> bool {
-        let Some(element) = self.element_at_mut(path) else {
-            return false;
-        };
-        element.attrs.insert(name.to_ascii_lowercase(), value);
-        true
-    }
-
-    pub fn remove_element_attribute(&mut self, path: &[usize], name: &str) -> bool {
-        self.element_at_mut(path)
-            .and_then(|element| element.attrs.remove(&name.to_ascii_lowercase()))
-            .is_some()
-    }
-
-    pub fn element_has_class(&self, path: &[usize], class: &str) -> bool {
-        self.element_at(path)
-            .is_some_and(|element| element.has_class(class))
-    }
-
-    pub fn add_element_class(&mut self, path: &[usize], class: &str) -> bool {
-        self.element_at_mut(path)
-            .is_some_and(|element| element.add_class(class))
-    }
-
-    pub fn remove_element_class(&mut self, path: &[usize], class: &str) -> bool {
-        self.element_at_mut(path)
-            .is_some_and(|element| element.remove_class(class))
-    }
-
-    pub fn toggle_element_class(
-        &mut self,
-        path: &[usize],
-        class: &str,
-        force: Option<bool>,
-    ) -> Option<bool> {
-        self.element_at_mut(path)
-            .map(|element| element.toggle_class(class, force))
-    }
-
-    pub fn style_property(&self, path: &[usize], property: &str) -> Option<String> {
-        self.element_at(path)?.style_property(property)
-    }
-
-    pub fn set_style_property(&mut self, path: &[usize], property: &str, value: String) -> bool {
-        let Some(element) = self.element_at_mut(path) else {
-            return false;
-        };
-        element.set_style_property(property, value)
-    }
-
-    pub(crate) fn element_at(&self, path: &[usize]) -> Option<&Element> {
-        let mut element = &self.root;
-        for &index in path {
-            element = match element.children.get(index)? {
-                Node::Element(child) => child,
-                Node::Text(_) => return None,
-            };
-        }
-        Some(element)
-    }
-
-    fn element_at_mut(&mut self, path: &[usize]) -> Option<&mut Element> {
-        let mut element = &mut self.root;
-        for &index in path {
-            element = match element.children.get_mut(index)? {
-                Node::Element(child) => child,
-                Node::Text(_) => return None,
-            };
-        }
-        Some(element)
-    }
-
-    fn ancestors_for_path(&self, path: &[usize]) -> Option<Vec<&Element>> {
-        let mut ancestors = Vec::new();
-        let mut element = &self.root;
-        for &index in path {
-            element = match element.children.get(index)? {
-                Node::Element(child) => child,
-                Node::Text(_) => return None,
-            };
-            ancestors.push(element);
-        }
-        Some(ancestors)
-    }
-
-    fn assign_ids_for_document(&mut self) {
-        let paths = self
-            .root
-            .children
-            .iter()
-            .enumerate()
-            .map(|(index, _)| vec![index])
-            .collect::<Vec<_>>();
-        for path in paths {
-            self.assign_ids_below(&path);
-        }
-    }
-
-    fn assign_ids_below(&mut self, path: &[usize]) {
-        let mut paths = Vec::new();
-        let Some(node) = self.node_at(path) else {
-            return;
-        };
-        let mut current = path.to_vec();
-        collect_node_paths(node, &mut current, &mut paths);
-        for path in paths {
-            if self.node_ids.contains_key(&path) {
-                continue;
-            }
-            let id = self.next_node_id;
-            self.next_node_id = self.next_node_id.saturating_add(1);
-            self.node_ids.insert(path.clone(), id);
-            self.paths.insert(id, path);
-        }
-    }
-
-    fn remove_descendant_ids(&mut self, path: &[usize]) {
-        self.paths
-            .retain(|_, candidate| !(candidate.starts_with(path) && candidate.len() > path.len()));
-        self.rebuild_path_index();
-    }
-
-    fn remove_ids_at_or_below(&mut self, path: &[usize]) {
-        self.paths
-            .retain(|_, candidate| !candidate.starts_with(path));
-        self.rebuild_path_index();
-    }
-
-    fn shift_paths_for_insert(&mut self, parent: &[usize], index: usize) {
-        for path in self.paths.values_mut() {
-            if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] >= index
-            {
-                path[parent.len()] += 1;
-            }
-        }
-        self.rebuild_path_index();
-    }
-
-    fn shift_paths_for_remove(&mut self, parent: &[usize], index: usize) {
-        for path in self.paths.values_mut() {
-            if path.len() > parent.len() && path.starts_with(parent) && path[parent.len()] > index {
-                path[parent.len()] -= 1;
-            }
-        }
-        self.rebuild_path_index();
-    }
-
-    fn rebuild_path_index(&mut self) {
-        self.node_ids = self
-            .paths
-            .iter()
-            .map(|(id, path)| (path.clone(), *id))
-            .collect();
+    fn accessibility_value(&self, id: NodeId, element: &Element) -> Option<String> {
+        element
+            .attr("aria-valuenow")
+            .or_else(|| element.attr("value"))
+            .map(str::to_string)
+            .or_else(|| {
+                (element.name == "textarea")
+                    .then(|| self.text_content(id).trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
     }
 }
 
@@ -1174,16 +1330,24 @@ impl Element {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_ascii_lowercase(),
+            namespace: Namespace::Html,
             attrs: BTreeMap::new(),
-            children: Vec::new(),
         }
     }
 
-    pub fn normalize(&mut self) {
-        normalize_element(self);
+    // tagName: upper case for HTML elements, as written otherwise
+    pub fn tag_name(&self) -> String {
+        if self.namespace == Namespace::Html {
+            self.name.to_ascii_uppercase()
+        } else {
+            self.name.clone()
+        }
     }
 
     pub fn attr(&self, name: &str) -> Option<&str> {
+        if let Some(value) = self.attrs.get(name) {
+            return Some(value);
+        }
         self.attrs
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
@@ -1243,24 +1407,6 @@ impl Element {
         enabled
     }
 
-    pub fn inner_html(&self) -> String {
-        let mut output = String::new();
-        serialize_nodes(&self.children, &mut output);
-        output
-    }
-
-    pub fn outer_html(&self) -> String {
-        let mut output = String::new();
-        serialize_element(self, &mut output);
-        output
-    }
-
-    pub fn set_inner_html(&mut self, source: &str) -> Result<(), ParseError> {
-        let fragment = Document::parse(source)?;
-        self.children = fragment.root.children;
-        Ok(())
-    }
-
     pub fn style_property(&self, property: &str) -> Option<String> {
         let style = self.attr("style")?;
         let property = css_property_name(property);
@@ -1281,7 +1427,9 @@ impl Element {
                 Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
             })
             .collect::<Vec<_>>();
-        if let Some(declaration) = declarations
+        if value.is_empty() {
+            declarations.retain(|(name, _)| !name.eq_ignore_ascii_case(&property));
+        } else if let Some(declaration) = declarations
             .iter_mut()
             .find(|(name, _)| name.eq_ignore_ascii_case(&property))
         {
@@ -1299,217 +1447,51 @@ impl Element {
     }
 }
 
-fn find_normalize_candidate(element: &Element, path: NodePath) -> Option<(NodePath, usize)> {
-    for (index, child) in element.children.iter().enumerate() {
-        match child {
-            Node::Text(text) if text.is_empty() => return Some((path, index)),
-            Node::Text(_)
-                if matches!(
-                    element.children.get(index.saturating_add(1)),
-                    Some(Node::Text(_))
-                ) =>
-            {
-                return Some((path, index));
-            }
-            Node::Element(child) => {
-                let mut child_path = path.clone();
-                child_path.push(index);
-                if let Some(candidate) = find_normalize_candidate(child, child_path) {
-                    return Some(candidate);
-                }
-            }
-            Node::Text(_) => {}
-        }
-    }
-    None
-}
-
-fn child_path(parent: &[usize], index: usize) -> NodePath {
-    let mut child = parent.to_vec();
-    child.push(index);
-    child
-}
-
-fn normalize_element(element: &mut Element) {
-    let mut index = 0;
-    while index < element.children.len() {
-        if matches!(element.children.get(index), Some(Node::Text(text)) if text.is_empty()) {
-            element.children.remove(index);
-            continue;
-        }
-        if matches!(element.children.get(index), Some(Node::Text(_))) {
-            while matches!(
-                element.children.get(index.saturating_add(1)),
-                Some(Node::Text(_))
-            ) {
-                let removed = element.children.remove(index.saturating_add(1));
-                let Node::Text(removed) = removed else {
-                    unreachable!("normalize candidate was a text node");
-                };
-                let Some(Node::Text(first)) = element.children.get_mut(index) else {
-                    unreachable!("normalize first node was a text node");
-                };
-                first.push_str(&removed);
-            }
-            index += 1;
-            continue;
-        }
-        if let Some(Node::Element(child)) = element.children.get_mut(index) {
-            normalize_element(child);
-        }
-        index += 1;
-    }
-}
-
-fn collect_node_paths(node: &Node, path: &mut NodePath, paths: &mut Vec<NodePath>) {
-    paths.push(path.clone());
-    if let Node::Element(element) = node {
-        for (index, child) in element.children.iter().enumerate() {
-            path.push(index);
-            collect_node_paths(child, path, paths);
-            path.pop();
-        }
-    }
-}
-
-fn path_after_remove(path: &[usize], parent: &[usize], index: usize) -> Option<NodePath> {
-    if path.len() <= parent.len() || !path.starts_with(parent) {
-        return Some(path.to_vec());
-    }
-    let child_index = path[parent.len()];
-    if child_index == index {
-        return None;
-    }
-    let mut adjusted = path.to_vec();
-    if child_index > index {
-        adjusted[parent.len()] -= 1;
-    }
-    Some(adjusted)
-}
-
-fn accessibility_node(element: &Element, path: NodePath) -> Option<AccessibilityNode> {
-    if is_accessibility_hidden(element) {
-        return None;
-    }
-    let children = element
-        .children
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| match node {
-            Node::Element(element) => {
-                let mut child_path = path.clone();
-                child_path.push(index);
-                accessibility_node(element, child_path)
-            }
-            Node::Text(_) => None,
-        })
-        .collect::<Vec<_>>();
-    let role = accessibility_role(element);
-    let name = accessibility_name(element);
-    let value = accessibility_value(element);
-    Some(AccessibilityNode {
-        role,
-        name,
-        value,
-        path,
-        disabled: is_accessibility_disabled(element),
-        focusable: is_accessibility_focusable(element),
-        children,
-    })
-}
-
 fn accessibility_role(element: &Element) -> String {
     if let Some(role) = element.attr("role").filter(|role| !role.trim().is_empty()) {
         return role.trim().to_ascii_lowercase();
     }
     match element.name.as_str() {
-        "main" => "main".to_string(),
-        "nav" => "navigation".to_string(),
-        "header" => "banner".to_string(),
-        "footer" => "contentinfo".to_string(),
-        "aside" => "complementary".to_string(),
-        "form" => "form".to_string(),
-        "button" => "button".to_string(),
-        "a" if element.attr("href").is_some() => "link".to_string(),
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading".to_string(),
-        "img" => "img".to_string(),
+        "main" => "main",
+        "nav" => "navigation",
+        "header" => "banner",
+        "footer" => "contentinfo",
+        "aside" => "complementary",
+        "form" => "form",
+        "button" => "button",
+        "a" if element.attr("href").is_some() => "link",
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
+        "img" => "img",
         "input" => input_accessibility_role(element),
-        "textarea" => "textbox".to_string(),
-        "select" => "combobox".to_string(),
-        "option" => "option".to_string(),
-        "ul" | "ol" => "list".to_string(),
-        "li" => "listitem".to_string(),
-        "table" => "table".to_string(),
-        "tr" => "row".to_string(),
-        "th" => "columnheader".to_string(),
-        "td" => "cell".to_string(),
-        "label" => "label".to_string(),
-        _ => "generic".to_string(),
+        "textarea" => "textbox",
+        "select" => "combobox",
+        "option" => "option",
+        "ul" | "ol" => "list",
+        "li" => "listitem",
+        "table" => "table",
+        "tr" => "row",
+        "th" => "columnheader",
+        "td" => "cell",
+        "label" => "label",
+        _ => "generic",
     }
+    .to_string()
 }
 
-fn input_accessibility_role(element: &Element) -> String {
+fn input_accessibility_role(element: &Element) -> &'static str {
     match element
         .attr("type")
         .unwrap_or("text")
         .to_ascii_lowercase()
         .as_str()
     {
-        "button" | "submit" | "reset" | "image" => "button".to_string(),
-        "checkbox" => "checkbox".to_string(),
-        "radio" => "radio".to_string(),
-        "range" => "slider".to_string(),
-        "hidden" => "none".to_string(),
-        _ => "textbox".to_string(),
+        "button" | "submit" | "reset" | "image" => "button",
+        "checkbox" => "checkbox",
+        "radio" => "radio",
+        "range" => "slider",
+        "hidden" => "none",
+        _ => "textbox",
     }
-}
-
-fn accessibility_name(element: &Element) -> String {
-    if let Some(label) = element
-        .attr("aria-label")
-        .filter(|label| !label.trim().is_empty())
-    {
-        return label.trim().to_string();
-    }
-    if element.name == "img"
-        && let Some(alt) = element.attr("alt")
-    {
-        return alt.to_string();
-    }
-    if let Some(title) = element
-        .attr("title")
-        .filter(|title| !title.trim().is_empty())
-    {
-        return title.trim().to_string();
-    }
-    if matches!(
-        element.name.as_str(),
-        "a" | "button" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "label" | "li" | "option"
-    ) || !element_has_element_child(element)
-    {
-        return element_text_content(element).trim().to_string();
-    }
-    if matches!(element.name.as_str(), "input" | "textarea") {
-        return element
-            .attr("placeholder")
-            .or_else(|| element.attr("value"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-    }
-    String::new()
-}
-
-fn accessibility_value(element: &Element) -> Option<String> {
-    element
-        .attr("aria-valuenow")
-        .or_else(|| element.attr("value"))
-        .map(str::to_string)
-        .or_else(|| {
-            (element.name == "textarea")
-                .then(|| element_text_content(element).trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
 }
 
 fn is_accessibility_disabled(element: &Element) -> bool {
@@ -1566,19 +1548,6 @@ fn is_accessibility_hidden(element: &Element) -> bool {
     style.contains("display:none") || style.contains("visibility:hidden")
 }
 
-fn element_has_element_child(element: &Element) -> bool {
-    element
-        .children
-        .iter()
-        .any(|node| matches!(node, Node::Element(_)))
-}
-
-fn element_text_content(element: &Element) -> String {
-    let mut text = String::new();
-    collect_text_nodes(element, &mut text);
-    text
-}
-
 fn class_token(class: &str) -> Option<&str> {
     let class = class.trim();
     (!class.is_empty()
@@ -1588,168 +1557,7 @@ fn class_token(class: &str) -> Option<&str> {
     .then_some(class)
 }
 
-fn append_node(root: &mut Element, stack: &mut [Element], node: Node) {
-    if let Some(parent) = stack.last_mut() {
-        parent.children.push(node);
-    } else {
-        root.children.push(node);
-    }
-}
-
-fn collect_style_text(element: &Element, output: &mut String) {
-    if element.name == "style" {
-        collect_text_nodes(element, output);
-    }
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            collect_style_text(child, output);
-        }
-    }
-}
-
-fn collect_script_text(element: &Element, scripts: &mut Vec<String>) {
-    if element.name == "script" && element.attr("src").is_none() {
-        let mut script = String::new();
-        collect_text_nodes(element, &mut script);
-        scripts.push(script);
-    }
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            collect_script_text(child, scripts);
-        }
-    }
-}
-
-fn collect_script_sources(element: &Element, scripts: &mut Vec<ScriptSource>) {
-    if element.name == "script" {
-        let is_module = element
-            .attr("type")
-            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("module"));
-        if let Some(source) = element.attr("src") {
-            scripts.push(if is_module {
-                ScriptSource::ExternalModule(source.to_string())
-            } else {
-                ScriptSource::External(source.to_string())
-            });
-        } else {
-            let mut script = String::new();
-            collect_text_nodes(element, &mut script);
-            scripts.push(if is_module {
-                ScriptSource::InlineModule(script)
-            } else {
-                ScriptSource::Inline(script)
-            });
-        }
-    }
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            collect_script_sources(child, scripts);
-        }
-    }
-}
-
-fn collect_stylesheet_sources(element: &Element, stylesheets: &mut Vec<StylesheetSource>) {
-    if element.name == "style" {
-        let mut stylesheet = String::new();
-        collect_text_nodes(element, &mut stylesheet);
-        stylesheets.push(StylesheetSource::Inline(stylesheet));
-    } else if element.name == "link"
-        && element.attr("rel").is_some_and(|rel| {
-            rel.split_ascii_whitespace()
-                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
-        })
-        && let Some(href) = element.attr("href")
-    {
-        stylesheets.push(StylesheetSource::External(href.to_string()));
-    }
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            collect_stylesheet_sources(child, stylesheets);
-        }
-    }
-}
-
-fn find_element_by_id(element: &Element, id: &str, path: &mut NodePath) -> Option<NodePath> {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if child.attr("id") == Some(id) {
-            return Some(path.clone());
-        }
-        if let Some(found) = find_element_by_id(child, id, path) {
-            return Some(found);
-        }
-        path.pop();
-    }
-    None
-}
-
-fn collect_autofocus_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if child.attrs.contains_key("autofocus") {
-            paths.push(path.clone());
-        }
-        collect_autofocus_paths(child, path, paths);
-        path.pop();
-    }
-}
-
-fn collect_form_control_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if matches!(
-            child.name.as_str(),
-            "button" | "input" | "select" | "textarea"
-        ) {
-            paths.push(path.clone());
-        }
-        collect_form_control_paths(child, path, paths);
-        path.pop();
-    }
-}
-
-fn collect_option_paths(element: &Element, path: &mut NodePath, paths: &mut Vec<NodePath>) {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if child.name == "option" {
-            paths.push(path.clone());
-        } else if child.name != "select" {
-            collect_option_paths(child, path, paths);
-        }
-        path.pop();
-    }
-}
-
-fn find_first_labelable_descendant(element: &Element, path: &mut NodePath) -> Option<NodePath> {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if is_labelable(child) {
-            return Some(path.clone());
-        }
-        if let Some(found) = find_first_labelable_descendant(child, path) {
-            return Some(found);
-        }
-        path.pop();
-    }
-    None
-}
-
-fn is_labelable(element: &Element) -> bool {
+pub(crate) fn is_labelable(element: &Element) -> bool {
     match element.name.as_str() {
         "button" | "meter" | "output" | "progress" | "select" | "textarea" => true,
         "input" => !element
@@ -1759,57 +1567,10 @@ fn is_labelable(element: &Element) -> bool {
     }
 }
 
-fn find_element_by_selector<'a>(
-    element: &'a Element,
-    selectors: &[crate::css::Selector],
-    ancestors: &mut Vec<&'a Element>,
-    path: &mut NodePath,
-) -> Option<NodePath> {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if selectors.iter().any(|selector| {
-            selector.matches(child, path, ancestors, &crate::css::StyleState::default())
-        }) {
-            return Some(path.clone());
-        }
-        ancestors.push(child);
-        if let Some(found) = find_element_by_selector(child, selectors, ancestors, path) {
-            return Some(found);
-        }
-        ancestors.pop();
-        path.pop();
-    }
-    None
-}
-
-fn collect_elements_by_selector<'a>(
-    element: &'a Element,
-    selectors: &[crate::css::Selector],
-    ancestors: &mut Vec<&'a Element>,
-    path: &mut NodePath,
-    matches: &mut Vec<NodePath>,
-) {
-    for (index, child) in element.children.iter().enumerate() {
-        let Node::Element(child) = child else {
-            continue;
-        };
-        path.push(index);
-        if selectors.iter().any(|selector| {
-            selector.matches(child, path, ancestors, &crate::css::StyleState::default())
-        }) {
-            matches.push(path.clone());
-        }
-        ancestors.push(child);
-        collect_elements_by_selector(child, selectors, ancestors, path, matches);
-        ancestors.pop();
-        path.pop();
-    }
-}
-
 fn css_property_name(property: &str) -> String {
+    if property.starts_with("--") {
+        return property.to_string();
+    }
     let mut output = String::with_capacity(property.len() + 2);
     for character in property.chars() {
         if character.is_ascii_uppercase() {
@@ -1822,37 +1583,7 @@ fn css_property_name(property: &str) -> String {
     output
 }
 
-fn collect_text_nodes(element: &Element, output: &mut String) {
-    for child in &element.children {
-        match child {
-            Node::Element(child) => collect_text_nodes(child, output),
-            Node::Text(text) => output.push_str(text),
-        }
-    }
-}
-
-fn first_element_named<'a>(element: &'a Element, name: &str) -> Option<&'a Element> {
-    for child in &element.children {
-        if let Node::Element(child) = child {
-            if child.name == name {
-                return Some(child);
-            }
-            if let Some(found) = first_element_named(child, name) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn text_utf16_len(node: &Node) -> usize {
-    match node {
-        Node::Element(element) => element.children.iter().map(text_utf16_len).sum(),
-        Node::Text(text) => text.encode_utf16().count(),
-    }
-}
-
-fn split_utf16(value: &str, offset: usize) -> (String, String) {
+pub(crate) fn split_utf16(value: &str, offset: usize) -> (String, String) {
     let units = value.encode_utf16().collect::<Vec<_>>();
     let offset = offset.min(units.len());
     (
@@ -1861,33 +1592,11 @@ fn split_utf16(value: &str, offset: usize) -> (String, String) {
     )
 }
 
-fn serialize_nodes(nodes: &[Node], output: &mut String) {
-    for node in nodes {
-        match node {
-            Node::Element(element) => serialize_element(element, output),
-            Node::Text(text) => escape_html(text, output),
-        }
-    }
-}
-
-fn serialize_element(element: &Element, output: &mut String) {
-    output.push('<');
-    output.push_str(&element.name);
-    for (name, value) in &element.attrs {
-        output.push(' ');
-        output.push_str(name);
-        output.push_str("=\"");
-        escape_html_attribute(value, output);
-        output.push('"');
-    }
-    output.push('>');
-    if is_void_element(&element.name) {
-        return;
-    }
-    serialize_nodes(&element.children, output);
-    output.push_str("</");
-    output.push_str(&element.name);
-    output.push('>');
+fn is_raw_text_element(name: &str) -> bool {
+    matches!(
+        name,
+        "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext"
+    )
 }
 
 fn escape_html(text: &str, output: &mut String) {
@@ -1896,6 +1605,7 @@ fn escape_html(text: &str, output: &mut String) {
             '&' => output.push_str("&amp;"),
             '<' => output.push_str("&lt;"),
             '>' => output.push_str("&gt;"),
+            '\u{a0}' => output.push_str("&nbsp;"),
             _ => output.push(character),
         }
     }
@@ -1908,6 +1618,7 @@ fn escape_html_attribute(text: &str, output: &mut String) {
             '"' => output.push_str("&quot;"),
             '<' => output.push_str("&lt;"),
             '>' => output.push_str("&gt;"),
+            '\u{a0}' => output.push_str("&nbsp;"),
             _ => output.push(character),
         }
     }
@@ -1938,6 +1649,9 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
                     message: "unterminated comment".to_string(),
                 });
             };
+            tokens.push(Token::Comment(
+                source[start + 4..start + 4 + end].to_string(),
+            ));
             cursor = start + 4 + end + 3;
             continue;
         }
@@ -2096,7 +1810,7 @@ fn find_tag_end(source: &str, mut cursor: usize) -> Option<usize> {
     None
 }
 
-fn is_void_element(name: &str) -> bool {
+pub(crate) fn is_void_element(name: &str) -> bool {
     matches!(
         name,
         "area"
@@ -2128,6 +1842,7 @@ enum Token {
         offset: usize,
     },
     Text(String),
+    Comment(String),
 }
 
 fn decode_entities(input: &str) -> String {
@@ -2182,17 +1897,55 @@ fn decode_entity(entity: &str) -> Option<char> {
 mod tests {
     use super::*;
 
+    fn element_named(document: &Document, name: &str) -> NodeId {
+        document
+            .descendants(document.root())
+            .find(|&node| {
+                document
+                    .element(node)
+                    .is_some_and(|element| element.name == name)
+            })
+            .expect("element should exist")
+    }
+
     #[test]
     fn parses_nested_elements_and_attributes() {
         let document =
             Document::parse(r#"<main data-kind='demo'><p>Hello <span>world</span></p></main>"#)
                 .expect("document should parse");
-        let Node::Element(main) = &document.root.children[0] else {
-            panic!("expected element");
-        };
-        assert_eq!(main.name, "main");
-        assert_eq!(main.attr("data-kind"), Some("demo"));
-        assert_eq!(main.children.len(), 1);
+        let main = document.document_element().expect("main should exist");
+        let element = document.element(main).expect("main is an element");
+        assert_eq!(element.name, "main");
+        assert_eq!(element.attr("data-kind"), Some("demo"));
+        assert_eq!(document.children(main).len(), 1);
+        assert_eq!(document.text_content(main), "Hello world");
+    }
+
+    #[test]
+    fn keeps_comments_and_template_contents_out_of_the_tree_text() {
+        let document = Document::parse(
+            "<main>a<!-- note -->b<template id='row'><li>item</li></template></main>",
+        )
+        .expect("document should parse");
+        let main = document.document_element().expect("main should exist");
+        assert_eq!(document.children(main).len(), 4);
+        assert_eq!(
+            document.character_data(document.children(main)[1]),
+            Some(" note ")
+        );
+        assert_eq!(document.text_content(main), "ab");
+        let template = document
+            .find_element_by_id("row")
+            .expect("template should exist");
+        assert!(document.children(template).is_empty());
+        let content = document
+            .template_content(template)
+            .expect("template has content");
+        assert_eq!(document.text_content(content), "item");
+        assert_eq!(
+            document.outer_html(main),
+            "<main>a<!-- note -->b<template id=\"row\"><li>item</li></template></main>"
+        );
     }
 
     #[test]
@@ -2202,19 +1955,15 @@ mod tests {
         )
         .expect("document should parse");
         assert_eq!(document.title().as_deref(), Some("Ceri Settings"));
+        assert_eq!(document.body(), Some(element_named(&document, "body")));
+        assert_eq!(document.head(), Some(element_named(&document, "head")));
 
         let untitled = Document::parse("<main><title> </title></main>").expect("should parse");
         assert_eq!(untitled.title(), None);
-        assert_eq!(
-            Document::parse("<main>no title</main>")
-                .expect("should parse")
-                .title(),
-            None
-        );
     }
 
     #[test]
-    fn builds_accessibility_roles_names_and_stable_paths() {
+    fn builds_accessibility_roles_names_and_nodes() {
         let document = Document::parse(
             r#"<main><h1>Settings</h1><button aria-label="Save changes">Save</button><input type="checkbox" aria-label="Enable sync" disabled><a href="/help">Help</a><p hidden>secret</p></main>"#,
         )
@@ -2222,47 +1971,28 @@ mod tests {
         let tree = document.accessibility_tree();
         assert_eq!(tree.role, "document");
         let main = &tree.children[0];
+        assert_eq!(main.role, "main");
+        assert_eq!(main.node, document.document_element().expect("main"));
+        let summary = main
+            .children
+            .iter()
+            .map(|child| {
+                (
+                    child.role.as_str(),
+                    child.name.as_str(),
+                    child.disabled,
+                    child.focusable,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            (main.role.as_str(), main.path.as_slice()),
-            ("main", [0].as_slice())
-        );
-        assert_eq!(main.children.len(), 4);
-        assert_eq!(
-            (
-                main.children[0].role.as_str(),
-                main.children[0].name.as_str(),
-                main.children[0].path.as_slice(),
-                main.children[0].focusable,
-            ),
-            ("heading", "Settings", [0, 0].as_slice(), false)
-        );
-        assert_eq!(
-            (
-                main.children[1].role.as_str(),
-                main.children[1].name.as_str(),
-                main.children[1].path.as_slice(),
-                main.children[1].focusable,
-            ),
-            ("button", "Save changes", [0, 1].as_slice(), true)
-        );
-        assert_eq!(
-            (
-                main.children[2].role.as_str(),
-                main.children[2].name.as_str(),
-                main.children[2].path.as_slice(),
-                main.children[2].disabled,
-                main.children[2].focusable,
-            ),
-            ("checkbox", "Enable sync", [0, 2].as_slice(), true, false)
-        );
-        assert_eq!(
-            (
-                main.children[3].role.as_str(),
-                main.children[3].name.as_str(),
-                main.children[3].path.as_slice(),
-                main.children[3].focusable,
-            ),
-            ("link", "Help", [0, 3].as_slice(), true)
+            summary,
+            vec![
+                ("heading", "Settings", false, false),
+                ("button", "Save changes", false, true),
+                ("checkbox", "Enable sync", true, false),
+                ("link", "Help", false, true),
+            ]
         );
     }
 
@@ -2272,10 +2002,9 @@ mod tests {
             Document::parse("<style>.accent { color: #fff; }</style><p>A &amp; B &#x21;</p>")
                 .expect("document should parse");
         assert_eq!(document.style_text(), ".accent { color: #fff; }");
-        let Node::Element(paragraph) = &document.root.children[1] else {
-            panic!("expected paragraph");
-        };
-        assert_eq!(paragraph.children, vec![Node::Text("A & B !".to_string())]);
+        let paragraph = element_named(&document, "p");
+        assert_eq!(document.text_content(paragraph), "A & B !");
+        assert_eq!(document.inner_html(paragraph), "A &amp; B !");
     }
 
     #[test]
@@ -2294,350 +2023,209 @@ mod tests {
             document.script_text(),
             vec!["if (count < 2) { count = count + 1; }".to_string()]
         );
+        let script = element_named(&document, "script");
+        assert_eq!(
+            document.inner_html(script),
+            "if (count < 2) { count = count + 1; }"
+        );
     }
 
     #[test]
-    fn mutates_text_and_style_through_a_stable_path() {
+    fn edits_style_properties_and_removes_empty_ones() {
         let mut document = Document::parse("<button id='go' style='color: red'>go</button>")
             .expect("document should parse");
-        let path = document
+        let button = document
             .find_element_by_id("go")
             .expect("button should exist");
-        assert!(document.set_element_text_content(&path, "done".to_string()));
-        assert!(document.set_style_property(&path, "backgroundColor", "#fff".to_string()));
-        assert_eq!(
-            document.element_text_content(&path).as_deref(),
-            Some("done")
-        );
+        assert!(document.set_style_property(button, "backgroundColor", "#fff".to_string()));
         assert_eq!(
             document
-                .style_property(&path, "background-color")
+                .style_property(button, "background-color")
                 .as_deref(),
             Some("#fff")
         );
+        assert!(document.set_style_property(button, "color", String::new()));
+        assert_eq!(
+            document.attribute(button, "style"),
+            Some("background-color: #fff")
+        );
     }
 
     #[test]
-    fn finds_simple_selectors() {
-        let document =
-            Document::parse("<main><p class='accent'>first</p><p id='second'>second</p></main>")
-                .expect("document should parse");
-        assert!(document.find_element_by_selector("p").is_some());
-        assert!(document.find_element_by_selector(".accent").is_some());
-        assert!(document.find_element_by_selector("#second").is_some());
-        assert!(document.find_element_by_selector(".missing").is_none());
-    }
-
-    #[test]
-    fn collects_selector_matches_in_document_order() {
+    fn finds_selectors_in_document_order_and_within_a_scope() {
         let document = Document::parse(
-            "<main><p data-check='first'>one</p><section><p data-check='second'>two</p></section><p data-check='third'>three</p></main>",
+            "<main class='shell'><p data-check='first'>one</p><section><p class='card' data-check='second'>two</p></section><p class='direct' data-check='third'>three</p></main>",
         )
         .expect("document should parse");
+        let texts = |nodes: Vec<NodeId>| {
+            nodes
+                .into_iter()
+                .map(|node| document.text_content(node))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            document.find_elements_by_selector("[data-check]"),
-            Some(vec![vec![0, 0], vec![0, 1, 0], vec![0, 2]])
+            texts(
+                document
+                    .find_elements_by_selector("[data-check]")
+                    .expect("valid")
+            ),
+            vec!["one", "two", "three"]
         );
         let section = document
             .find_element_by_selector("section")
-            .expect("section should exist");
+            .expect("section");
         assert_eq!(
-            document.find_elements_by_selector_within(&section, "[data-check]"),
-            Some(vec![vec![0, 1, 0]])
+            texts(
+                document
+                    .find_elements_by_selector_within(section, "[data-check]")
+                    .expect("valid")
+            ),
+            vec!["two"]
         );
-    }
-
-    #[test]
-    fn collects_form_controls_in_document_order() {
-        let document = Document::parse(
-            "<form id='profile'><input name='name'><fieldset><textarea name='note'></textarea></fieldset><button name='save'>save</button></form>",
-        )
-        .expect("document should parse");
-        let form = document
-            .find_element_by_id("profile")
-            .expect("form should exist");
-        assert_eq!(
-            document.form_control_paths(&form),
-            Some(vec![vec![0, 0], vec![0, 1, 0], vec![0, 2]])
-        );
-        assert_eq!(document.form_ancestor_path(&[0, 1, 0]), Some(vec![0]));
-    }
-
-    #[test]
-    fn resolves_explicit_and_wrapped_label_controls() {
-        let document = Document::parse(
-            "<label id='explicit' for='name'>Name</label><input id='name'><label id='wrapped'><span>Remember</span><input id='remember' type='checkbox'></label><label id='hidden' for='secret'>Secret</label><input id='secret' type='hidden'>",
-        )
-        .expect("labels should parse");
-        let explicit = document
-            .find_element_by_id("explicit")
-            .expect("explicit label should exist");
-        let wrapped = document
-            .find_element_by_id("wrapped")
-            .expect("wrapped label should exist");
-        let hidden = document
-            .find_element_by_id("hidden")
-            .expect("hidden label should exist");
-        assert_eq!(document.label_control_path(&explicit), Some(vec![1]));
-        assert_eq!(document.label_control_path(&wrapped), Some(vec![2, 1]));
-        assert!(document.label_control_path(&hidden).is_none());
-        assert_eq!(document.label_ancestor_path(&[2, 0]), Some(vec![2]));
-    }
-
-    #[test]
-    fn collects_autofocus_candidates_in_document_order() {
-        let document = Document::parse(
-            "<main autofocus><input id='first' autofocus><section><button id='second' autofocus>go</button></section></main>",
-        )
-        .expect("autofocus document should parse");
-        assert_eq!(
-            document.autofocus_paths(),
-            vec![vec![0], vec![0, 0], vec![0, 1, 0]]
-        );
-    }
-
-    #[test]
-    fn preserves_document_order_for_external_sources() {
-        let document = Document::parse(
-            "<link rel='StyleSheet' href='/theme.css'><style>p { color: red; }</style><script src='/boot.js'></script><script>console.log('inline');</script><script type='module' src='/entry.js'></script><script type='module'>console.log('inline module');</script>",
-        )
-        .expect("document should parse");
-        assert_eq!(
-            document.stylesheet_sources(),
-            vec![
-                StylesheetSource::External("/theme.css".to_string()),
-                StylesheetSource::Inline("p { color: red; }".to_string()),
-            ]
-        );
-        assert_eq!(
-            document.script_sources(),
-            vec![
-                ScriptSource::External("/boot.js".to_string()),
-                ScriptSource::Inline("console.log('inline');".to_string()),
-                ScriptSource::ExternalModule("/entry.js".to_string()),
-                ScriptSource::InlineModule("console.log('inline module');".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn appends_an_element_and_returns_its_stable_path() {
-        let mut document =
-            Document::parse("<main id='root'><p>before</p></main>").expect("document should parse");
-        let root = document
-            .find_element_by_id("root")
-            .expect("root should exist");
-        let path = document
-            .append_element(&root, Element::new("section"))
-            .expect("child should append");
-        assert_eq!(path, vec![0, 1]);
-        assert_eq!(
-            document.element_clone(&path).map(|element| element.name),
-            Some("section".to_string())
-        );
-    }
-
-    #[test]
-    fn removes_a_direct_child_without_reindexing_survivors() {
-        let mut document = Document::parse(
-            "<main><p id='first'>first</p><p id='gone'>gone</p><p id='last'>last</p></main>",
-        )
-        .expect("document should parse");
-        let main = document
-            .find_element_by_selector("main")
-            .expect("main should exist");
-        let gone = document
-            .find_element_by_id("gone")
-            .expect("removed child should exist");
-        let last = document
-            .find_element_by_id("last")
-            .expect("survivor should exist");
-        assert_eq!(
-            document
-                .remove_child(&main, &gone)
-                .map(|element| element.name),
-            Some("p".to_string())
-        );
-        assert!(document.find_element_by_id("gone").is_none());
-        assert_eq!(
-            document.element_text_content(&last).as_deref(),
-            Some("last")
-        );
-        let reattached = document
-            .append_element(&main, Element::new("aside"))
-            .expect("append should keep the removed slot behind the new child");
-        assert_eq!(reattached, vec![0, 3]);
-    }
-
-    #[test]
-    fn preserves_node_identity_when_inserting_before_a_survivor() {
-        let mut document = Document::parse(
-            "<main><p id='first'>first</p><p id='middle'>middle</p><p id='last'>last</p></main>",
-        )
-        .expect("document should parse");
-        let main = document
-            .find_element_by_selector("main")
-            .expect("main should exist");
-        let middle = document
-            .find_element_by_id("middle")
-            .expect("middle should exist");
-        let last = document
-            .find_element_by_id("last")
-            .expect("last should exist");
-        let middle_id = document.node_id(&middle).expect("middle should have an id");
-        let last_id = document.node_id(&last).expect("last should have an id");
-
-        let inserted = document
-            .insert_element_before(&main, Element::new("aside"), &middle)
-            .expect("element should insert before the reference");
-        assert_eq!(inserted, vec![0, 1]);
-        let inserted_id = document
-            .node_id(&inserted)
-            .expect("inserted element should have an id");
-        assert_ne!(inserted_id, middle_id);
-        assert_ne!(inserted_id, last_id);
-        assert_eq!(document.path_for_id(middle_id), Some(vec![0, 2]));
-        assert_eq!(document.path_for_id(last_id), Some(vec![0, 3]));
-        assert_eq!(
-            document.element_attribute(&[0, 2], "id").as_deref(),
-            Some("middle")
-        );
-        assert_eq!(
-            document.element_attribute(&[0, 3], "id").as_deref(),
-            Some("last")
-        );
-
-        assert!(document.remove_child(&main, &[0, 2]).is_some());
-        assert!(document.path_for_id(middle_id).is_none());
-        assert_eq!(document.path_for_id(last_id), Some(vec![0, 3]));
-    }
-
-    #[test]
-    fn moves_an_attached_element_between_parents_without_replacing_its_id() {
-        let mut document = Document::parse(
-            "<main id='source'><p id='move'>move</p><p id='stay'>stay</p></main><main id='target'><p id='reference'>reference</p></main>",
-        )
-        .expect("document should parse");
-        let source = document
-            .find_element_by_id("source")
-            .expect("source should exist");
-        let target = document
-            .find_element_by_id("target")
-            .expect("target should exist");
-        let moved = document
-            .find_element_by_id("move")
-            .expect("moved element should exist");
-        let reference = document
-            .find_element_by_id("reference")
-            .expect("reference should exist");
-        let moved_id = document
-            .node_id(&moved)
-            .expect("moved element should have an id");
-        let stay_id = document
-            .node_id(&[0, 1])
-            .expect("surviving sibling should have an id");
-        let new_path = document
-            .move_element_before(&moved, &target, Some(&reference))
-            .expect("attached element should move before the reference");
-
-        assert_eq!(new_path, vec![1, 0]);
-        assert_eq!(document.path_for_id(moved_id), Some(new_path));
-        assert_eq!(document.path_for_id(stay_id), Some(vec![0, 0]));
-        assert_eq!(document.find_element_by_id("reference"), Some(vec![1, 1]));
-        assert_eq!(document.find_element_by_id("move"), Some(vec![1, 0]));
-        assert_eq!(document.find_element_by_id("stay"), Some(vec![0, 0]));
-        assert_eq!(
-            document.element_text_content(&[1, 0]).as_deref(),
-            Some("move")
-        );
-        assert_eq!(
-            document.element_text_content(&[0, 0]).as_deref(),
-            Some("stay")
-        );
-        assert_ne!(source, target);
-    }
-
-    #[test]
-    fn moves_an_attached_element_within_one_parent_and_keeps_ordered_ids() {
-        let mut document = Document::parse(
-            "<main><p id='first'>first</p><p id='middle'>middle</p><p id='last'>last</p></main>",
-        )
-        .expect("document should parse");
-        let main = document
-            .find_element_by_selector("main")
-            .expect("main should exist");
-        let first = document
-            .find_element_by_id("first")
-            .expect("first should exist");
-        let middle = document
-            .find_element_by_id("middle")
-            .expect("middle should exist");
-        let last = document
-            .find_element_by_id("last")
-            .expect("last should exist");
-        let first_id = document.node_id(&first).expect("first should have an id");
-        let middle_id = document.node_id(&middle).expect("middle should have an id");
-        let last_id = document.node_id(&last).expect("last should have an id");
-
-        assert_eq!(
-            document.move_element_before(&last, &main, Some(&first)),
-            Some(vec![0, 0])
-        );
-        assert_eq!(document.path_for_id(last_id), Some(vec![0, 0]));
-        assert_eq!(document.path_for_id(first_id), Some(vec![0, 1]));
-        assert_eq!(document.path_for_id(middle_id), Some(vec![0, 2]));
-        assert_eq!(
-            document.move_element_before(&[0, 0], &main, Some(&[0, 0])),
-            Some(vec![0, 0])
-        );
-    }
-
-    #[test]
-    fn queries_compound_descendant_and_child_selectors() {
-        let document = Document::parse(
-            "<main class='shell'><section><p class='card'>nested</p></section><p class='direct'>direct</p></main>",
-        )
-        .expect("document should parse");
-        assert_eq!(
-            document
-                .find_element_by_selector(".shell .card")
-                .and_then(|path| document.element_text_content(&path)),
-            Some("nested".to_string())
-        );
+        assert!(document.find_element_by_selector(".shell .card").is_some());
         assert!(
             document
                 .find_element_by_selector(".shell > .direct")
                 .is_some()
         );
         assert!(document.find_element_by_selector("section.card").is_none());
-        let shell = document
-            .find_element_by_selector(".shell")
-            .expect("shell should exist");
+        assert!(document.find_elements_by_selector("p[").is_none());
         assert_eq!(
             document
-                .find_element_by_selector_within(&shell, ".card")
-                .and_then(|path| document.element_text_content(&path)),
-            Some("nested".to_string())
+                .find_element_by_selector_within(section, ".shell .card")
+                .map(|node| document.text_content(node)),
+            Some("two".to_string())
         );
     }
 
     #[test]
-    fn queries_selector_lists_and_not_pseudo_classes() {
+    fn resolves_forms_labels_options_and_radio_groups() {
         let document = Document::parse(
-            "<main><p class='muted'>skip</p><p class='card'>first</p><section data-label='a,b'>second</section></main>",
+            "<form id='profile'><input id='name' name='name'><fieldset><textarea name='note'></textarea></fieldset><select id='pick'><option>a</option><optgroup><option>b</option></optgroup></select><input type='radio' name='size' id='small'><input type='radio' name='size' id='large'></form><input id='outside' form='profile'><label id='explicit' for='name'>Name</label><label id='wrapped'><span>Remember</span><input id='remember' type='checkbox'></label>",
         )
         .expect("document should parse");
+        let id = |value: &str| document.find_element_by_id(value).expect("element exists");
+        let form = id("profile");
         assert_eq!(
-            document.find_element_by_selector(".muted, .card:not(.muted)"),
-            Some(vec![0, 0])
+            document.form_controls(form).map(|controls| controls.len()),
+            Some(6)
+        );
+        assert_eq!(document.form_owner(id("outside")), Some(form));
+        assert_eq!(document.form_owner(id("name")), Some(form));
+        assert_eq!(
+            document.options(id("pick")).map(|options| options.len()),
+            Some(2)
+        );
+        assert_eq!(document.label_control(id("explicit")), Some(id("name")));
+        assert_eq!(document.label_control(id("wrapped")), Some(id("remember")));
+        assert_eq!(
+            document.radio_group(id("small")),
+            Some(vec![id("small"), id("large")])
+        );
+    }
+
+    #[test]
+    fn inserts_moves_and_removes_nodes_with_stable_ids() {
+        let mut document = Document::parse(
+            "<main id='source'><p id='move'>move</p><p id='stay'>stay</p></main><main id='target'><p id='reference'>reference</p></main>",
+        )
+        .expect("document should parse");
+        let id = |document: &Document, value: &str| {
+            document.find_element_by_id(value).expect("element exists")
+        };
+        let (source, target) = (id(&document, "source"), id(&document, "target"));
+        let (moved, stay, reference) = (
+            id(&document, "move"),
+            id(&document, "stay"),
+            id(&document, "reference"),
         );
         assert_eq!(
-            document.find_element_by_selector(".card:not(.muted)"),
-            Some(vec![0, 1])
+            document.insert_before(target, moved, Some(reference)),
+            Ok(vec![moved])
+        );
+        assert_eq!(document.children(source), &[stay]);
+        assert_eq!(document.children(target), &[moved, reference]);
+        assert_eq!(document.parent(moved), Some(target));
+        assert_eq!(
+            document.insert_before(moved, target, None),
+            Err(DomError::HierarchyRequest)
         );
         assert_eq!(
-            document.find_elements_by_selector("[data-label='a,b'], .card:not(.muted)"),
-            Some(vec![vec![0, 1], vec![0, 2]])
+            document.insert_before(source, moved, Some(reference)),
+            Err(DomError::NotFound)
         );
+        assert_eq!(document.remove(moved), Some((target, 0)));
+        assert!(!document.is_connected(moved));
+        assert_eq!(document.text_content(moved), "move");
+        assert!(document.find_element_by_id("move").is_none());
+        assert_eq!(document.append_child(stay, moved), Ok(vec![moved]));
+        assert!(document.is_connected(moved));
+    }
+
+    #[test]
+    fn builds_detached_trees_and_inserts_fragments() {
+        let mut document = Document::parse("<ul id='list'></ul>").expect("document should parse");
+        let list = document
+            .find_element_by_id("list")
+            .expect("list should exist");
+        let fragment = document.create_fragment();
+        let first = document.create_element("li");
+        let text = document.create_text("one");
+        document.append_child(first, text).expect("text appends");
+        let second = document.create_element("LI");
+        document.append_child(fragment, first).expect("li appends");
+        document.append_child(fragment, second).expect("li appends");
+        assert_eq!(
+            document.element(second).map(Element::tag_name),
+            Some("LI".to_string())
+        );
+        assert_eq!(
+            document.append_child(list, fragment),
+            Ok(vec![first, second])
+        );
+        assert!(document.children(fragment).is_empty());
+        assert_eq!(document.inner_html(list), "<li>one</li><li></li>");
+        assert_eq!(document.tree_order(first, second), Ordering::Less);
+        assert_eq!(document.tree_order(text, list), Ordering::Greater);
+    }
+
+    #[test]
+    fn frees_orphaned_trees_and_rejects_their_stale_ids() {
+        let mut document = Document::parse("<main id='root'><p id='gone'>gone</p></main>")
+            .expect("document should parse");
+        assert!(document.take_orphans().is_empty());
+        let gone = document.find_element_by_id("gone").expect("paragraph");
+        let text = document.children(gone)[0];
+        document.remove(gone);
+        assert_eq!(document.take_orphans(), vec![gone]);
+        assert_eq!(document.free_tree(gone).len(), 2);
+        assert!(!document.contains(gone));
+        assert!(!document.contains(text));
+        let reused = document.create_element("p");
+        assert!(document.contains(reused));
+        assert!(!document.contains(gone));
+        let root = document.find_element_by_id("root").expect("main");
+        assert!(document.free_tree(root).is_empty());
+    }
+
+    #[test]
+    fn clones_splits_and_parses_fragments() {
+        let mut document = Document::parse("<p id='text'>hello world</p>").expect("should parse");
+        let paragraph = document.find_element_by_id("text").expect("paragraph");
+        let copy = document.clone_node(paragraph, true).expect("clone");
+        assert_eq!(document.outer_html(copy), "<p id=\"text\">hello world</p>");
+        let shallow = document.clone_node(paragraph, false).expect("clone");
+        assert!(document.children(shallow).is_empty());
+        let text = document.children(paragraph)[0];
+        let tail = document.split_text(text, 5).expect("split");
+        assert_eq!(document.children(paragraph), &[text, tail]);
+        assert_eq!(document.character_data(tail), Some(" world"));
+        let fragment = document
+            .parse_fragment("<b>bold</b> text")
+            .expect("fragment parses");
+        assert_eq!(document.children(fragment).len(), 2);
+        assert!(document.parse_fragment("<b></i>").is_err());
+        assert_eq!(document.node_text_offset(tail), Some(5));
+        assert_eq!(document.text_point(7), Some((tail, 2)));
     }
 }

@@ -23,8 +23,8 @@ mod window;
 
 pub use css::{Color, ColorScheme, Display, Stylesheet};
 pub use dom::{
-    AccessibilityNode, Document, Element, Node, NodeId, NodePath, ParseError, ScriptSource,
-    StylesheetSource,
+    AccessibilityNode, Document, DomError, Element, Namespace, NodeId, NodeKind, ParseError,
+    ScriptSource, StylesheetSource,
 };
 pub use font::{FontFace, FontSet, FontSource, FontStack, GlyphBitmap, intern_font_stack};
 pub use host::{

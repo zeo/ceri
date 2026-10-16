@@ -19,7 +19,7 @@ pub(super) enum KeyId {
     String(Rc<str>),
     Symbol(String),
     BigInt(Rc<super::bigint::BigInt>),
-    Node(usize),
+    Node(usize, u8),
     Address(usize),
 }
 
@@ -42,15 +42,11 @@ pub(super) fn key_id(value: &Value) -> KeyId {
         Value::Symbol(key) => KeyId::Symbol(key.clone()),
         Value::BigInt(value) => KeyId::BigInt(value.clone()),
         Value::Binding(cell, _) => key_id(&cell.borrow()),
-        Value::Element(handle)
-        | Value::Style(handle)
-        | Value::Dataset(handle)
-        | Value::ClassList(handle) => match &*handle.borrow() {
-            ElementLocation::Attached { id, .. } => KeyId::Node(*id as usize),
-            ElementLocation::Detached(_) => {
-                KeyId::Address(Rc::as_ptr(handle) as *const u8 as usize)
-            }
-        },
+        // a node and its style, dataset and class list views share one handle
+        Value::Element(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 0),
+        Value::Style(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 1),
+        Value::Dataset(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 2),
+        Value::ClassList(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 3),
         other => KeyId::Address(value_address(other)),
     }
 }

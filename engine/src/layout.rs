@@ -3,7 +3,7 @@ use crate::css::{
     GridTrack, InheritedText, JustifyContent, Overflow, Position, PseudoElement, Style,
     StyleContext, StyleState, Stylesheet, TextAlign,
 };
-use crate::dom::{Document, Element, Node, NodePath};
+use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::image::Image;
 
@@ -40,7 +40,7 @@ pub struct TextRun {
     pub bold: bool,
     // DOM text node that produced this run, so prose can be selected by pointer;
     // node_offset is where the word starts, past any leading space in text
-    pub node_path: Option<NodePath>,
+    pub node: Option<NodeId>,
     pub node_offset: usize,
     // UTF-16 length of the source word, which text-transform may change in text
     pub source_len: usize,
@@ -97,7 +97,8 @@ pub struct ResolvedShadow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutBox {
-    pub path: NodePath,
+    // the element that produced the box; generated boxes report their owner
+    pub node: NodeId,
     pub tag: String,
     pub rect: Rect,
     pub background: Color,
@@ -141,7 +142,7 @@ pub struct LayoutDocument {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ImageLayer {
-    pub(crate) path: NodePath,
+    pub(crate) node: NodeId,
     pub(crate) image: std::rc::Rc<Image>,
     // a CSS background rather than the element's own content
     pub(crate) background: bool,
@@ -174,7 +175,7 @@ struct InlineFragment {
     font_stack: FontStack,
     color: Color,
     bold: bool,
-    node_path: Option<NodePath>,
+    node: Option<NodeId>,
     node_offset: usize,
     source_len: usize,
     line_height: f32,
@@ -191,33 +192,114 @@ struct ParentStyle {
     text: InheritedText,
 }
 
-// css generated content becomes a synthetic child that the normal cascade styles
-fn generated_child(
-    element: &Element,
-    path: &[usize],
-    ancestors: &[&Element],
-    stylesheet: &Stylesheet,
-    style_state: &StyleState,
-    pseudo: PseudoElement,
-) -> Option<Node> {
-    let mut candidate = Element::new(pseudo.tag());
-    let mut candidate_path = path.to_vec();
-    candidate_path.push(element.children.len());
-    let content = stylesheet.generated_content(StyleContext {
-        element: &candidate,
-        path: &candidate_path,
-        ancestors,
-        parent_font_size: 16.0,
-        parent_color: Color::BLACK,
-        parent_weight: FontWeight::Normal,
-        parent_text: InheritedText::default(),
-        state: style_state,
-    })?;
-    if !content.is_empty() {
-        candidate.children.push(Node::Text(content));
-    }
-    Some(Node::Element(candidate))
+// an element to lay out, or the generated ::before or ::after box of one with its content
+#[derive(Clone, Copy)]
+struct Subject<'a> {
+    document: &'a Document,
+    node: NodeId,
+    generated: Option<(PseudoElement, &'a str)>,
 }
+
+enum Child<'a> {
+    Text(Option<NodeId>, &'a str),
+    Element(Subject<'a>),
+}
+
+impl<'a> Subject<'a> {
+    fn new(document: &'a Document, node: NodeId) -> Self {
+        Self {
+            document,
+            node,
+            generated: None,
+        }
+    }
+
+    fn element(self) -> Option<&'a Element> {
+        if self.generated.is_some() {
+            None
+        } else {
+            self.document.element(self.node)
+        }
+    }
+
+    fn name(self) -> &'a str {
+        match self.generated {
+            Some((pseudo, _)) => pseudo.tag(),
+            None => self.element().map_or("", |element| element.name.as_str()),
+        }
+    }
+
+    // the node whose own state, such as a control value or focus, belongs to the box
+    fn own(self) -> Option<NodeId> {
+        self.generated.is_none().then_some(self.node)
+    }
+
+    fn style_context(self, parent: ParentStyle, state: &'a StyleState) -> StyleContext<'a> {
+        StyleContext {
+            document: self.document,
+            node: self.node,
+            pseudo: self.generated.map(|(pseudo, _)| pseudo),
+            parent_font_size: parent.font_size,
+            parent_color: parent.color,
+            parent_weight: parent.weight,
+            parent_text: parent.text,
+            state,
+        }
+    }
+
+    // css generated content, which exists when the cascade gives it a content string
+    fn generated_content(self, stylesheet: &Stylesheet, state: &StyleState) -> [Option<String>; 2] {
+        if self.generated.is_some() {
+            return [None, None];
+        }
+        [PseudoElement::Before, PseudoElement::After].map(|pseudo| {
+            stylesheet.generated_content(StyleContext {
+                document: self.document,
+                node: self.node,
+                pseudo: Some(pseudo),
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::Normal,
+                parent_text: InheritedText::default(),
+                state,
+            })
+        })
+    }
+
+    // text and element children in order, with generated boxes first and last
+    fn children(self, generated: &'a [Option<String>; 2]) -> Vec<Child<'a>> {
+        let mut items = Vec::new();
+        if let Some((_, content)) = self.generated {
+            if !content.is_empty() {
+                items.push(Child::Text(None, content));
+            }
+            return items;
+        }
+        let generated_box = |pseudo: PseudoElement, content: &'a Option<String>| {
+            content.as_deref().map(|content| {
+                Child::Element(Subject {
+                    document: self.document,
+                    node: self.node,
+                    generated: Some((pseudo, content)),
+                })
+            })
+        };
+        items.extend(generated_box(PseudoElement::Before, &generated[0]));
+        for &child in self.document.children(self.node) {
+            match self.document.kind(child) {
+                Some(NodeKind::Text(text)) => items.push(Child::Text(Some(child), text)),
+                Some(NodeKind::Element(_)) => {
+                    items.push(Child::Element(Subject::new(self.document, child)))
+                }
+                _ => {}
+            }
+        }
+        items.extend(generated_box(PseudoElement::After, &generated[1]));
+        items
+    }
+}
+
+const NO_GENERATED_CONTENT: [Option<String>; 2] = [None, None];
 
 fn resolve_shadow(
     shadow: Option<crate::css::BoxShadow>,
@@ -264,25 +346,22 @@ struct InlineContext {
 // which DOM text node the next appended words belong to, for prose selection
 #[derive(Clone)]
 struct InlineSource {
-    path: Option<NodePath>,
+    node: Option<NodeId>,
     offset: usize,
 }
 
 struct InlineElementInput<'a> {
-    element: &'a Element,
-    path: &'a [usize],
+    node: Subject<'a>,
     parent: ParentStyle,
     context: InlineContext,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
-    ancestors: &'a [&'a Element],
     viewport: Size,
     containing_block: ContainingBlock,
 }
 
 struct FlexItem<'a> {
-    element: &'a Element,
-    path: NodePath,
+    node: Subject<'a>,
     style: Style,
     margin: ResolvedEdges,
     main_extras: f32,
@@ -293,9 +372,7 @@ struct FlexItem<'a> {
 
 struct FlexLayoutInput<'a> {
     parent_opacity: f32,
-    element: &'a Element,
-    path: NodePath,
-    ancestors: Vec<&'a Element>,
+    node: Subject<'a>,
     style: Style,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
@@ -314,8 +391,7 @@ struct FlexLayoutInput<'a> {
 }
 
 struct GridItem<'a> {
-    element: &'a Element,
-    path: NodePath,
+    node: Subject<'a>,
     style: Style,
     margin: ResolvedEdges,
     layout: Option<LayoutBox>,
@@ -323,9 +399,7 @@ struct GridItem<'a> {
 
 struct GridLayoutInput<'a> {
     parent_opacity: f32,
-    element: &'a Element,
-    path: NodePath,
-    ancestors: Vec<&'a Element>,
+    node: Subject<'a>,
     style: Style,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
@@ -343,14 +417,8 @@ struct GridLayoutInput<'a> {
     mode: LayoutMode,
 }
 
-struct LayoutNode<'a> {
-    element: &'a Element,
-    path: NodePath,
-    ancestors: &'a [&'a Element],
-}
-
 struct ElementLayoutInput<'node, 'style> {
-    node: LayoutNode<'node>,
+    node: Subject<'node>,
     containing_x: f32,
     containing_y: f32,
     containing_width: f32,
@@ -377,11 +445,6 @@ enum LayoutMode {
     Fixed,
 }
 
-struct PositionedNode<'a> {
-    element: &'a Element,
-    path: NodePath,
-}
-
 #[derive(Clone, Copy)]
 struct LayoutContext<'a> {
     viewport: Size,
@@ -392,12 +455,11 @@ struct LayoutContext<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct PositionedLayoutContext<'a, 'b> {
+struct PositionedLayoutContext<'a> {
     containing_block: ContainingBlock,
     viewport: ContainingBlock,
     viewport_size: Size,
     parent: ParentStyle,
-    ancestors: &'b [&'a Element],
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
 }
@@ -426,7 +488,7 @@ pub fn layout_with_state(
         height: viewport.height,
     };
     let mut root = LayoutBox {
-        path: Vec::new(),
+        node: document.root(),
         tag: "#document".to_string(),
         rect: Rect {
             x: 0.0,
@@ -467,41 +529,26 @@ pub fn layout_with_state(
     };
     let mut cursor_y = 0.0;
     let mut positioned = Vec::new();
-    for (index, child) in document.root.children.iter().enumerate() {
-        let Node::Element(element) = child else {
-            continue;
-        };
-        let path = vec![index];
-        let style = stylesheet.style_for(StyleContext {
-            element,
-            path: &path,
-            ancestors: &[],
-            parent_font_size: 16.0,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: style_state,
-        });
+    let root_parent = ParentStyle {
+        font_size: 16.0,
+        color: Color::BLACK,
+        weight: FontWeight::Normal,
+        text: InheritedText::default(),
+        opacity: 1.0,
+    };
+    for node in document.element_children(document.root()) {
+        let node = Subject::new(document, node);
+        let style = stylesheet.style_for(node.style_context(root_parent, style_state));
         if style.position.is_out_of_flow() {
-            positioned.push(PositionedNode { element, path });
+            positioned.push(node);
             continue;
         }
         if let Some(child_box) = layout_element(ElementLayoutInput {
-            node: LayoutNode {
-                element,
-                path,
-                ancestors: &[],
-            },
+            node,
             containing_x: 0.0,
             containing_y: cursor_y,
             containing_width: viewport.width,
-            parent: ParentStyle {
-                font_size: 16.0,
-                color: Color::BLACK,
-                weight: FontWeight::Normal,
-                text: InheritedText::default(),
-                opacity: 1.0,
-            },
+            parent: root_parent,
             context: LayoutContext {
                 viewport,
                 containing_block: viewport_block,
@@ -521,14 +568,7 @@ pub fn layout_with_state(
             containing_block: viewport_block,
             viewport: viewport_block,
             viewport_size: viewport,
-            parent: ParentStyle {
-                font_size: 16.0,
-                color: Color::BLACK,
-                weight: FontWeight::Normal,
-                text: InheritedText::default(),
-                opacity: 1.0,
-            },
-            ancestors: &[],
+            parent: root_parent,
             stylesheet,
             style_state,
         },
@@ -544,10 +584,10 @@ pub fn layout_with_state(
 
 impl LayoutDocument {
     // maps a point inside a text control to a UTF-16 offset in its value
-    pub fn control_text_offset_at(&self, x: f32, y: f32) -> Option<(NodePath, usize)> {
+    pub fn control_text_offset_at(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
         let mut found = None;
         collect_control_at(&self.root, x, y, (0.0, 0.0), &mut found);
-        let (path, runs, origin, (x, y)) = found?;
+        let (node, runs, origin, (x, y)) = found?;
         let mut offset = 0;
         let mut line = None;
         for run in &runs {
@@ -567,12 +607,12 @@ impl LayoutDocument {
                 .sum();
             Some((base, last.clone()))
         })?;
-        Some((path, base + offset_within_run(&run, x - origin.0)))
+        Some((node, base + offset_within_run(&run, x - origin.0)))
     }
 
     // maps a point over prose to the DOM text node and UTF-16 offset it lands on;
     // a snapping drag resolves points between lines or beside text to the nearest line
-    pub fn prose_text_offset_at(&self, x: f32, y: f32, snap: bool) -> Option<(NodePath, usize)> {
+    pub fn prose_text_offset_at(&self, x: f32, y: f32, snap: bool) -> Option<(NodeId, usize)> {
         let runs = self
             .prose_runs()
             .into_iter()
@@ -598,7 +638,7 @@ impl LayoutDocument {
             line = runs
                 .iter()
                 .filter(|(run, _)| {
-                    run.run.y == nearest.0.run.y && run.box_path == nearest.0.box_path
+                    run.run.y == nearest.0.run.y && run.box_node == nearest.0.box_node
                 })
                 .collect();
         }
@@ -609,7 +649,7 @@ impl LayoutDocument {
                         .total_cmp(&right.horizontal_distance(*right_x))
                 })?;
         let index = offset_within_run(&hit.run, *x);
-        Some((hit.node_path.clone(), hit.run.node_offset_at(index)))
+        Some((hit.node, hit.run.node_offset_at(index)))
     }
 
     // every painted prose run in tree order, translated to the viewport
@@ -624,7 +664,7 @@ impl LayoutDocument {
 // so a run's leading space belongs to the selection
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProseSpan {
-    pub(crate) path: NodePath,
+    pub(crate) node: NodeId,
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) continued: bool,
@@ -632,8 +672,8 @@ pub(crate) struct ProseSpan {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProseRun {
-    pub(crate) node_path: NodePath,
-    pub(crate) box_path: NodePath,
+    pub(crate) node: NodeId,
+    pub(crate) box_node: NodeId,
     pub(crate) box_rect: Rect,
     pub(crate) run: TextRun,
     // full transforms of transformed ancestors, outermost first
@@ -688,7 +728,7 @@ fn offset_within_run(run: &TextRun, x: f32) -> usize {
 }
 
 // a text control under the point: its runs, visual offset and the point in its own space
-type ControlHit = (NodePath, Vec<TextRun>, (f32, f32), (f32, f32));
+type ControlHit = (NodeId, Vec<TextRun>, (f32, f32), (f32, f32));
 
 fn collect_control_at(
     layout_box: &LayoutBox,
@@ -704,12 +744,7 @@ fn collect_control_at(
     let rect = visual_rect_for(layout_box, ancestor_offset);
     let inside = x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
     if inside && layout_box.control_value.is_some() && !layout_box.text.is_empty() {
-        *found = Some((
-            layout_box.path.clone(),
-            layout_box.text.clone(),
-            offset,
-            (x, y),
-        ));
+        *found = Some((layout_box.node, layout_box.text.clone(), offset, (x, y)));
     }
     for child in &layout_box.children {
         collect_control_at(child, x, y, offset, found);
@@ -728,7 +763,7 @@ fn collect_prose_runs(
         transforms.push(transform.about(box_rect.x, box_rect.y));
     }
     for run in &layout_box.text {
-        let Some(node_path) = &run.node_path else {
+        let Some(node) = run.node else {
             continue;
         };
         if run.text.trim().is_empty() {
@@ -738,8 +773,8 @@ fn collect_prose_runs(
         run.x += offset.0;
         run.y += offset.1;
         found.push(ProseRun {
-            node_path: node_path.clone(),
-            box_path: layout_box.path.clone(),
+            node,
+            box_node: layout_box.node,
             box_rect,
             run,
             transforms: transforms.clone(),
@@ -764,7 +799,7 @@ impl LayoutDocument {
         lines.join("\n")
     }
 
-    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodePath> {
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
 
@@ -780,7 +815,7 @@ impl LayoutDocument {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScrollTarget {
-    pub(crate) path: NodePath,
+    pub(crate) node: NodeId,
     pub(crate) max_x: f32,
     pub(crate) max_y: f32,
     pub(crate) offset: (f32, f32),
@@ -788,7 +823,7 @@ pub(crate) struct ScrollTarget {
 
 #[derive(Clone, Debug)]
 pub struct ThumbDrag {
-    pub(crate) path: NodePath,
+    pub(crate) node: NodeId,
     // track rectangle and thumb geometry in viewport coordinates
     pub track: Rect,
     pub vertical: bool,
@@ -810,7 +845,7 @@ pub(crate) struct ScrollbarMetrics {
 
 pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
     let rect = layout.rect;
-    let scroll_container = layout.path.is_empty() || layout.overflow == Overflow::Auto;
+    let scroll_container = layout.is_document() || layout.overflow == Overflow::Auto;
     if !scroll_container {
         return ScrollbarMetrics {
             scrollport: rect,
@@ -917,40 +952,26 @@ fn position_layout_box(
 
 fn append_positioned_nodes(
     children: &mut Vec<LayoutBox>,
-    nodes: Vec<PositionedNode<'_>>,
-    context: PositionedLayoutContext<'_, '_>,
+    nodes: Vec<Subject<'_>>,
+    context: PositionedLayoutContext<'_>,
 ) {
     let PositionedLayoutContext {
         containing_block,
         viewport,
         viewport_size,
         parent,
-        ancestors,
         stylesheet,
         style_state,
     } = context;
     for node in nodes {
-        let style = stylesheet.style_for(StyleContext {
-            element: node.element,
-            path: &node.path,
-            ancestors,
-            parent_font_size: parent.font_size,
-            parent_color: parent.color,
-            parent_weight: parent.weight,
-            parent_text: parent.text,
-            state: style_state,
-        });
+        let style = stylesheet.style_for(node.style_context(parent, style_state));
         let mode = if style.position == Position::Fixed {
             LayoutMode::Fixed
         } else {
             LayoutMode::Absolute
         };
         if let Some(layout) = layout_element(ElementLayoutInput {
-            node: LayoutNode {
-                element: node.element,
-                path: node.path,
-                ancestors,
-            },
+            node,
             containing_x: 0.0,
             containing_y: 0.0,
             containing_width: containing_block.width,
@@ -978,7 +999,7 @@ fn hit_test_box(
     y: f32,
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
-) -> Option<NodePath> {
+) -> Option<NodeId> {
     hit_test_context(layout, x, y, clip, ancestor_offset)
 }
 
@@ -988,7 +1009,7 @@ fn hit_test_context(
     y: f32,
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
-) -> Option<NodePath> {
+) -> Option<NodeId> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
@@ -1021,7 +1042,7 @@ fn hit_test_context(
             return Some(path);
         }
     }
-    (inside_layout && !layout.path.is_empty()).then(|| layout.path.clone())
+    (inside_layout && !layout.is_document()).then_some(layout.node)
 }
 
 fn hit_test_non_context_children(
@@ -1030,7 +1051,7 @@ fn hit_test_non_context_children(
     y: f32,
     clip: Option<Rect>,
     visual_offset: (f32, f32),
-) -> Option<NodePath> {
+) -> Option<NodeId> {
     let child_clip = stacking_child_clip(layout, clip, visual_offset);
     for index in paint_order(&layout.children).into_iter().rev() {
         let child = &layout.children[index];
@@ -1050,7 +1071,7 @@ fn hit_test_non_context(
     y: f32,
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
-) -> Option<NodePath> {
+) -> Option<NodeId> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
@@ -1061,9 +1082,7 @@ fn hit_test_non_context(
     if let Some(path) = hit_test_non_context_children(layout, x, y, clip, visual_offset) {
         return Some(path);
     }
-    contains_point(rect, x, y)
-        .then(|| (!layout.path.is_empty()).then(|| layout.path.clone()))
-        .flatten()
+    (contains_point(rect, x, y) && !layout.is_document()).then_some(layout.node)
 }
 
 pub(crate) struct StackingContextEntry<'a> {
@@ -1117,7 +1136,7 @@ fn stacking_child_clip(
     clip: Option<Rect>,
     visual_offset: (f32, f32),
 ) -> Option<Rect> {
-    if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.path.is_empty() {
+    if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.is_document() {
         intersect_rect(
             clip,
             translate_rect(scrollbar_metrics(layout).scrollport, visual_offset),
@@ -1198,7 +1217,7 @@ fn scroll_target_box(
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
     let child_clip =
-        if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.path.is_empty() {
+        if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.is_document() {
             intersect_rect(
                 clip,
                 translate_rect(scrollbar_metrics(layout).scrollport, visual_offset),
@@ -1213,13 +1232,13 @@ fn scroll_target_box(
             return Some(target);
         }
     }
-    if inside_layout && (layout.overflow == Overflow::Auto || layout.path.is_empty()) {
+    if inside_layout && (layout.overflow == Overflow::Auto || layout.is_document()) {
         let scrollport = scrollbar_metrics(layout).scrollport;
         let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
         let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
         if max_x > 0.0 || max_y > 0.0 {
             return Some(ScrollTarget {
-                path: layout.path.clone(),
+                node: layout.node,
                 max_x,
                 max_y,
                 offset: layout.scroll_offset,
@@ -1253,7 +1272,7 @@ fn thumb_drag_box(
     };
     let visual_offset = visual_offset_for(layout_box, ancestor_offset);
     let child_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
-        || layout_box.path.is_empty()
+        || layout_box.is_document()
     {
         intersect_rect(
             clip,
@@ -1310,7 +1329,7 @@ fn thumb_drag_box(
         };
         let pointer_along = if vertical { y } else { x } - if vertical { track.y } else { track.x };
         return Some(ThumbDrag {
-            path: layout_box.path.clone(),
+            node: layout_box.node,
             track,
             vertical,
             thumb_extent,
@@ -1358,24 +1377,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 style_state,
             },
     } = input;
-    let LayoutNode {
-        element,
-        path,
-        ancestors,
-    } = node;
-    let style = stylesheet.style_for(StyleContext {
-        element,
-        path: &path,
-        ancestors,
-        parent_font_size: parent.font_size,
-        parent_color: parent.color,
-        parent_weight: parent.weight,
-        parent_text: parent.text,
-        state: style_state,
-    });
+    let style = stylesheet.style_for(node.style_context(parent, style_state));
     if style.display == Display::None {
         return None;
     }
+    let name = node.name();
     let position_block = match mode {
         LayoutMode::Flow | LayoutMode::Absolute => containing_block,
         LayoutMode::Fixed => ContainingBlock {
@@ -1466,9 +1472,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     if style.display == Display::Flex {
         return Some(layout_flex_element(FlexLayoutInput {
             parent_opacity: parent.opacity,
-            element,
-            path,
-            ancestors: ancestors.to_vec(),
+            node,
             style,
             stylesheet,
             style_state,
@@ -1489,9 +1493,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     if style.display == Display::Grid {
         return Some(layout_grid_element(GridLayoutInput {
             parent_opacity: parent.opacity,
-            element,
-            path,
-            ancestors: ancestors.to_vec(),
+            node,
             style,
             stylesheet,
             style_state,
@@ -1523,14 +1525,17 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         placed: Vec::new(),
     };
     let mut text = Vec::new();
-    let control_value = text_control_value(element, &path, style_state);
+    let control_value = text_control_value(node, style_state);
     let control_placeholder = control_value
         .as_deref()
         .filter(|value| value.is_empty())
-        .and_then(|_| text_control_placeholder(element));
-    let control_display_value = control_value
-        .as_ref()
-        .map(|value| text_control_display_value(element, value));
+        .and_then(|_| node.element().and_then(text_control_placeholder));
+    let control_display_value = control_value.as_ref().map(|value| {
+        node.element().map_or_else(
+            || value.clone(),
+            |element| text_control_display_value(element, value),
+        )
+    });
     let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
     let letter_spacing = style
         .letter_spacing
@@ -1540,7 +1545,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .as_ref()
         .or(control_display_value.as_ref())
     {
-        let value_lines = control_text_lines(element, value, content_width, font_size);
+        let value_lines = control_text_lines(name, node.element(), value, content_width, font_size);
         let color = if control_placeholder.is_some() {
             Color::opaque(120, 145, 155)
         } else {
@@ -1563,7 +1568,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 font_stack: style.font_family,
                 color,
                 bold: style.font_weight == FontWeight::Bold,
-                node_path: None,
+                node: None,
                 node_offset: 0,
                 source_len: 0,
             });
@@ -1583,69 +1588,33 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         content_x,
         align: style.text_align,
     };
-    let mut child_ancestors = ancestors.to_vec();
-    child_ancestors.push(element);
-    let before = generated_child(
-        element,
-        &path,
-        &child_ancestors,
-        stylesheet,
-        style_state,
-        PseudoElement::Before,
-    );
-    let after = generated_child(
-        element,
-        &path,
-        &child_ancestors,
-        stylesheet,
-        style_state,
-        PseudoElement::After,
-    );
-    let mut sequence: Vec<(usize, &Node)> = Vec::with_capacity(element.children.len() + 2);
-    if let Some(node) = before.as_ref() {
-        sequence.push((element.children.len(), node));
-    }
-    sequence.extend(element.children.iter().enumerate());
-    if let Some(node) = after.as_ref() {
-        sequence.push((element.children.len() + 1, node));
-    }
-    for (index, child) in sequence {
+    let child_parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+        text: inherited_text(&style),
+        opacity: 1.0,
+    };
+    let generated = node.generated_content(stylesheet, style_state);
+    for child in node.children(&generated) {
         match child {
-            Node::Text(value) if element.name != "textarea" => {
+            Child::Text(text_node, value) if name != "textarea" => {
                 let source = InlineSource {
-                    // the run belongs to this element's text child at this index
-                    path: Some({
-                        let mut node_path = path.clone();
-                        node_path.push(index);
-                        node_path
-                    }),
+                    node: text_node,
                     offset: 0,
                 };
                 append_inline_text(value, inline_context, source, &mut text, &mut line)
             }
-            Node::Text(_) => {}
-            Node::Element(_) if element.name == "textarea" => {}
-            Node::Element(child_element) => {
-                let mut child_path = path.clone();
-                child_path.push(index);
-                let child_style = stylesheet.style_for(StyleContext {
-                    element: child_element,
-                    path: &child_path,
-                    ancestors: &child_ancestors,
-                    parent_font_size: font_size,
-                    parent_color: style.color,
-                    parent_weight: style.font_weight,
-                    parent_text: inherited_text(&style),
-                    state: style_state,
-                });
+            Child::Text(..) => {}
+            Child::Element(_) if name == "textarea" => {}
+            Child::Element(child) => {
+                let child_style =
+                    stylesheet.style_for(child.style_context(child_parent, style_state));
                 if child_style.display == Display::None {
                     continue;
                 }
                 if child_style.position.is_out_of_flow() {
-                    positioned.push(PositionedNode {
-                        element: child_element,
-                        path: child_path,
-                    });
+                    positioned.push(child);
                     continue;
                 }
                 if matches!(
@@ -1661,21 +1630,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     );
                     children.append(&mut line.placed);
                     if let Some(child_box) = layout_element(ElementLayoutInput {
-                        node: LayoutNode {
-                            element: child_element,
-                            path: child_path,
-                            ancestors: &child_ancestors,
-                        },
+                        node: child,
                         containing_x: content_x,
                         containing_y: line.y,
                         containing_width: content_width,
-                        parent: ParentStyle {
-                            font_size,
-                            color: style.color,
-                            weight: style.font_weight,
-                            text: inherited_text(&style),
-                            opacity: 1.0,
-                        },
+                        parent: child_parent,
                         context: LayoutContext {
                             viewport,
                             containing_block: descendant_block,
@@ -1693,19 +1652,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 } else {
                     append_inline_element(
                         InlineElementInput {
-                            element: child_element,
-                            path: &child_path,
-                            parent: ParentStyle {
-                                font_size,
-                                color: style.color,
-                                weight: style.font_weight,
-                                text: inherited_text(&style),
-                                opacity: 1.0,
-                            },
+                            node: child,
+                            parent: child_parent,
                             context: inline_context,
                             stylesheet,
                             style_state,
-                            ancestors: &child_ancestors,
                             viewport,
                             containing_block: descendant_block,
                         },
@@ -1733,8 +1684,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         ..rect
     };
     let mut layout = LayoutBox {
-        path: path.clone(),
-        tag: element.name.clone(),
+        node: node.node,
+        tag: name.to_string(),
         rect,
         background: style.background,
         gradient: style.gradient,
@@ -1752,8 +1703,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         border_width: border,
         border_color: style.border_color,
         text,
-        control_selection: style_state.text_selections.get(&path).copied(),
-        control_focused: style_state.focused_path.as_deref() == Some(path.as_slice()),
+        control_selection: node
+            .own()
+            .and_then(|own| style_state.text_selections.get(&own).copied()),
+        control_focused: node.own().is_some() && style_state.focused == node.own(),
         control_text_origin,
         control_value,
         children,
@@ -1791,14 +1744,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             },
             viewport: viewport_block(viewport),
             viewport_size: viewport,
-            parent: ParentStyle {
-                font_size,
-                color: style.color,
-                weight: style.font_weight,
-                text: inherited_text(&style),
-                opacity: 1.0,
-            },
-            ancestors: &child_ancestors,
+            parent: child_parent,
             stylesheet,
             style_state,
         },
@@ -1810,9 +1756,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let FlexLayoutInput {
         parent_opacity,
-        element,
-        path,
-        ancestors,
+        node,
         style,
         stylesheet,
         style_state,
@@ -1836,65 +1780,19 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         text: inherited_text(&style),
         opacity: 1.0,
     };
-    let mut child_ancestors = ancestors;
-    child_ancestors.push(element);
-    let generated = [
-        generated_child(
-            element,
-            &path,
-            &child_ancestors,
-            stylesheet,
-            style_state,
-            PseudoElement::Before,
-        ),
-        generated_child(
-            element,
-            &path,
-            &child_ancestors,
-            stylesheet,
-            style_state,
-            PseudoElement::After,
-        ),
-    ];
+    let generated = node.generated_content(stylesheet, style_state);
     let mut items = Vec::new();
     let mut positioned = Vec::new();
-    let owned_sequence: Vec<(usize, Node)> = {
-        let mut sequence: Vec<(usize, Node)> = Vec::with_capacity(element.children.len() + 2);
-        if let Some(node) = generated[0].as_ref() {
-            sequence.push((element.children.len(), node.clone()));
-        }
-        for (index, node) in element.children.iter().enumerate() {
-            sequence.push((index, node.clone()));
-        }
-        if let Some(node) = generated[1].as_ref() {
-            sequence.push((element.children.len() + 1, node.clone()));
-        }
-        sequence
-    };
-    for (index, child) in &owned_sequence {
-        let Node::Element(child) = child else {
+    for child in node.children(&generated) {
+        let Child::Element(child) = child else {
             continue;
         };
-        let mut child_path = path.clone();
-        child_path.push(*index);
-        let child_style = stylesheet.style_for(StyleContext {
-            element: child,
-            path: &child_path,
-            ancestors: &child_ancestors,
-            parent_font_size: font_size,
-            parent_color: style.color,
-            parent_weight: style.font_weight,
-            parent_text: inherited_text(&style),
-            state: style_state,
-        });
+        let child_style = stylesheet.style_for(child.style_context(child_parent, style_state));
         if child_style.display == Display::None {
             continue;
         }
         if child_style.position.is_out_of_flow() {
-            positioned.push(PositionedNode {
-                element: child,
-                path: child_path,
-            });
+            positioned.push(child);
             continue;
         }
         let child_font_size = child_style
@@ -1926,8 +1824,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             FlexDirection::Column => child_style.height.resolve(content_width, child_font_size),
         };
         items.push(FlexItem {
-            element: child,
-            path: child_path,
+            node: child,
             style: child_style,
             margin: child_margin,
             main_extras,
@@ -1973,11 +1870,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             content_width
         };
         item.layout = layout_element(ElementLayoutInput {
-            node: LayoutNode {
-                element: item.element,
-                path: item.path.clone(),
-                ancestors: &child_ancestors,
-            },
+            node: item.node,
             containing_x: 0.0,
             containing_y: 0.0,
             containing_width: child_width,
@@ -2086,8 +1979,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         }
     };
     let mut layout = LayoutBox {
-        path,
-        tag: element.name.clone(),
+        node: node.node,
+        tag: node.name().to_string(),
         rect: Rect {
             height: content_height + padding.top + padding.bottom + (border * 2.0),
             ..rect
@@ -2158,7 +2051,6 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             viewport: viewport_block(viewport),
             viewport_size: viewport,
             parent: child_parent,
-            ancestors: &child_ancestors,
             stylesheet,
             style_state,
         },
@@ -2170,9 +2062,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
 fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let GridLayoutInput {
         parent_opacity,
-        element,
-        path,
-        ancestors,
+        node,
         style,
         stylesheet,
         style_state,
@@ -2196,62 +2086,19 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         text: inherited_text(&style),
         opacity: 1.0,
     };
-    let mut child_ancestors = ancestors;
-    child_ancestors.push(element);
-    let generated = [
-        generated_child(
-            element,
-            &path,
-            &child_ancestors,
-            stylesheet,
-            style_state,
-            PseudoElement::Before,
-        ),
-        generated_child(
-            element,
-            &path,
-            &child_ancestors,
-            stylesheet,
-            style_state,
-            PseudoElement::After,
-        ),
-    ];
+    let generated = node.generated_content(stylesheet, style_state);
     let mut items = Vec::new();
     let mut positioned = Vec::new();
-    let mut owned_sequence: Vec<(usize, Node)> = Vec::with_capacity(element.children.len() + 2);
-    if let Some(node) = generated[0].as_ref() {
-        owned_sequence.push((element.children.len(), node.clone()));
-    }
-    for (index, node) in element.children.iter().enumerate() {
-        owned_sequence.push((index, node.clone()));
-    }
-    if let Some(node) = generated[1].as_ref() {
-        owned_sequence.push((element.children.len() + 1, node.clone()));
-    }
-    for (index, child) in &owned_sequence {
-        let Node::Element(child) = child else {
+    for child in node.children(&generated) {
+        let Child::Element(child) = child else {
             continue;
         };
-        let mut child_path = path.clone();
-        child_path.push(*index);
-        let child_style = stylesheet.style_for(StyleContext {
-            element: child,
-            path: &child_path,
-            ancestors: &child_ancestors,
-            parent_font_size: font_size,
-            parent_color: style.color,
-            parent_weight: style.font_weight,
-            parent_text: inherited_text(&style),
-            state: style_state,
-        });
+        let child_style = stylesheet.style_for(child.style_context(child_parent, style_state));
         if child_style.display == Display::None {
             continue;
         }
         if child_style.position.is_out_of_flow() {
-            positioned.push(PositionedNode {
-                element: child,
-                path: child_path,
-            });
+            positioned.push(child);
             continue;
         }
         let child_font_size = child_style
@@ -2261,8 +2108,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             .max(1.0);
         let child_margin = resolve_edges(child_style.margin, content_width, child_font_size);
         items.push(GridItem {
-            element: child,
-            path: child_path,
+            node: child,
             style: child_style,
             margin: child_margin,
             layout: None,
@@ -2288,9 +2134,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             continue;
         }
         let width = max_content_width(MaxContentInput {
-            element: item.element,
-            path: &item.path,
-            ancestors: &child_ancestors,
+            node: item.node,
             stylesheet,
             style_state,
             parent: child_parent,
@@ -2309,11 +2153,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let column = index % column_count;
         let column_width = column_widths[column];
         item.layout = layout_element(ElementLayoutInput {
-            node: LayoutNode {
-                element: item.element,
-                path: item.path.clone(),
-                ancestors: &child_ancestors,
-            },
+            node: item.node,
             containing_x: 0.0,
             containing_y: 0.0,
             containing_width: column_width.max(0.0),
@@ -2387,8 +2227,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         row_heights.iter().sum::<f32>() + gap * row_count.saturating_sub(1) as f32
     });
     let mut layout = LayoutBox {
-        path,
-        tag: element.name.clone(),
+        node: node.node,
+        tag: node.name().to_string(),
         rect: Rect {
             height: content_height + padding.top + padding.bottom + border * 2.0,
             ..rect
@@ -2459,7 +2299,6 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             viewport: viewport_block(viewport),
             viewport_size: viewport,
             parent: child_parent,
-            ancestors: &child_ancestors,
             stylesheet,
             style_state,
         },
@@ -2469,9 +2308,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
 }
 
 struct MaxContentInput<'a> {
-    element: &'a Element,
-    path: &'a [usize],
-    ancestors: &'a [&'a Element],
+    node: Subject<'a>,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
     parent: ParentStyle,
@@ -2481,24 +2318,13 @@ struct MaxContentInput<'a> {
 // the widest the element can be before wrapping, used for auto grid tracks
 fn max_content_width(input: MaxContentInput<'_>) -> f32 {
     let MaxContentInput {
-        element,
-        path,
-        ancestors,
+        node,
         stylesheet,
         style_state,
         parent,
         containing_width,
     } = input;
-    let style = stylesheet.style_for(StyleContext {
-        element,
-        path,
-        ancestors,
-        parent_font_size: parent.font_size,
-        parent_color: parent.color,
-        parent_weight: parent.weight,
-        parent_text: parent.text,
-        state: style_state,
-    });
+    let style = stylesheet.style_for(node.style_context(parent, style_state));
     if style.display == Display::None {
         return 0.0;
     }
@@ -2529,13 +2355,11 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
         text: inherited_text(&style),
         opacity: 1.0,
     };
-    let mut child_ancestors = ancestors.to_vec();
-    child_ancestors.push(element);
     let mut inline = 0.0_f32;
     let mut widest_block = 0.0_f32;
-    for (index, child) in element.children.iter().enumerate() {
+    for child in node.children(&NO_GENERATED_CONTENT) {
         match child {
-            Node::Text(value) => {
+            Child::Text(_, value) => {
                 let transformed = style.text_transform.apply(value);
                 inline += measure_text(
                     transformed.trim(),
@@ -2545,29 +2369,16 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
                     letter_spacing,
                 );
             }
-            Node::Element(child) => {
-                let mut child_path = path.to_vec();
-                child_path.push(index);
+            Child::Element(child) => {
                 let width = max_content_width(MaxContentInput {
-                    element: child,
-                    path: &child_path,
-                    ancestors: &child_ancestors,
+                    node: child,
                     stylesheet,
                     style_state,
                     parent: child_parent,
                     containing_width,
                 });
                 let child_display = stylesheet
-                    .style_for(StyleContext {
-                        element: child,
-                        path: &child_path,
-                        ancestors: &child_ancestors,
-                        parent_font_size: font_size,
-                        parent_color: style.color,
-                        parent_weight: style.font_weight,
-                        parent_text: inherited_text(&style),
-                        state: style_state,
-                    })
+                    .style_for(child.style_context(child_parent, style_state))
                     .display;
                 if matches!(child_display, Display::Inline | Display::InlineBlock) {
                     inline += width;
@@ -2776,7 +2587,7 @@ fn apply_relative_offset(
 
 fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
     layout.scroll_content = measure_scroll_content(layout);
-    let is_document = layout.path.is_empty();
+    let is_document = layout.is_document();
     if layout.overflow != Overflow::Auto && !is_document {
         return;
     }
@@ -2785,7 +2596,7 @@ fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
     let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
     let requested = style_state
         .scroll_offsets
-        .get(&layout.path)
+        .get(&layout.node)
         .copied()
         .unwrap_or_default();
     let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
@@ -2909,17 +2720,15 @@ fn append_inline_element(
     line: &mut InlineLine,
 ) {
     let InlineElementInput {
-        element,
-        path,
+        node,
         parent,
         context,
         stylesheet,
         style_state,
-        ancestors,
         viewport,
         containing_block,
     } = input;
-    if element.name == "br" {
+    if node.name() == "br" {
         if line.fragments.is_empty() {
             line.y += context.line_height;
             line.height = 0.0;
@@ -2934,20 +2743,11 @@ fn append_inline_element(
         }
         return;
     }
-    let style = stylesheet.style_for(StyleContext {
-        element,
-        path,
-        ancestors,
-        parent_font_size: parent.font_size,
-        parent_color: parent.color,
-        parent_weight: parent.weight,
-        parent_text: parent.text,
-        state: style_state,
-    });
+    let style = stylesheet.style_for(node.style_context(parent, style_state));
     if style.display == Display::None {
         return;
     }
-    if style.display == Display::InlineBlock || is_replaced(element) {
+    if style.display == Display::InlineBlock || node.name() == "img" {
         append_atomic(input, &style, text, line);
         return;
     }
@@ -2972,46 +2772,35 @@ fn append_inline_element(
         content_x: context.content_x,
         align: context.align,
     };
-    let mut child_ancestors = ancestors.to_vec();
-    child_ancestors.push(element);
-    for (index, child) in element.children.iter().enumerate() {
+    let child_parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+        text: inherited_text(&style),
+        opacity: style.opacity * parent.opacity,
+    };
+    for child in node.children(&NO_GENERATED_CONTENT) {
         match child {
-            Node::Text(value) => {
+            Child::Text(text_node, value) => {
                 let source = InlineSource {
-                    path: Some({
-                        let mut node_path = path.to_vec();
-                        node_path.push(index);
-                        node_path
-                    }),
+                    node: text_node,
                     offset: 0,
                 };
                 append_inline_text(value, child_context, source, text, line)
             }
-            Node::Element(child) => {
-                let mut child_path = path.to_vec();
-                child_path.push(index);
-                append_inline_element(
-                    InlineElementInput {
-                        element: child,
-                        path: &child_path,
-                        parent: ParentStyle {
-                            font_size,
-                            color: style.color,
-                            weight: style.font_weight,
-                            text: inherited_text(&style),
-                            opacity: style.opacity * parent.opacity,
-                        },
-                        context: child_context,
-                        stylesheet,
-                        style_state,
-                        ancestors: &child_ancestors,
-                        viewport,
-                        containing_block,
-                    },
-                    text,
-                    line,
-                )
-            }
+            Child::Element(child) => append_inline_element(
+                InlineElementInput {
+                    node: child,
+                    parent: child_parent,
+                    context: child_context,
+                    stylesheet,
+                    style_state,
+                    viewport,
+                    containing_block,
+                },
+                text,
+                line,
+            ),
         }
     }
 }
@@ -3097,7 +2886,7 @@ fn append_inline_text(
             font_stack: context.text.family,
             color: context.color.scale_alpha(context.opacity),
             bold,
-            node_path: source.path.clone(),
+            node: source.node,
             node_offset,
             source_len,
             line_height: context.line_height,
@@ -3110,10 +2899,6 @@ fn append_inline_text(
     }
 }
 
-fn is_replaced(element: &Element) -> bool {
-    element.name == "img"
-}
-
 // lays out an inline-block or replaced element as a block, then places it on the line
 fn append_atomic(
     input: InlineElementInput<'_>,
@@ -3122,13 +2907,11 @@ fn append_atomic(
     line: &mut InlineLine,
 ) {
     let InlineElementInput {
-        element,
-        path,
+        node,
         parent,
         context,
         stylesheet,
         style_state,
-        ancestors,
         viewport,
         containing_block,
     } = input;
@@ -3141,9 +2924,7 @@ fn append_atomic(
     let containing_width =
         if style.width == crate::css::Length::Auto && style.aspect_ratio.is_none() {
             max_content_width(MaxContentInput {
-                element,
-                path,
-                ancestors,
+                node,
                 stylesheet,
                 style_state,
                 parent,
@@ -3154,11 +2935,7 @@ fn append_atomic(
             context.content_width
         };
     let Some(laid_out) = layout_element(ElementLayoutInput {
-        node: LayoutNode {
-            element,
-            path: path.to_vec(),
-            ancestors,
-        },
+        node,
         containing_x: context.content_x + line.used,
         containing_y: line.y,
         containing_width,
@@ -3195,7 +2972,7 @@ fn append_atomic(
         font_stack: context.text.family,
         color: Color::transparent(),
         bold: false,
-        node_path: None,
+        node: None,
         node_offset: 0,
         source_len: 0,
         line_height: outer_height,
@@ -3248,7 +3025,7 @@ fn flush_line(
             font_stack: fragment.font_stack,
             color: fragment.color,
             bold: fragment.bold,
-            node_path: fragment.node_path,
+            node: fragment.node,
             node_offset: fragment.node_offset,
             source_len: fragment.source_len,
         });
@@ -3292,23 +3069,20 @@ fn root_font_size(
     style_state: &StyleState,
 ) -> f32 {
     const INITIAL_FONT_SIZE: f32 = 16.0;
-    let Some(path) = document.document_element_path() else {
-        return INITIAL_FONT_SIZE;
-    };
-    let Some(element) = document.element_at(&path) else {
+    let Some(root) = document.document_element() else {
         return INITIAL_FONT_SIZE;
     };
     stylesheet
-        .style_for(StyleContext {
-            element,
-            path: &path,
-            ancestors: &[],
-            parent_font_size: INITIAL_FONT_SIZE,
-            parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
-            parent_text: InheritedText::default(),
-            state: style_state,
-        })
+        .style_for(Subject::new(document, root).style_context(
+            ParentStyle {
+                font_size: INITIAL_FONT_SIZE,
+                color: Color::BLACK,
+                weight: FontWeight::Normal,
+                text: InheritedText::default(),
+                opacity: 1.0,
+            },
+            style_state,
+        ))
         .font_size
         .resolve(viewport.width, INITIAL_FONT_SIZE)
         .filter(|size| size.is_finite() && *size > 0.0)
@@ -3326,18 +3100,15 @@ fn measure_text(
         + letter_spacing * text.chars().count() as f32
 }
 
-fn text_control_value(
-    element: &Element,
-    path: &[usize],
-    style_state: &StyleState,
-) -> Option<String> {
+fn text_control_value(node: Subject<'_>, style_state: &StyleState) -> Option<String> {
+    let element = node.element()?;
     if element.name == "textarea" {
         return Some(
             style_state
                 .control_values
-                .get(path)
+                .get(&node.node)
                 .cloned()
-                .unwrap_or_else(|| element_text_value(element)),
+                .unwrap_or_else(|| node.document.text_content(node.node)),
         );
     }
     if element.name != "input"
@@ -3368,22 +3139,11 @@ fn text_control_value(
     Some(
         style_state
             .control_values
-            .get(path)
+            .get(&node.node)
             .cloned()
             .or_else(|| element.attr("value").map(str::to_string))
             .unwrap_or_default(),
     )
-}
-
-fn element_text_value(element: &Element) -> String {
-    let mut value = String::new();
-    for child in &element.children {
-        match child {
-            Node::Text(text) => value.push_str(text),
-            Node::Element(child) => value.push_str(&element_text_value(child)),
-        }
-    }
-    value
 }
 
 fn text_control_placeholder(element: &Element) -> Option<String> {
@@ -3408,7 +3168,8 @@ fn text_control_display_value(element: &Element, value: &str) -> String {
 }
 
 fn control_text_lines(
-    element: &Element,
+    name: &str,
+    element: Option<&Element>,
     value: &str,
     content_width: f32,
     font_size: f32,
@@ -3419,9 +3180,9 @@ fn control_text_lines(
     .max(1.0) as usize;
     let mut lines = Vec::new();
     for value_line in value.split('\n') {
-        if element.name != "textarea"
+        if name != "textarea"
             || element
-                .attr("wrap")
+                .and_then(|element| element.attr("wrap"))
                 .is_some_and(|wrap| wrap.eq_ignore_ascii_case("off"))
         {
             lines.push(value_line.to_string());
@@ -3437,6 +3198,12 @@ fn control_text_lines(
         }
     }
     lines
+}
+
+impl LayoutBox {
+    pub(crate) fn is_document(&self) -> bool {
+        self.tag == "#document"
+    }
 }
 
 fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
@@ -3539,12 +3306,12 @@ mod tests {
         assert_eq!(card.visual_offset, (12.0, -6.0));
         // the hit lands inside the translated card, on its paragraph
         assert_eq!(
-            layout.hit_test(20.0, 10.0).as_deref(),
-            Some([0, 0, 0, 0].as_slice())
+            layout.hit_test(20.0, 10.0),
+            Some(document.node_at(&[0, 0, 0, 0]))
         );
         assert_eq!(
-            layout.hit_test(5.0, 30.0).as_deref(),
-            Some([0, 0].as_slice()),
+            layout.hit_test(5.0, 30.0),
+            Some(document.node_at(&[0, 0])),
             "the vacated area falls through to the parent box"
         );
 
@@ -3673,11 +3440,15 @@ mod tests {
         .expect("input document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState {
-            focused_path: Some(vec![0]),
+            focused: Some(document.node_at(&[0])),
             ..Default::default()
         };
-        state.control_values.insert(vec![0], "live".to_string());
-        state.text_selections.insert(vec![0], (1, 3, true));
+        state
+            .control_values
+            .insert(document.node_at(&[0]), "live".to_string());
+        state
+            .text_selections
+            .insert(document.node_at(&[0]), (1, 3, true));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -3725,7 +3496,9 @@ mod tests {
             ["line one", "line two"]
         );
         let mut state = StyleState::default();
-        state.control_values.insert(vec![0], "live".to_string());
+        state
+            .control_values
+            .insert(document.node_at(&[0]), "live".to_string());
         let live = layout_with_state(
             &document,
             &stylesheet,
@@ -3746,10 +3519,12 @@ mod tests {
         .expect("password document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState {
-            focused_path: Some(vec![0]),
+            focused: Some(document.node_at(&[0])),
             ..Default::default()
         };
-        state.text_selections.insert(vec![0], (1, 3, false));
+        state
+            .text_selections
+            .insert(document.node_at(&[0]), (1, 3, false));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -3774,13 +3549,15 @@ mod tests {
         .expect("textarea document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState {
-            focused_path: Some(vec![0]),
+            focused: Some(document.node_at(&[0])),
             ..Default::default()
         };
         state
             .control_values
-            .insert(vec![0], "live\nvalue".to_string());
-        state.text_selections.insert(vec![0], (1, 7, false));
+            .insert(document.node_at(&[0]), "live\nvalue".to_string());
+        state
+            .text_selections
+            .insert(document.node_at(&[0]), (1, 7, false));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -3808,8 +3585,12 @@ mod tests {
         .expect("textarea document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.control_values.insert(vec![0], "abcdef".to_string());
-        state.control_values.insert(vec![1], "abcdef".to_string());
+        state
+            .control_values
+            .insert(document.node_at(&[0]), "abcdef".to_string());
+        state
+            .control_values
+            .insert(document.node_at(&[1]), "abcdef".to_string());
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -4006,9 +3787,9 @@ mod tests {
         assert_eq!(stage.children.len(), 2);
         let flow = &stage.children[0];
         let overlay = &stage.children[1];
-        assert_eq!(flow.path, vec![1, 1]);
+        assert_eq!(flow.node, document.node_at(&[1, 1]));
         assert_eq!(flow.rect.y, 0.0);
-        assert_eq!(overlay.path, vec![1, 0]);
+        assert_eq!(overlay.node, document.node_at(&[1, 0]));
         assert_eq!(overlay.rect.x, 30.0);
         assert_eq!(overlay.rect.y, 20.0);
         assert_eq!(overlay.rect.width, 40.0);
@@ -4053,7 +3834,7 @@ mod tests {
         let stage = &result.root.children[0];
         let wrapper = &stage.children[0];
         let overlay = &wrapper.children[0];
-        assert_eq!(overlay.path, vec![1, 0, 0]);
+        assert_eq!(overlay.node, document.node_at(&[1, 0, 0]));
         assert_eq!(overlay.rect.y, 80.0);
     }
 
@@ -4072,7 +3853,7 @@ mod tests {
                 height: 80.0,
             },
         );
-        assert_eq!(result.hit_test(10.0, 10.0), Some(vec![1, 0]));
+        assert_eq!(result.hit_test(10.0, 10.0), Some(document.node_at(&[1, 0])));
         assert_eq!(result.hit_test(30.0, 10.0), None);
         let canvas = result.paint();
         let inside = ((10 * canvas.width() + 10) * 4) as usize;
@@ -4092,7 +3873,9 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(vec![1], (20.0, 30.0));
+        state
+            .scroll_offsets
+            .insert(document.node_at(&[1]), (20.0, 30.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -4114,13 +3897,13 @@ mod tests {
         assert_eq!(viewport.scroll_offset, (20.0, 30.0));
         assert_eq!(content.rect.x, -20.0);
         assert_eq!(content.rect.y, -30.0);
-        assert_eq!(result.hit_test(10.0, 4.0), Some(vec![1, 0]));
+        assert_eq!(result.hit_test(10.0, 4.0), Some(document.node_at(&[1, 0])));
         assert_eq!(result.hit_test(50.0, 4.0), None);
-        assert_eq!(result.hit_test(10.0, 15.0), Some(vec![1]));
+        assert_eq!(result.hit_test(10.0, 15.0), Some(document.node_at(&[1])));
         let target = result
             .scroll_target_at(10.0, 10.0)
             .expect("point should resolve to the scroll container");
-        assert_eq!(target.path, vec![1]);
+        assert_eq!(target.node, document.node_at(&[1]));
         assert_eq!(target.max_x, 52.0);
         assert_eq!(target.max_y, 52.0);
         let canvas = result.paint();
@@ -4193,7 +3976,9 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(vec![1], (0.0, 30.0));
+        state
+            .scroll_offsets
+            .insert(document.node_at(&[1]), (0.0, 30.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -4217,7 +4002,9 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(vec![1], (0.0, 20.0));
+        state
+            .scroll_offsets
+            .insert(document.node_at(&[1]), (0.0, 20.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -4232,7 +4019,7 @@ mod tests {
         assert_eq!(sticky.position, Position::Sticky);
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
-        assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.path.clone()));
+        assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.node));
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
@@ -4269,7 +4056,7 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(Vec::new(), (0.0, 20.0));
+        state.scroll_offsets.insert(document.root(), (0.0, 20.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -4283,7 +4070,7 @@ mod tests {
         assert_eq!(sticky.position, Position::Sticky);
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
-        assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.path.clone()));
+        assert_eq!(result.hit_test(10.0, 4.0), Some(sticky.node));
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(4 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
@@ -4297,7 +4084,7 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(Vec::new(), (0.0, 30.0));
+        state.scroll_offsets.insert(document.root(), (0.0, 30.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -4318,7 +4105,7 @@ mod tests {
         let target = result
             .scroll_target_at(10.0, 10.0)
             .expect("viewport should expose the document scroll target");
-        assert_eq!(target.path, Vec::<usize>::new());
+        assert_eq!(target.node, document.root());
         assert_eq!(target.max_y, 72.0);
     }
 
@@ -4343,7 +4130,7 @@ mod tests {
         assert_eq!(first.rect.y, 0.0);
         assert_eq!(first.visual_offset, (10.0, 5.0));
         assert_eq!(second.rect.y, 20.0);
-        assert_eq!(result.hit_test(10.0, 5.0), Some(first.path.clone()));
+        assert_eq!(result.hit_test(10.0, 5.0), Some(first.node));
         assert_eq!(result.hit_test(0.0, 0.0), None);
     }
 
@@ -4366,7 +4153,7 @@ mod tests {
         let high = &result.root.children[1];
         assert_eq!(low.z_index, 1);
         assert_eq!(high.z_index, 2);
-        assert_eq!(result.hit_test(10.0, 10.0), Some(high.path.clone()));
+        assert_eq!(result.hit_test(10.0, 10.0), Some(high.node));
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 0, 255, 255]);
@@ -4388,7 +4175,7 @@ mod tests {
             },
         );
         let high = &result.root.children[1];
-        assert_eq!(result.hit_test(10.0, 10.0), Some(high.path.clone()));
+        assert_eq!(result.hit_test(10.0, 10.0), Some(high.node));
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
@@ -4410,7 +4197,7 @@ mod tests {
             },
         );
         let flow = &result.root.children[0];
-        assert_eq!(result.hit_test(10.0, 10.0), Some(flow.path.clone()));
+        assert_eq!(result.hit_test(10.0, 10.0), Some(flow.node));
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[255, 0, 0, 255]);

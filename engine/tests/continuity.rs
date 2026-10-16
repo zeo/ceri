@@ -57,7 +57,7 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
         .find_element_by_id("score")
         .expect("score output");
     assert_eq!(
-        document.borrow().element_text_content(&score).as_deref(),
+        document.borrow().element_text_content(score).as_deref(),
         Some("4 / 4")
     );
 
@@ -67,7 +67,10 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
             .find_element_by_selector(&format!("[data-check=\"{name}\"]"))
             .expect("continuity check");
         assert_eq!(
-            document.borrow().element_attribute(&path, "data-state"),
+            document
+                .borrow()
+                .attribute(path, "data-state")
+                .map(str::to_string),
             Some("pass".to_string())
         );
     }
@@ -78,12 +81,12 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
         .expect("runtime check");
     let runtime_detail = document
         .borrow()
-        .find_element_by_selector_within(&runtime, ".check__detail")
+        .find_element_by_selector_within(runtime, ".check__detail")
         .expect("runtime detail");
     assert_eq!(
         document
             .borrow()
-            .element_text_content(&runtime_detail)
+            .element_text_content(runtime_detail)
             .as_deref(),
         Some("ready; session lab-sess")
     );
@@ -94,17 +97,20 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
     assert_eq!(
         document
             .borrow()
-            .element_text_content(&runtime_line)
+            .element_text_content(runtime_line)
             .as_deref(),
         Some("ceri-lab / Chromium none")
     );
 
     let root = document
         .borrow()
-        .document_element_path()
+        .document_element()
         .expect("document element");
     assert_eq!(
-        document.borrow().element_attribute(&root, "data-outcome"),
+        document
+            .borrow()
+            .attribute(root, "data-outcome")
+            .map(str::to_string),
         Some("ready".to_string())
     );
 }
@@ -129,7 +135,7 @@ fn keeps_the_cef_fallback_when_the_custom_host_is_absent() {
         .find_element_by_id("score")
         .expect("score output");
     assert_eq!(
-        document.borrow().element_text_content(&score).as_deref(),
+        document.borrow().element_text_content(score).as_deref(),
         Some("3 / 4")
     );
     let runtime = document
@@ -137,17 +143,20 @@ fn keeps_the_cef_fallback_when_the_custom_host_is_absent() {
         .find_element_by_selector("[data-check=\"runtime\"]")
         .expect("runtime check");
     assert_eq!(
-        document.borrow().element_attribute(&runtime, "data-state"),
+        document
+            .borrow()
+            .attribute(runtime, "data-state")
+            .map(str::to_string),
         Some("fail".to_string())
     );
     let runtime_detail = document
         .borrow()
-        .find_element_by_selector_within(&runtime, ".check__detail")
+        .find_element_by_selector_within(runtime, ".check__detail")
         .expect("runtime detail");
     assert_eq!(
         document
             .borrow()
-            .element_text_content(&runtime_detail)
+            .element_text_content(runtime_detail)
             .as_deref(),
         Some("bridge-unavailable: The Ceri host bridge is unavailable in this document")
     );
