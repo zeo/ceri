@@ -215,7 +215,7 @@ fn camel_case(property: &str) -> String {
     result
 }
 
-fn rect_object(rect: Rect) -> Value {
+pub(super) fn rect_object(rect: Rect) -> Value {
     let entries = [
         ("x", rect.x),
         ("y", rect.y),
@@ -294,7 +294,7 @@ impl ScriptRuntime {
             .unwrap_or_default()
     }
 
-    fn bounding_box(&self, node: NodeId) -> Option<Rect> {
+    pub(super) fn bounding_box(&self, node: NodeId) -> Option<Rect> {
         let boxes = self.node_boxes(node);
         let first = boxes.first()?.rect;
         Some(boxes.iter().skip(1).fold(first, |union, geometry| {
@@ -310,6 +310,44 @@ impl ScriptRuntime {
                 height: bottom - top,
             }
         }))
+    }
+
+    // an element's border box, and its content box relative to the padding edge as
+    // ResizeObserver reports it
+    pub(super) fn box_sizes(&self, node: NodeId) -> Option<(Rect, Rect)> {
+        let geometry = *self.node_boxes(node).first()?;
+        let parent_width = self
+            .document
+            .borrow()
+            .parent_element(node)
+            .and_then(|parent| self.node_boxes(parent).first().copied())
+            .map_or(self.viewport.width, |parent| parent.rect.width);
+        let inputs = self.layout_inputs.as_ref()?.borrow();
+        let mut state = self.layout_state(&inputs);
+        let document = self.document.borrow();
+        let _environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+            viewport: Size {
+                width: self.viewport.width,
+                height: self.viewport.height,
+            },
+            root_font_size: 16.0,
+        });
+        inputs
+            .stylesheet
+            .populate_custom_properties(&document, &mut state);
+        let (style, font_size) = inputs.stylesheet.computed_style(&document, node, &state)?;
+        let padding = resolve_edges(style.padding, parent_width, font_size);
+        let rect = geometry.rect;
+        let border = geometry.border * 2.0;
+        Some((
+            rect,
+            Rect {
+                x: padding.left,
+                y: padding.top,
+                width: (rect.width - border - padding.left - padding.right).max(0.0),
+                height: (rect.height - border - padding.top - padding.bottom).max(0.0),
+            },
+        ))
     }
 
     // the nearest positioned ancestor, or the body, that offsetTop and offsetLeft measure from

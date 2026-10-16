@@ -92,6 +92,33 @@ impl LiveRange {
 
 pub type SharedRange = Rc<RefCell<LiveRange>>;
 
+// one change to the tree as a MutationObserver sees it
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mutation {
+    ChildList {
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    },
+    Attribute {
+        name: String,
+        old: Option<String>,
+    },
+    CharacterData {
+        old: String,
+    },
+}
+
+// a mutation with its target and the target's ancestors when it happened, which subtree
+// observers match against
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationEntry {
+    pub target: NodeId,
+    pub ancestors: Vec<NodeId>,
+    pub mutation: Mutation,
+}
+
 // ranges that tree mutations keep up to date; a cloned document starts without any
 #[derive(Debug, Default)]
 struct LiveRanges(Vec<Weak<RefCell<LiveRange>>>);
@@ -113,6 +140,8 @@ pub struct Document {
     orphans: Vec<NodeId>,
     template_contents: HashMap<NodeId, NodeId>,
     live_ranges: LiveRanges,
+    // mutations since the observers last looked, recorded only while something observes
+    mutations: Option<Vec<MutationEntry>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +251,7 @@ impl Document {
             orphans: Vec::new(),
             template_contents: HashMap::new(),
             live_ranges: LiveRanges::default(),
+            mutations: None,
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -389,11 +419,30 @@ impl Document {
     // unlinks a node from its parent, returning the parent and the index it had; live range
     // boundaries inside it move to where it was
     fn detach_raw(&mut self, id: NodeId) -> Option<(NodeId, usize)> {
+        self.detach_recorded(id, true)
+    }
+
+    fn detach_recorded(&mut self, id: NodeId, record: bool) -> Option<(NodeId, usize)> {
         let parent = self.data(id)?.parent?;
         let index = self
             .children(parent)
             .iter()
             .position(|&child| child == id)?;
+        if record {
+            let previous = index
+                .checked_sub(1)
+                .map(|previous| self.children(parent)[previous]);
+            let next = self.children(parent).get(index + 1).copied();
+            self.record(
+                parent,
+                Mutation::ChildList {
+                    added: Vec::new(),
+                    removed: vec![id],
+                    previous,
+                    next,
+                },
+            );
+        }
         self.update_ranges(|document, boundary| {
             if document.is_inclusive_ancestor(id, boundary.node) {
                 *boundary = Boundary {
@@ -497,6 +546,8 @@ impl Document {
         replaced.push_str(data);
         replaced.push_str(&String::from_utf16_lossy(&units[offset + count..]));
         let inserted = data.encode_utf16().count();
+        let old = current.to_string();
+        self.record(id, Mutation::CharacterData { old });
         match &mut self
             .data_mut(id)
             .expect("character data was read above")
@@ -526,6 +577,60 @@ impl Document {
             Some(data) => data.encode_utf16().count(),
             None => self.children(id).len(),
         }
+    }
+
+    // starts or stops recording mutations for observers
+    pub fn observe_mutations(&mut self, observe: bool) {
+        match (observe, &self.mutations) {
+            (true, None) => self.mutations = Some(Vec::new()),
+            (false, _) => self.mutations = None,
+            _ => {}
+        }
+    }
+
+    pub fn has_mutations(&self) -> bool {
+        self.mutations
+            .as_ref()
+            .is_some_and(|mutations| !mutations.is_empty())
+    }
+
+    pub fn take_mutations(&mut self) -> Vec<MutationEntry> {
+        self.mutations
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn record(&mut self, target: NodeId, mutation: Mutation) {
+        if self.mutations.is_none() {
+            return;
+        }
+        let ancestors = self.ancestors(target).collect();
+        if let Some(mutations) = self.mutations.as_mut() {
+            mutations.push(MutationEntry {
+                target,
+                ancestors,
+                mutation,
+            });
+        }
+    }
+
+    // changes an element through a closure, recording the attribute it touches
+    pub fn edit_element<R>(
+        &mut self,
+        id: NodeId,
+        attribute: &str,
+        edit: impl FnOnce(&mut Element) -> R,
+    ) -> Option<R> {
+        let old = self.element(id)?.attr(attribute).map(str::to_string);
+        self.record(
+            id,
+            Mutation::Attribute {
+                name: attribute.to_string(),
+                old,
+            },
+        );
+        self.element_mut(id).map(edit)
     }
 
     pub fn track_range(&mut self, range: &SharedRange) {
@@ -882,9 +987,11 @@ impl Document {
         reference: Option<NodeId>,
     ) -> Result<Vec<NodeId>, DomError> {
         self.validate_insertion(parent, node, reference)?;
-        let inserted = match self.kind(node) {
-            Some(NodeKind::Fragment) => self.children(node).to_vec(),
-            _ => vec![node],
+        let from_fragment = matches!(self.kind(node), Some(NodeKind::Fragment));
+        let inserted = if from_fragment {
+            self.children(node).to_vec()
+        } else {
+            vec![node]
         };
         let reference = match reference {
             Some(reference) if inserted.contains(&reference) => {
@@ -899,8 +1006,9 @@ impl Document {
             }
             other => other,
         };
+        // a fragment gives up its children without a removal record of its own
         for &child in &inserted {
-            self.detach_raw(child);
+            self.detach_recorded(child, !from_fragment);
         }
         let index = match reference {
             Some(reference) => self
@@ -919,6 +1027,20 @@ impl Document {
             data.children.splice(index..index, inserted.iter().copied());
         }
         let count = inserted.len();
+        if !inserted.is_empty() {
+            let siblings = self.children(parent);
+            let previous = index.checked_sub(1).map(|previous| siblings[previous]);
+            let next = siblings.get(index + count).copied();
+            self.record(
+                parent,
+                Mutation::ChildList {
+                    added: inserted.clone(),
+                    removed: Vec::new(),
+                    previous,
+                    next,
+                },
+            );
+        }
         self.update_ranges(|_, boundary| {
             if boundary.node == parent && boundary.offset > index {
                 boundary.offset += count;
@@ -998,28 +1120,36 @@ impl Document {
     }
 
     pub fn set_attribute(&mut self, id: NodeId, name: &str, value: String) -> bool {
-        let Some(element) = self.element_mut(id) else {
+        let Some(name) = self.attribute_name(id, name) else {
             return false;
         };
-        let name = if element.namespace == Namespace::Html {
-            name.to_ascii_lowercase()
-        } else {
-            name.to_string()
-        };
-        element.attrs.insert(name, value);
-        true
+        self.edit_element(id, &name.clone(), |element| {
+            element.attrs.insert(name, value);
+        })
+        .is_some()
     }
 
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> bool {
-        let Some(element) = self.element_mut(id) else {
+        let Some(name) = self.attribute_name(id, name) else {
             return false;
         };
-        let name = if element.namespace == Namespace::Html {
+        if self.attribute(id, &name).is_none() {
+            return false;
+        }
+        self.edit_element(id, &name.clone(), |element| {
+            element.attrs.remove(&name).is_some()
+        })
+        .unwrap_or(false)
+    }
+
+    // attribute names on HTML elements are case-insensitive
+    fn attribute_name(&self, id: NodeId, name: &str) -> Option<String> {
+        let element = self.element(id)?;
+        Some(if element.namespace == Namespace::Html {
             name.to_ascii_lowercase()
         } else {
             name.to_string()
-        };
-        element.attrs.remove(&name).is_some()
+        })
     }
 
     pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
@@ -1036,8 +1166,10 @@ impl Document {
     }
 
     pub fn set_style_property(&mut self, id: NodeId, property: &str, value: String) -> bool {
-        self.element_mut(id)
-            .is_some_and(|element| element.set_style_property(property, value))
+        self.edit_element(id, "style", |element| {
+            element.set_style_property(property, value)
+        })
+        .unwrap_or(false)
     }
 
     // copies a node, and with deep its descendants and template contents, as a new orphan

@@ -4907,6 +4907,51 @@ mod tests {
     }
 
     #[test]
+    fn resize_and_intersection_observers_report_at_the_rendering_step() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } #box { width: 100px; height: 50px; padding: 5px } #far { margin-top: 2000px; height: 10px }</style><div id="box"></div><div id="far"></div><p id="status">idle</p><script>
+                globalThis.log = [];
+                const resize = new ResizeObserver((entries) => entries.forEach((entry) =>
+                    log.push("resize:" + entry.contentRect.width + "x" + entry.contentRect.height + ":" + entry.borderBoxSize[0].inlineSize)));
+                resize.observe(document.getElementById("box"));
+                const visible = new IntersectionObserver((entries) => entries.forEach((entry) =>
+                    log.push("io:" + entry.target.id + ":" + entry.isIntersecting + ":" + entry.intersectionRatio)), { threshold: [0, 1] });
+                visible.observe(document.getElementById("box"));
+                visible.observe(document.getElementById("far"));
+                globalThis.report = () => document.getElementById("status").textContent = log.join(",");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("observer page should load");
+        browser.advance_time(16).expect("first rendering step");
+        let page = browser.page.as_mut().expect("page should be loaded");
+        page.runtime
+            .execute(r#"document.getElementById("box").style.width = "50px";"#)
+            .expect("resize should apply");
+        browser.advance_time(16).expect("second rendering step");
+        browser.advance_time(16).expect("quiet rendering step");
+        let page = browser.page.as_mut().expect("page should be loaded");
+        page.runtime
+            .execute("report();")
+            .expect("report should run");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("resize:100x50:110,io:box:true:1,io:far:false:0,resize:50x50:60")
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>

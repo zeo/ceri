@@ -14,6 +14,7 @@ mod json;
 mod lexer;
 mod numbers;
 mod object;
+mod observers;
 mod operations;
 mod parser;
 mod pattern;
@@ -509,6 +510,8 @@ pub struct ScriptRuntime {
     next_event_target: u32,
     // event target objects with listeners stay alive for as long as the listeners do
     held_targets: HashMap<u32, ObjectHandle>,
+    observers: HashMap<u32, observers::ObserverRecord>,
+    next_observer: u32,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1500,6 +1503,8 @@ impl ScriptRuntime {
             event_targets: HashMap::new(),
             next_event_target: 0,
             held_targets: HashMap::new(),
+            observers: HashMap::new(),
+            next_observer: 0,
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -3345,6 +3350,7 @@ impl ScriptRuntime {
         }
         self.clock = target;
         self.drain_microtasks()?;
+        self.run_layout_observers()?;
         self.pump_workers()?;
         Ok(executed)
     }
@@ -8876,7 +8882,15 @@ impl ScriptRuntime {
 
     fn drain_microtasks(&mut self) -> Result<(), ScriptError> {
         let mut executed = 0;
-        while let Some(task) = self.microtasks.pop_front() {
+        loop {
+            // mutation observers are notified from the microtask queue, ahead of what follows
+            if self.document.borrow().has_mutations() || self.mutation_records_waiting() {
+                self.notify_mutation_observers()?;
+                continue;
+            }
+            let Some(task) = self.microtasks.pop_front() else {
+                break;
+            };
             if executed == MAX_MICROTASKS_PER_DRAIN {
                 return Err(runtime_error(
                     "microtask queue exceeded the deterministic limit",
@@ -9340,16 +9354,16 @@ impl ScriptRuntime {
     }
 
     fn add_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
-        if let Some(element) = self.document.borrow_mut().element_mut(handle.id) {
-            element.add_class(class);
-        }
+        self.document
+            .borrow_mut()
+            .edit_element(handle.id, "class", |element| element.add_class(class));
         Ok(())
     }
 
     fn remove_class(&mut self, handle: &ElementHandle, class: &str) -> Result<(), ScriptError> {
-        if let Some(element) = self.document.borrow_mut().element_mut(handle.id) {
-            element.remove_class(class);
-        }
+        self.document
+            .borrow_mut()
+            .edit_element(handle.id, "class", |element| element.remove_class(class));
         Ok(())
     }
 
@@ -9361,8 +9375,9 @@ impl ScriptRuntime {
     ) -> Result<bool, ScriptError> {
         self.document
             .borrow_mut()
-            .element_mut(handle.id)
-            .map(|element| element.toggle_class(class, force))
+            .edit_element(handle.id, "class", |element| {
+                element.toggle_class(class, force)
+            })
             .ok_or_else(|| runtime_error("classList requires an element"))
     }
 }
@@ -17450,6 +17465,65 @@ mod tests {
         assert_eq!(
             status_text(&document).as_deref(),
             Some("ell|heXllo:1:5:eXll|hllo:1:3:ll|hYYo:1:1:|hYYo!:1:1:|😀")
+        );
+    }
+
+    #[test]
+    fn mutation_observers_receive_batched_records_at_the_microtask_checkpoint() {
+        let document =
+            document(r#"<html><body><main id="root"></main><p id="status">idle</p></body></html>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                var seen = [];
+                const describe = (record) => [record.type, record.target.id || record.target.nodeName,
+                    record.addedNodes.length, record.removedNodes.length, record.attributeName, record.oldValue].join("/");
+                const observer = new MutationObserver((records, self) => {
+                    seen.push(records.length + ":" + (self === observer));
+                    records.forEach((record) => seen.push(describe(record)));
+                });
+                observer.observe(root, { childList: true, subtree: true, attributeOldValue: true, characterDataOldValue: true });
+                const filtered = new MutationObserver((records) => records.forEach((record) => seen.push("filtered:" + record.attributeName)));
+                filtered.observe(root, { subtree: true, attributeFilter: ["data-x"] });
+                const p = document.createElement("p");
+                p.id = "new";
+                root.appendChild(p);
+                p.setAttribute("title", "a");
+                p.classList.add("x");
+                p.dataset.x = "1";
+                p.textContent = "hi";
+                p.firstChild.data = "yo";
+                root.removeChild(p);
+                seen.push("sync:" + seen.length);
+                let error;
+                try { observer.observe(root, {}); } catch (caught) { error = caught.name; }
+                seen.push(error);
+                "#,
+            )
+            .expect("observers should register");
+        runtime
+            .execute(
+                r#"
+                const later = new MutationObserver(() => seen.push("never"));
+                later.observe(document.getElementById("root"), { childList: true });
+                document.getElementById("root").append("x");
+                const taken = later.takeRecords();
+                later.disconnect();
+                document.getElementById("root").append("y");
+                seen.push("taken:" + taken.length);
+                "#,
+            )
+            .expect("takeRecords should run");
+        runtime
+            .execute(r#"document.getElementById("status").textContent = seen.join(",");"#)
+            .expect("report should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "sync:0,TypeError,7:true,childList/root/1/0//,attributes/new/0/0/title/,attributes/new/0/0/class/,attributes/new/0/0/data-x/,childList/new/1/0//,characterData/#text/0/0//hi,childList/root/0/1//,filtered:data-x,taken:1,2:true,childList/root/1/0//,childList/root/1/0//"
+            )
         );
     }
 

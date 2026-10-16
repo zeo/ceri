@@ -125,6 +125,8 @@ pub(super) enum Native {
     Range(super::ranges::RangeMember),
     RangeConstructor(&'static str),
     Window(super::geometry::WindowMethod),
+    Observer(super::observers::ObserverMethod),
+    ObserverConstructor(super::observers::ObserverKind),
 }
 
 impl Native {
@@ -151,6 +153,7 @@ impl Native {
                 | Native::DomConstructor(_)
                 | Native::EventConstructor(_)
                 | Native::RangeConstructor(_)
+                | Native::ObserverConstructor(_)
         ) || matches!(self, Native::Intl(method) if matches!(**method,
             super::intl::IntlMethod::NumberFormatConstructor
                 | super::intl::IntlMethod::DateTimeFormatConstructor
@@ -209,6 +212,7 @@ pub(super) struct Intrinsics {
     pub(super) dom: super::interfaces::DomInterfaces,
     pub(super) events: super::events::EventInterfaces,
     pub(super) ranges: super::ranges::RangeInterfaces,
+    pub(super) observers: super::observers::ObserverInterfaces,
 }
 
 fn plain(prototype: &ObjectHandle) -> ObjectHandle {
@@ -1157,6 +1161,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let dom = super::interfaces::create(&build, &object_prototype, &mut globals);
     let events = super::events::create(&build, &object_prototype, &mut globals);
     let ranges = super::ranges::create(&build, &object_prototype, &mut globals);
+    let observers = super::observers::create(&build, &object_prototype, &mut globals);
     let intrinsics = Intrinsics {
         object_prototype,
         function_prototype,
@@ -1199,6 +1204,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         dom,
         events,
         ranges,
+        observers,
     };
     (intrinsics, globals)
 }
@@ -2242,6 +2248,11 @@ impl ScriptRuntime {
             Native::Event(member) => self.call_event_member(member, this, arguments),
             Native::Range(member) => self.call_range_member(member, this, arguments),
             Native::Window(method) => self.call_window_method(method, this, arguments),
+            Native::Observer(method) => self.call_observer_method(method, this, arguments),
+            Native::ObserverConstructor(kind) => Err(self.type_error(format!(
+                "Failed to construct '{}': Please use the 'new' operator",
+                kind.name()
+            ))),
             Native::ParseInt => {
                 let text = self.coerce_string(first)?;
                 let radix = self.coerce_int32(argument(&arguments, 1))?;
@@ -2493,6 +2504,9 @@ impl ScriptRuntime {
             Native::DomConstructor(name) => self.construct_dom(name, arguments, new_target),
             Native::EventConstructor(name) => self.construct_event(name, arguments, new_target),
             Native::RangeConstructor(name) => self.construct_range(name, new_target),
+            Native::ObserverConstructor(kind) => {
+                self.construct_observer(kind, arguments, new_target)
+            }
             Native::Codec(method) => {
                 self.call_codec(method, Value::Undefined, arguments, Some(new_target))
             }

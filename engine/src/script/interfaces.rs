@@ -975,7 +975,7 @@ impl ScriptRuntime {
         })
     }
 
-    fn node_list(&self, nodes: Vec<NodeId>) -> Value {
+    pub(super) fn node_list(&self, nodes: Vec<NodeId>) -> Value {
         Value::NodeList(Rc::new(
             nodes
                 .into_iter()
