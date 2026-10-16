@@ -857,7 +857,33 @@ impl ScriptRuntime {
         }
     }
 
+    // a DOM member with its custom element reactions, which run before the call returns
     pub(super) fn call_dom(
+        &mut self,
+        member: DomMember,
+        this: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        if member.name() == "createElement"
+            && matches!(this, Value::Document)
+            && !self.custom_definitions.is_empty()
+        {
+            let name = match arguments.first() {
+                Some(name) => self.coerce_string(name.clone())?.to_ascii_lowercase(),
+                None => String::new(),
+            };
+            if let Some(element) = self.create_custom_element(&name)? {
+                return Ok(element);
+            }
+        }
+        let result = self.call_dom_member(member, this, arguments);
+        if !self.custom_definitions.is_empty() {
+            self.run_element_reactions()?;
+        }
+        result
+    }
+
+    fn call_dom_member(
         &mut self,
         member: DomMember,
         this: Value,
@@ -1376,6 +1402,12 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
         new_target: Value,
     ) -> Result<Value, ScriptError> {
+        if interface.starts_with("HTML") && matches!(new_target, Value::Object(_)) {
+            let own = self.get_property(&Value::Window, interface)?;
+            if !values_equal(&own, &new_target) {
+                return self.construct_custom_element(&new_target);
+            }
+        }
         if interface == "EventTarget" {
             let prototype = match new_target {
                 Value::Object(_) => self.prototype_from_constructor(&new_target)?,

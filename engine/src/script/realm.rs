@@ -131,6 +131,7 @@ pub(super) enum Native {
     XhrConstructor,
     // an asynchronous XMLHttpRequest reporting its answer
     XhrDeliver(u32, u64),
+    CustomElements(super::custom::RegistryMethod),
 }
 
 impl Native {
@@ -2258,6 +2259,7 @@ impl ScriptRuntime {
             Native::Window(method) => self.call_window_method(method, this, arguments),
             Native::Observer(method) => self.call_observer_method(method, this, arguments),
             Native::Xhr(member) => self.call_xhr(member, this, arguments),
+            Native::CustomElements(method) => self.call_registry(method, arguments),
             Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
             Native::XhrConstructor => Err(self
                 .type_error("Failed to construct 'XMLHttpRequest': Please use the 'new' operator")),

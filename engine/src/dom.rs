@@ -142,6 +142,8 @@ pub struct Document {
     live_ranges: LiveRanges,
     // mutations since the observers last looked, recorded only while something observes
     mutations: Option<Vec<MutationEntry>>,
+    // the same changes for custom element reactions, recorded once an element is defined
+    element_changes: Option<Vec<MutationEntry>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,6 +254,7 @@ impl Document {
             template_contents: HashMap::new(),
             live_ranges: LiveRanges::default(),
             mutations: None,
+            element_changes: None,
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -601,17 +604,35 @@ impl Document {
             .unwrap_or_default()
     }
 
+    pub fn record_element_changes(&mut self, record: bool) {
+        match (record, &self.element_changes) {
+            (true, None) => self.element_changes = Some(Vec::new()),
+            (false, _) => self.element_changes = None,
+            _ => {}
+        }
+    }
+
+    pub fn take_element_changes(&mut self) -> Vec<MutationEntry> {
+        self.element_changes
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     fn record(&mut self, target: NodeId, mutation: Mutation) {
-        if self.mutations.is_none() {
+        if self.mutations.is_none() && self.element_changes.is_none() {
             return;
         }
-        let ancestors = self.ancestors(target).collect();
+        let entry = MutationEntry {
+            target,
+            ancestors: self.ancestors(target).collect(),
+            mutation,
+        };
+        if let Some(changes) = self.element_changes.as_mut() {
+            changes.push(entry.clone());
+        }
         if let Some(mutations) = self.mutations.as_mut() {
-            mutations.push(MutationEntry {
-                target,
-                ancestors,
-                mutation,
-            });
+            mutations.push(entry);
         }
     }
 

@@ -4,6 +4,7 @@ mod bigint;
 mod collections;
 mod compiler;
 mod console;
+mod custom;
 mod dates;
 mod encoding;
 mod events;
@@ -514,6 +515,13 @@ pub struct ScriptRuntime {
     observers: HashMap<u32, observers::ObserverRecord>,
     next_observer: u32,
     xhr: HashMap<u32, xhr::XhrState>,
+    custom_definitions: Vec<custom::Definition>,
+    // custom elements by the index of their definition
+    custom_states: HashMap<NodeId, usize>,
+    // elements being upgraded; an entry becomes None once its constructor reached super()
+    construction_stack: Vec<Option<NodeId>>,
+    when_defined: HashMap<String, PromiseHandle>,
+    custom_registry: Value,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1508,6 +1516,11 @@ impl ScriptRuntime {
             observers: HashMap::new(),
             next_observer: 0,
             xhr: HashMap::new(),
+            custom_definitions: Vec::new(),
+            custom_states: HashMap::new(),
+            construction_stack: Vec::new(),
+            when_defined: HashMap::new(),
+            custom_registry: Value::Undefined,
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -1555,6 +1568,7 @@ impl ScriptRuntime {
         };
         runtime.initialize_select_state();
         runtime.performance = runtime.performance_object();
+        runtime.custom_registry = runtime.custom_element_registry();
         runtime
     }
 
@@ -1749,6 +1763,7 @@ impl ScriptRuntime {
             _ => true,
         });
         self.attribute_handlers.retain(|(node, _), _| !gone(*node));
+        self.custom_states.retain(|node, _| !gone(*node));
         self.control_values.retain(|node, _| !gone(*node));
         self.control_checked.retain(|node, _| !gone(*node));
         self.dirty_checked_controls.retain(|node| !gone(*node));
@@ -3396,6 +3411,7 @@ impl ScriptRuntime {
                 "innerWidth" => Ok(Value::Number(self.viewport.width as f64)),
                 "innerHeight" => Ok(Value::Number(self.viewport.height as f64)),
                 "performance" => Ok(self.performance.clone()),
+                "customElements" => Ok(self.custom_registry.clone()),
                 "getComputedStyle" => Ok(self.native_function(
                     Native::Window(geometry::WindowMethod::GetComputedStyle),
                     "getComputedStyle",
@@ -17539,6 +17555,59 @@ mod tests {
             status_text(&document).as_deref(),
             Some(
                 "sync:0,TypeError,7:true,childList/root/1/0//,attributes/new/0/0/title/,attributes/new/0/0/class/,attributes/new/0/0/data-x/,childList/new/1/0//,characterData/#text/0/0//hi,childList/root/0/1//,filtered:data-x,taken:1,2:true,childList/root/1/0//,childList/root/1/0//"
+            )
+        );
+    }
+
+    #[test]
+    fn custom_elements_construct_upgrade_and_react_to_the_dom() {
+        let document = document(
+            r#"<html><body><main id="root"></main><x-greeting id="early" name="pre"></x-greeting><p id="status">idle</p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                var log = [];
+                class Greeting extends HTMLElement {
+                    static observedAttributes = ["name"];
+                    constructor() {
+                        super();
+                        log.push("construct:" + (this instanceof Greeting) + ":" + this.tagName);
+                    }
+                    connectedCallback() {
+                        log.push("connected:" + this.isConnected);
+                        this.textContent = "hi " + (this.getAttribute("name") || "?");
+                    }
+                    disconnectedCallback() { log.push("disconnected"); }
+                    attributeChangedCallback(name, old, value) { log.push("attr:" + name + ":" + old + ":" + value); }
+                }
+                const early = document.getElementById("early");
+                log.push("before:" + (early instanceof Greeting));
+                customElements.whenDefined("x-greeting").then((constructor) => log.push("defined:" + (constructor === Greeting)));
+                customElements.define("x-greeting", Greeting);
+                log.push("after:" + (early instanceof Greeting) + ":" + early.textContent);
+                const made = document.createElement("x-greeting");
+                log.push("made:" + (made instanceof Greeting));
+                made.setAttribute("name", "bob");
+                document.body.appendChild(made);
+                made.remove();
+                const root = document.getElementById("root");
+                root.innerHTML = '<x-greeting name="ann"></x-greeting>';
+                log.push("inner:" + root.firstChild.textContent);
+                log.push(customElements.get("x-greeting") === Greeting, customElements.getName(Greeting));
+                try { customElements.define("x-greeting", class extends HTMLElement {}); } catch (error) { log.push(error.name); }
+                try { new HTMLElement(); } catch (error) { log.push(error.name); }
+                "#,
+            )
+            .expect("custom elements should run");
+        runtime
+            .execute(r#"document.getElementById("status").textContent = log.join(",");"#)
+            .expect("report should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "before:false,construct:true:X-GREETING,attr:name:null:pre,connected:true,after:true:hi pre,construct:true:X-GREETING,made:true,attr:name:null:bob,connected:true,disconnected,construct:true:X-GREETING,attr:name:null:ann,connected:true,inner:hi ann,true,x-greeting,NotSupportedError,TypeError,defined:true"
             )
         );
     }

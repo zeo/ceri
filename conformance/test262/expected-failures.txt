@@ -435,7 +435,6 @@ test/built-ins/Array/prototype/includes/coerced-searchelement-fromindex-resize.j
 test/built-ins/Array/prototype/includes/get-prop.js
 test/built-ins/Array/prototype/includes/length-boundaries.js
 test/built-ins/Array/prototype/includes/length-zero-returns-false.js
-test/built-ins/Array/prototype/includes/resizable-buffer-special-float-values.js
 test/built-ins/Array/prototype/includes/resizable-buffer.js
 test/built-ins/Array/prototype/indexOf/15.4.4.14-1-3.js
 test/built-ins/Array/prototype/indexOf/15.4.4.14-1-5.js
@@ -470,7 +469,6 @@ test/built-ins/Array/prototype/indexOf/coerced-searchelement-fromindex-grow.js
 test/built-ins/Array/prototype/indexOf/coerced-searchelement-fromindex-shrink.js
 test/built-ins/Array/prototype/indexOf/length-near-integer-limit.js
 test/built-ins/Array/prototype/indexOf/length-zero-returns-minus-one.js
-test/built-ins/Array/prototype/indexOf/resizable-buffer-special-float-values.js
 test/built-ins/Array/prototype/indexOf/resizable-buffer.js
 test/built-ins/Array/prototype/join/S15.4.4.5_A5_T1.js
 test/built-ins/Array/prototype/join/coerced-separator-grow.js
@@ -931,7 +929,6 @@ test/built-ins/Array/prototype/toLocaleString/S15.4.4.3_A3_T1.js
 test/built-ins/Array/prototype/toLocaleString/primitive_this_value.js
 test/built-ins/Array/prototype/toLocaleString/primitive_this_value_getter.js
 test/built-ins/Array/prototype/toLocaleString/resizable-buffer.js
-test/built-ins/Array/prototype/toLocaleString/user-provided-tolocalestring-grow.js
 test/built-ins/Array/prototype/toLocaleString/user-provided-tolocalestring-shrink.js
 test/built-ins/Array/prototype/toReversed/get-descending-order.js
 test/built-ins/Array/prototype/toReversed/holes-not-preserved.js
@@ -987,7 +984,6 @@ test/built-ins/ArrayBuffer/Symbol.species/return-value.js
 test/built-ins/ArrayBuffer/Symbol.species/symbol-species-name.js
 test/built-ins/ArrayBuffer/Symbol.species/symbol-species.js
 test/built-ins/ArrayBuffer/data-allocation-after-object-creation.js
-test/built-ins/ArrayBuffer/isView/arg-is-typedarray-subclass-instance.js
 test/built-ins/ArrayBuffer/isView/not-a-constructor.js
 test/built-ins/ArrayBuffer/options-maxbytelength-allocation-limit.js
 test/built-ins/ArrayBuffer/options-maxbytelength-compared-before-object-creation.js
@@ -2041,7 +2037,6 @@ test/built-ins/Object/defineProperty/15.2.3.6-4-547-1.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-547-3.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-579.js
 test/built-ins/Object/defineProperty/coerced-P-grow.js
-test/built-ins/Object/defineProperty/coerced-P-shrink.js
 test/built-ins/Object/defineProperty/redefine-length-with-various-values-and-configurable-true.js
 test/built-ins/Object/defineProperty/typedarray-backed-by-resizable-buffer.js
 test/built-ins/Object/entries/getter-making-future-key-nonenumerable.js
@@ -3340,7 +3335,6 @@ test/built-ins/TypedArray/prototype/byteLength/BigInt/resizable-array-buffer-fix
 test/built-ins/TypedArray/prototype/byteLength/detached-buffer.js
 test/built-ins/TypedArray/prototype/byteLength/resizable-array-buffer-auto.js
 test/built-ins/TypedArray/prototype/byteLength/resizable-array-buffer-fixed.js
-test/built-ins/TypedArray/prototype/byteLength/resizable-buffer-assorted.js
 test/built-ins/TypedArray/prototype/byteLength/resized-out-of-bounds-1.js
 test/built-ins/TypedArray/prototype/byteLength/resized-out-of-bounds-2.js
 test/built-ins/TypedArray/prototype/byteOffset/BigInt/detached-buffer.js
@@ -3398,7 +3392,6 @@ test/built-ins/TypedArray/prototype/fill/absent-indices-computed-from-initial-le
 test/built-ins/TypedArray/prototype/fill/coerced-end-detach.js
 test/built-ins/TypedArray/prototype/fill/coerced-start-detach.js
 test/built-ins/TypedArray/prototype/fill/coerced-value-detach.js
-test/built-ins/TypedArray/prototype/fill/coerced-value-start-end-resize.js
 test/built-ins/TypedArray/prototype/fill/detached-buffer.js
 test/built-ins/TypedArray/prototype/fill/fill-values-conversion-once.js
 test/built-ins/TypedArray/prototype/fill/get-length-ignores-length-prop.js
@@ -3562,7 +3555,6 @@ test/built-ins/TypedArray/prototype/includes/get-length-uses-internal-arraylengt
 test/built-ins/TypedArray/prototype/includes/index-compared-against-initial-length-out-of-bounds.js
 test/built-ins/TypedArray/prototype/includes/index-compared-against-initial-length.js
 test/built-ins/TypedArray/prototype/includes/length-zero-returns-false.js
-test/built-ins/TypedArray/prototype/includes/resizable-buffer-special-float-values.js
 test/built-ins/TypedArray/prototype/includes/resizable-buffer.js
 test/built-ins/TypedArray/prototype/includes/return-abrupt-from-this-out-of-bounds.js
 test/built-ins/TypedArray/prototype/includes/search-undefined-after-shrinking-buffer-index-is-oob.js
@@ -3580,7 +3572,6 @@ test/built-ins/TypedArray/prototype/indexOf/detached-buffer-during-fromIndex-ret
 test/built-ins/TypedArray/prototype/indexOf/detached-buffer.js
 test/built-ins/TypedArray/prototype/indexOf/get-length-uses-internal-arraylength.js
 test/built-ins/TypedArray/prototype/indexOf/length-zero-returns-minus-one.js
-test/built-ins/TypedArray/prototype/indexOf/resizable-buffer-special-float-values.js
 test/built-ins/TypedArray/prototype/indexOf/resizable-buffer.js
 test/built-ins/TypedArray/prototype/indexOf/return-abrupt-from-this-out-of-bounds.js
 test/built-ins/TypedArray/prototype/join/BigInt/detached-buffer-during-fromIndex-returns-single-comma.js
@@ -3616,7 +3607,6 @@ test/built-ins/TypedArray/prototype/lastIndexOf/detached-buffer.js
 test/built-ins/TypedArray/prototype/lastIndexOf/get-length-uses-internal-arraylength.js
 test/built-ins/TypedArray/prototype/lastIndexOf/length-zero-returns-minus-one.js
 test/built-ins/TypedArray/prototype/lastIndexOf/negative-index-and-resize-to-smaller.js
-test/built-ins/TypedArray/prototype/lastIndexOf/resizable-buffer-special-float-values.js
 test/built-ins/TypedArray/prototype/lastIndexOf/resizable-buffer.js
 test/built-ins/TypedArray/prototype/lastIndexOf/return-abrupt-from-this-out-of-bounds.js
 test/built-ins/TypedArray/prototype/length/BigInt/detached-buffer.js
@@ -3625,7 +3615,6 @@ test/built-ins/TypedArray/prototype/length/BigInt/resizable-array-buffer-fixed.j
 test/built-ins/TypedArray/prototype/length/detached-buffer.js
 test/built-ins/TypedArray/prototype/length/resizable-array-buffer-auto.js
 test/built-ins/TypedArray/prototype/length/resizable-array-buffer-fixed.js
-test/built-ins/TypedArray/prototype/length/resizable-buffer-assorted.js
 test/built-ins/TypedArray/prototype/length/resized-out-of-bounds-1.js
 test/built-ins/TypedArray/prototype/length/resized-out-of-bounds-2.js
 test/built-ins/TypedArray/prototype/map/BigInt/arraylength-internal.js
@@ -3725,7 +3714,6 @@ test/built-ins/TypedArray/prototype/reduceRight/resizable-buffer-shrink-mid-iter
 test/built-ins/TypedArray/prototype/reduceRight/resizable-buffer.js
 test/built-ins/TypedArray/prototype/reduceRight/return-abrupt-from-this-out-of-bounds.js
 test/built-ins/TypedArray/prototype/reduceRight/values-are-not-cached.js
-test/built-ins/TypedArray/prototype/resizable-and-fixed-have-same-prototype.js
 test/built-ins/TypedArray/prototype/reverse/BigInt/detached-buffer.js
 test/built-ins/TypedArray/prototype/reverse/BigInt/get-length-uses-internal-arraylength.js
 test/built-ins/TypedArray/prototype/reverse/BigInt/preserves-non-numeric-properties.js
@@ -3929,7 +3917,6 @@ test/built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-nextelemen
 test/built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-nextelement-tostring.js
 test/built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-nextelement-valueof.js
 test/built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-this-out-of-bounds.js
-test/built-ins/TypedArray/prototype/toLocaleString/user-provided-tolocalestring-grow.js
 test/built-ins/TypedArray/prototype/toLocaleString/user-provided-tolocalestring-shrink.js
 test/built-ins/TypedArray/prototype/toReversed/ignores-species.js
 test/built-ins/TypedArray/prototype/toReversed/length-property-ignored.js
@@ -4054,7 +4041,6 @@ test/built-ins/TypedArrayConstructors/ctors/length-arg/use-custom-proto-if-objec
 test/built-ins/TypedArrayConstructors/ctors/no-args/custom-proto-access-throws.js
 test/built-ins/TypedArrayConstructors/ctors/no-args/proto-from-ctor-realm.js
 test/built-ins/TypedArrayConstructors/ctors/no-args/use-custom-proto-if-object.js
-test/built-ins/TypedArrayConstructors/ctors/no-species.js
 test/built-ins/TypedArrayConstructors/ctors/object-arg/custom-proto-access-throws.js
 test/built-ins/TypedArrayConstructors/ctors/object-arg/iterated-array-with-modified-array-iterator.js
 test/built-ins/TypedArrayConstructors/ctors/object-arg/length-excessive-throws.js
@@ -5116,7 +5102,6 @@ test/language/expressions/class/params-dflt-gen-meth-ref-arguments.js
 test/language/expressions/class/params-dflt-gen-meth-static-ref-arguments.js
 test/language/expressions/class/params-dflt-meth-ref-arguments.js
 test/language/expressions/class/params-dflt-meth-static-ref-arguments.js
-test/language/expressions/class/poisoned-underscore-proto.js
 test/language/expressions/class/private-getter-brand-check-multiple-evaluations-of-class-eval-indirect.js
 test/language/expressions/class/private-getter-brand-check-multiple-evaluations-of-class-eval.js
 test/language/expressions/class/private-getter-brand-check-multiple-evaluations-of-class-realm-function-ctor.js
@@ -5996,7 +5981,6 @@ test/language/expressions/strict-does-not-equals/S11.9.5_A6.1.js
 test/language/expressions/strict-equals/S11.9.4_A1.js
 test/language/expressions/strict-equals/S11.9.4_A6.1.js
 test/language/expressions/subtraction/S11.6.2_A1.js
-test/language/expressions/super/call-poisoned-underscore-proto.js
 test/language/expressions/super/call-proto-not-ctor.js
 test/language/expressions/super/prop-dot-cls-null-proto.js
 test/language/expressions/super/prop-dot-cls-val-from-eval.js
@@ -6770,7 +6754,6 @@ test/language/statements/class/params-dflt-gen-meth-ref-arguments.js
 test/language/statements/class/params-dflt-gen-meth-static-ref-arguments.js
 test/language/statements/class/params-dflt-meth-ref-arguments.js
 test/language/statements/class/params-dflt-meth-static-ref-arguments.js
-test/language/statements/class/poisoned-underscore-proto.js
 test/language/statements/class/private-non-static-getter-static-setter-early-error.js
 test/language/statements/class/private-non-static-setter-static-getter-early-error.js
 test/language/statements/class/private-static-getter-non-static-setter-early-error.js
@@ -6806,21 +6789,13 @@ test/language/statements/class/subclass-builtins/subclass-Uint32Array.js
 test/language/statements/class/subclass-builtins/subclass-Uint8Array.js
 test/language/statements/class/subclass-builtins/subclass-Uint8ClampedArray.js
 test/language/statements/class/subclass-builtins/subclass-WeakRef.js
-test/language/statements/class/subclass/builtin-objects/Array/contructor-calls-super-multiple-arguments.js
-test/language/statements/class/subclass/builtin-objects/Array/contructor-calls-super-single-argument.js
-test/language/statements/class/subclass/builtin-objects/Array/length.js
-test/language/statements/class/subclass/builtin-objects/Array/regular-subclassing.js
-test/language/statements/class/subclass/builtin-objects/Array/super-must-be-called.js
 test/language/statements/class/subclass/builtin-objects/ArrayBuffer/regular-subclassing.js
-test/language/statements/class/subclass/builtin-objects/ArrayBuffer/super-must-be-called.js
 test/language/statements/class/subclass/builtin-objects/GeneratorFunction/instance-prototype.js
 test/language/statements/class/subclass/builtin-objects/GeneratorFunction/regular-subclassing.js
 test/language/statements/class/subclass/builtin-objects/Promise/regular-subclassing.js
 test/language/statements/class/subclass/builtin-objects/Promise/super-must-be-called.js
 test/language/statements/class/subclass/builtin-objects/Symbol/new-symbol-with-super-throws.js
 test/language/statements/class/subclass/builtin-objects/Symbol/symbol-valid-as-extends-value.js
-test/language/statements/class/subclass/builtin-objects/TypedArray/regular-subclassing.js
-test/language/statements/class/subclass/builtin-objects/TypedArray/super-must-be-called.js
 test/language/statements/class/subclass/builtins.js
 test/language/statements/class/subclass/derived-class-return-override-catch-finally-arrow.js
 test/language/statements/class/subclass/derived-class-return-override-finally-super-arrow.js
@@ -6954,7 +6929,6 @@ test/language/statements/for-of/typedarray-backed-by-resizable-buffer-grow-befor
 test/language/statements/for-of/typedarray-backed-by-resizable-buffer-grow-mid-iteration.js
 test/language/statements/for-of/typedarray-backed-by-resizable-buffer-shrink-mid-iteration.js
 test/language/statements/for-of/typedarray-backed-by-resizable-buffer-shrink-to-zero-mid-iteration.js
-test/language/statements/for-of/typedarray-backed-by-resizable-buffer.js
 test/language/statements/for-of/uint16array-mutate.js
 test/language/statements/for-of/uint32array-mutate.js
 test/language/statements/for-of/uint8array-mutate.js

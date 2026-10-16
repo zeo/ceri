@@ -871,7 +871,9 @@ impl ScriptRuntime {
         let finished = frames.pop().expect("a frame is running");
         let value = if finished.construct {
             match value {
-                Value::Object(_) => value,
+                // host objects such as nodes count as objects, so a custom element's
+                // constructor can hand back the element super() produced
+                ref object if !super::operations::is_primitive(object) => value,
                 _ if finished.code.kind == FunctionKind::DerivedConstructor
                     && !matches!(value, Value::Undefined) =>
                 {
