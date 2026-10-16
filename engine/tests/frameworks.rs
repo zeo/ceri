@@ -91,3 +91,8 @@ fn preact_runs_a_counter_and_a_list() {
 fn vue_runs_a_counter_and_a_list() {
     exercise("vue");
 }
+
+#[test]
+fn svelte_runs_a_counter_and_a_list() {
+    exercise("svelte");
+}

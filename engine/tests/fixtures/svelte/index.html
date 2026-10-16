@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>svelte fixture</title>
+<script type="importmap">
+{
+  "imports": {
+    "svelte": "./svelte/src/index-client.js",
+    "svelte/internal/client": "./svelte/src/internal/client/index.js",
+    "svelte/internal/disclose-version": "./svelte/src/internal/disclose-version.js",
+    "svelte/internal/flags/legacy": "./svelte/src/internal/flags/legacy.js",
+    "#client/constants": "./svelte/src/internal/client/constants.js",
+    "esm-env": "./esm-env/env.js",
+    "esm-env/browser": "./esm-env/true.js",
+    "esm-env/development": "./esm-env/false.js",
+    "esm-env/node": "./esm-env/false.js",
+    "clsx": "./clsx/clsx.mjs"
+  }
+}
+</script>
+</head>
+<body>
+<main id="app"></main>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

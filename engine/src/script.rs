@@ -14,6 +14,7 @@ mod interfaces;
 mod intl;
 mod json;
 mod lexer;
+mod modules;
 mod numbers;
 mod object;
 mod observers;
@@ -558,7 +559,6 @@ pub struct ScriptRuntime {
     time_zone: Rc<dyn dates::TimeZone>,
     host_runtime_info: Option<HostRuntimeInfo>,
     module_cache: BTreeMap<String, ModuleNamespace>,
-    loading_modules: BTreeSet<String>,
     workers: Vec<WorkerHandle>,
     worker_sender: Option<SyncSender<WorkerEvent>>,
     worker_script_type: Option<WorkerScriptType>,
@@ -1556,7 +1556,6 @@ impl ScriptRuntime {
             time_zone: Rc::new(dates::Utc),
             host_runtime_info,
             module_cache: BTreeMap::new(),
-            loading_modules: BTreeSet::new(),
             workers: Vec::new(),
             worker_sender: None,
             worker_script_type: None,
@@ -2043,102 +2042,6 @@ impl ScriptRuntime {
             Ok(map) => self.import_map.merge(map),
             Err(error) => self.report(format!("import map ignored: {error}")),
         }
-    }
-
-    fn execute_module_graph<L: ModuleSourceLoader>(
-        &mut self,
-        source: &str,
-        url: AppUrl,
-        loader: &mut L,
-    ) -> Result<ModuleNamespace, ScriptError> {
-        let key = url.to_string();
-        if let Some(namespace) = self.module_cache.get(&key) {
-            return Ok(namespace.clone());
-        }
-        if !self.loading_modules.insert(key.clone()) {
-            return Err(runtime_error(format!("cyclic module import at {key}")));
-        }
-        let result = self.execute_module_body(source, url.clone(), loader);
-        self.loading_modules.remove(&key);
-        let namespace = result?;
-        self.module_cache.insert(key, namespace.clone());
-        Ok(namespace)
-    }
-
-    fn execute_module_body<L: ModuleSourceLoader>(
-        &mut self,
-        source: &str,
-        url: AppUrl,
-        loader: &mut L,
-    ) -> Result<ModuleNamespace, ScriptError> {
-        let module = parser::parse_module(source)?;
-        let compiled = compiler::Compiler::new(source).compile_module(&module)?;
-        let scope = vm::Scope::new(compiled.code.scope_size as usize, None);
-        let mut load =
-            |runtime: &mut Self, specifier: &str| -> Result<ModuleNamespace, ScriptError> {
-                let mapped = runtime.import_map.resolve(specifier, &url);
-                let (dependency_url, dependency_source) =
-                    loader.load_module(&url, mapped.as_deref().unwrap_or(specifier))?;
-                runtime.execute_module_graph(&dependency_source, dependency_url, loader)
-            };
-        for (specifier, bindings) in &compiled.imports {
-            let namespace = load(self, specifier)?;
-            for (binding, slot) in bindings {
-                let value = match binding {
-                    ast::ImportBinding::Named { imported, .. } => {
-                        namespace.values.get(&**imported).cloned().ok_or_else(|| {
-                            runtime_error(format!("module {specifier} has no export {imported}"))
-                        })?
-                    }
-                    ast::ImportBinding::Namespace(_) => self.namespace_object(&namespace),
-                };
-                let value = match value {
-                    Value::Binding(cell, _) => Value::Binding(cell, false),
-                    value => value,
-                };
-                scope.borrow_mut().slots[*slot as usize] = value;
-            }
-        }
-        let mut exports = BTreeMap::new();
-        for (exported, slot) in &compiled.exports {
-            let cell = {
-                let mut scope = scope.borrow_mut();
-                match &scope.slots[*slot as usize] {
-                    Value::Binding(cell, _) => cell.clone(),
-                    _ => {
-                        let cell = Rc::new(RefCell::new(Value::Undefined));
-                        scope.slots[*slot as usize] = Value::Binding(cell.clone(), true);
-                        cell
-                    }
-                }
-            };
-            exports.insert(exported.to_string(), Value::Binding(cell, false));
-        }
-        for (from, imported, exported) in &compiled.reexports {
-            let namespace = load(self, from)?;
-            let value =
-                namespace.values.get(&**imported).cloned().ok_or_else(|| {
-                    runtime_error(format!("module {from} has no export {imported}"))
-                })?;
-            exports.insert(exported.to_string(), value);
-        }
-        for (from, alias) in &compiled.namespace_exports {
-            let namespace = load(self, from)?;
-            exports.insert(alias.to_string(), self.namespace_object(&namespace));
-        }
-        let mut star_namespaces = Vec::new();
-        for from in &compiled.star_exports {
-            star_namespaces.push(load(self, from)?);
-        }
-        self.run_module_code(compiled.code, scope, url.clone())?;
-        for namespace in star_namespaces {
-            for (name, value) in namespace.values {
-                if name != "default" {
-                    exports.entry(name).or_insert(value);
-                }
-            }
-        }
-        Ok(ModuleNamespace { values: exports })
     }
 
     pub fn click_id(&mut self, id: &str) -> Result<bool, ScriptError> {
@@ -14829,27 +14732,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cyclic_module_graphs() {
+    fn links_cyclic_module_graphs_before_running_them() {
         let document = document("<p>module</p>");
         let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
         let mut loader = StaticModuleLoader {
             modules: BTreeMap::from([
                 (
                     "/a.js".to_string(),
-                    "import \"./b.js\"; export const a = 1;".to_string(),
+                    "import { b, readA } from \"./b.js\"; export * from \"./c.js\"; export const a = 1; export function read() { return b + readA(); }".to_string(),
                 ),
                 (
                     "/b.js".to_string(),
-                    "import \"./a.js\"; export const b = 2;".to_string(),
+                    "import { a, c } from \"./a.js\"; export const b = 2; export function readA() { return a + c; }".to_string(),
                 ),
+                ("/c.js".to_string(), "export const c = 10;".to_string()),
             ]),
         };
-        let mut runtime = ScriptRuntime::new(document);
-        let error = match runtime.execute_module("import \"./a.js\";", base, &mut loader) {
-            Ok(_) => panic!("cyclic graph should be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.message.contains("cyclic module import"));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute_module(
+                "import { a, read } from \"./a.js\"; document.querySelector(\"p\").textContent = a + \":\" + read();",
+                base,
+                &mut loader,
+            )
+            .expect("a cycle should link and run");
+        let paragraph = document.borrow().find_element_by_selector("p").expect("p");
+        assert_eq!(document.borrow().text_content(paragraph), "1:13");
     }
 
     #[test]
