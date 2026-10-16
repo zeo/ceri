@@ -247,10 +247,30 @@ impl ScriptRuntime {
         }
     }
 
+    // the name an error object carries through its prototype chain, empty for other values
+    fn thrown_name(&self, value: &Value) -> String {
+        let Value::Object(object) = value else {
+            return String::new();
+        };
+        let mut current = Some(object.clone());
+        while let Some(object) = current {
+            let object = object.borrow();
+            if let Some(Value::String(name)) = object.get("name") {
+                return name.to_string();
+            }
+            current = object.prototype_or(&self.intrinsics);
+        }
+        String::new()
+    }
+
     pub(super) fn throw_value(&mut self, value: Value) -> ScriptError {
         let message = self.thrown_message(&value);
+        let name = self.thrown_name(&value);
         self.pending_exception = Some((value, message.clone()));
-        runtime_error(message)
+        ScriptError {
+            name,
+            ..runtime_error(message)
+        }
     }
 
     pub(super) fn throw_error(&mut self, kind: &str, message: impl Into<String>) -> ScriptError {
@@ -2034,6 +2054,27 @@ impl ScriptRuntime {
                 self.call_function(method, target, vec![sent])
             }
         }
+    }
+
+    // walks an iterable one value at a time; when the visitor fails, the iterator is closed
+    // and the visitor's error wins, so a throwing return method cannot mask it
+    pub(super) fn for_each_iterated(
+        &mut self,
+        iterable: Value,
+        mut visit: impl FnMut(&mut Self, Value) -> Result<(), ScriptError>,
+    ) -> Result<(), ScriptError> {
+        let iterator = self.get_iterator(iterable)?;
+        while let Some(item) = self.iterator_step(&iterator)? {
+            if let Err(error) = visit(self, item) {
+                let thrown = self.pending_exception.take();
+                if self.iterator_close(&iterator).is_err() {
+                    self.pending_exception = None;
+                }
+                self.pending_exception = thrown;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn iterate_to_vec(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {

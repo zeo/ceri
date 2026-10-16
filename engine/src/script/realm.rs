@@ -1754,15 +1754,16 @@ impl ScriptRuntime {
             }
             Native::ObjectFromEntries => {
                 let result = self.new_plain_object();
-                for entry in self.iterate_to_vec(first)? {
+                self.for_each_iterated(first, |runtime, entry| {
                     if is_primitive(&entry) {
-                        return Err(self.type_error("Iterator value is not an entry object"));
+                        return Err(runtime.type_error("Iterator value is not an entry object"));
                     }
-                    let key = self.get_index(&entry, Value::Number(0.0))?;
-                    let key = self.coerce_key(key)?;
-                    let value = self.get_index(&entry, Value::Number(1.0))?;
+                    let key = runtime.get_index(&entry, Value::Number(0.0))?;
+                    let key = runtime.coerce_key(key)?;
+                    let value = runtime.get_index(&entry, Value::Number(1.0))?;
                     result.borrow_mut().define(key, Property::data(value));
-                }
+                    Ok(())
+                })?;
                 Ok(Value::Object(result))
             }
             Native::ObjectIs => Ok(Value::Bool(same_value(&first, &argument(&arguments, 1)))),
@@ -2200,7 +2201,9 @@ impl ScriptRuntime {
             }
             Native::RegExp(method) => self.call_regexp(method, this, arguments, None),
             Native::Console(method) => self.call_console(method, arguments),
-            Native::Promise(function) => self.call_promise_function((*function).clone(), arguments),
+            Native::Promise(function) => {
+                self.call_promise_function((*function).clone(), this, arguments)
+            }
             Native::ParseInt => {
                 let text = self.coerce_string(first)?;
                 let radix = self.coerce_int32(argument(&arguments, 1))?;

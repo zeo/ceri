@@ -22,6 +22,7 @@ Install Rust and the native toolchain for the target platform. Nothing else is n
 
 ```powershell
 cargo test --all-targets
+cargo test --release -p ceri-engine --test test262 -- --ignored
 cargo run --bin ceri_bundle -- --release --output dist\windows-x64
 ```
 

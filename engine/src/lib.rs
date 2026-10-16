@@ -17,6 +17,9 @@ mod script;
 mod selection;
 mod text;
 mod transform;
+mod unicode;
+#[rustfmt::skip]
+mod unicode_tables;
 mod wasm;
 #[cfg(feature = "windowed")]
 mod window;

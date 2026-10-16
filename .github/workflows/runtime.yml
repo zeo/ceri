@@ -40,6 +40,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y libxkbcommon-dev
       - name: test
         run: cargo test --locked --all-targets
+      - name: test262 subset
+        run: cargo test --locked --release -p ceri-engine --test test262 -- --ignored
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: render the packaged app without a window

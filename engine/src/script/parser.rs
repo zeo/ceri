@@ -293,6 +293,7 @@ impl<'a> Parser<'a> {
         ScriptError {
             offset,
             message: message.into(),
+            name: "SyntaxError".to_string(),
         }
     }
 
@@ -941,6 +942,7 @@ impl<'a> Parser<'a> {
         let invalid = || ScriptError {
             offset,
             message: "invalid assignment target".to_string(),
+            name: "SyntaxError".to_string(),
         };
         Ok(match expression {
             Expr::Identifier(name) => {
@@ -1067,6 +1069,7 @@ impl<'a> Parser<'a> {
                     return Err(ScriptError {
                         offset: start,
                         message: "invalid compound assignment target".to_string(),
+                        name: "SyntaxError".to_string(),
                     });
                 }
             }
@@ -1326,6 +1329,7 @@ impl<'a> Parser<'a> {
             return Err(ScriptError {
                 offset: start,
                 message: "delete of an unqualified name in strict mode".to_string(),
+                name: "SyntaxError".to_string(),
             });
         }
         if self.is_punct("**")? {
@@ -1353,6 +1357,7 @@ impl<'a> Parser<'a> {
             _ => Err(ScriptError {
                 offset,
                 message: "invalid update target".to_string(),
+                name: "SyntaxError".to_string(),
             }),
         }
     }
@@ -1617,6 +1622,7 @@ impl<'a> Parser<'a> {
                 return Err(ScriptError {
                     offset: token.start,
                     message: "expected a template".to_string(),
+                    name: "SyntaxError".to_string(),
                 });
             };
             cooked.push(text.map(Name::from));
@@ -1659,6 +1665,7 @@ impl<'a> Parser<'a> {
                         text.ok_or_else(|| ScriptError {
                             offset: token.start,
                             message: "invalid escape in template".to_string(),
+                            name: "SyntaxError".to_string(),
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2394,6 +2401,7 @@ pub(super) fn parse_function_source(
         _ => Err(ScriptError {
             offset: 0,
             message: "invalid function source".to_string(),
+            name: "SyntaxError".to_string(),
         }),
     }
 }

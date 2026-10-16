@@ -79,6 +79,7 @@ impl ScriptRuntime {
     pub(super) fn call_promise_function(
         &mut self,
         function: PromiseFunction,
+        this: Value,
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match function {
@@ -87,36 +88,65 @@ impl ScriptRuntime {
             | PromiseFunction::Any
             | PromiseFunction::Race => {
                 let result = Self::pending_promise();
-                let items = match self.iterate_to_vec(argument(&arguments, 0)) {
-                    Ok(items) => items,
-                    Err(error) => {
-                        let reason = self.take_thrown(error);
-                        return Ok(Value::Promise(self.rejected_promise_value(reason)));
-                    }
-                };
-                if matches!(function, PromiseFunction::Race) {
-                    for item in items {
-                        let promise = self.promise_resolve(item)?;
-                        let resolve =
-                            Value::Builtin(Builtin::PromiseResolvePending(result.clone()));
-                        let reject = Value::Builtin(Builtin::PromiseRejectPending(result.clone()));
-                        self.promise_then(promise, Some(&resolve), Some(&reject))?;
-                    }
-                    return Ok(Value::Promise(result));
-                }
                 let combinator = match function {
-                    PromiseFunction::All => Combinator::All,
-                    PromiseFunction::AllSettled => Combinator::AllSettled,
-                    _ => Combinator::Any,
+                    PromiseFunction::All => Some(Combinator::All),
+                    PromiseFunction::AllSettled => Some(Combinator::AllSettled),
+                    PromiseFunction::Any => Some(Combinator::Any),
+                    _ => None,
                 };
                 let state = Rc::new(Aggregate {
-                    values: RefCell::new(vec![Value::Undefined; items.len()]),
+                    values: RefCell::new(Vec::new()),
                     remaining: Cell::new(1),
                     promise: result.clone(),
-                    combinator,
+                    combinator: combinator.unwrap_or(Combinator::All),
                 });
-                for (index, item) in items.into_iter().enumerate() {
-                    let promise = self.promise_resolve(item)?;
+                // a receiver other than Promise itself supplies its own resolve, as subclasses do
+                let resolver = match &this {
+                    Value::PromiseConstructor | Value::Undefined => None,
+                    receiver => match self.get_property(receiver, "resolve") {
+                        Ok(resolver) if is_callable(&resolver) => Some(resolver),
+                        Ok(_) => {
+                            let error = self.type_error("Promise resolve is not a function");
+                            let reason = self.take_thrown(error);
+                            return Ok(Value::Promise(self.rejected_promise_value(reason)));
+                        }
+                        Err(error) => {
+                            let reason = self.take_thrown(error);
+                            return Ok(Value::Promise(self.rejected_promise_value(reason)));
+                        }
+                    },
+                };
+                let mut count = 0;
+                let iterated = self.for_each_iterated(argument(&arguments, 0), |runtime, item| {
+                    count += 1;
+                    if count > MAX_USER_ITERATOR_VALUES {
+                        return Err(runtime.range_error(
+                            "Promise combinator input exceeded the deterministic limit",
+                        ));
+                    }
+                    let promise = match &resolver {
+                        Some(resolver) => {
+                            let resolved = runtime.call_function(
+                                resolver.clone(),
+                                this.clone(),
+                                vec![item],
+                            )?;
+                            runtime.promise_resolve(resolved)?
+                        }
+                        None => runtime.promise_resolve(item)?,
+                    };
+                    let resolve = Value::Builtin(Builtin::PromiseResolvePending(result.clone()));
+                    let reject = Value::Builtin(Builtin::PromiseRejectPending(result.clone()));
+                    let Some(combinator) = combinator else {
+                        return runtime
+                            .promise_then(promise, Some(&resolve), Some(&reject))
+                            .map(|_| ());
+                    };
+                    let index = {
+                        let mut values = state.values.borrow_mut();
+                        values.push(Value::Undefined);
+                        values.len() - 1
+                    };
                     state.remaining.set(state.remaining.get() + 1);
                     let element = |rejected| {
                         Self::native_value(PromiseFunction::Element {
@@ -126,20 +156,23 @@ impl ScriptRuntime {
                         })
                     };
                     let (fulfilled, rejected) = match combinator {
-                        Combinator::All => (
-                            element(false),
-                            Value::Builtin(Builtin::PromiseRejectPending(result.clone())),
-                        ),
+                        Combinator::All => (element(false), reject),
                         Combinator::AllSettled => (element(false), element(true)),
-                        Combinator::Any => (
-                            Value::Builtin(Builtin::PromiseResolvePending(result.clone())),
-                            element(true),
-                        ),
+                        Combinator::Any => (resolve, element(true)),
                     };
-                    self.promise_then(promise, Some(&fulfilled), Some(&rejected))?;
+                    runtime
+                        .promise_then(promise, Some(&fulfilled), Some(&rejected))
+                        .map(|_| ())
+                });
+                if let Err(error) = iterated {
+                    let reason = self.take_thrown(error);
+                    self.settle_promise(&result, PromiseOutcome::Rejected(reason));
+                    return Ok(Value::Promise(result));
                 }
-                state.remaining.set(state.remaining.get() - 1);
-                self.settle_aggregate(&state);
+                if combinator.is_some() {
+                    state.remaining.set(state.remaining.get() - 1);
+                    self.settle_aggregate(&state);
+                }
                 Ok(Value::Promise(result))
             }
             PromiseFunction::Element {

@@ -778,10 +778,19 @@ impl ScriptRuntime {
     fn run_frames(&mut self, entry: Frame) -> Result<RunResult, ScriptError> {
         let mut frames = vec![entry];
         loop {
+            self.steps += 1;
+            if self.step_limit.is_some_and(|limit| self.steps > limit) {
+                self.interrupted = true;
+            }
+            // an interrupted run leaves every frame at once, past any catch or finally
+            if self.interrupted {
+                return Err(super::runtime_error("script exceeded its step limit"));
+            }
             let outcome = self.step(&mut frames);
             match outcome {
                 Ok(Some(result)) => return Ok(result),
                 Ok(None) => {}
+                Err(error) if self.interrupted => return Err(error),
                 Err(error) => {
                     let thrown = self.take_thrown(error);
                     if let Some(result) = self.unwind(&mut frames, thrown)? {

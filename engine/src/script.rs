@@ -97,6 +97,8 @@ type WasmFunctionHandle = Rc<WasmFunctionData>;
 pub struct ScriptError {
     pub offset: usize,
     pub message: String,
+    // the error's constructor name, such as SyntaxError for a parse failure
+    pub name: String,
 }
 
 impl fmt::Display for ScriptError {
@@ -541,6 +543,9 @@ pub struct ScriptRuntime {
     worker_resource_sender: Option<SyncSender<WorkerResourceRequest>>,
     worker_resource_receiver: Option<Receiver<WorkerResourceRequest>>,
     node_handles: RefCell<HashMap<NodeId, ElementHandle>>,
+    step_limit: Option<u64>,
+    steps: u64,
+    interrupted: bool,
     // detached trees that script still reached when last checked
     retained_orphans: Vec<NodeId>,
     orphan_recheck_at: usize,
@@ -1575,6 +1580,9 @@ impl ScriptRuntime {
             worker_resource_sender: None,
             worker_resource_receiver: None,
             node_handles: RefCell::new(HashMap::new()),
+            step_limit: None,
+            steps: 0,
+            interrupted: false,
             retained_orphans: Vec::new(),
             orphan_recheck_at: 64,
         };
@@ -1948,6 +1956,13 @@ impl ScriptRuntime {
         outcome?;
         self.drain_microtasks()?;
         self.pump_workers().map(|_| ())
+    }
+
+    // after this many more VM instructions, running script stops without unwinding through
+    // its own handlers; a count rather than a clock keeps the cut-off the same on every machine
+    pub fn set_step_limit(&mut self, limit: Option<u64>) {
+        self.step_limit = limit.map(|limit| self.steps.saturating_add(limit));
+        self.interrupted = false;
     }
 
     pub(crate) fn set_time_zone(&mut self, time_zone: Rc<dyn dates::TimeZone>) {
@@ -15343,10 +15358,12 @@ fn parse_fetch_options(
     })
 }
 
+// a failure raised by the host side of an API, which script sees as a TypeError
 pub(crate) fn runtime_error(message: impl Into<String>) -> ScriptError {
     ScriptError {
         offset: 0,
         message: message.into(),
+        name: "TypeError".to_string(),
     }
 }
 

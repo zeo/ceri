@@ -18,6 +18,7 @@ pub(super) enum StringMethod {
     LastIndexOf,
     LocaleCompare,
     Match,
+    Normalize,
     MatchAll,
     PadEnd,
     PadStart,
@@ -53,6 +54,7 @@ pub(super) const STRING_METHODS: &[(&str, StringMethod, u32)] = &[
     ("localeCompare", StringMethod::LocaleCompare, 1),
     ("match", StringMethod::Match, 1),
     ("matchAll", StringMethod::MatchAll, 1),
+    ("normalize", StringMethod::Normalize, 0),
     ("padEnd", StringMethod::PadEnd, 1),
     ("padStart", StringMethod::PadStart, 1),
     ("repeat", StringMethod::Repeat, 1),
@@ -443,6 +445,18 @@ impl ScriptRuntime {
                         Value::Bool(haystack[..end].ends_with(&search))
                     }
                 }
+            }
+            M::Normalize => {
+                let form = match first {
+                    Value::Undefined => "NFC".to_string(),
+                    form => self.coerce_string(form)?,
+                };
+                let Some(form) = crate::unicode::NormalizationForm::parse(&form) else {
+                    return Err(self.range_error(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+                    ));
+                };
+                Value::String(crate::unicode::normalize(&text, form).into())
             }
             M::IsWellFormed => Value::Bool(true),
             M::ToWellFormed => Value::String(text.into()),

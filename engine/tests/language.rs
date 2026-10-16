@@ -1033,6 +1033,11 @@ fn string_methods_follow_the_specification() {
             "005 abxyx hahaha |x|y|z|",
         ),
         (
+            "normalization forms",
+            "const e = 'caf\\u00e9'; console.log(e.normalize('NFD').length, e.normalize('NFD').normalize() === e, '\\ufb01'.normalize('NFKC'), '\\ufb01'.normalize('NFC').length, '\\u1e0b\\u0323'.normalize().codePointAt(0).toString(16)); try { e.normalize('nfc'); } catch (error) { console.log(error.name); }",
+            "5 true fi 1 1e0d\nRangeError",
+        ),
+        (
             "case",
             "console.log('Straße'.toUpperCase(), 'ÀB'.toLowerCase(), 'i'.localeCompare('I'), 'a'.localeCompare('b'))",
             "STRASSE àb -1 -1",

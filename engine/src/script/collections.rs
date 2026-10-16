@@ -511,18 +511,22 @@ impl ScriptRuntime {
                 if !is_callable(&adder) {
                     return Err(self.type_error("collection adder is not a function"));
                 }
-                for item in self.iterate_to_vec(first)? {
-                    if matches!(kind, CollectionKind::Map | CollectionKind::WeakMap) {
+                let entries = matches!(kind, CollectionKind::Map | CollectionKind::WeakMap);
+                self.for_each_iterated(first, |runtime, item| {
+                    let arguments = if entries {
                         if is_primitive(&item) {
-                            return Err(self.type_error("Iterator value is not an entry object"));
+                            return Err(runtime.type_error("Iterator value is not an entry object"));
                         }
-                        let key = self.get_index(&item, Value::Number(0.0))?;
-                        let value = self.get_index(&item, Value::Number(1.0))?;
-                        self.call_function(adder.clone(), object.clone(), vec![key, value])?;
+                        let key = runtime.get_index(&item, Value::Number(0.0))?;
+                        let value = runtime.get_index(&item, Value::Number(1.0))?;
+                        vec![key, value]
                     } else {
-                        self.call_function(adder.clone(), object.clone(), vec![item])?;
-                    }
-                }
+                        vec![item]
+                    };
+                    runtime
+                        .call_function(adder.clone(), object.clone(), arguments)
+                        .map(|_| ())
+                })?;
                 Ok(object)
             }
             M::Get

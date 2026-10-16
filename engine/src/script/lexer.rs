@@ -93,6 +93,7 @@ impl<'a> Lexer<'a> {
         ScriptError {
             offset,
             message: message.into(),
+            name: "SyntaxError".to_string(),
         }
     }
 

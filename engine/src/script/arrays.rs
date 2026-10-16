@@ -479,8 +479,24 @@ impl ScriptRuntime {
                     relative(end, length),
                 );
                 let count = end.saturating_sub(start).min(length - target);
-                let copy: Vec<Value> = array.borrow()[start..start + count].to_vec();
-                array.borrow_mut()[target..target + count].clone_from_slice(&copy);
+                // the coercions above may have shrunk the array, so read what is there now
+                let mut values = array.borrow_mut();
+                let copy = (start..start + count)
+                    .map(|from| values.get(from).cloned())
+                    .collect::<Vec<_>>();
+                for (offset, value) in copy.into_iter().enumerate() {
+                    let to = target + offset;
+                    match value {
+                        Some(value) if to < values.len() => values[to] = value,
+                        Some(value) => {
+                            values.resize(to, Value::Undefined);
+                            values.push(value);
+                        }
+                        None if to < values.len() => values[to] = Value::Undefined,
+                        None => {}
+                    }
+                }
+                drop(values);
                 Ok(this)
             }
             M::Splice | M::ToSpliced => {

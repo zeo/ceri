@@ -448,6 +448,7 @@ fn error(message: impl Into<String>) -> ScriptError {
     ScriptError {
         offset: 0,
         message: message.into(),
+        name: "SyntaxError".to_string(),
     }
 }
 
