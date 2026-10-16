@@ -3,6 +3,7 @@ mod css;
 mod dom;
 mod font;
 mod gif;
+mod grid;
 mod host;
 mod image;
 mod inflate;

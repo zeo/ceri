@@ -80,7 +80,7 @@ The current slice implements:
 - an engine-owned `window.ceriQuery` runtime identity promise
 - dynamic CSS pseudo-classes for `:hover`, `:focus`, `:checked`, `:disabled`, and `:enabled`
 - viewport-aware `@media` rules for `screen`, `all`, and min/max width or height conditions
-- basic CSS Grid containers with fixed, fractional, percentage, and auto tracks, row-major child placement, and gaps
+- CSS Grid and inline grids: track lists of any length with `minmax()`, `fit-content()`, `min-content`, `max-content`, `repeat()` including `auto-fill` and `auto-fit`, and line names; `grid-template-areas` and the `grid-template` and `grid` shorthands; placement by line number, negative line, `span`, line name and area name; sparse and dense auto-placement by row or column; implicit tracks sized by `grid-auto-rows` and `grid-auto-columns`; the track sizing algorithm with intrinsic and flexible tracks; separate row and column gaps; `justify-items`, `justify-self`, `align-items`, `align-self`, auto margins, `justify-content` and `align-content`; text runs as anonymous items
 - `overflow: hidden` and `overflow: clip` clipping for software paint and coordinate hit testing
 - bounded element and document scrolling with persistent `scrollTop`/`scrollLeft`, `window.scrollX`/`scrollY`, wheel input, and `scroll` events
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
@@ -273,7 +273,7 @@ The grid demo exercises fixed row tracks, fractional columns, repeat syntax, and
 cargo run -p ceri-engine --bin ceri-engine -- --input engine/grid-demo.html --asset-root engine --url https://app.ceri.invalid/ --output target/ceri-grid-demo.bmp
 ```
 
-Grid placement is currently row-major. Explicit `grid-column`, auto-placement modes, and subgrid remain separate compatibility work.
+Subgrid, masonry, baseline alignment in grids, and line names inside `repeat()` are not supported. Grid items that span flexible tracks add only their minimum contribution to those tracks when the grid has a definite size.
 
 Transforms take the full CSS function list, including `matrix3d()` and `perspective()`, the individual `translate`, `rotate` and `scale` properties, `transform-origin`, the `perspective` and `perspective-origin` properties on a parent, and `backface-visibility: hidden`. A transformed subtree renders into its own layer at up to four times the device scale and composites through the inverse projection with bilinear sampling, and pointer input maps through the same inverse, so hit testing, text controls and prose selection follow the transformed geometry. Each transformed element flattens on its own; `preserve-3d` depth sorting is not implemented.
 

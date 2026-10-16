@@ -1,4 +1,5 @@
 use crate::dom::{Document, Element, NodeId};
+use crate::grid::{Areas, GridLine, GridPlacement, Tracks, parse_line, parse_placement};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -511,29 +512,6 @@ pub(crate) struct StyleContext<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum GridTrack {
-    Auto,
-    Px(f32),
-    Percent(f32),
-    Fr(f32),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct GridTemplate {
-    pub tracks: [GridTrack; 8],
-    pub count: usize,
-}
-
-impl GridTemplate {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            tracks: [GridTrack::Auto; 8],
-            count: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GradientStop {
     pub color: Color,
     pub position: f32,
@@ -627,8 +605,18 @@ pub(crate) struct Style {
     pub flex_shrink: f32,
     pub flex_basis: Length,
     pub order: i32,
-    pub grid_template_columns: GridTemplate,
-    pub grid_template_rows: GridTemplate,
+    pub grid_template_columns: Tracks,
+    pub grid_template_rows: Tracks,
+    pub grid_template_areas: Areas,
+    // implicit track sizes, cycled; none means auto
+    pub grid_auto_columns: Tracks,
+    pub grid_auto_rows: Tracks,
+    pub grid_auto_flow_column: bool,
+    pub grid_auto_flow_dense: bool,
+    pub grid_column: GridPlacement,
+    pub grid_row: GridPlacement,
+    pub justify_items: AlignItems,
+    pub justify_self: Option<AlignItems>,
     pub transitions: [Option<Transition>; MAX_TRANSITIONS],
     // only translation is expressed today, which the visual offset model already carries
     pub translate: (Length, Length),
@@ -753,8 +741,17 @@ impl Style {
             flex_shrink: 1.0,
             flex_basis: Length::Auto,
             order: 0,
-            grid_template_columns: GridTemplate::empty(),
-            grid_template_rows: GridTemplate::empty(),
+            grid_template_columns: Tracks::NONE,
+            grid_template_rows: Tracks::NONE,
+            grid_template_areas: Areas::NONE,
+            grid_auto_columns: Tracks::NONE,
+            grid_auto_rows: Tracks::NONE,
+            grid_auto_flow_column: false,
+            grid_auto_flow_dense: false,
+            grid_column: GridPlacement::AUTO,
+            grid_row: GridPlacement::AUTO,
+            justify_items: AlignItems::Stretch,
+            justify_self: None,
             transitions: [None; MAX_TRANSITIONS],
             translate: (Length::px(0.0), Length::px(0.0)),
             border_radius: Length::px(0.0),
@@ -3596,8 +3593,85 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.order = order;
             }
         }
-        "grid-template-columns" => style.grid_template_columns = parse_grid_template(value),
-        "grid-template-rows" => style.grid_template_rows = parse_grid_template(value),
+        "grid-template-columns" => {
+            style.grid_template_columns =
+                Tracks::parse(value).unwrap_or(style.grid_template_columns);
+        }
+        "grid-template-rows" => {
+            style.grid_template_rows = Tracks::parse(value).unwrap_or(style.grid_template_rows);
+        }
+        "grid-template-areas" => {
+            style.grid_template_areas = Areas::parse(value).unwrap_or(style.grid_template_areas);
+        }
+        "grid-template" | "grid" => apply_grid_template(style, value),
+        "grid-auto-columns" => {
+            style.grid_auto_columns = Tracks::parse(value).unwrap_or(style.grid_auto_columns);
+        }
+        "grid-auto-rows" => {
+            style.grid_auto_rows = Tracks::parse(value).unwrap_or(style.grid_auto_rows);
+        }
+        "grid-auto-flow" => {
+            let value = value.to_ascii_lowercase();
+            style.grid_auto_flow_column = value.contains("column");
+            style.grid_auto_flow_dense = value.contains("dense");
+        }
+        "grid-column" => style.grid_column = parse_placement(value).unwrap_or(style.grid_column),
+        "grid-row" => style.grid_row = parse_placement(value).unwrap_or(style.grid_row),
+        "grid-column-start" => {
+            style.grid_column.start = parse_line(value).unwrap_or(style.grid_column.start);
+        }
+        "grid-column-end" => {
+            style.grid_column.end = parse_line(value).unwrap_or(style.grid_column.end);
+        }
+        "grid-row-start" => {
+            style.grid_row.start = parse_line(value).unwrap_or(style.grid_row.start)
+        }
+        "grid-row-end" => style.grid_row.end = parse_line(value).unwrap_or(style.grid_row.end),
+        "grid-area" => {
+            let parts = value.split('/').collect::<Vec<_>>();
+            let lines = parts
+                .iter()
+                .map(|part| parse_line(part))
+                .collect::<Option<Vec<_>>>();
+            if let Some(lines) = lines.filter(|lines| (1..=4).contains(&lines.len())) {
+                // omitted lines copy a named start, or are auto
+                let copy = |line: GridLine| match line {
+                    GridLine::Named(..) => line,
+                    _ => GridLine::Auto,
+                };
+                let row_start = lines[0];
+                let column_start = lines.get(1).copied().unwrap_or(copy(row_start));
+                let row_end = lines.get(2).copied().unwrap_or(copy(row_start));
+                let column_end = lines.get(3).copied().unwrap_or(copy(column_start));
+                style.grid_row = GridPlacement {
+                    start: row_start,
+                    end: row_end,
+                };
+                style.grid_column = GridPlacement {
+                    start: column_start,
+                    end: column_end,
+                };
+            }
+        }
+        "justify-items" => {
+            style.justify_items = parse_align(value).unwrap_or(AlignItems::Stretch);
+        }
+        "justify-self" => style.justify_self = parse_align(value),
+        "place-items" => {
+            let mut parts = value.split_ascii_whitespace().map(parse_align);
+            if let Some(align) = parts.next() {
+                let align = align.unwrap_or(AlignItems::Stretch);
+                style.align_items = align;
+                style.justify_items = parts.next().flatten().unwrap_or(align);
+            }
+        }
+        "place-self" => {
+            let mut parts = value.split_ascii_whitespace().map(parse_align);
+            if let Some(align) = parts.next() {
+                style.align_self = align;
+                style.justify_self = parts.next().unwrap_or(align);
+            }
+        }
         "flex-grow" => style.flex_grow = parse_number(value).unwrap_or(style.flex_grow).max(0.0),
         "flex" => {
             if let Some((grow, shrink, basis)) = parse_flex_shorthand(value) {
@@ -4152,51 +4226,83 @@ fn parse_z_index(value: &str) -> Option<i32> {
     value.parse().ok()
 }
 
-fn parse_grid_template(value: &str) -> GridTemplate {
-    let mut template = GridTemplate::empty();
-    let mut tracks = Vec::new();
-    let value = value.replace(", ", ",");
-    for token in value.split_ascii_whitespace() {
-        if let Some(contents) = token
-            .strip_prefix("repeat(")
-            .and_then(|contents| contents.strip_suffix(')'))
-            && let Some((count, track)) = contents.split_once(',')
-            && let Ok(count) = count.trim().parse::<usize>()
-            && let Some(track) = parse_grid_track(track.trim())
-        {
-            tracks.extend(std::iter::repeat_n(track, count));
-            continue;
+// grid-template and grid: rows and columns around a slash, optionally with quoted area rows
+fn apply_grid_template(style: &mut Style, value: &str) {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        style.grid_template_rows = Tracks::NONE;
+        style.grid_template_columns = Tracks::NONE;
+        style.grid_template_areas = Areas::NONE;
+        return;
+    }
+    let (rows, columns) = match value.rsplit_once('/') {
+        Some((rows, columns)) => (rows.trim(), columns.trim()),
+        None => (value, "none"),
+    };
+    let auto_flow = |side: &str| {
+        let lower = side.to_ascii_lowercase();
+        lower.contains("auto-flow").then(|| {
+            let dense = lower.contains("dense");
+            let sizes = lower.replace("auto-flow", "").replace("dense", "");
+            (
+                dense,
+                Tracks::parse(if sizes.trim().is_empty() {
+                    "none"
+                } else {
+                    &sizes
+                }),
+            )
+        })
+    };
+    if let Some((dense, sizes)) = auto_flow(rows) {
+        style.grid_auto_flow_column = false;
+        style.grid_auto_flow_dense = dense;
+        style.grid_auto_rows = sizes.unwrap_or(Tracks::NONE);
+        style.grid_template_rows = Tracks::NONE;
+        style.grid_template_columns = Tracks::parse(columns).unwrap_or(Tracks::NONE);
+        style.grid_template_areas = Areas::NONE;
+        return;
+    }
+    if let Some((dense, sizes)) = auto_flow(columns) {
+        style.grid_auto_flow_column = true;
+        style.grid_auto_flow_dense = dense;
+        style.grid_auto_columns = sizes.unwrap_or(Tracks::NONE);
+        style.grid_template_columns = Tracks::NONE;
+        style.grid_template_rows = Tracks::parse(rows).unwrap_or(Tracks::NONE);
+        style.grid_template_areas = Areas::NONE;
+        return;
+    }
+    if rows.contains(['"', '\'']) {
+        // each quoted row may be followed by its size
+        let mut areas = String::new();
+        let mut sizes = Vec::new();
+        for (index, part) in rows.split(['"', '\'']).enumerate() {
+            if index % 2 == 1 {
+                areas.push_str(&format!("\"{part}\" "));
+                sizes.push("auto".to_string());
+            } else if let Some(size) = sizes.last_mut() {
+                let size_text = part
+                    .split_ascii_whitespace()
+                    .filter(|word| !word.starts_with('[') && !word.ends_with(']'))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !size_text.is_empty() {
+                    *size = size_text;
+                }
+            }
         }
-        if let Some(track) = parse_grid_track(token) {
-            tracks.push(track);
+        if let Some(areas) = Areas::parse(&areas) {
+            style.grid_template_areas = areas;
+            style.grid_template_rows = Tracks::parse(&sizes.join(" ")).unwrap_or(Tracks::NONE);
+            style.grid_template_columns = Tracks::parse(columns).unwrap_or(Tracks::NONE);
         }
+        return;
     }
-    for (index, track) in tracks.into_iter().take(template.tracks.len()).enumerate() {
-        template.tracks[index] = track;
-        template.count += 1;
+    if let (Some(rows), Some(columns)) = (Tracks::parse(rows), Tracks::parse(columns)) {
+        style.grid_template_rows = rows;
+        style.grid_template_columns = columns;
+        style.grid_template_areas = Areas::NONE;
     }
-    template
-}
-
-fn parse_grid_track(value: &str) -> Option<GridTrack> {
-    let value = value.trim().to_ascii_lowercase();
-    if value == "auto" {
-        return Some(GridTrack::Auto);
-    }
-    if let Some(value) = value.strip_suffix("fr") {
-        return value
-            .parse::<f32>()
-            .ok()
-            .filter(|value| *value > 0.0)
-            .map(GridTrack::Fr);
-    }
-    if let Some(value) = value.strip_suffix("px") {
-        return value.parse::<f32>().ok().map(GridTrack::Px);
-    }
-    if let Some(value) = value.strip_suffix('%') {
-        return value.parse::<f32>().ok().map(GridTrack::Percent);
-    }
-    None
 }
 
 // the translate, rotate and scale properties, which apply before transform in that order
@@ -5065,10 +5171,15 @@ mod tests {
             FontWeight::Normal,
         );
         assert_eq!(style.display, Display::Grid);
-        assert_eq!(style.grid_template_columns.count, 2);
-        assert_eq!(style.grid_template_columns.tracks[0], GridTrack::Fr(1.0));
-        assert_eq!(style.grid_template_rows.count, 2);
-        assert_eq!(style.grid_template_rows.tracks[0], GridTrack::Px(48.0));
+        let columns = style.grid_template_columns.list();
+        assert_eq!(columns.tracks.len(), 2);
+        assert_eq!(columns.tracks[0].max, crate::grid::Breadth::Fr(1.0));
+        let rows = style.grid_template_rows.list();
+        assert_eq!(rows.tracks.len(), 2);
+        assert_eq!(
+            rows.tracks[0].max,
+            crate::grid::Breadth::Length(Length::px(48.0))
+        );
         assert_eq!(style.gap, Length::px(12.0));
     }
 

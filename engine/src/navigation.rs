@@ -5226,6 +5226,75 @@ mod tests {
     }
 
     #[test]
+    fn grid_layout_places_items_by_line_span_and_area_and_sizes_tracks() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0 }
+                .g { display: grid }
+                .g > div { height: 10px }
+                #fr { grid-template-columns: 100px 1fr 2fr; width: 420px; column-gap: 10px }
+                #place { grid-template-columns: repeat(3, 50px); grid-auto-rows: 20px; width: 150px }
+                #p1 { grid-column: 2 / span 2; grid-row: 2 } #p3 { grid-column: -2 }
+                #areas { grid-template-areas: "head head" "side main"; grid-template-columns: 80px 1fr; width: 200px }
+                #areas > #head { grid-area: head; height: 30px } #areas > #side { grid-area: side; height: 40px }
+                #areas > #main { grid-area: main; height: auto }
+                #fill { grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); width: 215px; gap: 10px }
+                #fit { grid-template-columns: repeat(auto-fit, 50px); width: 300px; justify-content: center }
+                #flow { grid-template-columns: 50px; grid-template-rows: 10px 10px; grid-auto-flow: column; grid-auto-columns: 30px; width: 200px }
+                #text { grid-template-columns: 100px 100px; width: 200px }
+                #align { grid-template-columns: 100px; grid-template-rows: 50px; justify-items: center; align-items: end }
+                #align > div { width: 20px }
+                #content { grid-template-columns: auto 1fr; width: 300px }
+            </style>
+            <div class="g" id="fr"><div id="f1"></div><div id="f2"></div><div id="f3"></div></div>
+            <div class="g" id="place"><div id="p1"></div><div id="p2"></div><div id="p3"></div></div>
+            <div class="g" id="areas"><div id="main"></div><div id="side"></div><div id="head"></div></div>
+            <div class="g" id="fill"><div id="l1"></div><div id="l2"></div><div id="l3"></div><div id="l4"></div></div>
+            <div class="g" id="fit"><div id="t1"></div><div id="t2"></div></div>
+            <div class="g" id="flow"><div id="i1"></div><div id="i2"></div><div id="i3"></div></div>
+            <div class="g" id="text">hello<span id="tg">x</span></div>
+            <div class="g" id="align"><div id="al"></div></div>
+            <div class="g" id="content"><div><div style="width: 50px"></div></div><div id="c2"></div></div>
+            <p id="status">idle</p>
+            <script>
+                const box = (id) => document.getElementById(id).getBoundingClientRect();
+                const x = (id, parent) => box(id).x - box(parent).x;
+                const y = (id, parent) => box(id).y - box(parent).y;
+                document.getElementById("status").textContent = [
+                    x("f3", "fr"), box("f2").width,
+                    x("p1", "place"), y("p1", "place"), box("p1").width,
+                    x("p2", "place"), y("p2", "place"), x("p3", "place"),
+                    box("head").width, y("main", "areas"), x("main", "areas"),
+                    box("main").height, box("main").width,
+                    box("l1").width, x("l3", "fill"), x("l4", "fill"), y("l4", "fill"),
+                    x("t1", "fit"),
+                    x("i3", "flow"), box("i3").width,
+                    x("tg", "text"),
+                    x("al", "align"), y("al", "align"),
+                    x("c2", "content"),
+                ].join(",");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("grid page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("220,100,50,20,100,0,0,100,200,30,80,40,120,65,150,0,20,100,50,30,100,40,40,50")
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>
