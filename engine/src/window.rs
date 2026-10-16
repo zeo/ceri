@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Theme, Window, WindowId};
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
@@ -560,22 +560,33 @@ where
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 let key = match event.logical_key {
                     Key::Character(character) => character.to_string(),
+                    Key::Named(NamedKey::Space) => " ".to_string(),
                     Key::Named(named) => format!("{named:?}"),
                     other => format!("{other:?}"),
                 };
+                // winit names codes after KeyboardEvent.code, except Meta, which it calls Super
+                let code = match event.physical_key {
+                    PhysicalKey::Code(KeyCode::SuperLeft) => "MetaLeft".to_string(),
+                    PhysicalKey::Code(KeyCode::SuperRight) => "MetaRight".to_string(),
+                    PhysicalKey::Code(code) => format!("{code:?}"),
+                    PhysicalKey::Unidentified(_) => String::new(),
+                };
                 self.submit(
                     event_loop,
-                    InputEvent::KeyDownWithModifiers {
+                    InputEvent::Key {
                         key,
+                        code,
                         modifiers: KeyModifiers {
                             shift: self.modifiers.shift_key(),
                             control: self.modifiers.control_key(),
                             alt: self.modifiers.alt_key(),
                             meta: self.modifiers.super_key(),
                         },
+                        repeat: event.repeat,
+                        pressed: event.state == ElementState::Pressed,
                     },
                 );
             }

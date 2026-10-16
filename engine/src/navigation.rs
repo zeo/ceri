@@ -1559,6 +1559,7 @@ impl Browser {
             return Ok(false);
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime.set_pointer_position(x, y);
         page.runtime.set_click_detail(count);
         let clicked = self.activate_node(node);
         let double = match self.page.as_mut() {
@@ -1897,6 +1898,14 @@ impl Browser {
         Ok(Some(true))
     }
 
+    // a press or release of button 0 (primary), 1 (auxiliary) or 2 (secondary), which the
+    // next pointer events report
+    pub fn set_pointer_button(&mut self, button: i16, pressed: bool) {
+        if let Some(page) = self.page.as_mut() {
+            page.runtime.set_pointer_button(button, pressed);
+        }
+    }
+
     pub fn dispatch_at(
         &mut self,
         viewport: Size,
@@ -1905,8 +1914,13 @@ impl Browser {
         event: &str,
     ) -> Result<bool, NavigationError> {
         let node = self.layout(viewport)?.hit_test(x, y);
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime.set_pointer_position(x, y);
         let hover_changed = if event == "pointermove" && self.hovered_node != node {
-            self.hovered_node = node;
+            let previous = std::mem::replace(&mut self.hovered_node, node);
+            page.runtime
+                .dispatch_hover_change(previous, node)
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
             true
         } else {
             false
@@ -1915,7 +1929,6 @@ impl Browser {
             return Ok(hover_changed);
         };
         let handled = {
-            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             let focused = if event == "pointerdown" {
                 page.runtime
                     .focus_node(node)
@@ -1925,7 +1938,7 @@ impl Browser {
             };
             let dispatched = page
                 .runtime
-                .dispatch_node_event(node, event)
+                .dispatch_pointer_event(node, event)
                 .map_err(|error| NavigationError::Script(error.to_string()))?;
             focused || dispatched
         };
@@ -1945,12 +1958,46 @@ impl Browser {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, NavigationError> {
+        self.key_down_with_code(key, None, modifiers, false)
+    }
+
+    // a keydown with the physical key code and auto-repeat flag, when the window reports them
+    pub fn key_down_with_code(
+        &mut self,
+        key: &str,
+        code: Option<&str>,
+        modifiers: KeyModifiers,
+        repeat: bool,
+    ) -> Result<bool, NavigationError> {
         let handled = if let Some(handled) = self.prose_key(key, modifiers)? {
             handled
         } else {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            match code {
+                Some(code) => page
+                    .runtime
+                    .key_down_with_code(key, code, modifiers, repeat),
+                None => page.runtime.key_down_with_modifiers(key, modifiers),
+            }
+            .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        if self.process_pending_navigation()?.is_some() {
+            Ok(true)
+        } else {
+            Ok(handled)
+        }
+    }
+
+    pub fn key_up(
+        &mut self,
+        key: &str,
+        code: &str,
+        modifiers: KeyModifiers,
+    ) -> Result<bool, NavigationError> {
+        let handled = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
             page.runtime
-                .key_down_with_modifiers(key, modifiers)
+                .key_up(key, code, modifiers)
                 .map_err(|error| NavigationError::Script(error.to_string()))?
         };
         if self.process_pending_navigation()?.is_some() {

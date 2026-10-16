@@ -307,7 +307,7 @@ impl ScriptRuntime {
         hint: Hint,
     ) -> Result<Value, ScriptError> {
         match &value {
-            Value::Object(_) => {
+            Value::Object(_) | Value::Element(_) | Value::Document | Value::Event(_) => {
                 let exotic = self.get_property(&value, "@@toPrimitive")?;
                 if !matches!(exotic, Value::Undefined | Value::Null) {
                     let hint_name = match hint {
@@ -888,10 +888,13 @@ impl ScriptRuntime {
             Value::Object(object) => {
                 return object.borrow().prototype_or(&self.intrinsics);
             }
-            Value::Element(_) | Value::Document => {
-                let object = self.node_object(value).expect("nodes have wrappers");
+            Value::Element(_) | Value::Document | Value::Event(_) => {
+                let object = self
+                    .wrapper_object(value)
+                    .expect("nodes and events have wrappers");
                 return object.borrow().prototype_or(&self.intrinsics);
             }
+            Value::Window => intrinsics.dom.prototype("EventTarget"),
             Value::Binding(cell, _) => return self.prototype_of(&cell.borrow()),
             Value::Bool(_) => intrinsics.boolean_prototype.clone(),
             Value::Number(_) => intrinsics.number_prototype.clone(),
@@ -919,8 +922,10 @@ impl ScriptRuntime {
     pub(super) fn get_property(&mut self, value: &Value, key: &str) -> Result<Value, ScriptError> {
         match value {
             Value::Object(object) => self.ordinary_get(object.clone(), key, value),
-            Value::Element(_) | Value::Document => {
-                let object = self.node_object(value).expect("nodes have wrappers");
+            Value::Element(_) | Value::Document | Value::Event(_) => {
+                let object = self
+                    .wrapper_object(value)
+                    .expect("nodes and events have wrappers");
                 self.ordinary_get(object, key, value)
             }
             Value::Undefined | Value::Null | Value::Uninitialized => Err(self.type_error(format!(
@@ -989,7 +994,7 @@ impl ScriptRuntime {
         match self.member(Value::Window, key) {
             Ok(value) => Ok(value),
             Err(error) if is_missing_property(&error) => {
-                let prototype = self.intrinsics.object_prototype.clone();
+                let prototype = self.intrinsics.dom.prototype("EventTarget");
                 self.ordinary_get(prototype, key, &Value::Window)
             }
             Err(error) => Err(error),
@@ -1042,8 +1047,10 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         match target {
             Value::Object(object) => self.ordinary_set(object.clone(), key, value, target, strict),
-            Value::Element(_) | Value::Document => {
-                let object = self.node_object(target).expect("nodes have wrappers");
+            Value::Element(_) | Value::Document | Value::Event(_) => {
+                let object = self
+                    .wrapper_object(target)
+                    .expect("nodes and events have wrappers");
                 self.ordinary_set(object, key, value, target, strict)
             }
             Value::Undefined | Value::Null | Value::Uninitialized => Err(self.type_error(format!(
@@ -1185,7 +1192,7 @@ impl ScriptRuntime {
         }
         let receiver_object = match receiver {
             Value::Object(object) => object.clone(),
-            other => match self.node_object(other) {
+            other => match self.wrapper_object(other) {
                 Some(object) => object,
                 None => return self.set_property(receiver, key, value, strict),
             },
@@ -1300,7 +1307,7 @@ impl ScriptRuntime {
         key: &str,
         strict: bool,
     ) -> Result<bool, ScriptError> {
-        if let Some(object) = self.node_object(target) {
+        if let Some(object) = self.wrapper_object(target) {
             return self.delete_property(&Value::Object(object), key, strict);
         }
         match target {
@@ -1349,7 +1356,7 @@ impl ScriptRuntime {
     }
 
     pub(super) fn has_property(&mut self, target: &Value, key: &str) -> Result<bool, ScriptError> {
-        if let Some(object) = self.node_object(target) {
+        if let Some(object) = self.wrapper_object(target) {
             return self.has_property(&Value::Object(object), key);
         }
         match target {
@@ -1535,7 +1542,7 @@ impl ScriptRuntime {
         &mut self,
         source: &Value,
     ) -> Result<Vec<(String, Value)>, ScriptError> {
-        if let Some(object) = self.node_object(source) {
+        if let Some(object) = self.wrapper_object(source) {
             return self.own_enumerable_entries(&Value::Object(object));
         }
         match source {
@@ -1605,7 +1612,7 @@ impl ScriptRuntime {
 
     // for-in visits enumerable string keys along the prototype chain, each name once
     pub(super) fn for_in_keys(&mut self, value: &Value) -> Result<Vec<String>, ScriptError> {
-        if let Some(object) = self.node_object(value) {
+        if let Some(object) = self.wrapper_object(value) {
             return self.for_in_keys(&Value::Object(object));
         }
         if let Value::Object(object) = value

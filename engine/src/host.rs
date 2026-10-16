@@ -15,6 +15,15 @@ pub enum PointerButton {
     Auxiliary,
 }
 
+// the MouseEvent.button number of a host button
+fn button_index(button: PointerButton) -> i16 {
+    match button {
+        PointerButton::Primary => 0,
+        PointerButton::Auxiliary => 1,
+        PointerButton::Secondary => 2,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     Resize(Size),
@@ -48,6 +57,14 @@ pub enum InputEvent {
     KeyDownWithModifiers {
         key: String,
         modifiers: KeyModifiers,
+    },
+    // a key press as a window reports it, with the physical key code and auto-repeat flag
+    Key {
+        key: String,
+        code: String,
+        modifiers: KeyModifiers,
+        repeat: bool,
+        pressed: bool,
     },
     TextInput {
         text: String,
@@ -426,6 +443,7 @@ impl EngineHost {
                 }
             }
             InputEvent::PointerDown { x, y, button } => {
+                self.browser.set_pointer_button(button_index(button), true);
                 let dispatched = self
                     .browser
                     .dispatch_at(self.viewport, x, y, "pointerdown")?;
@@ -454,6 +472,7 @@ impl EngineHost {
                 }
             }
             InputEvent::PointerUp { x, y, button } => {
+                self.browser.set_pointer_button(button_index(button), false);
                 if button == PointerButton::Primary {
                     self.selecting = false;
                     self.selecting_thumb = None;
@@ -493,6 +512,21 @@ impl EngineHost {
             },
             InputEvent::KeyDownWithModifiers { key, modifiers } => InputResult {
                 handled: self.browser.key_down_with_modifiers(&key, modifiers)?,
+                ..InputResult::default()
+            },
+            InputEvent::Key {
+                key,
+                code,
+                modifiers,
+                repeat,
+                pressed,
+            } => InputResult {
+                handled: if pressed {
+                    self.browser
+                        .key_down_with_code(&key, Some(&code), modifiers, repeat)?
+                } else {
+                    self.browser.key_up(&key, &code, modifiers)?
+                },
                 ..InputResult::default()
             },
             InputEvent::TextInput { text } => InputResult {
@@ -1521,6 +1555,60 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn host_pointer_and_key_input_reach_page_listeners_with_details() {
+        let browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } button { display: block; width: 100px; height: 40px }</style><button id="go">Go</button><p id="status">idle</p><script>
+                const button = document.getElementById("go");
+                const seen = [];
+                const report = () => document.getElementById("status").textContent = seen.join(",");
+                button.addEventListener("mouseenter", () => { seen.push("enter"); report(); });
+                button.addEventListener("pointerdown", (event) => { seen.push("down:" + event.button + ":" + event.buttons + ":" + event.clientX); report(); });
+                button.addEventListener("mousedown", () => { seen.push("mousedown"); report(); });
+                button.addEventListener("pointerup", (event) => { seen.push("up:" + event.buttons); report(); });
+                button.addEventListener("click", (event) => { seen.push("click:" + event.clientY); report(); });
+                button.addEventListener("keydown", (event) => { seen.push(event.key + ":" + event.code + ":" + event.repeat); report(); });
+                button.addEventListener("keyup", (event) => { seen.push("keyup:" + event.code); report(); });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let point = (20.0, 10.0);
+        host.input(InputEvent::PointerMove {
+            x: point.0,
+            y: point.1,
+        })
+        .expect("move should be accepted");
+        press(&mut host, point);
+        release(&mut host, point);
+        for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+            host.input(InputEvent::Key {
+                key: "a".to_string(),
+                code: "KeyA".to_string(),
+                modifiers: KeyModifiers::default(),
+                repeat,
+                pressed,
+            })
+            .expect("key should be accepted");
+        }
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("enter,down:0:1:20,mousedown,up:0,click:10,a:KeyA:false,a:KeyA:true,keyup:KeyA")
         );
     }
 

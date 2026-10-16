@@ -6,6 +6,7 @@ mod compiler;
 mod console;
 mod dates;
 mod encoding;
+mod events;
 mod interfaces;
 mod intl;
 mod json;
@@ -23,6 +24,7 @@ mod strings;
 mod typed;
 mod vm;
 
+use events::{HostEventFields, ListenerTarget};
 use object::{JsObject, ObjectClass, ObjectHandle, new_object};
 use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol_description};
 use realm::{Intrinsics, Native, create_intrinsics};
@@ -138,7 +140,7 @@ enum Value {
     Error(ErrorHandle),
     Style(ElementHandle),
     ClassList(ElementHandle),
-    Event(Rc<EventData>),
+    Event(Rc<events::EventRecord>),
     Response(ResponseHandle),
     ResponseConstructor,
     Bytes(BytesHandle),
@@ -232,13 +234,8 @@ enum Builtin {
     DocumentCreateTextNode,
     DocumentCreateRange,
     DocumentGetSelection,
-    DocumentAddEventListener,
-    DocumentRemoveEventListener,
-    EventPreventDefault(Rc<RefCell<EventState>>),
     LocationAssign,
     LocationReplace,
-    WindowAddEventListener,
-    WindowRemoveEventListener,
     WindowScrollTo,
     WindowScrollBy,
     WindowGetSelection,
@@ -332,8 +329,6 @@ enum Builtin {
     RequestAnimationFrame,
     CancelAnimationFrame,
     CeriQuery,
-    ElementAddEventListener(ElementHandle),
-    ElementRemoveEventListener(ElementHandle),
     ElementClick(ElementHandle),
     ElementAppendChild(ElementHandle),
     ElementAppend(ElementHandle),
@@ -487,8 +482,10 @@ pub struct ScriptRuntime {
     intrinsics: Intrinsics,
     location: LocationHandle,
     history: HistoryHandle,
-    listeners: HashMap<NodeId, Vec<EventListener>>,
-    window_listeners: HashMap<String, Vec<WindowListener>>,
+    event_listeners: HashMap<ListenerTarget, Vec<events::Listener>>,
+    event_handlers: HashMap<(ListenerTarget, String), Value>,
+    // compiled inline on* attributes, keyed by their source so an edit recompiles
+    attribute_handlers: HashMap<(NodeId, String), (String, Value)>,
     focused_element: Option<NodeId>,
     control_values: HashMap<NodeId, String>,
     control_checked: HashMap<NodeId, bool>,
@@ -503,6 +500,12 @@ pub struct ScriptRuntime {
     composition: Option<TextComposition>,
     click_detail: u32,
     motion_detail: Option<Rc<(String, f64)>>,
+    pointer: events::PointerState,
+    // the physical code and auto-repeat flag of the key being dispatched, when the host knows them
+    key_detail: Option<(String, bool)>,
+    // set while the error event for an uncaught exception is out, so a throwing
+    // listener cannot recurse
+    reporting_error: bool,
     selection: SelectionHandle,
     ranges: Vec<WeakRangeHandle>,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
@@ -775,15 +778,8 @@ pub(crate) struct ModuleNamespace {
 }
 
 #[derive(Clone)]
-struct EventListener {
+struct WorkerListener {
     event: String,
-    callback: Value,
-    once: bool,
-    signal: Option<AbortSignalHandle>,
-}
-
-#[derive(Clone)]
-struct WindowListener {
     callback: Value,
     once: bool,
     signal: Option<AbortSignalHandle>,
@@ -795,36 +791,12 @@ struct ListenerOptions {
     signal: Option<AbortSignalHandle>,
 }
 
-#[derive(Clone)]
-struct EventData {
-    event_type: String,
-    target: NodeId,
-    current_target: NodeId,
-    state: Rc<RefCell<EventState>>,
-    history_state: Rc<RefCell<Value>>,
-    key: String,
-    data: String,
-    modifiers: KeyModifiers,
-    is_composing: bool,
-    // click count for click and dblclick, zero for other events
-    detail: u32,
-    // property or animation name and elapsed seconds for transition and animation events
-    motion: Option<Rc<(String, f64)>>,
-    data_value: Option<Box<Value>>,
-    error_message: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeyModifiers {
     pub shift: bool,
     pub control: bool,
     pub alt: bool,
     pub meta: bool,
-}
-
-#[derive(Default)]
-struct EventState {
-    default_prevented: bool,
 }
 
 struct HistoryData {
@@ -1160,7 +1132,7 @@ struct WorkerData {
     event_receiver: Receiver<WorkerEvent>,
     onmessage: Option<Value>,
     onerror: Option<Value>,
-    listeners: Vec<EventListener>,
+    listeners: Vec<WorkerListener>,
     terminated: bool,
     termination_flag: Arc<AtomicBool>,
 }
@@ -1526,8 +1498,9 @@ impl ScriptRuntime {
             intrinsics,
             location,
             history,
-            listeners: HashMap::new(),
-            window_listeners: HashMap::new(),
+            event_listeners: HashMap::new(),
+            event_handlers: HashMap::new(),
+            attribute_handlers: HashMap::new(),
             focused_element: None,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
@@ -1542,6 +1515,9 @@ impl ScriptRuntime {
             composition: None,
             click_detail: 1,
             motion_detail: None,
+            pointer: events::PointerState::default(),
+            key_detail: None,
+            reporting_error: false,
             selection: Rc::new(RefCell::new(SelectionData::default())),
             ranges: Vec::new(),
             selected_files: HashMap::new(),
@@ -1773,7 +1749,15 @@ impl ScriptRuntime {
         self.node_handles
             .borrow_mut()
             .retain(|node, _| !gone(*node));
-        self.listeners.retain(|node, _| !gone(*node));
+        self.event_listeners.retain(|target, _| match target {
+            ListenerTarget::Node(node) => !gone(*node),
+            ListenerTarget::Window => true,
+        });
+        self.event_handlers.retain(|(target, _), _| match target {
+            ListenerTarget::Node(node) => !gone(*node),
+            ListenerTarget::Window => true,
+        });
+        self.attribute_handlers.retain(|(node, _), _| !gone(*node));
         self.control_values.retain(|node, _| !gone(*node));
         self.control_checked.retain(|node, _| !gone(*node));
         self.dirty_checked_controls.retain(|node| !gone(*node));
@@ -1791,14 +1775,7 @@ impl ScriptRuntime {
     }
 
     fn remove_event_listeners_for_signal(&mut self, signal: &AbortSignalHandle) {
-        self.listeners.retain(|_, listeners| {
-            listeners.retain(|listener| !listener_uses_signal(listener, signal));
-            !listeners.is_empty()
-        });
-        self.window_listeners.retain(|_, listeners| {
-            listeners.retain(|listener| !window_listener_uses_signal(listener, signal));
-            !listeners.is_empty()
-        });
+        self.remove_signal_listeners(signal);
         for worker in &self.workers {
             worker
                 .borrow_mut()
@@ -2232,8 +2209,7 @@ impl ScriptRuntime {
         }
         let previous = self.focused_element.replace(node);
         if let Some(previous) = previous {
-            self.dispatch_event(previous, "blur")?;
-            self.drain_microtasks()?;
+            self.fire_focus_change(previous, "blur", Some(node))?;
         }
         if self.is_selection_control(node) && !self.text_selections.contains_key(&node) {
             let value = self.control_value(node).unwrap_or_default();
@@ -2247,18 +2223,16 @@ impl ScriptRuntime {
                 },
             );
         }
-        self.dispatch_event(node, "focus")?;
-        self.drain_microtasks()?;
+        self.fire_focus_change(node, "focus", previous)?;
         Ok(true)
     }
 
     pub(crate) fn blur_focused(&mut self) -> Result<bool, ScriptError> {
         let composition_changed = self.composition_cancel()?;
-        let Some(path) = self.focused_element.take() else {
+        let Some(node) = self.focused_element.take() else {
             return Ok(composition_changed);
         };
-        self.dispatch_event(path, "blur")?;
-        self.drain_microtasks()?;
+        self.fire_focus_change(node, "blur", None)?;
         Ok(true)
     }
 
@@ -3373,28 +3347,13 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
-        let callbacks = self.take_window_callbacks(event_type);
-        let event = Value::Event(Rc::new(EventData {
-            event_type: event_type.to_string(),
-            target: self.document_node(),
-            current_target: self.document_node(),
-            state: Rc::new(RefCell::new(EventState::default())),
-            history_state: Rc::new(RefCell::new(Value::Null)),
-            key: String::new(),
-            data: String::new(),
-            modifiers: KeyModifiers::default(),
-            is_composing: false,
-            detail: 0,
-            motion: None,
-            data_value: None,
-            error_message: None,
-        }));
-        let had_callbacks = !callbacks.is_empty();
-        for callback in callbacks {
-            self.call(callback, vec![event.clone()])?;
-        }
+        let dispatch = self.fire(
+            ListenerTarget::Window,
+            event_type,
+            HostEventFields::default(),
+        )?;
         self.drain_microtasks()?;
-        Ok(had_callbacks)
+        Ok(dispatch.handled)
     }
 
     fn apply_history_state_locally(
@@ -3415,28 +3374,13 @@ impl ScriptRuntime {
 
     pub(crate) fn dispatch_popstate(&mut self, serialized: &str) -> Result<bool, ScriptError> {
         let state = self.parse_json(serialized)?;
-        let callbacks = self.take_window_callbacks("popstate");
-        let event = Value::Event(Rc::new(EventData {
-            event_type: "popstate".to_string(),
-            target: self.document_node(),
-            current_target: self.document_node(),
-            state: Rc::new(RefCell::new(EventState::default())),
-            history_state: Rc::new(RefCell::new(state)),
-            key: String::new(),
-            data: String::new(),
-            modifiers: KeyModifiers::default(),
-            is_composing: false,
-            detail: 0,
-            motion: None,
-            data_value: None,
-            error_message: None,
-        }));
-        let had_callbacks = !callbacks.is_empty();
-        for callback in callbacks {
-            self.call(callback, vec![event.clone()])?;
-        }
+        let fields = HostEventFields {
+            state: Some(state),
+            ..HostEventFields::default()
+        };
+        let dispatch = self.fire(ListenerTarget::Window, "popstate", fields)?;
         self.drain_microtasks()?;
-        Ok(had_callbacks)
+        Ok(dispatch.handled)
     }
 
     fn request_location_navigation(&mut self, reference: String, replace_history: bool) {
@@ -3500,8 +3444,6 @@ impl ScriptRuntime {
                 "createTextNode" => Ok(Value::Builtin(Builtin::DocumentCreateTextNode)),
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
-                "addEventListener" => Ok(Value::Builtin(Builtin::DocumentAddEventListener)),
-                "removeEventListener" => Ok(Value::Builtin(Builtin::DocumentRemoveEventListener)),
                 "documentElement" => Ok(self
                     .document
                     .borrow()
@@ -3549,8 +3491,6 @@ impl ScriptRuntime {
                     .ok_or_else(|| runtime_error("window indexedDB is unavailable")),
                 "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
-                "addEventListener" => Ok(Value::Builtin(Builtin::WindowAddEventListener)),
-                "removeEventListener" => Ok(Value::Builtin(Builtin::WindowRemoveEventListener)),
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
@@ -3743,8 +3683,6 @@ impl ScriptRuntime {
                     "classList" => Value::ClassList(handle),
                     "querySelector" => bound(Builtin::ElementQuerySelector),
                     "querySelectorAll" => bound(Builtin::ElementQuerySelectorAll),
-                    "addEventListener" => bound(Builtin::ElementAddEventListener),
-                    "removeEventListener" => bound(Builtin::ElementRemoveEventListener),
                     "click" => bound(Builtin::ElementClick),
                     "focus" => bound(Builtin::ElementFocus),
                     "blur" => bound(Builtin::ElementBlur),
@@ -3899,46 +3837,6 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!(
                     "classList has no property {property}"
                 ))),
-            },
-            Value::Event(event) => match property {
-                "type" => Ok(Value::String(event.event_type.clone().into())),
-                "target" => Ok(self.node_value(event.target)),
-                "currentTarget" => Ok(self.node_value(event.current_target)),
-                "defaultPrevented" => Ok(Value::Bool(event.state.borrow().default_prevented)),
-                "state" => Ok(event.history_state.borrow().clone()),
-                "key" => Ok(Value::String(event.key.clone().into())),
-                "shiftKey" => Ok(Value::Bool(event.modifiers.shift)),
-                "ctrlKey" => Ok(Value::Bool(event.modifiers.control)),
-                "altKey" => Ok(Value::Bool(event.modifiers.alt)),
-                "metaKey" => Ok(Value::Bool(event.modifiers.meta)),
-                "isComposing" => Ok(Value::Bool(event.is_composing)),
-                "detail" => Ok(Value::Number(f64::from(event.detail))),
-                "propertyName" | "animationName" => Ok(Value::String(
-                    event
-                        .motion
-                        .as_ref()
-                        .map(|motion| motion.0.clone())
-                        .unwrap_or_default()
-                        .into(),
-                )),
-                "elapsedTime" => Ok(Value::Number(
-                    event.motion.as_ref().map_or(0.0, |motion| motion.1),
-                )),
-                "pseudoElement" => Ok(Value::String(String::new().into())),
-                "data" => Ok(event
-                    .data_value
-                    .as_ref()
-                    .map(|value| (**value).clone())
-                    .unwrap_or_else(|| Value::String(event.data.clone().into()))),
-                "message" => Ok(event
-                    .error_message
-                    .clone()
-                    .map(|text| Value::String(text.into()))
-                    .unwrap_or(Value::Undefined)),
-                "preventDefault" => Ok(Value::Builtin(Builtin::EventPreventDefault(
-                    event.state.clone(),
-                ))),
-                _ => Err(runtime_error(format!("event has no property {property}"))),
             },
             Value::Location(url) => {
                 let url = url.borrow();
@@ -4871,39 +4769,14 @@ impl ScriptRuntime {
                                 continue;
                             }
                         };
-                        let mut callbacks = runtime.take_window_callbacks("message");
-                        if let Some(callback) = runtime.global.borrow().get("onmessage")
-                            && is_callable(&callback.resolve())
+                        let fields = HostEventFields {
+                            value: Some(data),
+                            ..HostEventFields::default()
+                        };
+                        // listener errors reach the parent through report_exception
+                        if let Err(error) = runtime.fire(ListenerTarget::Window, "message", fields)
                         {
-                            callbacks.push(callback);
-                        }
-                        if callbacks.is_empty() {
-                            continue;
-                        }
-                        let event = Value::Event(Rc::new(EventData {
-                            event_type: "message".to_string(),
-                            target: runtime.document_node(),
-                            current_target: runtime.document_node(),
-                            state: Rc::new(RefCell::new(EventState::default())),
-                            history_state: Rc::new(RefCell::new(Value::Null)),
-                            key: String::new(),
-                            data: String::new(),
-                            modifiers: KeyModifiers::default(),
-                            is_composing: false,
-                            detail: 0,
-                            motion: None,
-                            data_value: Some(Box::new(data)),
-                            error_message: None,
-                        }));
-                        let mut callback_failed = false;
-                        for callback in callbacks {
-                            if let Err(error) = runtime.call(callback, vec![event.clone()]) {
-                                let _ = event_sender.try_send(WorkerEvent::Error(error.message));
-                                callback_failed = true;
-                                break;
-                            }
-                        }
-                        if callback_failed {
+                            let _ = event_sender.try_send(WorkerEvent::Error(error.message));
                             continue;
                         }
                         if let Err(error) = runtime.drain_microtasks() {
@@ -4968,84 +4841,57 @@ impl ScriptRuntime {
                 match event {
                     WorkerEvent::Message(message) => {
                         let data = message.into_value()?;
-                        let mut worker_data = worker.borrow_mut();
-                        let mut callbacks = worker_data
-                            .listeners
-                            .iter()
-                            .filter(|listener| listener.event == "message")
-                            .map(|listener| listener.callback.clone())
-                            .collect::<Vec<_>>();
-                        worker_data
-                            .listeners
-                            .retain(|listener| !(listener.event == "message" && listener.once));
-                        if let Some(callback) = worker_data.onmessage.clone() {
-                            callbacks.push(callback);
-                        }
-                        drop(worker_data);
-                        if callbacks.is_empty() {
-                            continue;
-                        }
-                        let event = Value::Event(Rc::new(EventData {
-                            event_type: "message".to_string(),
-                            target: self.document_node(),
-                            current_target: self.document_node(),
-                            state: Rc::new(RefCell::new(EventState::default())),
-                            history_state: Rc::new(RefCell::new(Value::Null)),
-                            key: String::new(),
-                            data: String::new(),
-                            modifiers: KeyModifiers::default(),
-                            is_composing: false,
-                            detail: 0,
-                            motion: None,
-                            data_value: Some(Box::new(data)),
-                            error_message: None,
-                        }));
-                        for callback in callbacks {
-                            self.call(callback, vec![event.clone()])?;
-                        }
+                        let fields = HostEventFields {
+                            value: Some(data),
+                            ..HostEventFields::default()
+                        };
+                        self.fire_worker_event(&worker, "message", fields)?;
                     }
                     WorkerEvent::Error(message) => {
-                        let mut worker_data = worker.borrow_mut();
-                        let mut callbacks = worker_data
-                            .listeners
-                            .iter()
-                            .filter(|listener| listener.event == "error")
-                            .map(|listener| listener.callback.clone())
-                            .collect::<Vec<_>>();
-                        worker_data
-                            .listeners
-                            .retain(|listener| !(listener.event == "error" && listener.once));
-                        if let Some(callback) = worker_data.onerror.clone() {
-                            callbacks.push(callback);
-                        }
-                        drop(worker_data);
-                        if callbacks.is_empty() {
-                            continue;
-                        }
-                        let event = Value::Event(Rc::new(EventData {
-                            event_type: "error".to_string(),
-                            target: self.document_node(),
-                            current_target: self.document_node(),
-                            state: Rc::new(RefCell::new(EventState::default())),
-                            history_state: Rc::new(RefCell::new(Value::Null)),
-                            key: String::new(),
-                            data: String::new(),
-                            modifiers: KeyModifiers::default(),
-                            is_composing: false,
-                            detail: 0,
-                            motion: None,
-                            data_value: None,
-                            error_message: Some(message),
-                        }));
-                        for callback in callbacks {
-                            self.call(callback, vec![event.clone()])?;
-                        }
+                        let fields = HostEventFields {
+                            message: Some(message),
+                            ..HostEventFields::default()
+                        };
+                        self.fire_worker_event(&worker, "error", fields)?;
                     }
                 }
             }
         }
         self.pump_worker_resource_requests()?;
         Ok(processed)
+    }
+
+    // a message or error event at a Worker object, which keeps its own listener list
+    fn fire_worker_event(
+        &mut self,
+        worker: &WorkerHandle,
+        event_type: &str,
+        fields: HostEventFields,
+    ) -> Result<(), ScriptError> {
+        let callbacks = {
+            let mut worker_data = worker.borrow_mut();
+            let mut callbacks = worker_data
+                .listeners
+                .iter()
+                .filter(|listener| listener.event == event_type)
+                .map(|listener| listener.callback.clone())
+                .collect::<Vec<_>>();
+            worker_data
+                .listeners
+                .retain(|listener| !(listener.event == event_type && listener.once));
+            let handler = if event_type == "message" {
+                &worker_data.onmessage
+            } else {
+                &worker_data.onerror
+            };
+            callbacks.extend(handler.clone());
+            callbacks
+        };
+        if callbacks.is_empty() {
+            return Ok(());
+        }
+        let event = self.host_event(event_type, fields);
+        self.deliver(&event, Value::Worker(worker.clone()), callbacks)
     }
 
     fn element_node_name(&self, handle: &ElementHandle) -> String {
@@ -5361,7 +5207,7 @@ impl ScriptRuntime {
         if flags.valid() {
             return Ok(true);
         }
-        self.dispatch_non_bubbling_event(node, "invalid")?;
+        self.dispatch_event(node, "invalid")?;
         self.drain_microtasks()?;
         Ok(false)
     }
@@ -7464,10 +7310,6 @@ impl ScriptRuntime {
                     .map(|value| Value::Number(value as f64))
                     .unwrap_or(Value::Undefined))
             }
-            Builtin::EventPreventDefault(state) => {
-                state.borrow_mut().default_prevented = true;
-                Ok(Value::Undefined)
-            }
             Builtin::WorkerGlobalImportScripts => {
                 if !matches!(self.worker_script_type, Some(WorkerScriptType::Classic)) {
                     return Err(runtime_error(
@@ -7536,7 +7378,7 @@ impl ScriptRuntime {
                     .iter()
                     .any(|listener| event_listener_matches(listener, &event, &callback))
                 {
-                    worker.listeners.push(EventListener {
+                    worker.listeners.push(WorkerListener {
                         event,
                         callback,
                         once: options.once,
@@ -7612,98 +7454,6 @@ impl ScriptRuntime {
                         TrySendError::Full(_) => runtime_error("Worker message queue is full"),
                         TrySendError::Disconnected(_) => runtime_error("Worker is unavailable"),
                     })?;
-                Ok(Value::Undefined)
-            }
-            Builtin::WindowAddEventListener => {
-                let event = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let options = listener_options(&arguments)?;
-                if !is_callable(&callback.resolve()) {
-                    return Err(runtime_error("window event listener must be a function"));
-                }
-                if options
-                    .signal
-                    .as_ref()
-                    .is_some_and(|signal| signal.borrow().aborted)
-                {
-                    return Ok(Value::Undefined);
-                }
-                let listeners = self.window_listeners.entry(event).or_default();
-                if !listeners
-                    .iter()
-                    .any(|listener| values_equal(&listener.callback, &callback))
-                {
-                    listeners.push(WindowListener {
-                        callback,
-                        once: options.once,
-                        signal: options.signal,
-                    });
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::WindowRemoveEventListener => {
-                let event = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !is_callable(&callback.resolve()) {
-                    return Err(runtime_error("window event listener must be a function"));
-                }
-                if let Some(listeners) = self.window_listeners.get_mut(&event) {
-                    listeners.retain(|listener| !values_equal(&listener.callback, &callback));
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::DocumentAddEventListener => {
-                let event = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let options = listener_options(&arguments)?;
-                if !is_callable(&callback.resolve()) {
-                    return Err(runtime_error("document event listener must be a function"));
-                }
-                if options
-                    .signal
-                    .as_ref()
-                    .is_some_and(|signal| signal.borrow().aborted)
-                {
-                    return Ok(Value::Undefined);
-                }
-                let document_node = self.document_node();
-                let listeners = self.listeners.entry(document_node).or_default();
-                if !listeners
-                    .iter()
-                    .any(|listener| event_listener_matches(listener, &event, &callback))
-                {
-                    listeners.push(EventListener {
-                        event,
-                        callback,
-                        once: options.once,
-                        signal: options.signal,
-                    });
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::DocumentRemoveEventListener => {
-                let event = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !is_callable(&callback.resolve()) {
-                    return Err(runtime_error("document event listener must be a function"));
-                }
-                let document_node = self.document_node();
-                if let Some(listeners) = self.listeners.get_mut(&document_node) {
-                    listeners
-                        .retain(|listener| !event_listener_matches(listener, &event, &callback));
-                }
                 Ok(Value::Undefined)
             }
             Builtin::WindowScrollTo => {
@@ -9195,9 +8945,8 @@ impl ScriptRuntime {
                     std::mem::take(&mut signal.listeners)
                 };
                 self.remove_event_listeners_for_signal(&signal);
-                for listener in listeners {
-                    self.call(listener, vec![abort_event_value()])?;
-                }
+                let event = self.host_event("abort", HostEventFields::default());
+                self.deliver(&event, Value::AbortSignal(signal), listeners)?;
                 Ok(Value::Undefined)
             }
             Builtin::AbortSignalAddEventListener(signal) => {
@@ -9280,54 +9029,6 @@ impl ScriptRuntime {
                 Ok(Value::Promise(
                     self.fulfilled_promise(Value::String(response.into())),
                 ))
-            }
-            Builtin::ElementAddEventListener(handle) => {
-                let node = handle.id;
-                let event = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                let options = listener_options(&arguments)?;
-                if !is_callable(&callback.resolve()) {
-                    return Err(runtime_error("event listener must be a function"));
-                }
-                if options
-                    .signal
-                    .as_ref()
-                    .is_some_and(|signal| signal.borrow().aborted)
-                {
-                    return Ok(Value::Undefined);
-                }
-                let listeners = self.listeners.entry(node).or_default();
-                if !listeners
-                    .iter()
-                    .any(|listener| event_listener_matches(listener, &event, &callback))
-                {
-                    listeners.push(EventListener {
-                        event,
-                        callback,
-                        once: options.once,
-                        signal: options.signal,
-                    });
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::ElementRemoveEventListener(handle) => {
-                let node = handle.id;
-                let event = arguments
-                    .first()
-                    .map(Value::string_value)
-                    .unwrap_or_default();
-                let callback = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                if !is_callable(&callback.resolve()) {
-                    return Err(runtime_error("event listener must be a function"));
-                }
-                if let Some(listeners) = self.listeners.get_mut(&node) {
-                    listeners
-                        .retain(|listener| !event_listener_matches(listener, &event, &callback));
-                }
-                Ok(Value::Undefined)
             }
             Builtin::ElementClick(handle) => {
                 self.click_node(handle.id)?;
@@ -9625,64 +9326,12 @@ impl ScriptRuntime {
         }
     }
 
-    fn take_event_callbacks(&mut self, node: NodeId, event: &str) -> Vec<Value> {
-        let Some(listeners) = self.listeners.get_mut(&node) else {
-            return Vec::new();
-        };
-        let callbacks = listeners
-            .iter()
-            .filter(|listener| listener.event == event)
-            .map(|listener| listener.callback.clone())
-            .collect::<Vec<_>>();
-        listeners.retain(|listener| !(listener.event == event && listener.once));
-        callbacks
-    }
-
-    fn take_window_callbacks(&mut self, event: &str) -> Vec<Value> {
-        let Some(listeners) = self.window_listeners.get_mut(event) else {
-            return Vec::new();
-        };
-        let callbacks = listeners
-            .iter()
-            .map(|listener| listener.callback.clone())
-            .collect::<Vec<_>>();
-        listeners.retain(|listener| !listener.once);
-        callbacks
-    }
-
     fn dispatch_event(&mut self, node: NodeId, event: &str) -> Result<EventDispatch, ScriptError> {
-        self.dispatch_event_with_details(node, event, "", "")
-    }
-
-    fn dispatch_non_bubbling_event(
-        &mut self,
-        node: NodeId,
-        event: &str,
-    ) -> Result<EventDispatch, ScriptError> {
-        let callbacks = self.take_event_callbacks(node, event);
-        let state = Rc::new(RefCell::new(EventState::default()));
-        let event_value = Value::Event(Rc::new(EventData {
-            event_type: event.to_string(),
-            target: node,
-            current_target: node,
-            state: state.clone(),
-            history_state: Rc::new(RefCell::new(Value::Null)),
-            key: String::new(),
-            data: String::new(),
-            modifiers: KeyModifiers::default(),
-            is_composing: self.composition.is_some(),
-            detail: click_detail_for(event, self.click_detail),
-            motion: self.motion_detail.clone(),
-            data_value: None,
-            error_message: None,
-        }));
-        for callback in callbacks.iter().cloned() {
-            self.call(callback, vec![event_value.clone()])?;
-        }
-        Ok(EventDispatch {
-            handled: !callbacks.is_empty(),
-            default_prevented: state.borrow().default_prevented,
-        })
+        self.fire(
+            ListenerTarget::Node(node),
+            event,
+            HostEventFields::default(),
+        )
     }
 
     fn selection_uses_range(&self, range: &RangeHandle) -> bool {
@@ -9717,38 +9366,13 @@ impl ScriptRuntime {
         data: &str,
         modifiers: KeyModifiers,
     ) -> Result<EventDispatch, ScriptError> {
-        let target = node;
-        let propagation = std::iter::once(node)
-            .chain(self.document.borrow().ancestors(node))
-            .collect::<Vec<_>>();
-        let mut had_callbacks = false;
-        let state = Rc::new(RefCell::new(EventState::default()));
-        for current in propagation {
-            let callbacks = self.take_event_callbacks(current, event);
-            had_callbacks |= !callbacks.is_empty();
-            let event_value = Value::Event(Rc::new(EventData {
-                event_type: event.to_string(),
-                target,
-                current_target: current,
-                state: state.clone(),
-                history_state: Rc::new(RefCell::new(Value::Null)),
-                key: key.to_string(),
-                data: data.to_string(),
-                modifiers,
-                is_composing: self.composition.is_some(),
-                detail: click_detail_for(event, self.click_detail),
-                motion: self.motion_detail.clone(),
-                data_value: None,
-                error_message: None,
-            }));
-            for callback in callbacks {
-                self.call(callback, vec![event_value.clone()])?;
-            }
-        }
-        Ok(EventDispatch {
-            handled: had_callbacks,
-            default_prevented: state.borrow().default_prevented,
-        })
+        let fields = HostEventFields {
+            key: key.to_string(),
+            data: data.to_string(),
+            modifiers,
+            ..HostEventFields::default()
+        };
+        self.fire(ListenerTarget::Node(node), event, fields)
     }
 
     fn fulfilled_promise(&self, value: Value) -> PromiseHandle {
@@ -11699,16 +11323,6 @@ fn subtle_error_value(name: &str, message: impl Into<String>) -> Value {
         code: None,
         class_name: "Error".to_string(),
     }))
-}
-
-fn abort_event_value() -> Value {
-    let mut event = BTreeMap::new();
-    event.insert(
-        "type".to_string(),
-        Value::String("abort".to_string().into()),
-    );
-    event.insert("defaultPrevented".to_string(), Value::Bool(false));
-    plain_object(event)
 }
 
 const MAX_CACHE_NAME_BYTES: usize = 256;
@@ -15024,7 +14638,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::VmIterator(left), Value::VmIterator(right)) => Rc::ptr_eq(left, right),
         (Value::Dataset(left), Value::Dataset(right))
         | (Value::ClassList(left), Value::ClassList(right)) => Rc::ptr_eq(left, right),
-        (Value::Event(left), Value::Event(right)) => Rc::ptr_eq(&left.state, &right.state),
+        (Value::Event(left), Value::Event(right)) => Rc::ptr_eq(left, right),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
         (Value::File(left), Value::File(right)) => Rc::ptr_eq(left, right),
@@ -15045,7 +14659,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn event_listener_matches(listener: &EventListener, event: &str, callback: &Value) -> bool {
+fn event_listener_matches(listener: &WorkerListener, event: &str, callback: &Value) -> bool {
     listener.event == event && values_equal(&listener.callback, callback)
 }
 
@@ -15077,14 +14691,7 @@ fn listener_options(arguments: &[Value]) -> Result<ListenerOptions, ScriptError>
     }
 }
 
-fn listener_uses_signal(listener: &EventListener, signal: &AbortSignalHandle) -> bool {
-    listener
-        .signal
-        .as_ref()
-        .is_some_and(|candidate| Rc::ptr_eq(candidate, signal))
-}
-
-fn window_listener_uses_signal(listener: &WindowListener, signal: &AbortSignalHandle) -> bool {
+fn listener_uses_signal(listener: &WorkerListener, signal: &AbortSignalHandle) -> bool {
     listener
         .signal
         .as_ref()
@@ -16781,7 +16388,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
-            Some(":Rus|blur:null")
+            Some("null:Rus|blur:null")
         );
     }
 
@@ -17687,6 +17294,262 @@ mod tests {
             .find_element_by_id("status")
             .expect("status should exist");
         document.element_text_content(status)
+    }
+
+    #[test]
+    fn events_run_capture_target_and_bubble_phases_through_the_window() {
+        let document = document(
+            r#"<html><body><main id="root"><button id="go">Go</button></main><p id="status"></p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const button = document.getElementById("go");
+                const seen = [];
+                const note = (label) => function (event) {
+                    seen.push(label + event.eventPhase + (this === event.currentTarget ? "" : "!"));
+                };
+                window.addEventListener("ping", note("wc"), true);
+                window.addEventListener("ping", note("wb"));
+                document.addEventListener("ping", note("dc"), { capture: true });
+                root.addEventListener("ping", note("rc"), true);
+                root.addEventListener("ping", note("rb"));
+                button.addEventListener("ping", note("bb"));
+                button.addEventListener("ping", note("bc"), true);
+                const event = new CustomEvent("ping", { bubbles: true, cancelable: true, detail: 7 });
+                button.addEventListener("ping", (event) => event.preventDefault());
+                const result = button.dispatchEvent(event);
+                seen.push(result, event.defaultPrevented, event.detail, event.isTrusted);
+                seen.push(event.eventPhase, String(event.currentTarget), event.target === button);
+                const quiet = new Event("ping");
+                button.dispatchEvent(quiet);
+                seen.push(quiet.bubbles, quiet instanceof Event, event instanceof CustomEvent);
+                document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("listeners should run in phase order");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "wc1,dc1,rc1,bc2,bb2,rb3,wb3,false,true,7,false,0,null,true,wc1,dc1,rc1,bc2,bb2,false,true,true"
+            )
+        );
+    }
+
+    #[test]
+    fn propagation_stops_and_listener_options_follow_the_dom_standard() {
+        let document = document(
+            r#"<html><body><main id="root"><button id="go">Go</button></main><p id="status"></p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const button = document.getElementById("go");
+                const seen = [];
+                const fire = (type) => button.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+                button.addEventListener("a", (event) => { seen.push("a1"); event.stopPropagation(); });
+                button.addEventListener("a", () => seen.push("a2"));
+                root.addEventListener("a", () => seen.push("a-root"));
+                button.addEventListener("b", (event) => { seen.push("b1"); event.stopImmediatePropagation(); });
+                button.addEventListener("b", () => seen.push("b2"));
+                const once = () => seen.push("once");
+                button.addEventListener("c", once, { once: true });
+                button.addEventListener("c", once, { once: true });
+                button.addEventListener("d", (event) => { event.preventDefault(); seen.push(event.defaultPrevented); }, { passive: true });
+                const capture = () => seen.push("capture");
+                button.addEventListener("e", capture, true);
+                button.removeEventListener("e", capture);
+                const listener = { count: 0, handleEvent(event) { this.count++; seen.push(event.type + this.count); } };
+                button.addEventListener("f", listener);
+                button.addEventListener("g", () => { throw new Error("boom"); });
+                button.addEventListener("g", () => seen.push("after-throw"));
+                fire("a");
+                fire("b");
+                fire("c");
+                fire("c");
+                seen.push(fire("d"));
+                fire("e");
+                button.removeEventListener("e", capture, { capture: true });
+                fire("e");
+                fire("f");
+                fire("f");
+                fire("g");
+                const blank = document.createEvent("Event");
+                let state;
+                try { button.dispatchEvent(blank); } catch (error) { state = error.name; }
+                blank.initEvent("f", true, true);
+                button.dispatchEvent(blank);
+                seen.push(state);
+                document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("listener options should apply");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("a1,a2,b1,once,false,true,capture,f1,f2,after-throw,f3,InvalidStateError")
+        );
+        assert_eq!(runtime.logs(), &["Uncaught Error: boom"]);
+    }
+
+    #[test]
+    fn uncaught_errors_fire_the_window_error_event_before_the_console() {
+        let document =
+            document(r#"<html><body><button id="go">Go</button><p id="status"></p></body></html>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const button = document.getElementById("go");
+                const seen = [];
+                window.addEventListener("error", (event) => {
+                    seen.push(event.constructor.name + ":" + event.message + ":" + event.error.message);
+                    if (event.error.message === "quiet") event.preventDefault();
+                });
+                window.onerror = (message, source, line, column, error) => {
+                    seen.push("onerror:" + error.message + ":" + typeof message);
+                    return error.message === "hushed";
+                };
+                button.addEventListener("click", () => { throw new Error(button.dataset.next); });
+                globalThis.report = () => document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("error listeners should register");
+        let button = document.borrow().find_element_by_id("go").expect("button");
+        for message in ["loud", "quiet", "hushed"] {
+            document
+                .borrow_mut()
+                .set_attribute(button, "data-next", message.to_string());
+            runtime.click_node(button).expect("click should dispatch");
+        }
+        runtime.execute("report();").expect("report");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "onerror:loud:string,ErrorEvent:Uncaught Error: loud:loud,onerror:quiet:string,ErrorEvent:Uncaught Error: quiet:quiet,onerror:hushed:string,ErrorEvent:Uncaught Error: hushed:hushed"
+            )
+        );
+        assert_eq!(runtime.logs(), &["Uncaught Error: loud"]);
+    }
+
+    #[test]
+    fn event_handler_properties_and_inline_attributes_run_with_listeners() {
+        let document = document(
+            r#"<html><body><a id="link" href="/next" onclick="this.dataset.hits = (Number(this.dataset.hits) || 0) + 1; return false">Next</a><button id="go">Go</button><p id="status"></p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const button = document.getElementById("go");
+                const seen = [];
+                button.addEventListener("click", () => seen.push("listener"));
+                button.onclick = function (event) { seen.push("handler:" + (this === button) + ":" + event.type); };
+                seen.push(typeof button.onclick, String(button.onkeydown), "onclick" in button);
+                window.onresize = () => seen.push("resize");
+                globalThis.report = () => document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("handlers should register");
+        let button = document.borrow().find_element_by_id("go").expect("button");
+        let link = document.borrow().find_element_by_id("link").expect("link");
+        runtime.click_node(button).expect("button click");
+        runtime.click_node(link).expect("link click");
+        runtime
+            .dispatch_window_event("resize")
+            .expect("resize should dispatch");
+        runtime
+            .execute(
+                r#"
+                button.onclick = null;
+                button.click();
+                seen.push(document.getElementById("link").dataset.hits, typeof document.getElementById("link").onclick);
+                report();
+                "#,
+            )
+            .expect("handler removal should work");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("function,null,true,listener,handler:true:click,resize,listener,1,function")
+        );
+        assert!(runtime.take_navigation_request().is_none());
+    }
+
+    #[test]
+    fn host_input_events_carry_pointer_keyboard_and_focus_details() {
+        let document = document(
+            r#"<html><body><main id="root"><input id="name"><button id="go">Go</button></main><p id="status"></p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const input = document.getElementById("name");
+                const button = document.getElementById("go");
+                const seen = [];
+                root.addEventListener("focus", () => seen.push("focus-bubbled"));
+                root.addEventListener("focusin", (event) => seen.push("focusin:" + event.target.id + ":" + event.relatedTarget));
+                root.addEventListener("focusout", (event) => seen.push("focusout:" + event.target.id + ":" + event.relatedTarget.id));
+                input.addEventListener("keydown", (event) => {
+                    seen.push([event.constructor.name, event.key, event.code, event.repeat, event.keyCode, event.shiftKey, event.isTrusted].join(":"));
+                });
+                input.addEventListener("keyup", (event) => seen.push("up:" + event.code));
+                button.addEventListener("click", (event) => {
+                    seen.push([event.constructor.name, event.clientX, event.clientY, event.button, event.buttons, event.detail, event.isTrusted].join(":"));
+                });
+                button.addEventListener("pointerdown", (event) => { seen.push("pointerdown:" + event.button + ":" + event.buttons); event.preventDefault(); });
+                button.addEventListener("mousedown", () => seen.push("mousedown"));
+                button.addEventListener("pointerup", (event) => seen.push("pointerup:" + event.buttons));
+                button.addEventListener("mouseup", () => seen.push("mouseup"));
+                button.addEventListener("mouseover", (event) => seen.push("over:" + event.relatedTarget.id));
+                root.addEventListener("mouseenter", () => seen.push("enter-root"));
+                button.addEventListener("mouseenter", () => seen.push("enter-button"));
+                input.addEventListener("mouseleave", () => seen.push("leave-input"));
+                globalThis.report = () => document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("listeners should register");
+        let input = document.borrow().find_element_by_id("name").expect("input");
+        let button = document.borrow().find_element_by_id("go").expect("button");
+        assert!(runtime.focus_node(input).expect("input should focus"));
+        runtime
+            .key_down_with_code(
+                "A",
+                "KeyA",
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                },
+                true,
+            )
+            .expect("keydown should dispatch");
+        runtime
+            .key_up("A", "KeyA", KeyModifiers::default())
+            .expect("keyup should dispatch");
+        runtime
+            .dispatch_hover_change(Some(input), Some(button))
+            .expect("hover should move");
+        runtime.set_pointer_position(12.0, 8.0);
+        runtime.set_pointer_button(0, true);
+        runtime
+            .dispatch_pointer_event(button, "pointerdown")
+            .expect("pointerdown should dispatch");
+        runtime.set_pointer_button(0, false);
+        runtime
+            .dispatch_pointer_event(button, "pointerup")
+            .expect("pointerup should dispatch");
+        runtime.click_node(button).expect("click should dispatch");
+        runtime.execute("report();").expect("report");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "focusin:name:null,KeyboardEvent:A:KeyA:true:65:true:true,up:KeyA,leave-input,over:name,enter-button,pointerdown:0:1,pointerup:0,focusout:name:go,focusin:go:[object HTMLInputElement],PointerEvent:12:8:0:0:1:true"
+            )
+        );
     }
 
     #[test]
@@ -19217,7 +19080,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "a安b|2|compositionstart:|compositionupdate:x:ab:true|x:axb:true|compositionupdate:xy:axb:true|xy:axyb:true|安:a安b:true|compositionend:安:a安b|"
+                "a安b|2|compositionstart:|compositionupdate:x:ab:undefined|x:axb:true|compositionupdate:xy:axb:undefined|xy:axyb:true|安:a安b:true|compositionend:安:a安b|"
             )
         );
 

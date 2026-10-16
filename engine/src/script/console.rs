@@ -423,10 +423,18 @@ impl ScriptRuntime {
         Ok(Value::Undefined)
     }
 
-    // an uncaught error from a task, reported to the console as browsers do
+    // an uncaught error from a task: the global error event goes first, and unless script
+    // cancels it the error reaches the console and, in a worker, the parent's Worker object
     pub(super) fn report_exception(&mut self, error: ScriptError) {
+        let message = error.message.clone();
         let value = self.take_thrown(error);
         let text = self.inspect(&value, 0, &mut Vec::new());
+        if self.report_error_event(&text, value) {
+            return;
+        }
+        if let Some(sender) = &self.worker_sender {
+            let _ = sender.try_send(WorkerEvent::Error(message));
+        }
         self.logs.push(format!("Uncaught {text}"));
     }
 }

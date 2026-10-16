@@ -51,9 +51,11 @@ enum Kind {
     Method(u32),
     Reflect(&'static str),
     Flag(&'static str),
+    // an on* event handler property
+    Handler,
 }
 
-use Kind::{Flag, Method, ReadOnly, ReadWrite, Reflect as Attr};
+use Kind::{Flag, Handler, Method, ReadOnly, ReadWrite, Reflect as Attr};
 
 struct Interface {
     name: &'static str,
@@ -70,6 +72,64 @@ static FORM_VALIDATION: &[(&str, Kind)] = &[
     ("reportValidity", Method(0)),
     ("setCustomValidity", Method(1)),
 ];
+
+// the GlobalEventHandlers mixin of HTML and SVG elements and the document
+static EVENT_HANDLERS: &[(&str, Kind)] = &[
+    ("onabort", Handler),
+    ("onanimationend", Handler),
+    ("onanimationiteration", Handler),
+    ("onanimationstart", Handler),
+    ("onauxclick", Handler),
+    ("onbeforeinput", Handler),
+    ("onblur", Handler),
+    ("oncancel", Handler),
+    ("onchange", Handler),
+    ("onclick", Handler),
+    ("onclose", Handler),
+    ("oncontextmenu", Handler),
+    ("oncopy", Handler),
+    ("oncut", Handler),
+    ("ondblclick", Handler),
+    ("onerror", Handler),
+    ("onfocus", Handler),
+    ("onfocusin", Handler),
+    ("onfocusout", Handler),
+    ("oninput", Handler),
+    ("oninvalid", Handler),
+    ("onkeydown", Handler),
+    ("onkeypress", Handler),
+    ("onkeyup", Handler),
+    ("onload", Handler),
+    ("onmousedown", Handler),
+    ("onmouseenter", Handler),
+    ("onmouseleave", Handler),
+    ("onmousemove", Handler),
+    ("onmouseout", Handler),
+    ("onmouseover", Handler),
+    ("onmouseup", Handler),
+    ("onpaste", Handler),
+    ("onpointercancel", Handler),
+    ("onpointerdown", Handler),
+    ("onpointerenter", Handler),
+    ("onpointerleave", Handler),
+    ("onpointermove", Handler),
+    ("onpointerout", Handler),
+    ("onpointerover", Handler),
+    ("onpointerup", Handler),
+    ("onreset", Handler),
+    ("onresize", Handler),
+    ("onscroll", Handler),
+    ("onselect", Handler),
+    ("onselectionchange", Handler),
+    ("onsubmit", Handler),
+    ("ontoggle", Handler),
+    ("ontransitioncancel", Handler),
+    ("ontransitionend", Handler),
+    ("ontransitionrun", Handler),
+    ("ontransitionstart", Handler),
+    ("onwheel", Handler),
+];
+const HANDLING: &[&str] = &["Document", "HTMLElement", "SVGElement"];
 
 static TEXT_SELECTION: &[(&str, Kind)] = &[
     ("selectionStart", ReadWrite),
@@ -88,6 +148,7 @@ static INTERFACES: &[Interface] = &[
         members: &[
             ("addEventListener", Method(2)),
             ("removeEventListener", Method(2)),
+            ("dispatchEvent", Method(1)),
         ],
     },
     Interface {
@@ -238,6 +299,7 @@ static INTERFACES: &[Interface] = &[
             ("createTextNode", Method(1)),
             ("createComment", Method(1)),
             ("createDocumentFragment", Method(0)),
+            ("createEvent", Method(1)),
             ("createRange", Method(0)),
             ("getSelection", Method(0)),
             ("append", Method(0)),
@@ -529,7 +591,7 @@ fn define_member(build: &Builder, prototype: &ObjectHandle, entry: &'static (&'s
             return;
         }
         ReadOnly => (true, false),
-        ReadWrite | Attr(_) | Flag(_) => (true, true),
+        ReadWrite | Attr(_) | Flag(_) | Handler => (true, true),
     };
     let get = getter.then(|| {
         Value::Object(build.function(Native::Dom(member(Access::Get)), &format!("get {name}"), 0))
@@ -574,6 +636,11 @@ pub(super) fn create(
         }
         if SELECTABLE.contains(&interface.name) {
             for entry in TEXT_SELECTION {
+                define_member(build, &prototype, entry);
+            }
+        }
+        if HANDLING.contains(&interface.name) {
+            for entry in EVENT_HANDLERS {
                 define_member(build, &prototype, entry);
             }
         }
@@ -745,10 +812,11 @@ fn is_known_html_element(name: &str) -> bool {
 }
 
 impl ScriptRuntime {
-    // the wrapper object of a node value, which holds its expandos and prototype
-    pub(super) fn node_object(&self, value: &Value) -> Option<ObjectHandle> {
+    // the wrapper object of a node or event value, which holds its expandos and prototype
+    pub(super) fn wrapper_object(&self, value: &Value) -> Option<ObjectHandle> {
         match value {
             Value::Element(handle) => Some(handle.object.clone()),
+            Value::Event(event) => Some(event.object.clone()),
             Value::Document => Some(self.node_handle(self.document_node()).object.clone()),
             _ => None,
         }
@@ -780,6 +848,9 @@ impl ScriptRuntime {
         this: Value,
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
+        if let Some(result) = self.call_event_target(member, &this, &arguments)? {
+            return Ok(result);
+        }
         let handle = self.this_node(&this, member)?;
         let node = handle.id;
         let first = arguments.first().cloned().unwrap_or(Value::Undefined);
@@ -820,16 +891,8 @@ impl ScriptRuntime {
         let target = match (&this, member.name()) {
             (
                 Value::Document,
-                "getElementById"
-                | "querySelector"
-                | "querySelectorAll"
-                | "createElement"
-                | "createTextNode"
-                | "createRange"
-                | "getSelection"
-                | "addEventListener"
-                | "removeEventListener"
-                | "documentElement"
+                "getElementById" | "querySelector" | "querySelectorAll" | "createElement"
+                | "createTextNode" | "createRange" | "getSelection" | "documentElement"
                 | "activeElement",
             ) => Value::Document,
             _ => Value::Element(handle),
@@ -845,6 +908,47 @@ impl ScriptRuntime {
                 self.call_function(method, target, arguments)
             }
         }
+    }
+
+    // EventTarget members and on* handlers, which the window shares with nodes
+    fn call_event_target(
+        &mut self,
+        member: DomMember,
+        this: &Value,
+        arguments: &[Value],
+    ) -> Result<Option<Value>, ScriptError> {
+        let name = member.name();
+        let handler = matches!(member.entry.1, Handler);
+        if !handler
+            && !matches!(
+                name,
+                "addEventListener" | "removeEventListener" | "dispatchEvent"
+            )
+        {
+            return Ok(None);
+        }
+        let Some(target) = self.listener_target(this) else {
+            return Err(self.type_error(format!(
+                "Illegal invocation of '{name}' on a value that is not an EventTarget"
+            )));
+        };
+        let first = arguments.first().cloned().unwrap_or(Value::Undefined);
+        Ok(Some(match (name, member.access) {
+            (_, Access::Get) => self.event_handler(target, &name[2..]),
+            (_, Access::Set) => {
+                self.set_event_handler(target, &name[2..], first);
+                Value::Undefined
+            }
+            ("addEventListener", _) => {
+                self.add_event_listener(target, arguments)?;
+                Value::Undefined
+            }
+            ("removeEventListener", _) => {
+                self.remove_event_listener(target, arguments)?;
+                Value::Undefined
+            }
+            _ => self.dispatch_event_from_script(target, &first)?,
+        }))
     }
 
     fn selector_list(&mut self, source: &str) -> Result<Vec<crate::css::Selector>, ScriptError> {
@@ -1227,6 +1331,10 @@ impl ScriptRuntime {
             ("createDocumentFragment", Access::Call) => {
                 let created = self.document.borrow_mut().create_fragment();
                 self.node_value(created)
+            }
+            ("createEvent", Access::Call) => {
+                let interface = self.coerce_string(first)?;
+                self.create_legacy_event(&interface)?
             }
             _ => return Ok(None),
         };

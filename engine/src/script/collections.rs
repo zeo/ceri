@@ -79,7 +79,7 @@ pub(super) fn value_address(value: &Value) -> usize {
         Value::AbortSignal(handle) => address!(handle),
         Value::Range(handle) => address!(handle),
         Value::Selection(handle) => address!(handle),
-        Value::Event(handle) => address!(&handle.state),
+        Value::Event(handle) => address!(handle),
         Value::NodeList(handle) => address!(handle),
         Value::VmIterator(handle) => address!(handle),
         // singletons such as document and window compare equal to themselves
