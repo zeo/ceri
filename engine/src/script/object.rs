@@ -81,6 +81,8 @@ pub(super) enum ObjectClass {
     WeakMap(Rc<RefCell<super::collections::Collection>>),
     WeakSet(Rc<RefCell<super::collections::Collection>>),
     WeakRef(std::rc::Weak<RefCell<JsObject>>),
+    // an object that holds event listeners, keyed by this id in the runtime's registry
+    EventTarget(u32),
     // a live Map or Set iterator
     Cursor(Rc<RefCell<super::collections::Cursor>>),
     DataView {

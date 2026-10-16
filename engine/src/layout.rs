@@ -6,6 +6,7 @@ use crate::css::{
 use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::image::Image;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
@@ -13,7 +14,7 @@ pub struct Size {
     pub height: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -150,10 +151,10 @@ pub(crate) struct ImageLayer {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ResolvedEdges {
-    top: f32,
-    right: f32,
-    bottom: f32,
-    left: f32,
+    pub(crate) top: f32,
+    pub(crate) right: f32,
+    pub(crate) bottom: f32,
+    pub(crate) left: f32,
 }
 
 struct InlineLine {
@@ -788,7 +789,26 @@ fn collect_prose_runs(
     }
 }
 
+// where a node's box sits in the viewport, as script geometry reads it
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BoxGeometry {
+    // the border box
+    pub(crate) rect: Rect,
+    pub(crate) border: f32,
+    pub(crate) position: Position,
+    // the border box less any scrollbar, which client sizes start from
+    pub(crate) scrollport: Rect,
+    pub(crate) scroll_size: Size,
+}
+
 impl LayoutDocument {
+    // every node's boxes in viewport coordinates and tree order, leaving out generated content
+    pub(crate) fn box_index(&self) -> HashMap<NodeId, Vec<BoxGeometry>> {
+        let mut index = HashMap::new();
+        index_boxes(&self.root, (0.0, 0.0), &mut index);
+        index
+    }
+
     pub fn paint(&self) -> crate::paint::Canvas {
         crate::paint::paint(self)
     }
@@ -990,6 +1010,34 @@ fn append_positioned_nodes(
         }) {
             children.push(layout);
         }
+    }
+}
+
+fn index_boxes(
+    layout: &LayoutBox,
+    ancestor_offset: (f32, f32),
+    index: &mut HashMap<NodeId, Vec<BoxGeometry>>,
+) {
+    let offset = visual_offset_for(layout, ancestor_offset);
+    if !layout.tag.starts_with("::") {
+        let content = if layout.is_document() || layout.overflow != Overflow::Visible {
+            layout.scroll_content
+        } else {
+            Size {
+                width: layout.rect.width,
+                height: layout.rect.height,
+            }
+        };
+        index.entry(layout.node).or_default().push(BoxGeometry {
+            rect: translate_rect(layout.rect, offset),
+            border: layout.border_width,
+            position: layout.position,
+            scrollport: translate_rect(scrollbar_metrics(layout).scrollport, offset),
+            scroll_size: content,
+        });
+    }
+    for child in &layout.children {
+        index_boxes(child, offset, index);
     }
 }
 
@@ -3036,7 +3084,7 @@ fn flush_line(
     line.height = 0.0;
 }
 
-fn resolve_edges(edges: Edges, containing_width: f32, font_size: f32) -> ResolvedEdges {
+pub(crate) fn resolve_edges(edges: Edges, containing_width: f32, font_size: f32) -> ResolvedEdges {
     ResolvedEdges {
         top: edges
             .top

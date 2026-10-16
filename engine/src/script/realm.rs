@@ -124,6 +124,7 @@ pub(super) enum Native {
     EventConstructor(&'static str),
     Range(super::ranges::RangeMember),
     RangeConstructor(&'static str),
+    Window(super::geometry::WindowMethod),
 }
 
 impl Native {
@@ -2240,6 +2241,7 @@ impl ScriptRuntime {
             ))),
             Native::Event(member) => self.call_event_member(member, this, arguments),
             Native::Range(member) => self.call_range_member(member, this, arguments),
+            Native::Window(method) => self.call_window_method(method, this, arguments),
             Native::ParseInt => {
                 let text = self.coerce_string(first)?;
                 let radix = self.coerce_int32(argument(&arguments, 1))?;
@@ -2488,7 +2490,7 @@ impl ScriptRuntime {
             Native::Typed(method) => {
                 self.call_typed(method, Value::Undefined, arguments, Some(new_target))
             }
-            Native::DomConstructor(name) => self.construct_dom(name, arguments),
+            Native::DomConstructor(name) => self.construct_dom(name, arguments, new_target),
             Native::EventConstructor(name) => self.construct_event(name, arguments, new_target),
             Native::RangeConstructor(name) => self.construct_range(name, new_target),
             Native::Codec(method) => {

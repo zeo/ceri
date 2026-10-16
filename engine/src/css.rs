@@ -1477,6 +1477,53 @@ impl Stylesheet {
         })
     }
 
+    // an element's style with the inherited values of its ancestors, as layout computes it,
+    // and its font size in pixels
+    pub(crate) fn computed_style(
+        &self,
+        document: &Document,
+        node: NodeId,
+        state: &StyleState,
+    ) -> Option<(Style, f32)> {
+        document.element(node)?;
+        let mut chain = std::iter::once(node)
+            .chain(document.ancestors(node))
+            .filter(|&current| document.element(current).is_some())
+            .collect::<Vec<_>>();
+        chain.reverse();
+        let mut font_size = 16.0;
+        let mut color = Color::BLACK;
+        let mut weight = FontWeight::Normal;
+        let mut text = InheritedText::default();
+        let mut computed = None;
+        for current in chain {
+            let style = self.style_for(StyleContext {
+                document,
+                node: current,
+                pseudo: None,
+                parent_font_size: font_size,
+                parent_color: color,
+                parent_weight: weight,
+                parent_text: text,
+                state,
+            });
+            font_size = style
+                .font_size
+                .resolve(font_size, font_size)
+                .unwrap_or(font_size)
+                .max(1.0);
+            color = style.color;
+            weight = style.font_weight;
+            text = InheritedText {
+                transform: style.text_transform,
+                letter_spacing: style.letter_spacing,
+                family: style.font_family,
+            };
+            computed = Some((style, font_size));
+        }
+        computed
+    }
+
     // declared values after custom property substitution, from one cascade
     pub(crate) fn declared_values(&self, context: StyleContext<'_>) -> BTreeMap<String, String> {
         let values = self.cascaded_values(
@@ -2551,6 +2598,15 @@ fn matching_brace(source: &str, open: usize) -> Result<usize, String> {
         }
     }
     Err("stylesheet rule has no closing brace".to_string())
+}
+
+// a media query list from script, such as matchMedia's; one that does not parse matches
+// nothing
+pub(crate) fn media_query_matches(query: &str, state: &StyleState) -> bool {
+    query.split(',').any(|part| {
+        parse_media_condition(&format!("@media {}", part.trim()))
+            .is_ok_and(|condition| condition.matches(state))
+    })
 }
 
 fn parse_media_condition(header: &str) -> Result<MediaCondition, String> {

@@ -7,6 +7,7 @@ mod console;
 mod dates;
 mod encoding;
 mod events;
+mod geometry;
 mod interfaces;
 mod intl;
 mod json;
@@ -31,6 +32,7 @@ use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol
 use realm::{Intrinsics, Native, create_intrinsics};
 
 pub use dates::TimeZone;
+pub(crate) use geometry::LayoutInputs;
 
 use crate::Color;
 use crate::css::StyleState;
@@ -497,6 +499,16 @@ pub struct ScriptRuntime {
     selection: SelectionHandle,
     // the selection as selectionchange listeners last saw it
     reported_selection: ranges::SelectionSnapshot,
+    layout_inputs: Option<Rc<RefCell<geometry::LayoutInputs>>>,
+    measured: RefCell<Option<geometry::MeasuredLayout>>,
+    media_queries: Vec<geometry::MediaQueryRecord>,
+    media_list_prototype: Option<ObjectHandle>,
+    performance: Value,
+    performance_entries: Vec<geometry::PerformanceEntry>,
+    event_targets: HashMap<u32, Weak<RefCell<JsObject>>>,
+    next_event_target: u32,
+    // event target objects with listeners stay alive for as long as the listeners do
+    held_targets: HashMap<u32, ObjectHandle>,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1218,6 +1230,7 @@ enum TaskKind {
     Timeout,
     Interval(u64),
     AnimationFrame,
+    Idle,
 }
 
 struct ScheduledTask {
@@ -1478,6 +1491,15 @@ impl ScriptRuntime {
             reporting_error: false,
             selection,
             reported_selection: None,
+            layout_inputs: None,
+            measured: RefCell::new(None),
+            media_queries: Vec::new(),
+            media_list_prototype: None,
+            performance: Value::Undefined,
+            performance_entries: Vec::new(),
+            event_targets: HashMap::new(),
+            next_event_target: 0,
+            held_targets: HashMap::new(),
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -1524,6 +1546,7 @@ impl ScriptRuntime {
             orphan_recheck_at: 64,
         };
         runtime.initialize_select_state();
+        runtime.performance = runtime.performance_object();
         runtime
     }
 
@@ -1711,11 +1734,11 @@ impl ScriptRuntime {
             .retain(|node, _| !gone(*node));
         self.event_listeners.retain(|target, _| match target {
             ListenerTarget::Node(node) => !gone(*node),
-            ListenerTarget::Window => true,
+            _ => true,
         });
         self.event_handlers.retain(|(target, _), _| match target {
             ListenerTarget::Node(node) => !gone(*node),
-            ListenerTarget::Window => true,
+            _ => true,
         });
         self.attribute_handlers.retain(|(node, _), _| !gone(*node));
         self.control_values.retain(|node, _| !gone(*node));
@@ -3305,6 +3328,7 @@ impl ScriptRuntime {
             let arguments = match task.kind {
                 TaskKind::Timeout | TaskKind::Interval(_) => task.arguments.clone(),
                 TaskKind::AnimationFrame => vec![Value::Number(self.clock as f64)],
+                TaskKind::Idle => vec![self.idle_deadline()],
             };
             let callback = task.callback.clone();
             if let TaskKind::Interval(period) = task.kind {
@@ -3362,6 +3386,27 @@ impl ScriptRuntime {
                     .ok_or_else(|| runtime_error("window location is unavailable")),
                 "innerWidth" => Ok(Value::Number(self.viewport.width as f64)),
                 "innerHeight" => Ok(Value::Number(self.viewport.height as f64)),
+                "performance" => Ok(self.performance.clone()),
+                "getComputedStyle" => Ok(self.native_function(
+                    Native::Window(geometry::WindowMethod::GetComputedStyle),
+                    "getComputedStyle",
+                    1,
+                )),
+                "matchMedia" => Ok(self.native_function(
+                    Native::Window(geometry::WindowMethod::MatchMedia),
+                    "matchMedia",
+                    1,
+                )),
+                "requestIdleCallback" => Ok(self.native_function(
+                    Native::Window(geometry::WindowMethod::RequestIdleCallback),
+                    "requestIdleCallback",
+                    1,
+                )),
+                "cancelIdleCallback" => Ok(self.native_function(
+                    Native::Window(geometry::WindowMethod::CancelIdleCallback),
+                    "cancelIdleCallback",
+                    1,
+                )),
                 "devicePixelRatio" => Ok(Value::Number(self.viewport.device_pixel_ratio as f64)),
                 "scrollX" | "pageXOffset" => {
                     Ok(Value::Number(self.document_scroll_offset().0 as f64))
@@ -8850,6 +8895,7 @@ impl ScriptRuntime {
             executed += 1;
         }
         self.sync_selection_change()?;
+        self.prune_event_targets();
         self.collect_detached_nodes();
         Ok(())
     }
@@ -9262,6 +9308,7 @@ impl ScriptRuntime {
                 .transpose()?
                 .map_or(0, delay_milliseconds),
             TaskKind::AnimationFrame => 16,
+            TaskKind::Idle => 0,
         };
         let kind = match kind {
             TaskKind::Interval(_) => TaskKind::Interval(delay),

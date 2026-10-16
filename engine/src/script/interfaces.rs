@@ -210,6 +210,14 @@ static INTERFACES: &[Interface] = &[
             ("hasAttribute", Method(1)),
             ("toggleAttribute", Method(1)),
             ("getAttributeNames", Method(0)),
+            ("getBoundingClientRect", Method(0)),
+            ("getClientRects", Method(0)),
+            ("clientWidth", ReadOnly),
+            ("clientHeight", ReadOnly),
+            ("clientTop", ReadOnly),
+            ("clientLeft", ReadOnly),
+            ("scrollWidth", ReadOnly),
+            ("scrollHeight", ReadOnly),
             ("hasAttributes", Method(0)),
             ("querySelector", Method(1)),
             ("querySelectorAll", Method(1)),
@@ -314,6 +322,11 @@ static INTERFACES: &[Interface] = &[
             ("style", ReadOnly),
             ("dataset", ReadOnly),
             ("innerText", ReadWrite),
+            ("offsetWidth", ReadOnly),
+            ("offsetHeight", ReadOnly),
+            ("offsetTop", ReadOnly),
+            ("offsetLeft", ReadOnly),
+            ("offsetParent", ReadOnly),
             ("hidden", Flag("hidden")),
             ("title", Attr("title")),
             ("lang", Attr("lang")),
@@ -987,6 +1000,11 @@ impl ScriptRuntime {
         let first = arguments.first().cloned().unwrap_or(Value::Undefined);
         let second = arguments.get(1).cloned().unwrap_or(Value::Undefined);
         let on_document = matches!(this, Value::Document);
+        if member.access != Access::Set
+            && let Some(measured) = self.element_geometry(node, member.name())?
+        {
+            return Ok(Some(measured));
+        }
         let value = match (member.name(), member.access) {
             ("tagName", Access::Get) | ("localName", Access::Get) => {
                 let document = self.document.borrow();
@@ -1356,7 +1374,15 @@ impl ScriptRuntime {
         &mut self,
         interface: &'static str,
         arguments: Vec<Value>,
+        new_target: Value,
     ) -> Result<Value, ScriptError> {
+        if interface == "EventTarget" {
+            let prototype = match new_target {
+                Value::Object(_) => self.prototype_from_constructor(&new_target)?,
+                _ => self.intrinsics.dom.prototype("EventTarget"),
+            };
+            return Ok(Value::Object(self.new_event_target(prototype)));
+        }
         let first = arguments.first().cloned().unwrap_or(Value::Undefined);
         let data = |runtime: &mut Self| match first.clone() {
             Value::Undefined => Ok(String::new()),

@@ -234,6 +234,11 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         ],
     },
     EventInterface {
+        name: "MediaQueryListEvent",
+        parent: "Event",
+        members: &[("media", Text), ("matches", Flag)],
+    },
+    EventInterface {
         name: "SubmitEvent",
         parent: "Event",
         members: &[("submitter", Any)],
@@ -355,6 +360,8 @@ enum CallbackKind {
 pub(super) enum ListenerTarget {
     Node(NodeId),
     Window,
+    // a script object that is an EventTarget, such as `new EventTarget()` or a MediaQueryList
+    Object(u32),
 }
 
 pub(super) struct Listener {
@@ -402,6 +409,10 @@ pub(super) struct EventRecord {
 }
 
 impl EventRecord {
+    pub(super) fn set_field(&self, name: &str, value: Value) {
+        self.fields.borrow_mut().insert(name.to_string(), value);
+    }
+
     pub(super) fn event_type(&self) -> String {
         self.meta.borrow().event_type.clone()
     }
@@ -711,6 +722,10 @@ impl ScriptRuntime {
             Value::Element(handle) => Some(ListenerTarget::Node(handle.id)),
             Value::Document => Some(ListenerTarget::Node(self.document_node())),
             Value::Window => Some(ListenerTarget::Window),
+            Value::Object(object) => match object.borrow().class {
+                ObjectClass::EventTarget(id) => Some(ListenerTarget::Object(id)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -719,13 +734,48 @@ impl ScriptRuntime {
         match target {
             ListenerTarget::Node(node) => self.node_value(node),
             ListenerTarget::Window => Value::Window,
+            ListenerTarget::Object(id) => self
+                .event_targets
+                .get(&id)
+                .and_then(Weak::upgrade)
+                .map_or(Value::Null, Value::Object),
         }
+    }
+
+    // a fresh object that can hold listeners, with the given prototype
+    pub(super) fn new_event_target(&mut self, prototype: ObjectHandle) -> ObjectHandle {
+        self.next_event_target += 1;
+        let id = self.next_event_target;
+        let object = new_object(JsObject::with_prototype(
+            Some(prototype),
+            ObjectClass::EventTarget(id),
+        ));
+        self.event_targets.insert(id, Rc::downgrade(&object));
+        object
+    }
+
+    // forgets listeners of event target objects that script can no longer reach
+    pub(super) fn prune_event_targets(&mut self) {
+        let before = self.event_targets.len();
+        self.event_targets
+            .retain(|_, object| object.strong_count() != 0);
+        if self.event_targets.len() == before {
+            return;
+        }
+        let live = &self.event_targets;
+        let alive = |target: &ListenerTarget| match target {
+            ListenerTarget::Object(id) => live.contains_key(id),
+            _ => true,
+        };
+        self.event_listeners.retain(|target, _| alive(target));
+        self.event_handlers.retain(|(target, _), _| alive(target));
     }
 
     // the targets an event visits, innermost first; the window follows a connected node
     fn event_path(&self, target: ListenerTarget, event_type: &str) -> Vec<ListenerTarget> {
-        let ListenerTarget::Node(node) = target else {
-            return vec![ListenerTarget::Window];
+        let node = match target {
+            ListenerTarget::Node(node) => node,
+            other => return vec![other],
         };
         let document = self.document.borrow();
         let mut path = std::iter::once(node)
@@ -776,6 +826,12 @@ impl ScriptRuntime {
                     .as_ref()
                     .is_some_and(|existing| values_equal(existing, &callback))
         });
+        if let ListenerTarget::Object(id) = target
+            && let Some(object) = self.event_targets.get(&id).and_then(Weak::upgrade)
+        {
+            self.held_targets.insert(id, object);
+        }
+        let listeners = self.event_listeners.entry(target).or_default();
         if !duplicate {
             listeners.push(Listener {
                 event,
@@ -848,6 +904,11 @@ impl ScriptRuntime {
                 !matches
             });
         }
+        if let ListenerTarget::Object(id) = target
+            && self.event_listeners.get(&target).is_none_or(Vec::is_empty)
+        {
+            self.held_targets.remove(&id);
+        }
         Ok(())
     }
 
@@ -864,12 +925,28 @@ impl ScriptRuntime {
                     .filter(|value| !is_primitive(value))
                     .unwrap_or(Value::Null);
             }
-            ListenerTarget::Node(node) => node,
+            ListenerTarget::Node(node) => Some(node),
+            ListenerTarget::Object(_) => {
+                let handler = match self.target_value(target) {
+                    Value::Object(object) => object
+                        .borrow()
+                        .get(&format!("on{event}"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                return if is_primitive(&handler) {
+                    Value::Null
+                } else {
+                    handler
+                };
+            }
         };
         if let Some(handler) = self.event_handlers.get(&(target, event.to_string())) {
             return handler.clone();
         }
-        self.attribute_handler(node, event).unwrap_or(Value::Null)
+        node.and_then(|node| self.attribute_handler(node, event))
+            .unwrap_or(Value::Null)
     }
 
     pub(super) fn set_event_handler(&mut self, target: ListenerTarget, event: &str, value: Value) {
@@ -1008,6 +1085,7 @@ impl ScriptRuntime {
                 ListenerTarget::Node(_) => !self
                     .event_handlers
                     .contains_key(&(target, event_type.to_string())),
+                ListenerTarget::Object(_) => true,
             };
         if implicit {
             let handler = self.event_handler(target, event_type);

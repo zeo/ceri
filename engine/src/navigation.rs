@@ -1,4 +1,6 @@
-use crate::css::{AnimatableProperty, ColorScheme, StyleContext, Stylesheet, TransitionState};
+use crate::css::{
+    AnimatableProperty, ColorScheme, StyleContext, StyleState, Stylesheet, TransitionState,
+};
 use crate::dom::{AccessibilityNode, Document, NodeId, ScriptSource, StylesheetSource};
 use crate::font::FontSet;
 use crate::image::Image;
@@ -7,8 +9,8 @@ use crate::layout::{
 };
 use crate::paint::Canvas;
 use crate::script::{
-    HostRuntimeInfo, KeyModifiers, ModuleSourceLoader, NavigationRequest, ScriptRuntime,
-    StorageData, StorageHandle, ViewportMetrics, runtime_error,
+    HostRuntimeInfo, KeyModifiers, LayoutInputs, ModuleSourceLoader, NavigationRequest,
+    ScriptRuntime, StorageData, StorageHandle, ViewportMetrics, runtime_error,
 };
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -821,7 +823,9 @@ struct Page {
     document: Rc<RefCell<Document>>,
     runtime: ScriptRuntime,
     // parsed once per document, because layout and paint run on every frame
-    stylesheet: Stylesheet,
+    stylesheet: Rc<Stylesheet>,
+    // shared with the runtime, so script can lay out the document to measure it
+    layout_inputs: Rc<RefCell<LayoutInputs>>,
     animated: bool,
     // decoded once per document and shared by every frame; failures are remembered too
     images: RefCell<HashMap<String, Option<Rc<Image>>>>,
@@ -1012,6 +1016,7 @@ impl Browser {
         if let Some(page) = self.page.as_mut() {
             page.runtime.set_viewport_metrics(self.viewport);
         }
+        self.evaluate_media_queries();
     }
 
     pub fn device_pixel_ratio(&self) -> f32 {
@@ -1025,6 +1030,34 @@ impl Browser {
 
     pub fn set_user_preferences(&mut self, preferences: UserPreferences) {
         self.preferences = preferences;
+        if let Some(page) = self.page.as_ref() {
+            let mut inputs = page.layout_inputs.borrow_mut();
+            inputs.extras.color_scheme = preferences.color_scheme;
+            inputs.extras.reduced_motion = preferences.reduced_motion;
+        }
+        self.evaluate_media_queries();
+    }
+
+    // media query lists answer again after the viewport or a preference changed
+    fn evaluate_media_queries(&mut self) {
+        if let Some(page) = self.page.as_mut()
+            && let Err(error) = page.runtime.evaluate_media_queries()
+        {
+            page.runtime
+                .report(format!("media query change listener failed: {error}"));
+        }
+    }
+
+    fn layout_inputs(&self, stylesheet: Rc<Stylesheet>) -> Rc<RefCell<LayoutInputs>> {
+        Rc::new(RefCell::new(LayoutInputs {
+            stylesheet,
+            fonts: self.fonts.clone(),
+            extras: StyleState {
+                color_scheme: self.preferences.color_scheme,
+                reduced_motion: self.preferences.reduced_motion,
+                ..StyleState::default()
+            },
+        }))
     }
 
     pub fn user_preferences(&self) -> UserPreferences {
@@ -1221,6 +1254,9 @@ impl Browser {
         for dropped in dropped_rules {
             runtime.report(format!("dropped CSS rule: {dropped}"));
         }
+        let parsed_stylesheet = Rc::new(parsed_stylesheet);
+        let layout_inputs = self.layout_inputs(parsed_stylesheet.clone());
+        runtime.set_layout_inputs(layout_inputs.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -1242,6 +1278,7 @@ impl Browser {
             document,
             runtime,
             stylesheet: parsed_stylesheet,
+            layout_inputs,
             animated,
             images: RefCell::default(),
         });
@@ -2143,6 +2180,15 @@ impl Browser {
                 }
             }
         }
+        page.layout_inputs.borrow_mut().extras = StyleState {
+            hovered: self.hovered_node,
+            color_scheme: style_state.color_scheme,
+            reduced_motion: style_state.reduced_motion,
+            transitions: style_state.transitions.clone(),
+            animation_starts: style_state.animation_starts.clone(),
+            image_sizes: style_state.image_sizes.clone(),
+            ..StyleState::default()
+        };
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         layout.prose_selections = page.runtime.prose_selections();
         if let Some(base) = self.current_url.as_ref() {
@@ -2521,7 +2567,8 @@ impl Browser {
         let document = Rc::new(RefCell::new(
             Document::parse(&source).expect("built-in recovery document should parse"),
         ));
-        let stylesheet = document.borrow().style_text();
+        let stylesheet = Rc::new(Stylesheet::parse_recovering(&document.borrow().style_text()).0);
+        let layout_inputs = self.layout_inputs(stylesheet.clone());
         self.page = Some(Page {
             runtime: {
                 let mut runtime = ScriptRuntime::with_storage_and_runtime_info(
@@ -2536,10 +2583,12 @@ impl Browser {
                     runtime.set_time_zone(time_zone.clone());
                 }
                 runtime.set_viewport_metrics(self.viewport);
+                runtime.set_layout_inputs(layout_inputs.clone());
                 runtime
             },
             document,
-            stylesheet: Stylesheet::parse_recovering(&stylesheet).0,
+            stylesheet,
+            layout_inputs,
             animated: false,
             images: RefCell::default(),
         });
@@ -4757,6 +4806,104 @@ mod tests {
         );
         assert_eq!(writes.borrow().as_slice(), ["copied"]);
         assert_eq!(text.borrow().as_str(), "copied");
+    }
+
+    #[test]
+    fn script_measures_layout_computed_style_and_media_queries() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } #box { position: relative; width: 100px; height: 40px; padding: 10px; border: 2px solid red; margin: 5px 0 0 8px; color: rgb(10, 20, 30) } #inner { height: 10px } @media (max-width: 500px) { #box { width: 50px } }</style><div id="box"><div id="inner"></div></div><p id="status">idle</p><script>
+                const box = document.getElementById("box");
+                const inner = document.getElementById("inner");
+                const rect = box.getBoundingClientRect();
+                const style = getComputedStyle(box);
+                globalThis.wide = matchMedia("(min-width: 600px)");
+                globalThis.changes = [];
+                wide.addEventListener("change", (event) => changes.push(event.matches + ":" + event.media + ":" + wide.matches));
+                wide.onchange = () => changes.push("handler");
+                document.getElementById("status").textContent = [
+                    rect.x, rect.y, rect.width, rect.height, box.offsetWidth, box.clientWidth,
+                    box.clientTop, inner.offsetTop, inner.offsetParent === box, style.width,
+                    style.paddingLeft, style.getPropertyValue("border-top-width"), style.color,
+                    style.display, style.position, wide.matches, wide.media, wide instanceof EventTarget,
+                ].join(",");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("measuring page should load");
+        let document = browser.document().expect("document should exist");
+        let status = |document: &Rc<RefCell<Document>>| {
+            let document = document.borrow();
+            let node = document.find_element_by_id("status").expect("status");
+            document.element_text_content(node)
+        };
+        assert_eq!(
+            status(&document).as_deref(),
+            Some(
+                "8,5,124,64,124,120,2,10,true,100px,10px,2px,rgb(10, 20, 30),block,relative,true,(min-width: 600px),true"
+            )
+        );
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        let page = browser.page.as_mut().expect("page should be loaded");
+        page.runtime
+            .execute(
+                r#"document.getElementById("status").textContent = changes.join("|") + "," + document.getElementById("box").offsetWidth;"#,
+            )
+            .expect("measurement after resize should run");
+        assert_eq!(
+            status(&document).as_deref(),
+            Some("handler|false:(min-width: 600px):false,74")
+        );
+    }
+
+    #[test]
+    fn performance_timeline_idle_callbacks_and_event_target_objects() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                const seen = [];
+                performance.mark("start");
+                setTimeout(() => {
+                    performance.mark("end");
+                    const measure = performance.measure("span", "start", "end");
+                    seen.push(performance.now(), measure.duration, performance.getEntriesByType("mark").length, typeof performance.timeOrigin);
+                    requestIdleCallback((deadline) => {
+                        seen.push("idle:" + deadline.timeRemaining() + ":" + deadline.didTimeout);
+                        document.getElementById("status").textContent = seen.join(",");
+                    });
+                    cancelIdleCallback(requestIdleCallback(() => seen.push("cancelled")));
+                }, 25);
+                class Bus extends EventTarget {
+                    ping() { return this.dispatchEvent(new CustomEvent("ping", { detail: 3, cancelable: true })); }
+                }
+                const bus = new Bus();
+                bus.addEventListener("ping", (event) => { seen.push("ping:" + event.detail + ":" + (event.target === bus)); event.preventDefault(); });
+                seen.push(bus instanceof EventTarget, bus.ping());
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("timing page should load");
+        browser.advance_time(30).expect("timers should run");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("ping:3:true,true,false,25,25,2,number,idle:50:false")
+        );
     }
 
     #[test]
