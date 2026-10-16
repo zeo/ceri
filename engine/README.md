@@ -12,8 +12,9 @@ The current slice implements:
 
 - HTML tokenization and a small DOM tree
 - HTML entity decoding for common named and numeric entities
-- CSS rules with compound tag, class, id, and attribute selectors, top-level selector lists, bounded `:not(...)`, descendant matching, and direct-child matching
-- a deterministic cascade with selector specificity
+- CSS rules with compound tag, class, id and attribute selectors (`=`, `~=`, `|=`, `^=`, `$=`, `*=` and the `i` flag), all four combinators, `:is()`, `:where()`, `:not()`, `:has()` with relative selectors, `:nth-child(An+B of S)`, `:nth-last-child()`, the `*-of-type` family, `:empty`, `:focus-within`, `:active`, `:placeholder-shown`, `:any-link`, `:read-only`, `:read-write`, `:required` and `:optional`; ids and classes keep their case and accept escapes, and pseudo-elements the engine does not draw (`::placeholder`, `::selection`, `::marker` and the like) parse without applying
+- a cascade ordered by importance, inline style, specificity and source position, so `!important` wins and a later shorthand overrides an earlier longhand in the same rule
+- every CSS Color 4 named color, hex with alpha, `rgb()` and `hsl()` in both syntaxes, `hwb()`, `currentColor` and `color-mix()` in `srgb` and `srgb-linear`
 - inherited CSS custom properties with `:root` matching, bounded `var()` substitution, fallbacks, cycle rejection, and `calc()` lengths
 - document and subtree `querySelector` and `querySelectorAll` lookups using the same selector matcher
 - block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
