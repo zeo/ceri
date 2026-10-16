@@ -2,43 +2,35 @@
 
 Ceri keeps the browser engine inside the application boundary. Rust owns the native process model and the engine lifecycle. Web code owns presentation and application state. TypeScript is an authoring layer, not a second runtime that ships beside the app.
 
-The runtime has two engine backends behind one contract. The CEF backend runs Chromium in its own process tree. The `ceri-engine` backend is a Rust-native engine in this repository that runs in-process, on one dedicated engine thread, with no Chromium underneath it. Both load the same packaged app from `https://app.ceri.invalid`, share the asset-origin policy in `src/assets.rs`, and expose the same typed runtime query to page code.
+The engine is `ceri-engine`, a Rust-native engine in this repository that runs in-process on one dedicated engine thread. It loads the packaged app from `https://app.ceri.invalid` through the asset-origin policy in `src/assets.rs` and exposes one typed runtime query to page code.
 
 ```mermaid
 flowchart LR
-    web["HTML CSS JavaScript"] -->|"bundled HTTPS origin"| renderer["CEF renderer process"]
-    renderer -->|"typed cefQuery request"| bridge["Rust V8 bridge"]
-    browser["Rust browser process"] -->|"CEF Views"| window["native window"]
-    browser -->|"scheme handler"| resolver["asset resolver"]
+    web["HTML CSS JavaScript"] -->|"owned HTTPS origin"| engine["engine thread"]
+    engine -->|"typed ceriQuery request"| info["HostRuntimeInfo"]
+    window["main thread: winit window"] -->|"bounded command queue"| engine
+    engine -->|"device-pixel frames"| window
+    engine -->|"ResourceProvider"| resolver["asset resolver"]
     resolver --> assets["packaged assets"]
-    browser -->|"restart once, then recover"| renderer
+    window -->|"restart once, then recover"| engine
 ```
 
 ## Process model
 
-The executable follows CEF's multi-process model:
-
-- the browser process creates the CEF Views window, registers the app origin, controls navigation, and owns the asset resolver
-- renderer processes execute the web application and receive the narrow runtime bridge
-- GPU and utility processes are started by CEF from the same bundled executable
-- the Windows sandbox is enabled by default through the CEF helper bootstrap
-
-The browser process verifies the entry route before calling `cef::initialize`. The profile lives in a per-user Ceri directory so Chromium's cache and session state do not collide with another application.
-
-## Rust-native process model
-
-The `custom-engine` build is a single process:
+The runtime is a single process:
 
 - the main thread owns the native window, input translation, the display scale factor and the desktop theme
 - one engine thread owns the browser state, navigation, layout, paint and the page script runtime, reached through a bounded command queue
 - frames cross back as device-pixel surfaces that the window presents through a CPU surface
 - worker threads carry page-visible `Worker` objects, with provider requests serviced through an explicit host pump
 
-There is no renderer sandbox in this mode, because there is no separate renderer process to confine. What confines the page instead is the surface the engine exposes: script has no filesystem, process, socket or clipboard handle, and every resource read crosses the embedder-owned `ResourceProvider` seam that applies the same path policy as the CEF scheme handler. Multi-process isolation for the Rust-native engine is a named gate, not a shipped property.
+The runtime verifies the entry route before the engine starts. The profile lives in a per-user Ceri directory, so storage and window geometry do not collide with another application.
+
+There is no process sandbox yet, because there is no separate renderer process to confine. What confines the page today is the surface the engine exposes: script has no filesystem, process, socket or clipboard handle, and every resource read crosses the embedder-owned `ResourceProvider` seam, which applies the asset path policy. A renderer process per window under a Windows job object and restricted token is the next isolation milestone, not a shipped property.
 
 ## App origin and asset routing
 
-The app loads from `https://app.ceri.invalid`. This is an application-owned origin, registered with CEF's HTTPS scheme handler factory in the CEF build and served through the engine's `ResourceProvider` seam in the Rust-native build. It is not resolved by DNS and it does not require a listening socket.
+The app loads from `https://app.ceri.invalid`. This is an application-owned origin served through the engine's `ResourceProvider` seam. It is not resolved by DNS and it does not require a listening socket.
 
 The resolver receives the URL path, normalizes it once, and checks the canonical result against the packaged asset root. It then returns a file or a Ceri-owned response document. Query strings are not used as filesystem paths. The resolver does not follow symlinks outside the asset root.
 
@@ -46,36 +38,23 @@ The origin gives normal browser code a stable secure context for modules, storag
 
 ## Runtime bridge
 
-The SDK keeps the familiar `window.cefQuery` call shape so existing CEF-oriented web code can be adapted without adding a Node dependency. Experimental backends can provide the promise-based `window.ceriQuery` method first, while the SDK falls back to `cefQuery` for the shipping adapter. Ceri installs the CEF function from the Rust render-process handler. The handler:
+`window.ceriQuery` takes one request string and returns a promise. It exists only when the host supplies `HostRuntimeInfo`, and it answers exactly one request, `{"method":"runtimeInfo","version":1}`, with the engine name, the recovery state and the session ID. Any other request rejects. The SDK validates the response shape before handing it to page code.
 
-1. accepts one object with a string request
-2. rejects persistent queries
-3. rejects requests larger than 1024 bytes
-4. checks that the current frame is the main frame on `https://app.ceri.invalid`
-5. accepts the exact `runtimeInfo` request
-6. invokes the supplied success or failure callback with a validated response
-
-The bridge has no general-purpose evaluator, no filesystem method, and no network proxy. `cefQueryCancel` is a no-op because the current runtime response is completed during the native call and does not create a pending request.
+The bridge has no general-purpose evaluator, no filesystem method, and no network proxy. New native capabilities should arrive as typed commands with explicit input limits, an allowlist per window and origin, and tests for untrusted callers.
 
 ## Navigation and recovery
 
-Top-level navigation is allowed only for the app origin and Ceri's own data-URI recovery documents. Popups are blocked. A renderer termination cancels the normal load state and reloads once. A second termination loads a recovery document and stops the loop. Load errors are converted to the same application-owned recovery surface.
-
-The recovery page is generated by Rust, carries a restrictive CSP, and points back to the verified entry URL. This prevents a missing asset or a dead renderer from becoming a browser-owned error page that tells the user to repair an unrelated local server.
+Top-level navigation stays on the app origin and Ceri's own recovery documents. A page can fetch outside its origin only through HTTPS origins the operator lists with `--ceri-allow-origin`. If the engine thread stops, the window restarts it once; a second failure shows the engine's own recovery document and stops the loop. Load errors are converted to the same application-owned recovery surface, so a missing asset never becomes a generic browser error page.
 
 ## Security boundaries
 
-- the browser process owns the filesystem path and canonicalization checks
-- the renderer sees only the web asset origin and the explicit bridge function
-- the bridge performs origin and frame checks inside the native handler
-- application documents receive a restrictive CSP, `nosniff`, `no-referrer`, and frame denial headers
-- remote top-level navigation and popup creation are denied
-- sandboxed Windows builds use the CEF sandbox bootstrap and ship the helper DLL in the generated bundle
-
-The bridge boundary is intentionally small. New native capabilities should be added as typed, audited methods with explicit input limits and tests for untrusted frames.
+- the runtime owns the filesystem path and canonicalization checks
+- the engine sees only the app asset origin, the allowlisted HTTPS origins and the explicit bridge function
+- remote top-level navigation is denied
+- the clipboard and file input reach the page through host seams that pass text and bytes, never handles or paths
 
 ## Platform contract
 
-The source layout covers Windows, macOS, and Linux on x64 and ARM64. CEF binaries are target-specific, so a CEF release pipeline must build once per target and package that target's CEF archive. The Rust-native engine has no per-target archive and its bundle is the executable plus packaged assets.
+The source layout covers Windows, macOS, and Linux on x64 and ARM64. The engine has no per-target archive, and its bundle is the executable plus packaged assets.
 
-The Windows x64 path is the locally validated path for this repository. The Rust-native engine is built and tested on Linux, macOS and Windows in CI, including a headless render of the packaged app. macOS and Linux still require signing and installed-runtime smoke gates before a release claim is made, and the CEF path additionally requires its per-target archive.
+The Windows x64 path is the locally validated path for this repository. Clipboard, file input and time zone adapters are implemented for Windows; other platforms return typed errors for clipboard and file input until their adapters land. macOS and Linux still require signing and installed-runtime smoke gates before a release claim is made.

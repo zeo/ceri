@@ -99,7 +99,7 @@ async function runContinuityCheck() {
     const session = info.session.slice(0, 8) || "unnamed";
     const state = info.recovery === "degraded" ? "fail" : "pass";
 
-    runtimeLine.textContent = `${info.engine} / Chromium ${info.chromium}`;
+    runtimeLine.textContent = info.engine;
     updateCheck(
       "runtime",
       state,

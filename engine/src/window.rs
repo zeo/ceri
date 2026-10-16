@@ -145,7 +145,7 @@ impl<F> App<F>
 where
     F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
 {
-    // one restart, then the engine's own recovery document, matching the CEF path
+    // one restart, then the engine's own recovery document
     fn recover(&mut self, event_loop: &ActiveEventLoop, detail: &str) -> bool {
         self.restarts = self.restarts.saturating_add(1);
         if self.restarts > 2 {

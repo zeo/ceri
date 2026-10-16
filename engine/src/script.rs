@@ -1298,7 +1298,6 @@ const RUNTIME_INFO_REQUEST: &str = r#"{"method":"runtimeInfo","version":1}"#;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostRuntimeInfo {
     pub engine: String,
-    pub chromium: String,
     pub recovery: String,
     pub session: String,
 }
@@ -1306,13 +1305,11 @@ pub struct HostRuntimeInfo {
 impl HostRuntimeInfo {
     pub fn new(
         engine: impl Into<String>,
-        chromium: impl Into<String>,
         recovery: impl Into<String>,
         session: impl Into<String>,
     ) -> Self {
         Self {
             engine: engine.into(),
-            chromium: chromium.into(),
             recovery: recovery.into(),
             session: session.into(),
         }
@@ -3564,7 +3561,6 @@ impl ScriptRuntime {
                     .as_ref()
                     .map(|_| Value::Builtin(Builtin::CeriQuery))
                     .unwrap_or(Value::Undefined)),
-                "cefQuery" | "cefQueryCancel" => Ok(Value::Undefined),
                 _ => Err(runtime_error(format!("window has no property {property}"))),
             },
             Value::Navigator => match property {
@@ -9255,7 +9251,6 @@ impl ScriptRuntime {
                 }
                 let mut payload = BTreeMap::new();
                 payload.insert("engine".to_string(), Value::String(info.engine.into()));
-                payload.insert("chromium".to_string(), Value::String(info.chromium.into()));
                 payload.insert("recovery".to_string(), Value::String(info.recovery.into()));
                 payload.insert("session".to_string(), Value::String(info.session.into()));
                 let response = self.json_text(&plain_object(payload))?;

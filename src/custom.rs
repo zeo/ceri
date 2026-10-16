@@ -147,7 +147,6 @@ fn system_font_set() -> FontSet {
 fn runtime_info() -> HostRuntimeInfo {
     HostRuntimeInfo::new(
         format!("Ceri {}", env!("CARGO_PKG_VERSION")),
-        "none",
         "ready",
         session_id(),
     )
@@ -192,7 +191,7 @@ fn allowed_origins(arguments: &[std::ffi::OsString]) -> Result<Vec<String>, Stri
     Ok(origins)
 }
 
-// serves the packaged app through the same origin policy the CEF scheme handler uses
+// serves the packaged app through the asset origin policy
 struct PackagedAssets {
     assets: Arc<AssetOrigin>,
     allowed_origins: Vec<String>,

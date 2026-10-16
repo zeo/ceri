@@ -29,7 +29,6 @@ function decodeRuntimeInfo(response) {
     typeof payload !== "object" ||
     payload === null ||
     typeof payload.engine !== "string" ||
-    typeof payload.chromium !== "string" ||
     typeof payload.session !== "string" ||
     !RECOVERY_STATES.has(payload.recovery)
   ) {
@@ -41,18 +40,13 @@ function decodeRuntimeInfo(response) {
 
   return Object.freeze({
     engine: payload.engine,
-    chromium: payload.chromium,
     recovery: payload.recovery,
     session: payload.session,
   });
 }
 
 export function runtimeInfo() {
-  if (typeof window !== "undefined" && typeof window.ceriQuery === "function") {
-    return window.ceriQuery(RUNTIME_INFO_REQUEST).then(decodeRuntimeInfo);
-  }
-
-  if (typeof window === "undefined" || typeof window.cefQuery !== "function") {
+  if (typeof window === "undefined" || typeof window.ceriQuery !== "function") {
     return Promise.reject(
       new CeriBridgeError(
         "bridge-unavailable",
@@ -61,34 +55,10 @@ export function runtimeInfo() {
     );
   }
 
-  return new Promise((resolve, reject) => {
-    try {
-      window.cefQuery({
-        request: RUNTIME_INFO_REQUEST,
-        persistent: false,
-        onSuccess(response) {
-          try {
-            resolve(decodeRuntimeInfo(response));
-          } catch (fault) {
-            reject(fault);
-          }
-        },
-        onFailure(errorCode, errorMessage) {
-          reject(
-            new CeriBridgeError(
-              `cef:${errorCode}`,
-              errorMessage || "The Ceri host rejected the runtime information request",
-            ),
-          );
-        },
-      });
-    } catch {
-      reject(
-        new CeriBridgeError(
-          "query-failed",
-          "The Ceri host bridge could not accept the runtime information request",
-        ),
-      );
-    }
+  return window.ceriQuery(RUNTIME_INFO_REQUEST).then(decodeRuntimeInfo, () => {
+    throw new CeriBridgeError(
+      "query-failed",
+      "The Ceri host rejected the runtime information request",
+    );
   });
 }

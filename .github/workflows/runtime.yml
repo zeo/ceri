@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 jobs:
-  custom-engine:
+  runtime:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     steps:
@@ -39,17 +39,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libxkbcommon-dev
       - name: test
-        run: cargo test --locked --no-default-features --features custom-engine --all-targets
+        run: cargo test --locked --all-targets
       - name: clippy
-        run: cargo clippy --locked --no-default-features --features custom-engine --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: render the packaged app without a window
         shell: bash
         run: |
-          cargo run --locked --no-default-features --features custom-engine --bin ceri -- \
+          cargo run --locked --bin ceri -- \
             "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target/app.png"
           test -s target/app.png
       - name: bundle
-        run: cargo run --locked --no-default-features --features custom-engine --bin ceri_bundle -- --output dist/ci
+        run: cargo run --locked --bin ceri_bundle -- --output dist/ci
     strategy:
       fail-fast: false
       matrix:

@@ -35,12 +35,7 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
         .to_path_buf();
     let mut browser = continuity_browser(
         &root,
-        Some(HostRuntimeInfo::new(
-            "ceri-lab",
-            "none",
-            "ready",
-            "lab-session",
-        )),
+        Some(HostRuntimeInfo::new("ceri-lab", "ready", "lab-session")),
     );
     assert_eq!(
         browser
@@ -99,7 +94,7 @@ fn loads_the_packaged_continuity_page_without_a_recovery_document() {
             .borrow()
             .element_text_content(runtime_line)
             .as_deref(),
-        Some("ceri-lab / Chromium none")
+        Some("ceri-lab")
     );
 
     let root = document

@@ -7,23 +7,9 @@ use std::{
 };
 
 const APP_NAME: &str = "ceri";
-#[cfg(all(feature = "cef-engine", target_os = "macos"))]
-const HELPER_NAME: &str = "ceri_helper";
-
-#[cfg(feature = "cef-engine")]
 const HELP: &str = "Usage: ceri_bundle [--release] [--output PATH]\n\
 \n\
-Build Ceri and assemble its bundled CEF runtime.\n\
-\n\
-Options:\n\
-  -o, --output PATH  Bundle destination, defaults to ./dist\n\
-      --release      Build the release profile\n\
-  -h, --help         Show this help\n";
-
-#[cfg(not(feature = "cef-engine"))]
-const HELP: &str = "Usage: ceri_bundle [--release] [--output PATH]\n\
-\n\
-Build Ceri on its own engine and assemble the app bundle.\n\
+Build Ceri and assemble the app bundle.\n\
 \n\
 Options:\n\
   -o, --output PATH  Bundle destination, defaults to ./dist\n\
@@ -127,14 +113,6 @@ fn prepare_output(requested: &Path) -> io::Result<PathBuf> {
         ));
     }
 
-    #[cfg(target_os = "macos")]
-    if output.join(format!("{APP_NAME}.app")).exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "the destination already contains a Ceri app bundle",
-        ));
-    }
-
     Ok(output)
 }
 
@@ -178,59 +156,10 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "cef-engine", target_os = "windows"))]
-fn platform_bundle(output: &Path, release: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(cef::build_util::win::build_bundle(
-        output, APP_NAME, release,
-    )?)
-}
-
-#[cfg(all(feature = "cef-engine", target_os = "linux"))]
-fn platform_bundle(output: &Path, release: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(cef::build_util::linux::build_bundle(
-        output, APP_NAME, release,
-    )?)
-}
-
-#[cfg(all(feature = "cef-engine", target_os = "macos"))]
-fn platform_bundle(output: &Path, release: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    use cef::build_util::{mac, metadata};
-
-    let metadata = metadata::get_cargo_metadata()?;
-    let bundle_metadata = metadata.parse_bundle_metadata(APP_NAME)?;
-    if bundle_metadata.helper_name != HELPER_NAME {
-        return Err(invalid_input(format!(
-            "package metadata must name {HELPER_NAME} as the CEF helper"
-        ))
-        .into());
-    }
-
-    cargo_build(APP_NAME, release, &[])?;
-    cargo_build(HELPER_NAME, release, &[])?;
-
-    let profile = if release { "release" } else { "debug" };
-    let target = metadata.target_directory().join(profile);
-    let version = env!("CARGO_PKG_VERSION").parse()?;
-    let info = mac::BundleInfo::new(APP_NAME, "dev.ceri.runtime", "Ceri", "English", version);
-
-    Ok(mac::bundle(
-        output,
-        &target,
-        APP_NAME,
-        HELPER_NAME,
-        bundle_metadata.resources_path,
-        info,
-    )?)
-}
-
-fn cargo_build(binary: &str, release: bool, features: &[&str]) -> io::Result<()> {
+fn cargo_build(binary: &str, release: bool) -> io::Result<()> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command.args(["build", "--bin", binary]);
-    if !features.is_empty() {
-        command.arg("--no-default-features");
-        command.args(["--features", &features.join(" ")]);
-    }
     if release {
         command.arg("--release");
     }
@@ -245,22 +174,9 @@ fn cargo_build(binary: &str, release: bool, features: &[&str]) -> io::Result<()>
     }
 }
 
-#[cfg(all(
-    feature = "cef-engine",
-    not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
-))]
-fn platform_bundle(_output: &Path, _release: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "CEF desktop bundles support Windows, Linux, and macOS",
-    )
-    .into())
-}
-
-// the custom engine links no external runtime, so the bundle is the executable plus its assets
-#[cfg(not(feature = "cef-engine"))]
+// the engine links no external runtime, so the bundle is the executable plus its assets
 fn platform_bundle(output: &Path, release: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    cargo_build(APP_NAME, release, &["custom-engine"])?;
+    cargo_build(APP_NAME, release)?;
     let profile = if release { "release" } else { "debug" };
     let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -278,7 +194,6 @@ fn platform_bundle(output: &Path, release: bool) -> Result<PathBuf, Box<dyn std:
     Ok(executable)
 }
 
-#[cfg(not(feature = "cef-engine"))]
 fn executable_name(name: &str) -> String {
     if cfg!(target_os = "windows") {
         format!("{name}.exe")

@@ -10,49 +10,20 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "A Rust-owned desktop web runtime with its own browser engine"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [[bin]]
 name = "ceri"
 path = "src/main.rs"
 
 [[bin]]
-name = "ceri_helper"
-path = "src/bin/ceri_helper.rs"
-required-features = ["cef-engine"]
-
-[[bin]]
 name = "ceri_bundle"
 path = "src/bin/ceri_bundle.rs"
 
-[features]
-default = ["cef-engine", "sandbox"]
-cef-engine = ["dep:cef"]
-custom-engine = ["dep:ceri-engine"]
-sandbox = ["cef-engine", "cef/sandbox"]
-
-[package.metadata.cef.bundle]
-helper_name = "ceri_helper"
-
 [dependencies]
-cef = { version = "=150.2.1", features = ["build-util"], optional = true }
-ceri-engine = { path = "engine", features = ["windowed"], optional = true }
+ceri-engine = { path = "engine", features = ["windowed"] }
 
 # windows reaches the network through the platform stack, other targets use the engine client
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-ceri-engine = { path = "engine", features = [
-    "windowed",
-    "native-http",
-], optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.3"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-    "NSApplication",
-    "NSEvent",
-    "NSResponder",
-] }
+ceri-engine = { path = "engine", features = ["windowed", "native-http"] }
 
 [profile.release]
 codegen-units = 1

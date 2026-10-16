@@ -1,38 +1,28 @@
 # Ceri
 
-Ceri is a Rust-owned desktop runtime for web applications. The engine ships inside the app, so the rendering behaviour is chosen and updated with the release instead of arriving from an operating-system webview.
+Ceri is a Rust-owned desktop runtime for web applications. It ships its own browser engine inside the app, so rendering behaviour is chosen and updated with the release instead of arriving from an operating-system webview or a bundled Chromium.
 
-Two engines sit behind one runtime contract:
+The engine, `ceri-engine` in [engine/](engine/README.md), is written against the Rust standard library, with no Chromium, WebKit, Servo, Edge WebView2 or third-party JavaScript engine underneath it. The app loads from an owned HTTPS origin, `https://app.ceri.invalid`, with no loopback HTTP server, no `file://` navigation and no Node.js requirement. Rust owns process startup, window creation, navigation policy, asset routing and recovery.
 
-- `ceri-engine`, a Rust-native browser engine in [engine/](engine/README.md), written against the standard library with no Chromium, WebKit, Servo or third-party JavaScript engine underneath it
-- CEF 150.0.14 with Chromium 150, the compatibility engine for apps that need the full web platform today
+## Size and speed
 
-Both engines load the same packaged app from the same owned HTTPS origin, `https://app.ceri.invalid`, with no loopback HTTP server, no `file://` navigation, no Edge WebView2 and no Node.js requirement. Rust owns process startup, window creation, navigation policy, asset routing and recovery in both modes.
+Release build on Windows x64, running the packaged continuity app at 1120x720:
 
-## Measured difference
+- the bundle is 5.7 MB in 9 files and runs as one process, with a 28 MB working set while the app is open
+- process start to a written PNG of the first frame takes about 430 ms, font discovery included
+- an animating frame takes 2.7 ms at the median of 300
 
-Same app, same machine, release builds, Windows x64. The runtime bundle is the executable plus the packaged `web/` and `sdk/` assets.
+The CEF 150 build this repository carried before it moved to its own engine measured 411 MB in 252 files, ran six processes, and held 319.7 MB resident for the same app.
 
-| | `ceri-engine` | CEF |
-| --- | --- | --- |
-| bundle size | 4.6 MB | 411 MB |
-| files in bundle | 9 | 252 |
-| processes at rest | 1 | 6 |
-| resident memory, app open | 31 MB | 319.7 MB |
-| start to first painted frame | 160 ms median, headless render of the packaged app | not instrumented |
-| frame time, app animating | 3.3 ms at 1120x720, 5.7 ms at twice the device pixel ratio | not instrumented |
-
-The Rust-native engine renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, reaches `4 / 4` on the packaged continuity page, and applies every rule in that page's stylesheet with nothing dropped.
+The engine renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, reaches `4 / 4` on the packaged continuity page, and applies every rule in that page's stylesheet with nothing dropped.
 
 ## Build
 
-Install Rust and the native toolchain for the target platform.
-
-The Rust-native engine needs nothing else:
+Install Rust and the native toolchain for the target platform. Nothing else is needed:
 
 ```powershell
-cargo test --no-default-features --features custom-engine --all-targets
-cargo run --no-default-features --features custom-engine --bin ceri_bundle -- --release --output dist\windows-x64-custom
+cargo test --all-targets
+cargo run --bin ceri_bundle -- --release --output dist\windows-x64
 ```
 
 The generated bundle holds `ceri.exe` and an `assets` directory. Launch the executable; it resolves its asset root next to itself.
@@ -40,21 +30,8 @@ The generated bundle holds `ceri.exe` and an `assets` directory. Launch the exec
 Render one frame of the packaged app without opening a window, which is what CI checks on every push:
 
 ```powershell
-cargo run --no-default-features --features custom-engine --bin ceri -- "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target\app.png"
+cargo run --bin ceri -- "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target\app.png"
 ```
-
-The CEF build additionally needs CMake, Ninja and the matching CEF distribution for the target. The CEF crate can download its archive during the first build, and a shared extracted directory is faster:
-
-```powershell
-$env:CEF_PATH = (Resolve-Path -LiteralPath '.\target\cef-cache\cef_windows_x86_64').Path
-$env:Path = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;' + $env:Path
-cargo test --all-targets
-cargo run --bin ceri_bundle -- --release --output dist\windows-x64-cef
-```
-
-The default build is the CEF engine with the Windows sandbox enabled, because CEF still covers more of the web platform than the Rust-native engine does. Launch the sandboxed executable from its generated bundle: CEF starts the browser process through the bundled bootstrap DLL, so copying the executable alone does not work. For development without the sandbox, add `--no-default-features --features cef-engine`.
-
-Each CEF release must be built with the CEF archive for its target. The Rust-native engine has no per-target archive.
 
 ## Authoring
 
@@ -64,14 +41,14 @@ The web surface is ordinary HTML, CSS and JavaScript. TypeScript projects can co
 import { runtimeInfo } from "./sdk/index.js";
 
 const info = await runtimeInfo();
-console.log(info.engine, info.chromium, info.recovery);
+console.log(info.engine, info.recovery);
 ```
 
-`runtimeInfo()` validates the response shape before returning it, and reads the promise-based `window.ceriQuery` bridge on the Rust-native engine or `window.cefQuery` on the CEF engine. Requests are limited to the runtime method Ceri implements. A new host capability should arrive as an explicit typed method with an explicit capability check, not as a general command evaluator.
+`runtimeInfo()` reads the promise-based `window.ceriQuery` bridge and validates the response shape before returning it. Requests are limited to the runtime method Ceri implements. A new host capability should arrive as an explicit typed method with an explicit capability check, not as a general command evaluator.
 
 ## Failure behavior
 
-Ceri verifies the entry document before the engine starts. Every packaged app document is served from the owned HTTPS origin: through the CEF scheme handler in the CEF build, and through the same asset-origin policy behind a `ResourceProvider` in the Rust-native build. Missing assets, unsafe paths, navigation errors and repeated renderer termination produce a Ceri recovery document with a retry link. The browser's generic network failure page is not part of the application path.
+Ceri verifies the entry document before the engine starts. Every packaged app document is served from the owned HTTPS origin, through the asset-origin policy behind a `ResourceProvider`. Missing assets, unsafe paths, navigation errors and repeated renderer termination produce a Ceri recovery document with a retry link. The browser's generic network failure page is not part of the application path.
 
 The resolver rejects encoded separators, traversal, malformed UTF-8, Windows device names, invalid path characters, symlink escapes and ambiguous empty path segments. Top-level extensionless routes may use the packaged `index.html`; missing subresources never fall back to the app shell.
 
@@ -79,7 +56,7 @@ Page stylesheets follow CSS error handling. An unsupported rule is dropped and r
 
 See [docs/architecture.md](docs/architecture.md) for the process model and security boundaries.
 
-## The Rust-native engine
+## The engine
 
 [engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex and basic grid layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, its own ES2022 JavaScript engine (parser, bytecode compiler and VM with generators, async functions and an object model with prototypes and descriptors) with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
 
@@ -101,6 +78,6 @@ Page text selects the same way outside form fields. A drag can cross paragraphs 
 
 Scrollbars behave like native scrollbars: the wheel scrolls from anywhere over the gutter, and pressing the thumb drags it with the pointer while it stays grabbed at its press offset.
 
-The window takes its caption from `document.title`, its icon from the packaged favicon, and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document, which is what the CEF path does with a dead renderer.
+The window takes its caption from `document.title`, its icon from the packaged favicon, and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document.
 
-What CEF still covers and this engine does not: media playback, WebGL and other GPU APIs, depth-sorted `preserve-3d` scenes, full WebAssembly, extensions, printing, platform accessibility adapters, multi-process renderer isolation, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+Not covered yet: media playback, WebGL and other GPU APIs, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, multi-process renderer isolation with a sandbox, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
