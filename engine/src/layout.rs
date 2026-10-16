@@ -4,12 +4,13 @@ use crate::css::{
     JustifyContent, Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
     Stylesheet, TextAlign,
 };
-use crate::css::{Cursor, Visibility};
+use crate::css::{Clear, Cursor, Float, Visibility};
 use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
 use crate::image::Image;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
@@ -134,6 +135,8 @@ pub struct LayoutBox {
     pub(crate) overflow_axes: [Overflow; 2],
     pub(crate) visible: bool,
     pub(crate) cursor: Cursor,
+    // floats paint after their in-flow siblings
+    pub(crate) floated: bool,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
     pub(crate) margin: ResolvedEdges,
@@ -269,11 +272,125 @@ struct InlineLine {
     y: f32,
     used: f32,
     height: f32,
+    // how far floats reach into this line from the left and right of the content box
+    left: f32,
+    right: f32,
+    // the block's line height, the band a fresh line checks floats against
+    band: f32,
+    floats: Option<Rc<FloatArea>>,
     // whether the text appended so far ended on whitespace, which decides word joining
     trailing_space: bool,
     fragments: Vec<InlineFragment>,
     // inline-block and replaced boxes already placed by a flushed line
     placed: Vec<LayoutBox>,
+}
+
+impl InlineLine {
+    fn available(&self, content_width: f32) -> f32 {
+        (content_width - self.left - self.right).max(0.0)
+    }
+
+    // a fresh line narrows to the floats beside it
+    fn fit_to_floats(&mut self, content_x: f32, content_width: f32) {
+        if let Some(floats) = &self.floats {
+            (self.left, self.right) = floats.insets(self.y, self.band, content_x, content_width);
+        }
+    }
+
+    // moves an empty line down past floats until something this wide fits beside them
+    fn make_room(&mut self, width: f32, content_x: f32, content_width: f32) {
+        while self.fragments.is_empty()
+            && width > self.available(content_width)
+            && (self.left > 0.0 || self.right > 0.0)
+        {
+            let Some(bottom) = self
+                .floats
+                .as_ref()
+                .and_then(|floats| floats.next_bottom(self.y, self.band))
+            else {
+                return;
+            };
+            self.y = bottom;
+            self.fit_to_floats(content_x, content_width);
+        }
+    }
+}
+
+// the floats of one block formatting context, as margin boxes in layout coordinates
+#[derive(Default)]
+struct FloatArea {
+    placed: std::cell::RefCell<Vec<(Rect, Float)>>,
+}
+
+impl FloatArea {
+    fn crossing(&self, top: f32, height: f32) -> Vec<(Rect, Float)> {
+        let bottom = top + height.max(1.0);
+        self.placed
+            .borrow()
+            .iter()
+            .filter(|(rect, _)| rect.y < bottom && rect.bottom() > top)
+            .copied()
+            .collect()
+    }
+
+    // how far floats reach into a band of a content box from its left and right
+    fn insets(&self, top: f32, height: f32, content_x: f32, content_width: f32) -> (f32, f32) {
+        self.crossing(top, height).into_iter().fold(
+            (0.0_f32, 0.0_f32),
+            |(left, right), (rect, side)| {
+                if side == Float::Left {
+                    (left.max(rect.x + rect.width - content_x), right)
+                } else {
+                    (left, right.max(content_x + content_width - rect.x))
+                }
+            },
+        )
+    }
+
+    // the nearest float bottom below a band's top, where the band can widen
+    fn next_bottom(&self, top: f32, height: f32) -> Option<f32> {
+        self.crossing(top, height)
+            .into_iter()
+            .map(|(rect, _)| rect.bottom())
+            .filter(|bottom| *bottom > top)
+            .min_by(f32::total_cmp)
+    }
+
+    // the top a box must move to so that it sits below the floats it clears
+    fn clearance(&self, clear: Clear) -> Option<f32> {
+        self.placed
+            .borrow()
+            .iter()
+            .filter(|(_, side)| match clear {
+                Clear::None => false,
+                Clear::Left => *side == Float::Left,
+                Clear::Right => *side == Float::Right,
+                Clear::Both => true,
+            })
+            .map(|(rect, _)| rect.bottom())
+            .max_by(f32::total_cmp)
+    }
+
+    fn bottom(&self) -> Option<f32> {
+        self.clearance(Clear::Both)
+    }
+
+    // a float may not sit higher than one placed before it
+    fn lowest_top(&self) -> Option<f32> {
+        self.placed
+            .borrow()
+            .iter()
+            .map(|(rect, _)| rect.y)
+            .max_by(f32::total_cmp)
+    }
+}
+
+// boxes that keep their floats to themselves and stay clear of outside floats
+fn establishes_formatting_context(style: &Style) -> bool {
+    style.float != Float::None
+        || style.position.is_out_of_flow()
+        || style.overflow.clips()
+        || !matches!(style.display, Display::Block | Display::Inline)
 }
 
 struct InlineFragment {
@@ -545,6 +662,8 @@ struct ElementLayoutInput<'node, 'style> {
     containing_height: Option<f32>,
     // a content-box width and height a flex container has already decided
     size_override: (Option<f32>, Option<f32>),
+    // the floats of the formatting context a block child shares with its parent
+    floats: Option<Rc<FloatArea>>,
     parent: ParentStyle,
     context: LayoutContext<'style>,
 }
@@ -646,6 +765,7 @@ pub fn layout_with_state(
         overflow_axes: [Overflow::Visible; 2],
         visible: true,
         cursor: Cursor::Auto,
+        floated: false,
         scroll_content: Size {
             width: viewport.width,
             height: viewport.height,
@@ -653,7 +773,7 @@ pub fn layout_with_state(
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
     };
-    let mut cursor_y = 0.0;
+    let mut cursor_y = 0.0_f32;
     let mut positioned = Vec::new();
     let root_parent = ParentStyle {
         font_size: 16.0,
@@ -662,11 +782,55 @@ pub fn layout_with_state(
         text: InheritedText::default(),
         opacity: 1.0,
     };
+    // the document is one formatting context, shared by elements outside any html element
+    let root_floats = Rc::new(FloatArea::default());
     for node in document.element_children(document.root()) {
         let node = Subject::new(document, node);
         let style = stylesheet.style_for(node.style_context(root_parent, style_state));
         if style.position.is_out_of_flow() {
             positioned.push(node);
+            continue;
+        }
+        if let Some(clear_to) = root_floats.clearance(style.clear) {
+            cursor_y = cursor_y.max(clear_to);
+        }
+        if style.float != Float::None {
+            let mut line = InlineLine {
+                y: cursor_y,
+                used: 0.0,
+                height: 0.0,
+                left: 0.0,
+                right: 0.0,
+                band: 1.0,
+                floats: Some(root_floats.clone()),
+                trailing_space: false,
+                fragments: Vec::new(),
+                placed: Vec::new(),
+            };
+            place_float(
+                InlineElementInput {
+                    node,
+                    parent: root_parent,
+                    context: InlineContext {
+                        font_size: 16.0,
+                        line_height: 20.0,
+                        color: Color::BLACK,
+                        weight: FontWeight::Normal,
+                        text: InheritedText::default(),
+                        opacity: 1.0,
+                        content_width: viewport.width,
+                        content_x: 0.0,
+                        align: TextAlign::Left,
+                    },
+                    stylesheet,
+                    style_state,
+                    viewport,
+                    containing_block: viewport_block,
+                },
+                &style,
+                &mut line,
+            );
+            root.children.append(&mut line.placed);
             continue;
         }
         if let Some(child_box) = layout_element(ElementLayoutInput {
@@ -676,6 +840,7 @@ pub fn layout_with_state(
             containing_width: viewport.width,
             containing_height: Some(viewport.height),
             size_override: (None, None),
+            floats: Some(root_floats.clone()),
             parent: root_parent,
             context: LayoutContext {
                 viewport,
@@ -1207,6 +1372,7 @@ fn append_positioned_nodes(
             containing_width: containing_block.width,
             containing_height: (block.height > 0.0).then_some(block.height),
             size_override: (None, None),
+            floats: None,
             parent,
             context: LayoutContext {
                 viewport: viewport_size,
@@ -1246,6 +1412,28 @@ fn index_boxes(
             position: layout.position,
             scrollport: translate_rect(scrollbar_metrics(layout).scrollport, offset),
             scroll_size: content,
+        });
+    }
+    // text nodes are measured by the runs they produced
+    for run in &layout.text {
+        let Some(node) = run.node else {
+            continue;
+        };
+        let rect = Rect {
+            x: run.x + offset.0,
+            y: run.y + offset.1,
+            width: run.width,
+            height: run.font_size * 1.25,
+        };
+        index.entry(node).or_default().push(BoxGeometry {
+            rect,
+            border: ResolvedEdges::default(),
+            position: Position::Static,
+            scrollport: rect,
+            scroll_size: Size {
+                width: rect.width,
+                height: rect.height,
+            },
         });
     }
     for child in &layout.children {
@@ -1457,7 +1645,7 @@ fn stacking_child_clip(
 
 pub(crate) fn paint_order(children: &[LayoutBox]) -> Vec<usize> {
     let mut order = (0..children.len()).collect::<Vec<_>>();
-    order.sort_by_key(|index| (children[*index].z_index, *index));
+    order.sort_by_key(|index| (children[*index].z_index, children[*index].floated, *index));
     order
 }
 
@@ -1684,6 +1872,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         containing_width,
         containing_height,
         size_override,
+        floats,
         parent,
         context:
             LayoutContext {
@@ -1888,14 +2077,25 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         .resolve(font_size, font_size)
         .unwrap_or(font_size * 1.25)
         .max(1.0);
+    // a box that starts a formatting context keeps a float area of its own
+    let float_area = match floats {
+        Some(area) if !establishes_formatting_context(&style) => area,
+        _ => Rc::new(FloatArea::default()),
+    };
+    let owns_floats = Rc::strong_count(&float_area) == 1;
     let mut line = InlineLine {
         trailing_space: false,
         y: content_y,
         used: 0.0,
         height: line_height,
+        left: 0.0,
+        right: 0.0,
+        band: line_height,
+        floats: Some(float_area.clone()),
         fragments: Vec::new(),
         placed: Vec::new(),
     };
+    line.fit_to_floats(content_x, content_width);
     let mut text = Vec::new();
     let control_value = text_control_value(node, style_state);
     let control_placeholder = control_value
@@ -1996,9 +2196,29 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     positioned.push(child);
                     continue;
                 }
+                if child_style.float != Float::None {
+                    if let Some(pending) = pending_margin.take() {
+                        line.y += pending;
+                        line.fit_to_floats(content_x, content_width);
+                    }
+                    place_float(
+                        InlineElementInput {
+                            node: child,
+                            parent: child_parent,
+                            context: inline_context,
+                            stylesheet,
+                            style_state,
+                            viewport,
+                            containing_block: descendant_block,
+                        },
+                        &child_style,
+                        &mut line,
+                    );
+                    continue;
+                }
                 if matches!(
                     child_style.display,
-                    Display::Block | Display::Flex | Display::Grid
+                    Display::Block | Display::Flex | Display::Grid | Display::FlowRoot
                 ) {
                     flush_line(
                         &mut line,
@@ -2016,17 +2236,30 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         .max(1.0);
                     let child_top =
                         resolve_margins(child_style.margin, content_width, child_font_size).top;
-                    let child_y = match pending_margin.take() {
+                    let mut child_y = match pending_margin.take() {
                         Some(pending) => line.y + collapse_margins(pending, child_top) - child_top,
                         None => line.y,
                     };
+                    // clearance drops the border box below the floats it clears
+                    if let Some(clear_to) = float_area.clearance(child_style.clear) {
+                        child_y = child_y.max(clear_to - child_top);
+                    }
+                    // a box with its own formatting context sits beside floats, not under them
+                    let (child_x, child_width) = if establishes_formatting_context(&child_style) {
+                        let (left, right) =
+                            float_area.insets(child_y + child_top, 1.0, content_x, content_width);
+                        (content_x + left, (content_width - left - right).max(0.0))
+                    } else {
+                        (content_x, content_width)
+                    };
                     if let Some(child_box) = layout_element(ElementLayoutInput {
                         node: child,
-                        containing_x: content_x,
+                        containing_x: child_x,
                         containing_y: child_y,
-                        containing_width: content_width,
+                        containing_width: child_width,
                         containing_height: explicit_height,
                         size_override: (None, None),
+                        floats: Some(float_area.clone()),
                         parent: child_parent,
                         context: LayoutContext {
                             viewport,
@@ -2041,6 +2274,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         line.used = 0.0;
                         line.height = line_height;
                         line.fragments.clear();
+                        line.fit_to_floats(content_x, content_width);
                         children.push(child_box);
                     }
                 } else {
@@ -2074,6 +2308,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     children.append(&mut line.placed);
     if let Some(pending) = pending_margin.take() {
         line.y += pending;
+    }
+    // a formatting context grows to hold its floats
+    if owns_floats && let Some(bottom) = float_area.bottom() {
+        line.y = line.y.max(bottom);
     }
     let content_height = explicit_height
         .unwrap_or_else(|| {
@@ -2122,6 +2360,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
+        floated: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -2270,6 +2509,7 @@ fn anonymous_box(
         overflow_axes: [Overflow::Visible; 2],
         visible: true,
         cursor,
+        floated: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
@@ -2293,6 +2533,10 @@ fn layout_text_item(
         y: 0.0,
         used: 0.0,
         height: context.line_height,
+        left: 0.0,
+        right: 0.0,
+        band: context.line_height,
+        floats: None,
         trailing_space: false,
         fragments: Vec::new(),
         placed: Vec::new(),
@@ -2691,6 +2935,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                     }),
                     containing_height: if row { available_cross } else { available_main },
                     size_override: (width, height),
+                    floats: None,
                     parent: child_parent,
                     context: LayoutContext {
                         viewport,
@@ -3071,6 +3316,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
+        floated: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -3376,6 +3622,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 containing_width: cell_width,
                 containing_height: cell_height,
                 size_override: (item.width, height),
+                floats: None,
                 parent: child_parent,
                 context: LayoutContext {
                     viewport,
@@ -3516,6 +3763,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
+        floated: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4629,6 +4877,7 @@ fn append_inline_element(
         if line.fragments.is_empty() {
             line.y += context.line_height;
             line.height = 0.0;
+            line.fit_to_floats(context.content_x, context.content_width);
         } else {
             flush_line(
                 line,
@@ -4642,6 +4891,10 @@ fn append_inline_element(
     }
     let style = stylesheet.style_for(node.style_context(parent, style_state));
     if style.display == Display::None {
+        return;
+    }
+    if style.float != Float::None && !style.position.is_out_of_flow() {
+        place_float(input, &style, line);
         return;
     }
     if matches!(
@@ -4757,8 +5010,12 @@ fn append_inline_text(
                 letter_spacing,
             )
         };
+        if line.fragments.is_empty() {
+            line.fit_to_floats(context.content_x, context.content_width);
+            line.make_room(word_width, context.content_x, context.content_width);
+        }
         if !line.fragments.is_empty()
-            && line.used + space_width + word_width > context.content_width
+            && line.used + space_width + word_width > line.available(context.content_width)
         {
             flush_line(
                 line,
@@ -4840,11 +5097,12 @@ fn append_atomic(
         };
     let Some(laid_out) = layout_element(ElementLayoutInput {
         node,
-        containing_x: context.content_x + line.used,
+        containing_x: context.content_x + line.left + line.used,
         containing_y: line.y,
         containing_width,
         containing_height: None,
         size_override: (None, None),
+        floats: None,
         parent,
         context: LayoutContext {
             viewport,
@@ -4858,7 +5116,12 @@ fn append_atomic(
     };
     let outer_width = laid_out.rect.width + laid_out.margin.left + laid_out.margin.right;
     let outer_height = laid_out.rect.height + laid_out.margin.top + laid_out.margin.bottom;
-    if !line.fragments.is_empty() && line.used + outer_width > context.content_width {
+    if line.fragments.is_empty() {
+        line.fit_to_floats(context.content_x, context.content_width);
+        line.make_room(outer_width, context.content_x, context.content_width);
+    }
+    if !line.fragments.is_empty() && line.used + outer_width > line.available(context.content_width)
+    {
         flush_line(
             line,
             text,
@@ -4896,12 +5159,13 @@ fn flush_line(
     if line.fragments.is_empty() {
         return;
     }
+    let available = line.available(content_width);
     let offset = match align {
         TextAlign::Left => 0.0,
-        TextAlign::Center => ((content_width - line.used) / 2.0).max(0.0),
-        TextAlign::Right => (content_width - line.used).max(0.0),
+        TextAlign::Center => ((available - line.used) / 2.0).max(0.0),
+        TextAlign::Right => (available - line.used).max(0.0),
     };
-    let mut x = content_x + offset;
+    let mut x = content_x + line.left + offset;
     // text shares the bottom of a line that a taller inline box stretched
     let stretched = line
         .fragments
@@ -4940,6 +5204,120 @@ fn flush_line(
     line.y += line.height.max(1.0);
     line.used = 0.0;
     line.height = 0.0;
+    line.fit_to_floats(content_x, content_width);
+}
+
+// takes a float out of the line and puts it as high and as far to its side as the floats
+// already there allow, beside the current line when it fits
+fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLine) {
+    let InlineElementInput {
+        node,
+        parent,
+        context,
+        stylesheet,
+        style_state,
+        viewport,
+        containing_block,
+    } = input;
+    let Some(floats) = line.floats.clone() else {
+        return;
+    };
+    let (content_x, content_width) = (context.content_x, context.content_width);
+    // an auto width shrinks to fit, as for inline-blocks
+    let containing_width = if style.width == Length::Auto && style.aspect_ratio.is_none() {
+        let measure = |minimum: bool| {
+            intrinsic_width(
+                MaxContentInput {
+                    node,
+                    stylesheet,
+                    style_state,
+                    parent,
+                    containing_width: content_width,
+                    own_width: true,
+                },
+                minimum,
+            )
+        };
+        measure(false).min(content_width.max(measure(true)))
+    } else {
+        content_width
+    };
+    let Some(mut laid_out) = layout_element(ElementLayoutInput {
+        node,
+        containing_x: 0.0,
+        containing_y: 0.0,
+        containing_width,
+        containing_height: None,
+        size_override: (None, None),
+        floats: None,
+        parent,
+        context: LayoutContext {
+            viewport,
+            containing_block,
+            mode: LayoutMode::Flow,
+            stylesheet,
+            style_state,
+        },
+    }) else {
+        return;
+    };
+    let margin = laid_out.margin;
+    let outer = (
+        laid_out.rect.width + margin.left + margin.right,
+        laid_out.rect.height + margin.top + margin.bottom,
+    );
+    let mut y = line.y;
+    if let Some(top) = floats.lowest_top() {
+        y = y.max(top);
+    }
+    if let Some(clear_to) = floats.clearance(style.clear) {
+        y = y.max(clear_to);
+    }
+    loop {
+        let (left, right) = floats.insets(y, outer.1, content_x, content_width);
+        let beside_line = y < line.y + line.band && !line.fragments.is_empty();
+        let used = if beside_line { line.used } else { 0.0 };
+        if outer.0 <= content_width - left - right - used + 0.01 {
+            break;
+        }
+        if let Some(bottom) = floats.next_bottom(y, outer.1) {
+            y = bottom;
+        } else if beside_line {
+            y = line.y + line.height.max(line.band);
+        } else {
+            break;
+        }
+    }
+    let (left, right) = floats.insets(y, outer.1, content_x, content_width);
+    let x = if style.float == Float::Left {
+        content_x + left
+    } else {
+        content_x + content_width - right - outer.0
+    };
+    let shift = (
+        x + margin.left - laid_out.rect.x,
+        y + margin.top - laid_out.rect.y,
+    );
+    translate_layout_box(&mut laid_out, shift.0, shift.1);
+    laid_out.floated = true;
+    floats.placed.borrow_mut().push((
+        Rect {
+            x,
+            y,
+            width: outer.0,
+            height: outer.1,
+        },
+        style.float,
+    ));
+    line.placed.push(laid_out);
+    let (left, right) = floats.insets(line.y, line.band, content_x, content_width);
+    if line.fragments.is_empty() {
+        (line.left, line.right) = (left, right);
+    } else {
+        // content already on the line keeps its place, and the rest of the line narrows
+        line.left = line.left.max(left);
+        line.right = line.right.max(right);
+    }
 }
 
 // a height, where a percentage resolves only against a definite containing height

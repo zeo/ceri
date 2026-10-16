@@ -17,7 +17,24 @@ pub enum Display {
     // a flex or grid container that sits on the line like an inline-block
     InlineFlex,
     InlineGrid,
+    // a block that contains its floats
+    FlowRoot,
     None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Float {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -715,6 +732,8 @@ pub(crate) struct Style {
     pub overflow_y: Overflow,
     pub visibility: Visibility,
     pub cursor: Cursor,
+    pub float: Float,
+    pub clear: Clear,
     pub width: Length,
     pub height: Length,
     pub min_width: Length,
@@ -872,6 +891,8 @@ impl Style {
             overflow_y: Overflow::Visible,
             visibility: parent_text.visibility,
             cursor: parent_text.cursor,
+            float: Float::None,
+            clear: Clear::None,
             width: Length::Auto,
             height: Length::Auto,
             min_width: Length::Auto,
@@ -3513,7 +3534,23 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "inline-block" => Display::InlineBlock,
                 "inline-flex" => Display::InlineFlex,
                 "inline-grid" => Display::InlineGrid,
+                "flow-root" => Display::FlowRoot,
                 _ => Display::Block,
+            };
+        }
+        "float" => {
+            style.float = match value.trim().to_ascii_lowercase().as_str() {
+                "left" | "inline-start" => Float::Left,
+                "right" | "inline-end" => Float::Right,
+                _ => Float::None,
+            };
+        }
+        "clear" => {
+            style.clear = match value.trim().to_ascii_lowercase().as_str() {
+                "left" | "inline-start" => Clear::Left,
+                "right" | "inline-end" => Clear::Right,
+                "both" => Clear::Both,
+                _ => Clear::None,
             };
         }
         "position" => {

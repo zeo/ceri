@@ -2521,6 +2521,7 @@ mod tests {
                 overflow_axes: [Overflow::Visible; 2],
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
+                floated: false,
                 scroll_content: Size {
                     width: 64.0,
                     height: 24.0,
@@ -2787,6 +2788,7 @@ mod tests {
                 overflow_axes: [Overflow::Visible; 2],
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
+                floated: false,
                 scroll_content: Size {
                     width: 20.0,
                     height: 10.0,
@@ -2909,6 +2911,7 @@ mod tests {
                 overflow_axes: [Overflow::Visible; 2],
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
+                floated: false,
                 scroll_content: Size {
                     width: 32.0,
                     height: 28.0,
@@ -3003,6 +3006,7 @@ mod tests {
                         overflow_axes: [Overflow::Visible; 2],
                         visible: true,
                         cursor: crate::css::Cursor::Auto,
+                        floated: false,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3046,6 +3050,7 @@ mod tests {
                         overflow_axes: [Overflow::Visible; 2],
                         visible: true,
                         cursor: crate::css::Cursor::Auto,
+                        floated: false,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3064,6 +3069,7 @@ mod tests {
                 overflow_axes: [Overflow::Visible; 2],
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
+                floated: false,
                 scroll_content: Size {
                     width: 20.0,
                     height: 20.0,

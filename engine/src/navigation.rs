@@ -5873,6 +5873,58 @@ mod tests {
     }
 
     #[test]
+    fn floats_stack_to_their_sides_push_lines_aside_and_clear() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                #wrap { width: 300px; font-size: 16px; line-height: 20px }
+                .left { float: left; width: 100px; height: 50px }
+                .right { float: right; width: 80px; height: 30px }
+                #second { width: 150px }
+                #clear { clear: left; height: 10px }
+                #context { overflow: hidden }
+                #inner { float: left; width: 40px; height: 70px }
+            </style>
+            <div id="wrap">
+            <div class="left" id="first"></div><div class="right" id="right"></div>
+            <div class="left" id="second"></div>
+            <p id="text" style="margin: 0"><span id="word" style="display: inline-block">word</span> <span id="plain">more</span></p>
+            <div id="clear"></div>
+            <div id="context"><div id="inner"></div><span id="beside" style="display: inline-block">x</span></div>
+            </div>
+            <p id="status">idle</p>
+            <script>
+                const box = (id) => document.getElementById(id).getBoundingClientRect();
+                document.getElementById("status").textContent = [
+                    box("first").x, box("right").x, box("second").x, box("second").y,
+                    box("word").x, box("word").y,
+                    box("clear").y,
+                    box("beside").x, box("context").height,
+                    box("plain").x >= box("word").x + box("word").width,
+                    box("plain").height > 10, box("plain").y,
+                    document.getElementById("plain").getClientRects().length,
+                ].join(",");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("float page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("0,220,100,30,100,0,80,40,70,true,true,0,1")
+        );
+    }
+
+    #[test]
     fn overflow_axes_visibility_rounded_hits_and_cursors_follow_style() {
         let mut browser = Browser::new(bundle(
             r##"<style>

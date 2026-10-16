@@ -291,9 +291,51 @@ impl ScriptRuntime {
     }
 
     fn node_boxes(&self, node: NodeId) -> Vec<BoxGeometry> {
-        self.measure()
-            .and_then(|measured| measured.boxes.get(&node).cloned())
-            .unwrap_or_default()
+        let Some(measured) = self.measure() else {
+            return Vec::new();
+        };
+        if let Some(boxes) = measured.boxes.get(&node) {
+            return boxes.clone();
+        }
+        // an inline element has no box of its own: it is the text and boxes inside it, one
+        // rectangle per line
+        let document = self.document.borrow();
+        if document.element(node).is_none() {
+            return Vec::new();
+        }
+        let mut lines: Vec<BoxGeometry> = Vec::new();
+        for part in document
+            .descendants(node)
+            .filter_map(|descendant| measured.boxes.get(&descendant))
+            .flatten()
+        {
+            let rect = part.rect;
+            match lines
+                .iter_mut()
+                .find(|line| (line.rect.y - rect.y).abs() < 0.5)
+            {
+                Some(line) => {
+                    let left = line.rect.x.min(rect.x);
+                    let right = (line.rect.x + line.rect.width).max(rect.x + rect.width);
+                    let bottom = (line.rect.y + line.rect.height).max(rect.y + rect.height);
+                    line.rect = Rect {
+                        x: left,
+                        y: line.rect.y,
+                        width: right - left,
+                        height: bottom - line.rect.y,
+                    };
+                    line.scrollport = line.rect;
+                }
+                None => lines.push(BoxGeometry {
+                    rect,
+                    border: Default::default(),
+                    position: part.position,
+                    scrollport: rect,
+                    scroll_size: part.scroll_size,
+                }),
+            }
+        }
+        lines
     }
 
     pub(super) fn bounding_box(&self, node: NodeId) -> Option<Rect> {
@@ -945,6 +987,7 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             Display::InlineBlock => "inline-block",
             Display::InlineFlex => "inline-flex",
             Display::InlineGrid => "inline-grid",
+            Display::FlowRoot => "flow-root",
             Display::None => "none",
         }
         .to_string(),
