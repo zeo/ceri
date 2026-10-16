@@ -4952,6 +4952,58 @@ mod tests {
     }
 
     #[test]
+    fn xml_http_request_loads_packaged_resources_from_a_task() {
+        let mut resources = bundle(
+            r#"<p id="status">idle</p><script>
+                const log = [];
+                const xhr = new XMLHttpRequest();
+                xhr.onreadystatechange = () => log.push("state:" + xhr.readyState);
+                xhr.addEventListener("load", (event) => log.push("load:" + xhr.status + ":" + xhr.response.answer + ":" + event.loaded + ":" + xhr.getResponseHeader("Content-Type")));
+                xhr.onloadend = () => {
+                    log.push("end:" + (xhr instanceof EventTarget) + ":" + XMLHttpRequest.DONE);
+                    document.getElementById("status").textContent = log.join(",");
+                };
+                xhr.open("GET", "/data.json");
+                xhr.responseType = "json";
+                xhr.send();
+                log.push("sent:" + xhr.readyState);
+                const sync = new XMLHttpRequest();
+                sync.open("GET", "/data.json", false);
+                sync.send();
+                log.push("sync:" + sync.status + ":" + sync.responseText.length);
+                const missing = new XMLHttpRequest();
+                missing.open("GET", "/missing.json", false);
+                missing.send();
+                log.push("missing:" + missing.status);
+                try { missing.setRequestHeader("x", "y"); } catch (error) { log.push(error.name); }
+            </script>"#,
+        );
+        resources
+            .insert(
+                "/data.json",
+                "application/json",
+                br#"{"answer":42}"#.to_vec(),
+            )
+            .expect("data should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("request page should load");
+        browser
+            .advance_time(0)
+            .expect("the response task should run");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some(
+                "state:1,sent:1,sync:200:13,missing:404,InvalidStateError,state:2,state:3,state:4,load:200:42:13:application/json,end:true:4"
+            )
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>

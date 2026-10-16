@@ -26,6 +26,7 @@ mod regexp;
 mod strings;
 mod typed;
 mod vm;
+mod xhr;
 
 use events::{HostEventFields, ListenerTarget};
 use object::{JsObject, ObjectClass, ObjectHandle, new_object};
@@ -512,6 +513,7 @@ pub struct ScriptRuntime {
     held_targets: HashMap<u32, ObjectHandle>,
     observers: HashMap<u32, observers::ObserverRecord>,
     next_observer: u32,
+    xhr: HashMap<u32, xhr::XhrState>,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1505,6 +1507,7 @@ impl ScriptRuntime {
             held_targets: HashMap::new(),
             observers: HashMap::new(),
             next_observer: 0,
+            xhr: HashMap::new(),
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -9304,6 +9307,19 @@ impl ScriptRuntime {
 
     fn parse_json(&mut self, source: &str) -> Result<Value, ScriptError> {
         json::parse(source).map_err(|message| self.throw_error("SyntaxError", message))
+    }
+
+    // a host step that runs as its own task once the current one finishes
+    fn schedule_native_task(&mut self, native: Native) {
+        let id = self.next_task_id;
+        self.next_task_id = self.next_task_id.saturating_add(1);
+        self.tasks.push(ScheduledTask {
+            id,
+            due: self.clock,
+            callback: Value::Builtin(Builtin::Native(native)),
+            arguments: Vec::new(),
+            kind: TaskKind::Timeout,
+        });
     }
 
     fn schedule_task(

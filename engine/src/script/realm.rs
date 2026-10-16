@@ -127,6 +127,10 @@ pub(super) enum Native {
     Window(super::geometry::WindowMethod),
     Observer(super::observers::ObserverMethod),
     ObserverConstructor(super::observers::ObserverKind),
+    Xhr(super::xhr::XhrMember),
+    XhrConstructor,
+    // an asynchronous XMLHttpRequest reporting its answer
+    XhrDeliver(u32, u64),
 }
 
 impl Native {
@@ -154,6 +158,7 @@ impl Native {
                 | Native::EventConstructor(_)
                 | Native::RangeConstructor(_)
                 | Native::ObserverConstructor(_)
+                | Native::XhrConstructor
         ) || matches!(self, Native::Intl(method) if matches!(**method,
             super::intl::IntlMethod::NumberFormatConstructor
                 | super::intl::IntlMethod::DateTimeFormatConstructor
@@ -213,6 +218,7 @@ pub(super) struct Intrinsics {
     pub(super) events: super::events::EventInterfaces,
     pub(super) ranges: super::ranges::RangeInterfaces,
     pub(super) observers: super::observers::ObserverInterfaces,
+    pub(super) xhr: super::xhr::XhrInterfaces,
 }
 
 fn plain(prototype: &ObjectHandle) -> ObjectHandle {
@@ -1162,6 +1168,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let events = super::events::create(&build, &object_prototype, &mut globals);
     let ranges = super::ranges::create(&build, &object_prototype, &mut globals);
     let observers = super::observers::create(&build, &object_prototype, &mut globals);
+    let xhr = super::xhr::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let intrinsics = Intrinsics {
         object_prototype,
         function_prototype,
@@ -1205,6 +1212,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         events,
         ranges,
         observers,
+        xhr,
     };
     (intrinsics, globals)
 }
@@ -2249,6 +2257,10 @@ impl ScriptRuntime {
             Native::Range(member) => self.call_range_member(member, this, arguments),
             Native::Window(method) => self.call_window_method(method, this, arguments),
             Native::Observer(method) => self.call_observer_method(method, this, arguments),
+            Native::Xhr(member) => self.call_xhr(member, this, arguments),
+            Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
+            Native::XhrConstructor => Err(self
+                .type_error("Failed to construct 'XMLHttpRequest': Please use the 'new' operator")),
             Native::ObserverConstructor(kind) => Err(self.type_error(format!(
                 "Failed to construct '{}': Please use the 'new' operator",
                 kind.name()
@@ -2507,6 +2519,7 @@ impl ScriptRuntime {
             Native::ObserverConstructor(kind) => {
                 self.construct_observer(kind, arguments, new_target)
             }
+            Native::XhrConstructor => self.construct_xhr(new_target),
             Native::Codec(method) => {
                 self.call_codec(method, Value::Undefined, arguments, Some(new_target))
             }

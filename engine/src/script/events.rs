@@ -769,6 +769,7 @@ impl ScriptRuntime {
         };
         self.event_listeners.retain(|target, _| alive(target));
         self.event_handlers.retain(|(target, _), _| alive(target));
+        self.xhr.retain(|id, _| live.contains_key(id));
     }
 
     // the targets an event visits, innermost first; the window follows a connected node
