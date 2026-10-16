@@ -18,7 +18,8 @@ The current slice implements:
 - block boxes with `box-sizing`, `min-width`, `max-width`, `min-height` and `max-height`, `margin: auto` centering, negative margins, collapsing margins between adjacent block siblings, and percentage heights that resolve only against a definite containing height; margins do not yet collapse through a parent's top or bottom edge
 - inherited CSS custom properties with `:root` matching, bounded `var()` substitution, fallbacks, cycle rejection, and `calc()` lengths
 - document and subtree `querySelector` and `querySelectorAll` lookups using the same selector matcher
-- block layout, row and column flex layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
+- block layout, inline text wrapping, margins, padding, borders, colors, and basic lengths
+- flexbox following the CSS Flexbox resolution steps: `flex-direction` with the reverse directions, `flex-wrap` with `wrap-reverse`, `flex-grow`, `flex-shrink` and `flex-basis` (and the `flex` shorthand) resolved with min and max clamping and the automatic minimum size, `order`, `row-gap` and `column-gap`, every `justify-content`, `align-items`, `align-self` and `align-content` keyword except baseline (which aligns to the start), auto margins in both axes, `inline-flex`, and anonymous items for text directly inside a container
 - bounded CSS positioning for flow-preserving relative visual offsets, `relative` containing blocks, vertical `sticky` descendants tied to the nearest scrollport, `absolute` descendants, viewport-anchored `fixed` descendants, `inset` offsets, and integer `z-index` ordering within layout parents
 - layout boxes carry their DOM node ID for coordinate hit testing
 - a software paint step with a small built-in bitmap font

@@ -12,6 +12,9 @@ pub enum Display {
     Inline,
     // laid out as a block, then placed on the line like a word
     InlineBlock,
+    // a flex or grid container that sits on the line like an inline-block
+    InlineFlex,
+    InlineGrid,
     None,
 }
 
@@ -381,7 +384,38 @@ pub(crate) enum FontWeight {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlexDirection {
     Row,
+    RowReverse,
     Column,
+    ColumnReverse,
+}
+
+impl FlexDirection {
+    pub(crate) fn is_row(self) -> bool {
+        matches!(self, Self::Row | Self::RowReverse)
+    }
+
+    pub(crate) fn is_reverse(self) -> bool {
+        matches!(self, Self::RowReverse | Self::ColumnReverse)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlexWrap {
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+// align-content: how the lines of a wrapping flex container share its cross size
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlignContent {
+    Stretch,
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,6 +424,8 @@ pub(crate) enum JustifyContent {
     Center,
     FlexEnd,
     SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,6 +434,8 @@ pub(crate) enum AlignItems {
     FlexStart,
     Center,
     FlexEnd,
+    // first-baseline alignment, which lines items up by their tops for now
+    Baseline,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -578,8 +616,17 @@ pub(crate) struct Style {
     pub flex_direction: FlexDirection,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
+    // None is auto: the item follows its container's align-items
+    pub align_self: Option<AlignItems>,
+    pub align_content: AlignContent,
+    pub flex_wrap: FlexWrap,
+    // the gap between columns, and between flex items in a row
     pub gap: Length,
+    pub row_gap: Length,
     pub flex_grow: f32,
+    pub flex_shrink: f32,
+    pub flex_basis: Length,
+    pub order: i32,
     pub grid_template_columns: GridTemplate,
     pub grid_template_rows: GridTemplate,
     pub transitions: [Option<Transition>; MAX_TRANSITIONS],
@@ -697,8 +744,15 @@ impl Style {
             flex_direction: FlexDirection::Row,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
+            align_self: None,
+            align_content: AlignContent::Stretch,
+            flex_wrap: FlexWrap::NoWrap,
             gap: Length::px(0.0),
+            row_gap: Length::px(0.0),
             flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: Length::Auto,
+            order: 0,
             grid_template_columns: GridTemplate::empty(),
             grid_template_rows: GridTemplate::empty(),
             transitions: [None; MAX_TRANSITIONS],
@@ -3286,6 +3340,8 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "grid" => Display::Grid,
                 "inline" => Display::Inline,
                 "inline-block" => Display::InlineBlock,
+                "inline-flex" => Display::InlineFlex,
+                "inline-grid" => Display::InlineGrid,
                 _ => Display::Block,
             };
         }
@@ -3475,35 +3531,79 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             }
         }
         "flex-direction" => {
-            style.flex_direction = if value.trim().eq_ignore_ascii_case("column") {
-                FlexDirection::Column
-            } else {
-                FlexDirection::Row
-            };
+            if let Some(direction) = parse_flex_direction(value) {
+                style.flex_direction = direction;
+            }
+        }
+        "flex-wrap" => {
+            if let Some(wrap) = parse_flex_wrap(value) {
+                style.flex_wrap = wrap;
+            }
+        }
+        "flex-flow" => {
+            for word in value.split_ascii_whitespace() {
+                if let Some(direction) = parse_flex_direction(word) {
+                    style.flex_direction = direction;
+                } else if let Some(wrap) = parse_flex_wrap(word) {
+                    style.flex_wrap = wrap;
+                }
+            }
         }
         "justify-content" => {
-            style.justify_content = match value.trim().to_ascii_lowercase().as_str() {
+            style.justify_content = match last_keyword(value).as_str() {
                 "center" => JustifyContent::Center,
-                "flex-end" | "end" => JustifyContent::FlexEnd,
+                "flex-end" | "end" | "right" => JustifyContent::FlexEnd,
                 "space-between" => JustifyContent::SpaceBetween,
+                "space-around" => JustifyContent::SpaceAround,
+                "space-evenly" => JustifyContent::SpaceEvenly,
                 _ => JustifyContent::FlexStart,
             };
         }
-        "align-items" => {
-            style.align_items = match value.trim().to_ascii_lowercase().as_str() {
-                "flex-start" | "start" => AlignItems::FlexStart,
-                "center" => AlignItems::Center,
-                "flex-end" | "end" => AlignItems::FlexEnd,
-                _ => AlignItems::Stretch,
+        "align-items" => style.align_items = parse_align(value).unwrap_or(AlignItems::Stretch),
+        "align-self" => style.align_self = parse_align(value),
+        "align-content" => {
+            style.align_content = match last_keyword(value).as_str() {
+                "flex-start" | "start" => AlignContent::FlexStart,
+                "flex-end" | "end" => AlignContent::FlexEnd,
+                "center" => AlignContent::Center,
+                "space-between" => AlignContent::SpaceBetween,
+                "space-around" => AlignContent::SpaceAround,
+                "space-evenly" => AlignContent::SpaceEvenly,
+                _ => AlignContent::Stretch,
             };
         }
-        "gap" | "row-gap" | "column-gap" => style.gap = parse_length(value).unwrap_or(style.gap),
+        "gap" | "grid-gap" => {
+            let mut parts = value.split_ascii_whitespace().filter_map(parse_length);
+            if let Some(row) = parts.next() {
+                style.row_gap = row;
+                style.gap = parts.next().unwrap_or(row);
+            }
+        }
+        "row-gap" | "grid-row-gap" => style.row_gap = parse_length(value).unwrap_or(style.row_gap),
+        "column-gap" | "grid-column-gap" => style.gap = parse_length(value).unwrap_or(style.gap),
+        "flex-shrink" => {
+            style.flex_shrink = parse_number(value).unwrap_or(style.flex_shrink).max(0.0);
+        }
+        "flex-basis" => {
+            style.flex_basis = if value.trim().eq_ignore_ascii_case("content") {
+                Length::Auto
+            } else {
+                parse_length(value).unwrap_or(style.flex_basis)
+            };
+        }
+        "order" => {
+            if let Ok(order) = value.trim().parse::<i32>() {
+                style.order = order;
+            }
+        }
         "grid-template-columns" => style.grid_template_columns = parse_grid_template(value),
         "grid-template-rows" => style.grid_template_rows = parse_grid_template(value),
         "flex-grow" => style.flex_grow = parse_number(value).unwrap_or(style.flex_grow).max(0.0),
         "flex" => {
-            if let Some(grow) = value.split_ascii_whitespace().find_map(parse_number) {
-                style.flex_grow = grow.max(0.0);
+            if let Some((grow, shrink, basis)) = parse_flex_shorthand(value) {
+                style.flex_grow = grow;
+                style.flex_shrink = shrink;
+                style.flex_basis = basis;
             }
         }
         "text-align" => {
@@ -4342,12 +4442,91 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
         .then_some(Some(width / height))
 }
 
+// flex-direction keywords
+fn parse_flex_direction(value: &str) -> Option<FlexDirection> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "row" => FlexDirection::Row,
+        "row-reverse" => FlexDirection::RowReverse,
+        "column" => FlexDirection::Column,
+        "column-reverse" => FlexDirection::ColumnReverse,
+        _ => return None,
+    })
+}
+
+fn parse_flex_wrap(value: &str) -> Option<FlexWrap> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "nowrap" => FlexWrap::NoWrap,
+        "wrap" => FlexWrap::Wrap,
+        "wrap-reverse" => FlexWrap::WrapReverse,
+        _ => return None,
+    })
+}
+
+// the last word of an alignment value, which drops prefixes such as `safe` and `unsafe`
+fn last_keyword(value: &str) -> String {
+    value
+        .split_ascii_whitespace()
+        .last()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+// align-items and align-self; auto and normal give None
+fn parse_align(value: &str) -> Option<AlignItems> {
+    Some(match last_keyword(value).as_str() {
+        "flex-start" | "start" | "self-start" => AlignItems::FlexStart,
+        "center" => AlignItems::Center,
+        "flex-end" | "end" | "self-end" => AlignItems::FlexEnd,
+        "baseline" => AlignItems::Baseline,
+        "stretch" => AlignItems::Stretch,
+        _ => return None,
+    })
+}
+
+// the flex shorthand: none, auto, initial, or up to two numbers and a basis
+fn parse_flex_shorthand(value: &str) -> Option<(f32, f32, Length)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => return Some((0.0, 0.0, Length::Auto)),
+        "auto" => return Some((1.0, 1.0, Length::Auto)),
+        "initial" => return Some((0.0, 1.0, Length::Auto)),
+        _ => {}
+    }
+    let mut numbers = Vec::new();
+    let mut basis = None;
+    for word in value.split_ascii_whitespace() {
+        if let Some(number) = parse_number(word) {
+            numbers.push(number);
+        } else if word.eq_ignore_ascii_case("content") {
+            basis = Some(Length::Auto);
+        } else {
+            basis = Some(parse_length(word)?);
+        }
+    }
+    let grow = numbers.first().copied();
+    let shrink = numbers.get(1).copied();
+    if grow.is_none() && basis.is_none() {
+        return None;
+    }
+    // a bare flex factor sets the basis to zero, so items share all the space
+    let basis = basis.unwrap_or(if grow.is_some() {
+        Length::px(0.0)
+    } else {
+        Length::Auto
+    });
+    Some((
+        grow.unwrap_or(1.0).max(0.0),
+        shrink.unwrap_or(1.0).max(0.0),
+        basis,
+    ))
+}
+
 fn default_display(name: &str) -> Display {
     match name {
         "#document" | "html" | "body" | "address" | "article" | "aside" | "blockquote" | "div"
-        | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3"
-        | "h4" | "h5" | "h6" | "header" | "hgroup" | "hr" | "main" | "nav" | "ol" | "p" | "pre"
-        | "section" | "table" | "ul" => Display::Block,
+        | "dl" | "dd" | "dt" | "details" | "summary" | "fieldset" | "figcaption" | "figure"
+        | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup"
+        | "hr" | "li" | "legend" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "search"
+        | "section" | "table" | "ul" | "center" | "dialog" => Display::Block,
         "head" | "link" | "meta" | "noscript" | "script" | "style" | "template" | "title" => {
             Display::None
         }

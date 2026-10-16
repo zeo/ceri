@@ -5155,6 +5155,77 @@ mod tests {
     }
 
     #[test]
+    fn flex_layout_grows_shrinks_wraps_aligns_and_wraps_text_in_anonymous_items() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0 }
+                .row { display: flex; width: 300px }
+                .row > div { height: 10px }
+                #grow > .a { flex: 1 } #grow > .b { flex: 2 }
+                #shrink > div { width: 200px } #shrink > .c { flex-shrink: 0 }
+                #wrap { flex-wrap: wrap; width: 100px; gap: 5px 10px } #wrap > div { width: 40px }
+                #just { justify-content: space-between } #just > div { width: 50px }
+                #evenly { justify-content: space-evenly } #evenly > div { width: 60px }
+                #auto > .push { margin-left: auto; width: 50px }
+                #col { display: flex; flex-direction: column; height: 100px; width: 100px } #col > .g { flex: 1 }
+                #rev { flex-direction: row-reverse } #rev > div { width: 50px }
+                #order > div { width: 30px } #order > .first { order: -1 }
+                #center { align-items: center; height: 50px } #center > div { height: 20px; width: 20px }
+                #text { display: flex; width: 300px; gap: 10px }
+            </style>
+            <div class="row" id="grow"><div class="a" id="g1"></div><div class="b" id="g2"></div></div>
+            <div class="row" id="shrink"><div id="s1"></div><div class="c" id="s2"></div></div>
+            <div class="row" id="wrap"><div id="w1"></div><div id="w2"></div><div id="w3"></div></div>
+            <div class="row" id="just"><div id="j1"></div><div id="j2"></div><div id="j3"></div></div>
+            <div class="row" id="evenly"><div id="e1"></div><div id="e2"></div></div>
+            <div class="row" id="auto"><div id="a1" class="push"></div></div>
+            <div id="col"><div id="c1" style="height: 20px"></div><div class="g" id="c2"></div></div>
+            <div class="row" id="rev"><div id="r1"></div><div id="r2"></div></div>
+            <div class="row" id="order"><div id="o1"></div><div class="first" id="o2"></div></div>
+            <div class="row" id="center"><div id="ce"></div></div>
+            <div id="text">hello<span id="after">x</span></div>
+            <p id="status">idle</p>
+            <script>
+                const box = (id) => document.getElementById(id).getBoundingClientRect();
+                const x = (id, parent) => box(id).x - box(parent).x;
+                const y = (id, parent) => box(id).y - box(parent).y;
+                document.getElementById("status").textContent = [
+                    box("g1").width, box("g2").width, x("g2", "grow"),
+                    box("s1").width, x("s2", "shrink"),
+                    x("w3", "wrap"), y("w3", "wrap"), box("wrap").height,
+                    x("j2", "just"), x("j3", "just"),
+                    x("e1", "evenly"), x("e2", "evenly"),
+                    x("a1", "auto"),
+                    y("c2", "col"), box("c2").height, box("c1").width,
+                    x("r1", "rev"), x("r2", "rev"),
+                    x("o2", "order"), x("o1", "order"),
+                    y("ce", "center"),
+                    x("after", "text") > 10, box("text").height,
+                ].join(",");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("flex page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some(
+                "100,200,100,100,100,0,15,25,125,250,60,180,250,20,80,100,250,200,0,30,15,true,20"
+            )
+        );
+    }
+
+    #[test]
     fn selection_keeps_its_anchor_through_set_base_and_extent_and_extend() {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>

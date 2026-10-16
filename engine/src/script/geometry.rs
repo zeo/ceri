@@ -924,6 +924,8 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             Display::Grid => "grid",
             Display::Inline => "inline",
             Display::InlineBlock => "inline-block",
+            Display::InlineFlex => "inline-flex",
+            Display::InlineGrid => "inline-grid",
             Display::None => "none",
         }
         .to_string(),
@@ -987,7 +989,9 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         .to_string(),
         "flex-direction" => match style.flex_direction {
             FlexDirection::Row => "row",
+            FlexDirection::RowReverse => "row-reverse",
             FlexDirection::Column => "column",
+            FlexDirection::ColumnReverse => "column-reverse",
         }
         .to_string(),
         "flex-grow" => number_to_string(f64::from(style.flex_grow)),
@@ -999,6 +1003,8 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             JustifyContent::Center => "center".to_string(),
             JustifyContent::FlexEnd => "flex-end".to_string(),
             JustifyContent::SpaceBetween => "space-between".to_string(),
+            JustifyContent::SpaceAround => "space-around".to_string(),
+            JustifyContent::SpaceEvenly => "space-evenly".to_string(),
         },
         "align-items" => match style.align_items {
             AlignItems::Stretch => own
@@ -1008,6 +1014,7 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             AlignItems::FlexStart => "flex-start".to_string(),
             AlignItems::Center => "center".to_string(),
             AlignItems::FlexEnd => "flex-end".to_string(),
+            AlignItems::Baseline => "baseline".to_string(),
         },
         "row-gap" | "column-gap" => style
             .gap
