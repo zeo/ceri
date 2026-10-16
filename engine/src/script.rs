@@ -17,6 +17,7 @@ mod operations;
 mod parser;
 mod pattern;
 mod promises;
+mod ranges;
 mod realm;
 mod reflect;
 mod regexp;
@@ -33,7 +34,9 @@ pub use dates::TimeZone;
 
 use crate::Color;
 use crate::css::StyleState;
-use crate::dom::{AccessibilityNode, Document, DomError, Element, NodeId, NodeKind};
+use crate::dom::{
+    AccessibilityNode, Boundary, Document, DomError, Element, LiveRange, NodeId, NodeKind,
+};
 use crate::navigation::{
     APP_ORIGIN, AppUrl, ClipboardProvider, FilePicker, FilePickerRequest, NavigationError,
     Resource, ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
@@ -57,9 +60,8 @@ use std::thread;
 
 type ElementHandle = Rc<NodeHandle>;
 type ValidityHandle = ElementHandle;
-type RangeHandle = Rc<RefCell<RangeData>>;
-type WeakRangeHandle = Weak<RefCell<RangeData>>;
-type SelectionHandle = Rc<RefCell<SelectionData>>;
+type RangeHandle = Rc<ranges::RangeRecord>;
+type SelectionHandle = Rc<ranges::SelectionRecord>;
 type RequestHandle = Rc<RequestData>;
 type ResponseHandle = Rc<ResponseData>;
 type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
@@ -353,20 +355,6 @@ enum Builtin {
     ElementInsertData(ElementHandle),
     ElementDeleteData(ElementHandle),
     ElementReplaceData(ElementHandle),
-    RangeSetStart(RangeHandle),
-    RangeSetEnd(RangeHandle),
-    RangeCollapse(RangeHandle),
-    RangeSelectNodeContents(RangeHandle),
-    RangeClone(RangeHandle),
-    RangeToString(RangeHandle),
-    RangeDetach,
-    SelectionAddRange(SelectionHandle),
-    SelectionRemoveAllRanges(SelectionHandle),
-    SelectionGetRangeAt(SelectionHandle),
-    SelectionCollapse(SelectionHandle),
-    SelectionToString(SelectionHandle),
-    SelectionExtend(SelectionHandle),
-    SelectionSetBaseAndExtent(SelectionHandle),
     ElementSetAttribute(ElementHandle),
     ElementRemoveAttribute(ElementHandle),
     ElementGetAttribute(ElementHandle),
@@ -507,7 +495,8 @@ pub struct ScriptRuntime {
     // listener cannot recurse
     reporting_error: bool,
     selection: SelectionHandle,
-    ranges: Vec<WeakRangeHandle>,
+    // the selection as selectionchange listeners last saw it
+    reported_selection: ranges::SelectionSnapshot,
     selected_files: HashMap<NodeId, Vec<FileHandle>>,
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
@@ -1035,38 +1024,6 @@ impl ConstraintFlags {
     }
 }
 
-#[derive(Clone)]
-struct RangeBoundary {
-    node: ElementHandle,
-    offset: usize,
-}
-
-impl PartialEq for RangeBoundary {
-    fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset && Rc::ptr_eq(&self.node, &other.node)
-    }
-}
-
-#[derive(Clone, PartialEq)]
-struct RangeData {
-    start: RangeBoundary,
-    end: RangeBoundary,
-}
-
-#[derive(Clone, Default)]
-struct SelectionData {
-    range: Option<RangeHandle>,
-    // the anchor is the range end when the focus moved before it
-    backward: bool,
-}
-
-impl SelectionData {
-    fn set(&mut self, range: Option<RangeHandle>) {
-        self.range = range;
-        self.backward = false;
-    }
-}
-
 struct HeadersData {
     values: BTreeMap<String, String>,
     mutable: bool,
@@ -1365,6 +1322,7 @@ impl ScriptRuntime {
     ) -> Self {
         let global = Rc::new(RefCell::new(Environment::default()));
         let (intrinsics, intrinsic_globals) = create_intrinsics();
+        let selection = ranges::new_selection(&intrinsics);
         global.borrow_mut().values.extend(
             intrinsic_globals
                 .into_iter()
@@ -1518,8 +1476,8 @@ impl ScriptRuntime {
             pointer: events::PointerState::default(),
             key_detail: None,
             reporting_error: false,
-            selection: Rc::new(RefCell::new(SelectionData::default())),
-            ranges: Vec::new(),
+            selection,
+            reported_selection: None,
             selected_files: HashMap::new(),
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
@@ -1718,6 +1676,7 @@ impl ScriptRuntime {
         {
             let mut document = self.document.borrow_mut();
             let handles = self.node_handles.borrow();
+            let ranged = document.range_nodes().into_iter().collect::<HashSet<_>>();
             for root in candidates {
                 if !document.contains(root)
                     || root == document.root()
@@ -1726,9 +1685,10 @@ impl ScriptRuntime {
                     continue;
                 }
                 let reachable = document.subtree(root).into_iter().any(|node| {
-                    handles
-                        .get(&node)
-                        .is_some_and(|handle| Rc::strong_count(handle) > 1)
+                    ranged.contains(&node)
+                        || handles
+                            .get(&node)
+                            .is_some_and(|handle| Rc::strong_count(handle) > 1)
                 });
                 if reachable {
                     self.retained_orphans.push(root);
@@ -1819,14 +1779,10 @@ impl ScriptRuntime {
         {
             self.blur_focused()?;
         }
-        let selection_changed = self.adjust_ranges_for_remove(parent, node);
         if self.document.borrow_mut().remove(node).is_none() {
             return Ok(());
         }
         self.refresh_select_state_after_remove(parent);
-        if selection_changed {
-            self.dispatch_document_selection_change()?;
-        }
         Ok(())
     }
 
@@ -2746,13 +2702,13 @@ impl ScriptRuntime {
 
     // document prose ranges as (text node, start, end) for paint highlighting
     pub(crate) fn prose_selections(&self) -> Vec<crate::layout::ProseSpan> {
-        let Some(range) = self.selection.borrow().range.clone() else {
+        let Some(range) = self.selection.range() else {
             return Vec::new();
         };
-        let range = range.borrow();
+        let range = range.get();
         let Some((start, end)) = self
-            .range_boundary_position(&range.start)
-            .zip(self.range_boundary_position(&range.end))
+            .boundary_position(range.start)
+            .zip(self.boundary_position(range.end))
         else {
             return Vec::new();
         };
@@ -2760,8 +2716,8 @@ impl ScriptRuntime {
         spans
             .into_iter()
             .enumerate()
-            .map(|(index, (path, start, end))| crate::layout::ProseSpan {
-                node: path,
+            .map(|(index, (node, start, end))| crate::layout::ProseSpan {
+                node,
                 start,
                 end,
                 continued: index > 0,
@@ -2771,15 +2727,9 @@ impl ScriptRuntime {
 
     // the document selection as flat UTF-16 (anchor, focus) text positions
     pub(crate) fn document_selection_points(&self) -> Option<(usize, usize)> {
-        let selection = self.selection.borrow();
-        let range = selection.range.as_ref()?.borrow();
-        let start = self.range_boundary_position(&range.start)?;
-        let end = self.range_boundary_position(&range.end)?;
-        Some(if selection.backward {
-            (end, start)
-        } else {
-            (start, end)
-        })
+        let (anchor, focus) = self.selection.anchor_focus()?;
+        self.boundary_position(anchor)
+            .zip(self.boundary_position(focus))
     }
 
     // selects between two flat text positions; a fresh selection replaces the range object
@@ -2789,79 +2739,26 @@ impl ScriptRuntime {
         focus: usize,
         fresh: bool,
     ) -> Result<bool, ScriptError> {
-        let boundary = |position: usize| -> Option<RangeBoundary> {
-            let (text_node, offset) = self.document.borrow().text_point(position)?;
-            Some(RangeBoundary {
-                node: self.node_handle(text_node),
-                offset,
-            })
+        let boundary = |position: usize| -> Option<Boundary> {
+            let (node, offset) = self.document.borrow().text_point(position)?;
+            Some(Boundary { node, offset })
         };
         let Some((anchor, focus)) = boundary(anchor).zip(boundary(focus)) else {
             return Ok(false);
         };
+        let before = self.selection_snapshot();
         let selection = self.selection.clone();
-        self.set_selection_points(&selection, anchor, focus, fresh)
+        self.select_points(&selection, anchor, focus, fresh);
+        let changed = self.selection_snapshot() != before;
+        self.drain_microtasks()?;
+        Ok(changed)
     }
 
     pub(crate) fn clear_document_selection(&mut self) -> Result<bool, ScriptError> {
-        let changed = self.selection.borrow().range.is_some();
-        self.selection.borrow_mut().set(None);
-        if changed {
-            self.dispatch_document_selection_change()?;
-        }
+        let changed = self.selection.range().is_some();
+        self.selection.state.borrow_mut().range = None;
+        self.drain_microtasks()?;
         Ok(changed)
-    }
-
-    fn set_selection_points(
-        &mut self,
-        selection: &SelectionHandle,
-        anchor: RangeBoundary,
-        focus: RangeBoundary,
-        fresh: bool,
-    ) -> Result<bool, ScriptError> {
-        let backward = self
-            .range_boundary_position(&focus)
-            .zip(self.range_boundary_position(&anchor))
-            .is_some_and(|(focus, anchor)| focus < anchor);
-        let ordered = if backward {
-            RangeData {
-                start: focus,
-                end: anchor,
-            }
-        } else {
-            RangeData {
-                start: anchor,
-                end: focus,
-            }
-        };
-        let existing = selection.borrow().range.clone();
-        let changed = existing
-            .as_ref()
-            .is_none_or(|range| *range.borrow() != ordered)
-            || selection.borrow().backward != backward;
-        match existing {
-            Some(range) if !fresh => *range.borrow_mut() = ordered,
-            _ => {
-                let range = Rc::new(RefCell::new(ordered));
-                self.track_range(&range);
-                selection.borrow_mut().range = Some(range);
-            }
-        }
-        selection.borrow_mut().backward = backward;
-        if changed && Rc::ptr_eq(selection, &self.selection) {
-            self.dispatch_document_selection_change()?;
-        }
-        Ok(changed)
-    }
-
-    fn selection_anchor(&self, selection: &SelectionHandle) -> Option<RangeBoundary> {
-        let selection = selection.borrow();
-        let range = selection.range.as_ref()?.borrow();
-        Some(if selection.backward {
-            range.end.clone()
-        } else {
-            range.start.clone()
-        })
     }
 
     // dispatches a bubbling transition or animation event with its name and elapsed time
@@ -3010,19 +2907,17 @@ impl ScriptRuntime {
         offset: usize,
         extend: bool,
     ) -> Result<bool, ScriptError> {
-        let node = self.node_handle(text_node);
-        let content = self
-            .document
-            .borrow()
-            .node_text_content(text_node)
-            .unwrap_or_default();
-        let offset = offset.min(utf16_len(&content));
-        let focus = RangeBoundary { node, offset };
+        let offset = offset.min(self.document.borrow().node_length(text_node));
+        let focus = Boundary {
+            node: text_node,
+            offset,
+        };
         let selection = self.selection.clone();
-        let anchor = extend.then(|| self.selection_anchor(&selection)).flatten();
-        let fresh = anchor.is_none();
-        let anchor = anchor.unwrap_or_else(|| focus.clone());
-        self.set_selection_points(&selection, anchor, focus, fresh)?;
+        let anchor = extend
+            .then(|| selection.anchor_focus().map(|(anchor, _)| anchor))
+            .flatten();
+        self.select_points(&selection, anchor.unwrap_or(focus), focus, anchor.is_none());
+        self.drain_microtasks()?;
         // a resolved press starts the selection gesture even when the range did not move
         Ok(true)
     }
@@ -3729,99 +3624,6 @@ impl ScriptRuntime {
                     "valueMissing" => Ok(Value::Bool(flags.value_missing)),
                     _ => Err(runtime_error(format!(
                         "ValidityState has no property {property}"
-                    ))),
-                }
-            }
-            Value::Range(range) => {
-                let range_data = range.borrow();
-                match property {
-                    "startContainer" => Ok(self.range_container(&range_data.start)),
-                    "startOffset" => Ok(Value::Number(range_data.start.offset as f64)),
-                    "endContainer" => Ok(self.range_container(&range_data.end)),
-                    "endOffset" => Ok(Value::Number(range_data.end.offset as f64)),
-                    "collapsed" => Ok(Value::Bool(self.range_is_collapsed(&range_data))),
-                    "commonAncestorContainer" => {
-                        let ancestor = self
-                            .document
-                            .borrow()
-                            .common_ancestor(range_data.start.node.id, range_data.end.node.id);
-                        Ok(ancestor.map_or(Value::Null, |ancestor| self.node_value(ancestor)))
-                    }
-                    "setStart" => Ok(Value::Builtin(Builtin::RangeSetStart(range.clone()))),
-                    "setEnd" => Ok(Value::Builtin(Builtin::RangeSetEnd(range.clone()))),
-                    "collapse" => Ok(Value::Builtin(Builtin::RangeCollapse(range.clone()))),
-                    "selectNodeContents" => Ok(Value::Builtin(Builtin::RangeSelectNodeContents(
-                        range.clone(),
-                    ))),
-                    "cloneRange" => Ok(Value::Builtin(Builtin::RangeClone(range.clone()))),
-                    "toString" => Ok(Value::Builtin(Builtin::RangeToString(range.clone()))),
-                    "detach" => Ok(Value::Builtin(Builtin::RangeDetach)),
-                    _ => Err(runtime_error(format!("Range has no property {property}"))),
-                }
-            }
-            Value::Selection(selection) => {
-                let selection_data = selection.borrow();
-                let range = selection_data.range.clone();
-                match property {
-                    "rangeCount" => Ok(Value::Number(if range.is_some() { 1.0 } else { 0.0 })),
-                    "isCollapsed" => {
-                        Ok(Value::Bool(range.as_ref().is_none_or(|range| {
-                            self.range_is_collapsed(&range.borrow())
-                        })))
-                    }
-                    "anchorNode" | "focusNode" => Ok(range
-                        .as_ref()
-                        .map(|range| {
-                            let range = range.borrow();
-                            let anchor = (property == "anchorNode") != selection_data.backward;
-                            let boundary = if anchor { &range.start } else { &range.end };
-                            self.range_container(boundary)
-                        })
-                        .unwrap_or(Value::Null)),
-                    "anchorOffset" | "focusOffset" => Ok(range
-                        .as_ref()
-                        .map(|range| {
-                            let range = range.borrow();
-                            let anchor = (property == "anchorOffset") != selection_data.backward;
-                            let boundary = if anchor { &range.start } else { &range.end };
-                            Value::Number(boundary.offset as f64)
-                        })
-                        .unwrap_or(Value::Number(0.0))),
-                    "addRange" => Ok(Value::Builtin(Builtin::SelectionAddRange(
-                        selection.clone(),
-                    ))),
-                    "removeAllRanges" => Ok(Value::Builtin(Builtin::SelectionRemoveAllRanges(
-                        selection.clone(),
-                    ))),
-                    "getRangeAt" => Ok(Value::Builtin(Builtin::SelectionGetRangeAt(
-                        selection.clone(),
-                    ))),
-                    "collapse" => Ok(Value::Builtin(Builtin::SelectionCollapse(
-                        selection.clone(),
-                    ))),
-                    "toString" => Ok(Value::Builtin(Builtin::SelectionToString(
-                        selection.clone(),
-                    ))),
-                    "extend" => Ok(Value::Builtin(Builtin::SelectionExtend(selection.clone()))),
-                    "setBaseAndExtent" => Ok(Value::Builtin(Builtin::SelectionSetBaseAndExtent(
-                        selection.clone(),
-                    ))),
-                    "direction" => Ok(Value::String(
-                        match range.as_ref() {
-                            Some(range) if !self.range_is_collapsed(&range.borrow()) => {
-                                if selection_data.backward {
-                                    "backward"
-                                } else {
-                                    "forward"
-                                }
-                            }
-                            _ => "none",
-                        }
-                        .to_string()
-                        .into(),
-                    )),
-                    _ => Err(runtime_error(format!(
-                        "Selection has no property {property}"
                     ))),
                 }
             }
@@ -5884,259 +5686,10 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn range_boundary_from_arguments(
-        &self,
-        arguments: &[Value],
-    ) -> Result<RangeBoundary, ScriptError> {
-        let Some(Value::Element(handle)) = arguments.first().map(Value::resolve) else {
-            return Err(runtime_error("Range boundary requires an Element"));
-        };
-        let container = handle.id;
-        let value = self
-            .document
-            .borrow()
-            .node_text_content(container)
-            .ok_or_else(|| runtime_error("Range boundary node no longer exists"))?;
-        let offset = arguments
-            .get(1)
-            .map(Value::number)
-            .transpose()?
-            .map(selection_offset)
-            .unwrap_or_default()
-            .min(utf16_len(&value));
-        Ok(RangeBoundary {
-            node: handle,
-            offset,
-        })
-    }
-
-    fn range_boundary_position(&self, boundary: &RangeBoundary) -> Option<usize> {
-        let node = boundary.node.id;
-        let document = self.document.borrow();
-        let content = document.node_text_content(node)?;
-        let prefix = document.node_text_offset(node)?;
-        Some(prefix.saturating_add(boundary.offset.min(utf16_len(&content))))
-    }
-
-    // a boundary container, which script sees only while it is in the document
-    fn range_container(&self, boundary: &RangeBoundary) -> Value {
-        if self.document.borrow().is_connected(boundary.node.id) {
-            Value::Element(boundary.node.clone())
-        } else {
-            Value::Null
-        }
-    }
-
-    fn range_is_collapsed(&self, range: &RangeData) -> bool {
-        self.range_boundary_position(&range.start)
-            .zip(self.range_boundary_position(&range.end))
-            .is_some_and(|(start, end)| start == end)
-    }
-
-    fn range_to_string(&self, range: &RangeHandle) -> String {
-        let range = range.borrow();
-        let Some(start) = self.range_boundary_position(&range.start) else {
-            return String::new();
-        };
-        let Some(end) = self.range_boundary_position(&range.end) else {
-            return String::new();
-        };
-        if start > end {
-            return String::new();
-        }
-        let value = self.document.borrow().document_text();
-        utf16_substring(&value, start, end)
-    }
-
-    fn track_range(&mut self, range: &RangeHandle) {
-        self.ranges.retain(|weak| weak.strong_count() != 0);
-        if self
-            .ranges
-            .iter()
-            .filter_map(Weak::upgrade)
-            .all(|current| !Rc::ptr_eq(&current, range))
-        {
-            self.ranges.push(Rc::downgrade(range));
-        }
-    }
-
-    // applies a boundary update to every live range, reporting whether the selection moved
-    fn adjust_ranges(&mut self, adjust: impl Fn(&mut RangeBoundary, &Document)) -> bool {
-        let selected = self.selection.borrow().range.clone();
-        let document = self.document.borrow();
-        self.ranges.retain(|weak| weak.strong_count() != 0);
-        let mut selection_changed = false;
-        for range in self.ranges.iter().filter_map(Weak::upgrade) {
-            let mut range_data = range.borrow_mut();
-            let previous = range_data.clone();
-            adjust(&mut range_data.start, &document);
-            adjust(&mut range_data.end, &document);
-            if *range_data != previous
-                && selected
-                    .as_ref()
-                    .is_some_and(|current| Rc::ptr_eq(current, &range))
-            {
-                selection_changed = true;
-            }
-        }
-        selection_changed
-    }
-
-    fn adjust_ranges_for_remove(&mut self, parent: NodeId, child: NodeId) -> bool {
-        let (child_start, removed_length) = {
-            let document = self.document.borrow();
-            let Some(parent_prefix) = document.node_text_offset(parent) else {
-                return false;
-            };
-            let Some(child_prefix) = document.node_text_offset(child) else {
-                return false;
-            };
-            (
-                child_prefix.saturating_sub(parent_prefix),
-                utf16_len(&document.text_content(child)),
-            )
-        };
-        let parent_handle = self.node_handle(parent);
-        self.adjust_ranges(|boundary, document| {
-            adjust_range_boundary_for_remove(
-                boundary,
-                child,
-                child_start,
-                removed_length,
-                &parent_handle,
-                document,
-            )
-        })
-    }
-
-    fn adjust_ranges_for_replacement(&mut self, target: NodeId, new_length: usize) -> bool {
-        let (target_start, old_length) = {
-            let document = self.document.borrow();
-            let Some(target_start) = document.node_text_offset(target) else {
-                return false;
-            };
-            (target_start, utf16_len(&document.text_content(target)))
-        };
-        let target_handle = self.node_handle(target);
-        self.adjust_ranges(|boundary, document| {
-            adjust_range_boundary_for_replacement(
-                boundary,
-                target,
-                target_start,
-                old_length,
-                new_length,
-                &target_handle,
-                document,
-            )
-        })
-    }
-
-    fn adjust_ranges_for_character_data_edit(
-        &mut self,
-        target: NodeId,
-        replacement_start: usize,
-        old_length: usize,
-        new_length: usize,
-    ) -> bool {
-        let Some(target_start) = self.document.borrow().node_text_offset(target) else {
-            return false;
-        };
-        self.adjust_ranges(|boundary, document| {
-            adjust_range_boundary_for_character_data_edit(
-                boundary,
-                target,
-                target_start,
-                replacement_start,
-                old_length,
-                new_length,
-                document,
-            )
-        })
-    }
-
-    fn adjust_ranges_for_split_text(
-        &mut self,
-        target: NodeId,
-        offset: usize,
-        right: &ElementHandle,
-    ) -> bool {
-        self.adjust_ranges(|boundary, _| {
-            adjust_range_boundary_for_split_text(boundary, target, offset, right)
-        })
-    }
-
-    // moves live range boundaries off a text node that normalize removes
-    fn retarget_ranges(&mut self, from: NodeId, to: &ElementHandle, base: usize) -> bool {
-        self.adjust_ranges(|boundary, _| {
-            if boundary.node.id == from {
-                boundary.node = to.clone();
-                boundary.offset = base.saturating_add(boundary.offset);
-            }
-        })
-    }
-
     // drops empty text nodes and merges adjacent ones below a node, keeping live ranges on
     // the text they covered
     fn normalize_element_handle(&mut self, handle: &ElementHandle) -> Result<(), ScriptError> {
-        let texts = {
-            let document = self.document.borrow();
-            document
-                .descendants(handle.id)
-                .filter(|&node| document.is_text(node))
-                .collect::<Vec<_>>()
-        };
-        let mut selection_changed = false;
-        for text in texts {
-            let (data, parent) = {
-                let document = self.document.borrow();
-                match (document.text(text), document.parent(text)) {
-                    (Some(data), Some(parent)) => (data.to_string(), parent),
-                    _ => continue,
-                }
-            };
-            if data.is_empty() {
-                let base = {
-                    let document = self.document.borrow();
-                    document
-                        .node_text_offset(text)
-                        .zip(document.node_text_offset(parent))
-                        .map_or(0, |(child, parent)| child.saturating_sub(parent))
-                };
-                let parent_handle = self.node_handle(parent);
-                selection_changed |= self.retarget_ranges(text, &parent_handle, base);
-                self.document.borrow_mut().remove(text);
-                continue;
-            }
-            let mut merged = data;
-            loop {
-                let next = {
-                    let document = self.document.borrow();
-                    document
-                        .sibling(text, true)
-                        .filter(|&sibling| document.is_text(sibling))
-                };
-                let Some(next) = next else {
-                    break;
-                };
-                let addition = self
-                    .document
-                    .borrow()
-                    .text(next)
-                    .unwrap_or_default()
-                    .to_string();
-                let base = utf16_len(&merged);
-                merged.push_str(&addition);
-                self.document
-                    .borrow_mut()
-                    .set_character_data(text, merged.clone());
-                let first = self.node_handle(text);
-                selection_changed |= self.retarget_ranges(next, &first, base);
-                self.document.borrow_mut().remove(next);
-            }
-        }
-        if selection_changed {
-            self.dispatch_document_selection_change()?;
-        }
+        self.document.borrow_mut().normalize(handle.id);
         Ok(())
     }
 
@@ -6225,12 +5778,8 @@ impl ScriptRuntime {
         if self.document.borrow().element(node).is_none() {
             return Ok(false);
         }
-        let selection_changed = self.adjust_ranges_for_replacement(node, utf16_len(&text));
         let text = (!text.is_empty()).then(|| self.document.borrow_mut().create_text(text));
         self.replace_children_quietly(node, text);
-        if selection_changed {
-            self.dispatch_document_selection_change()?;
-        }
         Ok(true)
     }
 
@@ -6263,17 +5812,10 @@ impl ScriptRuntime {
         let length = utf16_len(&current);
         let start = start.min(length);
         let end = end.min(length).max(start);
-        let (updated, _) = replace_utf16_range(&current, start, end, replacement);
-        let selection_changed = self.adjust_ranges_for_character_data_edit(
-            node,
-            start,
-            end.saturating_sub(start),
-            utf16_len(replacement),
-        );
-        let changed = self.document.borrow_mut().set_character_data(node, updated);
-        if changed && selection_changed {
-            self.dispatch_document_selection_change()?;
-        }
+        let changed =
+            self.document
+                .borrow_mut()
+                .replace_data(node, start, end - start, replacement);
         Ok(changed)
     }
 
@@ -6386,8 +5928,6 @@ impl ScriptRuntime {
             .borrow_mut()
             .parse_fragment(&source)
             .map_err(|error| runtime_error(error.to_string()))?;
-        let replacement_length = utf16_len(&self.document.borrow().text_content(fragment));
-        let selection_changed = self.adjust_ranges_for_replacement(node, replacement_length);
         let target = self
             .document
             .borrow_mut()
@@ -6395,9 +5935,6 @@ impl ScriptRuntime {
             .unwrap_or(node);
         self.replace_children_quietly(target, Some(fragment));
         self.refresh_select_state_after_inner_html(node);
-        if selection_changed {
-            self.dispatch_document_selection_change()?;
-        }
         Ok(true)
     }
 
@@ -7191,22 +6728,11 @@ impl ScriptRuntime {
                 Ok(self.node_value(node))
             }
             Builtin::DocumentCreateRange => {
-                let root = self
-                    .document
-                    .borrow()
-                    .document_element()
-                    .ok_or_else(|| runtime_error("document has no range boundary element"))?;
-                let node = self.node_handle(root);
-                let range = RangeData {
-                    start: RangeBoundary {
-                        node: node.clone(),
-                        offset: 0,
-                    },
-                    end: RangeBoundary { node, offset: 0 },
+                let start = Boundary {
+                    node: self.document_node(),
+                    offset: 0,
                 };
-                let range = Rc::new(RefCell::new(range));
-                self.track_range(&range);
-                Ok(Value::Range(range))
+                Ok(Value::Range(self.new_range(LiveRange::collapsed(start))))
             }
             Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
             Builtin::PromiseReject => Ok(Value::Promise(Rc::new(RefCell::new(PromiseData {
@@ -7591,12 +7117,7 @@ impl ScriptRuntime {
                     .borrow_mut()
                     .split_text(node, offset)
                     .ok_or_else(|| runtime_error("text node could not be split"))?;
-                let right = self.node_handle(new_node);
-                let selection_changed = self.adjust_ranges_for_split_text(node, offset, &right);
-                if selection_changed {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Element(right))
+                Ok(self.node_value(new_node))
             }
             Builtin::ElementNormalize(handle) => {
                 self.normalize_element_handle(&handle)?;
@@ -7661,223 +7182,6 @@ impl ScriptRuntime {
                     &replacement,
                 )?;
                 Ok(Value::Undefined)
-            }
-            Builtin::RangeSetStart(range) => {
-                let boundary = self.range_boundary_from_arguments(&arguments)?;
-                let changed = {
-                    let mut range_data = range.borrow_mut();
-                    let previous = range_data.clone();
-                    range_data.start = boundary.clone();
-                    if self
-                        .range_boundary_position(&range_data.start)
-                        .zip(self.range_boundary_position(&range_data.end))
-                        .is_some_and(|(start, end)| start > end)
-                    {
-                        range_data.end = boundary;
-                    }
-                    *range_data != previous
-                };
-                if changed && self.selection_uses_range(&range) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::RangeSetEnd(range) => {
-                let boundary = self.range_boundary_from_arguments(&arguments)?;
-                let changed = {
-                    let mut range_data = range.borrow_mut();
-                    let previous = range_data.clone();
-                    range_data.end = boundary.clone();
-                    if self
-                        .range_boundary_position(&range_data.start)
-                        .zip(self.range_boundary_position(&range_data.end))
-                        .is_some_and(|(start, end)| end < start)
-                    {
-                        range_data.start = boundary;
-                    }
-                    *range_data != previous
-                };
-                if changed && self.selection_uses_range(&range) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::RangeCollapse(range) => {
-                let to_start = arguments.first().map(Value::truthy).unwrap_or(false);
-                let changed = {
-                    let mut range_data = range.borrow_mut();
-                    let previous = range_data.clone();
-                    if to_start {
-                        range_data.end = range_data.start.clone();
-                    } else {
-                        range_data.start = range_data.end.clone();
-                    }
-                    *range_data != previous
-                };
-                if changed && self.selection_uses_range(&range) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::RangeSelectNodeContents(range) => {
-                let boundary = self.range_boundary_from_arguments(&arguments)?;
-                let length = self
-                    .document
-                    .borrow()
-                    .node_text_content(boundary.node.id)
-                    .map(|text| utf16_len(&text))
-                    .unwrap_or(0);
-                let changed = {
-                    let mut range_data = range.borrow_mut();
-                    let previous = range_data.clone();
-                    range_data.start = RangeBoundary {
-                        node: boundary.node.clone(),
-                        offset: 0,
-                    };
-                    range_data.end = RangeBoundary {
-                        node: boundary.node,
-                        offset: length,
-                    };
-                    *range_data != previous
-                };
-                if changed && self.selection_uses_range(&range) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::RangeClone(range) => {
-                let clone = Rc::new(RefCell::new(range.borrow().clone()));
-                self.track_range(&clone);
-                Ok(Value::Range(clone))
-            }
-            Builtin::RangeToString(range) => Ok(Value::String(self.range_to_string(&range).into())),
-            Builtin::RangeDetach => Ok(Value::Undefined),
-            Builtin::SelectionAddRange(selection) => {
-                let Some(Value::Range(range)) = arguments.first().map(Value::resolve) else {
-                    return Err(runtime_error("Selection.addRange expects a Range"));
-                };
-                let changed = selection
-                    .borrow()
-                    .range
-                    .as_ref()
-                    .is_none_or(|current| !Rc::ptr_eq(current, &range));
-                self.track_range(&range);
-                selection.borrow_mut().set(Some(range));
-                if changed && Rc::ptr_eq(&selection, &self.selection) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::SelectionRemoveAllRanges(selection) => {
-                let changed = selection.borrow().range.is_some();
-                selection.borrow_mut().set(None);
-                if changed && Rc::ptr_eq(&selection, &self.selection) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::SelectionGetRangeAt(selection) => {
-                let index = arguments
-                    .first()
-                    .map(Value::number)
-                    .transpose()?
-                    .unwrap_or(0.0);
-                if !index.is_finite() || index.fract() != 0.0 || index < 0.0 {
-                    return Err(runtime_error(
-                        "Selection range index must be a non-negative integer",
-                    ));
-                }
-                if index != 0.0 {
-                    return Err(runtime_error("Selection range index is out of bounds"));
-                }
-                selection
-                    .borrow()
-                    .range
-                    .clone()
-                    .map(Value::Range)
-                    .ok_or_else(|| runtime_error("Selection has no range at index 0"))
-            }
-            Builtin::SelectionCollapse(selection) => {
-                let Some(node) = arguments.first().map(Value::resolve) else {
-                    let changed = selection.borrow().range.is_some();
-                    selection.borrow_mut().set(None);
-                    if changed && Rc::ptr_eq(&selection, &self.selection) {
-                        self.dispatch_document_selection_change()?;
-                    }
-                    return Ok(Value::Undefined);
-                };
-                if matches!(node, Value::Null | Value::Undefined) {
-                    let changed = selection.borrow().range.is_some();
-                    selection.borrow_mut().set(None);
-                    if changed && Rc::ptr_eq(&selection, &self.selection) {
-                        self.dispatch_document_selection_change()?;
-                    }
-                    return Ok(Value::Undefined);
-                }
-                let Value::Element(handle) = node else {
-                    return Err(runtime_error(
-                        "Selection.collapse expects an Element or null",
-                    ));
-                };
-                let value = self
-                    .document
-                    .borrow()
-                    .node_text_content(handle.id)
-                    .unwrap_or_default();
-                let offset = arguments
-                    .get(1)
-                    .map(Value::number)
-                    .transpose()?
-                    .map(selection_offset)
-                    .unwrap_or_default()
-                    .min(utf16_len(&value));
-                let range = RangeData {
-                    start: RangeBoundary {
-                        node: handle.clone(),
-                        offset,
-                    },
-                    end: RangeBoundary {
-                        node: handle,
-                        offset,
-                    },
-                };
-                let changed = selection
-                    .borrow()
-                    .range
-                    .as_ref()
-                    .is_none_or(|current| *current.borrow() != range);
-                let range = Rc::new(RefCell::new(range));
-                self.track_range(&range);
-                selection.borrow_mut().set(Some(range));
-                if changed && Rc::ptr_eq(&selection, &self.selection) {
-                    self.dispatch_document_selection_change()?;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::SelectionExtend(selection) => {
-                let focus = self.range_boundary_from_arguments(&arguments)?;
-                let Some(anchor) = self.selection_anchor(&selection) else {
-                    return Err(runtime_error("Selection.extend requires an existing range"));
-                };
-                self.set_selection_points(&selection, anchor, focus, false)?;
-                Ok(Value::Undefined)
-            }
-            Builtin::SelectionSetBaseAndExtent(selection) => {
-                let anchor = self.range_boundary_from_arguments(&arguments)?;
-                let focus =
-                    self.range_boundary_from_arguments(arguments.get(2..).unwrap_or(&[]))?;
-                self.set_selection_points(&selection, anchor, focus, true)?;
-                Ok(Value::Undefined)
-            }
-            Builtin::SelectionToString(selection) => {
-                let range = selection.borrow().range.clone();
-                Ok(Value::String(
-                    range
-                        .as_ref()
-                        .map(|range| self.range_to_string(range))
-                        .unwrap_or_default()
-                        .into(),
-                ))
             }
             Builtin::ElementRequestSubmit(handle) => {
                 let node = handle.id;
@@ -9334,20 +8638,6 @@ impl ScriptRuntime {
         )
     }
 
-    fn selection_uses_range(&self, range: &RangeHandle) -> bool {
-        self.selection
-            .borrow()
-            .range
-            .as_ref()
-            .is_some_and(|active| Rc::ptr_eq(active, range))
-    }
-
-    fn dispatch_document_selection_change(&mut self) -> Result<(), ScriptError> {
-        self.dispatch_event(self.document_node(), "selectionchange")?;
-        self.drain_microtasks()?;
-        Ok(())
-    }
-
     fn dispatch_event_with_details(
         &mut self,
         node: NodeId,
@@ -9559,6 +8849,7 @@ impl ScriptRuntime {
             }
             executed += 1;
         }
+        self.sync_selection_change()?;
         self.collect_detached_nodes();
         Ok(())
     }
@@ -13459,131 +12750,6 @@ fn selection_direction_name(direction: SelectionDirection) -> &'static str {
         SelectionDirection::None => "none",
         SelectionDirection::Forward => "forward",
         SelectionDirection::Backward => "backward",
-    }
-}
-
-fn adjust_range_boundary_for_remove(
-    boundary: &mut RangeBoundary,
-    child: NodeId,
-    child_start: usize,
-    removed_length: usize,
-    parent_handle: &ElementHandle,
-    document: &Document,
-) {
-    let node = boundary.node.id;
-    if document.is_inclusive_ancestor(child, node) {
-        boundary.node = parent_handle.clone();
-        boundary.offset = child_start;
-        return;
-    }
-    if !document.is_inclusive_ancestor(node, child) {
-        return;
-    }
-    let Some(ancestor_start) = document.node_text_offset(node) else {
-        return;
-    };
-    let Some(removed_start) = document.node_text_offset(child) else {
-        return;
-    };
-    let removed_start = removed_start.saturating_sub(ancestor_start);
-    let removed_end = removed_start.saturating_add(removed_length);
-    let offset = boundary.offset;
-    boundary.offset = if offset <= removed_start {
-        offset
-    } else if offset >= removed_end {
-        offset.saturating_sub(removed_length)
-    } else {
-        removed_start
-    };
-}
-
-fn adjust_range_boundary_for_replacement(
-    boundary: &mut RangeBoundary,
-    target: NodeId,
-    target_start: usize,
-    old_length: usize,
-    new_length: usize,
-    target_handle: &ElementHandle,
-    document: &Document,
-) {
-    let node = boundary.node.id;
-    if node != target && document.is_inclusive_ancestor(target, node) {
-        boundary.node = target_handle.clone();
-        boundary.offset = 0;
-        return;
-    }
-    if node == target || !document.is_inclusive_ancestor(node, target) {
-        return;
-    }
-    let Some(ancestor_start) = document.node_text_offset(node) else {
-        return;
-    };
-    let replacement_start = target_start.saturating_sub(ancestor_start);
-    boundary.offset =
-        remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
-}
-
-fn adjust_range_boundary_for_character_data_edit(
-    boundary: &mut RangeBoundary,
-    target: NodeId,
-    target_start: usize,
-    replacement_start: usize,
-    old_length: usize,
-    new_length: usize,
-    document: &Document,
-) {
-    let node = boundary.node.id;
-    if node == target {
-        boundary.offset =
-            remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
-        return;
-    }
-    if !document.is_inclusive_ancestor(node, target) {
-        return;
-    }
-    let Some(ancestor_start) = document.node_text_offset(node) else {
-        return;
-    };
-    let replacement_start = target_start
-        .saturating_add(replacement_start)
-        .saturating_sub(ancestor_start);
-    boundary.offset =
-        remap_range_offset(boundary.offset, replacement_start, old_length, new_length);
-}
-
-fn adjust_range_boundary_for_split_text(
-    boundary: &mut RangeBoundary,
-    target: NodeId,
-    offset: usize,
-    right: &ElementHandle,
-) {
-    if boundary.node.id == target && boundary.offset > offset {
-        boundary.node = right.clone();
-        boundary.offset -= offset;
-    }
-}
-
-fn remap_range_offset(
-    offset: usize,
-    replacement_start: usize,
-    old_length: usize,
-    new_length: usize,
-) -> usize {
-    if old_length == 0 {
-        if offset > replacement_start {
-            offset.saturating_add(new_length)
-        } else {
-            offset
-        }
-    } else {
-        let replacement_end = replacement_start.saturating_add(old_length);
-        if offset <= replacement_start {
-            offset
-        } else if offset >= replacement_end {
-            offset.saturating_sub(old_length).saturating_add(new_length)
-        } else {
-            replacement_start
-        }
     }
 }
 
@@ -18015,362 +17181,228 @@ mod tests {
     }
 
     #[test]
-    fn document_range_and_selection_cover_bounded_element_text() {
-        let document = document(r#"<p id="copy">hello</p><p id="status">idle</p>"#);
+    fn ranges_use_child_and_text_offsets_and_validate_boundaries() {
+        let document = document(
+            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
+        );
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
                 r#"
-                const copy = document.getElementById("copy");
-                const status = document.getElementById("status");
-                const range = document.createRange();
-                let changes = 0;
-                document.addEventListener("selectionchange", () => changes = changes + 1);
-                range.selectNodeContents(copy);
+                const root = document.getElementById("root");
+                const first = document.getElementById("first");
+                const second = document.getElementById("second");
+                const range = new Range();
+                const seen = [range.startContainer === document, range.collapsed, range instanceof Range];
+                range.setStart(first.firstChild, 2);
+                range.setEnd(second.firstChild, 3);
+                seen.push(range.toString(), range.commonAncestorContainer === root);
+                range.setStart(root, 1);
+                seen.push(range.toString(), range.startOffset);
+                try { range.setEnd(first, 2); } catch (error) { seen.push(error.name); }
+                range.setEnd(root, 0);
+                seen.push(range.collapsed, range.startOffset);
+                range.selectNode(second);
+                seen.push(range.startContainer === root, range.startOffset, range.endOffset, range.toString());
+                range.selectNodeContents(first);
+                seen.push(range.endOffset);
+                const other = document.createRange();
+                other.selectNodeContents(second);
+                seen.push(
+                    range.compareBoundaryPoints(Range.START_TO_START, other),
+                    range.compareBoundaryPoints(Range.END_TO_START, other),
+                    other.compareBoundaryPoints(Range.START_TO_END, range),
+                );
+                seen.push(
+                    range.isPointInRange(first.firstChild, 3),
+                    range.isPointInRange(second, 0),
+                    range.comparePoint(root, 0),
+                    range.comparePoint(root, 3),
+                    range.intersectsNode(first),
+                    range.intersectsNode(second),
+                );
+                document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("Range boundaries should follow the DOM standard");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "true,true,true,llowor,true,wor,1,IndexSizeError,true,0,true,1,2,world,1,-1,-1,1,true,false,-1,1,true,false"
+            )
+        );
+    }
+
+    #[test]
+    fn live_ranges_follow_the_dom_mutation_rules() {
+        let document = document(
+            r#"<main id="root"><p id="a">hello</p><p id="b">world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const root = document.getElementById("root");
+                const a = document.getElementById("a");
+                const b = document.getElementById("b");
+                const text = a.firstChild;
+                const inside = new Range();
+                inside.setStart(text, 1);
+                inside.setEnd(text, 4);
+                const after = new Range();
+                after.setStart(root, 2);
+                const seen = [];
+                root.insertBefore(document.createElement("hr"), b);
+                seen.push(after.startOffset);
+                text.insertData(0, "oh ");
+                seen.push(inside.startOffset + ":" + inside.endOffset + ":" + inside);
+                text.deleteData(2, 4);
+                seen.push(inside.startOffset + ":" + inside.endOffset + ":" + inside);
+                const right = text.splitText(1);
+                seen.push(inside.startContainer === right, inside.startOffset, inside.endOffset, inside.toString());
+                a.normalize();
+                seen.push(inside.startContainer === text, inside.startOffset, inside.endOffset, inside.toString());
+                text.data = "replaced";
+                seen.push(inside.startOffset, inside.endOffset);
+                const span = new Range();
+                span.selectNodeContents(b);
+                b.textContent = "x";
+                seen.push(span.startOffset + ":" + span.endOffset);
+                const deep = new Range();
+                deep.setStart(b.firstChild, 1);
+                root.removeChild(b);
+                seen.push(deep.startContainer === root, deep.startOffset, after.startOffset);
+                document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("live ranges should follow mutations");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("3,4:7:ell,2:3:l,true,1,2,l,true,2,3,l,0,0,0:0,true,2,2")
+        );
+    }
+
+    #[test]
+    fn range_contents_delete_extract_clone_insert_and_surround() {
+        let document = document(
+            r#"<main id="root"><p id="a">hello <b id="bold">big</b> world</p><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const a = document.getElementById("a");
+                const head = a.childNodes[0];
+                const tail = a.childNodes[2];
+                const range = new Range();
+                range.setStart(head, 2);
+                range.setEnd(tail, 3);
+                const seen = [];
+                const clone = range.cloneContents();
+                seen.push(clone.childNodes.length, clone.textContent, a.textContent);
+                const extracted = range.extractContents();
+                seen.push(extracted.textContent, a.textContent, range.collapsed, range.startContainer === a, range.startOffset);
+                range.insertNode(document.createTextNode("[x]"));
+                seen.push(a.textContent, range.toString());
+                range.surroundContents(document.createElement("em"));
+                seen.push(a.innerHTML, range.startOffset, range.endOffset);
+                range.setStart(a.firstChild, 1);
+                range.setEnd(a.lastChild, 2);
+                range.deleteContents();
+                seen.push(a.innerHTML, range.startContainer === a.firstChild, range.startOffset);
+                document.getElementById("status").textContent = seen.join(",");
+                "#,
+            )
+            .expect("range content operations should execute");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "3,llo big wo,hello big world,llo big wo,herld,true,true,1,he[x]rld,[x],he<em>[x]</em>rld,1,2,hd,false,1"
+            )
+        );
+    }
+
+    #[test]
+    fn selection_tracks_one_live_range_with_direction_and_coalesced_changes() {
+        let document = document(r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                var changes = 0;
+                document.addEventListener("selectionchange", () => changes++);
+                const a = document.getElementById("a").firstChild;
+                const b = document.getElementById("b").firstChild;
                 const selection = window.getSelection();
+                const seen = [selection.type, selection.rangeCount, String(selection.anchorNode)];
+                selection.setBaseAndExtent(b, 3, a, 1);
+                const range = selection.getRangeAt(0);
+                seen.push(selection.type, selection.direction, selection.anchorOffset, selection.focusOffset, String(selection), range.startContainer === a);
+                selection.extend(b, 5);
+                seen.push(selection.direction, selection.toString(), selection.getRangeAt(0) === range);
+                selection.collapseToEnd();
+                seen.push(selection.type, selection.isCollapsed, selection.focusOffset);
+                selection.selectAllChildren(document.getElementById("a"));
+                seen.push(selection.toString(), selection.containsNode(a), selection.containsNode(b, true));
+                try { selection.getRangeAt(1); } catch (error) { seen.push(error.name); }
+                var mine = new Range();
+                mine.selectNodeContents(document.getElementById("b"));
                 selection.removeAllRanges();
-                selection.addRange(range);
-                const clone = range.cloneRange();
-                clone.setStart(copy, 1);
-                clone.setEnd(copy, 4);
-                status.textContent = range.toString() + "|" + selection.toString() + "|" + clone.toString() + "|" + range.startOffset + ":" + range.endOffset + ":" + range.collapsed + ":" + range.commonAncestorContainer.id + "|" + selection.rangeCount + ":" + selection.anchorNode.id + ":" + selection.anchorOffset + ":" + selection.focusOffset;
-                selection.collapse(copy, 2);
-                status.textContent = status.textContent + "|" + selection.isCollapsed + ":" + selection.toString() + ":" + selection.rangeCount + ":" + changes;
+                selection.addRange(mine);
+                seen.push(selection.getRangeAt(0) === mine, changes);
+                mine.setStart(b, 2);
+                selection.deleteFromDocument();
+                seen.push(document.getElementById("b").textContent);
+                document.getElementById("status").textContent = seen.join(",");
                 "#,
             )
-            .expect("Range and Selection should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
+            .expect("Selection should execute");
+        runtime
+            .execute(
+                r#"document.getElementById("status").textContent += "|" + changes; mine.selectNodeContents(document.getElementById("a"));"#,
+            )
+            .expect("selection change should be reported");
+        runtime
+            .execute(r#"document.getElementById("status").textContent += "|" + changes;"#)
+            .expect("range change should be reported");
         assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("hello|hello|ell|0:5:false:copy|1:copy:0:5|true::1:2")
+            status_text(&document).as_deref(),
+            Some(
+                "None,0,null,Range,backward,3,1,ellowor,true,forward,ld,false,Caret,true,5,hello,true,false,IndexSizeError,true,0,wo|1|2"
+            )
         );
     }
 
     #[test]
-    fn document_range_spans_sibling_elements_and_keeps_live_boundaries() {
+    fn character_data_methods_edit_utf16_data_and_live_ranges() {
         let document = document(
-            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
+            r#"<main id="root"><p id="first">hello</p><p id="unicode">A😀B</p><p id="status">idle</p></main>"#,
         );
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
             .execute(
                 r#"
-                const first = document.getElementById("first");
-                const second = document.getElementById("second");
-                const status = document.getElementById("status");
-                const range = document.createRange();
-                range.setStart(first, 2);
-                range.setEnd(second, 3);
-                const selection = window.getSelection();
-                selection.removeAllRanges();
-                selection.addRange(range);
-                status.textContent = range.toString() + "|" + selection.toString() + "|" +
-                    range.startContainer.id + ":" + range.startOffset + "|" +
-                    range.endContainer.id + ":" + range.endOffset + "|" +
-                    range.commonAncestorContainer.id;
-                "#,
-            )
-            .expect("cross-node Range should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("llowor|llowor|first:2|second:3|root")
-        );
-    }
-
-    #[test]
-    fn document_range_accepts_text_node_boundaries_and_child_nodes() {
-        let document = document(
-            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const first = document.getElementById("first");
-                const second = document.getElementById("second");
-                const firstText = first.firstChild;
-                const secondText = second.childNodes[0];
-                const status = document.getElementById("status");
-                const range = document.createRange();
-                range.setStart(firstText, 1);
-                range.setEnd(secondText, 3);
-                const inserted = document.createElement("aside");
-                inserted.textContent = "ignored";
-                first.parentNode.insertBefore(inserted, second);
-                const target = document.createElement("section");
-                target.id = "target";
-                first.parentNode.insertBefore(target, inserted);
-                target.appendChild(first);
-                status.textContent = firstText.nodeType + ":" + firstText.nodeName + ":" +
-                    firstText.data + ":" + firstText.parentNode.id + ":" +
-                    firstText.parentNode.parentNode.id + ":" +
-                    first.childNodes.length + ":" + (first.childNodes[0] === firstText) + "|" +
-                    (second.firstChild === secondText) + "|" + range.toString() + "|" + range.startContainer.nodeName + ":" +
-                    range.startOffset + ":" + range.endContainer.nodeName + ":" +
-                    range.endOffset + ":" + range.commonAncestorContainer.id;
-                "#,
-            )
-            .expect("text-node Range boundaries should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("3:#text:hello:first:target:1:true|true|elloignoredwor|#text:1:#text:3:root")
-        );
-    }
-
-    #[test]
-    fn document_range_boundaries_follow_attached_node_moves() {
-        let document = document(
-            r#"<main id="source"><p id="first">hello</p><p id="stay">stay</p></main><main id="target"><p id="second">world</p><p id="status">idle</p></main>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const first = document.getElementById("first");
-                const second = document.getElementById("second");
-                const target = document.getElementById("target");
-                const status = document.getElementById("status");
-                const range = document.createRange();
-                range.setStart(first, 1);
-                range.setEnd(second, 4);
-                target.insertBefore(first, second);
-                status.textContent = range.toString() + "|" + range.startContainer.id + "|" +
-                    range.commonAncestorContainer.id;
-                "#,
-            )
-            .expect("Range should follow a moved node");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("elloworl|first|target")
-        );
-    }
-
-    #[test]
-    fn attached_text_nodes_move_through_append_and_insert_before() {
-        let document = document(
-            r#"<main id="source"><p id="first">hello<span id="marker">!</span>tail</p></main><main id="target"><p id="second">world</p></main><p id="status">idle</p>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const source = document.getElementById("first");
-                const target = document.getElementById("second");
-                const marker = document.getElementById("marker");
-                const leading = source.firstChild;
-                const trailing = marker.nextSibling;
-                const range = document.createRange();
-                range.setStart(leading, 1);
-                range.setEnd(leading, 4);
-                target.appendChild(leading);
-                target.insertBefore(trailing, leading);
-                const status = document.getElementById("status");
-                status.textContent = source.textContent + "|" + target.textContent + "|" +
-                    (leading.parentNode === target) + ":" + (trailing.parentNode === target) + ":" +
-                    (target.lastChild === leading) + ":" + (trailing.nextSibling === leading) + "|" +
-                    range.startContainer.data + ":" + range.startOffset + ":" +
-                    range.endContainer.data + ":" + range.endOffset + ":" + range.toString();
-                "#,
-            )
-            .expect("attached text movement should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("!|worldtailhello|true:true:true:true|hello:1:hello:4:ell")
-        );
-    }
-
-    #[test]
-    fn document_range_boundaries_survive_sibling_insertion_and_clamp_after_text_replacement() {
-        let document = document(
-            r#"<main id="root"><p id="first">hello</p><p id="second">world</p><p id="status">idle</p></main>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const root = document.getElementById("root");
-                const second = document.getElementById("second");
-                const status = document.getElementById("status");
-                const range = document.createRange();
-                range.selectNodeContents(second);
-                const inserted = document.createElement("aside");
-                inserted.textContent = "ignored";
-                root.insertBefore(inserted, second);
-                status.textContent = range.toString() + "|" + range.startContainer.id + "|" +
-                    range.endContainer.id;
-                second.textContent = "x";
-                status.textContent = status.textContent + "|" + range.toString() + "|" +
-                    range.endOffset;
-                "#,
-            )
-            .expect("Range should follow insertion and replacement");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("world|second|second|x|5")
-        );
-        assert_eq!(
-            document.borrow().find_element_by_id("second"),
-            Some(document.borrow().node_at(&[0, 2]))
-        );
-        assert_eq!(
-            document.borrow().find_element_by_id("first"),
-            Some(document.borrow().node_at(&[0, 0]))
-        );
-    }
-
-    #[test]
-    fn document_range_retargets_text_nodes_through_text_and_html_replacement() {
-        let document = document(
-            r#"<main id="root"><p id="before">before</p><p id="first">hello</p><p id="after">after</p></main><p id="status">idle</p>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const root = document.getElementById("root");
-                const first = document.getElementById("first");
-                const status = document.getElementById("status");
-                const removed = document.createRange();
-                removed.setStart(first.firstChild, 1);
-                removed.setEnd(first.firstChild, 4);
-                const ancestor = document.createRange();
-                ancestor.setStart(root, 6);
-                ancestor.setEnd(root, 16);
-                const selection = window.getSelection();
-                selection.addRange(removed);
-                let changes = 0;
-                document.addEventListener("selectionchange", () => changes = changes + 1);
-                first.textContent = "new";
-                status.textContent = removed.startContainer.id + ":" + removed.startOffset + "|" +
-                    removed.endContainer.id + ":" + removed.endOffset + "|" + removed.toString() + "|" +
-                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
-                const nested = document.createRange();
-                nested.setStart(first.firstChild, 1);
-                nested.setEnd(first.firstChild, 2);
-                selection.addRange(nested);
-                first.innerHTML = "<em>longer</em>!";
-                status.textContent = status.textContent + "|" +
-                    nested.startContainer.id + ":" + nested.startOffset + "|" +
-                    nested.endContainer.id + ":" + nested.endOffset + "|" + nested.toString() + "|" +
-                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
-                "#,
-            )
-            .expect("Range replacement retargeting should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("first:0|first:0||6:14:newafter|1|first:0|first:0||6:18:longer!after|3")
-        );
-    }
-
-    #[test]
-    fn text_node_data_mutation_keeps_identity_and_adjusts_live_ranges() {
-        let document = document(
-            r#"<main id="root"><p id="before">before</p><p id="first">hello</p><p id="after">after</p></main><p id="status">idle</p>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const root = document.getElementById("root");
-                const first = document.getElementById("first");
-                const text = first.firstChild;
-                const status = document.getElementById("status");
+                const text = document.getElementById("first").firstChild;
                 const range = document.createRange();
                 range.setStart(text, 1);
                 range.setEnd(text, 4);
-                const ancestor = document.createRange();
-                ancestor.setStart(root, 6);
-                ancestor.setEnd(root, 16);
-                const selection = window.getSelection();
-                selection.addRange(range);
-                let changes = 0;
-                document.addEventListener("selectionchange", () => changes = changes + 1);
-                text.data = "new";
-                status.textContent = (text === first.firstChild) + ":" + text.data + "|" +
-                    range.startOffset + ":" + range.endOffset + ":" + range.toString() + "|" +
-                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
-                const second = document.createRange();
-                second.setStart(text, 1);
-                second.setEnd(text, 2);
-                selection.addRange(second);
-                text.textContent = "longer";
-                status.textContent = status.textContent + "|" +
-                    (text === first.firstChild) + ":" + text.textContent + "|" +
-                    second.startOffset + ":" + second.endOffset + ":" + second.toString() + "|" +
-                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
+                const report = () => text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range;
+                const seen = [text.substringData(1, 3)];
+                text.insertData(2, "X");
+                seen.push(report());
+                text.deleteData(1, 2);
+                seen.push(report());
+                text.replaceData(1, 2, "YY");
+                seen.push(report());
+                text.appendData("!");
+                seen.push(report(), document.getElementById("unicode").firstChild.substringData(1, 2));
+                document.getElementById("status").textContent = seen.join("|");
                 "#,
             )
-            .expect("text-node data mutation should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
+            .expect("CharacterData methods should execute");
         assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("true:new|0:0:|6:14:newafter|1|true:longer|0:0:|6:17:longerafter|3")
-        );
-    }
-
-    #[test]
-    fn split_text_moves_live_boundaries_to_the_new_text_node() {
-        let document =
-            document(r#"<main id="root"><p id="first">hello</p><p id="status">idle</p></main>"#);
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const first = document.getElementById("first");
-                const text = first.firstChild;
-                const status = document.getElementById("status");
-                const range = document.createRange();
-                range.setStart(text, 1);
-                range.setEnd(text, 4);
-                const selection = window.getSelection();
-                selection.addRange(range);
-                let changes = 0;
-                document.addEventListener("selectionchange", () => changes = changes + 1);
-                const right = text.splitText(2);
-                status.textContent = text.data + ":" + right.data + ":" +
-                    (first.childNodes[0] === text) + ":" + (first.childNodes[1] === right) + "|" +
-                    range.startContainer.data + ":" + range.startOffset + ":" +
-                    range.endContainer.data + ":" + range.endOffset + ":" + range.toString() + "|" + changes;
-                "#,
-            )
-            .expect("splitText should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("he:llo:true:true|he:1:llo:2:ell|1")
+            status_text(&document).as_deref(),
+            Some("ell|heXllo:1:5:eXll|hllo:1:3:ll|hYYo:1:1:|hYYo!:1:1:|😀")
         );
     }
 
@@ -18447,61 +17479,6 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("hello|1|true|true:0:0|true")
-        );
-    }
-
-    #[test]
-    fn character_data_methods_edit_utf16_ranges_in_place() {
-        let document = document(
-            r#"<main id="root"><p id="first">hello</p><p id="unicode">A😀B</p><p id="status">idle</p></main>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const first = document.getElementById("first");
-                const text = first.firstChild;
-                const range = document.createRange();
-                range.setStart(text, 1);
-                range.setEnd(text, 4);
-                const root = document.getElementById("root");
-                const ancestor = document.createRange();
-                ancestor.setStart(root, 1);
-                ancestor.setEnd(root, 5);
-                const selection = window.getSelection();
-                selection.addRange(range);
-                let changes = 0;
-                document.addEventListener("selectionchange", () => changes = changes + 1);
-                const substring = text.substringData(1, 3);
-                text.insertData(2, "X");
-                const inserted = text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
-                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString();
-                text.deleteData(1, 2);
-                const deleted = text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
-                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString();
-                text.replaceData(1, 2, "YY");
-                const replaced = text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
-                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString();
-                text.appendData("!");
-                const unicode = document.getElementById("unicode").firstChild;
-                const emoji = unicode.substringData(1, 2);
-                const status = document.getElementById("status");
-                status.textContent = substring + "|" + inserted + "|" + deleted + "|" + replaced + "|" +
-                    text.data + ":" + range.startOffset + ":" + range.endOffset + ":" + range.toString() +
-                    "|" + ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() +
-                    "|" + changes + "|" + emoji;
-                "#,
-            )
-            .expect("CharacterData methods should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some(
-                "ell|heXllo:1:5:eXll|1:6:eXllo|hllo:1:3:ll|1:4:llo|hYYo:1:3:YY|1:4:YYo|hYYo!:1:3:YY|1:4:YYo|2|😀"
-            )
         );
     }
 
@@ -18969,45 +17946,6 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("😀|Ax😀B|AQ:B!|3:#text:true:false")
-        );
-    }
-
-    #[test]
-    fn document_range_retargets_removed_subtrees_and_shifts_ancestor_offsets() {
-        let document = document(
-            r#"<main id="root"><p id="before">before</p><p id="gone">hello</p><p id="after">after</p></main><p id="status">idle</p>"#,
-        );
-        let mut runtime = ScriptRuntime::new(document.clone());
-        runtime
-            .execute(
-                r#"
-                const root = document.getElementById("root");
-                const gone = document.getElementById("gone");
-                const status = document.getElementById("status");
-                const removed = document.createRange();
-                removed.setStart(gone, 1);
-                removed.setEnd(gone, 4);
-                const ancestor = document.createRange();
-                ancestor.setStart(root, 6);
-                ancestor.setEnd(root, 16);
-                const selection = window.getSelection();
-                selection.addRange(removed);
-                let changes = 0;
-                document.addEventListener("selectionchange", () => changes = changes + 1);
-                root.removeChild(gone);
-                status.textContent = removed.startContainer.id + ":" + removed.startOffset + "|" +
-                    removed.endContainer.id + ":" + removed.endOffset + "|" + removed.toString() + "|" +
-                    ancestor.startOffset + ":" + ancestor.endOffset + ":" + ancestor.toString() + "|" + changes;
-                "#,
-            )
-            .expect("Range removal retargeting should execute");
-        let status = document
-            .borrow()
-            .find_element_by_id("status")
-            .expect("status should exist");
-        assert_eq!(
-            document.borrow().element_text_content(status).as_deref(),
-            Some("root:6|root:6||6:11:after|1")
         );
     }
 

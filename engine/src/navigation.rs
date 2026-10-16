@@ -4764,8 +4764,8 @@ mod tests {
         let mut browser = Browser::new(bundle(
             r#"<p id="a">hello</p><p id="b">world</p><p id="status">idle</p><script>
                 const selection = window.getSelection();
-                const a = document.getElementById("a");
-                const b = document.getElementById("b");
+                const a = document.getElementById("a").firstChild;
+                const b = document.getElementById("b").firstChild;
                 selection.setBaseAndExtent(b, 3, a, 1);
                 let report = selection.direction + "|" + (selection.anchorNode === b) + "|" + selection.anchorOffset + "|" + (selection.focusNode === a) + "|" + selection.focusOffset + "|" + selection.toString();
                 selection.extend(b, 5);

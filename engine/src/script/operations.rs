@@ -307,7 +307,12 @@ impl ScriptRuntime {
         hint: Hint,
     ) -> Result<Value, ScriptError> {
         match &value {
-            Value::Object(_) | Value::Element(_) | Value::Document | Value::Event(_) => {
+            Value::Object(_)
+            | Value::Element(_)
+            | Value::Document
+            | Value::Event(_)
+            | Value::Range(_)
+            | Value::Selection(_) => {
                 let exotic = self.get_property(&value, "@@toPrimitive")?;
                 if !matches!(exotic, Value::Undefined | Value::Null) {
                     let hint_name = match hint {
@@ -888,7 +893,11 @@ impl ScriptRuntime {
             Value::Object(object) => {
                 return object.borrow().prototype_or(&self.intrinsics);
             }
-            Value::Element(_) | Value::Document | Value::Event(_) => {
+            Value::Element(_)
+            | Value::Document
+            | Value::Event(_)
+            | Value::Range(_)
+            | Value::Selection(_) => {
                 let object = self
                     .wrapper_object(value)
                     .expect("nodes and events have wrappers");
@@ -922,7 +931,11 @@ impl ScriptRuntime {
     pub(super) fn get_property(&mut self, value: &Value, key: &str) -> Result<Value, ScriptError> {
         match value {
             Value::Object(object) => self.ordinary_get(object.clone(), key, value),
-            Value::Element(_) | Value::Document | Value::Event(_) => {
+            Value::Element(_)
+            | Value::Document
+            | Value::Event(_)
+            | Value::Range(_)
+            | Value::Selection(_) => {
                 let object = self
                     .wrapper_object(value)
                     .expect("nodes and events have wrappers");
@@ -1047,7 +1060,11 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         match target {
             Value::Object(object) => self.ordinary_set(object.clone(), key, value, target, strict),
-            Value::Element(_) | Value::Document | Value::Event(_) => {
+            Value::Element(_)
+            | Value::Document
+            | Value::Event(_)
+            | Value::Range(_)
+            | Value::Selection(_) => {
                 let object = self
                     .wrapper_object(target)
                     .expect("nodes and events have wrappers");

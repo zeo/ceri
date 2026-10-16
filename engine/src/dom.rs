@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::rc::{Rc, Weak};
 
 // a node in one document arena; the generation tells a reused slot apart from a freed node
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -68,6 +70,38 @@ struct Slot {
     node: Option<NodeData>,
 }
 
+// a boundary point: a node and an offset into its children, or into the UTF-16 units of
+// its data for text and comments
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boundary {
+    pub node: NodeId,
+    pub offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRange {
+    pub start: Boundary,
+    pub end: Boundary,
+}
+
+impl LiveRange {
+    pub fn collapsed(at: Boundary) -> Self {
+        Self { start: at, end: at }
+    }
+}
+
+pub type SharedRange = Rc<RefCell<LiveRange>>;
+
+// ranges that tree mutations keep up to date; a cloned document starts without any
+#[derive(Debug, Default)]
+struct LiveRanges(Vec<Weak<RefCell<LiveRange>>>);
+
+impl Clone for LiveRanges {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     slots: Vec<Slot>,
@@ -78,6 +112,7 @@ pub struct Document {
     // nodes that were created or lost their parent, so their owner can decide whether to free them
     orphans: Vec<NodeId>,
     template_contents: HashMap<NodeId, NodeId>,
+    live_ranges: LiveRanges,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +221,7 @@ impl Document {
             version: 0,
             orphans: Vec::new(),
             template_contents: HashMap::new(),
+            live_ranges: LiveRanges::default(),
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -350,11 +386,25 @@ impl Document {
         }
     }
 
-    // unlinks a node from its parent, returning the parent and the index it had
+    // unlinks a node from its parent, returning the parent and the index it had; live range
+    // boundaries inside it move to where it was
     fn detach_raw(&mut self, id: NodeId) -> Option<(NodeId, usize)> {
         let parent = self.data(id)?.parent?;
+        let index = self
+            .children(parent)
+            .iter()
+            .position(|&child| child == id)?;
+        self.update_ranges(|document, boundary| {
+            if document.is_inclusive_ancestor(id, boundary.node) {
+                *boundary = Boundary {
+                    node: parent,
+                    offset: index,
+                };
+            } else if boundary.node == parent && boundary.offset > index {
+                boundary.offset -= 1;
+            }
+        });
         let siblings = &mut self.data_mut(parent)?.children;
-        let index = siblings.iter().position(|&child| child == id)?;
         siblings.remove(index);
         self.data_mut(id)?.parent = None;
         self.version += 1;
@@ -427,17 +477,193 @@ impl Document {
         }
     }
 
+    // replaces all of a text or comment node's data, which collapses live boundaries in it
+    // to its start
     pub fn set_character_data(&mut self, id: NodeId, data: String) -> bool {
-        let Some(node) = self.data_mut(id) else {
+        let length = self.node_length(id);
+        self.replace_data(id, 0, length, &data)
+    }
+
+    // the DOM's replace data: count UTF-16 units at offset become data, and live boundaries
+    // inside the replaced span move to its start while later ones shift
+    pub fn replace_data(&mut self, id: NodeId, offset: usize, count: usize, data: &str) -> bool {
+        let Some(current) = self.character_data(id) else {
             return false;
         };
-        match &mut node.kind {
-            NodeKind::Text(text) | NodeKind::Comment(text) => {
-                *text = data;
-                self.version += 1;
-                true
+        let units = current.encode_utf16().collect::<Vec<_>>();
+        let offset = offset.min(units.len());
+        let count = count.min(units.len() - offset);
+        let mut replaced = String::from_utf16_lossy(&units[..offset]);
+        replaced.push_str(data);
+        replaced.push_str(&String::from_utf16_lossy(&units[offset + count..]));
+        let inserted = data.encode_utf16().count();
+        match &mut self
+            .data_mut(id)
+            .expect("character data was read above")
+            .kind
+        {
+            NodeKind::Text(text) | NodeKind::Comment(text) => *text = replaced,
+            _ => unreachable!("only character data has text"),
+        }
+        self.version += 1;
+        self.update_ranges(|_, boundary| {
+            if boundary.node != id {
+                return;
             }
-            _ => false,
+            if boundary.offset > offset + count {
+                boundary.offset = boundary.offset + inserted - count;
+            } else if boundary.offset > offset {
+                boundary.offset = offset;
+            }
+        });
+        true
+    }
+
+    // the length a boundary offset is measured against: UTF-16 units of character data, or
+    // the number of children
+    pub fn node_length(&self, id: NodeId) -> usize {
+        match self.character_data(id) {
+            Some(data) => data.encode_utf16().count(),
+            None => self.children(id).len(),
+        }
+    }
+
+    pub fn track_range(&mut self, range: &SharedRange) {
+        let ranges = &mut self.live_ranges.0;
+        ranges.retain(|weak| weak.strong_count() != 0);
+        if !ranges
+            .iter()
+            .any(|weak| std::ptr::eq(weak.as_ptr(), Rc::as_ptr(range)))
+        {
+            ranges.push(Rc::downgrade(range));
+        }
+    }
+
+    // the boundary nodes of every live range, which keep detached trees from being freed
+    pub fn range_nodes(&self) -> Vec<NodeId> {
+        self.live_ranges
+            .0
+            .iter()
+            .filter_map(Weak::upgrade)
+            .flat_map(|range| {
+                let range = *range.borrow();
+                [range.start.node, range.end.node]
+            })
+            .collect()
+    }
+
+    fn update_ranges(&mut self, mut adjust: impl FnMut(&Self, &mut Boundary)) {
+        self.live_ranges.0.retain(|weak| weak.strong_count() != 0);
+        if self.live_ranges.0.is_empty() {
+            return;
+        }
+        let ranges = self
+            .live_ranges
+            .0
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for range in ranges {
+            let mut range = range.borrow_mut();
+            adjust(self, &mut range.start);
+            adjust(self, &mut range.end);
+        }
+    }
+
+    // where one boundary point sits relative to another, or None across trees
+    pub fn compare_boundaries(&self, left: Boundary, right: Boundary) -> Option<Ordering> {
+        if self.tree_root(left.node) != self.tree_root(right.node) {
+            return None;
+        }
+        if left.node == right.node {
+            return Some(left.offset.cmp(&right.offset));
+        }
+        if self.tree_order(left.node, right.node) == Ordering::Greater {
+            return self.compare_boundaries(right, left).map(Ordering::reverse);
+        }
+        if self.is_inclusive_ancestor(left.node, right.node) {
+            let child = std::iter::once(right.node)
+                .chain(self.ancestors(right.node))
+                .find(|&node| self.parent(node) == Some(left.node))?;
+            let index = self.index_in_parent(child)?;
+            if index < left.offset {
+                return Some(Ordering::Greater);
+            }
+        }
+        Some(Ordering::Less)
+    }
+
+    // the flat UTF-16 position of a boundary in the document's text, for connected nodes
+    pub fn boundary_text_position(&self, boundary: Boundary) -> Option<usize> {
+        let node = boundary.node;
+        if let Some(data) = self.character_data(node) {
+            let start = self.node_text_offset(node)?;
+            let inside = if self.is_text(node) {
+                boundary.offset.min(data.encode_utf16().count())
+            } else {
+                0
+            };
+            return Some(start + inside);
+        }
+        match self.children(node).get(boundary.offset) {
+            Some(&child) => self.node_text_offset(child),
+            None => {
+                Some(self.node_text_offset(node)? + self.text_content(node).encode_utf16().count())
+            }
+        }
+    }
+
+    // the DOM's normalize: drops empty text nodes and merges runs of adjacent ones, moving live
+    // boundaries into the text that survives
+    pub fn normalize(&mut self, root: NodeId) {
+        let texts = self
+            .descendants(root)
+            .filter(|&node| self.is_text(node))
+            .collect::<Vec<_>>();
+        for node in texts {
+            if self.parent(node).is_none() {
+                continue;
+            }
+            let mut length = self.node_length(node);
+            if length == 0 {
+                self.remove(node);
+                continue;
+            }
+            let mut run = Vec::new();
+            let mut next = self.sibling(node, true);
+            while let Some(current) = next.filter(|&current| self.is_text(current)) {
+                run.push(current);
+                next = self.sibling(current, true);
+            }
+            if run.is_empty() {
+                continue;
+            }
+            let appended = run
+                .iter()
+                .filter_map(|&current| self.text(current))
+                .collect::<String>();
+            self.replace_data(node, length, 0, &appended);
+            for &current in &run {
+                let parent = self.parent(current);
+                let index = self.index_in_parent(current);
+                self.update_ranges(|_, boundary| {
+                    if boundary.node == current {
+                        *boundary = Boundary {
+                            node,
+                            offset: boundary.offset + length,
+                        };
+                    } else if Some(boundary.node) == parent && Some(boundary.offset) == index {
+                        *boundary = Boundary {
+                            node,
+                            offset: length,
+                        };
+                    }
+                });
+                length += self.node_length(current);
+            }
+            for current in run {
+                self.remove(current);
+            }
         }
     }
 
@@ -692,6 +918,12 @@ impl Document {
         if let Some(data) = self.data_mut(parent) {
             data.children.splice(index..index, inserted.iter().copied());
         }
+        let count = inserted.len();
+        self.update_ranges(|_, boundary| {
+            if boundary.node == parent && boundary.offset > index {
+                boundary.offset += count;
+            }
+        });
         self.version += 1;
         Ok(inserted)
     }
@@ -839,14 +1071,26 @@ impl Document {
     // splits a text node at a UTF-16 offset; the tail follows it in the parent, if any
     pub fn split_text(&mut self, id: NodeId, offset: usize) -> Option<NodeId> {
         let text = self.text(id)?.to_string();
-        let (head, tail) = split_utf16(&text, offset);
-        self.set_character_data(id, head);
+        let length = self.node_length(id);
+        let (_, tail) = split_utf16(&text, offset);
         let created = self.create_text(tail);
         if let Some(parent) = self.parent(id) {
             let next = self.sibling(id, true);
             self.insert_before(parent, created, next).ok()?;
             self.orphans.retain(|&orphan| orphan != created);
+            let after = self.index_in_parent(id)? + 1;
+            self.update_ranges(|_, boundary| {
+                if boundary.node == id && boundary.offset > offset {
+                    *boundary = Boundary {
+                        node: created,
+                        offset: boundary.offset - offset,
+                    };
+                } else if boundary.node == parent && boundary.offset == after {
+                    boundary.offset += 1;
+                }
+            });
         }
+        self.replace_data(id, offset, length.saturating_sub(offset), "");
         Some(created)
     }
 

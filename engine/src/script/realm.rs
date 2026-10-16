@@ -122,6 +122,8 @@ pub(super) enum Native {
     DomConstructor(&'static str),
     Event(super::events::EventMember),
     EventConstructor(&'static str),
+    Range(super::ranges::RangeMember),
+    RangeConstructor(&'static str),
 }
 
 impl Native {
@@ -147,6 +149,7 @@ impl Native {
                 | Native::Codec(super::encoding::CodecMethod::DecoderConstructor)
                 | Native::DomConstructor(_)
                 | Native::EventConstructor(_)
+                | Native::RangeConstructor(_)
         ) || matches!(self, Native::Intl(method) if matches!(**method,
             super::intl::IntlMethod::NumberFormatConstructor
                 | super::intl::IntlMethod::DateTimeFormatConstructor
@@ -204,6 +207,7 @@ pub(super) struct Intrinsics {
     pub(super) intl_prototypes: Vec<ObjectHandle>,
     pub(super) dom: super::interfaces::DomInterfaces,
     pub(super) events: super::events::EventInterfaces,
+    pub(super) ranges: super::ranges::RangeInterfaces,
 }
 
 fn plain(prototype: &ObjectHandle) -> ObjectHandle {
@@ -1151,6 +1155,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
 
     let dom = super::interfaces::create(&build, &object_prototype, &mut globals);
     let events = super::events::create(&build, &object_prototype, &mut globals);
+    let ranges = super::ranges::create(&build, &object_prototype, &mut globals);
     let intrinsics = Intrinsics {
         object_prototype,
         function_prototype,
@@ -1192,6 +1197,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         intl_prototypes,
         dom,
         events,
+        ranges,
     };
     (intrinsics, globals)
 }
@@ -2227,10 +2233,13 @@ impl ScriptRuntime {
                 self.call_promise_function((*function).clone(), this, arguments)
             }
             Native::Dom(member) => self.call_dom(member, this, arguments),
-            Native::DomConstructor(name) | Native::EventConstructor(name) => Err(self.type_error(
-                format!("Failed to construct '{name}': Please use the 'new' operator"),
-            )),
+            Native::DomConstructor(name)
+            | Native::EventConstructor(name)
+            | Native::RangeConstructor(name) => Err(self.type_error(format!(
+                "Failed to construct '{name}': Please use the 'new' operator"
+            ))),
             Native::Event(member) => self.call_event_member(member, this, arguments),
+            Native::Range(member) => self.call_range_member(member, this, arguments),
             Native::ParseInt => {
                 let text = self.coerce_string(first)?;
                 let radix = self.coerce_int32(argument(&arguments, 1))?;
@@ -2481,6 +2490,7 @@ impl ScriptRuntime {
             }
             Native::DomConstructor(name) => self.construct_dom(name, arguments),
             Native::EventConstructor(name) => self.construct_event(name, arguments, new_target),
+            Native::RangeConstructor(name) => self.construct_range(name, new_target),
             Native::Codec(method) => {
                 self.call_codec(method, Value::Undefined, arguments, Some(new_target))
             }
