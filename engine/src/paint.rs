@@ -1144,7 +1144,7 @@ fn paint_outline(
     opacity: f32,
     clip: Option<Rect>,
 ) {
-    let Some(outline) = layout_box.outline else {
+    let Some(outline) = layout_box.outline.filter(|_| layout_box.visible) else {
         return;
     };
     let inner = Shape::from_rect(rect, layout_box.radii).outset(outline.offset);
@@ -1165,7 +1165,7 @@ fn paint_outline(
 
 // an overflow clip with rounded corners clips to the padding box's curves as well
 fn overflow_mask(layout_box: &LayoutBox, rect: Rect) -> Option<Shape> {
-    let clips = matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto);
+    let clips = layout_box.overflow.clips();
     let padding_box = Shape::from_rect(rect, layout_box.radii).inset(layout_box.border.widths);
     (clips && !padding_box.is_square()).then_some(padding_box)
 }
@@ -1571,6 +1571,15 @@ fn paint_box_surface(
     rect: Rect,
     opacity: f32,
 ) -> Option<Rect> {
+    let content_clip = if layout_box.overflow.clips() || layout_box.is_document() {
+        intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
+    } else {
+        clip
+    };
+    // a hidden box paints nothing of its own but still clips what its children paint
+    if !layout_box.visible {
+        return content_clip;
+    }
     let radii = layout_box.radii;
     if let Some(shadow) = layout_box.shadow.as_ref() {
         paint_shadow(canvas, shadow, rect, radii, opacity, clip);
@@ -1615,13 +1624,6 @@ fn paint_box_surface(
             },
         );
     }
-    let content_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
-        || layout_box.is_document()
-    {
-        intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
-    } else {
-        clip
-    };
     if layout_box.tag == "img"
         && let Some(layer) = images
             .iter()
@@ -1655,6 +1657,9 @@ fn paint_box_text(
     offset: (f32, f32),
     prose_selections: &[ProseSpan],
 ) {
+    if !layout_box.visible {
+        return;
+    }
     paint_control_selection(canvas, layout_box, clip, offset);
     paint_prose_selection(canvas, layout_box, prose_selections, clip, offset);
     for run in &layout_box.text {
@@ -1868,7 +1873,7 @@ fn paint_canvas_commands(
     clip: Option<Rect>,
     rect: Rect,
 ) {
-    if layout_box.tag != "canvas" {
+    if layout_box.tag != "canvas" || !layout_box.visible {
         return;
     }
     for command in commands {
@@ -1882,6 +1887,9 @@ fn paint_scrollbars(
     offset: (f32, f32),
     clip: Option<Rect>,
 ) {
+    if !layout_box.visible {
+        return;
+    }
     let metrics = scrollbar_metrics(layout_box);
     let track_color = Color::opaque(232, 236, 240);
     let thumb_color = Color::opaque(126, 138, 150);
@@ -2510,6 +2518,9 @@ mod tests {
                 sticky_inset: crate::css::Edges::auto(),
                 font_size: 16.0,
                 overflow: Overflow::Visible,
+                overflow_axes: [Overflow::Visible; 2],
+                visible: true,
+                cursor: crate::css::Cursor::Auto,
                 scroll_content: Size {
                     width: 64.0,
                     height: 24.0,
@@ -2702,6 +2713,22 @@ mod tests {
             vec![255, 255, 255],
             "the offset leaves a gap"
         );
+
+        let hidden = render(
+            "<div id='hidden'><div id='shown'></div></div>",
+            "html, body { margin: 0; background: #ffffff } #hidden { visibility: hidden; width: 40px; height: 40px; background: #ff0000; border: 2px solid #000000 } #shown { visibility: visible; width: 10px; height: 10px; background: #00ff00 }",
+        );
+        assert_eq!(
+            pixel(&hidden, 5, 5),
+            vec![0, 255, 0],
+            "a visible child still paints"
+        );
+        assert_eq!(
+            pixel(&hidden, 30, 30),
+            vec![255, 255, 255],
+            "a hidden box paints nothing"
+        );
+        assert_eq!(pixel(&hidden, 0, 30), vec![255, 255, 255], "nor its border");
     }
 
     #[test]
@@ -2757,6 +2784,9 @@ mod tests {
                 sticky_inset: crate::css::Edges::auto(),
                 font_size: 16.0,
                 overflow: Overflow::Visible,
+                overflow_axes: [Overflow::Visible; 2],
+                visible: true,
+                cursor: crate::css::Cursor::Auto,
                 scroll_content: Size {
                     width: 20.0,
                     height: 10.0,
@@ -2876,6 +2906,9 @@ mod tests {
                 sticky_inset: crate::css::Edges::auto(),
                 font_size: 12.0,
                 overflow: Overflow::Visible,
+                overflow_axes: [Overflow::Visible; 2],
+                visible: true,
+                cursor: crate::css::Cursor::Auto,
                 scroll_content: Size {
                     width: 32.0,
                     height: 28.0,
@@ -2967,6 +3000,9 @@ mod tests {
                         sticky_inset: crate::css::Edges::auto(),
                         font_size: 16.0,
                         overflow: Overflow::Visible,
+                        overflow_axes: [Overflow::Visible; 2],
+                        visible: true,
+                        cursor: crate::css::Cursor::Auto,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3007,6 +3043,9 @@ mod tests {
                         sticky_inset: crate::css::Edges::auto(),
                         font_size: 16.0,
                         overflow: Overflow::Visible,
+                        overflow_axes: [Overflow::Visible; 2],
+                        visible: true,
+                        cursor: crate::css::Cursor::Auto,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3022,6 +3061,9 @@ mod tests {
                 sticky_inset: crate::css::Edges::auto(),
                 font_size: 16.0,
                 overflow: Overflow::Visible,
+                overflow_axes: [Overflow::Visible; 2],
+                visible: true,
+                cursor: crate::css::Cursor::Auto,
                 scroll_content: Size {
                     width: 20.0,
                     height: 20.0,

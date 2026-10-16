@@ -39,7 +39,141 @@ impl Position {
 pub(crate) enum Overflow {
     Visible,
     Hidden,
+    // clips like hidden, but never scrolls, even from script
+    Clip,
     Auto,
+}
+
+impl Overflow {
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "visible" => Self::Visible,
+            "hidden" => Self::Hidden,
+            "clip" => Self::Clip,
+            "auto" | "scroll" | "overlay" => Self::Auto,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::Clip => "clip",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub(crate) fn clips(self) -> bool {
+        self != Self::Visible
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    Visible,
+    Hidden,
+    Collapse,
+}
+
+// the css cursor keywords, which hosts map to their own pointer shapes
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Cursor {
+    #[default]
+    Auto,
+    Default,
+    None,
+    ContextMenu,
+    Help,
+    Pointer,
+    Progress,
+    Wait,
+    Cell,
+    Crosshair,
+    Text,
+    VerticalText,
+    Alias,
+    Copy,
+    Move,
+    NoDrop,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    EResize,
+    NResize,
+    NeResize,
+    NwResize,
+    SResize,
+    SeResize,
+    SwResize,
+    WResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ColResize,
+    RowResize,
+    AllScroll,
+    ZoomIn,
+    ZoomOut,
+}
+
+const CURSOR_NAMES: [(Cursor, &str); 36] = [
+    (Cursor::Auto, "auto"),
+    (Cursor::Default, "default"),
+    (Cursor::None, "none"),
+    (Cursor::ContextMenu, "context-menu"),
+    (Cursor::Help, "help"),
+    (Cursor::Pointer, "pointer"),
+    (Cursor::Progress, "progress"),
+    (Cursor::Wait, "wait"),
+    (Cursor::Cell, "cell"),
+    (Cursor::Crosshair, "crosshair"),
+    (Cursor::Text, "text"),
+    (Cursor::VerticalText, "vertical-text"),
+    (Cursor::Alias, "alias"),
+    (Cursor::Copy, "copy"),
+    (Cursor::Move, "move"),
+    (Cursor::NoDrop, "no-drop"),
+    (Cursor::NotAllowed, "not-allowed"),
+    (Cursor::Grab, "grab"),
+    (Cursor::Grabbing, "grabbing"),
+    (Cursor::EResize, "e-resize"),
+    (Cursor::NResize, "n-resize"),
+    (Cursor::NeResize, "ne-resize"),
+    (Cursor::NwResize, "nw-resize"),
+    (Cursor::SResize, "s-resize"),
+    (Cursor::SeResize, "se-resize"),
+    (Cursor::SwResize, "sw-resize"),
+    (Cursor::WResize, "w-resize"),
+    (Cursor::EwResize, "ew-resize"),
+    (Cursor::NsResize, "ns-resize"),
+    (Cursor::NeswResize, "nesw-resize"),
+    (Cursor::NwseResize, "nwse-resize"),
+    (Cursor::ColResize, "col-resize"),
+    (Cursor::RowResize, "row-resize"),
+    (Cursor::AllScroll, "all-scroll"),
+    (Cursor::ZoomIn, "zoom-in"),
+    (Cursor::ZoomOut, "zoom-out"),
+];
+
+impl Cursor {
+    // image cursors are not loaded, so the keyword fallback after them is used
+    fn parse(value: &str) -> Option<Self> {
+        let keyword = split_top_level(value).last()?.trim().to_ascii_lowercase();
+        let keyword = keyword.strip_prefix("-webkit-").unwrap_or(&keyword);
+        CURSOR_NAMES
+            .iter()
+            .find(|(_, name)| *name == keyword)
+            .map(|(cursor, _)| *cursor)
+    }
+
+    pub fn name(self) -> &'static str {
+        CURSOR_NAMES
+            .iter()
+            .find(|(cursor, _)| *cursor == self)
+            .map_or("auto", |(_, name)| name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -321,6 +455,8 @@ pub(crate) struct InheritedText {
     pub(crate) transform: TextTransform,
     pub(crate) letter_spacing: Length,
     pub(crate) family: crate::font::FontStack,
+    pub(crate) visibility: Visibility,
+    pub(crate) cursor: Cursor,
 }
 
 impl Default for InheritedText {
@@ -329,6 +465,8 @@ impl Default for InheritedText {
             transform: TextTransform::None,
             letter_spacing: Length::px(0.0),
             family: crate::font::FontStack::default(),
+            visibility: Visibility::Visible,
+            cursor: Cursor::Auto,
         }
     }
 }
@@ -571,7 +709,12 @@ pub(crate) struct Style {
     pub position: Position,
     pub z_index: Option<i32>,
     pub inset: Edges,
+    // the stronger of the two axes, which decides clipping and scroll containment
     pub overflow: Overflow,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
+    pub visibility: Visibility,
+    pub cursor: Cursor,
     pub width: Length,
     pub height: Length,
     pub min_width: Length,
@@ -698,6 +841,20 @@ pub(crate) enum ObjectFit {
 }
 
 impl Style {
+    // a scrolling axis turns the other one from visible into auto, and from clip into hidden
+    pub(crate) fn overflow_axes(&self) -> [Overflow; 2] {
+        let scrolls = |axis: Overflow| matches!(axis, Overflow::Hidden | Overflow::Auto);
+        let settle = |axis: Overflow, other: Overflow| match axis {
+            Overflow::Visible if scrolls(other) => Overflow::Auto,
+            Overflow::Clip if scrolls(other) => Overflow::Hidden,
+            axis => axis,
+        };
+        [
+            settle(self.overflow_x, self.overflow_y),
+            settle(self.overflow_y, self.overflow_x),
+        ]
+    }
+
     fn default_for(
         name: &str,
         parent_font_size: f32,
@@ -711,6 +868,10 @@ impl Style {
             z_index: None,
             inset: Edges::auto(),
             overflow: Overflow::Visible,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
+            visibility: parent_text.visibility,
+            cursor: parent_text.cursor,
             width: Length::Auto,
             height: Length::Auto,
             min_width: Length::Auto,
@@ -1445,6 +1606,15 @@ impl Stylesheet {
             parent_weight,
             parent_text,
         );
+        // links show a pointer, as the user agent's :any-link rule does
+        if pseudo.is_none()
+            && name == "a"
+            && document
+                .element(node)
+                .is_some_and(|element| element.attrs.contains_key("href"))
+        {
+            style.cursor = Cursor::Pointer;
+        }
         let values = self.cascaded_values(document, node, pseudo, state);
         let empty_properties = BTreeMap::new();
         let custom_properties =
@@ -1581,6 +1751,8 @@ impl Stylesheet {
                 transform: style.text_transform,
                 letter_spacing: style.letter_spacing,
                 family: style.font_family,
+                visibility: style.visibility,
+                cursor: style.cursor,
             };
             computed = Some((style, font_size));
         }
@@ -3360,12 +3532,32 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "bottom" => style.inset.bottom = parse_length(value).unwrap_or(style.inset.bottom),
         "left" => style.inset.left = parse_length(value).unwrap_or(style.inset.left),
         "overflow" | "overflow-x" | "overflow-y" => {
-            style.overflow = match value.trim().to_ascii_lowercase().as_str() {
-                "hidden" | "clip" => Overflow::Hidden,
-                "auto" | "scroll" | "overlay" => Overflow::Auto,
+            let words = value
+                .split_ascii_whitespace()
+                .map(Overflow::parse)
+                .collect::<Option<Vec<_>>>();
+            match (property, words.as_deref()) {
+                ("overflow", Some([both])) => (style.overflow_x, style.overflow_y) = (*both, *both),
+                ("overflow", Some([x, y])) => (style.overflow_x, style.overflow_y) = (*x, *y),
+                ("overflow-x", Some([x])) => style.overflow_x = *x,
+                ("overflow-y", Some([y])) => style.overflow_y = *y,
+                _ => {}
+            }
+            style.overflow = match style.overflow_axes() {
+                axes if axes.contains(&Overflow::Auto) => Overflow::Auto,
+                axes if axes.contains(&Overflow::Hidden) => Overflow::Hidden,
+                axes if axes.contains(&Overflow::Clip) => Overflow::Clip,
                 _ => Overflow::Visible,
             };
         }
+        "visibility" => {
+            style.visibility = match value.trim().to_ascii_lowercase().as_str() {
+                "hidden" => Visibility::Hidden,
+                "collapse" => Visibility::Collapse,
+                _ => Visibility::Visible,
+            };
+        }
+        "cursor" => style.cursor = Cursor::parse(value).unwrap_or(style.cursor),
         "width" => style.width = parse_length(value).unwrap_or(Length::Auto),
         "height" => style.height = parse_length(value).unwrap_or(Length::Auto),
         // none and auto both read as no limit
@@ -5095,7 +5287,7 @@ mod tests {
         assert_eq!(style.inset.right, Length::px(20.0));
         assert_eq!(style.inset.bottom, Length::Auto);
         assert_eq!(style.inset.left, Length::px(30.0));
-        assert_eq!(style.overflow, Overflow::Hidden);
+        assert_eq!(style.overflow, Overflow::Clip);
         let auto =
             Stylesheet::parse(".scroll { overflow: auto; }").expect("auto stylesheet should parse");
         let mut scroll = Element::new("div");

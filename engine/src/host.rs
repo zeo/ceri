@@ -88,6 +88,8 @@ pub struct InputResult {
     pub handled: bool,
     pub tasks_run: usize,
     pub frame_requested: bool,
+    // the pointer shape after a pointer move, for the host to show
+    pub cursor: Option<crate::css::Cursor>,
 }
 
 #[derive(Clone, Debug)]
@@ -439,6 +441,7 @@ impl EngineHost {
                 InputResult {
                     handled: dispatched || dragged || extended,
                     frame_requested: dragged || extended,
+                    cursor: Some(self.browser.cursor()),
                     ..InputResult::default()
                 }
             }

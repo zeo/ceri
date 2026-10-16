@@ -4,6 +4,7 @@ use crate::css::{
     JustifyContent, Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
     Stylesheet, TextAlign,
 };
+use crate::css::{Cursor, Visibility};
 use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
@@ -129,6 +130,10 @@ pub struct LayoutBox {
     pub(crate) sticky_inset: Edges,
     pub(crate) font_size: f32,
     pub(crate) overflow: Overflow,
+    // the x and y axes, after a scrolling axis has settled the other
+    pub(crate) overflow_axes: [Overflow; 2],
+    pub(crate) visible: bool,
+    pub(crate) cursor: Cursor,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
     pub(crate) margin: ResolvedEdges,
@@ -431,6 +436,17 @@ fn inherited_text(style: &Style) -> InheritedText {
         transform: style.text_transform,
         letter_spacing: style.letter_spacing,
         family: style.font_family,
+        visibility: style.visibility,
+        cursor: style.cursor,
+    }
+}
+
+// a hidden box's own text paints nothing, while its visible descendants still show
+fn text_color(style: &Style) -> Color {
+    if style.visibility == Visibility::Visible {
+        style.color
+    } else {
+        Color::transparent()
     }
 }
 
@@ -627,6 +643,9 @@ pub fn layout_with_state(
         sticky_inset: Edges::auto(),
         font_size: 16.0,
         overflow: Overflow::Visible,
+        overflow_axes: [Overflow::Visible; 2],
+        visible: true,
+        cursor: Cursor::Auto,
         scroll_content: Size {
             width: viewport.width,
             height: viewport.height,
@@ -928,7 +947,37 @@ impl LayoutDocument {
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
-        hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
+        hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0)).map(|hit| hit.layout.node)
+    }
+
+    // the pointer shape over a point; auto shows a text cursor over text and editable fields
+    pub(crate) fn cursor_at(&self, x: f32, y: f32) -> Cursor {
+        let Some(hit) = hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0)) else {
+            return Cursor::Default;
+        };
+        let layout = hit.layout;
+        if layout.cursor != Cursor::Auto {
+            return layout.cursor;
+        }
+        let editable = layout.tag == "textarea"
+            || (layout.tag == "input" && layout.control_text_origin.is_some());
+        let over_text = layout.text.iter().any(|run| {
+            contains_point(
+                Rect {
+                    x: run.x + hit.offset.0,
+                    y: run.y + hit.offset.1,
+                    width: run.width,
+                    height: run.font_size * 1.25,
+                },
+                hit.point.0,
+                hit.point.1,
+            )
+        });
+        if editable || over_text {
+            Cursor::Text
+        } else {
+            Cursor::Default
+        }
     }
 
     pub(crate) fn scroll_target_at(&self, x: f32, y: f32) -> Option<ScrollTarget> {
@@ -981,13 +1030,17 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
             horizontal_track: None,
         };
     }
-    let mut vertical = layout.scroll_content.height > rect.height;
-    let mut horizontal = layout.scroll_content.width
-        > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
-    vertical = layout.scroll_content.height
-        > (rect.height - if horizontal { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
-    horizontal = layout.scroll_content.width
-        > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+    let [user_x, user_y] = user_scroll_axes(layout);
+    let mut vertical = user_y && layout.scroll_content.height > rect.height;
+    let mut horizontal = user_x
+        && layout.scroll_content.width
+            > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+    vertical = user_y
+        && layout.scroll_content.height
+            > (rect.height - if horizontal { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+    horizontal = user_x
+        && layout.scroll_content.width
+            > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
     let vertical_width = if vertical {
         SCROLLBAR_THICKNESS.min(rect.width)
     } else {
@@ -1023,15 +1076,42 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
     }
 }
 
-// what an overflow container clips its content to: the padding box, less any scrollbar
+// the axes a user can scroll with a wheel or scrollbar; hidden ones scroll only from script
+fn user_scroll_axes(layout: &LayoutBox) -> [bool; 2] {
+    if layout.is_document() {
+        return [true, true];
+    }
+    layout.overflow_axes.map(|axis| axis == Overflow::Auto)
+}
+
+// what an overflow container clips its content to: the padding box, less any scrollbar, on
+// the axes that clip
 pub(crate) fn overflow_clip_rect(layout: &LayoutBox) -> Rect {
+    const UNCLIPPED: f32 = 1.0e9;
     let scrollport = scrollbar_metrics(layout).scrollport;
     let border = layout.border.widths;
     let rect = layout.rect;
-    let left = scrollport.x.max(rect.x + border.left);
-    let top = scrollport.y.max(rect.y + border.top);
-    let right = (scrollport.x + scrollport.width).min(rect.x + rect.width - border.right);
-    let bottom = (scrollport.y + scrollport.height).min(rect.y + rect.height - border.bottom);
+    let [clip_x, clip_y] = if layout.is_document() {
+        [true, true]
+    } else {
+        layout.overflow_axes.map(Overflow::clips)
+    };
+    let (left, right) = if clip_x {
+        (
+            scrollport.x.max(rect.x + border.left),
+            (scrollport.x + scrollport.width).min(rect.x + rect.width - border.right),
+        )
+    } else {
+        (-UNCLIPPED, UNCLIPPED)
+    };
+    let (top, bottom) = if clip_y {
+        (
+            scrollport.y.max(rect.y + border.top),
+            (scrollport.y + scrollport.height).min(rect.y + rect.height - border.bottom),
+        )
+    } else {
+        (-UNCLIPPED, UNCLIPPED)
+    };
     Rect {
         x: left,
         y: top,
@@ -1173,13 +1253,21 @@ fn index_boxes(
     }
 }
 
+// the box under a point, with its visual offset and the point in its local space
+#[derive(Clone, Copy)]
+struct Hit<'a> {
+    layout: &'a LayoutBox,
+    offset: (f32, f32),
+    point: (f32, f32),
+}
+
 fn hit_test_box(
     layout: &LayoutBox,
     x: f32,
     y: f32,
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
-) -> Option<NodeId> {
+) -> Option<Hit<'_>> {
     hit_test_context(layout, x, y, clip, ancestor_offset)
 }
 
@@ -1189,7 +1277,7 @@ fn hit_test_context(
     y: f32,
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
-) -> Option<NodeId> {
+) -> Option<Hit<'_>> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
@@ -1222,7 +1310,44 @@ fn hit_test_context(
             return Some(path);
         }
     }
-    (inside_layout && !layout.is_document()).then_some(layout.node)
+    (inside_layout && hit_target(layout, rect, x, y)).then_some(Hit {
+        layout,
+        offset: visual_offset,
+        point: (x, y),
+    })
+}
+
+fn hit_target(layout: &LayoutBox, rect: Rect, x: f32, y: f32) -> bool {
+    !layout.is_document() && layout.visible && inside_corners(rect, layout.radii, x, y)
+}
+
+// whether a point inside a box's rectangle is also inside its rounded corners
+fn inside_corners(rect: Rect, radii: CornerRadii, x: f32, y: f32) -> bool {
+    let right = x > rect.x + rect.width / 2.0;
+    let bottom = y > rect.y + rect.height / 2.0;
+    let corner = match (right, bottom) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+        (false, true) => 3,
+    };
+    let (radius_x, radius_y) = radii[corner];
+    if radius_x <= 0.0 || radius_y <= 0.0 {
+        return true;
+    }
+    let along_x = if right {
+        x - (rect.x + rect.width - radius_x)
+    } else {
+        rect.x + radius_x - x
+    };
+    let along_y = if bottom {
+        y - (rect.y + rect.height - radius_y)
+    } else {
+        rect.y + radius_y - y
+    };
+    along_x <= 0.0
+        || along_y <= 0.0
+        || (along_x / radius_x).powi(2) + (along_y / radius_y).powi(2) <= 1.0
 }
 
 fn hit_test_non_context_children(
@@ -1231,7 +1356,7 @@ fn hit_test_non_context_children(
     y: f32,
     clip: Option<Rect>,
     visual_offset: (f32, f32),
-) -> Option<NodeId> {
+) -> Option<Hit<'_>> {
     let child_clip = stacking_child_clip(layout, clip, visual_offset);
     for index in paint_order(&layout.children).into_iter().rev() {
         let child = &layout.children[index];
@@ -1251,7 +1376,7 @@ fn hit_test_non_context(
     y: f32,
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
-) -> Option<NodeId> {
+) -> Option<Hit<'_>> {
     if let Some(clip) = clip
         && !contains_point(clip, x, y)
     {
@@ -1262,7 +1387,11 @@ fn hit_test_non_context(
     if let Some(path) = hit_test_non_context_children(layout, x, y, clip, visual_offset) {
         return Some(path);
     }
-    (contains_point(rect, x, y) && !layout.is_document()).then_some(layout.node)
+    (contains_point(rect, x, y) && hit_target(layout, rect, x, y)).then_some(Hit {
+        layout,
+        offset: visual_offset,
+        point: (x, y),
+    })
 }
 
 pub(crate) struct StackingContextEntry<'a> {
@@ -1316,7 +1445,7 @@ fn stacking_child_clip(
     clip: Option<Rect>,
     visual_offset: (f32, f32),
 ) -> Option<Rect> {
-    if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.is_document() {
+    if layout.overflow.clips() || layout.is_document() {
         intersect_rect(
             clip,
             translate_rect(overflow_clip_rect(layout), visual_offset),
@@ -1396,15 +1525,14 @@ fn scroll_target_box(
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     let inside_layout = contains_point(rect, x, y);
-    let child_clip =
-        if matches!(layout.overflow, Overflow::Hidden | Overflow::Auto) || layout.is_document() {
-            intersect_rect(
-                clip,
-                translate_rect(overflow_clip_rect(layout), visual_offset),
-            )
-        } else {
-            clip
-        };
+    let child_clip = if layout.overflow.clips() || layout.is_document() {
+        intersect_rect(
+            clip,
+            translate_rect(overflow_clip_rect(layout), visual_offset),
+        )
+    } else {
+        clip
+    };
     for index in paint_order(&layout.children).into_iter().rev() {
         if let Some(target) =
             scroll_target_box(&layout.children[index], x, y, child_clip, visual_offset)
@@ -1414,8 +1542,17 @@ fn scroll_target_box(
     }
     if inside_layout && (layout.overflow == Overflow::Auto || layout.is_document()) {
         let scrollport = scrollbar_metrics(layout).scrollport;
-        let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
-        let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
+        let [user_x, user_y] = user_scroll_axes(layout);
+        let max_x = if user_x {
+            (layout.scroll_content.width - scrollport.width).max(0.0)
+        } else {
+            0.0
+        };
+        let max_y = if user_y {
+            (layout.scroll_content.height - scrollport.height).max(0.0)
+        } else {
+            0.0
+        };
         if max_x > 0.0 || max_y > 0.0 {
             return Some(ScrollTarget {
                 node: layout.node,
@@ -1451,9 +1588,7 @@ fn thumb_drag_box(
         clip
     };
     let visual_offset = visual_offset_for(layout_box, ancestor_offset);
-    let child_clip = if matches!(layout_box.overflow, Overflow::Hidden | Overflow::Auto)
-        || layout_box.is_document()
-    {
+    let child_clip = if layout_box.overflow.clips() || layout_box.is_document() {
         intersect_rect(
             clip,
             translate_rect(overflow_clip_rect(layout_box), visual_offset),
@@ -1819,7 +1954,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let inline_context = InlineContext {
         font_size,
         line_height,
-        color: style.color,
+        color: text_color(&style),
         weight: style.font_weight,
         text: inherited_text(&style),
         opacity: 1.0,
@@ -1984,6 +2119,9 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         sticky_inset: style.inset,
         font_size,
         overflow: style.overflow,
+        overflow_axes: style.overflow_axes(),
+        visible: style.visibility == Visibility::Visible,
+        cursor: style.cursor,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -2098,7 +2236,7 @@ fn anonymous_box(
     node: NodeId,
     rect: Rect,
     text: Vec<TextRun>,
-    font_size: f32,
+    (font_size, cursor): (f32, Cursor),
     opacity: f32,
 ) -> LayoutBox {
     LayoutBox {
@@ -2129,6 +2267,9 @@ fn anonymous_box(
         sticky_inset: Edges::auto(),
         font_size,
         overflow: Overflow::Visible,
+        overflow_axes: [Overflow::Visible; 2],
+        visible: true,
+        cursor,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
@@ -2176,7 +2317,13 @@ fn layout_text_item(
         width,
         height: line.y.max(0.0),
     };
-    anonymous_box(node, rect, text, context.font_size, opacity)
+    anonymous_box(
+        node,
+        rect,
+        text,
+        (context.font_size, context.text.cursor),
+        opacity,
+    )
 }
 
 // the widest and narrowest a run of text can be laid out
@@ -2387,7 +2534,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let text_context = InlineContext {
         font_size,
         line_height,
-        color: style.color,
+        color: text_color(&style),
         weight: style.font_weight,
         text: inherited_text(&style),
         opacity: 1.0,
@@ -2921,6 +3068,9 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         sticky_inset: style.inset,
         font_size,
         overflow: style.overflow,
+        overflow_axes: style.overflow_axes(),
+        visible: style.visibility == Visibility::Visible,
+        cursor: style.cursor,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -3002,7 +3152,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let text_context = InlineContext {
         font_size,
         line_height,
-        color: style.color,
+        color: text_color(&style),
         weight: style.font_weight,
         text: inherited_text(&style),
         opacity: 1.0,
@@ -3363,6 +3513,9 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         sticky_inset: style.inset,
         font_size,
         overflow: style.overflow,
+        overflow_axes: style.overflow_axes(),
+        visible: style.visibility == Visibility::Visible,
+        cursor: style.cursor,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4331,7 +4484,8 @@ fn apply_relative_offset(
 fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
     layout.scroll_content = measure_scroll_content(layout);
     let is_document = layout.is_document();
-    if layout.overflow != Overflow::Auto && !is_document {
+    // clip never scrolls; hidden scrolls only when script asks
+    if !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden) && !is_document {
         return;
     }
     let scrollport = scrollbar_metrics(layout).scrollport;
@@ -4511,7 +4665,7 @@ fn append_inline_element(
     let child_context = InlineContext {
         font_size,
         line_height,
-        color: style.color,
+        color: text_color(&style),
         weight: style.font_weight,
         text: inherited_text(&style),
         opacity: style.opacity * parent.opacity,

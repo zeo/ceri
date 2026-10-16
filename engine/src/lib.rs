@@ -27,7 +27,7 @@ mod wasm;
 #[cfg(feature = "windowed")]
 mod window;
 
-pub use css::{Color, ColorScheme, Display, Stylesheet};
+pub use css::{Color, ColorScheme, Cursor, Display, Stylesheet};
 pub use dom::{
     AccessibilityNode, Document, DomError, Element, Namespace, NodeId, NodeKind, ParseError,
     ScriptSource, StylesheetSource,

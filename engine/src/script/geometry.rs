@@ -6,8 +6,8 @@ use super::operations::{is_callable, number_to_string, plain_object};
 use super::realm::Native;
 use super::*;
 use crate::css::{
-    AlignItems, Display, FlexDirection, FontWeight, JustifyContent, Overflow, Position, Style,
-    StyleState, Stylesheet, TextAlign, TextTransform,
+    AlignItems, Display, FlexDirection, FontWeight, JustifyContent, Position, Style, StyleState,
+    Stylesheet, TextAlign, TextTransform,
 };
 use crate::font::FontSet;
 use crate::layout::{
@@ -1032,12 +1032,8 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         "z-index" => style
             .z_index
             .map_or_else(|| "auto".to_string(), |index| index.to_string()),
-        "overflow-x" | "overflow-y" => match style.overflow {
-            Overflow::Visible => "visible",
-            Overflow::Hidden => "hidden",
-            Overflow::Auto => "auto",
-        }
-        .to_string(),
+        "overflow-x" => style.overflow_axes()[0].name().to_string(),
+        "overflow-y" => style.overflow_axes()[1].name().to_string(),
         "flex-direction" => match style.flex_direction {
             FlexDirection::Row => "row",
             FlexDirection::RowReverse => "row-reverse",

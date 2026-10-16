@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{Theme, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
@@ -106,6 +106,7 @@ where
         render_request: None,
         latest_frame: None,
         applied_title: None,
+        applied_cursor: None,
         viewport,
         scale: 1.0,
         window: None,
@@ -131,6 +132,7 @@ struct App<F> {
     render_request: Option<u64>,
     latest_frame: Option<Frame>,
     applied_title: Option<String>,
+    applied_cursor: Option<crate::css::Cursor>,
     viewport: Size,
     scale: f32,
     window: Option<Rc<Window>>,
@@ -242,7 +244,12 @@ where
                         self.time_request = None;
                     }
                     match result {
-                        Ok(_) => request_redraw = true,
+                        Ok(result) => {
+                            if let Some(cursor) = result.cursor {
+                                self.apply_cursor(cursor);
+                            }
+                            request_redraw = true;
+                        }
                         Err(error) => return self.recover(event_loop, &error.to_string()),
                     }
                 }
@@ -268,6 +275,19 @@ where
             self.request_redraw();
         }
         true
+    }
+
+    fn apply_cursor(&mut self, cursor: crate::css::Cursor) {
+        if self.applied_cursor == Some(cursor) {
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.set_cursor_visible(cursor != crate::css::Cursor::None);
+            // the engine's names are the css keywords, which the platform cursor set shares
+            let icon = cursor.name().parse::<CursorIcon>().unwrap_or_default();
+            window.set_cursor(icon);
+        }
+        self.applied_cursor = Some(cursor);
     }
 
     fn apply_title(&mut self, frame: &Frame) {

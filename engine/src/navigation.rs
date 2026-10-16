@@ -855,6 +855,8 @@ pub struct Browser {
     local_storage: StorageHandle,
     session_storage: StorageHandle,
     hovered_node: Option<NodeId>,
+    // the pointer shape for the last pointer position
+    cursor: crate::css::Cursor,
     transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
     declared: BTreeMap<(NodeId, AnimatableProperty), String>,
     // each element's running keyframe animation, so it plays from when it was applied
@@ -953,6 +955,7 @@ impl Browser {
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_node: None,
+            cursor: crate::css::Cursor::Default,
             transitions: BTreeMap::new(),
             declared: BTreeMap::new(),
             animations: BTreeMap::new(),
@@ -1943,6 +1946,10 @@ impl Browser {
         }
     }
 
+    pub fn cursor(&self) -> crate::css::Cursor {
+        self.cursor
+    }
+
     pub fn dispatch_at(
         &mut self,
         viewport: Size,
@@ -1950,7 +1957,9 @@ impl Browser {
         y: f32,
         event: &str,
     ) -> Result<bool, NavigationError> {
-        let node = self.layout(viewport)?.hit_test(x, y);
+        let layout = self.layout(viewport)?;
+        let node = layout.hit_test(x, y);
+        let moved_cursor = (event == "pointermove").then(|| layout.cursor_at(x, y));
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime.set_pointer_position(x, y);
         let hover_changed = if event == "pointermove" && self.hovered_node != node {
@@ -1962,9 +1971,18 @@ impl Browser {
         } else {
             false
         };
+        if let Some(cursor) = moved_cursor {
+            // hover rules can change the cursor, so a hover change reads it from the new styles
+            self.cursor = if hover_changed {
+                self.layout(viewport)?.cursor_at(x, y)
+            } else {
+                cursor
+            };
+        }
         let Some(node) = node else {
             return Ok(hover_changed);
         };
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         let handled = {
             let focused = if event == "pointerdown" {
                 page.runtime
@@ -3054,7 +3072,7 @@ pub(crate) fn normalize_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::Color;
+    use crate::css::{Color, Cursor};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -5852,6 +5870,67 @@ mod tests {
             document.borrow().element_text_content(status).as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn overflow_axes_visibility_rounded_hits_and_cursors_follow_style() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0 }
+                #axes { width: 50px; height: 20px; overflow-x: hidden }
+                #clip { width: 50px; height: 20px; overflow: clip visible }
+                #hidden { visibility: hidden; width: 50px; height: 50px }
+                #shown { visibility: visible; width: 20px; height: 20px }
+                #link { display: block; width: 50px; height: 20px }
+                #round { width: 40px; height: 40px; border-radius: 20px }
+                #move { cursor: url(grab.png) 2 2, move; width: 50px; height: 20px }
+                #text { height: 20px; font-size: 14px }
+            </style>
+            <div id="axes"></div><div id="clip"></div>
+            <div id="hidden"><div id="shown"></div></div>
+            <a id="link" href="#next">go</a><div id="round"></div><div id="move"></div>
+            <div id="text">hi</div>
+            <p id="status">idle</p>
+            <script>
+                const style = (id) => getComputedStyle(document.getElementById(id));
+                document.getElementById("status").textContent = [
+                    style("axes").overflowX, style("axes").overflowY,
+                    style("clip").overflowX, style("clip").overflowY,
+                ].join(",");
+            </script>"##,
+        ));
+        let viewport = Size {
+            width: 400.0,
+            height: 600.0,
+        };
+        browser.set_viewport(viewport, 1.0);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let id = |name: &str| document.find_element_by_id(name).expect("element exists");
+        assert_eq!(
+            document.element_text_content(id("status")).as_deref(),
+            Some("hidden,auto,clip,visible")
+        );
+        let layout = browser.layout(viewport).expect("layout should build");
+        assert_eq!(layout.hit_test(10.0, 50.0), Some(id("shown")));
+        assert_ne!(
+            layout.hit_test(40.0, 80.0),
+            Some(id("hidden")),
+            "a hidden box is not a hit target"
+        );
+        assert_eq!(layout.hit_test(20.0, 130.0), Some(id("round")));
+        assert_ne!(
+            layout.hit_test(1.0, 111.0),
+            Some(id("round")),
+            "points outside a rounded corner miss the box"
+        );
+        assert_eq!(layout.cursor_at(10.0, 100.0), Cursor::Pointer);
+        assert_eq!(layout.cursor_at(10.0, 160.0), Cursor::Move);
+        assert_eq!(layout.cursor_at(3.0, 178.0), Cursor::Text);
+        assert_eq!(layout.cursor_at(300.0, 178.0), Cursor::Default);
     }
 
     #[test]
