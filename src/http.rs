@@ -12,85 +12,25 @@ mod platform {
     use ceri_engine::{ExternalRequest, NavigationError, ResourceResponse};
     use std::collections::BTreeMap;
     use std::ffi::c_void;
+    use windows::Win32::Networking::WinHttp::{
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD, WINHTTP_ADDREQ_FLAG_REPLACE,
+        WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+        WINHTTP_QUERY_STATUS_CODE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect,
+        WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData,
+        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+    };
+    use windows::core::PCWSTR;
 
-    type Handle = *mut c_void;
-
-    const ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
-    const FLAG_SECURE: u32 = 0x0080_0000;
-    const ADD_REQUEST_HEADERS_REPLACE: u32 = 0x8000_0000;
-    const ADD_REQUEST_HEADERS_ADD: u32 = 0x2000_0000;
-    const QUERY_STATUS_CODE: u32 = 19;
-    const QUERY_RAW_HEADERS_CRLF: u32 = 22;
-    const QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     const TIMEOUT_MILLISECONDS: i32 = 30_000;
     const READ_CHUNK: usize = 64 * 1024;
 
-    #[link(name = "winhttp")]
-    unsafe extern "system" {
-        fn WinHttpOpen(
-            agent: *const u16,
-            access_type: u32,
-            proxy: *const u16,
-            proxy_bypass: *const u16,
-            flags: u32,
-        ) -> Handle;
-        fn WinHttpSetTimeouts(
-            session: Handle,
-            resolve: i32,
-            connect: i32,
-            send: i32,
-            receive: i32,
-        ) -> i32;
-        fn WinHttpConnect(session: Handle, host: *const u16, port: u16, reserved: u32) -> Handle;
-        fn WinHttpOpenRequest(
-            connection: Handle,
-            verb: *const u16,
-            object: *const u16,
-            version: *const u16,
-            referrer: *const u16,
-            accept_types: *const *const u16,
-            flags: u32,
-        ) -> Handle;
-        fn WinHttpAddRequestHeaders(
-            request: Handle,
-            headers: *const u16,
-            length: u32,
-            modifiers: u32,
-        ) -> i32;
-        fn WinHttpSendRequest(
-            request: Handle,
-            headers: *const u16,
-            headers_length: u32,
-            optional: *const c_void,
-            optional_length: u32,
-            total_length: u32,
-            context: usize,
-        ) -> i32;
-        fn WinHttpReceiveResponse(request: Handle, reserved: *mut c_void) -> i32;
-        fn WinHttpQueryHeaders(
-            request: Handle,
-            info_level: u32,
-            name: *const u16,
-            buffer: *mut c_void,
-            buffer_length: *mut u32,
-            index: *mut u32,
-        ) -> i32;
-        fn WinHttpReadData(
-            request: Handle,
-            buffer: *mut c_void,
-            to_read: u32,
-            read: *mut u32,
-        ) -> i32;
-        fn WinHttpCloseHandle(handle: Handle) -> i32;
-    }
-
-    struct Internet(Handle);
+    struct Internet(*mut c_void);
 
     impl Drop for Internet {
         fn drop(&mut self) {
             if !self.0.is_null() {
                 // SAFETY: the handle came from WinHTTP and is closed once
-                unsafe { WinHttpCloseHandle(self.0) };
+                let _ = unsafe { WinHttpCloseHandle(self.0) };
             }
         }
     }
@@ -110,10 +50,10 @@ mod platform {
         // SAFETY: every pointer below refers to a live null terminated buffer
         let session = Internet(unsafe {
             WinHttpOpen(
-                agent.as_ptr(),
-                ACCESS_TYPE_AUTOMATIC_PROXY,
-                std::ptr::null(),
-                std::ptr::null(),
+                PCWSTR(agent.as_ptr()),
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                PCWSTR::null(),
+                PCWSTR::null(),
                 0,
             )
         });
@@ -121,7 +61,7 @@ mod platform {
             return Err(failure("the platform HTTP stack is unavailable"));
         }
         // SAFETY: the session handle is live
-        unsafe {
+        let _ = unsafe {
             WinHttpSetTimeouts(
                 session.0,
                 TIMEOUT_MILLISECONDS,
@@ -133,7 +73,7 @@ mod platform {
         let host_wide = wide(&host);
         // SAFETY: the session handle is live and the host buffer outlives the call
         let connection =
-            Internet(unsafe { WinHttpConnect(session.0, host_wide.as_ptr(), port, 0) });
+            Internet(unsafe { WinHttpConnect(session.0, PCWSTR(host_wide.as_ptr()), port, 0) });
         if connection.0.is_null() {
             return Err(failure(format!("could not connect to {host}")));
         }
@@ -143,12 +83,12 @@ mod platform {
         let call = Internet(unsafe {
             WinHttpOpenRequest(
                 connection.0,
-                verb.as_ptr(),
-                object.as_ptr(),
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(object.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
                 std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                FLAG_SECURE,
+                WINHTTP_FLAG_SECURE,
             )
         });
         if call.0.is_null() {
@@ -161,14 +101,13 @@ mod platform {
                 .map(|(name, value)| format!("{name}: {value}"))
                 .collect::<Vec<_>>()
                 .join("\r\n");
-            let headers = wide(&headers);
+            let headers = headers.encode_utf16().collect::<Vec<_>>();
             // SAFETY: the request handle is live and the header buffer outlives the call
-            unsafe {
+            let _ = unsafe {
                 WinHttpAddRequestHeaders(
                     call.0,
-                    headers.as_ptr(),
-                    u32::MAX,
-                    ADD_REQUEST_HEADERS_ADD | ADD_REQUEST_HEADERS_REPLACE,
+                    &headers,
+                    WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
                 )
             };
         }
@@ -177,19 +116,21 @@ mod platform {
         let sent = unsafe {
             WinHttpSendRequest(
                 call.0,
-                std::ptr::null(),
-                0,
-                body.as_ptr() as *const c_void,
+                None,
+                (!body.is_empty()).then_some(body.as_ptr() as *const c_void),
                 body.len() as u32,
                 body.len() as u32,
                 0,
             )
         };
-        if sent == 0 {
-            return Err(failure(format!("the request to {host} could not be sent")));
+        if let Err(error) = sent {
+            return Err(failure(format!(
+                "the request to {host} could not be sent: {}",
+                error.message()
+            )));
         }
         // SAFETY: the request handle is live
-        if unsafe { WinHttpReceiveResponse(call.0, std::ptr::null_mut()) } == 0 {
+        if unsafe { WinHttpReceiveResponse(call.0, std::ptr::null_mut()) }.is_err() {
             return Err(failure(format!("{host} did not answer the request")));
         }
 
@@ -199,13 +140,14 @@ mod platform {
         if unsafe {
             WinHttpQueryHeaders(
                 call.0,
-                QUERY_STATUS_CODE | QUERY_FLAG_NUMBER,
-                std::ptr::null(),
-                &mut status as *mut u32 as *mut c_void,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                PCWSTR::null(),
+                Some(&mut status as *mut u32 as *mut c_void),
                 &mut status_size,
                 std::ptr::null_mut(),
             )
-        } == 0
+        }
+        .is_err()
         {
             return Err(failure("the response had no status code"));
         }
@@ -223,7 +165,7 @@ mod platform {
                     &mut read,
                 )
             };
-            if ok == 0 {
+            if ok.is_err() {
                 return Err(failure(format!(
                     "the response from {host} could not be read"
                 )));
@@ -249,15 +191,15 @@ mod platform {
         ResourceResponse::new(status as u16, mime_type, headers, body)
     }
 
-    fn read_raw_headers(call: Handle) -> BTreeMap<String, String> {
+    fn read_raw_headers(call: *mut c_void) -> BTreeMap<String, String> {
         let mut length = 0_u32;
-        // SAFETY: a null buffer asks WinHTTP for the size it needs
-        unsafe {
+        // SAFETY: no buffer asks WinHTTP for the size it needs, which it reports as a failure
+        let _ = unsafe {
             WinHttpQueryHeaders(
                 call,
-                QUERY_RAW_HEADERS_CRLF,
-                std::ptr::null(),
-                std::ptr::null_mut(),
+                WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                PCWSTR::null(),
+                None,
                 &mut length,
                 std::ptr::null_mut(),
             )
@@ -270,13 +212,14 @@ mod platform {
         if unsafe {
             WinHttpQueryHeaders(
                 call,
-                QUERY_RAW_HEADERS_CRLF,
-                std::ptr::null(),
-                buffer.as_mut_ptr() as *mut c_void,
+                WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                PCWSTR::null(),
+                Some(buffer.as_mut_ptr() as *mut c_void),
                 &mut length,
                 std::ptr::null_mut(),
             )
-        } == 0
+        }
+        .is_err()
         {
             return BTreeMap::new();
         }
