@@ -1,5 +1,6 @@
 mod bidi;
 mod border;
+mod bridge;
 mod cff;
 mod color_glyph;
 mod colors;
@@ -35,6 +36,9 @@ mod wasm;
 mod window;
 mod woff;
 
+pub use bridge::{
+    Capabilities, CommandCall, CommandError, CommandReply, CommandResult, CommandRouter, Grant,
+};
 pub use css::{Color, ColorScheme, Cursor, Display, Stylesheet};
 pub use dom::{
     AccessibilityNode, Document, DomError, Element, Namespace, NodeId, NodeKind, ParseError,
@@ -58,6 +62,6 @@ pub use navigation::{
     external_url, mime_type_for,
 };
 pub use paint::Canvas;
-pub use script::{HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
+pub use script::{HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
 #[cfg(feature = "windowed")]
 pub use window::{WindowConfig, run as run_window};

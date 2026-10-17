@@ -62,3 +62,56 @@ export function runtimeInfo() {
     );
   });
 }
+
+function bridge() {
+  if (typeof window === "undefined" || typeof window.ceri !== "object" || window.ceri === null) {
+    throw new CeriBridgeError("bridge-unavailable", "The Ceri host bridge is unavailable in this document");
+  }
+  return window.ceri;
+}
+
+// a host error arrives as an Error carrying a code; callers see one CeriBridgeError shape
+function asBridgeError(error) {
+  if (error instanceof CeriBridgeError) {
+    return error;
+  }
+  const code = typeof error?.code === "string" ? error.code : "failed";
+  const message = typeof error?.message === "string" ? error.message : String(error);
+  return new CeriBridgeError(code, message);
+}
+
+export function invoke(command, args) {
+  let host;
+  try {
+    host = bridge();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return host.invoke(command, args).catch((error) => {
+    throw asBridgeError(error);
+  });
+}
+
+export function listen(event, handler) {
+  let host;
+  try {
+    host = bridge();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return host.listen(event, handler);
+}
+
+export function emit(event, payload) {
+  let host;
+  try {
+    host = bridge();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return host.emit(event, payload);
+}
+
+export function windowLabel() {
+  return bridge().windowLabel;
+}

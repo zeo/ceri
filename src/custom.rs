@@ -1,11 +1,12 @@
 use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
+use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone};
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
-    AppUrl, Browser, EngineHost, ExternalRequest, FontSet, HostRuntimeInfo, NavigationError,
-    Resource, ResourceBundle, ResourceProvider, ResourceResponse, Size, WindowConfig,
-    mime_type_for, run_window,
+    AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost, ExternalRequest, FontSet,
+    HostBridge, HostRuntimeInfo, NavigationError, Resource, ResourceBundle, ResourceProvider,
+    ResourceResponse, Size, WindowConfig, mime_type_for, run_window,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -16,7 +17,74 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
 const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 
+// the label of the window an app opens with
+const MAIN_WINDOW: &str = "main";
+
+// an app: its commands and the capabilities that say which pages may invoke them
+#[derive(Clone, Default)]
+pub struct App {
+    commands: Commands,
+    capabilities: Capabilities,
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // a command quick enough to answer on the engine thread
+    pub fn command<F>(mut self, name: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(&CommandCall) -> Result<String, CommandError> + Send + Sync + 'static,
+    {
+        self.commands.add(name, handler);
+        self
+    }
+
+    // a command that may block, answered from a thread of its own
+    pub fn blocking_command<F>(mut self, name: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(&CommandCall) -> Result<String, CommandError> + Send + Sync + 'static,
+    {
+        self.commands.add_blocking(name, handler);
+        self
+    }
+
+    pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn run(self) -> Result<(), String> {
+        run_app(Bridge {
+            commands: Arc::new(self.commands),
+            capabilities: self.capabilities,
+        })
+    }
+}
+
+// what each browser the app builds hands its pages
+#[derive(Clone)]
+struct Bridge {
+    commands: Arc<Commands>,
+    capabilities: Capabilities,
+}
+
+impl Bridge {
+    fn host_bridge(&self) -> HostBridge {
+        HostBridge::new(
+            Rc::new(CommandRoutes(self.commands.clone())),
+            self.capabilities.clone(),
+            MAIN_WINDOW,
+        )
+    }
+}
+
 pub fn run() -> Result<(), String> {
+    App::new().run()
+}
+
+fn run_app(bridge: Bridge) -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let launch = launch::resolve(
         launch::switch_value(arguments.clone(), ASSETS_SWITCH).map(PathBuf::from),
@@ -35,10 +103,22 @@ pub fn run() -> Result<(), String> {
         ..WindowConfig::default()
     };
     if let Some(path) = launch::switch_value(arguments, SCREENSHOT_SWITCH) {
-        return capture(&config, PathBuf::from(path), assets, storage, allowed);
+        return capture(
+            &config,
+            PathBuf::from(path),
+            assets,
+            storage,
+            allowed,
+            bridge,
+        );
     }
     run_window(config, move || {
-        build_browser(assets.clone(), storage.clone(), allowed.clone())
+        build_browser(
+            assets.clone(),
+            storage.clone(),
+            allowed.clone(),
+            bridge.clone(),
+        )
     })
 }
 
@@ -49,9 +129,10 @@ fn capture(
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
     allowed: Vec<String>,
+    bridge: Bridge,
 ) -> Result<(), String> {
     let mut host = EngineHost::new(
-        build_browser(assets, storage, allowed)?,
+        build_browser(assets, storage, allowed, bridge)?,
         Size {
             width: config.width as f32,
             height: config.height as f32,
@@ -85,6 +166,7 @@ fn build_browser(
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
     allowed_origins: Vec<String>,
+    bridge: Bridge,
 ) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
         .map_err(|error| format!("could not create {}: {error}", storage.display()))?;
@@ -103,6 +185,7 @@ fn build_browser(
         )
     })?
     .with_host_runtime_info(runtime_info())
+    .with_host_bridge(bridge.host_bridge())
     .with_fonts(Rc::new(system_font_set()))
     .with_clipboard_provider(Rc::new(DesktopClipboard))
     .with_time_zone(Rc::new(DesktopTimeZone))

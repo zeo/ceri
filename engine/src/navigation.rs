@@ -866,6 +866,7 @@ pub struct Browser {
     animations: BTreeMap<NodeId, AnimationRun>,
     motion_clock: Option<u64>,
     host_runtime_info: Option<HostRuntimeInfo>,
+    host_bridge: Option<crate::script::HostBridge>,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
     fonts: Rc<FontSet>,
@@ -965,6 +966,7 @@ impl Browser {
             animations: BTreeMap::new(),
             motion_clock: None,
             host_runtime_info: None,
+            host_bridge: None,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
@@ -1008,6 +1010,25 @@ impl Browser {
     pub fn with_host_runtime_info(mut self, info: HostRuntimeInfo) -> Self {
         self.host_runtime_info = Some(info);
         self
+    }
+
+    // gives each page a window.ceri that invokes commands through the router, as the
+    // capabilities allow
+    pub fn with_host_bridge(mut self, bridge: crate::script::HostBridge) -> Self {
+        self.host_bridge = Some(bridge);
+        self
+    }
+
+    // an event from the host to the page's ceri.listen callbacks
+    pub fn emit_event(&mut self, name: &str, payload: &str) -> Result<usize, NavigationError> {
+        let delivered = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime
+                .dispatch_host_event(name, payload)
+                .map_err(|error| NavigationError::Script(error.to_string()))?
+        };
+        self.process_pending_navigation()?;
+        Ok(delivered)
     }
 
     pub fn set_viewport(&mut self, viewport: Size, device_pixel_ratio: f32) {
@@ -1253,6 +1274,9 @@ impl Browser {
         );
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
+        if let Some(bridge) = &self.host_bridge {
+            runtime.set_host_bridge(bridge.clone(), APP_ORIGIN.to_string());
+        }
         if let Some(time_zone) = &self.time_zone {
             runtime.set_time_zone(time_zone.clone());
         }
@@ -6120,6 +6144,150 @@ A</div>
         assert!(
             (160..190).all(|y| (60..120).all(|x| pixel(x, y) == [255, 255, 255])),
             "nothing paints past the clipped row"
+        );
+    }
+
+    #[test]
+    fn ceri_invokes_allowed_commands_rejects_denied_ones_and_hears_host_events() {
+        use crate::bridge::{
+            Capabilities, CommandCall, CommandError, CommandReply, CommandRouter, Grant,
+        };
+
+        #[derive(Default)]
+        struct Router {
+            calls: RefCell<Vec<CommandCall>>,
+            later: RefCell<Option<CommandReply>>,
+            events: RefCell<Vec<String>>,
+        }
+
+        impl CommandRouter for Router {
+            fn invoke(&self, call: CommandCall, reply: CommandReply) {
+                match call.command.as_str() {
+                    "greet" => reply.send(Ok(format!("{{\"echo\":{}}}", call.payload))),
+                    "slow" => *self.later.borrow_mut() = Some(reply),
+                    other => reply.send(Err(CommandError::unknown(other))),
+                }
+                self.calls.borrow_mut().push(call);
+            }
+
+            fn event(&self, window: &str, name: &str, payload: &str) {
+                self.events
+                    .borrow_mut()
+                    .push(format!("{window}:{name}:{payload}"));
+            }
+        }
+
+        let router = Rc::new(Router::default());
+        let capabilities = Capabilities::new(vec![Grant {
+            windows: vec!["main".to_string()],
+            origins: vec![APP_ORIGIN.to_string()],
+            commands: vec![
+                "greet".to_string(),
+                "slow".to_string(),
+                "missing".to_string(),
+            ],
+        }]);
+        let mut browser = Browser::new(bundle(
+            r##"<p id="status"></p><button id="stop">stop</button>
+            <script>
+                const log = (line) => { document.getElementById("status").textContent += line + "|"; };
+                log(window.ceri.windowLabel + ":" + (window.ceri === window.ceri));
+                window.ceri.invoke("greet", { name: "ceri" }).then((reply) => log("greet:" + reply.echo.name));
+                window.ceri.invoke("slow").then((reply) => log("slow:" + reply));
+                window.ceri.invoke("delete").catch((error) => log(error.name + ":" + error.code));
+                window.ceri.invoke("missing").catch((error) => log("missing:" + error.code));
+                window.ceri.listen("tick", (event) => log("tick:" + event.payload.n)).then((unlisten) => document.getElementById("stop").addEventListener("click", unlisten));
+                window.ceri.emit("ready", [1]);
+            </script>"##,
+        ))
+        .with_host_bridge(crate::script::HostBridge::new(
+            router.clone(),
+            capabilities,
+            "main",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let status = |browser: &Browser| {
+            let document = browser.document().expect("document");
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            document.element_text_content(status).unwrap_or_default()
+        };
+        assert_eq!(
+            status(&browser),
+            "main:true|greet:ceri|CeriBridgeError:denied|missing:unknown-command|"
+        );
+        let calls = router.calls.borrow().clone();
+        assert_eq!(calls.len(), 3, "a denied command never reaches the router");
+        assert_eq!(calls[0].origin, APP_ORIGIN);
+        assert_eq!(calls[0].payload, "{\"name\":\"ceri\"}");
+        assert_eq!(calls[1].payload, "{}");
+        assert_eq!(*router.events.borrow(), ["main:ready:[1]"]);
+        router
+            .later
+            .borrow_mut()
+            .take()
+            .expect("the slow reply is held")
+            .send(Ok("42".to_string()));
+        assert_eq!(browser.pump().expect("pump"), 1);
+        assert_eq!(browser.emit_event("tick", "{\"n\":7}").expect("emit"), 1);
+        assert!(status(&browser).ends_with("slow:42|tick:7|"));
+        browser.click_id("stop").expect("unlisten runs");
+        assert_eq!(browser.emit_event("tick", "{\"n\":8}").expect("emit"), 0);
+    }
+
+    #[test]
+    fn the_sdk_wraps_invoke_results_and_host_errors() {
+        use crate::bridge::{Capabilities, CommandCall, CommandReply, CommandRouter, Grant};
+
+        struct Echo;
+
+        impl CommandRouter for Echo {
+            fn invoke(&self, call: CommandCall, reply: CommandReply) {
+                reply.send(Ok(call.payload));
+            }
+        }
+
+        let mut resources = bundle(
+            r##"<p id="status"></p>
+            <script type="module">
+                import { invoke, windowLabel, CeriBridgeError } from "/sdk/index.js";
+                const status = document.getElementById("status");
+                const echoed = await invoke("echo", { n: 3 });
+                let denied = "none";
+                try {
+                    await invoke("secret");
+                } catch (error) {
+                    denied = (error instanceof CeriBridgeError) + ":" + error.code;
+                }
+                status.textContent = windowLabel() + "," + echoed.n + "," + denied;
+            </script>"##,
+        );
+        let sdk = std::fs::read(format!("{}/../sdk/index.js", env!("CARGO_MANIFEST_DIR")))
+            .expect("the sdk should exist");
+        resources
+            .insert("/sdk/index.js", "text/javascript", sdk)
+            .expect("sdk should be accepted");
+        let mut browser = Browser::new(resources).with_host_bridge(crate::script::HostBridge::new(
+            Rc::new(Echo),
+            Capabilities::new(vec![Grant {
+                windows: vec!["*".to_string()],
+                origins: vec![APP_ORIGIN.to_string()],
+                commands: vec!["echo".to_string()],
+            }]),
+            "settings",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser.pump().expect("pump");
+        let document = browser.document().expect("document");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("settings,3,true:denied")
         );
     }
 

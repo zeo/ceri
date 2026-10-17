@@ -1,6 +1,7 @@
 mod arrays;
 mod ast;
 mod bigint;
+mod bridge;
 mod collections;
 mod compiler;
 mod console;
@@ -36,6 +37,7 @@ use object::{JsObject, ObjectClass, ObjectHandle, new_object};
 use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol_description};
 use realm::{Intrinsics, Native, create_intrinsics};
 
+pub use bridge::HostBridge;
 pub use dates::TimeZone;
 pub(crate) use geometry::LayoutInputs;
 
@@ -236,6 +238,10 @@ enum CloneValue {
 
 #[derive(Clone)]
 enum Builtin {
+    CeriInvoke,
+    CeriListen,
+    CeriUnlisten(u64),
+    CeriEmit,
     DocumentGetElementById,
     DocumentQuerySelector,
     DocumentQuerySelectorAll,
@@ -560,6 +566,7 @@ pub struct ScriptRuntime {
     time_origin: f64,
     time_zone: Rc<dyn dates::TimeZone>,
     host_runtime_info: Option<HostRuntimeInfo>,
+    bridge: Option<Box<bridge::BridgeState>>,
     module_cache: BTreeMap<String, ModuleNamespace>,
     workers: Vec<WorkerHandle>,
     worker_sender: Option<SyncSender<WorkerEvent>>,
@@ -1531,6 +1538,7 @@ impl ScriptRuntime {
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
             clipboard_provider: None,
+            bridge: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
             canvas_commands: Vec::new(),
@@ -3419,6 +3427,7 @@ impl ScriptRuntime {
                 "onmessage" | "onerror" if self.worker_sender.is_some() => {
                     Ok(self.global.borrow().get(property).unwrap_or(Value::Null))
                 }
+                "ceri" => Ok(self.ceri_object()),
                 "ceriQuery" => Ok(self
                     .host_runtime_info
                     .as_ref()
@@ -4609,7 +4618,7 @@ impl ScriptRuntime {
     }
 
     pub fn pump(&mut self) -> Result<usize, ScriptError> {
-        let processed = self.pump_workers()?;
+        let processed = self.pump_workers()? + self.settle_command_replies()?;
         self.drain_microtasks()?;
         Ok(processed)
     }
@@ -8315,6 +8324,13 @@ impl ScriptRuntime {
                 self.tasks.retain(|task| task.id != id);
                 Ok(Value::Undefined)
             }
+            Builtin::CeriInvoke => self.ceri_invoke(&arguments),
+            Builtin::CeriListen => self.ceri_listen(&arguments),
+            Builtin::CeriUnlisten(id) => {
+                self.ceri_unlisten(id);
+                Ok(Value::Undefined)
+            }
+            Builtin::CeriEmit => self.ceri_emit(&arguments),
             Builtin::CeriQuery => {
                 let request = arguments
                     .first()

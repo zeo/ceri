@@ -45,7 +45,41 @@ const info = await runtimeInfo();
 console.log(info.engine, info.recovery);
 ```
 
-`runtimeInfo()` reads the promise-based `window.ceriQuery` bridge and validates the response shape before returning it. Requests are limited to the runtime method Ceri implements. A new host capability should arrive as an explicit typed method with an explicit capability check, not as a general command evaluator.
+`runtimeInfo()` reads the promise-based `window.ceriQuery` bridge and validates the response shape before returning it.
+
+### Commands
+
+An app registers named commands in Rust and grants pages the right to call them. Arguments and results cross the bridge as JSON text:
+
+```rust
+use ceri::{App, Capabilities, CommandError, Grant};
+
+fn main() -> Result<(), String> {
+    App::new()
+        .command("greet", |call| Ok(format!("{{\"hello\":{}}}", call.payload)))
+        .blocking_command("export", |call| {
+            std::fs::write("export.json", &call.payload)
+                .map(|()| "true".to_string())
+                .map_err(|error| CommandError::failed(error.to_string()))
+        })
+        .capabilities(Capabilities::new(vec![Grant {
+            windows: vec!["main".into()],
+            origins: vec![ceri::APP_ORIGIN.into()],
+            commands: vec!["greet".into(), "export".into()],
+        }]))
+        .run()
+}
+```
+
+```js
+import { invoke, listen, emit } from "./sdk/index.js";
+
+const reply = await invoke("greet", { name: "ceri" });
+const unlisten = await listen("progress", (event) => console.log(event.payload));
+await emit("ready", { at: Date.now() });
+```
+
+`command` handlers answer on the engine thread and should return quickly. `blocking_command` handlers each run on a thread of their own, and their promises settle on the next engine frame. Capabilities deny by default: a grant names windows, origins and commands, where each pattern is `*`, an exact name or a prefix ending in `*`. A call no grant allows is rejected in the engine before it reaches the app, as a `CeriBridgeError` with code `denied`. An unregistered command rejects with `unknown-command`, a payload that is not JSON serializable with `invalid-payload`, and a handler's own `CommandError` arrives with its code and message. `Browser::emit_event` delivers host events to `listen` callbacks as `{ event, payload }`, and `emit` passes page events to the router's `event` hook.
 
 ## Failure behavior
 
