@@ -5873,6 +5873,73 @@ mod tests {
     }
 
     #[test]
+    fn tables_size_columns_span_cells_align_content_and_number_list_items() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                table { border-spacing: 4px; font-size: 16px; line-height: 20px }
+                td { padding: 0; height: 20px }
+                .wide { width: 100px }
+                #tall { height: 60px; vertical-align: bottom }
+                #fixed { table-layout: fixed; width: 210px; border-spacing: 0 }
+                ol { margin: 0; padding-left: 40px; font-size: 16px; line-height: 20px }
+            </style>
+            <table id="table">
+              <tr id="first"><td id="a" class="wide"></td><td id="b" style="width: 50px"></td></tr>
+              <tr><td id="span" colspan="2"></td></tr>
+              <tr><td id="down" rowspan="2"></td><td id="tall"><span id="bottom" style="display: inline-block; height: 20px; width: 10px"></span></td></tr>
+              <tr><td id="under"></td></tr>
+            </table>
+            <table id="fixed"><tr><td id="f1" style="width: 10px"></td><td id="f2"></td><td id="f3"></td></tr></table>
+            <ol start="4" id="list"><li id="i4">four</li><li>five</li></ol>
+            <p id="status">idle</p>
+            <script>
+                const box = (id) => document.getElementById(id).getBoundingClientRect();
+                const x = (id) => box(id).x - box("table").x;
+                const y = (id) => box(id).y - box("table").y;
+                document.getElementById("status").textContent = [
+                    box("table").width, x("a"), x("b"), box("b").width,
+                    box("span").width, y("span"), box("down").height, y("bottom"),
+                    y("under"), box("first").width,
+                    box("f2").width, box("f3").x - box("fixed").x,
+                    getComputedStyle(document.getElementById("i4")).display,
+                ].join(",");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("table page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("162,4,108,50,154,28,84,92,116,154,100,110,list-item")
+        );
+        let layout = browser
+            .layout(Size {
+                width: 400.0,
+                height: 600.0,
+            })
+            .expect("layout should build");
+        let marker = find_marker(&layout.root).expect("the list item has a marker");
+        assert_eq!(marker.text[0].text, "4.");
+    }
+
+    fn find_marker(layout: &crate::layout::LayoutBox) -> Option<&crate::layout::LayoutBox> {
+        if layout.tag == "::marker" {
+            return Some(layout);
+        }
+        layout.children.iter().find_map(find_marker)
+    }
+
+    #[test]
     fn floats_stack_to_their_sides_push_lines_aside_and_clear() {
         let mut browser = Browser::new(bundle(
             r##"<style>

@@ -19,7 +19,162 @@ pub enum Display {
     InlineGrid,
     // a block that contains its floats
     FlowRoot,
+    // a block with a marker before its first line
+    ListItem,
+    Table,
+    InlineTable,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableRow,
+    TableCell,
+    TableCaption,
+    TableColumn,
+    TableColumnGroup,
     None,
+}
+
+impl Display {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Flex => "flex",
+            Self::Grid => "grid",
+            Self::Inline => "inline",
+            Self::InlineBlock => "inline-block",
+            Self::InlineFlex => "inline-flex",
+            Self::InlineGrid => "inline-grid",
+            Self::FlowRoot => "flow-root",
+            Self::ListItem => "list-item",
+            Self::Table => "table",
+            Self::InlineTable => "inline-table",
+            Self::TableRowGroup => "table-row-group",
+            Self::TableHeaderGroup => "table-header-group",
+            Self::TableFooterGroup => "table-footer-group",
+            Self::TableRow => "table-row",
+            Self::TableCell => "table-cell",
+            Self::TableCaption => "table-caption",
+            Self::TableColumn => "table-column",
+            Self::TableColumnGroup => "table-column-group",
+            Self::None => "none",
+        }
+    }
+
+    // boxes that sit on a line like a word, rather than stacking as blocks
+    pub(crate) fn is_inline_level(self) -> bool {
+        matches!(
+            self,
+            Self::Inline
+                | Self::InlineBlock
+                | Self::InlineFlex
+                | Self::InlineGrid
+                | Self::InlineTable
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerticalAlign {
+    Baseline,
+    Top,
+    Middle,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListStyleType {
+    None,
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    DecimalLeadingZero,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+    LowerGreek,
+}
+
+impl ListStyleType {
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "none" => Self::None,
+            "disc" => Self::Disc,
+            "circle" => Self::Circle,
+            "square" => Self::Square,
+            "decimal" => Self::Decimal,
+            "decimal-leading-zero" => Self::DecimalLeadingZero,
+            "lower-alpha" | "lower-latin" => Self::LowerAlpha,
+            "upper-alpha" | "upper-latin" => Self::UpperAlpha,
+            "lower-roman" => Self::LowerRoman,
+            "upper-roman" => Self::UpperRoman,
+            "lower-greek" => Self::LowerGreek,
+            _ => return None,
+        })
+    }
+
+    // the text a numbered marker shows, with its suffix; bullets are drawn as shapes
+    pub(crate) fn marker_text(self, ordinal: i32) -> Option<String> {
+        let alphabetic = |letters: &[char]| {
+            if ordinal < 1 {
+                return ordinal.to_string();
+            }
+            let mut value = ordinal as usize;
+            let mut text = Vec::new();
+            while value > 0 {
+                value -= 1;
+                text.push(letters[value % letters.len()]);
+                value /= letters.len();
+            }
+            text.iter().rev().collect()
+        };
+        let roman = |upper: bool| {
+            if !(1..4000).contains(&ordinal) {
+                return ordinal.to_string();
+            }
+            let mut value = ordinal;
+            let mut text = String::new();
+            for (amount, digits) in [
+                (1000, "m"),
+                (900, "cm"),
+                (500, "d"),
+                (400, "cd"),
+                (100, "c"),
+                (90, "xc"),
+                (50, "l"),
+                (40, "xl"),
+                (10, "x"),
+                (9, "ix"),
+                (5, "v"),
+                (4, "iv"),
+                (1, "i"),
+            ] {
+                while value >= amount {
+                    text.push_str(digits);
+                    value -= amount;
+                }
+            }
+            if upper { text.to_uppercase() } else { text }
+        };
+        let latin = ('a'..='z').collect::<Vec<_>>();
+        let body = match self {
+            Self::None | Self::Disc | Self::Circle | Self::Square => return None,
+            Self::Decimal => ordinal.to_string(),
+            Self::DecimalLeadingZero if (0..10).contains(&ordinal) => format!("0{ordinal}"),
+            Self::DecimalLeadingZero => ordinal.to_string(),
+            Self::LowerAlpha => alphabetic(&latin),
+            Self::UpperAlpha => alphabetic(&latin).to_uppercase(),
+            Self::LowerRoman => roman(false),
+            Self::UpperRoman => roman(true),
+            Self::LowerGreek => alphabetic(
+                &('α'..='ω')
+                    .filter(|letter| *letter != 'ς')
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        Some(format!("{body}."))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -474,6 +629,11 @@ pub(crate) struct InheritedText {
     pub(crate) family: crate::font::FontStack,
     pub(crate) visibility: Visibility,
     pub(crate) cursor: Cursor,
+    pub(crate) list_style_type: ListStyleType,
+    pub(crate) list_inside: bool,
+    pub(crate) border_collapse: bool,
+    pub(crate) border_spacing: (f32, f32),
+    pub(crate) caption_bottom: bool,
 }
 
 impl Default for InheritedText {
@@ -484,6 +644,11 @@ impl Default for InheritedText {
             family: crate::font::FontStack::default(),
             visibility: Visibility::Visible,
             cursor: Cursor::Auto,
+            list_style_type: ListStyleType::Disc,
+            list_inside: false,
+            border_collapse: false,
+            border_spacing: (0.0, 0.0),
+            caption_bottom: false,
         }
     }
 }
@@ -734,6 +899,14 @@ pub(crate) struct Style {
     pub cursor: Cursor,
     pub float: Float,
     pub clear: Clear,
+    pub list_style_type: ListStyleType,
+    pub list_inside: bool,
+    pub border_collapse: bool,
+    // horizontal and vertical
+    pub border_spacing: (f32, f32),
+    pub caption_bottom: bool,
+    pub table_fixed: bool,
+    pub vertical_align: VerticalAlign,
     pub width: Length,
     pub height: Length,
     pub min_width: Length,
@@ -893,6 +1066,18 @@ impl Style {
             cursor: parent_text.cursor,
             float: Float::None,
             clear: Clear::None,
+            list_style_type: parent_text.list_style_type,
+            list_inside: parent_text.list_inside,
+            border_collapse: parent_text.border_collapse,
+            border_spacing: parent_text.border_spacing,
+            caption_bottom: parent_text.caption_bottom,
+            table_fixed: false,
+            // rows and their cells center their content unless told otherwise
+            vertical_align: if matches!(name, "td" | "th" | "tr" | "tbody" | "thead" | "tfoot") {
+                VerticalAlign::Middle
+            } else {
+                VerticalAlign::Baseline
+            },
             width: Length::Auto,
             height: Length::Auto,
             min_width: Length::Auto,
@@ -973,6 +1158,28 @@ impl Style {
                 style.font_weight = FontWeight::Bold;
             }
             "p" => style.margin = Edges::vertical(Length::em(1.0)),
+            "ul" | "ol" | "menu" => {
+                style.margin = Edges::vertical(Length::em(1.0));
+                style.padding.left = Length::px(40.0);
+                style.list_style_type = if name == "ol" {
+                    ListStyleType::Decimal
+                } else {
+                    ListStyleType::Disc
+                };
+            }
+            "dd" => style.margin.left = Length::px(40.0),
+            "table" => {
+                style.border_spacing = (2.0, 2.0);
+                style.border_collapse = false;
+            }
+            "td" | "th" => {
+                style.padding = Edges::all(Length::px(1.0));
+                if name == "th" {
+                    style.font_weight = FontWeight::Bold;
+                    style.text_align = TextAlign::Center;
+                }
+            }
+            "caption" => style.text_align = TextAlign::Center,
             "strong" | "b" => style.font_weight = FontWeight::Bold,
             _ => {}
         }
@@ -1627,6 +1834,35 @@ impl Stylesheet {
             parent_weight,
             parent_text,
         );
+        // nested unordered lists step from discs to circles to squares, without margins
+        if pseudo.is_none() && matches!(name, "ul" | "menu") {
+            let depth = document
+                .ancestors(node)
+                .filter(|ancestor| {
+                    document.element(*ancestor).is_some_and(|element| {
+                        matches!(element.name.as_str(), "ul" | "ol" | "menu")
+                    })
+                })
+                .count();
+            if depth > 0 {
+                style.list_style_type = if depth == 1 {
+                    ListStyleType::Circle
+                } else {
+                    ListStyleType::Square
+                };
+            }
+        }
+        if pseudo.is_none()
+            && matches!(name, "ul" | "ol" | "menu")
+            && document.ancestors(node).any(|ancestor| {
+                document
+                    .element(ancestor)
+                    .is_some_and(|element| matches!(element.name.as_str(), "ul" | "ol" | "menu"))
+            })
+        {
+            style.margin.top = Length::px(0.0);
+            style.margin.bottom = Length::px(0.0);
+        }
         // links show a pointer, as the user agent's :any-link rule does
         if pseudo.is_none()
             && name == "a"
@@ -1774,6 +2010,11 @@ impl Stylesheet {
                 family: style.font_family,
                 visibility: style.visibility,
                 cursor: style.cursor,
+                list_style_type: style.list_style_type,
+                list_inside: style.list_inside,
+                border_collapse: style.border_collapse,
+                border_spacing: style.border_spacing,
+                caption_bottom: style.caption_bottom,
             };
             computed = Some((style, font_size));
         }
@@ -3535,6 +3776,17 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "inline-flex" => Display::InlineFlex,
                 "inline-grid" => Display::InlineGrid,
                 "flow-root" => Display::FlowRoot,
+                "list-item" => Display::ListItem,
+                "table" => Display::Table,
+                "inline-table" => Display::InlineTable,
+                "table-row-group" => Display::TableRowGroup,
+                "table-header-group" => Display::TableHeaderGroup,
+                "table-footer-group" => Display::TableFooterGroup,
+                "table-row" => Display::TableRow,
+                "table-cell" => Display::TableCell,
+                "table-caption" => Display::TableCaption,
+                "table-column" => Display::TableColumn,
+                "table-column-group" => Display::TableColumnGroup,
                 _ => Display::Block,
             };
         }
@@ -3595,6 +3847,49 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "cursor" => style.cursor = Cursor::parse(value).unwrap_or(style.cursor),
+        "list-style-type" => {
+            style.list_style_type =
+                ListStyleType::parse(value.trim()).unwrap_or(style.list_style_type);
+        }
+        "list-style-position" => style.list_inside = value.trim().eq_ignore_ascii_case("inside"),
+        "border-collapse" => style.border_collapse = value.trim().eq_ignore_ascii_case("collapse"),
+        "border-spacing" => {
+            let lengths = split_words(value)
+                .into_iter()
+                .map(|word| parse_length(word).and_then(|length| length.resolve(0.0, 16.0)))
+                .collect::<Option<Vec<_>>>();
+            match lengths.as_deref() {
+                Some([both]) => style.border_spacing = (both.max(0.0), both.max(0.0)),
+                Some([horizontal, vertical]) => {
+                    style.border_spacing = (horizontal.max(0.0), vertical.max(0.0));
+                }
+                _ => {}
+            }
+        }
+        "caption-side" => style.caption_bottom = value.trim().eq_ignore_ascii_case("bottom"),
+        "table-layout" => style.table_fixed = value.trim().eq_ignore_ascii_case("fixed"),
+        "vertical-align" => {
+            style.vertical_align = match value.trim().to_ascii_lowercase().as_str() {
+                "top" | "text-top" => VerticalAlign::Top,
+                "middle" => VerticalAlign::Middle,
+                "bottom" | "text-bottom" => VerticalAlign::Bottom,
+                _ => VerticalAlign::Baseline,
+            };
+        }
+        "list-style" => {
+            // images are not loaded, so the type stands in for them
+            let mut list_type = None;
+            let mut inside = false;
+            for word in split_words(value) {
+                if word.eq_ignore_ascii_case("inside") {
+                    inside = true;
+                } else if let Some(parsed) = ListStyleType::parse(word) {
+                    list_type = Some(parsed);
+                }
+            }
+            style.list_style_type = list_type.unwrap_or(ListStyleType::Disc);
+            style.list_inside = inside;
+        }
         "width" => style.width = parse_length(value).unwrap_or(Length::Auto),
         "height" => style.height = parse_length(value).unwrap_or(Length::Auto),
         // none and auto both read as no limit
@@ -4831,8 +5126,18 @@ fn default_display(name: &str) -> Display {
         "#document" | "html" | "body" | "address" | "article" | "aside" | "blockquote" | "div"
         | "dl" | "dd" | "dt" | "details" | "summary" | "fieldset" | "figcaption" | "figure"
         | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup"
-        | "hr" | "li" | "legend" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "search"
-        | "section" | "table" | "ul" | "center" | "dialog" => Display::Block,
+        | "hr" | "legend" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "search" | "section"
+        | "ul" | "center" | "dialog" => Display::Block,
+        "li" => Display::ListItem,
+        "table" => Display::Table,
+        "thead" => Display::TableHeaderGroup,
+        "tbody" => Display::TableRowGroup,
+        "tfoot" => Display::TableFooterGroup,
+        "tr" => Display::TableRow,
+        "td" | "th" => Display::TableCell,
+        "caption" => Display::TableCaption,
+        "col" => Display::TableColumn,
+        "colgroup" => Display::TableColumnGroup,
         "head" | "link" | "meta" | "noscript" | "script" | "style" | "template" | "title" => {
             Display::None
         }

@@ -4,7 +4,7 @@ use crate::css::{
     JustifyContent, Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
     Stylesheet, TextAlign,
 };
-use crate::css::{Clear, Cursor, Float, Visibility};
+use crate::css::{Clear, Cursor, Float, ListStyleType, VerticalAlign, Visibility};
 use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
@@ -390,7 +390,10 @@ fn establishes_formatting_context(style: &Style) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.overflow.clips()
-        || !matches!(style.display, Display::Block | Display::Inline)
+        || !matches!(
+            style.display,
+            Display::Block | Display::Inline | Display::ListItem
+        )
 }
 
 struct InlineFragment {
@@ -555,6 +558,11 @@ fn inherited_text(style: &Style) -> InheritedText {
         family: style.font_family,
         visibility: style.visibility,
         cursor: style.cursor,
+        list_style_type: style.list_style_type,
+        list_inside: style.list_inside,
+        border_collapse: style.border_collapse,
+        border_spacing: style.border_spacing,
+        caption_bottom: style.caption_bottom,
     }
 }
 
@@ -664,6 +672,8 @@ struct ElementLayoutInput<'node, 'style> {
     size_override: (Option<f32>, Option<f32>),
     // the floats of the formatting context a block child shares with its parent
     floats: Option<Rc<FloatArea>>,
+    // the number a list item's marker shows
+    list_ordinal: i32,
     parent: ParentStyle,
     context: LayoutContext<'style>,
 }
@@ -841,6 +851,7 @@ pub fn layout_with_state(
             containing_height: Some(viewport.height),
             size_override: (None, None),
             floats: Some(root_floats.clone()),
+            list_ordinal: 1,
             parent: root_parent,
             context: LayoutContext {
                 viewport,
@@ -1373,6 +1384,7 @@ fn append_positioned_nodes(
             containing_height: (block.height > 0.0).then_some(block.height),
             size_override: (None, None),
             floats: None,
+            list_ordinal: 1,
             parent,
             context: LayoutContext {
                 viewport: viewport_size,
@@ -1873,6 +1885,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         containing_height,
         size_override,
         floats,
+        list_ordinal,
         parent,
         context:
             LayoutContext {
@@ -2050,6 +2063,28 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             mode,
         }));
     }
+    if matches!(style.display, Display::Table | Display::InlineTable) {
+        return Some(layout_table_element(GridLayoutInput {
+            content_height: explicit_height,
+            parent_opacity: parent.opacity,
+            node,
+            style,
+            stylesheet,
+            style_state,
+            margin,
+            padding,
+            border,
+            rect,
+            content_x,
+            content_y,
+            content_width,
+            font_size,
+            viewport,
+            containing_block: descendant_block,
+            inherited_containing_block: containing_block,
+            mode,
+        }));
+    }
     if matches!(style.display, Display::Grid | Display::InlineGrid) {
         return Some(layout_grid_element(GridLayoutInput {
             content_height: explicit_height,
@@ -2170,6 +2205,70 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         opacity: 1.0,
     };
     let generated = node.generated_content(stylesheet, style_state);
+    // an ordered list counts its items from start, or down from the item count when reversed
+    let list_attribute =
+        |attribute: &str| node.element().and_then(|element| element.attr(attribute));
+    let reversed_list = name == "ol" && list_attribute("reversed").is_some();
+    let mut list_counter = list_attribute("start")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or_else(|| {
+            if reversed_list {
+                node.document
+                    .element_children(node.node)
+                    .filter(|child| {
+                        node.document
+                            .element(*child)
+                            .is_some_and(|element| element.name == "li")
+                    })
+                    .count() as i32
+            } else {
+                1
+            }
+        });
+    if style.display == Display::ListItem && style.list_inside {
+        match style.list_style_type.marker_text(list_ordinal) {
+            Some(label) => append_inline_text(
+                &format!("{label} "),
+                inline_context,
+                InlineSource {
+                    node: None,
+                    offset: 0,
+                },
+                &mut text,
+                &mut line,
+            ),
+            None => {
+                let size = bullet_size(font_size);
+                let rect = Rect {
+                    x: 0.0,
+                    y: (line_height - size) / 2.0,
+                    width: size,
+                    height: size,
+                };
+                if let Some(mut bullet) = bullet_marker(&style, node.node, rect, font_size) {
+                    // the bullet sits on the line like a word, with a space after it
+                    bullet.margin.top = rect.y;
+                    bullet.margin.right = font_size * 0.5;
+                    line.used += size + bullet.margin.right;
+                    line.height = line.height.max(line_height);
+                    line.fragments.push(InlineFragment {
+                        text: String::new(),
+                        width: size + bullet.margin.right,
+                        font_size,
+                        letter_spacing: 0.0,
+                        font_stack: style.font_family,
+                        color: Color::transparent(),
+                        bold: false,
+                        node: None,
+                        node_offset: 0,
+                        source_len: 0,
+                        line_height,
+                        atomic: Some(Box::new(bullet)),
+                    });
+                }
+            }
+        }
+    }
     for child in node.children(&generated) {
         match child {
             Child::Text(text_node, value) if name != "textarea" => {
@@ -2216,10 +2315,21 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     );
                     continue;
                 }
-                if matches!(
-                    child_style.display,
-                    Display::Block | Display::Flex | Display::Grid | Display::FlowRoot
-                ) {
+                if !child_style.display.is_inline_level() {
+                    let list_ordinal = if child_style.display == Display::ListItem {
+                        if let Some(value) = child
+                            .element()
+                            .and_then(|element| element.attr("value"))
+                            .and_then(|value| value.trim().parse::<i32>().ok())
+                        {
+                            list_counter = value;
+                        }
+                        let ordinal = list_counter;
+                        list_counter += if reversed_list { -1 } else { 1 };
+                        ordinal
+                    } else {
+                        1
+                    };
                     flush_line(
                         &mut line,
                         &mut text,
@@ -2260,6 +2370,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         containing_height: explicit_height,
                         size_override: (None, None),
                         floats: Some(float_area.clone()),
+                        list_ordinal,
                         parent: child_parent,
                         context: LayoutContext {
                             viewport,
@@ -2326,6 +2437,15 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         height: border_box_height,
         ..rect
     };
+    if style.display == Display::ListItem && !style.list_inside {
+        children.extend(outside_marker(
+            &style,
+            list_ordinal,
+            node.node,
+            (content_x, content_y),
+            (font_size, line_height),
+        ));
+    }
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -2936,6 +3056,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                     containing_height: if row { available_cross } else { available_main },
                     size_override: (width, height),
                     floats: None,
+                    list_ordinal: 1,
                     parent: child_parent,
                     context: LayoutContext {
                         viewport,
@@ -3623,6 +3744,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 containing_height: cell_height,
                 size_override: (item.width, height),
                 floats: None,
+                list_ordinal: 1,
                 parent: child_parent,
                 context: LayoutContext {
                     viewport,
@@ -3809,6 +3931,716 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     layout
 }
 
+// a row of a table: its element, or none for cells placed straight into a group or table
+struct TableRow<'a> {
+    node: Option<(Subject<'a>, Style)>,
+    group: usize,
+    cells: Vec<(Subject<'a>, Style)>,
+}
+
+struct TableCellSlot<'a> {
+    node: Subject<'a>,
+    style: Style,
+    row: usize,
+    column: usize,
+    rows: usize,
+    columns: usize,
+    layout: Option<LayoutBox>,
+}
+
+fn table_span(cell: Subject<'_>, attribute: &str, limit: usize) -> usize {
+    cell.element()
+        .and_then(|element| element.attr(attribute))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(1, |span| {
+            if span == 0 {
+                limit
+            } else {
+                span.clamp(1, limit)
+            }
+        })
+}
+
+// a table, laid out by the automatic table layout algorithm (or the fixed one) of CSS 2.1
+// with separated borders, or collapsed borders that overlap by the widest cell border
+fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
+    let GridLayoutInput {
+        content_height,
+        parent_opacity,
+        node,
+        style,
+        stylesheet,
+        style_state,
+        margin,
+        padding,
+        border,
+        rect,
+        content_x,
+        content_y,
+        content_width,
+        font_size,
+        viewport,
+        containing_block,
+        inherited_containing_block,
+        mode,
+    } = input;
+    let child_parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+        text: inherited_text(&style),
+        opacity: 1.0,
+    };
+    let box_opacity = style.opacity * parent_opacity;
+    let item_block = if style.position == Position::Static {
+        inherited_containing_block
+    } else {
+        containing_block
+    };
+    let style_of = |child: Subject<'_>, parent: ParentStyle| {
+        stylesheet.style_for(child.style_context(parent, style_state))
+    };
+    let parent_of = |child_style: &Style| ParentStyle {
+        font_size: child_style
+            .font_size
+            .resolve(font_size, font_size)
+            .unwrap_or(font_size)
+            .max(1.0),
+        color: child_style.color,
+        weight: child_style.font_weight,
+        text: inherited_text(child_style),
+        opacity: 1.0,
+    };
+
+    // captions, then row groups in header, body, footer order, each with its rows and cells
+    let mut captions = Vec::new();
+    let mut positioned = Vec::new();
+    let mut groups: Vec<(Option<(Subject<'_>, Style)>, u8)> = Vec::new();
+    let mut rows: Vec<TableRow<'_>> = Vec::new();
+    let anonymous_group = |groups: &mut Vec<(Option<(Subject<'_>, Style)>, u8)>| {
+        if !matches!(groups.last(), Some((None, _))) {
+            groups.push((None, 1));
+        }
+        groups.len() - 1
+    };
+    for child in node.children(&NO_GENERATED_CONTENT) {
+        let Child::Element(child) = child else {
+            continue;
+        };
+        let child_style = style_of(child, child_parent);
+        if child_style.display == Display::None {
+            continue;
+        }
+        if child_style.position.is_out_of_flow() {
+            positioned.push(child);
+            continue;
+        }
+        match child_style.display {
+            Display::TableCaption => captions.push((child, child_style)),
+            Display::TableColumn | Display::TableColumnGroup => {}
+            Display::TableHeaderGroup | Display::TableRowGroup | Display::TableFooterGroup => {
+                let kind = match child_style.display {
+                    Display::TableHeaderGroup => 0,
+                    Display::TableFooterGroup => 2,
+                    _ => 1,
+                };
+                groups.push((Some((child, child_style)), kind));
+                let group = groups.len() - 1;
+                let group_parent = parent_of(&child_style);
+                let mut loose: Option<usize> = None;
+                for grandchild in child.children(&NO_GENERATED_CONTENT) {
+                    let Child::Element(grandchild) = grandchild else {
+                        continue;
+                    };
+                    let grandchild_style = style_of(grandchild, group_parent);
+                    if grandchild_style.display == Display::None {
+                        continue;
+                    }
+                    if grandchild_style.display == Display::TableRow {
+                        loose = None;
+                        rows.push(TableRow {
+                            node: Some((grandchild, grandchild_style)),
+                            group,
+                            cells: Vec::new(),
+                        });
+                    } else {
+                        let row = *loose.get_or_insert_with(|| {
+                            rows.push(TableRow {
+                                node: None,
+                                group,
+                                cells: Vec::new(),
+                            });
+                            rows.len() - 1
+                        });
+                        rows[row].cells.push((grandchild, grandchild_style));
+                    }
+                }
+            }
+            Display::TableRow => {
+                let group = anonymous_group(&mut groups);
+                rows.push(TableRow {
+                    node: Some((child, child_style)),
+                    group,
+                    cells: Vec::new(),
+                });
+            }
+            _ => {
+                // anything else becomes a cell of an anonymous row
+                let group = anonymous_group(&mut groups);
+                let reuse = rows
+                    .last()
+                    .is_some_and(|row| row.node.is_none() && row.group == group);
+                if !reuse {
+                    rows.push(TableRow {
+                        node: None,
+                        group,
+                        cells: Vec::new(),
+                    });
+                }
+                if let Some(row) = rows.last_mut() {
+                    row.cells.push((child, child_style));
+                }
+            }
+        }
+    }
+    // the cells of each real row
+    for row in &mut rows {
+        let Some((row_node, row_style)) = row.node else {
+            continue;
+        };
+        let row_parent = parent_of(&row_style);
+        for cell in row_node.children(&NO_GENERATED_CONTENT) {
+            let Child::Element(cell) = cell else {
+                continue;
+            };
+            let cell_style = style_of(cell, row_parent);
+            if cell_style.display != Display::None && !cell_style.position.is_out_of_flow() {
+                row.cells.push((cell, cell_style));
+            }
+        }
+    }
+    // headers first and footers last, keeping document order otherwise
+    let mut group_order = (0..groups.len()).collect::<Vec<_>>();
+    group_order.sort_by_key(|group| groups[*group].1);
+    rows.sort_by_key(|row| {
+        group_order
+            .iter()
+            .position(|group| *group == row.group)
+            .unwrap_or(0)
+    });
+
+    // cells take the first free slots of their row, below any cell spanning down into it
+    let mut occupied: Vec<Vec<bool>> = vec![Vec::new(); rows.len()];
+    let mut cells: Vec<TableCellSlot<'_>> = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let group_end = rows
+            .iter()
+            .enumerate()
+            .skip(row_index)
+            .take_while(|(_, other)| other.group == row.group)
+            .count();
+        let mut column = 0;
+        for &(cell, cell_style) in &row.cells {
+            while occupied[row_index].get(column).copied().unwrap_or(false) {
+                column += 1;
+            }
+            let columns = table_span(cell, "colspan", 1000);
+            let spanned_rows = table_span(cell, "rowspan", group_end).min(group_end);
+            for slots in &mut occupied[row_index..row_index + spanned_rows] {
+                if slots.len() < column + columns {
+                    slots.resize(column + columns, false);
+                }
+                slots[column..column + columns].fill(true);
+            }
+            cells.push(TableCellSlot {
+                node: cell,
+                style: cell_style,
+                row: row_index,
+                column,
+                rows: spanned_rows,
+                columns,
+                layout: None,
+            });
+            column += columns;
+        }
+    }
+    let column_count = occupied.iter().map(Vec::len).max().unwrap_or(0);
+    let row_count = rows.len();
+
+    // collapsed borders share their width between neighbours; separated ones keep spacing
+    let collapse_overlap = |side: fn(&ResolvedEdges) -> f32| {
+        cells
+            .iter()
+            .map(|cell| side(&used_border(&cell.style)))
+            .fold(0.0_f32, f32::max)
+    };
+    let (spacing_x, spacing_y) = if style.border_collapse {
+        (
+            -collapse_overlap(|edges| edges.left.max(edges.right)),
+            -collapse_overlap(|edges| edges.top.max(edges.bottom)),
+        )
+    } else {
+        style.border_spacing
+    };
+    let edge_x = spacing_x.max(0.0);
+    let edge_y = spacing_y.max(0.0);
+
+    // column widths from the cells' minimum and maximum content widths
+    let intrinsic = |cell: &TableCellSlot<'_>, minimum: bool| {
+        intrinsic_width(
+            MaxContentInput {
+                node: cell.node,
+                stylesheet,
+                style_state,
+                parent: child_parent,
+                containing_width: content_width,
+                own_width: true,
+            },
+            minimum,
+        )
+    };
+    let mut column_min = vec![0.0_f32; column_count];
+    let mut column_max = vec![0.0_f32; column_count];
+    let mut by_span = (0..cells.len()).collect::<Vec<_>>();
+    by_span.sort_by_key(|index| cells[*index].columns);
+    for index in by_span {
+        let cell = &cells[index];
+        let (minimum, maximum) = (intrinsic(cell, true), intrinsic(cell, false));
+        let maximum = maximum.max(minimum);
+        let range = cell.column..cell.column + cell.columns;
+        let gaps = spacing_x * (cell.columns - 1) as f32;
+        let have_min = column_min[range.clone()].iter().sum::<f32>() + gaps;
+        let have_max = column_max[range.clone()].iter().sum::<f32>() + gaps;
+        let share = |extra: f32| (extra / cell.columns as f32).max(0.0);
+        let (min_share, max_share) = (share(minimum - have_min), share(maximum - have_max));
+        for column in range {
+            column_min[column] += min_share;
+            column_max[column] += max_share;
+            column_max[column] = column_max[column].max(column_min[column]);
+        }
+    }
+    let spacing_total = edge_x * 2.0 + spacing_x * column_count.saturating_sub(1) as f32;
+    let sum_min = column_min.iter().sum::<f32>();
+    let sum_max = column_max.iter().sum::<f32>();
+    let table_width = if style.width == Length::Auto {
+        (sum_max + spacing_total)
+            .min(content_width)
+            .max(sum_min + spacing_total)
+    } else {
+        content_width.max(sum_min + spacing_total)
+    };
+    let available = (table_width - spacing_total).max(0.0);
+    let mut column_widths = if style.table_fixed && style.width != Length::Auto {
+        // fixed layout reads widths from the first row and shares out the rest
+        let mut widths = vec![None; column_count];
+        for cell in cells
+            .iter()
+            .filter(|cell| cell.row == 0 && cell.columns == 1)
+        {
+            widths[cell.column] = cell.style.width.resolve(available, font_size).map(|width| {
+                if cell.style.box_sizing == crate::css::BoxSizing::BorderBox {
+                    width
+                } else {
+                    let inner = resolve_edges(cell.style.padding, available, font_size);
+                    let edges = used_border(&cell.style);
+                    width + inner.left + inner.right + edges.left + edges.right
+                }
+            });
+        }
+        let fixed = widths.iter().flatten().sum::<f32>();
+        let open = widths.iter().filter(|width| width.is_none()).count();
+        let share = if open > 0 {
+            ((available - fixed) / open as f32).max(0.0)
+        } else {
+            0.0
+        };
+        widths
+            .into_iter()
+            .map(|width| width.unwrap_or(share))
+            .collect()
+    } else if available >= sum_max {
+        let extra = available - sum_max;
+        column_max
+            .iter()
+            .map(|maximum| {
+                if sum_max > 0.0 {
+                    maximum + extra * maximum / sum_max
+                } else {
+                    extra / column_count.max(1) as f32
+                }
+            })
+            .collect()
+    } else {
+        let ratio = if sum_max > sum_min {
+            ((available - sum_min) / (sum_max - sum_min)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        column_min
+            .iter()
+            .zip(&column_max)
+            .map(|(minimum, maximum)| minimum + (maximum - minimum) * ratio)
+            .collect::<Vec<_>>()
+    };
+    if column_widths.is_empty() {
+        column_widths.push(0.0);
+    }
+    let mut column_x = Vec::with_capacity(column_count);
+    let mut x = edge_x;
+    for width in &column_widths {
+        column_x.push(x);
+        x += width + spacing_x;
+    }
+    let span_width = |cell: &TableCellSlot<'_>| {
+        column_widths[cell.column..cell.column + cell.columns]
+            .iter()
+            .sum::<f32>()
+            + spacing_x * (cell.columns - 1) as f32
+    };
+
+    // cells laid out at their widths decide the row heights
+    let lay_out_cell = |cell: &TableCellSlot<'_>| {
+        let width = span_width(cell);
+        let inner_padding = resolve_edges(cell.style.padding, width, font_size);
+        let edges = used_border(&cell.style);
+        layout_element(ElementLayoutInput {
+            node: cell.node,
+            containing_x: 0.0,
+            containing_y: 0.0,
+            containing_width: width,
+            containing_height: None,
+            size_override: (
+                Some(
+                    (width - inner_padding.left - inner_padding.right - edges.left - edges.right)
+                        .max(0.0),
+                ),
+                None,
+            ),
+            floats: None,
+            list_ordinal: 1,
+            parent: child_parent,
+            context: LayoutContext {
+                viewport,
+                containing_block: item_block,
+                mode: LayoutMode::Flow,
+                stylesheet,
+                style_state,
+            },
+        })
+    };
+    for cell in &mut cells {
+        cell.layout = lay_out_cell(cell);
+    }
+    let mut row_heights = rows
+        .iter()
+        .map(|row| {
+            row.node
+                .and_then(|(_, row_style)| resolve_height(row_style.height, None, font_size))
+                .unwrap_or(0.0)
+        })
+        .collect::<Vec<_>>();
+    let mut by_rows = (0..cells.len()).collect::<Vec<_>>();
+    by_rows.sort_by_key(|index| cells[*index].rows);
+    for index in by_rows {
+        let cell = &cells[index];
+        let height = cell
+            .layout
+            .as_ref()
+            .map_or(0.0, |layout| layout.rect.height);
+        let range = cell.row..cell.row + cell.rows;
+        let have =
+            row_heights[range.clone()].iter().sum::<f32>() + spacing_y * (cell.rows - 1) as f32;
+        if height > have {
+            row_heights[range.end - 1] += height - have;
+        }
+    }
+    let rows_total = row_heights.iter().sum::<f32>()
+        + edge_y * 2.0
+        + spacing_y * row_count.saturating_sub(1) as f32;
+    // a taller specified table height grows its rows evenly
+    if let Some(height) = content_height
+        && height > rows_total
+        && row_count > 0
+    {
+        let extra = (height - rows_total) / row_count as f32;
+        for row_height in &mut row_heights {
+            *row_height += extra;
+        }
+    }
+    let table_x = content_x;
+    let mut cursor_y = content_y;
+    let mut children = Vec::new();
+    let caption_box = |caption: &(Subject<'_>, Style), y: f32| {
+        layout_element(ElementLayoutInput {
+            node: caption.0,
+            containing_x: table_x,
+            containing_y: y,
+            containing_width: table_width,
+            containing_height: None,
+            size_override: (None, None),
+            floats: None,
+            list_ordinal: 1,
+            parent: child_parent,
+            context: LayoutContext {
+                viewport,
+                containing_block: item_block,
+                mode: LayoutMode::Flow,
+                stylesheet,
+                style_state,
+            },
+        })
+    };
+    if !style.caption_bottom {
+        for caption in &captions {
+            if let Some(laid_out) = caption_box(caption, cursor_y) {
+                cursor_y = laid_out.rect.bottom() + laid_out.margin.bottom;
+                children.push(laid_out);
+            }
+        }
+    }
+    let grid_top = cursor_y;
+    let mut row_y = Vec::with_capacity(row_count);
+    let mut y = grid_top + edge_y;
+    for height in &row_heights {
+        row_y.push(y);
+        y += height + spacing_y;
+    }
+    let grid_height = if row_count > 0 {
+        y - spacing_y + edge_y - grid_top
+    } else {
+        0.0
+    };
+
+    // cells take their row span's height and place their content by vertical-align
+    let mut cell_boxes: Vec<Vec<LayoutBox>> = vec![Vec::new(); row_count];
+    for cell in &mut cells {
+        let Some(mut laid_out) = cell.layout.take() else {
+            continue;
+        };
+        let height = row_heights[cell.row..cell.row + cell.rows]
+            .iter()
+            .sum::<f32>()
+            + spacing_y * (cell.rows - 1) as f32;
+        // the free space is measured from the content, which an explicit cell height leaves
+        // at the top of a taller box
+        let content_top = laid_out.rect.y + laid_out.border.widths.top + {
+            let padding = resolve_edges(cell.style.padding, span_width(cell), font_size);
+            padding.top
+        };
+        let content_bottom = laid_out
+            .children
+            .iter()
+            .map(|child| child.rect.bottom() + child.margin.bottom)
+            .chain(laid_out.text.iter().map(|run| run.y + run.font_size * 1.25))
+            .fold(content_top, f32::max);
+        let inner_bottom = laid_out.rect.y + height.max(laid_out.rect.height)
+            - laid_out.border.widths.bottom
+            - resolve_edges(cell.style.padding, span_width(cell), font_size).bottom;
+        let free = inner_bottom - content_bottom;
+        laid_out.rect.height = laid_out.rect.height.max(height);
+        if free > 0.01 {
+            let shift = match cell.style.vertical_align {
+                VerticalAlign::Middle => free / 2.0,
+                VerticalAlign::Bottom => free,
+                VerticalAlign::Top | VerticalAlign::Baseline => 0.0,
+            };
+            for child in &mut laid_out.children {
+                translate_layout_box(child, 0.0, shift);
+            }
+            for run in &mut laid_out.text {
+                run.y += shift;
+            }
+        }
+        let target = (table_x + column_x[cell.column], row_y[cell.row]);
+        let offset = (target.0 - laid_out.rect.x, target.1 - laid_out.rect.y);
+        translate_layout_box(&mut laid_out, offset.0, offset.1);
+        cell_boxes[cell.row].push(laid_out);
+    }
+
+    // rows and groups are boxes of their own, so their backgrounds paint under the cells
+    let inner_left = table_x + edge_x;
+    let inner_width = (table_width - edge_x * 2.0).max(0.0);
+    let section_box = |subject: Subject<'_>, section_style: &Style, top: f32, height: f32| {
+        let rect = Rect {
+            x: inner_left,
+            y: top,
+            width: inner_width,
+            height,
+        };
+        let mut section = anonymous_box(
+            subject.node,
+            rect,
+            Vec::new(),
+            (font_size, section_style.cursor),
+            box_opacity * section_style.opacity,
+        );
+        section.tag = subject.name().to_string();
+        section.background = section_style.background;
+        section.gradient = section_style.gradient;
+        section.visible = section_style.visibility == Visibility::Visible;
+        section
+    };
+    let mut row_boxes: Vec<(usize, LayoutBox)> = Vec::new();
+    for (index, (row, cells_here)) in rows.iter().zip(cell_boxes).enumerate() {
+        match row.node {
+            Some((row_node, row_style)) => {
+                let mut row_box =
+                    section_box(row_node, &row_style, row_y[index], row_heights[index]);
+                row_box.children = cells_here;
+                row_boxes.push((row.group, row_box));
+            }
+            None => {
+                for cell_box in cells_here {
+                    row_boxes.push((row.group, cell_box));
+                }
+            }
+        }
+    }
+    for group in group_order {
+        let members = row_boxes
+            .iter()
+            .filter(|(owner, _)| *owner == group)
+            .count();
+        if members == 0 {
+            continue;
+        }
+        let mut contents = Vec::with_capacity(members);
+        let mut index = 0;
+        while index < row_boxes.len() {
+            if row_boxes[index].0 == group {
+                contents.push(row_boxes.remove(index).1);
+            } else {
+                index += 1;
+            }
+        }
+        match groups[group].0 {
+            Some((group_node, group_style)) => {
+                let top = contents
+                    .iter()
+                    .map(|row| row.rect.y)
+                    .fold(f32::INFINITY, f32::min);
+                let bottom = contents
+                    .iter()
+                    .map(|row| row.rect.bottom())
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut group_box = section_box(group_node, &group_style, top, bottom - top);
+                group_box.children = contents;
+                children.push(group_box);
+            }
+            None => children.extend(contents),
+        }
+    }
+    cursor_y = grid_top + grid_height;
+    if style.caption_bottom {
+        for caption in &captions {
+            if let Some(laid_out) = caption_box(caption, cursor_y) {
+                cursor_y = laid_out.rect.bottom() + laid_out.margin.bottom;
+                children.push(laid_out);
+            }
+        }
+    }
+
+    // an auto-width table shrinks to its columns, and auto margins center what is left
+    let content_height = content_height.unwrap_or(0.0).max(cursor_y - content_y);
+    let mut rect = Rect {
+        width: table_width + padding.left + padding.right + border.left + border.right,
+        height: content_height + padding.top + padding.bottom + border.top + border.bottom,
+        ..rect
+    };
+    let free = content_width - table_width;
+    if mode == LayoutMode::Flow && free > 0.0 {
+        let shift = match (
+            style.margin.left == Length::Auto,
+            style.margin.right == Length::Auto,
+        ) {
+            (true, true) => free / 2.0,
+            (true, false) => free,
+            _ => 0.0,
+        };
+        if shift > 0.0 {
+            rect.x += shift;
+            for child in &mut children {
+                translate_layout_box(child, shift, 0.0);
+            }
+        }
+    }
+    let mut layout = LayoutBox {
+        node: node.node,
+        tag: node.name().to_string(),
+        rect,
+        background: style.background,
+        gradient: style.gradient,
+        background_image: style.background_layer(),
+        object_fit: style.object_fit,
+        transform: None,
+        backface_hidden: style.backface_hidden,
+        radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
+        opacity: box_opacity,
+        shadow: resolve_shadow(style.shadow, content_width, font_size),
+        border: BoxBorder::of(&style),
+        outline: box_outline(&style),
+        text: Vec::new(),
+        control_value: None,
+        control_selection: None,
+        control_focused: false,
+        control_text_origin: None,
+        children,
+        position: style.position,
+        visual_offset: (0.0, 0.0),
+        z_index: positioned_z_index(style),
+        creates_stacking_context: creates_stacking_context(style) || box_opacity < 1.0,
+        sticky_inset: style.inset,
+        font_size,
+        overflow: style.overflow,
+        overflow_axes: style.overflow_axes(),
+        visible: style.visibility == Visibility::Visible,
+        cursor: style.cursor,
+        floated: false,
+        scroll_content: Size::default(),
+        scroll_offset: (0.0, 0.0),
+        margin,
+    };
+    if mode != LayoutMode::Flow {
+        position_layout_box(
+            &mut layout,
+            style,
+            mode,
+            if mode == LayoutMode::Fixed {
+                viewport_block(viewport)
+            } else {
+                inherited_containing_block
+            },
+            font_size,
+        );
+    }
+    apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
+    apply_transform(&mut layout, &style, font_size);
+    let positioned_block = ContainingBlock {
+        x: layout.rect.x,
+        y: layout.rect.y,
+        width: layout.rect.width,
+        height: layout.rect.height,
+    };
+    append_positioned_nodes(
+        &mut layout.children,
+        positioned,
+        PositionedLayoutContext {
+            containing_block: if style.position == Position::Static {
+                inherited_containing_block
+            } else {
+                positioned_block
+            },
+            viewport: viewport_block(viewport),
+            viewport_size: viewport,
+            parent: child_parent,
+            stylesheet,
+            style_state,
+        },
+    );
+    finalize_scroll(&mut layout, style_state);
+    layout
+}
+
 struct MaxContentInput<'a> {
     node: Subject<'a>,
     stylesheet: &'a Stylesheet,
@@ -3864,10 +4696,12 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         };
         return extras + width.max(0.0);
     }
-    // a row of flex items sits side by side, as inline content does
-    let row_flex = matches!(style.display, Display::Flex | Display::InlineFlex)
-        && style.flex_direction.is_row();
-    let nowrap_row = row_flex && style.flex_wrap == crate::css::FlexWrap::NoWrap;
+    // a row of flex items, or of table cells, sits side by side as inline content does
+    let row_flex = (matches!(style.display, Display::Flex | Display::InlineFlex)
+        && style.flex_direction.is_row())
+        || style.display == Display::TableRow;
+    let nowrap_row = (row_flex && style.flex_wrap == crate::css::FlexWrap::NoWrap)
+        || style.display == Display::TableRow;
     let letter_spacing = style
         .letter_spacing
         .resolve(font_size, font_size)
@@ -4899,7 +5733,7 @@ fn append_inline_element(
     }
     if matches!(
         style.display,
-        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable
     ) || node.name() == "img"
     {
         append_atomic(input, &style, text, line);
@@ -5103,6 +5937,7 @@ fn append_atomic(
         containing_height: None,
         size_override: (None, None),
         floats: None,
+        list_ordinal: 1,
         parent,
         context: LayoutContext {
             viewport,
@@ -5207,6 +6042,98 @@ fn flush_line(
     line.fit_to_floats(content_x, content_width);
 }
 
+// a marker outside the content box, level with the first line: a drawn bullet, or the item's
+// number in the list's style
+fn outside_marker(
+    style: &Style,
+    ordinal: i32,
+    node: NodeId,
+    (content_x, content_y): (f32, f32),
+    (font_size, line_height): (f32, f32),
+) -> Option<LayoutBox> {
+    let color = text_color(style);
+    let gap = font_size * 0.5;
+    if let Some(label) = style.list_style_type.marker_text(ordinal) {
+        let bold = style.font_weight == FontWeight::Bold;
+        let letter_spacing = style
+            .letter_spacing
+            .resolve(font_size, font_size)
+            .unwrap_or(0.0);
+        let width = measure_text(&label, style.font_family, font_size, bold, letter_spacing);
+        let rect = Rect {
+            x: content_x - gap - width,
+            y: content_y,
+            width,
+            height: line_height,
+        };
+        let run = TextRun {
+            text: label,
+            x: rect.x,
+            y: rect.y,
+            width,
+            font_size,
+            letter_spacing,
+            font_stack: style.font_family,
+            color,
+            bold,
+            node: None,
+            node_offset: 0,
+            source_len: 0,
+        };
+        let mut marker = anonymous_box(node, rect, vec![run], (font_size, style.cursor), 1.0);
+        marker.tag = "::marker".to_string();
+        return Some(marker);
+    }
+    let size = bullet_size(font_size);
+    bullet_marker(
+        style,
+        node,
+        Rect {
+            x: content_x - gap - size,
+            y: content_y + (line_height - size) / 2.0,
+            width: size,
+            height: size,
+        },
+        font_size,
+    )
+}
+
+fn bullet_size(font_size: f32) -> f32 {
+    (font_size * 0.35).max(3.0)
+}
+
+// a disc, circle or square drawn as a box, so it needs no glyph from the font
+fn bullet_marker(style: &Style, node: NodeId, rect: Rect, font_size: f32) -> Option<LayoutBox> {
+    let color = text_color(style);
+    let size = rect.width;
+    let mut marker = anonymous_box(node, rect, Vec::new(), (font_size, style.cursor), 1.0);
+    marker.tag = "::marker".to_string();
+    let round = [(size / 2.0, size / 2.0); 4];
+    match style.list_style_type {
+        ListStyleType::Disc => {
+            marker.background = color;
+            marker.radii = round;
+        }
+        ListStyleType::Circle => {
+            let width = (size / 5.0).max(1.0);
+            marker.radii = round;
+            marker.border = BoxBorder {
+                widths: ResolvedEdges {
+                    top: width,
+                    right: width,
+                    bottom: width,
+                    left: width,
+                },
+                styles: [BorderStyle::Solid; 4],
+                colors: [color; 4],
+            };
+        }
+        ListStyleType::Square => marker.background = color,
+        _ => return None,
+    }
+    Some(marker)
+}
+
 // takes a float out of the line and puts it as high and as far to its side as the floats
 // already there allow, beside the current line when it fits
 fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLine) {
@@ -5250,6 +6177,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
         containing_height: None,
         size_override: (None, None),
         floats: None,
+        list_ordinal: 1,
         parent,
         context: LayoutContext {
             viewport,

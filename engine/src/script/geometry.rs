@@ -6,8 +6,8 @@ use super::operations::{is_callable, number_to_string, plain_object};
 use super::realm::Native;
 use super::*;
 use crate::css::{
-    AlignItems, Display, FlexDirection, FontWeight, JustifyContent, Position, Style, StyleState,
-    Stylesheet, TextAlign, TextTransform,
+    AlignItems, FlexDirection, FontWeight, JustifyContent, Position, Style, StyleState, Stylesheet,
+    TextAlign, TextTransform,
 };
 use crate::font::FontSet;
 use crate::layout::{
@@ -979,18 +979,7 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             .map_or_else(|| "auto".to_string(), px)
     };
     match property {
-        "display" => match style.display {
-            Display::Block => "block",
-            Display::Flex => "flex",
-            Display::Grid => "grid",
-            Display::Inline => "inline",
-            Display::InlineBlock => "inline-block",
-            Display::InlineFlex => "inline-flex",
-            Display::InlineGrid => "inline-grid",
-            Display::FlowRoot => "flow-root",
-            Display::None => "none",
-        }
-        .to_string(),
+        "display" => style.display.name().to_string(),
         "position" => match style.position {
             Position::Static => "static",
             Position::Relative => "relative",
