@@ -8,6 +8,8 @@ use ceri_engine::{
     HostBridge, HostRuntimeInfo, NavigationError, Resource, ResourceBundle, ResourceProvider,
     ResourceResponse, Size, WindowConfig, mime_type_for, run_window,
 };
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,8 +34,29 @@ impl App {
         Self::default()
     }
 
-    // a command quick enough to answer on the engine thread
-    pub fn command<F>(mut self, name: impl Into<String>, handler: F) -> Self
+    // a command quick enough to answer on the engine thread, its arguments and result in
+    // their serde shapes
+    pub fn command<A, R, F>(self, name: impl Into<String>, handler: F) -> Self
+    where
+        A: DeserializeOwned + 'static,
+        R: Serialize + 'static,
+        F: Fn(A) -> Result<R, CommandError> + Send + Sync + 'static,
+    {
+        self.json_command(name, typed(handler))
+    }
+
+    // a command that may block, answered from a thread of its own
+    pub fn blocking_command<A, R, F>(self, name: impl Into<String>, handler: F) -> Self
+    where
+        A: DeserializeOwned + 'static,
+        R: Serialize + 'static,
+        F: Fn(A) -> Result<R, CommandError> + Send + Sync + 'static,
+    {
+        self.blocking_json_command(name, typed(handler))
+    }
+
+    // a command that reads the call itself and answers with JSON text
+    pub fn json_command<F>(mut self, name: impl Into<String>, handler: F) -> Self
     where
         F: Fn(&CommandCall) -> Result<String, CommandError> + Send + Sync + 'static,
     {
@@ -41,8 +64,7 @@ impl App {
         self
     }
 
-    // a command that may block, answered from a thread of its own
-    pub fn blocking_command<F>(mut self, name: impl Into<String>, handler: F) -> Self
+    pub fn blocking_json_command<F>(mut self, name: impl Into<String>, handler: F) -> Self
     where
         F: Fn(&CommandCall) -> Result<String, CommandError> + Send + Sync + 'static,
     {
@@ -60,6 +82,21 @@ impl App {
             commands: Arc::new(self.commands),
             capabilities: self.capabilities,
         })
+    }
+}
+
+// a handler over serde types as one over the call's JSON text
+fn typed<A, R, F>(handler: F) -> impl Fn(&CommandCall) -> Result<String, CommandError>
+where
+    A: DeserializeOwned,
+    R: Serialize,
+    F: Fn(A) -> Result<R, CommandError>,
+{
+    move |call| {
+        let arguments = serde_json::from_str(&call.payload)
+            .map_err(|error| CommandError::new("invalid-payload", error.to_string()))?;
+        let result = handler(arguments)?;
+        serde_json::to_string(&result).map_err(|error| CommandError::failed(error.to_string()))
     }
 }
 
@@ -333,7 +370,9 @@ fn is_document_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackagedAssets, allowed_origins, is_document_path};
+    use super::{
+        CommandCall, MAIN_WINDOW, PackagedAssets, allowed_origins, is_document_path, typed,
+    };
     use crate::assets::AssetOrigin;
     use ceri_engine::{AppUrl, ExternalRequest, ResourceProvider};
     use std::collections::BTreeMap;
@@ -425,6 +464,30 @@ mod tests {
         );
         assert!(
             allowed_origins(&[OsString::from("--ceri-allow-origin=http://insecure.test")]).is_err()
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Greeting {
+        name: String,
+    }
+
+    #[test]
+    fn typed_commands_read_and_write_serde_shapes() {
+        let handler = typed(|greeting: Greeting| Ok(vec![format!("hello {}", greeting.name)]));
+        let call = |payload: &str| CommandCall {
+            window: MAIN_WINDOW.to_string(),
+            origin: ceri_engine::APP_ORIGIN.to_string(),
+            command: "greet".to_string(),
+            payload: payload.to_string(),
+        };
+        assert_eq!(
+            handler(&call("{\"name\":\"ceri\"}")),
+            Ok("[\"hello ceri\"]".to_string())
+        );
+        assert_eq!(
+            handler(&call("{}")).map_err(|error| error.code),
+            Err("invalid-payload".to_string())
         );
     }
 }

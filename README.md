@@ -49,15 +49,20 @@ console.log(info.engine, info.recovery);
 
 ### Commands
 
-An app registers named commands in Rust and grants pages the right to call them. Arguments and results cross the bridge as JSON text:
+An app registers named commands in Rust and grants pages the right to call them. A command takes its arguments and returns its result as serde types; `json_command` and `blocking_json_command` work on the raw call and its JSON text instead:
 
 ```rust
 use ceri::{App, Capabilities, CommandError, Grant};
 
+#[derive(serde::Deserialize)]
+struct Greeting {
+    name: String,
+}
+
 fn main() -> Result<(), String> {
     App::new()
-        .command("greet", |call| Ok(format!("{{\"hello\":{}}}", call.payload)))
-        .blocking_command("export", |call| {
+        .command("greet", |greeting: Greeting| Ok(format!("hello {}", greeting.name)))
+        .blocking_json_command("export", |call| {
             std::fs::write("export.json", &call.payload)
                 .map(|()| "true".to_string())
                 .map_err(|error| CommandError::failed(error.to_string()))
@@ -79,7 +84,7 @@ const unlisten = await listen("progress", (event) => console.log(event.payload))
 await emit("ready", { at: Date.now() });
 ```
 
-`command` handlers answer on the engine thread and should return quickly. `blocking_command` handlers each run on a thread of their own, and their promises settle on the next engine frame. Capabilities deny by default: a grant names windows, origins and commands, where each pattern is `*`, an exact name or a prefix ending in `*`. A call no grant allows is rejected in the engine before it reaches the app, as a `CeriBridgeError` with code `denied`. An unregistered command rejects with `unknown-command`, a payload that is not JSON serializable with `invalid-payload`, and a handler's own `CommandError` arrives with its code and message. `Browser::emit_event` delivers host events to `listen` callbacks as `{ event, payload }`, and `emit` passes page events to the router's `event` hook.
+A payload that does not fit the argument type rejects with `invalid-payload`. `command` handlers answer on the engine thread and should return quickly. `blocking_command` handlers each run on a thread of their own, and their promises settle on the next engine frame. Capabilities deny by default: a grant names windows, origins and commands, where each pattern is `*`, an exact name or a prefix ending in `*`. A call no grant allows is rejected in the engine before it reaches the app, as a `CeriBridgeError` with code `denied`. An unregistered command rejects with `unknown-command`, a payload that is not JSON serializable with `invalid-payload`, and a handler's own `CommandError` arrives with its code and message. `Browser::emit_event` delivers host events to `listen` callbacks as `{ event, payload }`, and `emit` passes page events to the router's `event` hook.
 
 ## Failure behavior
 
