@@ -22,6 +22,7 @@ mod paint;
 mod png;
 mod script;
 mod selection;
+mod shaping;
 mod text;
 mod text_tables;
 mod transform;

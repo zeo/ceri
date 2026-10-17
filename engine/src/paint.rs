@@ -2541,25 +2541,51 @@ fn paint_outline_text(
     let shift = canvas.shift;
     let baseline =
         (run.y + offset.1 - shift.1 + fonts.ascent(run.font_stack, run.font_size)) * scale;
-    let mut pen = (run.x + offset.0 - shift.0) * scale;
+    let pen = (run.x + offset.0 - shift.0) * scale;
     let device_clip = clip.map(|clip| Rect {
         x: (clip.x - shift.0) * scale,
         y: (clip.y - shift.1) * scale,
         width: clip.width * scale,
         height: clip.height * scale,
     });
-    for character in run.text.chars() {
-        if let Some(glyph) = fonts.glyph(character, run.font_stack, device_size, run.font) {
+    // css turns ligatures off when letters are spaced apart
+    let text = if run.rtl {
+        run.text
+            .chars()
+            .map(crate::bidi::mirrored)
+            .collect::<String>()
+    } else {
+        run.text.clone()
+    };
+    let shaped = fonts.shape(
+        &text,
+        run.font_stack,
+        device_size,
+        run.font,
+        run.letter_spacing == 0.0,
+    );
+    let spacing = run.letter_spacing * scale;
+    let total = shaped.width + spacing * shaped.glyphs.len() as f32;
+    for (index, glyph) in shaped.glyphs.iter().enumerate() {
+        let Some(face) = &glyph.face else {
+            continue;
+        };
+        let offset = glyph.x + spacing * index as f32;
+        // right-to-left glyphs are laid from the run's right edge leftward
+        let x = if run.rtl {
+            pen + total - offset - glyph.advance - spacing
+        } else {
+            pen + offset
+        };
+        if let Some(bitmap) = fonts.glyph_bitmap(face, glyph.glyph, device_size, x) {
             canvas.blend_coverage(
-                pen.round() as i32 + glyph.left,
-                baseline.round() as i32 + glyph.top,
-                &glyph,
+                x.floor() as i32 + bitmap.left,
+                baseline.round() as i32 + bitmap.top,
+                &bitmap,
                 run.color,
                 device_clip,
             );
         }
-        pen += fonts.advance(character, run.font_stack, device_size, run.font)
-            + run.letter_spacing * scale;
     }
 }
 
@@ -2743,6 +2769,7 @@ mod tests {
                     node: Some(node(&[1, 0])),
                     node_offset: 0,
                     source_len: 6,
+                    rtl: false,
                 }],
                 control_value: None,
                 control_selection: None,
@@ -3013,6 +3040,7 @@ mod tests {
                     node: None,
                     node_offset: 0,
                     source_len: 0,
+                    rtl: false,
                 }],
                 control_value: None,
                 control_selection: None,
@@ -3124,6 +3152,7 @@ mod tests {
                         node: None,
                         node_offset: 0,
                         source_len: 0,
+                        rtl: false,
                     },
                     TextRun {
                         text: "CD".to_string(),
@@ -3138,6 +3167,7 @@ mod tests {
                         node: None,
                         node_offset: 0,
                         source_len: 0,
+                        rtl: false,
                     },
                 ],
                 control_value: Some("ABCD".to_string()),

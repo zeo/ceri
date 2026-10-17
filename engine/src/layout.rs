@@ -48,6 +48,8 @@ pub struct TextRun {
     pub font_stack: FontStack,
     pub color: Color,
     pub font: FontStyle,
+    // drawn right to left, with its glyphs shaped in logical order
+    pub rtl: bool,
     // DOM text node that produced this run, so prose can be selected by pointer;
     // node_offset is where the word starts, past any leading space in text
     pub node: Option<NodeId>,
@@ -372,6 +374,7 @@ impl InlineLine {
             node: None,
             node_offset: 0,
             source_len: 0,
+            rtl: false,
             line_height: 0.0,
             atomic: None,
             edge: Some((decoration, opening)),
@@ -501,6 +504,7 @@ struct InlineFragment {
     node: Option<NodeId>,
     node_offset: usize,
     source_len: usize,
+    rtl: bool,
     line_height: f32,
     // an inline-block or replaced element that sits on the line like a word
     atomic: Option<Box<LayoutBox>>,
@@ -2355,6 +2359,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 node: None,
                 node_offset: 0,
                 source_len: 0,
+                rtl: false,
             });
         }
         line.y = content_y + value_lines.len() as f32 * line_height;
@@ -2448,6 +2453,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         node: None,
                         node_offset: 0,
                         source_len: 0,
+                        rtl: false,
                         line_height,
                         atomic: Some(Box::new(bullet)),
                         edge: None,
@@ -6766,6 +6772,7 @@ impl TextPlacer {
             node: self.source.node,
             node_offset: offset,
             source_len,
+            rtl: false,
             line_height: self.context.line_height,
             atomic: None,
             edge: None,
@@ -6860,6 +6867,7 @@ fn append_atomic(
         node: None,
         node_offset: 0,
         source_len: 0,
+        rtl: false,
         line_height: outer_height,
         atomic: Some(Box::new(laid_out)),
         edge: None,
@@ -6937,6 +6945,7 @@ fn flush_line(
             node: fragment.node,
             node_offset: fragment.node_offset,
             source_len: fragment.source_len,
+            rtl: fragment.rtl,
         });
         x += fragment.width;
     }
@@ -7070,6 +7079,7 @@ fn outside_marker(
             node: None,
             node_offset: 0,
             source_len: 0,
+            rtl: false,
         };
         let mut marker = anonymous_box(node, rect, vec![run], (font_size, style.cursor), 1.0);
         marker.tag = "::marker".to_string();
@@ -7147,7 +7157,19 @@ fn visual_fragments(fragments: Vec<InlineFragment>, base: u8) -> Vec<InlineFragm
         .filter_map(|index| {
             let mut fragment = slots[index].take()?;
             if levels[index] % 2 == 1 && fragment.atomic.is_none() {
-                fragment.text = reversed_for_display(&fragment.text);
+                if crate::font::active_fonts().is_builtin() {
+                    fragment.text = reversed_for_display(&fragment.text);
+                } else {
+                    // shaping needs logical order, so the run is drawn backwards instead; in a
+                    // left-to-right paragraph the space joining it to the text before stays on
+                    // the left
+                    if base.is_multiple_of(2)
+                        && let Some(rest) = fragment.text.strip_prefix(' ')
+                    {
+                        fragment.text = format!("{rest} ");
+                    }
+                    fragment.rtl = true;
+                }
             }
             Some(fragment)
         })
@@ -7383,8 +7405,14 @@ fn measure_text(
     font: FontStyle,
     letter_spacing: f32,
 ) -> f32 {
-    crate::font::active_fonts().measure(text, stack, font_size, font)
-        + letter_spacing * text.chars().count() as f32
+    let fonts = crate::font::active_fonts();
+    if fonts.is_builtin() {
+        return fonts.measure(text, stack, font_size, font)
+            + letter_spacing * text.chars().count() as f32;
+    }
+    // spaced letters draw without ligatures, one glyph each
+    let shaped = fonts.shape(text, stack, font_size, font, letter_spacing == 0.0);
+    shaped.width + letter_spacing * shaped.glyphs.len() as f32
 }
 
 fn text_control_value(node: Subject<'_>, style_state: &StyleState) -> Option<String> {

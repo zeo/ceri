@@ -26,6 +26,8 @@ pub struct FontFace {
     // usWeightClass and the italic flag, from OS/2 and head
     weight: u16,
     italic: bool,
+    // where each table starts, for the layout tables shaping reads
+    tables: BTreeMap<[u8; 4], (usize, usize)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -121,6 +123,7 @@ impl FontFace {
             characters,
             weight,
             italic,
+            tables,
         })
     }
 
@@ -138,6 +141,21 @@ impl FontFace {
 
     pub fn line_height(&self, size: f32) -> f32 {
         (self.ascent + self.descent + self.line_gap) / self.units_per_em * size
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub(crate) fn table(&self, tag: &[u8; 4]) -> Option<usize> {
+        self.tables.get(tag).map(|(start, _)| *start)
+    }
+
+    // a glyph's advance in font units
+    pub(crate) fn advance_units(&self, glyph: u16) -> f32 {
+        let metrics = self.horizontal_metrics.max(1);
+        let index = glyph.min(metrics - 1);
+        f32::from(read_u16(&self.data, self.hmtx.0 + usize::from(index) * 4).unwrap_or(0))
     }
 
     pub fn weight(&self) -> u16 {
@@ -614,7 +632,29 @@ struct GlyphKey {
     size: u32,
     synthetic_bold: bool,
     synthetic_italic: bool,
+    // the pen's fraction of a pixel, in quarters
+    quarter: u8,
 }
+
+// shaped runs kept before the cache is emptied
+const MAX_SHAPED_RUNS: usize = 16_384;
+
+// a glyph of a shaped run: its face (none for the builtin bitmap face), its pen position
+// from the run's start and its advance, in pixels
+#[derive(Clone)]
+pub(crate) struct RunGlyph {
+    pub(crate) face: Option<ChosenFace>,
+    pub(crate) glyph: u16,
+    pub(crate) x: f32,
+    pub(crate) advance: f32,
+}
+
+pub(crate) struct ShapedRun {
+    pub(crate) glyphs: Vec<RunGlyph>,
+    pub(crate) width: f32,
+}
+
+type ShapeKey = (String, FontStack, u32, FontStyle, bool);
 
 // the weight and slant text asks for
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -787,6 +827,7 @@ pub struct FontSet {
     // the faces a stack's families supply, in order
     stacks: RefCell<HashMap<(FontStack, FontStyle), FaceList>>,
     fallbacks: RefCell<FallbackCache>,
+    shaped: RefCell<HashMap<ShapeKey, Rc<ShapedRun>>>,
     glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
 }
 
@@ -804,6 +845,7 @@ impl FontSet {
             web_faces: RefCell::default(),
             stacks: RefCell::default(),
             fallbacks: RefCell::default(),
+            shaped: RefCell::default(),
             glyphs: RefCell::default(),
         }
     }
@@ -841,6 +883,7 @@ impl FontSet {
         });
         self.stacks.borrow_mut().clear();
         self.fallbacks.borrow_mut().clear();
+        self.shaped.borrow_mut().clear();
     }
 
     pub(crate) fn clear_web_faces(&self) {
@@ -848,6 +891,7 @@ impl FontSet {
             self.web_faces.borrow_mut().clear();
             self.stacks.borrow_mut().clear();
             self.fallbacks.borrow_mut().clear();
+            self.shaped.borrow_mut().clear();
             self.glyphs.borrow_mut().clear();
         }
     }
@@ -856,9 +900,89 @@ impl FontSet {
         if self.is_builtin() {
             return text.chars().count() as f32 * builtin_advance(size);
         }
-        text.chars()
-            .map(|character| self.advance(character, stack, size, style))
-            .sum()
+        self.shape(text, stack, size, style, true).width
+    }
+
+    // the glyphs a run of text draws as, with ligatures when allowed and kerning, positioned in
+    // logical order from the run's start
+    pub(crate) fn shape(
+        &self,
+        text: &str,
+        stack: FontStack,
+        size: f32,
+        style: FontStyle,
+        ligatures: bool,
+    ) -> Rc<ShapedRun> {
+        let key = (text.to_string(), stack, size.to_bits(), style, ligatures);
+        if let Some(cached) = self.shaped.borrow().get(&key) {
+            return cached.clone();
+        }
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut glyphs = Vec::with_capacity(characters.len());
+        let mut x = 0.0;
+        let mut start = 0;
+        while start < characters.len() {
+            let chosen = self.face_for(characters[start], stack, style);
+            // a run of characters the same face draws shapes together
+            let mut end = start + 1;
+            while end < characters.len() {
+                let next = self.face_for(characters[end], stack, style);
+                let same = match (&chosen, &next) {
+                    (Some(left), Some(right)) => {
+                        Rc::ptr_eq(&left.face, &right.face)
+                            && left.synthetic_bold == right.synthetic_bold
+                            && left.synthetic_italic == right.synthetic_italic
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    break;
+                }
+                end += 1;
+            }
+            match chosen {
+                Some(chosen) => {
+                    let scale = size / chosen.face.units_per_em();
+                    let extra = if chosen.synthetic_bold {
+                        size / 24.0
+                    } else {
+                        0.0
+                    };
+                    for shaped in crate::shaping::Shaper::new(&chosen.face)
+                        .shape(&characters[start..end], ligatures)
+                    {
+                        let advance = shaped.advance * scale + extra;
+                        glyphs.push(RunGlyph {
+                            face: Some(chosen.clone()),
+                            glyph: shaped.glyph,
+                            x,
+                            advance,
+                        });
+                        x += advance;
+                    }
+                }
+                None => {
+                    for _ in start..end {
+                        glyphs.push(RunGlyph {
+                            face: None,
+                            glyph: 0,
+                            x,
+                            advance: builtin_advance(size),
+                        });
+                        x += builtin_advance(size);
+                    }
+                }
+            }
+            start = end;
+        }
+        let run = Rc::new(ShapedRun { glyphs, width: x });
+        let mut shaped = self.shaped.borrow_mut();
+        if shaped.len() >= MAX_SHAPED_RUNS {
+            shaped.clear();
+        }
+        shaped.insert(key, run.clone());
+        run
     }
 
     pub fn advance(&self, character: char, stack: FontStack, size: f32, style: FontStyle) -> f32 {
@@ -898,13 +1022,25 @@ impl FontSet {
         style: FontStyle,
     ) -> Option<Rc<GlyphBitmap>> {
         let chosen = self.face_for(character, stack, style)?;
-        let glyph = chosen.face.glyph_for(character);
+        self.glyph_bitmap(&chosen, chosen.face.glyph_for(character), size, 0.0)
+    }
+
+    // a glyph rasterized at a size, at a pen position's fraction of a pixel (to a quarter)
+    pub(crate) fn glyph_bitmap(
+        &self,
+        chosen: &ChosenFace,
+        glyph: u16,
+        size: f32,
+        subpixel: f32,
+    ) -> Option<Rc<GlyphBitmap>> {
+        let quarter = ((subpixel.fract() * 4.0).round() as u8) % 4;
         let key = GlyphKey {
             face: Rc::as_ptr(&chosen.face) as usize,
             glyph,
             size: size.to_bits(),
             synthetic_bold: chosen.synthetic_bold,
             synthetic_italic: chosen.synthetic_italic,
+            quarter,
         };
         if let Some(cached) = self.glyphs.borrow().get(&key) {
             return cached.clone();
@@ -919,7 +1055,13 @@ impl FontSet {
                     outline
                 }
             })
-            .and_then(|outline| rasterize(&outline, size / chosen.face.units_per_em(), 0.0))
+            .and_then(|outline| {
+                rasterize(
+                    &outline,
+                    size / chosen.face.units_per_em(),
+                    f32::from(quarter) / 4.0,
+                )
+            })
             .map(|bitmap| {
                 if chosen.synthetic_bold {
                     embolden(bitmap, (size / 24.0).round().max(1.0) as usize)
@@ -1433,6 +1575,29 @@ mod tests {
             let row = bitmap.height / 2;
             assert!(bitmap.coverage[row * bitmap.width + 1] > 200);
         }
+    }
+
+    #[test]
+    fn shaping_applies_ligatures_and_kerning_from_the_font() {
+        let fonts = FontSet::new(Rc::new(fixture("ceri-test.otf")), None);
+        let stack = intern_font_stack("Ceri Test");
+        // f and i join into one 700 unit ligature; A and B kern by -100
+        assert_eq!(fonts.measure("fi", stack, 1000.0, FontStyle::NORMAL), 700.0);
+        assert_eq!(
+            fonts.measure("AB", stack, 1000.0, FontStyle::NORMAL),
+            1100.0
+        );
+        let spaced = fonts.shape("fi", stack, 1000.0, FontStyle::NORMAL, false);
+        assert_eq!(
+            spaced.glyphs.len(),
+            2,
+            "without ligatures each letter keeps its glyph"
+        );
+        let woff2 = FontSet::new(Rc::new(fixture("ceri-test.woff2")), None);
+        assert_eq!(
+            woff2.measure("fiAB", stack, 1000.0, FontStyle::NORMAL),
+            1800.0
+        );
     }
 
     #[test]
