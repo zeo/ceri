@@ -1453,6 +1453,7 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
             entry.ancestor_offset,
         );
     }
+    paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
     paint_box_text(
         canvas,
         layout_box,
@@ -1499,7 +1500,7 @@ fn paint_non_context_children(
 ) {
     for index in paint_order(&layout_box.children) {
         let child = &layout_box.children[index];
-        if child.creates_stacking_context {
+        if child.creates_stacking_context || child.inline {
             continue;
         }
         paint_non_context_subtree(
@@ -1538,6 +1539,7 @@ fn paint_non_context_subtree(
     if let Some(mask) = mask {
         canvas.push_mask(mask);
     }
+    paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
     paint_box_text(
         canvas,
         layout_box,
@@ -1648,6 +1650,29 @@ fn paint_box_surface(
         );
     }
     content_clip
+}
+
+// inline element backgrounds and borders sit under the text of their block
+fn paint_inline_fragments(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
+    for fragment in layout_box.children.iter().filter(|child| child.inline) {
+        let rect = visual_rect_for(fragment, offset);
+        paint_box_surface(
+            canvas,
+            fragment,
+            images,
+            clip,
+            offset,
+            rect,
+            fragment.opacity,
+        );
+        paint_outline(canvas, fragment, rect, fragment.opacity, clip);
+    }
 }
 
 fn paint_box_text(
@@ -2522,6 +2547,7 @@ mod tests {
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
+                inline: false,
                 scroll_content: Size {
                     width: 64.0,
                     height: 24.0,
@@ -2789,6 +2815,7 @@ mod tests {
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
+                inline: false,
                 scroll_content: Size {
                     width: 20.0,
                     height: 10.0,
@@ -2912,6 +2939,7 @@ mod tests {
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
+                inline: false,
                 scroll_content: Size {
                     width: 32.0,
                     height: 28.0,
@@ -3007,6 +3035,7 @@ mod tests {
                         visible: true,
                         cursor: crate::css::Cursor::Auto,
                         floated: false,
+                        inline: false,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3051,6 +3080,7 @@ mod tests {
                         visible: true,
                         cursor: crate::css::Cursor::Auto,
                         floated: false,
+                        inline: false,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3070,6 +3100,7 @@ mod tests {
                 visible: true,
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
+                inline: false,
                 scroll_content: Size {
                     width: 20.0,
                     height: 20.0,

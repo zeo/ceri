@@ -138,6 +138,8 @@ pub struct LayoutBox {
     pub(crate) cursor: Cursor,
     // floats paint after their in-flow siblings
     pub(crate) floated: bool,
+    // one line's part of an inline element, painted under the text of the block it is in
+    pub(crate) inline: bool,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
     pub(crate) margin: ResolvedEdges,
@@ -279,6 +281,9 @@ struct InlineLine {
     // the block's line height, the band a fresh line checks floats against
     band: f32,
     floats: Option<Rc<FloatArea>>,
+    // inline elements seen in this block, and those still open at the start of the line
+    decorations: Vec<InlineDecoration>,
+    open_inlines: Vec<usize>,
     // whether the text appended so far ended on whitespace, which decides word joining
     trailing_space: bool,
     fragments: Vec<InlineFragment>,
@@ -286,7 +291,47 @@ struct InlineLine {
     placed: Vec<LayoutBox>,
 }
 
+// an inline element, whose boxes come from the lines it lands on
+struct InlineDecoration {
+    node: NodeId,
+    tag: String,
+    style: Style,
+    font_size: f32,
+    line_height: f32,
+    padding: ResolvedEdges,
+    border: ResolvedEdges,
+    margin: ResolvedEdges,
+    opacity: f32,
+}
+
 impl InlineLine {
+    fn has_content(&self) -> bool {
+        self.fragments
+            .iter()
+            .any(|fragment| fragment.edge.is_none())
+    }
+
+    // the start or end of an inline element: a fragment as wide as its margin, border and
+    // padding on that side
+    fn push_edge(&mut self, decoration: usize, opening: bool, width: f32) {
+        self.used += width;
+        self.fragments.push(InlineFragment {
+            text: String::new(),
+            width,
+            font_size: 0.0,
+            letter_spacing: 0.0,
+            font_stack: FontStack::default(),
+            color: Color::transparent(),
+            bold: false,
+            node: None,
+            node_offset: 0,
+            source_len: 0,
+            line_height: 0.0,
+            atomic: None,
+            edge: Some((decoration, opening)),
+        });
+    }
+
     fn available(&self, content_width: f32) -> f32 {
         (content_width - self.left - self.right).max(0.0)
     }
@@ -300,7 +345,7 @@ impl InlineLine {
 
     // moves an empty line down past floats until something this wide fits beside them
     fn make_room(&mut self, width: f32, content_x: f32, content_width: f32) {
-        while self.fragments.is_empty()
+        while !self.has_content()
             && width > self.available(content_width)
             && (self.left > 0.0 || self.right > 0.0)
         {
@@ -411,6 +456,8 @@ struct InlineFragment {
     line_height: f32,
     // an inline-block or replaced element that sits on the line like a word
     atomic: Option<Box<LayoutBox>>,
+    // where an inline element opens or closes
+    edge: Option<(usize, bool)>,
 }
 
 #[derive(Clone, Copy)]
@@ -789,6 +836,7 @@ pub fn layout_with_state(
         visible: true,
         cursor: Cursor::Auto,
         floated: false,
+        inline: false,
         scroll_content: Size {
             width: viewport.width,
             height: viewport.height,
@@ -826,6 +874,8 @@ pub fn layout_with_state(
                 right: 0.0,
                 band: 1.0,
                 floats: Some(root_floats.clone()),
+                decorations: Vec::new(),
+                open_inlines: Vec::new(),
                 trailing_space: false,
                 fragments: Vec::new(),
                 placed: Vec::new(),
@@ -2153,6 +2203,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         right: 0.0,
         band: line_height,
         floats: Some(float_area.clone()),
+        decorations: Vec::new(),
+        open_inlines: Vec::new(),
         fragments: Vec::new(),
         placed: Vec::new(),
     };
@@ -2290,6 +2342,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         source_len: 0,
                         line_height,
                         atomic: Some(Box::new(bullet)),
+                        edge: None,
                     });
                 }
             }
@@ -2507,6 +2560,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
         floated: false,
+        inline: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -2656,6 +2710,7 @@ fn anonymous_box(
         visible: true,
         cursor,
         floated: false,
+        inline: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
@@ -2683,6 +2738,8 @@ fn layout_text_item(
         right: 0.0,
         band: context.line_height,
         floats: None,
+        decorations: Vec::new(),
+        open_inlines: Vec::new(),
         trailing_space: false,
         fragments: Vec::new(),
         placed: Vec::new(),
@@ -3464,6 +3521,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
         floated: false,
+        inline: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -3912,6 +3970,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
         floated: false,
+        inline: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4622,6 +4681,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         visible: style.visibility == Visibility::Visible,
         cursor: style.cursor,
         floated: false,
+        inline: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -5734,7 +5794,7 @@ fn append_inline_element(
         containing_block,
     } = input;
     if node.name() == "br" {
-        if line.fragments.is_empty() {
+        if !line.has_content() {
             line.y += context.line_height;
             line.height = 0.0;
             line.fit_to_floats(context.content_x, context.content_width);
@@ -5793,7 +5853,24 @@ fn append_inline_element(
         text: inherited_text(&style),
         opacity: style.opacity * parent.opacity,
     };
-    for child in node.children(&NO_GENERATED_CONTENT) {
+    let margin = resolve_margins(style.margin, context.content_width, font_size);
+    let padding = resolve_edges(style.padding, context.content_width, font_size);
+    let border = used_border(&style);
+    let decoration = line.decorations.len();
+    line.decorations.push(InlineDecoration {
+        node: node.node,
+        tag: node.name().to_string(),
+        style,
+        font_size,
+        line_height,
+        padding,
+        border,
+        margin,
+        opacity: style.opacity * parent.opacity,
+    });
+    line.push_edge(decoration, true, margin.left + border.left + padding.left);
+    let generated = node.generated_content(stylesheet, style_state);
+    for child in node.children(&generated) {
         match child {
             Child::Text(text_node, value) => {
                 let source = InlineSource {
@@ -5817,6 +5894,11 @@ fn append_inline_element(
             ),
         }
     }
+    line.push_edge(
+        decoration,
+        false,
+        padding.right + border.right + margin.right,
+    );
 }
 
 fn append_inline_text(
@@ -5858,8 +5940,8 @@ fn append_inline_text(
             bold,
             letter_spacing,
         );
-        let joins_previous = !line.fragments.is_empty() && (line.trailing_space || leading_space);
-        let mut space_width = if line.fragments.is_empty() || (first_word && !joins_previous) {
+        let joins_previous = line.has_content() && (line.trailing_space || leading_space);
+        let mut space_width = if !line.has_content() || (first_word && !joins_previous) {
             0.0
         } else {
             measure_text(
@@ -5870,11 +5952,11 @@ fn append_inline_text(
                 letter_spacing,
             )
         };
-        if line.fragments.is_empty() {
+        if !line.has_content() {
             line.fit_to_floats(context.content_x, context.content_width);
             line.make_room(word_width, context.content_x, context.content_width);
         }
-        if !line.fragments.is_empty()
+        if line.has_content()
             && line.used + space_width + word_width > line.available(context.content_width)
         {
             flush_line(
@@ -5885,6 +5967,23 @@ fn append_inline_text(
                 context.align,
             );
             // the space that broke the line is not drawn at the start of the next
+            space_width = 0.0;
+        }
+        // a space before an element's first word belongs to the text before the element
+        if space_width > 0.0
+            && line
+                .fragments
+                .last()
+                .is_some_and(|fragment| matches!(fragment.edge, Some((_, true))))
+            && let Some(previous) = line
+                .fragments
+                .iter_mut()
+                .rev()
+                .find(|fragment| fragment.edge.is_none() && fragment.atomic.is_none())
+        {
+            previous.text.push(' ');
+            previous.width += space_width;
+            line.used += space_width;
             space_width = 0.0;
         }
         let prefix = if space_width > 0.0 { " " } else { "" };
@@ -5911,6 +6010,7 @@ fn append_inline_text(
             source_len,
             line_height: context.line_height,
             atomic: None,
+            edge: None,
         });
         first_word = false;
     }
@@ -5977,12 +6077,11 @@ fn append_atomic(
     };
     let outer_width = laid_out.rect.width + laid_out.margin.left + laid_out.margin.right;
     let outer_height = laid_out.rect.height + laid_out.margin.top + laid_out.margin.bottom;
-    if line.fragments.is_empty() {
+    if !line.has_content() {
         line.fit_to_floats(context.content_x, context.content_width);
         line.make_room(outer_width, context.content_x, context.content_width);
     }
-    if !line.fragments.is_empty() && line.used + outer_width > line.available(context.content_width)
-    {
+    if line.has_content() && line.used + outer_width > line.available(context.content_width) {
         flush_line(
             line,
             text,
@@ -6007,6 +6106,7 @@ fn append_atomic(
         source_len: 0,
         line_height: outer_height,
         atomic: Some(Box::new(laid_out)),
+        edge: None,
     });
 }
 
@@ -6017,7 +6117,7 @@ fn flush_line(
     content_width: f32,
     align: TextAlign,
 ) {
-    if line.fragments.is_empty() {
+    if !line.has_content() {
         return;
     }
     let available = line.available(content_width);
@@ -6027,12 +6127,27 @@ fn flush_line(
         TextAlign::Right => (available - line.used).max(0.0),
     };
     let mut x = content_x + line.left + offset;
+    let line_start = x;
     // text shares the bottom of a line that a taller inline box stretched
     let stretched = line
         .fragments
         .iter()
         .any(|fragment| fragment.atomic.is_some());
-    for fragment in line.fragments.drain(..) {
+    let mut active = line.open_inlines.clone();
+    let mut starts = HashMap::new();
+    let mut ends = HashMap::new();
+    for fragment in std::mem::take(&mut line.fragments) {
+        if let Some((decoration, opening)) = fragment.edge {
+            let margin = line.decorations[decoration].margin;
+            if opening {
+                starts.insert(decoration, x + margin.left);
+                active.push(decoration);
+            } else {
+                ends.insert(decoration, x + fragment.width - margin.right);
+            }
+            x += fragment.width;
+            continue;
+        }
         let top = if stretched {
             line.y + (line.height - fragment.line_height).max(0.0)
         } else {
@@ -6062,10 +6177,89 @@ fn flush_line(
         });
         x += fragment.width;
     }
+    for &decoration in &active {
+        let start = starts.get(&decoration).copied().unwrap_or(line_start);
+        let end = ends.get(&decoration).copied().unwrap_or(x);
+        let fragment = inline_fragment_box(
+            &line.decorations[decoration],
+            (start, end),
+            (
+                starts.contains_key(&decoration),
+                ends.contains_key(&decoration),
+            ),
+            if stretched {
+                line.y + (line.height - line.decorations[decoration].line_height).max(0.0)
+            } else {
+                line.y
+            },
+        );
+        line.placed.push(fragment);
+    }
+    line.open_inlines = active
+        .into_iter()
+        .filter(|decoration| !ends.contains_key(decoration))
+        .collect();
     line.y += line.height.max(1.0);
     line.used = 0.0;
     line.height = 0.0;
     line.fit_to_floats(content_x, content_width);
+}
+
+// one line's part of an inline element: its content area with padding and border around it,
+// and the left and right edges only where the element starts and ends
+fn inline_fragment_box(
+    decoration: &InlineDecoration,
+    (start, end): (f32, f32),
+    (first, last): (bool, bool),
+    text_top: f32,
+) -> LayoutBox {
+    let InlineDecoration {
+        node,
+        tag,
+        style,
+        font_size,
+        line_height,
+        padding,
+        border,
+        ..
+    } = decoration;
+    let border = ResolvedEdges {
+        left: if first { border.left } else { 0.0 },
+        right: if last { border.right } else { 0.0 },
+        ..*border
+    };
+    let content_height = line_height.min(font_size * 1.25);
+    let rect = Rect {
+        x: start,
+        y: text_top - padding.top - border.top,
+        width: (end - start).max(0.0),
+        height: content_height + padding.top + padding.bottom + border.top + border.bottom,
+    };
+    let mut fragment = anonymous_box(
+        *node,
+        rect,
+        Vec::new(),
+        (*font_size, style.cursor),
+        decoration.opacity,
+    );
+    fragment.tag = tag.clone();
+    fragment.inline = true;
+    fragment.visible = style.visibility == Visibility::Visible;
+    fragment.background = style.background;
+    fragment.gradient = style.gradient;
+    fragment.border = BoxBorder {
+        widths: border,
+        ..BoxBorder::of(style)
+    };
+    let radii = resolve_corner_radii(style.border_radius, rect.width, rect.height, *font_size);
+    fragment.radii = [
+        if first { radii[0] } else { (0.0, 0.0) },
+        if last { radii[1] } else { (0.0, 0.0) },
+        if last { radii[2] } else { (0.0, 0.0) },
+        if first { radii[3] } else { (0.0, 0.0) },
+    ];
+    fragment.outline = box_outline(style);
+    fragment
 }
 
 // a marker outside the content box, level with the first line: a drawn bullet, or the item's
@@ -6229,7 +6423,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
     }
     loop {
         let (left, right) = floats.insets(y, outer.1, content_x, content_width);
-        let beside_line = y < line.y + line.band && !line.fragments.is_empty();
+        let beside_line = y < line.y + line.band && line.has_content();
         let used = if beside_line { line.used } else { 0.0 };
         if outer.0 <= content_width - left - right - used + 0.01 {
             break;
@@ -6265,7 +6459,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
     ));
     line.placed.push(laid_out);
     let (left, right) = floats.insets(line.y, line.band, content_x, content_width);
-    if line.fragments.is_empty() {
+    if !line.has_content() {
         (line.left, line.right) = (left, right);
     } else {
         // content already on the line keeps its place, and the rest of the line narrows
@@ -6620,7 +6814,13 @@ mod tests {
             .join("");
         assert_eq!(text, "[bracketed]barnospacehere");
 
-        let generated = find_box(&layout.root, "::before").expect("a generated box should exist");
+        fn positioned_before(layout: &LayoutBox) -> Option<&LayoutBox> {
+            if layout.tag == "::before" && !layout.inline {
+                return Some(layout);
+            }
+            layout.children.iter().find_map(positioned_before)
+        }
+        let generated = positioned_before(&layout.root).expect("a generated box should exist");
         assert_eq!(
             (generated.rect.width, generated.rect.height),
             (4.0, 40.0),

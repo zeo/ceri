@@ -6118,6 +6118,52 @@ mod tests {
     }
 
     #[test]
+    fn inline_elements_get_a_box_per_line_that_paints_and_takes_hits() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0; width: 200px; font-size: 16px; line-height: 20px }
+                #span { padding: 0 4px; border-left: 2px solid #000000; background: #ffcc00 }
+            </style>
+            <p style="margin: 0">x <span id="span">one two three four five six seven</span> <a id="link" href="#next">go</a></p>
+            <p id="status">idle</p>
+            <script>
+                const span = document.getElementById("span");
+                const rects = span.getClientRects();
+                const first = rects[0];
+                document.getElementById("status").textContent = [
+                    rects.length > 1, first.height, rects[rects.length - 1].y > first.y,
+                ].join(",");
+            </script>"##,
+        ));
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        browser.set_viewport(viewport, 1.0);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("true,20,true")
+        );
+        let layout = browser.layout(viewport).expect("layout should build");
+        let link = document.find_element_by_id("link").expect("link");
+        let span = document.find_element_by_id("span").expect("span");
+        let link_box = find_node_box(&layout.root, link).expect("the link has a box");
+        assert_eq!(
+            layout.hit_test(link_box.rect.x + 2.0, link_box.rect.y + 5.0),
+            Some(link)
+        );
+        let span_box = find_node_box(&layout.root, span).expect("the span has a box");
+        assert_eq!(span_box.background, Color::opaque(255, 204, 0));
+        assert_eq!(span_box.border.widths.left, 2.0);
+    }
+
+    #[test]
     fn floats_stack_to_their_sides_push_lines_aside_and_clear() {
         let mut browser = Browser::new(bundle(
             r##"<style>
