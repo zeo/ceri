@@ -253,6 +253,11 @@ impl ScriptRuntime {
         state.transitions = extras.transitions.clone();
         state.animation_starts = extras.animation_starts.clone();
         state.image_sizes = extras.image_sizes.clone();
+        // the last measurement knows container sizes the page's own layout may not yet
+        state.container_sizes = self.measured.borrow().as_ref().map_or_else(
+            || extras.container_sizes.clone(),
+            |measured| measured.state.container_sizes.clone(),
+        );
         state
     }
 
@@ -267,7 +272,16 @@ impl ScriptRuntime {
             .as_ref()
             .is_none_or(|measured| measured.version != version || measured.state != state);
         if stale {
-            let layout = self.run_layout(&inputs, &state);
+            let mut state = state;
+            let mut layout = self.run_layout(&inputs, &state);
+            // container queries read sizes from a layout, so a change in them lays out again
+            if inputs.stylesheet.has_container_queries() {
+                let measured = crate::layout::take_layout_containers();
+                if measured != state.container_sizes {
+                    state.container_sizes = measured;
+                    layout = self.run_layout(&inputs, &state);
+                }
+            }
             *self.measured.borrow_mut() = Some(MeasuredLayout {
                 version,
                 state,
@@ -514,6 +528,9 @@ impl ScriptRuntime {
         let Some(inputs) = self.layout_inputs.clone() else {
             return values;
         };
+        if inputs.borrow().stylesheet.has_container_queries() {
+            drop(self.measure());
+        }
         let inputs = inputs.borrow();
         let mut state = self.layout_state(&inputs);
         let document = self.document.borrow();

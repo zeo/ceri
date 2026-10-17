@@ -192,7 +192,7 @@ impl Areas {
     }
 }
 
-fn intern_name(name: &str) -> u32 {
+pub(crate) fn intern_name(name: &str) -> u32 {
     INTERNED.with(|interned| {
         let mut interned = interned.borrow_mut();
         if let Some(id) = interned.name_keys.get(name) {

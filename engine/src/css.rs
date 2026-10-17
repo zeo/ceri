@@ -1,6 +1,7 @@
 use crate::border::{BorderSide, CornerLengths, OutlineStyle, SQUARE_CORNERS};
 use crate::dom::{Document, Element, NodeId};
 use crate::grid::{Areas, GridLine, GridPlacement, Tracks, parse_line, parse_placement};
+use crate::media::{ContainerQuery, MediaQueryList};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -438,6 +439,30 @@ pub(crate) struct LengthTerms {
 }
 
 impl LengthTerms {
+    fn scaled(self, factor: f32) -> Self {
+        Self {
+            px: self.px * factor,
+            em: self.em * factor,
+            rem: self.rem * factor,
+            percent: self.percent * factor,
+            viewport_width: self.viewport_width * factor,
+            viewport_height: self.viewport_height * factor,
+            zero_width: self.zero_width * factor,
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            px: self.px + other.px,
+            em: self.em + other.em,
+            rem: self.rem + other.rem,
+            percent: self.percent + other.percent,
+            viewport_width: self.viewport_width + other.viewport_width,
+            viewport_height: self.viewport_height + other.viewport_height,
+            zero_width: self.zero_width + other.zero_width,
+        }
+    }
+
     fn resolve(self, containing: f32, font_size: f32) -> f32 {
         let environment = layout_environment();
         self.px
@@ -795,6 +820,8 @@ pub(crate) struct StyleState {
     pub(crate) image_sizes: BTreeMap<NodeId, (u32, u32)>,
     // when each element's current animation began, on the page clock
     pub(crate) animation_starts: BTreeMap<NodeId, u64>,
+    // query containers and their content sizes from the last layout
+    pub(crate) container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
 }
 
 impl StyleState {
@@ -901,6 +928,9 @@ pub(crate) struct Style {
     pub clear: Clear,
     pub list_style_type: ListStyleType,
     pub list_inside: bool,
+    // none, or whether the container answers queries on its height as well as its width
+    pub container_type: Option<bool>,
+    pub container_name: Option<u32>,
     pub border_collapse: bool,
     // horizontal and vertical
     pub border_spacing: (f32, f32),
@@ -1068,6 +1098,8 @@ impl Style {
             clear: Clear::None,
             list_style_type: parent_text.list_style_type,
             list_inside: parent_text.list_inside,
+            container_type: None,
+            container_name: None,
             border_collapse: parent_text.border_collapse,
             border_spacing: parent_text.border_spacing,
             caption_bottom: parent_text.caption_bottom,
@@ -1598,9 +1630,7 @@ impl Stylesheet {
 impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = strip_comments(source);
-        let mut rules = Vec::new();
-        let mut keyframes = Vec::new();
-        parse_rules(&source, None, &mut rules, &mut keyframes, None)?;
+        let (rules, keyframes) = parse_stylesheet(&source, None)?;
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         Ok(Self {
@@ -1615,16 +1645,8 @@ impl Stylesheet {
     // page rendering follows CSS error handling: an unsupported rule is dropped, the rest applies
     pub fn parse_recovering(source: &str) -> (Self, Vec<String>) {
         let source = strip_comments(source);
-        let mut rules = Vec::new();
-        let mut keyframes = Vec::new();
         let mut dropped = Vec::new();
-        let _ = parse_rules(
-            &source,
-            None,
-            &mut rules,
-            &mut keyframes,
-            Some(&mut dropped),
-        );
+        let (rules, keyframes) = parse_stylesheet(&source, Some(&mut dropped)).unwrap_or_default();
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         (
@@ -2060,11 +2082,7 @@ impl Stylesheet {
             let Some(rule) = self.rules.get(position) else {
                 continue;
             };
-            if rule
-                .media
-                .as_ref()
-                .is_some_and(|media| !media.matches(state))
-            {
+            if !rule.applies(document, node, state) {
                 continue;
             }
             let Some(specificity) = rule
@@ -2080,7 +2098,7 @@ impl Stylesheet {
             // later declarations in a rule follow earlier ones in the cascade order
             for (position, declaration) in rule.declarations.iter().enumerate() {
                 let candidate = (
-                    specificity.important(declaration.important),
+                    specificity.ranked(declaration.important, rule.layer),
                     (rule.order << 16) | position,
                     Cow::Borrowed(declaration.value.as_str()),
                 );
@@ -2148,11 +2166,19 @@ impl Stylesheet {
         }
         self.motion_rules.iter().any(|&index| {
             let rule = &self.rules[index];
-            rule.media.as_ref().is_none_or(|media| media.matches(state))
+            rule.applies(document, node, state)
                 && rule
                     .selectors
                     .iter()
                     .any(|selector| selector.matches(document, node, None, state))
+        })
+    }
+
+    pub(crate) fn has_container_queries(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.conditions
+                .iter()
+                .any(|condition| matches!(condition, RuleCondition::Container(_)))
         })
     }
 
@@ -2256,17 +2282,10 @@ struct Rule {
     selectors: Vec<Selector>,
     declarations: Vec<Declaration>,
     order: usize,
-    media: Option<MediaCondition>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct MediaCondition {
-    min_width: Option<f32>,
-    max_width: Option<f32>,
-    min_height: Option<f32>,
-    max_height: Option<f32>,
-    color_scheme: Option<ColorScheme>,
-    reduced_motion: Option<bool>,
+    // media and container conditions that must all hold
+    conditions: Vec<RuleCondition>,
+    // the rule's rank among cascade layers, with unlayered rules above every layer
+    layer: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2274,28 +2293,6 @@ pub enum ColorScheme {
     #[default]
     Light,
     Dark,
-}
-
-impl MediaCondition {
-    fn matches(&self, state: &StyleState) -> bool {
-        self.min_width
-            .is_none_or(|value| state.viewport_width >= value)
-            && self
-                .max_width
-                .is_none_or(|value| state.viewport_width <= value)
-            && self
-                .min_height
-                .is_none_or(|value| state.viewport_height >= value)
-            && self
-                .max_height
-                .is_none_or(|value| state.viewport_height <= value)
-            && self
-                .color_scheme
-                .is_none_or(|scheme| scheme == state.color_scheme)
-            && self
-                .reduced_motion
-                .is_none_or(|reduced| reduced == state.reduced_motion)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2513,18 +2510,25 @@ impl NthPattern {
 struct Specificity(u32, u32, u32);
 
 // importance and inline style sit above every selector's specificity: normal rules, then
-// inline style, then !important rules, then !important inline style
+// inline style, then !important rules, then !important inline style; cascade layers sit
+// between those tiers and the id count
 const IMPORTANT: u32 = 1 << 30;
+const LAYER_SHIFT: u32 = 20;
+const UNLAYERED: u32 = 511;
 
 impl Specificity {
     const INLINE: Self = Self(1 << 29, 0, 0);
     const INLINE_IMPORTANT: Self = Self(u32::MAX, u32::MAX, u32::MAX);
 
-    fn important(self, important: bool) -> Self {
+    // later layers win among normal declarations and earlier ones among important ones
+    fn ranked(self, important: bool, layer: u32) -> Self {
+        let layer = layer.min(UNLAYERED);
+        let layer = if important { UNLAYERED - layer } else { layer };
+        let ids = self.0.min((1 << LAYER_SHIFT) - 1) | (layer << LAYER_SHIFT);
         if important {
-            Self(self.0.saturating_add(IMPORTANT), self.1, self.2)
+            Self(ids + IMPORTANT, self.1, self.2)
         } else {
-            self
+            Self(ids, self.1, self.2)
         }
     }
 }
@@ -3291,13 +3295,8 @@ fn declaration_pairs(declarations: &[Declaration]) -> Vec<(String, String)> {
 }
 
 // colors, numbers, lengths and translate transforms blend, anything else steps at the midpoint
-fn parse_keyframes(header: &str, body: &str) -> Option<Keyframes> {
-    let name = header
-        .get("@keyframes".len()..)?
-        .trim()
-        .trim_matches(['"', '\''])
-        .trim()
-        .to_string();
+fn parse_keyframes(name: &str, body: &str) -> Option<Keyframes> {
+    let name = name.trim().trim_matches(['"', '\'']).trim().to_string();
     if name.is_empty() {
         return None;
     }
@@ -3498,110 +3497,382 @@ fn parse_duration(value: &str) -> Option<u64> {
     None
 }
 
-fn parse_rules(
-    source: &str,
-    media: Option<MediaCondition>,
-    rules: &mut Vec<Rule>,
-    keyframes: &mut Vec<Keyframes>,
-    mut dropped: Option<&mut Vec<String>>,
-) -> Result<(), String> {
-    let mut cursor = 0;
-    while cursor < source.len() {
-        let remaining = &source[cursor..];
-        let Some(relative_open) = remaining.find('{') else {
-            if remaining.trim().is_empty() {
-                break;
+// the next statement or block of a stylesheet or rule body, skipping strings, escapes and
+// parenthesized text such as url(data:...;...) when looking for its end
+enum CssItem<'a> {
+    Statement(&'a str),
+    Block { header: &'a str, body: &'a str },
+}
+
+fn next_css_item<'a>(source: &'a str, cursor: &mut usize) -> Option<Result<CssItem<'a>, String>> {
+    let bytes = source.as_bytes();
+    while *cursor < bytes.len() && (bytes[*cursor].is_ascii_whitespace() || bytes[*cursor] == b';')
+    {
+        *cursor += 1;
+    }
+    if *cursor >= bytes.len() {
+        return None;
+    }
+    let start = *cursor;
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(expected) = quote {
+            if byte == b'\\' {
+                index += 1;
+            } else if byte == expected {
+                quote = None;
             }
-            return drop_or_fail(
-                dropped.as_deref_mut(),
-                "stylesheet has text outside a rule".to_string(),
-            );
-        };
-        let open = cursor + relative_open;
-        let header = source[cursor..open].trim();
-        let close = match matching_brace(source, open) {
-            Ok(close) => close,
-            Err(error) => {
-                drop_or_fail(dropped.as_deref_mut(), error)?;
-                break;
-            }
-        };
-        let body = &source[open + 1..close];
-        cursor = close + 1;
-        if header.is_empty() {
-            drop_or_fail(
-                dropped.as_deref_mut(),
-                "stylesheet rule has no selector".to_string(),
-            )?;
-            continue;
-        }
-        if header
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@media"))
-        {
-            if media.is_some() {
-                drop_or_fail(
-                    dropped.as_deref_mut(),
-                    "nested media rules are not supported".to_string(),
-                )?;
-                continue;
-            }
-            let nested_media = match parse_media_condition(header) {
-                Ok(condition) => condition,
-                Err(error) => {
-                    drop_or_fail(dropped.as_deref_mut(), error)?;
-                    continue;
+        } else {
+            match byte {
+                b'\\' => index += 1,
+                b'"' | b'\'' => quote = Some(byte),
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b';' if depth == 0 => {
+                    *cursor = index + 1;
+                    return Some(Ok(CssItem::Statement(source[start..index].trim())));
                 }
+                b'{' if depth == 0 => {
+                    return Some(match matching_brace(source, index) {
+                        Ok(close) => {
+                            *cursor = close + 1;
+                            Ok(CssItem::Block {
+                                header: source[start..index].trim(),
+                                body: &source[index + 1..close],
+                            })
+                        }
+                        Err(error) => {
+                            *cursor = bytes.len();
+                            Err(error)
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    *cursor = bytes.len();
+    Some(Ok(CssItem::Statement(source[start..].trim())))
+}
+
+fn matching_brace(source: &str, open: usize) -> Result<usize, String> {
+    let bytes = source.as_bytes();
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(expected) = quote {
+            if byte == b'\\' {
+                index += 1;
+            } else if byte == expected {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\\' => index += 1,
+                b'"' | b'\'' => quote = Some(byte),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    Err("stylesheet rule has no closing brace".to_string())
+}
+
+#[derive(Clone, Debug)]
+enum RuleCondition {
+    Media(Rc<MediaQueryList>),
+    Container(Rc<ContainerQuery>),
+}
+
+impl Rule {
+    fn applies(&self, document: &Document, node: NodeId, state: &StyleState) -> bool {
+        self.conditions.iter().all(|condition| match condition {
+            RuleCondition::Media(media) => media.matches(state),
+            RuleCondition::Container(query) => query.matches(document, node, state),
+        })
+    }
+}
+
+// where parsed rules go, with the cascade layers in the order they first appeared
+struct RuleSink<'a> {
+    rules: Vec<Rule>,
+    keyframes: Vec<Keyframes>,
+    layer_names: Vec<String>,
+    // layer ids from lowest to highest precedence
+    layer_order: Vec<usize>,
+    anonymous_layers: usize,
+    dropped: Option<&'a mut Vec<String>>,
+}
+
+impl RuleSink<'_> {
+    fn drop_or_fail(&mut self, error: String) -> Result<(), String> {
+        drop_or_fail(self.dropped.as_deref_mut(), error)
+    }
+
+    // a sublayer sits below its parent's own rules, after the sublayers before it
+    fn layer(&mut self, name: &str) -> usize {
+        if let Some(id) = self.layer_names.iter().position(|known| known == name) {
+            return id;
+        }
+        let parent = name.rsplit_once('.').map(|(parent, _)| self.layer(parent));
+        self.layer_names.push(name.to_string());
+        let id = self.layer_names.len() - 1;
+        match parent.and_then(|parent| self.layer_order.iter().position(|known| *known == parent)) {
+            Some(position) => self.layer_order.insert(position, id),
+            None => self.layer_order.push(id),
+        }
+        id
+    }
+
+    fn finish(mut self) -> (Vec<Rule>, Vec<Keyframes>) {
+        let ranks = self
+            .layer_order
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (*id, rank as u32))
+            .collect::<HashMap<_, _>>();
+        for rule in &mut self.rules {
+            rule.layer = if rule.layer == UNLAYERED {
+                UNLAYERED
+            } else {
+                ranks
+                    .get(&(rule.layer as usize))
+                    .copied()
+                    .unwrap_or(UNLAYERED - 1)
+                    .min(UNLAYERED - 1)
             };
-            parse_rules(
-                body,
-                Some(nested_media),
-                rules,
-                keyframes,
-                dropped.as_deref_mut(),
-            )?;
-            continue;
         }
-        if header
-            .get(..10)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@keyframes"))
-        {
-            match parse_keyframes(header, body) {
-                Some(frames) => keyframes.push(frames),
-                None => drop_or_fail(
-                    dropped.as_deref_mut(),
-                    format!("unsupported keyframes rule: {header}"),
-                )?,
-            }
-            continue;
-        }
-        if header.starts_with('@') {
-            drop_or_fail(
-                dropped.as_deref_mut(),
-                format!("unsupported at-rule: {header}"),
-            )?;
-            continue;
-        }
-        let selectors = match Selector::parse_list(header) {
-            Ok(selectors) => selectors,
+        (self.rules, self.keyframes)
+    }
+}
+
+#[derive(Clone, Default)]
+struct RuleScope {
+    conditions: Vec<RuleCondition>,
+    layer: Option<String>,
+    // the selector of the style rule this text is nested in
+    parent: Option<String>,
+}
+
+fn parse_stylesheet(
+    source: &str,
+    dropped: Option<&mut Vec<String>>,
+) -> Result<(Vec<Rule>, Vec<Keyframes>), String> {
+    let mut sink = RuleSink {
+        rules: Vec::new(),
+        keyframes: Vec::new(),
+        layer_names: Vec::new(),
+        layer_order: Vec::new(),
+        anonymous_layers: 0,
+        dropped,
+    };
+    parse_rules(source, &RuleScope::default(), &mut sink)?;
+    Ok(sink.finish())
+}
+
+fn parse_rules(source: &str, scope: &RuleScope, sink: &mut RuleSink<'_>) -> Result<(), String> {
+    let mut cursor = 0;
+    while let Some(item) = next_css_item(source, &mut cursor) {
+        match item {
             Err(error) => {
-                drop_or_fail(dropped.as_deref_mut(), format!("{header}: {error}"))?;
-                continue;
+                sink.drop_or_fail(error)?;
+                break;
             }
-        };
-        let declarations = match parse_declarations(body, dropped.as_deref_mut()) {
-            Ok(declarations) => declarations,
+            Ok(CssItem::Statement(text)) => parse_statement(text, scope, sink)?,
+            Ok(CssItem::Block { header, body }) => {
+                if header.is_empty() {
+                    sink.drop_or_fail("stylesheet rule has no selector".to_string())?;
+                } else if header.starts_with('@') {
+                    parse_at_rule(header, body, scope, sink)?;
+                } else {
+                    let selector = nest_selector(header, scope.parent.as_deref());
+                    parse_rule_body(&selector, body, scope, sink)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_statement(text: &str, scope: &RuleScope, sink: &mut RuleSink<'_>) -> Result<(), String> {
+    let (name, prelude) = at_rule_name(text);
+    match name.as_deref() {
+        // imports are fetched and spliced in before parsing; any left over cannot load
+        Some("import" | "charset" | "namespace") => Ok(()),
+        Some("layer") => {
+            for layer in prelude
+                .split(',')
+                .map(str::trim)
+                .filter(|layer| !layer.is_empty())
+            {
+                sink.layer(&scoped_layer(scope, layer));
+            }
+            Ok(())
+        }
+        _ => sink.drop_or_fail("stylesheet has text outside a rule".to_string()),
+    }
+}
+
+fn at_rule_name(text: &str) -> (Option<String>, &str) {
+    let Some(rest) = text.strip_prefix('@') else {
+        return (None, text);
+    };
+    let end = rest
+        .find(|character: char| character.is_whitespace() || matches!(character, '(' | '"' | '\''))
+        .unwrap_or(rest.len());
+    (Some(rest[..end].to_ascii_lowercase()), rest[end..].trim())
+}
+
+fn scoped_layer(scope: &RuleScope, name: &str) -> String {
+    match &scope.layer {
+        Some(parent) => format!("{parent}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+fn parse_at_rule(
+    header: &str,
+    body: &str,
+    scope: &RuleScope,
+    sink: &mut RuleSink<'_>,
+) -> Result<(), String> {
+    let (name, prelude) = at_rule_name(header);
+    let name = name.unwrap_or_default();
+    let mut inner = scope.clone();
+    match name.as_str() {
+        "media" => inner
+            .conditions
+            .push(RuleCondition::Media(Rc::new(MediaQueryList::parse(
+                prelude,
+            )))),
+        "container" => {
+            inner
+                .conditions
+                .push(RuleCondition::Container(Rc::new(ContainerQuery::parse(
+                    prelude,
+                ))))
+        }
+        "supports" => {
+            if !crate::media::supports(prelude) {
+                return Ok(());
+            }
+        }
+        "layer" => {
+            let layer = if prelude.is_empty() {
+                sink.anonymous_layers += 1;
+                format!(" anonymous {}", sink.anonymous_layers)
+            } else {
+                prelude.to_string()
+            };
+            let full = scoped_layer(scope, &layer);
+            sink.layer(&full);
+            inner.layer = Some(full);
+        }
+        "keyframes" | "-webkit-keyframes" => {
+            match parse_keyframes(prelude, body) {
+                Some(frames) => sink.keyframes.push(frames),
+                None => sink.drop_or_fail(format!("unsupported keyframes rule: {header}"))?,
+            }
+            return Ok(());
+        }
+        _ => return sink.drop_or_fail(format!("unsupported at-rule: {header}")),
+    }
+    // inside a style rule, a conditional rule holds declarations for the same selector
+    match inner.parent.clone() {
+        Some(parent) => parse_rule_body(&parent, body, &inner, sink),
+        None => parse_rules(body, &inner, sink),
+    }
+}
+
+// a nested selector refers to its parent through &, or is a descendant of it
+fn nest_selector(header: &str, parent: Option<&str>) -> String {
+    let Some(parent) = parent else {
+        return header.to_string();
+    };
+    let Ok(parts) = split_selector_list(header) else {
+        return header.to_string();
+    };
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.contains('&') {
+                part.replace('&', &format!(":is({parent})"))
+            } else {
+                format!(":is({parent}) {part}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_rule_body(
+    selector: &str,
+    body: &str,
+    scope: &RuleScope,
+    sink: &mut RuleSink<'_>,
+) -> Result<(), String> {
+    let selectors = match Selector::parse_list(selector) {
+        Ok(selectors) => selectors,
+        Err(error) => return sink.drop_or_fail(format!("{selector}: {error}")),
+    };
+    let mut declarations = Vec::new();
+    let mut nested = Vec::new();
+    let mut cursor = 0;
+    while let Some(item) = next_css_item(body, &mut cursor) {
+        match item {
             Err(error) => {
-                drop_or_fail(dropped.as_deref_mut(), format!("{header}: {error}"))?;
-                continue;
+                sink.drop_or_fail(format!("{selector}: {error}"))?;
+                break;
             }
+            Ok(CssItem::Statement(text)) => match parse_declaration(text) {
+                Ok(declaration) => declarations.push(declaration),
+                Err(error) => sink.drop_or_fail(error)?,
+            },
+            Ok(CssItem::Block { header, body }) => nested.push((header, body)),
+        }
+    }
+    if !declarations.is_empty() {
+        let layer = match &scope.layer {
+            Some(name) => sink.layer(name) as u32,
+            None => UNLAYERED,
         };
-        rules.push(Rule {
+        let order = sink.rules.len();
+        sink.rules.push(Rule {
             selectors,
             declarations,
-            order: rules.len(),
-            media: media.clone(),
+            order,
+            conditions: scope.conditions.clone(),
+            layer,
         });
+    }
+    let child_scope = RuleScope {
+        parent: Some(selector.to_string()),
+        ..scope.clone()
+    };
+    for (header, nested_body) in nested {
+        if header.starts_with('@') {
+            parse_at_rule(header, nested_body, &child_scope, sink)?;
+        } else {
+            parse_rule_body(
+                &nest_selector(header, Some(selector)),
+                nested_body,
+                &child_scope,
+                sink,
+            )?;
+        }
     }
     Ok(())
 }
@@ -3616,94 +3887,339 @@ fn drop_or_fail(dropped: Option<&mut Vec<String>>, error: String) -> Result<(), 
     }
 }
 
-fn matching_brace(source: &str, open: usize) -> Result<usize, String> {
-    let bytes = source.as_bytes();
-    let mut depth = 0;
-    for (offset, byte) in bytes.iter().enumerate().skip(open) {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(offset);
+fn parse_container_type(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "size" => Some(true),
+        "inline-size" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_container_name(value: &str) -> Option<u32> {
+    value
+        .split_ascii_whitespace()
+        .next()
+        .filter(|name| !name.eq_ignore_ascii_case("none"))
+        .map(crate::grid::intern_name)
+}
+
+// the properties this engine applies, for @supports
+const SUPPORTED_PROPERTIES: &[&str] = &[
+    "align-content",
+    "align-items",
+    "align-self",
+    "animation",
+    "animation-delay",
+    "animation-direction",
+    "animation-duration",
+    "animation-fill-mode",
+    "animation-iteration-count",
+    "animation-name",
+    "animation-play-state",
+    "animation-timing-function",
+    "aspect-ratio",
+    "backface-visibility",
+    "background",
+    "background-color",
+    "background-image",
+    "background-position",
+    "background-repeat",
+    "background-size",
+    "border",
+    "border-bottom",
+    "border-bottom-color",
+    "border-bottom-left-radius",
+    "border-bottom-right-radius",
+    "border-bottom-style",
+    "border-bottom-width",
+    "border-collapse",
+    "border-color",
+    "border-left",
+    "border-left-color",
+    "border-left-style",
+    "border-left-width",
+    "border-radius",
+    "border-right",
+    "border-right-color",
+    "border-right-style",
+    "border-right-width",
+    "border-spacing",
+    "border-style",
+    "border-top",
+    "border-top-color",
+    "border-top-left-radius",
+    "border-top-right-radius",
+    "border-top-style",
+    "border-top-width",
+    "border-width",
+    "bottom",
+    "box-shadow",
+    "box-sizing",
+    "caption-side",
+    "clear",
+    "color",
+    "column-gap",
+    "container",
+    "container-name",
+    "container-type",
+    "content",
+    "cursor",
+    "display",
+    "flex",
+    "flex-basis",
+    "flex-direction",
+    "flex-flow",
+    "flex-grow",
+    "flex-shrink",
+    "flex-wrap",
+    "float",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "gap",
+    "grid",
+    "grid-area",
+    "grid-auto-columns",
+    "grid-auto-flow",
+    "grid-auto-rows",
+    "grid-column",
+    "grid-column-end",
+    "grid-column-start",
+    "grid-row",
+    "grid-row-end",
+    "grid-row-start",
+    "grid-template",
+    "grid-template-areas",
+    "grid-template-columns",
+    "grid-template-rows",
+    "height",
+    "inset",
+    "justify-content",
+    "justify-items",
+    "justify-self",
+    "left",
+    "letter-spacing",
+    "line-height",
+    "list-style",
+    "list-style-position",
+    "list-style-type",
+    "margin",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "margin-top",
+    "max-height",
+    "max-width",
+    "min-height",
+    "min-width",
+    "object-fit",
+    "opacity",
+    "order",
+    "outline",
+    "outline-color",
+    "outline-offset",
+    "outline-style",
+    "outline-width",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "perspective",
+    "perspective-origin",
+    "place-items",
+    "place-self",
+    "position",
+    "right",
+    "rotate",
+    "row-gap",
+    "scale",
+    "table-layout",
+    "text-align",
+    "text-transform",
+    "top",
+    "transform",
+    "transform-origin",
+    "transition",
+    "transition-delay",
+    "transition-duration",
+    "transition-property",
+    "transition-timing-function",
+    "translate",
+    "vertical-align",
+    "visibility",
+    "width",
+    "z-index",
+];
+
+pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if property.starts_with("--") {
+        return true;
+    }
+    let property = property.to_ascii_lowercase();
+    if !SUPPORTED_PROPERTIES.contains(&property.as_str()) {
+        return false;
+    }
+    match property.as_str() {
+        "display" => {
+            let keyword = value.trim().to_ascii_lowercase();
+            keyword == "block" || {
+                let mut style = Style::default_for(
+                    "div",
+                    16.0,
+                    Color::BLACK,
+                    FontWeight::Normal,
+                    InheritedText::default(),
+                );
+                apply_declaration(&mut style, "display", &keyword);
+                style.display != Display::Block
+            }
+        }
+        "position" => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "static" | "relative" | "absolute" | "fixed" | "sticky"
+        ),
+        _ => true,
+    }
+}
+
+// an @import: what to fetch, and the conditional rules its text goes inside
+pub(crate) struct StyleImport {
+    pub(crate) url: String,
+    pub(crate) open: String,
+    pub(crate) close: String,
+}
+
+// the @import rules a stylesheet starts with, the @layer statements among them, and the
+// rest of its text; imports after the first other rule are ignored, as CSS requires
+pub(crate) fn leading_imports(source: &str) -> (Vec<StyleImport>, String, String) {
+    let source = strip_comments(source);
+    let mut imports = Vec::new();
+    let mut statements = String::new();
+    let mut cursor = 0;
+    loop {
+        let before = cursor;
+        let Some(Ok(CssItem::Statement(text))) = next_css_item(&source, &mut cursor) else {
+            cursor = before;
+            break;
+        };
+        let (name, prelude) = at_rule_name(text);
+        match name.as_deref() {
+            Some("charset") => {}
+            Some("layer") => {
+                statements.push_str(text);
+                statements.push_str(";\n");
+            }
+            Some("import") => {
+                if let Some(import) = parse_import(prelude) {
+                    imports.push(import);
                 }
             }
-            _ => {}
+            _ => {
+                cursor = before;
+                break;
+            }
         }
     }
-    Err("stylesheet rule has no closing brace".to_string())
+    let rest = source[cursor..].to_string();
+    (imports, statements, rest)
+}
+
+fn parse_import(prelude: &str) -> Option<StyleImport> {
+    let prelude = prelude.trim();
+    let (url, mut rest) = if let Some(after) = prelude.strip_prefix("url(") {
+        let end = after.find(')')?;
+        (
+            after[..end].trim().trim_matches(['"', '\'']).to_string(),
+            &after[end + 1..],
+        )
+    } else {
+        let quote = prelude
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '"' | '\''))?;
+        let end = prelude[1..].find(quote)? + 1;
+        (prelude[1..end].to_string(), &prelude[end + 1..])
+    };
+    let mut open = String::new();
+    let mut close = String::new();
+    rest = rest.trim();
+    if let Some(after) = rest.strip_prefix("layer") {
+        let name = if let Some(arguments) = after.strip_prefix('(') {
+            let end = arguments.find(')')?;
+            rest = arguments[end + 1..].trim();
+            arguments[..end].trim().to_string()
+        } else {
+            rest = after.trim();
+            String::new()
+        };
+        open.push_str(&format!("@layer {name} {{\n"));
+        close.insert_str(0, "\n}");
+    }
+    if let Some(after) = rest.strip_prefix("supports(") {
+        let mut depth = 1_usize;
+        let end = after.char_indices().find_map(|(index, character)| {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })?;
+        open.push_str(&format!("@supports ({}) {{\n", &after[..end]));
+        close.insert_str(0, "\n}");
+        rest = after[end + 1..].trim();
+    }
+    if !rest.is_empty() {
+        open.push_str(&format!("@media {rest} {{\n"));
+        close.insert_str(0, "\n}");
+    }
+    (!url.is_empty()).then_some(StyleImport { url, open, close })
 }
 
 // a media query list from script, such as matchMedia's; one that does not parse matches
 // nothing
 pub(crate) fn media_query_matches(query: &str, state: &StyleState) -> bool {
-    query.split(',').any(|part| {
-        parse_media_condition(&format!("@media {}", part.trim()))
-            .is_ok_and(|condition| condition.matches(state))
-    })
+    MediaQueryList::parse(query).matches(state)
 }
 
-fn parse_media_condition(header: &str) -> Result<MediaCondition, String> {
-    let query = header
-        .get(6..)
-        .ok_or_else(|| format!("invalid media rule: {header}"))?
-        .trim()
-        .to_ascii_lowercase();
-    let mut condition = MediaCondition::default();
-    for raw_feature in query.split("and") {
-        let feature = raw_feature.trim().trim_matches(['(', ')']).trim();
-        if feature.is_empty()
-            || feature.eq_ignore_ascii_case("all")
-            || feature.eq_ignore_ascii_case("screen")
-        {
-            continue;
-        }
-        let Some((name, value)) = feature.split_once(':') else {
-            return Err(format!("unsupported media feature: {feature}"));
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        match name.as_str() {
-            "prefers-color-scheme" => {
-                condition.color_scheme = Some(match value {
-                    "dark" => ColorScheme::Dark,
-                    "light" => ColorScheme::Light,
-                    other => return Err(format!("unsupported color scheme: {other}")),
-                });
-                continue;
-            }
-            "prefers-reduced-motion" => {
-                condition.reduced_motion = Some(match value {
-                    "reduce" => true,
-                    "no-preference" => false,
-                    other => return Err(format!("unsupported motion preference: {other}")),
-                });
-                continue;
-            }
-            _ => {}
-        }
-        let value = parse_media_dimension(value)?;
-        match name.as_str() {
-            "min-width" => condition.min_width = Some(value),
-            "max-width" => condition.max_width = Some(value),
-            "min-height" => condition.min_height = Some(value),
-            "max-height" => condition.max_height = Some(value),
-            _ => return Err(format!("unsupported media feature: {name}")),
-        }
+fn parse_declaration(text: &str) -> Result<Declaration, String> {
+    let Some(colon) = text.find(':') else {
+        return Err(format!("declaration has no colon: {text}"));
+    };
+    let property_name = text[..colon].trim();
+    let property = if property_name.starts_with("--") {
+        property_name.to_string()
+    } else {
+        property_name.to_ascii_lowercase()
+    };
+    let mut value = text[colon + 1..].trim();
+    let mut important = false;
+    if let Some(bang) = value.rfind('!')
+        && value[bang + 1..].trim().eq_ignore_ascii_case("important")
+    {
+        important = true;
+        value = value[..bang].trim_end();
     }
-    Ok(condition)
-}
-
-fn parse_media_dimension(value: &str) -> Result<f32, String> {
-    let value = value.trim();
-    let value = value.strip_suffix("px").unwrap_or(value).trim();
-    let value = value
-        .parse::<f32>()
-        .map_err(|_| format!("invalid media dimension: {value}"))?;
-    value
-        .is_finite()
-        .then_some(value.max(0.0))
-        .ok_or_else(|| "media dimension must be finite".to_string())
+    if property.is_empty() || value.is_empty() {
+        return Err(format!("invalid declaration: {text}"));
+    }
+    Ok(Declaration {
+        property,
+        value: value.to_string(),
+        important,
+    })
 }
 
 fn parse_declarations(
@@ -3711,45 +4227,19 @@ fn parse_declarations(
     mut dropped: Option<&mut Vec<String>>,
 ) -> Result<Vec<Declaration>, String> {
     let mut declarations = Vec::new();
-    for chunk in source.split(';') {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        let Some(colon) = chunk.find(':') else {
-            drop_or_fail(
+    let mut cursor = 0;
+    while let Some(item) = next_css_item(source, &mut cursor) {
+        match item {
+            Ok(CssItem::Statement(text)) => match parse_declaration(text) {
+                Ok(declaration) => declarations.push(declaration),
+                Err(error) => drop_or_fail(dropped.as_deref_mut(), error)?,
+            },
+            Ok(CssItem::Block { header, .. }) => drop_or_fail(
                 dropped.as_deref_mut(),
-                format!("declaration has no colon: {chunk}"),
-            )?;
-            continue;
-        };
-        let property_name = chunk[..colon].trim();
-        let property = if property_name.starts_with("--") {
-            property_name.to_string()
-        } else {
-            property_name.to_ascii_lowercase()
-        };
-        let mut value = chunk[colon + 1..].trim();
-        let mut important = false;
-        if let Some(bang) = value.rfind('!')
-            && value[bang + 1..].trim().eq_ignore_ascii_case("important")
-        {
-            important = true;
-            value = value[..bang].trim_end();
+                format!("a declaration list cannot hold the rule {header}"),
+            )?,
+            Err(error) => drop_or_fail(dropped.as_deref_mut(), error)?,
         }
-        let value = value.to_string();
-        if property.is_empty() || value.is_empty() {
-            drop_or_fail(
-                dropped.as_deref_mut(),
-                format!("invalid declaration: {chunk}"),
-            )?;
-            continue;
-        }
-        declarations.push(Declaration {
-            property,
-            value,
-            important,
-        });
     }
     Ok(declarations)
 }
@@ -3853,6 +4343,13 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "list-style-position" => style.list_inside = value.trim().eq_ignore_ascii_case("inside"),
         "border-collapse" => style.border_collapse = value.trim().eq_ignore_ascii_case("collapse"),
+        "container-type" => style.container_type = parse_container_type(value),
+        "container-name" => style.container_name = parse_container_name(value),
+        "container" => {
+            let (names, container_type) = value.split_once('/').unwrap_or((value, "normal"));
+            style.container_name = parse_container_name(names);
+            style.container_type = parse_container_type(container_type);
+        }
         "border-spacing" => {
             let lengths = split_words(value)
                 .into_iter()
@@ -4439,53 +4936,164 @@ fn split_selector_list(source: &str) -> Result<Vec<&str>, String> {
     Ok(selectors)
 }
 
+// a calc() expression with +, -, * and / and nested parentheses, kept as a sum of unit
+// terms; a product or quotient needs a plain number on one side, as CSS requires
 fn parse_length_sum(expression: &str) -> Option<LengthTerms> {
-    let expression = expression.trim();
-    if expression.is_empty() {
+    let tokens = calc_tokens(expression)?;
+    let mut cursor = 0;
+    let value = calc_sum(&tokens, &mut cursor)?;
+    if cursor != tokens.len() {
         return None;
     }
+    let terms = match value {
+        CalcValue::Number(number) => LengthTerms {
+            px: number,
+            ..LengthTerms::default()
+        },
+        CalcValue::Length(terms) => terms,
+    };
+    terms.is_finite().then_some(terms)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CalcToken {
+    Value(CalcValue),
+    Operator(u8),
+    Open,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CalcValue {
+    Number(f32),
+    Length(LengthTerms),
+}
+
+fn calc_tokens(expression: &str) -> Option<Vec<CalcToken>> {
     let bytes = expression.as_bytes();
-    let mut cursor = 0;
-    let mut total = LengthTerms::default();
-    let mut saw_term = false;
-    let mut sign = 1.0;
-    while cursor < bytes.len() {
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
         }
-        if cursor >= bytes.len() {
-            break;
+        let operand_expected = matches!(
+            tokens.last(),
+            None | Some(CalcToken::Operator(_) | CalcToken::Open)
+        );
+        let starts_number = byte.is_ascii_digit()
+            || byte == b'.'
+            || (matches!(byte, b'+' | b'-')
+                && operand_expected
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_digit() || *next == b'.'));
+        if starts_number {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'.' | b'%'))
+            {
+                index += 1;
+            }
+            let token = &expression[start..index];
+            let value = match token.parse::<f32>() {
+                Ok(number) => CalcValue::Number(number),
+                Err(_) => CalcValue::Length(parse_length_unit(token)?),
+            };
+            tokens.push(CalcToken::Value(value));
+            continue;
         }
-        if matches!(bytes[cursor], b'+' | b'-') {
-            sign = if bytes[cursor] == b'-' { -1.0 } else { 1.0 };
-            cursor += 1;
-            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
+        match byte {
+            b'+' | b'-' | b'*' | b'/' => tokens.push(CalcToken::Operator(byte)),
+            b'(' => tokens.push(CalcToken::Open),
+            b')' => tokens.push(CalcToken::Close),
+            _ => {
+                // a nested calc() reads as plain parentheses; other functions are not linear
+                let rest = &expression[index..];
+                if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("calc(") {
+                    tokens.push(CalcToken::Open);
+                    index += 5;
+                    continue;
+                }
+                return None;
             }
         }
-        let start = cursor;
-        while cursor < bytes.len() && !matches!(bytes[cursor], b'+' | b'-') {
-            cursor += 1;
-        }
-        let token = expression[start..cursor].trim();
-        if token.is_empty() {
-            return None;
-        }
-        let terms = parse_length_unit(token)?;
-        total.px += sign * terms.px;
-        total.em += sign * terms.em;
-        total.rem += sign * terms.rem;
-        total.percent += sign * terms.percent;
-        total.viewport_width += sign * terms.viewport_width;
-        total.viewport_height += sign * terms.viewport_height;
-        total.zero_width += sign * terms.zero_width;
-        if !total.is_finite() {
-            return None;
-        }
-        saw_term = true;
-        sign = 1.0;
+        index += 1;
     }
-    saw_term.then_some(total)
+    Some(tokens)
+}
+
+fn calc_sum(tokens: &[CalcToken], cursor: &mut usize) -> Option<CalcValue> {
+    let mut total = calc_product(tokens, cursor)?;
+    while let Some(CalcToken::Operator(operator @ (b'+' | b'-'))) = tokens.get(*cursor) {
+        *cursor += 1;
+        let right = calc_product(tokens, cursor)?;
+        let sign = if *operator == b'-' { -1.0 } else { 1.0 };
+        total = match (total, right) {
+            (CalcValue::Number(left), CalcValue::Number(right)) => {
+                CalcValue::Number(left + sign * right)
+            }
+            (left, right) => {
+                let (left, right) = (calc_terms(left), calc_terms(right).scaled(sign));
+                CalcValue::Length(left.plus(right))
+            }
+        };
+    }
+    Some(total)
+}
+
+fn calc_product(tokens: &[CalcToken], cursor: &mut usize) -> Option<CalcValue> {
+    let mut total = calc_factor(tokens, cursor)?;
+    while let Some(CalcToken::Operator(operator @ (b'*' | b'/'))) = tokens.get(*cursor) {
+        *cursor += 1;
+        let right = calc_factor(tokens, cursor)?;
+        total = match (*operator, total, right) {
+            (b'*', CalcValue::Number(left), CalcValue::Number(right)) => {
+                CalcValue::Number(left * right)
+            }
+            (b'*', CalcValue::Number(number), CalcValue::Length(terms))
+            | (b'*', CalcValue::Length(terms), CalcValue::Number(number)) => {
+                CalcValue::Length(terms.scaled(number))
+            }
+            (b'/', left, CalcValue::Number(divisor)) if divisor != 0.0 => match left {
+                CalcValue::Number(number) => CalcValue::Number(number / divisor),
+                CalcValue::Length(terms) => CalcValue::Length(terms.scaled(1.0 / divisor)),
+            },
+            _ => return None,
+        };
+    }
+    Some(total)
+}
+
+fn calc_factor(tokens: &[CalcToken], cursor: &mut usize) -> Option<CalcValue> {
+    match *tokens.get(*cursor)? {
+        CalcToken::Value(value) => {
+            *cursor += 1;
+            Some(value)
+        }
+        CalcToken::Open => {
+            *cursor += 1;
+            let value = calc_sum(tokens, cursor)?;
+            (tokens.get(*cursor) == Some(&CalcToken::Close)).then(|| {
+                *cursor += 1;
+                value
+            })
+        }
+        _ => None,
+    }
+}
+
+fn calc_terms(value: CalcValue) -> LengthTerms {
+    match value {
+        CalcValue::Number(number) => LengthTerms {
+            px: number,
+            ..LengthTerms::default()
+        },
+        CalcValue::Length(terms) => terms,
+    }
 }
 
 fn parse_linear_gradient(value: &str) -> Option<Gradient> {
@@ -5145,18 +5753,42 @@ fn default_display(name: &str) -> Display {
     }
 }
 
+// removes comments, leaving any comment-like text inside strings alone
 fn strip_comments(source: &str) -> String {
     let mut output = String::with_capacity(source.len());
-    let mut cursor = 0;
-    while let Some(relative_start) = source[cursor..].find("/*") {
-        let start = cursor + relative_start;
-        output.push_str(&source[cursor..start]);
-        let Some(relative_end) = source[start + 2..].find("*/") else {
-            break;
-        };
-        cursor = start + 2 + relative_end + 2;
+    let mut characters = source.char_indices().peekable();
+    let mut quote = None;
+    while let Some((index, character)) = characters.next() {
+        match quote {
+            Some(expected) => {
+                output.push(character);
+                if character == '\\' {
+                    if let Some((_, escaped)) = characters.next() {
+                        output.push(escaped);
+                    }
+                } else if character == expected {
+                    quote = None;
+                }
+            }
+            None if character == '/' && source[index..].starts_with("/*") => {
+                match source[index + 2..].find("*/") {
+                    Some(end) => {
+                        let resume = index + 2 + end + 2;
+                        while characters.peek().is_some_and(|(next, _)| *next < resume) {
+                            characters.next();
+                        }
+                    }
+                    None => break,
+                }
+            }
+            None => {
+                if matches!(character, '"' | '\'') {
+                    quote = Some(character);
+                }
+                output.push(character);
+            }
+        }
     }
-    output.push_str(&source[cursor..]);
     output
 }
 
@@ -5776,21 +6408,20 @@ mod tests {
     #[test]
     fn recovering_parse_keeps_valid_rules_and_reports_the_rest() {
         let (stylesheet, dropped) = Stylesheet::parse_recovering(
-            r#"p::nonsense { color: red; } .card { color: red; } @supports (display: grid) { p { color: red } } p { color: } .last { color: blue; }"#,
+            r#"p::nonsense { color: red; } .card { color: red; } @supports (display: grid) { p { color: red } } @supports (display: contents) { p { color: blue } } p { color: } @font-palette-values --x { } .last { color: blue; }"#,
         );
-        assert_eq!(stylesheet.rules.len(), 3);
         assert_eq!(
             stylesheet
                 .rules
                 .iter()
                 .map(|rule| rule.declarations.len())
                 .collect::<Vec<_>>(),
-            vec![1, 0, 1]
+            vec![1, 1, 1]
         );
         assert_eq!(dropped.len(), 3);
         assert!(dropped[0].starts_with("p::nonsense"));
-        assert!(dropped[1].starts_with("unsupported at-rule: @supports"));
-        assert!(dropped[2].contains("invalid declaration: color:"));
+        assert!(dropped[1].contains("invalid declaration: color:"));
+        assert!(dropped[2].starts_with("unsupported at-rule: @font-palette-values"));
         assert!(Stylesheet::parse("p::nonsense { color: red; }").is_err());
         assert!(Stylesheet::parse("p::first-line { color: red; }").is_ok());
         assert!(Stylesheet::parse("body::before { content: \"\"; }").is_ok());

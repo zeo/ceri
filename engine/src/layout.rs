@@ -9,6 +9,7 @@ use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
 use crate::image::Image;
+use crate::media::ContainerSize;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -716,12 +717,24 @@ struct PositionedLayoutContext<'a> {
     style_state: &'a StyleState,
 }
 
+thread_local! {
+    // query containers sized by the most recent layout on this thread
+    static CONTAINERS: std::cell::RefCell<std::collections::BTreeMap<NodeId, ContainerSize>> =
+        std::cell::RefCell::default();
+}
+
+// the query containers the last layout sized, for container queries in the next style pass
+pub(crate) fn take_layout_containers() -> std::collections::BTreeMap<NodeId, ContainerSize> {
+    CONTAINERS.with(|containers| std::mem::take(&mut *containers.borrow_mut()))
+}
+
 pub fn layout_with_state(
     document: &Document,
     stylesheet: &Stylesheet,
     viewport: Size,
     style_state: &StyleState,
 ) -> LayoutDocument {
+    CONTAINERS.with(|containers| containers.borrow_mut().clear());
     let _viewport_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
         viewport,
         root_font_size: 16.0,
@@ -2041,6 +2054,19 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     let content_x = rect.x + border.left + padding.left;
     let content_y = rect.y + border.top + padding.top;
+    // size containment keeps a container's size from depending on its content, so its
+    // width, and a size container's explicit height, are known here
+    if let Some(both_axes) = style.container_type
+        && node.own().is_some()
+    {
+        let size = ContainerSize {
+            width: content_width,
+            height: explicit_height.unwrap_or(0.0),
+            both_axes,
+            name: style.container_name,
+        };
+        CONTAINERS.with(|containers| containers.borrow_mut().insert(node.node, size));
+    }
     if matches!(style.display, Display::Flex | Display::InlineFlex) {
         return Some(layout_flex_element(FlexLayoutInput {
             content_height: explicit_height,

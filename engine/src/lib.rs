@@ -11,6 +11,7 @@ mod inflate;
 mod interpolate;
 mod jpeg;
 mod layout;
+mod media;
 #[cfg(feature = "native-http")]
 mod native_http;
 mod navigation;

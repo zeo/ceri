@@ -855,6 +855,9 @@ pub struct Browser {
     local_storage: StorageHandle,
     session_storage: StorageHandle,
     hovered_node: Option<NodeId>,
+    // query container sizes from the last layout, which container queries read
+    container_sizes:
+        std::cell::RefCell<std::collections::BTreeMap<NodeId, crate::media::ContainerSize>>,
     // the pointer shape for the last pointer position
     cursor: crate::css::Cursor,
     transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
@@ -955,6 +958,7 @@ impl Browser {
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_node: None,
+            container_sizes: std::cell::RefCell::default(),
             cursor: crate::css::Cursor::Default,
             transitions: BTreeMap::new(),
             declared: BTreeMap::new(),
@@ -2198,6 +2202,17 @@ impl Browser {
                 }
             }
         }
+        style_state.container_sizes = self.container_sizes.borrow().clone();
+        let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
+        // container queries read sizes from a layout, so a change in them lays out once more
+        if stylesheet.has_container_queries() {
+            let measured = crate::layout::take_layout_containers();
+            if measured != style_state.container_sizes {
+                style_state.container_sizes = measured;
+                layout = build_layout(&document, stylesheet, viewport, &style_state);
+            }
+            *self.container_sizes.borrow_mut() = style_state.container_sizes.clone();
+        }
         page.layout_inputs.borrow_mut().extras = StyleState {
             hovered: self.hovered_node,
             color_scheme: style_state.color_scheme,
@@ -2205,9 +2220,9 @@ impl Browser {
             transitions: style_state.transitions.clone(),
             animation_starts: style_state.animation_starts.clone(),
             image_sizes: style_state.image_sizes.clone(),
+            container_sizes: style_state.container_sizes.clone(),
             ..StyleState::default()
         };
-        let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         layout.prose_selections = page.runtime.prose_selections();
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(page, base, &document, &mut layout);
@@ -2495,7 +2510,7 @@ impl Browser {
         let mut stylesheet = String::new();
         for source in sources {
             let source = match source {
-                StylesheetSource::Inline(source) => source.clone(),
+                StylesheetSource::Inline(source) => self.expand_imports(source.clone(), base, 0),
                 StylesheetSource::External(reference) => {
                     let url = base.resolve(reference)?;
                     let resource = self.load_subresource(&url)?;
@@ -2505,8 +2520,9 @@ impl Browser {
                             mime_type: resource.mime_type,
                         });
                     }
-                    String::from_utf8(resource.body)
-                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?
+                    let text = String::from_utf8(resource.body)
+                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
+                    self.expand_imports(text, &url, 0)
                 }
             };
             if !stylesheet.is_empty() {
@@ -2515,6 +2531,40 @@ impl Browser {
             stylesheet.push_str(&source);
         }
         Ok(stylesheet)
+    }
+
+    // splices each @import's stylesheet in place of the rule, inside the layer, supports and
+    // media conditions it names; one that fails to load is skipped, as a browser does
+    fn expand_imports(&self, text: String, base: &AppUrl, depth: usize) -> String {
+        const MAX_IMPORT_DEPTH: usize = 8;
+        let (imports, statements, rest) = crate::css::leading_imports(&text);
+        if imports.is_empty() {
+            return text;
+        }
+        let mut expanded = statements;
+        for import in imports {
+            if depth >= MAX_IMPORT_DEPTH {
+                continue;
+            }
+            let Ok(url) = base.resolve(&import.url) else {
+                continue;
+            };
+            let Ok(resource) = self.load_subresource(&url) else {
+                continue;
+            };
+            if !is_css(&resource) {
+                continue;
+            }
+            let Ok(body) = String::from_utf8(resource.body) else {
+                continue;
+            };
+            expanded.push_str(&import.open);
+            expanded.push_str(&self.expand_imports(body, &url, depth + 1));
+            expanded.push_str(&import.close);
+            expanded.push('\n');
+        }
+        expanded.push_str(&rest);
+        expanded
     }
 
     fn execute_scripts(
@@ -5873,6 +5923,121 @@ mod tests {
     }
 
     #[test]
+    fn stylesheets_import_layer_nest_and_query_media_supports_and_containers() {
+        let mut resources = bundle(
+            r##"<link rel="stylesheet" href="/main.css">
+            <style>
+                @layer base, theme;
+                @layer theme { #layered { color: rgb(0, 0, 255) } }
+                @layer base { #layered { color: rgb(255, 0, 0) } #important { color: rgb(255, 0, 0) !important } }
+                #important { color: rgb(0, 128, 0) !important }
+                #unlayered { color: rgb(0, 128, 0) }
+                @layer theme { #unlayered { color: rgb(255, 0, 0) } }
+                @media screen and (min-width: 100px) { @media (orientation: landscape) { #media { color: rgb(0, 128, 0) } } }
+                @media print, (max-width: 50px) { #media2 { color: rgb(255, 0, 0) } }
+                @media not print and (width >= 300px) { #media2 { width: 10px } }
+                @supports (display: grid) and (not (display: contents)) { #supports { color: rgb(0, 128, 0) } }
+                @supports selector(:has(a)) or (display: nonsense) { #supports { width: 20px } }
+                .card { color: rgb(255, 0, 0); & .title { color: rgb(0, 128, 0) } &.wide { width: 30px } @media (min-width: 1px) { background-color: rgb(0, 0, 255) } }
+                #calc { width: calc((100px - 2 * 10px) / 4 + 1px) }
+                #strings::after { content: "a;b{}" }
+                #strings { background-image: url(data:image/png;base64,AAAA); color: rgb(0, 128, 0) }
+                #comment::before { content: "/* kept */" }
+                #comment { color: rgb(0, 128, 0) }
+                .box { container-type: inline-size; width: 300px }
+                @container (min-width: 200px) { .inner { color: rgb(0, 128, 0) } }
+                @container (min-width: 400px) { .inner { color: rgb(255, 0, 0) } }
+            </style>
+            <div id="layered">a</div><div id="important">a</div><div id="unlayered">a</div>
+            <div id="media">a</div><div id="media2">a</div><div id="supports">a</div>
+            <div class="card wide" id="card"><span class="title" id="title">t</span></div>
+            <div id="calc">a</div><div id="strings">a</div><div id="comment">a</div>
+            <div class="box"><div class="inner" id="inner">a</div></div>
+            <div id="imported">a</div><div id="main">a</div>
+            <p id="status">idle</p>
+            <script>
+                const style = (id) => getComputedStyle(document.getElementById(id));
+                document.getElementById("status").textContent = [
+                    style("layered").color, style("important").color, style("unlayered").color,
+                    style("media").color, style("media2").color, style("media2").width,
+                    style("supports").color, style("supports").width,
+                    style("title").color, style("card").width, style("card").backgroundColor,
+                    style("calc").width, style("strings").color, style("comment").color,
+                    style("inner").color, style("imported").color, style("main").color,
+                ].join("|");
+            </script>"##,
+        );
+        resources
+            .insert(
+                "/main.css",
+                "text/css",
+                b"@charset \"utf-8\";\n@import url(\"/imported.css\") screen;\n#main { color: rgb(0, 128, 0) }"
+                    .to_vec(),
+            )
+            .expect("main stylesheet should be accepted");
+        resources
+            .insert(
+                "/imported.css",
+                "text/css",
+                b"#imported { color: rgb(0, 128, 0) }".to_vec(),
+            )
+            .expect("imported stylesheet should be accepted");
+        let mut browser = Browser::new(resources);
+        browser.set_viewport(
+            Size {
+                width: 600.0,
+                height: 400.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let layout = browser
+            .layout(Size {
+                width: 600.0,
+                height: 400.0,
+            })
+            .expect("layout should build");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let inner = document.find_element_by_id("inner").expect("inner");
+        // the page's own layout answers the container query too
+        assert_eq!(
+            find_node_box(&layout.root, inner).map(|inner| inner.text[0].color),
+            Some(Color::opaque(0, 128, 0))
+        );
+        let status = document.find_element_by_id("status").expect("status");
+        let green = "rgb(0, 128, 0)";
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some(
+                [
+                    "rgb(0, 0, 255)",
+                    "rgb(255, 0, 0)",
+                    green,
+                    green,
+                    "rgb(0, 0, 0)",
+                    "10px",
+                    green,
+                    "20px",
+                    green,
+                    "30px",
+                    "rgb(0, 0, 255)",
+                    "21px",
+                    green,
+                    green,
+                    green,
+                    green,
+                    green,
+                ]
+                .join("|")
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
     fn tables_size_columns_span_cells_align_content_and_number_list_items() {
         let mut browser = Browser::new(bundle(
             r##"<style>
@@ -5930,6 +6095,19 @@ mod tests {
             .expect("layout should build");
         let marker = find_marker(&layout.root).expect("the list item has a marker");
         assert_eq!(marker.text[0].text, "4.");
+    }
+
+    fn find_node_box(
+        layout: &crate::layout::LayoutBox,
+        node: NodeId,
+    ) -> Option<&crate::layout::LayoutBox> {
+        if layout.node == node {
+            return Some(layout);
+        }
+        layout
+            .children
+            .iter()
+            .find_map(|child| find_node_box(child, node))
     }
 
     fn find_marker(layout: &crate::layout::LayoutBox) -> Option<&crate::layout::LayoutBox> {
