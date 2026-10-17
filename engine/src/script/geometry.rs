@@ -1117,7 +1117,9 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             .resolve(0.0, font_size)
             .map_or_else(|| "normal".to_string(), px),
         "text-align" => match style.text_align {
-            TextAlign::Left => inherited("text-align").unwrap_or_else(|| "start".to_string()),
+            TextAlign::Start => inherited("text-align").unwrap_or_else(|| "start".to_string()),
+            TextAlign::End => "end".to_string(),
+            TextAlign::Left => "left".to_string(),
             TextAlign::Center => "center".to_string(),
             TextAlign::Right => "right".to_string(),
         },

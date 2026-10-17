@@ -74,6 +74,27 @@ impl Display {
     }
 }
 
+// how white space in text is kept (white-space-collapse)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpaceCollapse {
+    Collapse,
+    // spaces and newlines stay
+    Preserve,
+    // spaces collapse, newlines stay
+    PreserveBreaks,
+    // spaces stay and each may start a new line
+    BreakSpaces,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverflowWrap {
+    Normal,
+    // a word too long for its line breaks anywhere, and its pieces count toward min-content
+    Anywhere,
+    // as anywhere, but the word's full width still counts toward min-content
+    BreakWord,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VerticalAlign {
     Baseline,
@@ -663,6 +684,12 @@ pub(crate) struct InheritedText {
     pub(crate) text_align: TextAlign,
     // a factor of the font size, or a length an ancestor already turned into pixels
     pub(crate) line_height: Length,
+    pub(crate) space_collapse: SpaceCollapse,
+    // whether lines wrap at all (text-wrap-mode)
+    pub(crate) wrap: bool,
+    pub(crate) word_break: crate::linebreak::WordBreak,
+    pub(crate) overflow_wrap: OverflowWrap,
+    pub(crate) rtl: bool,
 }
 
 impl Default for InheritedText {
@@ -679,8 +706,13 @@ impl Default for InheritedText {
             border_spacing: (0.0, 0.0),
             caption_bottom: false,
             accent_color: None,
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
             line_height: Length::em(NORMAL_LINE_HEIGHT),
+            space_collapse: SpaceCollapse::Collapse,
+            wrap: true,
+            word_break: crate::linebreak::WordBreak::Normal,
+            overflow_wrap: OverflowWrap::Normal,
+            rtl: false,
         }
     }
 }
@@ -724,6 +756,9 @@ pub(crate) enum BoxSizing {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextAlign {
+    // the side a line starts on, left in left-to-right text
+    Start,
+    End,
     Left,
     Center,
     Right,
@@ -965,6 +1000,12 @@ pub(crate) struct Style {
     pub line_height: Length,
     // a line-height with units, which descendants inherit in pixels rather than as a factor
     pub line_height_absolute: bool,
+    pub space_collapse: SpaceCollapse,
+    pub wrap: bool,
+    pub word_break: crate::linebreak::WordBreak,
+    pub overflow_wrap: OverflowWrap,
+    // direction: rtl
+    pub rtl: bool,
     // top, right, bottom and left
     pub border: [BorderSide; 4],
     pub outline: OutlineStyle,
@@ -1141,6 +1182,11 @@ impl Style {
             font_size: Length::px(parent_font_size),
             line_height: parent_text.line_height,
             line_height_absolute: false,
+            space_collapse: parent_text.space_collapse,
+            wrap: parent_text.wrap,
+            word_break: parent_text.word_break,
+            overflow_wrap: parent_text.overflow_wrap,
+            rtl: parent_text.rtl,
             border: [BorderSide::INITIAL; 4],
             outline: OutlineStyle::INITIAL,
             text_align: parent_text.text_align,
@@ -2034,6 +2080,11 @@ impl Stylesheet {
                 accent_color: style.accent_color,
                 text_align: style.text_align,
                 line_height: style.line_height,
+                space_collapse: style.space_collapse,
+                wrap: style.wrap,
+                word_break: style.word_break,
+                overflow_wrap: style.overflow_wrap,
+                rtl: style.rtl,
             };
             computed = Some((style, font_size));
         }
@@ -3969,6 +4020,13 @@ fn parse_container_name(value: &str) -> Option<u32> {
 // the properties this engine applies, for @supports
 const SUPPORTED_PROPERTIES: &[&str] = &[
     "accent-color",
+    "direction",
+    "word-wrap",
+    "overflow-wrap",
+    "word-break",
+    "text-wrap-mode",
+    "white-space-collapse",
+    "white-space",
     "align-content",
     "appearance",
     "align-items",
@@ -4323,6 +4381,12 @@ h6 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; font-weight: 
 b, strong, th, optgroup { font-weight: bold }
 small, sub, sup { font-size: 0.83em }
 code, kbd, pre, samp, tt, listing, xmp, plaintext { font-family: monospace }
+pre, listing, xmp, plaintext { white-space: pre }
+[dir="rtl" i] { direction: rtl }
+[dir="ltr" i] { direction: ltr }
+textarea { white-space: pre-wrap }
+nobr { white-space: nowrap }
+td[nowrap], th[nowrap] { white-space: nowrap }
 mark { background-color: yellow; color: black }
 a:any-link { color: #0000ee; cursor: pointer }
 center, th, caption { text-align: center }
@@ -4490,6 +4554,68 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "list-style-position" => style.list_inside = value.trim().eq_ignore_ascii_case("inside"),
         "border-collapse" => style.border_collapse = value.trim().eq_ignore_ascii_case("collapse"),
+        "direction" => match value.trim().to_ascii_lowercase().as_str() {
+            "rtl" => style.rtl = true,
+            "ltr" => style.rtl = false,
+            _ => {}
+        },
+        "white-space" => {
+            let (collapse, wrap) = match value.trim().to_ascii_lowercase().as_str() {
+                "normal" => (SpaceCollapse::Collapse, true),
+                "nowrap" => (SpaceCollapse::Collapse, false),
+                "pre" => (SpaceCollapse::Preserve, false),
+                "pre-wrap" => (SpaceCollapse::Preserve, true),
+                "pre-line" => (SpaceCollapse::PreserveBreaks, true),
+                "break-spaces" => (SpaceCollapse::BreakSpaces, true),
+                _ => (style.space_collapse, style.wrap),
+            };
+            style.space_collapse = collapse;
+            style.wrap = wrap;
+        }
+        "white-space-collapse" => {
+            style.space_collapse = match value.trim().to_ascii_lowercase().as_str() {
+                "collapse" => SpaceCollapse::Collapse,
+                "preserve" => SpaceCollapse::Preserve,
+                "preserve-breaks" => SpaceCollapse::PreserveBreaks,
+                "break-spaces" => SpaceCollapse::BreakSpaces,
+                _ => style.space_collapse,
+            };
+        }
+        "text-wrap-mode" | "text-wrap" => {
+            match value
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "nowrap" => style.wrap = false,
+                "wrap" | "balance" | "pretty" | "stable" => style.wrap = true,
+                _ => {}
+            }
+        }
+        "word-break" => {
+            use crate::linebreak::WordBreak;
+            match value.trim().to_ascii_lowercase().as_str() {
+                "normal" => style.word_break = WordBreak::Normal,
+                "break-all" => style.word_break = WordBreak::BreakAll,
+                "keep-all" => style.word_break = WordBreak::KeepAll,
+                // the legacy value reads as a normal word-break with words broken anywhere
+                "break-word" => {
+                    style.word_break = WordBreak::Normal;
+                    style.overflow_wrap = OverflowWrap::Anywhere;
+                }
+                _ => {}
+            }
+        }
+        "overflow-wrap" | "word-wrap" => {
+            style.overflow_wrap = match value.trim().to_ascii_lowercase().as_str() {
+                "anywhere" => OverflowWrap::Anywhere,
+                "break-word" => OverflowWrap::BreakWord,
+                "normal" => OverflowWrap::Normal,
+                _ => style.overflow_wrap,
+            };
+        }
         "appearance" | "-webkit-appearance" | "-moz-appearance" => {
             style.appearance_none = value.trim().eq_ignore_ascii_case("none");
         }
@@ -4862,8 +4988,10 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "text-align" => {
             style.text_align = match value.trim().to_ascii_lowercase().as_str() {
                 "center" | "-webkit-center" => TextAlign::Center,
-                "right" | "end" | "-webkit-right" => TextAlign::Right,
-                "left" | "start" | "justify" | "-webkit-left" => TextAlign::Left,
+                "right" | "-webkit-right" => TextAlign::Right,
+                "left" | "-webkit-left" => TextAlign::Left,
+                "start" | "justify" => TextAlign::Start,
+                "end" => TextAlign::End,
                 _ => style.text_align,
             };
         }

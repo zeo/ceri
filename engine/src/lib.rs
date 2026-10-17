@@ -1,3 +1,4 @@
+mod bidi;
 mod border;
 mod colors;
 mod css;
@@ -11,6 +12,7 @@ mod inflate;
 mod interpolate;
 mod jpeg;
 mod layout;
+mod linebreak;
 mod media;
 #[cfg(feature = "native-http")]
 mod native_http;
@@ -20,6 +22,7 @@ mod png;
 mod script;
 mod selection;
 mod text;
+mod text_tables;
 mod transform;
 mod unicode;
 #[rustfmt::skip]

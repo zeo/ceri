@@ -1,14 +1,18 @@
+use crate::bidi::{BidiClass, bidi_class, mirrored, resolve_levels, visual_order};
 use crate::border::{BorderSide, BorderStyle, CornerLengths};
 use crate::css::{
     AlignContent, AlignItems, Color, Display, Edges, FontWeight, Gradient, InheritedText,
     JustifyContent, Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
     Stylesheet, TextAlign,
 };
-use crate::css::{Clear, Cursor, Float, ListStyleType, VerticalAlign, Visibility};
+use crate::css::{
+    Clear, Cursor, Float, ListStyleType, OverflowWrap, SpaceCollapse, VerticalAlign, Visibility,
+};
 use crate::dom::{Document, Element, NodeId, NodeKind};
 use crate::font::FontStack;
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
 use crate::image::Image;
+use crate::linebreak::{WordBreak, break_opportunities};
 use crate::media::ContainerSize;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -322,6 +326,8 @@ struct InlineLine {
     open_inlines: Vec<usize>,
     // whether the text appended so far ended on whitespace, which decides word joining
     trailing_space: bool,
+    // the paragraph runs right to left
+    rtl: bool,
     fragments: Vec<InlineFragment>,
     // inline-block and replaced boxes already placed by a flushed line
     placed: Vec<LayoutBox>,
@@ -341,6 +347,10 @@ struct InlineDecoration {
 }
 
 impl InlineLine {
+    fn base_level(&self) -> u8 {
+        u8::from(self.rtl)
+    }
+
     fn has_content(&self) -> bool {
         self.fragments
             .iter()
@@ -365,6 +375,8 @@ impl InlineLine {
             line_height: 0.0,
             atomic: None,
             edge: Some((decoration, opening)),
+            level: self.base_level(),
+            leading: 0.0,
         });
     }
 
@@ -494,6 +506,10 @@ struct InlineFragment {
     atomic: Option<Box<LayoutBox>>,
     // where an inline element opens or closes
     edge: Option<(usize, bool)>,
+    // the bidi embedding level; odd levels run right to left
+    level: u8,
+    // half the leading, between the top of the line and the glyph box
+    leading: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -650,6 +666,11 @@ fn inherited_text(style: &Style) -> InheritedText {
         accent_color: style.accent_color,
         text_align: style.text_align,
         line_height: style.line_height,
+        space_collapse: style.space_collapse,
+        wrap: style.wrap,
+        word_break: style.word_break,
+        overflow_wrap: style.overflow_wrap,
+        rtl: style.rtl,
     }
 }
 
@@ -918,6 +939,7 @@ pub fn layout_with_state(
                 decorations: Vec::new(),
                 open_inlines: Vec::new(),
                 trailing_space: false,
+                rtl: false,
                 fragments: Vec::new(),
                 placed: Vec::new(),
             };
@@ -934,7 +956,7 @@ pub fn layout_with_state(
                         opacity: 1.0,
                         content_width: viewport.width,
                         content_x: 0.0,
-                        align: TextAlign::Left,
+                        align: TextAlign::Start,
                     },
                     stylesheet,
                     style_state,
@@ -2250,6 +2272,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let owns_floats = Rc::strong_count(&float_area) == 1;
     let mut line = InlineLine {
         trailing_space: false,
+        rtl: style.rtl,
         y: content_y,
         used: 0.0,
         height: line_height,
@@ -2427,6 +2450,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         line_height,
                         atomic: Some(Box::new(bullet)),
                         edge: None,
+                        level: line.base_level(),
+                        leading: 0.0,
                     });
                 }
             }
@@ -2863,6 +2888,7 @@ fn layout_text_item(
         decorations: Vec::new(),
         open_inlines: Vec::new(),
         trailing_space: false,
+        rtl: context.text.rtl,
         fragments: Vec::new(),
         placed: Vec::new(),
     };
@@ -2918,9 +2944,55 @@ fn text_intrinsic_widths(pieces: &[(Option<NodeId>, &str)], context: InlineConte
             letter_spacing,
         )
     };
-    let words = joined.split_ascii_whitespace().collect::<Vec<_>>();
-    let widest_word = words.iter().map(|word| measure(word)).fold(0.0, f32::max);
-    (widest_word, measure(&words.join(" ")))
+    text_extents(&joined, &context.text, &measure)
+}
+
+// a text's min-content width, its widest unbreakable piece, and its max-content width, its
+// widest line, as its white-space and word breaking settings shape them
+fn text_extents(value: &str, text: &InheritedText, measure: &dyn Fn(&str) -> f32) -> (f32, f32) {
+    let preserve = matches!(
+        text.space_collapse,
+        SpaceCollapse::Preserve | SpaceCollapse::BreakSpaces
+    );
+    let lines = if preserve || text.space_collapse == SpaceCollapse::PreserveBreaks {
+        value.split('\n').collect::<Vec<_>>()
+    } else {
+        vec![value]
+    };
+    let shown = |line: &str| {
+        if preserve {
+            measure(line)
+        } else {
+            measure(&line.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
+        }
+    };
+    let widest = lines.iter().map(|line| shown(line)).fold(0.0, f32::max);
+    if !text.wrap {
+        return (widest, widest);
+    }
+    if text.overflow_wrap == OverflowWrap::Anywhere {
+        let widest_character = value
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .map(|character| measure(character.encode_utf8(&mut [0; 4])))
+            .fold(0.0, f32::max);
+        return (widest_character, widest);
+    }
+    let mut narrowest = 0.0_f32;
+    for word in value.split_ascii_whitespace() {
+        let simple = !may_break_inside(word) && text.word_break != WordBreak::BreakAll;
+        if simple {
+            narrowest = narrowest.max(measure(word));
+            continue;
+        }
+        let mut start = 0;
+        for (offset, _) in break_opportunities(word, text.word_break) {
+            narrowest = narrowest.max(measure(&word[start..offset]));
+            start = offset;
+        }
+        narrowest = narrowest.max(measure(&word[start..]));
+    }
+    (narrowest, widest)
 }
 
 // the free space a line leaves, shared out as justify-content asks: an offset before the
@@ -5202,14 +5274,12 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                 let measure = |text: &str| {
                     measure_text(text, style.font_family, font_size, bold, letter_spacing)
                 };
+                let (narrowest, widest) =
+                    text_extents(&transformed, &inherited_text(&style), &measure);
                 if minimum {
-                    let widest_word = transformed
-                        .split_ascii_whitespace()
-                        .map(measure)
-                        .fold(0.0, f32::max);
-                    widest_block = widest_block.max(widest_word);
+                    widest_block = widest_block.max(narrowest);
                 } else {
-                    inline += measure(transformed.trim());
+                    inline += widest;
                 }
             }
             Child::Element(child) => {
@@ -6311,64 +6381,292 @@ fn append_inline_text(
     text: &mut Vec<TextRun>,
     line: &mut InlineLine,
 ) {
-    let letter_spacing = context
-        .text
-        .letter_spacing
-        .resolve(context.font_size, context.font_size)
-        .unwrap_or(0.0);
-    let leading_space = value.chars().next().is_some_and(char::is_whitespace);
-    let trailing_space = value.chars().next_back().is_some_and(char::is_whitespace);
-    let mut first_word = true;
-    let mut consumed_bytes = 0_usize;
-    let mut consumed_units = source.offset;
-    // words come from the source so offsets stay exact when text-transform
-    // changes the length of what is drawn
-    for source_word in value.split_ascii_whitespace() {
-        let start = source_word.as_ptr() as usize - value.as_ptr() as usize;
-        consumed_units += value[consumed_bytes..start].encode_utf16().count();
-        consumed_bytes = start + source_word.len();
-        let node_offset = consumed_units;
-        let source_len = source_word.encode_utf16().count();
-        consumed_units += source_len;
-        let transformed_word = match context.text.transform {
-            crate::css::TextTransform::None => std::borrow::Cow::Borrowed(source_word),
-            transform => std::borrow::Cow::Owned(transform.apply(source_word)),
-        };
-        let word = transformed_word.as_ref();
-        let bold = context.weight == FontWeight::Bold;
-        let word_width = measure_text(
-            word,
-            context.text.family,
-            context.font_size,
-            bold,
-            letter_spacing,
-        );
-        let joins_previous = line.has_content() && (line.trailing_space || leading_space);
-        let mut space_width = if !line.has_content() || (first_word && !joins_previous) {
-            0.0
-        } else {
-            measure_text(
-                " ",
-                context.text.family,
-                context.font_size,
-                bold,
-                letter_spacing,
-            )
-        };
-        if !line.has_content() {
-            line.fit_to_floats(context.content_x, context.content_width);
-            line.make_room(word_width, context.content_x, context.content_width);
+    let mut placer = TextPlacer {
+        context,
+        source,
+        letter_spacing: context
+            .text
+            .letter_spacing
+            .resolve(context.font_size, context.font_size)
+            .unwrap_or(0.0),
+        bold: context.weight == FontWeight::Bold,
+        levels: None,
+        space: 0.0,
+        leading: half_leading(context.line_height, context.text.family, context.font_size),
+    };
+    placer.space = placer.measure(" ");
+    // right-to-left text, or any text in a right-to-left paragraph, resolves its levels
+    if line.rtl || value.chars().any(|character| u32::from(character) >= 0x590) {
+        let (_, levels) = resolve_levels(value, Some(u8::from(line.rtl)));
+        if levels.iter().any(|level| *level > 0) {
+            placer.levels = Some(levels_by_utf16(value, &levels));
         }
-        if line.has_content()
-            && line.used + space_width + word_width > line.available(context.content_width)
+    }
+    match context.text.space_collapse {
+        SpaceCollapse::Collapse | SpaceCollapse::PreserveBreaks => {
+            placer.collapsed(value, text, line);
+        }
+        SpaceCollapse::Preserve | SpaceCollapse::BreakSpaces => placer.preserved(value, text, line),
+    }
+}
+
+// puts the words and spaces of one text node on lines
+struct TextPlacer {
+    context: InlineContext,
+    source: InlineSource,
+    letter_spacing: f32,
+    bold: bool,
+    // each UTF-16 unit's bidi level, when some text is right to left
+    levels: Option<Vec<u8>>,
+    // measured once for the node: a space, and half the leading
+    space: f32,
+    leading: f32,
+}
+
+// whether the line breaking algorithm could find a break inside a word: ASCII letters, digits
+// and most punctuation hold together, and the rest is left to the full algorithm
+fn may_break_inside(word: &str) -> bool {
+    !word.is_ascii()
+        || word
+            .bytes()
+            .any(|byte| matches!(byte, b'-' | b'/' | b'!' | b'?' | b']' | b'}' | b'|'))
+}
+
+// spreads per-character levels over the UTF-16 units each character takes
+fn levels_by_utf16(value: &str, levels: &[u8]) -> Vec<u8> {
+    value
+        .chars()
+        .zip(levels)
+        .flat_map(|(character, level)| std::iter::repeat_n(*level, character.len_utf16()))
+        .collect()
+}
+
+// a piece of text that sits on a line whole
+struct TextUnit<'a> {
+    text: &'a str,
+    // where it starts in the text node, in UTF-16 units
+    offset: usize,
+    // a collapsed space drawn before it, when it is not the first thing on its line
+    space_before: bool,
+    // whether the line may end just before it
+    breakable: bool,
+}
+
+impl TextPlacer {
+    fn measure(&self, text: &str) -> f32 {
+        measure_text(
+            text,
+            self.context.text.family,
+            self.context.font_size,
+            self.bold,
+            self.letter_spacing,
+        )
+    }
+
+    // where a word may break inside, for scripts without spaces, hyphens and the like
+    fn pieces<'a>(&self, word: &'a str) -> Vec<&'a str> {
+        if !self.context.text.wrap
+            || (!may_break_inside(word) && self.context.text.word_break != WordBreak::BreakAll)
+        {
+            return vec![word];
+        }
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        for (offset, _) in break_opportunities(word, self.context.text.word_break) {
+            pieces.push(&word[start..offset]);
+            start = offset;
+        }
+        pieces.push(&word[start..]);
+        pieces
+    }
+
+    // a line feed kept by white-space ends the line, or makes an empty one
+    fn forced_break(&self, text: &mut Vec<TextRun>, line: &mut InlineLine) {
+        if line.has_content() {
+            flush_line(
+                line,
+                text,
+                self.context.content_x,
+                self.context.content_width,
+                self.context.align,
+            );
+        } else {
+            line.y += self.context.line_height;
+            line.height = 0.0;
+            line.fit_to_floats(self.context.content_x, self.context.content_width);
+        }
+    }
+
+    // white space collapses to single spaces between words; under pre-line, line feeds stay
+    fn collapsed(&mut self, value: &str, text: &mut Vec<TextRun>, line: &mut InlineLine) {
+        let keep_breaks = self.context.text.space_collapse == SpaceCollapse::PreserveBreaks;
+        let mut pending_space = line.trailing_space;
+        let mut units = self.source.offset;
+        let mut rest = value;
+        while !rest.is_empty() {
+            let space_end = rest
+                .find(|character: char| !character.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            if space_end > 0 {
+                let spaces = &rest[..space_end];
+                if keep_breaks && spaces.contains('\n') {
+                    for _ in 0..spaces.matches('\n').count() {
+                        self.forced_break(text, line);
+                    }
+                    pending_space = false;
+                } else {
+                    pending_space = true;
+                }
+                units += spaces.len();
+                rest = &rest[space_end..];
+                continue;
+            }
+            let word_end = rest
+                .find(|character: char| character.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            let word = &rest[..word_end];
+            for (index, piece) in self.pieces(word).into_iter().enumerate() {
+                let first = index == 0;
+                self.place(
+                    TextUnit {
+                        text: piece,
+                        offset: units,
+                        space_before: first && pending_space,
+                        breakable: !first || pending_space,
+                    },
+                    text,
+                    line,
+                );
+                units += piece.encode_utf16().count();
+            }
+            pending_space = false;
+            rest = &rest[word_end..];
+        }
+        if !value.is_empty() {
+            line.trailing_space = pending_space;
+        }
+    }
+
+    // spaces and line feeds stay as written; lines still wrap at spaces under pre-wrap
+    fn preserved(&mut self, value: &str, text: &mut Vec<TextRun>, line: &mut InlineLine) {
+        let spaces_break = self.context.text.space_collapse == SpaceCollapse::BreakSpaces;
+        let wrap = self.context.text.wrap;
+        let mut units = self.source.offset;
+        for (index, segment) in value.split('\n').enumerate() {
+            if index > 0 {
+                self.forced_break(text, line);
+                units += 1;
+            }
+            let segment = segment.strip_suffix('\r').unwrap_or(segment);
+            let mut rest = segment;
+            let mut after_space = false;
+            while !rest.is_empty() {
+                let space_end = rest
+                    .find(|character: char| character != ' ' && character != '\t')
+                    .unwrap_or(rest.len());
+                if space_end > 0 {
+                    // a tab advances to the next stop eight spaces apart
+                    let space = self.space.max(0.1);
+                    let mut shown = String::new();
+                    let mut used = line.used;
+                    for character in rest[..space_end].chars() {
+                        let count = if character == '\t' {
+                            let stop = space * 8.0;
+                            (((used / stop).floor() + 1.0) * stop - used) / space
+                        } else {
+                            1.0
+                        };
+                        let count = count.round().max(1.0) as usize;
+                        shown.push_str(&" ".repeat(count));
+                        used += space * count as f32;
+                    }
+                    self.place_preserved(&shown, units, spaces_break && wrap, text, line);
+                    units += rest[..space_end].encode_utf16().count();
+                    rest = &rest[space_end..];
+                    after_space = true;
+                    continue;
+                }
+                let word_end = rest.find([' ', '\t']).unwrap_or(rest.len());
+                for (piece_index, piece) in self.pieces(&rest[..word_end]).into_iter().enumerate() {
+                    self.place(
+                        TextUnit {
+                            text: piece,
+                            offset: units,
+                            space_before: false,
+                            breakable: wrap && (piece_index > 0 || after_space),
+                        },
+                        text,
+                        line,
+                    );
+                    units += piece.encode_utf16().count();
+                }
+                after_space = false;
+                rest = &rest[word_end..];
+            }
+        }
+        line.trailing_space = false;
+    }
+
+    // kept spaces hang at the end of a line rather than wrapping it, unless break-spaces
+    fn place_preserved(
+        &mut self,
+        spaces: &str,
+        offset: usize,
+        breakable: bool,
+        text: &mut Vec<TextRun>,
+        line: &mut InlineLine,
+    ) {
+        let width = self.measure(spaces);
+        if breakable
+            && line.has_content()
+            && line.used + width > line.available(self.context.content_width)
         {
             flush_line(
                 line,
                 text,
-                context.content_x,
-                context.content_width,
-                context.align,
+                self.context.content_x,
+                self.context.content_width,
+                self.context.align,
             );
+        }
+        self.push(
+            spaces.to_string(),
+            width,
+            offset,
+            spaces.encode_utf16().count(),
+            line,
+        );
+    }
+
+    fn place(&mut self, unit: TextUnit<'_>, text: &mut Vec<TextRun>, line: &mut InlineLine) {
+        let TextUnit {
+            text: source_text,
+            offset,
+            space_before,
+            breakable,
+        } = unit;
+        let transformed = match self.context.text.transform {
+            crate::css::TextTransform::None => std::borrow::Cow::Borrowed(source_text),
+            transform => std::borrow::Cow::Owned(transform.apply(source_text)),
+        };
+        let word = transformed.as_ref();
+        let word_width = self.measure(word);
+        let (content_x, content_width) = (self.context.content_x, self.context.content_width);
+        if !line.has_content() {
+            line.fit_to_floats(content_x, content_width);
+            line.make_room(word_width, content_x, content_width);
+        }
+        let mut space_width = if space_before && line.has_content() {
+            self.space
+        } else {
+            0.0
+        };
+        if self.context.text.wrap
+            && breakable
+            && line.has_content()
+            && line.used + space_width + word_width > line.available(content_width)
+        {
+            flush_line(line, text, content_x, content_width, self.context.align);
             // the space that broke the line is not drawn at the start of the next
             space_width = 0.0;
         }
@@ -6389,36 +6687,91 @@ fn append_inline_text(
             line.used += space_width;
             space_width = 0.0;
         }
-        let prefix = if space_width > 0.0 { " " } else { "" };
-        let text = format!("{prefix}{word}");
-        let width = measure_text(
-            &text,
-            context.text.family,
-            context.font_size,
-            bold,
-            letter_spacing,
-        );
+        let source_len = source_text.encode_utf16().count();
+        // a word too wide for any line breaks between its characters when overflow-wrap allows
+        if self.context.text.wrap
+            && self.context.text.overflow_wrap != OverflowWrap::Normal
+            && word_width > line.available(content_width)
+            && word.chars().nth(1).is_some()
+        {
+            if space_width > 0.0 {
+                self.push(" ".to_string(), space_width, offset, 0, line);
+            }
+            let mut piece = String::new();
+            let mut piece_offset = offset;
+            for character in word.chars() {
+                let mut candidate = piece.clone();
+                candidate.push(character);
+                if !piece.is_empty()
+                    && line.used + self.measure(&candidate) > line.available(content_width)
+                {
+                    let width = self.measure(&piece);
+                    let length = piece.encode_utf16().count();
+                    self.push(
+                        std::mem::take(&mut piece),
+                        width,
+                        piece_offset,
+                        length,
+                        line,
+                    );
+                    piece_offset += length;
+                    flush_line(line, text, content_x, content_width, self.context.align);
+                }
+                piece.push(character);
+            }
+            if !piece.is_empty() {
+                let width = self.measure(&piece);
+                let length = piece.encode_utf16().count();
+                self.push(piece, width, piece_offset, length, line);
+            }
+            return;
+        }
+        let shown = if space_width > 0.0 {
+            format!(" {word}")
+        } else {
+            word.to_string()
+        };
+        let width = if space_width > 0.0 {
+            self.measure(&shown)
+        } else {
+            word_width
+        };
+        self.push(shown, width, offset, source_len, line);
+    }
+
+    fn push(
+        &self,
+        shown: String,
+        width: f32,
+        offset: usize,
+        source_len: usize,
+        line: &mut InlineLine,
+    ) {
+        let level = self.levels.as_ref().map_or(line.base_level(), |levels| {
+            levels
+                .get(offset.saturating_sub(self.source.offset))
+                .copied()
+                .unwrap_or(line.base_level())
+        });
         line.used += width;
-        line.height = line.height.max(context.line_height);
+        line.height = line.height.max(self.context.line_height);
         line.fragments.push(InlineFragment {
-            text,
+            text: shown,
             width,
-            font_size: context.font_size,
-            letter_spacing,
-            font_stack: context.text.family,
-            color: context.color.scale_alpha(context.opacity),
-            bold,
-            node: source.node,
-            node_offset,
+            font_size: self.context.font_size,
+            letter_spacing: self.letter_spacing,
+            font_stack: self.context.text.family,
+            color: self.context.color.scale_alpha(self.context.opacity),
+            bold: self.bold,
+            node: self.source.node,
+            node_offset: offset,
             source_len,
-            line_height: context.line_height,
+            line_height: self.context.line_height,
             atomic: None,
             edge: None,
+            level,
+            leading: self.leading,
         });
-        first_word = false;
-    }
-    if !value.trim().is_empty() || trailing_space {
-        line.trailing_space = trailing_space;
     }
 }
 
@@ -6510,6 +6863,8 @@ fn append_atomic(
         line_height: outer_height,
         atomic: Some(Box::new(laid_out)),
         edge: None,
+        level: line.base_level(),
+        leading: 0.0,
     });
 }
 
@@ -6524,10 +6879,11 @@ fn flush_line(
         return;
     }
     let available = line.available(content_width);
-    let offset = match align {
-        TextAlign::Left => 0.0,
-        TextAlign::Center => ((available - line.used) / 2.0).max(0.0),
-        TextAlign::Right => (available - line.used).max(0.0),
+    let end = (available - line.used).max(0.0);
+    let offset = match (align, line.rtl) {
+        (TextAlign::Left, _) | (TextAlign::Start, false) | (TextAlign::End, true) => 0.0,
+        (TextAlign::Center, _) => end / 2.0,
+        _ => end,
     };
     let mut x = content_x + line.left + offset;
     let line_start = x;
@@ -6539,7 +6895,11 @@ fn flush_line(
     let mut active = line.open_inlines.clone();
     let mut starts = HashMap::new();
     let mut ends = HashMap::new();
-    for fragment in std::mem::take(&mut line.fragments) {
+    let mut fragments = std::mem::take(&mut line.fragments);
+    if line.rtl || fragments.iter().any(|fragment| fragment.level > 0) {
+        fragments = visual_fragments(fragments, line.base_level());
+    }
+    for fragment in fragments {
         if let Some((decoration, opening)) = fragment.edge {
             let margin = line.decorations[decoration].margin;
             if opening {
@@ -6565,12 +6925,7 @@ fn flush_line(
             continue;
         }
         text.push(TextRun {
-            y: top
-                + half_leading(
-                    fragment.line_height,
-                    fragment.font_stack,
-                    fragment.font_size,
-                ),
+            y: top + fragment.leading,
             text: fragment.text,
             x,
             width: fragment.width,
@@ -6768,6 +7123,47 @@ fn bullet_marker(style: &Style, node: NodeId, rect: Rect, font_size: f32) -> Opt
         _ => return None,
     }
     Some(marker)
+}
+
+// L2 of the bidi algorithm over a line's fragments: runs reverse by level, and right-to-left
+// text reads backwards, with mirrored brackets
+fn visual_fragments(fragments: Vec<InlineFragment>, base: u8) -> Vec<InlineFragment> {
+    // trailing spaces go back to the paragraph level, as L1 asks
+    let mut levels = fragments
+        .iter()
+        .map(|fragment| fragment.level)
+        .collect::<Vec<_>>();
+    for (index, fragment) in fragments.iter().enumerate().rev() {
+        if fragment.atomic.is_none() && fragment.text.trim().is_empty() {
+            levels[index] = base;
+        } else {
+            break;
+        }
+    }
+    let order = visual_order(&levels);
+    let mut slots = fragments.into_iter().map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .filter_map(|index| {
+            let mut fragment = slots[index].take()?;
+            if levels[index] % 2 == 1 && fragment.atomic.is_none() {
+                fragment.text = reversed_for_display(&fragment.text);
+            }
+            Some(fragment)
+        })
+        .collect()
+}
+
+// characters in reverse with each base kept before its marks, brackets mirrored
+fn reversed_for_display(text: &str) -> String {
+    let mut clusters: Vec<String> = Vec::new();
+    for character in text.chars() {
+        match clusters.last_mut() {
+            Some(cluster) if bidi_class(character) == BidiClass::Nsm => cluster.push(character),
+            _ => clusters.push(mirrored(character).to_string()),
+        }
+    }
+    clusters.into_iter().rev().collect()
 }
 
 // takes a float out of the line and puts it as high and as far to its side as the floats
@@ -7406,6 +7802,120 @@ mod tests {
         assert_eq!(
             pixels.rect.height, 30.0,
             "a pixel line-height inherits as pixels"
+        );
+    }
+
+    #[test]
+    fn white_space_modes_cjk_breaks_and_overflow_wrap_shape_lines() {
+        let html = concat!(
+            "<html><body>",
+            "<p id='pre' style='white-space: pre'>a  b\nc</p>",
+            "<p id='nowrap' style='white-space: nowrap'>one two three four five six</p>",
+            "<p id='prewrap' style='white-space: pre-wrap'>one  two  three  four  five</p>",
+            "<p id='preline' style='white-space: pre-line'>a     b\nc</p>",
+            "<p id='cjk'>\u{4E00}\u{4E8C}\u{4E09}\u{56DB}\u{4E94}\u{516D}\u{4E03}\u{516B}\u{4E5D}\u{5341}\u{4E00}\u{4E8C}\u{4E09}\u{56DB}</p>",
+            "<p id='long'>aaaaaaaaaaaaaaaaaaaaaaaa</p>",
+            "<p id='anywhere' style='overflow-wrap: anywhere'>aaaaaaaaaaaaaaaaaaaaaaaa</p>",
+            "</body></html>"
+        );
+        let document = Document::parse(html).expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "body, p { margin: 0; width: 60px; font-size: 10px; line-height: 10px }",
+        )
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 400.0,
+            },
+        );
+        let paragraphs = {
+            fn collect<'a>(layout_box: &'a LayoutBox, found: &mut Vec<&'a LayoutBox>) {
+                if layout_box.tag == "p" {
+                    found.push(layout_box);
+                }
+                for child in &layout_box.children {
+                    collect(child, found);
+                }
+            }
+            let mut found = Vec::new();
+            collect(&layout.root, &mut found);
+            found
+        };
+        let lines = |paragraph: &LayoutBox| {
+            let mut tops = paragraph.text.iter().map(|run| run.y).collect::<Vec<_>>();
+            tops.dedup();
+            tops.len()
+        };
+        let joined = |paragraph: &LayoutBox| {
+            paragraph
+                .text
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+        };
+        let [pre, nowrap, prewrap, preline, cjk, long, anywhere] = paragraphs[..] else {
+            panic!("seven paragraphs should lay out");
+        };
+        assert_eq!(lines(pre), 2);
+        assert_eq!(joined(pre), "a  bc", "pre keeps both spaces");
+        assert_eq!(lines(nowrap), 1);
+        assert!(lines(prewrap) > 1);
+        assert!(
+            joined(prewrap).contains("one  two"),
+            "pre-wrap keeps spaces"
+        );
+        assert_eq!(lines(preline), 2);
+        assert_eq!(
+            joined(preline),
+            "a bc",
+            "pre-line collapses spaces but keeps the line feed"
+        );
+        assert!(lines(cjk) > 1, "ideographs break between each other");
+        assert_eq!(lines(long), 1, "a long word overflows by default");
+        assert!(
+            lines(anywhere) > 1,
+            "overflow-wrap anywhere breaks inside it"
+        );
+    }
+
+    #[test]
+    fn right_to_left_text_aligns_to_its_start_and_reorders_by_level() {
+        let document = Document::parse(
+            "<html><body><p dir='rtl'>abc</p><p>x \u{5D0}\u{5D1} \u{5D2}\u{5D3} y</p></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("body, p { margin: 0; width: 200px }")
+            .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 200.0,
+            },
+        );
+        let runs = collect_text_runs(&layout.root);
+        let abc = runs.iter().find(|run| run.text == "abc").expect("abc");
+        assert!(abc.x > 150.0, "an rtl paragraph starts at its right edge");
+        let x_of = |needle: char| {
+            runs.iter()
+                .find(|run| run.text.contains(needle))
+                .map(|run| run.x)
+                .expect("run")
+        };
+        // the hebrew words read right to left, so the second word sits to the left of the first
+        assert!(x_of('\u{5D2}') < x_of('\u{5D0}'));
+        assert!(x_of('x') < x_of('\u{5D2}') && x_of('\u{5D0}') < x_of('y'));
+        let first = runs
+            .iter()
+            .find(|run| run.text.contains('\u{5D0}'))
+            .expect("first word");
+        assert!(
+            first.text.trim_end().ends_with('\u{5D0}'),
+            "its letters are drawn in reverse"
         );
     }
 
