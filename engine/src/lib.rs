@@ -1,6 +1,7 @@
 mod bidi;
 mod border;
 mod cff;
+mod color_glyph;
 mod colors;
 mod css;
 mod dom;

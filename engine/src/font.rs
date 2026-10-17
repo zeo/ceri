@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::color_glyph::ColorGlyph;
+
 const MAX_COMPOSITE_DEPTH: u8 = 5;
 const MAX_CONTOUR_POINTS: usize = 20_000;
 const MAX_GLYPH_PIXELS: usize = 4_000_000;
@@ -742,6 +744,11 @@ pub trait FontSource {
     fn fallback(&self, _character: char, _style: FontStyle) -> Option<Rc<FontFace>> {
         None
     }
+
+    // the platform's colour emoji face
+    fn emoji(&self, _style: FontStyle) -> Option<Rc<FontFace>> {
+        None
+    }
 }
 
 struct SingleFaceSource {
@@ -819,6 +826,8 @@ type FaceList = Rc<[StackFace]>;
 
 // the face each missing character fell back to, by style
 type FallbackCache = HashMap<(char, FontStyle), Option<Rc<FontFace>>>;
+// colour glyphs by glyph and the text colour their foreground layers take
+type ColorGlyphCache = HashMap<(GlyphKey, [u8; 4]), Option<Rc<ColorGlyph>>>;
 
 // text metrics and rasterized glyphs for the whole engine, cached per face and size
 pub struct FontSet {
@@ -829,6 +838,7 @@ pub struct FontSet {
     fallbacks: RefCell<FallbackCache>,
     shaped: RefCell<HashMap<ShapeKey, Rc<ShapedRun>>>,
     glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
+    color_glyphs: RefCell<ColorGlyphCache>,
 }
 
 impl Default for FontSet {
@@ -847,6 +857,7 @@ impl FontSet {
             fallbacks: RefCell::default(),
             shaped: RefCell::default(),
             glyphs: RefCell::default(),
+            color_glyphs: RefCell::default(),
         }
     }
 
@@ -893,6 +904,7 @@ impl FontSet {
             self.fallbacks.borrow_mut().clear();
             self.shaped.borrow_mut().clear();
             self.glyphs.borrow_mut().clear();
+            self.color_glyphs.borrow_mut().clear();
         }
     }
 
@@ -918,16 +930,36 @@ impl FontSet {
             return cached.clone();
         }
         let characters = text.chars().collect::<Vec<_>>();
+        let mut faces: Vec<Option<ChosenFace>> = Vec::with_capacity(characters.len());
+        for (index, &character) in characters.iter().enumerate() {
+            // a selector or joiner stays in its base character's run, so the face sees the sequence
+            let face = if (crate::color_glyph::is_variation_selector(character)
+                || character == '\u{200D}')
+                && index > 0
+            {
+                faces[index - 1].clone()
+            } else {
+                let presentation = characters.get(index + 1).copied();
+                let emoji = presentation != Some('\u{FE0E}')
+                    && (presentation == Some('\u{FE0F}')
+                        || crate::color_glyph::prefers_emoji(character));
+                emoji
+                    .then(|| self.emoji_face(character, style))
+                    .flatten()
+                    .or_else(|| self.face_for(character, stack, style))
+            };
+            faces.push(face);
+        }
         let mut glyphs = Vec::with_capacity(characters.len());
         let mut x = 0.0;
         let mut start = 0;
         while start < characters.len() {
-            let chosen = self.face_for(characters[start], stack, style);
+            let chosen = faces[start].clone();
             // a run of characters the same face draws shapes together
             let mut end = start + 1;
             while end < characters.len() {
-                let next = self.face_for(characters[end], stack, style);
-                let same = match (&chosen, &next) {
+                let next = &faces[end];
+                let same = match (&chosen, next) {
                     (Some(left), Some(right)) => {
                         Rc::ptr_eq(&left.face, &right.face)
                             && left.synthetic_bold == right.synthetic_bold
@@ -949,8 +981,14 @@ impl FontSet {
                     } else {
                         0.0
                     };
-                    for shaped in crate::shaping::Shaper::new(&chosen.face)
-                        .shape(&characters[start..end], ligatures)
+                    // variation selectors only choose the face and take no room
+                    let visible = characters[start..end]
+                        .iter()
+                        .copied()
+                        .filter(|&character| !crate::color_glyph::is_variation_selector(character))
+                        .collect::<Vec<_>>();
+                    for shaped in
+                        crate::shaping::Shaper::new(&chosen.face).shape(&visible, ligatures)
                     {
                         let advance = shaped.advance * scale + extra;
                         glyphs.push(RunGlyph {
@@ -963,7 +1001,10 @@ impl FontSet {
                     }
                 }
                 None => {
-                    for _ in start..end {
+                    let visible = characters[start..end].iter().filter(|&&character| {
+                        !crate::color_glyph::is_variation_selector(character)
+                    });
+                    for _ in visible {
                         glyphs.push(RunGlyph {
                             face: None,
                             glyph: 0,
@@ -1074,6 +1115,50 @@ impl FontSet {
         bitmap
     }
 
+    // a glyph in its font's own colours, for faces with COLR layers or CBDT bitmaps
+    pub(crate) fn color_glyph(
+        &self,
+        chosen: &ChosenFace,
+        glyph: u16,
+        size: f32,
+        subpixel: f32,
+        foreground: crate::css::Color,
+    ) -> Option<Rc<ColorGlyph>> {
+        if !crate::color_glyph::has_color(&chosen.face) {
+            return None;
+        }
+        let quarter = ((subpixel.fract() * 4.0).round() as u8) % 4;
+        let key = GlyphKey {
+            face: Rc::as_ptr(&chosen.face) as usize,
+            glyph,
+            size: size.to_bits(),
+            synthetic_bold: false,
+            synthetic_italic: false,
+            quarter,
+        };
+        let color = [
+            foreground.red,
+            foreground.green,
+            foreground.blue,
+            foreground.alpha,
+        ];
+        if let Some(cached) = self.color_glyphs.borrow().get(&(key, color)) {
+            return cached.clone();
+        }
+        let rendered = crate::color_glyph::render(
+            &chosen.face,
+            glyph,
+            size,
+            f32::from(quarter) / 4.0,
+            foreground,
+        )
+        .map(Rc::new);
+        self.color_glyphs
+            .borrow_mut()
+            .insert((key, color), rendered.clone());
+        rendered
+    }
+
     // the face that draws a character: the first family in the stack that has it, then an
     // installed face that does, then the first family anyway
     pub(crate) fn face_for(
@@ -1095,6 +1180,12 @@ impl FontSet {
         faces
             .first()
             .map(|entry| ChosenFace::new(entry.face.clone(), style))
+    }
+
+    fn emoji_face(&self, character: char, style: FontStyle) -> Option<ChosenFace> {
+        let face = self.source.as_ref()?.emoji(style)?;
+        face.has_glyph(character)
+            .then(|| ChosenFace::new(face, FontStyle::NORMAL))
     }
 
     fn primary(&self, stack: FontStack, style: FontStyle) -> Option<Rc<FontFace>> {

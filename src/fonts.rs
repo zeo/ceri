@@ -116,7 +116,19 @@ impl FontSource for SystemFonts {
         self.fallbacks.borrow_mut().insert(character, found.clone());
         found.and_then(|path| self.load(&path))
     }
+
+    fn emoji(&self, style: FontStyle) -> Option<Rc<FontFace>> {
+        let path = self.lookup(EMOJI_FAMILY, style)?.path.clone();
+        self.load(&path)
+    }
 }
+
+#[cfg(target_os = "windows")]
+const EMOJI_FAMILY: &str = "segoe ui emoji";
+#[cfg(target_os = "macos")]
+const EMOJI_FAMILY: &str = "apple color emoji";
+#[cfg(all(unix, not(target_os = "macos")))]
+const EMOJI_FAMILY: &str = "noto color emoji";
 
 // how many installed faces a missing character may load before it is given up on
 const MAX_FALLBACK_PROBES: usize = 64;

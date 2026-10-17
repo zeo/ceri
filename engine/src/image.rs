@@ -33,7 +33,7 @@ impl Image {
         self.pixels[(y * self.width + x) as usize]
     }
 
-    fn blend_pixel(&mut self, x: i32, y: i32, color: Color) {
+    pub(crate) fn blend_pixel(&mut self, x: i32, y: i32, color: Color) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }

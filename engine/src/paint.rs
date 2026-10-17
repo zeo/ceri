@@ -267,6 +267,54 @@ impl Canvas {
         }
     }
 
+    // a colour glyph's own pixels faded by the text colour's opacity, or its shape in the text
+    // colour for a silhouette
+    fn blend_color_glyph(
+        &mut self,
+        x: i32,
+        y: i32,
+        glyph: &crate::color_glyph::ColorGlyph,
+        text: Color,
+        silhouette: bool,
+        clip: Option<crate::layout::Rect>,
+    ) {
+        for row in 0..glyph.height {
+            let pixel_y = y + row as i32;
+            if pixel_y < 0 || pixel_y as u32 >= self.height {
+                continue;
+            }
+            for column in 0..glyph.width {
+                let pixel_x = x + column as i32;
+                if pixel_x < 0 || pixel_x as u32 >= self.width {
+                    continue;
+                }
+                let color = glyph.pixels[row * glyph.width + column];
+                if color.alpha == 0 {
+                    continue;
+                }
+                if let Some(clip) = clip {
+                    let inside = (pixel_x as f32) >= clip.x.floor()
+                        && (pixel_x as f32) < (clip.x + clip.width).ceil()
+                        && (pixel_y as f32) >= clip.y.floor()
+                        && (pixel_y as f32) < (clip.y + clip.height).ceil();
+                    if !inside {
+                        continue;
+                    }
+                }
+                let alpha = u32::from(color.alpha) * u32::from(text.alpha) / 255;
+                let base = if silhouette { text } else { color };
+                self.blend_pixel(
+                    pixel_x as u32,
+                    pixel_y as u32,
+                    Color {
+                        alpha: alpha as u8,
+                        ..base
+                    },
+                );
+            }
+        }
+    }
+
     // signed distance coverage gives antialiased corners without a second pass
     fn fill_shape(&mut self, shape: Shape, paint: &Paint, clip: Option<Rect>) {
         if shape.width <= 0.0 || shape.height <= 0.0 {
@@ -2549,7 +2597,7 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f
     {
         paint_text_shadow(canvas, run, shadow, clip, offset);
     }
-    paint_glyphs(canvas, run, clip, offset);
+    paint_glyphs(canvas, run, clip, offset, false);
     if run.decoration.has_lines() {
         paint_decoration_lines(canvas, run, clip, offset);
     }
@@ -2574,7 +2622,7 @@ fn paint_text_shadow(
     };
     let at = (offset.0 + shadow.x, offset.1 + shadow.y);
     if shadow.blur <= 0.0 {
-        paint_glyphs(canvas, &shadowed, clip, at);
+        paint_glyphs(canvas, &shadowed, clip, at, true);
         if shadowed.decoration.has_lines() {
             paint_decoration_lines(canvas, &shadowed, clip, at);
         }
@@ -2591,7 +2639,7 @@ fn paint_text_shadow(
         return;
     };
     let mut layer = canvas.layer(bounds);
-    paint_glyphs(&mut layer, &shadowed, None, at);
+    paint_glyphs(&mut layer, &shadowed, None, at, true);
     if shadowed.decoration.has_lines() {
         paint_decoration_lines(&mut layer, &shadowed, None, at);
     }
@@ -2734,10 +2782,17 @@ fn paint_decoration_lines(
     }
 }
 
-fn paint_glyphs(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
+// a silhouette draws colour glyphs in the run's colour, as their shadows are
+fn paint_glyphs(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+    silhouette: bool,
+) {
     let fonts = crate::font::active_fonts();
     if !fonts.is_builtin() {
-        paint_outline_text(canvas, run, clip, offset, &fonts);
+        paint_outline_text(canvas, run, clip, offset, &fonts, silhouette);
         return;
     }
     let cell = text_advance(run.font_size) + run.letter_spacing;
@@ -2775,6 +2830,7 @@ fn paint_outline_text(
     clip: Option<Rect>,
     offset: (f32, f32),
     fonts: &crate::font::FontSet,
+    silhouette: bool,
 ) {
     let scale = canvas.scale();
     let device_size = run.font_size * scale;
@@ -2817,7 +2873,16 @@ fn paint_outline_text(
         } else {
             pen + offset
         };
-        if let Some(bitmap) = fonts.glyph_bitmap(face, glyph.glyph, device_size, x) {
+        if let Some(colored) = fonts.color_glyph(face, glyph.glyph, device_size, x, run.color) {
+            canvas.blend_color_glyph(
+                x.floor() as i32 + colored.left,
+                baseline.round() as i32 + colored.top,
+                &colored,
+                run.color,
+                silhouette,
+                device_clip,
+            );
+        } else if let Some(bitmap) = fonts.glyph_bitmap(face, glyph.glyph, device_size, x) {
             canvas.blend_coverage(
                 x.floor() as i32 + bitmap.left,
                 baseline.round() as i32 + bitmap.top,
