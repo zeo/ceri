@@ -1028,6 +1028,19 @@ pub fn layout_with_state(
 }
 
 impl LayoutDocument {
+    // the body's box, where a page's own content starts
+    #[cfg(test)]
+    pub(crate) fn body(&self) -> &LayoutBox {
+        let mut stack = vec![&self.root];
+        while let Some(layout_box) = stack.pop() {
+            if layout_box.tag == "body" {
+                return layout_box;
+            }
+            stack.extend(layout_box.children.iter().rev());
+        }
+        &self.root
+    }
+
     // maps a point inside a text control to a UTF-16 offset in its value
     pub fn control_text_offset_at(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
         let mut found = None;
@@ -7664,7 +7677,7 @@ mod tests {
 
     #[test]
     fn inherited_text_transform_and_tracking_reach_layout_runs() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<main style=\"text-transform: uppercase; letter-spacing: 2px\"><p>ab cd</p></main>",
         )
         .expect("document should parse");
@@ -7690,7 +7703,7 @@ mod tests {
 
     #[test]
     fn grid_auto_tracks_take_content_width_before_fr_tracks_expand() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<div style=\"display: grid; grid-template-columns: auto 1fr auto\"><p>ab</p><p>middle</p><p>cd</p></div>",
         )
         .expect("document should parse");
@@ -7719,7 +7732,7 @@ mod tests {
     #[test]
     fn a_translate_transform_moves_the_visual_subtree_without_moving_layout() {
         let document =
-            Document::parse("<html><body><div id='card'><p>inside</p></div></body></html>")
+            Document::parse_markup("<html><body><div id='card'><p>inside</p></div></body></html>")
                 .expect("document should parse");
         let stylesheet = Stylesheet::parse(
             "html, body, p { margin: 0 } #card { width: 100px; height: 40px; transform: translate(12px, -6px) }",
@@ -7769,7 +7782,7 @@ mod tests {
 
     #[test]
     fn generated_content_becomes_boxes_and_joins_inline_text_without_extra_spaces() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<html><body><p class=\"tag\">bracketed</p><div class=\"rule\">bar</div><p>no<span>space</span>here</p></body></html>",
         )
         .expect("document should parse");
@@ -7810,7 +7823,7 @@ mod tests {
 
     #[test]
     fn form_controls_take_their_default_sizes_labels_and_drawn_parts() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             r#"<html><body><input id="text"><input id="short" size="5"><input type="submit"><select><option>First</option><option selected>Second</option></select><input type="checkbox" checked><input type="range" min="0" max="10" value="5"><input type="checkbox" style="appearance: none"><textarea rows="3"></textarea></body></html>"#,
         )
         .expect("document should parse");
@@ -7898,7 +7911,7 @@ mod tests {
 
     #[test]
     fn placeholder_marker_and_selection_pseudo_elements_style_their_parts() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             r#"<html><body><input placeholder="hint"><ul><li>item</li></ul><p>text</p></body></html>"#,
         )
         .expect("document should parse");
@@ -7928,7 +7941,7 @@ mod tests {
 
     #[test]
     fn text_align_and_line_height_inherit_and_lines_centre_their_glyphs() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             r#"<html><body><main style="text-align: right; line-height: 2"><p>a</p></main><section style="line-height: 30px; font-size: 10px"><p style="font-size: 20px">b</p></section></body></html>"#,
         )
         .expect("document should parse");
@@ -7980,7 +7993,7 @@ mod tests {
             "<p id='anywhere' style='overflow-wrap: anywhere'>aaaaaaaaaaaaaaaaaaaaaaaa</p>",
             "</body></html>"
         );
-        let document = Document::parse(html).expect("document should parse");
+        let document = Document::parse_markup(html).expect("document should parse");
         let stylesheet = Stylesheet::parse(
             "body, p { margin: 0; width: 60px; font-size: 10px; line-height: 10px }",
         )
@@ -8045,7 +8058,7 @@ mod tests {
 
     #[test]
     fn right_to_left_text_aligns_to_its_start_and_reorders_by_level() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<html><body><p dir='rtl'>abc</p><p>x \u{5D0}\u{5D1} \u{5D2}\u{5D3} y</p></body></html>",
         )
         .expect("document should parse");
@@ -8101,7 +8114,7 @@ mod tests {
 
     #[test]
     fn block_flow_respects_margin_padding_and_border() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>main { margin: 10px; padding: 4px; border: 2px solid #000; } p { height: 20px; }</style><main><p>hello</p><p>world</p></main>",
         )
         .expect("document should parse");
@@ -8124,7 +8137,7 @@ mod tests {
 
     #[test]
     fn wraps_text_when_the_line_is_full() {
-        let document = Document::parse("<main>one two three four five six</main>")
+        let document = Document::parse_markup("<main>one two three four five six</main>")
             .expect("document should parse");
         let stylesheet = Stylesheet::parse("").expect("empty css should parse");
         let result = layout(
@@ -8149,7 +8162,7 @@ mod tests {
 
     #[test]
     fn focused_input_layout_carries_live_value_and_selection_metadata() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             r#"<input id="name" value="initial" style="display: block; width: 120px; height: 28px">"#,
         )
         .expect("input document should parse");
@@ -8182,7 +8195,7 @@ mod tests {
 
     #[test]
     fn empty_text_controls_paint_placeholder_without_changing_live_value() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             r#"<input id="name" placeholder="your name"><textarea id="note" placeholder="line one&#13;&#10;line two"></textarea>"#,
         )
         .expect("placeholder document should parse");
@@ -8228,7 +8241,7 @@ mod tests {
 
     #[test]
     fn password_controls_mask_display_text_without_changing_live_value() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             r#"<input id="secret" type="password" value="s😀cret" style="display: block; width: 120px; height: 28px">"#,
         )
         .expect("password document should parse");
@@ -8258,7 +8271,7 @@ mod tests {
 
     #[test]
     fn textarea_layout_carries_multiline_live_value_without_child_text_duplication() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<textarea id='note' style='display: block; width: 120px; height: 54px'>initial\ntext</textarea>",
         )
         .expect("textarea document should parse");
@@ -8294,7 +8307,7 @@ mod tests {
 
     #[test]
     fn textarea_layout_wraps_to_content_width_and_honors_wrap_off() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<textarea id='wrapped' style='display: block; width: 24px; height: 80px; padding: 0; border: 0; font-size: 16px'>old</textarea><textarea id='off' wrap='off' style='display: block; width: 24px; height: 80px; padding: 0; border: 0; font-size: 16px'>old</textarea>",
         )
         .expect("textarea document should parse");
@@ -8331,7 +8344,7 @@ mod tests {
 
     #[test]
     fn inherited_text_color_reaches_nested_blocks() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>body { color: #42d3b4; }</style><body><main>hello</main></body>",
         )
         .expect("document should parse");
@@ -8350,7 +8363,7 @@ mod tests {
 
     #[test]
     fn flex_row_distributes_growing_items_and_gap() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#row { display: flex; width: 180px; gap: 10px; } #left { flex-grow: 1; } #right { flex-grow: 2; }</style><div id='row'><p id='left'>left</p><p id='right'>right</p></div>",
         )
         .expect("document should parse");
@@ -8375,7 +8388,7 @@ mod tests {
 
     #[test]
     fn flex_column_centers_items_in_an_explicit_height() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#column { display: flex; flex-direction: column; width: 100px; height: 100px; gap: 10px; align-items: center; } p { width: 20px; height: 20px; margin: 0; }</style><div id='column'><p>one</p><p>two</p></div>",
         )
         .expect("document should parse");
@@ -8400,7 +8413,7 @@ mod tests {
 
     #[test]
     fn flex_containers_remain_in_block_parent_flow() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<body><main style='display: flex;'><p>inside</p></main><p>after</p></body>",
         )
         .expect("document should parse");
@@ -8422,7 +8435,7 @@ mod tests {
 
     #[test]
     fn grid_places_children_in_tracks_with_gap() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#grid { display: grid; width: 200px; grid-template-columns: 1fr 2fr; grid-template-rows: 30px 40px; gap: 10px; } #grid > p { height: 20px; margin: 0; }</style><div id='grid'><p>one</p><p>two</p><p>three</p><p>four</p></div>",
         )
         .expect("document should parse");
@@ -8447,7 +8460,7 @@ mod tests {
 
     #[test]
     fn flex_and_grid_children_include_generated_content_boxes() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#row { display: flex; margin: 0; } #row::before { content: 'badge'; } #grid { display: grid; grid-template-columns: 60px; margin: 0; } #grid::after { content: 'tail'; }</style><div id='row'><p>one</p></div><div id='grid'><p>cell</p></div>",
         )
         .expect("document should parse");
@@ -8485,7 +8498,7 @@ mod tests {
 
     #[test]
     fn positioned_children_leave_flow_and_use_relative_containing_blocks() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#stage { position: relative; width: 200px; height: 100px; margin: 0; } #overlay { position: absolute; left: 30px; top: 20px; width: 40px; height: 20px; margin: 0; } #flow { width: 20px; height: 10px; margin: 0; }</style><div id='stage'><div id='overlay'></div><div id='flow'></div></div>",
         )
         .expect("document should parse");
@@ -8513,7 +8526,7 @@ mod tests {
 
     #[test]
     fn fixed_children_anchor_to_the_viewport() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#fixed { position: fixed; right: 10px; bottom: 5px; width: 20px; height: 10px; margin: 0; }</style><div id='fixed'></div>",
         )
         .expect("document should parse");
@@ -8533,7 +8546,7 @@ mod tests {
 
     #[test]
     fn nested_absolute_children_use_the_nearest_positioned_ancestor() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#stage { position: relative; width: 200px; height: 100px; margin: 0; } #wrapper { margin: 0; } #overlay { position: absolute; bottom: 10px; width: 40px; height: 10px; margin: 0; }</style><div id='stage'><div id='wrapper'><div id='overlay'></div></div></div>",
         )
         .expect("document should parse");
@@ -8555,7 +8568,7 @@ mod tests {
 
     #[test]
     fn hidden_overflow_clips_paint_and_hit_testing() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#clip { width: 20px; height: 20px; overflow: hidden; margin: 0; } #child { width: 40px; height: 40px; margin: 0; background: #ff0000; }</style><div id='clip'><div id='child'></div></div>",
         )
         .expect("document should parse");
@@ -8582,7 +8595,7 @@ mod tests {
 
     #[test]
     fn auto_overflow_scrolls_paint_and_hit_testing_with_bounded_offsets() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='content'></div></div>",
         )
         .expect("document should parse");
@@ -8633,7 +8646,7 @@ mod tests {
 
     #[test]
     fn scrollbars_reserve_the_scrollport_and_paint_overflow_tracks() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#viewport { width: 40px; height: 40px; overflow: auto; margin: 0; } #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='content'></div></div>",
         )
         .expect("document should parse");
@@ -8685,7 +8698,7 @@ mod tests {
 
     #[test]
     fn auto_overflow_keeps_fixed_descendants_at_the_viewport() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 40px; height: 80px; margin: 0; } #fixed { position: fixed; left: 70px; top: 12px; width: 8px; height: 8px; margin: 0; }</style><div id='viewport'><div id='content'></div><div id='fixed'></div></div>",
         )
         .expect("document should parse");
@@ -8711,7 +8724,7 @@ mod tests {
 
     #[test]
     fn sticky_children_hold_to_the_scrollport_during_element_scroll() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#viewport { width: 80px; height: 40px; overflow: auto; margin: 0; } #sticky { position: sticky; top: 0; width: 80px; height: 10px; margin: 0; background: #00ff00; } #spacer { width: 80px; height: 80px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='sticky'></div><div id='spacer'></div></div>",
         )
         .expect("document should parse");
@@ -8742,7 +8755,7 @@ mod tests {
 
     #[test]
     fn layout_resolves_inherited_custom_properties_before_paint() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>:root { --accent: #00ff00; --card-width: calc(50% - 10px); margin: 0; } #card { width: var(--card-width); height: calc(10px + 10px); margin: 0; background: var(--accent); }</style><html><div id='card'></div></html>",
         )
         .expect("document should parse");
@@ -8765,7 +8778,7 @@ mod tests {
 
     #[test]
     fn sticky_children_hold_to_the_viewport_during_document_scroll() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#sticky { position: sticky; top: 0; width: 120px; height: 10px; margin: 0; background: #00ff00; } #spacer { width: 120px; height: 160px; margin: 0; background: #ff0000; }</style><div id='sticky'></div><div id='spacer'></div>",
         )
         .expect("document should parse");
@@ -8793,7 +8806,7 @@ mod tests {
 
     #[test]
     fn document_scroll_moves_flow_content_and_keeps_fixed_chrome_in_place() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#content { width: 60px; height: 160px; margin: 0; background: #ff0000; } #fixed { position: fixed; left: 70px; top: 12px; width: 8px; height: 8px; margin: 0; background: #0000ff; }</style><div id='content'></div><div id='fixed'></div>",
         )
         .expect("document should parse");
@@ -8826,7 +8839,7 @@ mod tests {
 
     #[test]
     fn relative_offsets_move_visual_boxes_without_changing_flow() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#first { position: relative; left: 10px; top: 5px; width: 20px; height: 20px; margin: 0; background: #ff0000; } #second { width: 20px; height: 20px; margin: 0; background: #0000ff; }</style><div id='first'></div><div id='second'></div>",
         )
         .expect("document should parse");
@@ -8851,7 +8864,7 @@ mod tests {
 
     #[test]
     fn z_index_orders_overlapping_paint_and_hit_testing() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#low { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 1; background: #ff0000; } #high { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 2; background: #0000ff; }</style><div id='low'></div><div id='high'></div>",
         )
         .expect("document should parse");
@@ -8876,7 +8889,7 @@ mod tests {
 
     #[test]
     fn nested_stacking_contexts_paint_and_hit_test_as_atomic_layers() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#low { position: relative; z-index: 1; width: 30px; height: 30px; margin: 0; background: #ff0000; } #low-child { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: 0; z-index: 100; background: #0000ff; } #high { position: relative; z-index: 2; top: -30px; width: 30px; height: 30px; margin: 0; background: #00ff00; }</style><div id='low'><div id='low-child'></div></div><div id='high'></div>",
         )
         .expect("document should parse");
@@ -8898,7 +8911,7 @@ mod tests {
 
     #[test]
     fn negative_stacking_layers_stay_behind_in_flow_content() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<style>#negative { position: absolute; z-index: -1; left: 0; top: 0; width: 30px; height: 30px; margin: 0; background: #0000ff; } #flow { width: 30px; height: 30px; margin: 0; background: #ff0000; }</style><div id='negative'></div><div id='flow'></div>",
         )
         .expect("document should parse");

@@ -615,13 +615,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::ThreadId;
 
+    // the pages these tests build lay out from the viewport's corner, as most apps reset it
+    const PAGE_RESET: &str = "<style>body { margin: 0 }</style>";
+
     fn bundle(source: &str) -> ResourceBundle {
         let mut resources = ResourceBundle::default();
         resources
             .insert(
                 "/index.html",
                 "text/html; charset=utf-8",
-                source.as_bytes().to_vec(),
+                format!("{PAGE_RESET}{source}").into_bytes(),
             )
             .expect("HTML resource should be accepted");
         resources
@@ -763,7 +766,7 @@ mod tests {
                 height: 100.0,
             })
             .expect("scrolled host page should layout");
-        assert_eq!(layout.root.children[0].children[0].rect.y, -30.0);
+        assert_eq!(layout.body().children[0].children[0].rect.y, -30.0);
     }
 
     #[test]
@@ -808,7 +811,7 @@ mod tests {
                 height: 80.0,
             })
             .expect("sticky page should layout");
-        let sticky = &layout.root.children[0].children[0];
+        let sticky = &layout.body().children[0].children[0];
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
         let click = host
@@ -883,7 +886,7 @@ mod tests {
                 height: 80.0,
             })
             .expect("scrolled scrollbar page should layout");
-        assert_eq!(layout.root.children[0].scroll_offset, (0.0, 10.0));
+        assert_eq!(layout.body().children[0].scroll_offset, (0.0, 10.0));
     }
 
     #[test]
@@ -923,7 +926,7 @@ mod tests {
             .browser()
             .layout(host.viewport())
             .expect("dragged page should layout");
-        let offset = layout.root.children[0].scroll_offset.1;
+        let offset = layout.body().children[0].scroll_offset.1;
         assert!(
             offset > 5.0,
             "a downward drag should scroll down, got {offset}"
@@ -975,7 +978,7 @@ mod tests {
                 height: 100.0,
             })
             .expect("scrolled document should layout");
-        assert_eq!(layout.root.children[0].rect.y, -30.0);
+        assert_eq!(layout.body().children[0].rect.y, -30.0);
     }
 
     #[test]
@@ -1942,9 +1945,9 @@ mod tests {
         // halfway the width and the rotation are both in flight
         host.input(InputEvent::AdvanceTime(50)).expect("tick");
         let layout = host.browser().layout(host.viewport()).expect("layout");
-        let width = layout.root.children[0].rect.width;
+        let width = layout.body().children[0].rect.width;
         assert!(width > 60.0 && width < 180.0, "{width}");
-        assert!(layout.root.children[0].transform.is_some());
+        assert!(layout.body().children[0].transform.is_some());
         host.input(InputEvent::AdvanceTime(100)).expect("tick");
         assert_eq!(
             status_text(&host),
@@ -2000,7 +2003,7 @@ mod tests {
             .browser()
             .layout(host.viewport())
             .expect("layout")
-            .root
+            .body()
             .children[0]
             .rect
             .width;

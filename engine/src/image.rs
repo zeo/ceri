@@ -290,7 +290,7 @@ pub fn rasterize_icon(bytes: &[u8], size: u32) -> Option<(Vec<u8>, u32)> {
 }
 
 pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
-    let document = Document::parse(source).map_err(|error| ImageError(error.to_string()))?;
+    let document = Document::parse_markup(source).map_err(|error| ImageError(error.to_string()))?;
     let root_node = document
         .element_children(document.root())
         .find(|&node| {

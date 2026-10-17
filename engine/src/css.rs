@@ -6825,7 +6825,7 @@ mod tests {
 
     #[test]
     fn inherits_custom_properties_and_resolves_fallbacks() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<div id='theme' style='--Accent: #00ff00'><div id='card' style='background: var(--Accent); color: var(--missing, #0000ff); padding: var(--gap, 4px); --gap: 8px; --loop: var(--loop, #123456)'></div></div>",
         )
         .expect("document should parse");
@@ -6848,8 +6848,8 @@ mod tests {
 
     #[test]
     fn matches_root_and_resolves_calc_using_custom_properties() {
-        let document =
-            Document::parse("<html><div id='card'></div></html>").expect("document should parse");
+        let document = Document::parse_markup("<html><div id='card'></div></html>")
+            .expect("document should parse");
         let stylesheet = Stylesheet::parse(
             ":root { --accent: #00ff00; } #card { width: calc(100% - 20px); color: var(--accent); }",
         )
@@ -7101,7 +7101,7 @@ mod tests {
             "p + p { color: red; } h1 ~ p { background-color: green; } li:first-child { color: blue; } li:last-child { color: yellow; } li:nth-child(2n) { border-width: 3px; }",
         )
         .expect("stylesheet should parse");
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<ul><li></li><li></li><li></li></ul><section><h1></h1> <p></p><p></p></section>",
         )
         .expect("document should parse");
@@ -7159,7 +7159,7 @@ mod tests {
             "button:hover { color: red; } button:disabled { color: yellow; } button:enabled { background-color: green; } input:checked { color: blue; } input:disabled { color: yellow; }",
         )
         .expect("stylesheet should parse");
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<button id='hovered'></button><input id='box' type='checkbox' checked><button id='off'></button>",
         )
         .expect("document should parse");

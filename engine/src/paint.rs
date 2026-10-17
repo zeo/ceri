@@ -3026,7 +3026,7 @@ mod tests {
 
     // node ids for hand-built layout trees, taken from one fixed document shape
     fn node(path: &[usize]) -> NodeId {
-        crate::dom::Document::parse("<i></i><i><i></i></i>")
+        crate::dom::Document::parse_markup("<i></i><i><i></i></i>")
             .expect("fixture parses")
             .node_at(path)
     }
@@ -3135,7 +3135,7 @@ mod tests {
 
     #[test]
     fn rounded_gradient_and_faded_surfaces_reach_the_pixels() {
-        let document = Document::parse("<html><body><div id='card'></div></body></html>")
+        let document = Document::parse_markup("<html><body><div id='card'></div></body></html>")
             .expect("document should parse");
         let stylesheet = Stylesheet::parse(
             "html, body { margin: 0 } #card { width: 40px; height: 40px; border-radius: 12px; background: #ff0000 }",
@@ -3203,7 +3203,7 @@ mod tests {
     #[test]
     fn borders_paint_each_side_by_style_and_rounded_overflow_clips_children() {
         let render = |html: &str, css: &str| {
-            let document = Document::parse(&format!("<html><body>{html}</body></html>"))
+            let document = Document::parse_markup(&format!("<html><body>{html}</body></html>"))
                 .expect("document should parse");
             let stylesheet = Stylesheet::parse(css).expect("stylesheet should parse");
             paint(&crate::layout::layout(
@@ -3309,7 +3309,7 @@ mod tests {
 
     #[test]
     fn text_decorations_shadows_and_ellipses_paint() {
-        let document = Document::parse(
+        let document = Document::parse_markup(
             "<html><body><p id='under'>ab</p><p id='shadow'>ab</p><p id='cut'>abcdefghijklmnop</p></body></html>",
         )
         .expect("document should parse");

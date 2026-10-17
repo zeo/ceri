@@ -3455,13 +3455,16 @@ mod tests {
         }
     }
 
+    // the pages these tests build lay out from the viewport's corner, as most apps reset it
+    const PAGE_RESET: &str = "<style>body { margin: 0 }</style>";
+
     fn bundle(shell: &str) -> ResourceBundle {
         let mut resources = ResourceBundle::default();
         resources
             .insert(
                 "/index.html",
                 "text/html; charset=utf-8",
-                shell.as_bytes().to_vec(),
+                format!("{PAGE_RESET}{shell}").into_bytes(),
             )
             .expect("shell should be accepted");
         resources
@@ -3949,7 +3952,7 @@ mod tests {
             {
                 let document = browser.document().unwrap();
                 let document = document.borrow();
-                document.element_text_content(document.node_at(&[0]))
+                document.element_text_content(document.node_at(&[0, 1]))
             }
             .as_deref(),
             Some("home")
@@ -5147,7 +5150,7 @@ mod tests {
         assert_eq!(
             document.element_text_content(status).as_deref(),
             Some(
-                "true,true,open,true,,2,rgb(0, 0, 255),rgb(255, 0, 0),4px,20,true,true,1,true,true,inner:text|host:text:7|host:card:5"
+                "true,true,open,true,,2,rgb(0, 0, 255),rgb(255, 0, 0),4px,20,true,true,1,true,true,inner:text|host:text:9|host:card:7"
             )
         );
     }
@@ -5528,7 +5531,7 @@ mod tests {
         assert_eq!(
             document
                 .borrow()
-                .element_text_content(document.borrow().node_at(&[0]))
+                .element_text_content(document.borrow().node_at(&[0, 1]))
                 .as_deref(),
             Some("shell")
         );
@@ -6523,7 +6526,7 @@ A</div>
                 height: 100.0,
             })
             .expect("scrolled page should layout");
-        assert_eq!(layout.root.children[0].children[0].rect.y, -30.0);
+        assert_eq!(layout.body().children[0].children[0].rect.y, -30.0);
         assert!(
             browser
                 .scroll_at(
@@ -6583,7 +6586,7 @@ A</div>
                 .expect("sticky wheel input should scroll")
         );
         let layout = browser.layout(viewport).expect("sticky page should layout");
-        let sticky = &layout.root.children[0].children[0];
+        let sticky = &layout.body().children[0].children[0];
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
         let canvas = browser.paint(viewport).expect("sticky page should paint");
@@ -6633,7 +6636,7 @@ A</div>
                 .expect("sticky wheel input should scroll")
         );
         let layout = browser.layout(viewport).expect("sticky page should layout");
-        let sticky = &layout.root.children[0];
+        let sticky = &layout.body().children[0];
         assert_eq!(sticky.rect.y, -20.0);
         assert_eq!(sticky.visual_offset, (0.0, 20.0));
         let canvas = browser.paint(viewport).expect("sticky page should paint");
@@ -6674,7 +6677,7 @@ A</div>
         let layout = browser
             .layout(viewport)
             .expect("custom-property page should layout");
-        let card = &layout.root.children[0].children[0];
+        let card = &layout.body().children[0];
         assert_eq!(card.rect.width, 40.0);
         assert_eq!(card.rect.height, 20.0);
         let canvas = browser
@@ -6736,8 +6739,8 @@ A</div>
         let layout = browser
             .layout(viewport)
             .expect("scrolled scrollbar page should layout");
-        assert_eq!(layout.root.children[0].scroll_offset, (0.0, 10.0));
-        assert_eq!(layout.root.children[0].children[0].rect.y, -10.0);
+        assert_eq!(layout.body().children[0].scroll_offset, (0.0, 10.0));
+        assert_eq!(layout.body().children[0].children[0].rect.y, -10.0);
     }
 
     #[test]
@@ -6793,8 +6796,8 @@ A</div>
         let layout = browser
             .layout(viewport)
             .expect("scrolled document should layout");
-        assert_eq!(layout.root.children[0].rect.y, -30.0);
-        assert_eq!(layout.root.children[1].rect.y, 0.0);
+        assert_eq!(layout.body().children[0].rect.y, -30.0);
+        assert_eq!(layout.body().children[1].rect.y, 0.0);
         assert!(
             browser
                 .scroll_at(viewport, 10.0, 10.0, 0.0, 100.0)
@@ -6897,7 +6900,7 @@ A</div>
             })
             .expect("page should layout");
         assert_eq!(
-            layout.root.children[0].text[0].color,
+            layout.body().children[0].text[0].color,
             crate::Color::opaque(66, 211, 180)
         );
     }
@@ -6961,7 +6964,7 @@ A</div>
             })
             .expect("provider-backed page should layout");
         assert_eq!(
-            layout.root.children[0].text[0].color,
+            layout.body().children[0].text[0].color,
             Color::opaque(66, 211, 180)
         );
     }
@@ -7172,7 +7175,7 @@ A</div>
             })
             .expect("narrow layout should build");
         assert_eq!(
-            narrow.root.children[0].text[0].color,
+            narrow.body().children[0].text[0].color,
             Color::opaque(255, 0, 0)
         );
         let wide = browser
@@ -7182,7 +7185,7 @@ A</div>
             })
             .expect("wide layout should build");
         assert_eq!(
-            wide.root.children[0].text[0].color,
+            wide.body().children[0].text[0].color,
             Color::opaque(0, 0, 255)
         );
         let short = browser
@@ -7192,7 +7195,7 @@ A</div>
             })
             .expect("short layout should build");
         assert_eq!(
-            short.root.children[0].text[0].color,
+            short.body().children[0].text[0].color,
             Color::opaque(66, 211, 180)
         );
     }
@@ -7678,10 +7681,10 @@ A</div>
             })
             .expect("initial layout should build");
         assert_eq!(
-            initial.root.children[0].background,
+            initial.body().children[0].background,
             Color::opaque(17, 17, 17)
         );
-        assert_eq!(initial.root.children[0].border.widths.top, 0.0);
+        assert_eq!(initial.body().children[0].border.widths.top, 0.0);
 
         assert!(
             browser
@@ -7703,7 +7706,7 @@ A</div>
             })
             .expect("hovered layout should build");
         assert_eq!(
-            hovered.root.children[0].background,
+            hovered.body().children[0].background,
             Color::opaque(255, 0, 0)
         );
 
@@ -7725,7 +7728,7 @@ A</div>
                 height: 180.0,
             })
             .expect("focused layout should build");
-        assert_eq!(focused.root.children[0].border.widths.top, 3.0);
+        assert_eq!(focused.body().children[0].border.widths.top, 3.0);
 
         assert!(browser.click_id("check").expect("checkbox should click"));
         let checked = browser
@@ -7735,7 +7738,7 @@ A</div>
             })
             .expect("checked layout should build");
         assert_eq!(
-            checked.root.children[1].background,
+            checked.body().children[1].background,
             Color::opaque(0, 0, 255)
         );
     }

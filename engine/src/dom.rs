@@ -270,7 +270,17 @@ impl Document {
     pub fn parse(source: &str) -> Result<Self, ParseError> {
         let mut document = Self::new();
         let root = document.root;
-        document.parse_into(root, source)?;
+        document.parse_into(root, source, true)?;
+        document.orphans.clear();
+        Ok(document)
+    }
+
+    // markup with no implied html, head or body, as an svg image or a bare fragment of markup
+    // is built
+    pub(crate) fn parse_markup(source: &str) -> Result<Self, ParseError> {
+        let mut document = Self::new();
+        let root = document.root;
+        document.parse_into(root, source, false)?;
         document.orphans.clear();
         Ok(document)
     }
@@ -278,97 +288,37 @@ impl Document {
     // parses markup into a new fragment of this document
     pub fn parse_fragment(&mut self, source: &str) -> Result<NodeId, ParseError> {
         let fragment = self.create_fragment();
-        if let Err(error) = self.parse_into(fragment, source) {
+        if let Err(error) = self.parse_into(fragment, source, false) {
             self.free_tree(fragment);
             return Err(error);
         }
         Ok(fragment)
     }
 
-    fn parse_into(&mut self, parent: NodeId, source: &str) -> Result<(), ParseError> {
+    fn parse_into(
+        &mut self,
+        parent: NodeId,
+        source: &str,
+        whole_document: bool,
+    ) -> Result<(), ParseError> {
         let tokens = tokenize(source)?;
-        // open elements by name, with the node their children go into
-        let mut stack: Vec<(NodeId, NodeId)> = Vec::new();
-        let mut created = Vec::new();
-        let result = (|| {
-            for token in tokens {
-                let target = stack.last().map_or(parent, |&(_, target)| target);
-                match token {
-                    Token::Start {
-                        name,
-                        attrs,
-                        self_closing,
-                    } => {
-                        let in_svg = stack.iter().any(|&(open, _)| {
-                            self.element(open)
-                                .is_some_and(|element| element.namespace == Namespace::Svg)
-                        });
-                        let namespace = if name == "svg" || in_svg {
-                            Namespace::Svg
-                        } else if name == "math" {
-                            Namespace::MathMl
-                        } else {
-                            Namespace::Html
-                        };
-                        let void = is_void_element(&name);
-                        let template = name == "template";
-                        let id = self.allocate(NodeKind::Element(Element {
-                            name,
-                            namespace,
-                            attrs,
-                        }));
-                        created.push(id);
-                        self.append_raw(target, id);
-                        if !(self_closing || void) {
-                            let content = if template {
-                                let content = self.allocate(NodeKind::Fragment);
-                                self.template_contents.insert(id, content);
-                                content
-                            } else {
-                                id
-                            };
-                            stack.push((id, content));
-                        }
-                    }
-                    Token::End { name, offset } => {
-                        let Some(index) = stack.iter().rposition(|&(open, _)| {
-                            self.element(open)
-                                .is_some_and(|element| element.name == name)
-                        }) else {
-                            return Err(ParseError {
-                                offset,
-                                message: format!("closing tag </{name}> has no open element"),
-                            });
-                        };
-                        stack.truncate(index);
-                    }
-                    Token::Text(text) => {
-                        if !text.is_empty() {
-                            let id = self.allocate(NodeKind::Text(text));
-                            created.push(id);
-                            self.append_raw(target, id);
-                        }
-                    }
-                    Token::Comment(text) => {
-                        let id = self.allocate(NodeKind::Comment(text));
-                        created.push(id);
-                        self.append_raw(target, id);
-                    }
-                }
-            }
-            Ok(())
-        })();
+        let mut builder = TreeBuilder {
+            parent,
+            whole_document,
+            stack: Vec::new(),
+            created: Vec::new(),
+            html: None,
+            head: None,
+            body: None,
+        };
+        for token in tokens {
+            builder.token(self, token);
+        }
+        builder.finish(self);
+        let created = builder.created;
         let created_set: std::collections::HashSet<NodeId> = created.iter().copied().collect();
         self.orphans.retain(|id| !created_set.contains(id));
-        if result.is_err() {
-            for child in self.children(parent).to_vec() {
-                if created_set.contains(&child) {
-                    self.detach_raw(child);
-                    self.free_tree(child);
-                }
-            }
-        }
-        result
+        Ok(())
     }
 
     fn allocate(&mut self, kind: NodeKind) -> NodeId {
@@ -1789,11 +1739,22 @@ impl Document {
             node: self.root,
             disabled: false,
             focusable: false,
-            children: self
-                .element_children(self.root)
-                .filter_map(|child| self.accessibility_node(child))
-                .collect(),
+            children: self.accessibility_children(self.root),
         }
+    }
+
+    // html and body carry no role of their own and head nothing to present, so their content
+    // sits directly under the document
+    fn accessibility_children(&self, id: NodeId) -> Vec<AccessibilityNode> {
+        let mut children = Vec::new();
+        for child in self.element_children(id) {
+            match self.element(child).map(|element| element.name.as_str()) {
+                Some("head") => {}
+                Some("html" | "body") => children.extend(self.accessibility_children(child)),
+                _ => children.extend(self.accessibility_node(child)),
+            }
+        }
+        children
     }
 
     fn accessibility_node(&self, id: NodeId) -> Option<AccessibilityNode> {
@@ -1808,10 +1769,7 @@ impl Document {
             node: id,
             disabled: is_accessibility_disabled(element),
             focusable: is_accessibility_focusable(element),
-            children: self
-                .element_children(id)
-                .filter_map(|child| self.accessibility_node(child))
-                .collect(),
+            children: self.accessibility_children(id),
         })
     }
 
@@ -2162,6 +2120,458 @@ fn escape_html_attribute(text: &str, output: &mut String) {
     }
 }
 
+// elements whose start tag closes an open p, as the html tree construction rules list them
+const CLOSES_PARAGRAPH: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "center",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "li",
+    "dd",
+    "dt",
+    "listing",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "plaintext",
+    "pre",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "ul",
+    "xmp",
+];
+// elements that only belong in head before the body starts
+const HEAD_CONTENT: &[&str] = &[
+    "base", "basefont", "bgsound", "link", "meta", "noframes", "script", "style", "template",
+    "title",
+];
+// the default scope's boundaries, past which a search for an open element stops
+const SCOPE_BOUNDARIES: &[&str] = &[
+    "applet",
+    "caption",
+    "html",
+    "table",
+    "td",
+    "th",
+    "marquee",
+    "object",
+    "template",
+    "foreignObject",
+    "desc",
+];
+
+fn is_heading(name: &str) -> bool {
+    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+// the html tree construction rules a document and its fragments are built by: implied html,
+// head and body in a whole document, implied end tags, implied table sections, and end tags
+// with nothing open to close ignored
+struct TreeBuilder {
+    parent: NodeId,
+    whole_document: bool,
+    // open elements, with the node their children go into
+    stack: Vec<(NodeId, NodeId)>,
+    created: Vec<NodeId>,
+    html: Option<NodeId>,
+    head: Option<NodeId>,
+    body: Option<NodeId>,
+}
+
+impl TreeBuilder {
+    fn target(&self) -> NodeId {
+        self.stack.last().map_or(self.parent, |&(_, target)| target)
+    }
+
+    fn name(document: &Document, id: NodeId) -> &str {
+        document
+            .element(id)
+            .map_or("", |element| element.name.as_str())
+    }
+
+    fn current(&self, document: &Document) -> Option<String> {
+        self.stack
+            .last()
+            .map(|&(open, _)| Self::name(document, open).to_string())
+    }
+
+    // where an open element sits on the stack, when no boundary of the default scope or the
+    // extra ones hides it
+    fn in_scope(&self, document: &Document, names: &[&str], extra: &[&str]) -> Option<usize> {
+        self.in_bounds(document, names, |name| {
+            SCOPE_BOUNDARIES.contains(&name) || extra.contains(&name)
+        })
+    }
+
+    // the table scope stops only at html, table and template
+    fn in_table_scope(&self, document: &Document, names: &[&str]) -> Option<usize> {
+        self.in_bounds(document, names, |name| {
+            matches!(name, "html" | "table" | "template")
+        })
+    }
+
+    fn in_bounds(
+        &self,
+        document: &Document,
+        names: &[&str],
+        boundary: impl Fn(&str) -> bool,
+    ) -> Option<usize> {
+        for (index, &(open, _)) in self.stack.iter().enumerate().rev() {
+            let name = Self::name(document, open);
+            if names.contains(&name) {
+                return Some(index);
+            }
+            if boundary(name) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn close_paragraph(&mut self, document: &Document) {
+        if let Some(index) = self.in_scope(document, &["p"], &["button"]) {
+            self.stack.truncate(index);
+        }
+    }
+
+    fn insert(
+        &mut self,
+        document: &mut Document,
+        target: NodeId,
+        name: String,
+        attrs: BTreeMap<String, String>,
+        self_closing: bool,
+    ) -> NodeId {
+        let in_svg = self.stack.iter().any(|&(open, _)| {
+            document
+                .element(open)
+                .is_some_and(|element| element.namespace == Namespace::Svg)
+        });
+        let namespace = if name == "svg" || in_svg {
+            Namespace::Svg
+        } else if name == "math" {
+            Namespace::MathMl
+        } else {
+            Namespace::Html
+        };
+        let void = is_void_element(&name);
+        let template = name == "template";
+        let id = document.allocate(NodeKind::Element(Element {
+            name,
+            namespace,
+            attrs,
+        }));
+        self.created.push(id);
+        document.append_raw(target, id);
+        if !(self_closing || void) {
+            let content = if template {
+                let content = document.allocate(NodeKind::Fragment);
+                document.template_contents.insert(id, content);
+                content
+            } else {
+                id
+            };
+            self.stack.push((id, content));
+        }
+        id
+    }
+
+    fn implied(&mut self, document: &mut Document, name: &str) -> NodeId {
+        let target = self.target();
+        self.insert(document, target, name.to_string(), BTreeMap::new(), false)
+    }
+
+    fn ensure_html(&mut self, document: &mut Document) -> NodeId {
+        if let Some(html) = self.html {
+            return html;
+        }
+        let html = self.implied(document, "html");
+        self.html = Some(html);
+        html
+    }
+
+    fn ensure_head(&mut self, document: &mut Document) -> NodeId {
+        if let Some(head) = self.head {
+            return head;
+        }
+        self.ensure_html(document);
+        let head = self.implied(document, "head");
+        self.head = Some(head);
+        head
+    }
+
+    fn ensure_body(&mut self, document: &mut Document) {
+        if self.body.is_some() {
+            return;
+        }
+        self.ensure_head(document);
+        self.leave_head(document);
+        let body = self.implied(document, "body");
+        self.body = Some(body);
+    }
+
+    fn leave_head(&mut self, document: &Document) {
+        if let Some(index) = self
+            .stack
+            .iter()
+            .position(|&(open, _)| Self::name(document, open) == "head")
+        {
+            self.stack.truncate(index);
+        }
+    }
+
+    fn merge_attributes(document: &mut Document, id: NodeId, attrs: BTreeMap<String, String>) {
+        if let Some(NodeKind::Element(element)) = document.data_mut(id).map(|data| &mut data.kind) {
+            for (name, value) in attrs {
+                element.attrs.entry(name).or_insert(value);
+            }
+        }
+    }
+
+    fn token(&mut self, document: &mut Document, token: Token) {
+        match token {
+            Token::Start {
+                name,
+                attrs,
+                self_closing,
+            } => self.start(document, name, attrs, self_closing),
+            Token::End { name } => self.end(document, &name),
+            Token::Text(text) => {
+                if text.is_empty() {
+                    return;
+                }
+                if self.whole_document && self.body.is_none() {
+                    let in_head_element = self
+                        .current(document)
+                        .is_some_and(|current| current != "head" && current != "html");
+                    if !in_head_element {
+                        if text
+                            .chars()
+                            .all(|character| character.is_ascii_whitespace())
+                        {
+                            if self.html.is_none() {
+                                return;
+                            }
+                        } else {
+                            self.ensure_body(document);
+                        }
+                    }
+                }
+                let id = document.allocate(NodeKind::Text(text));
+                self.created.push(id);
+                let target = self.target();
+                document.append_raw(target, id);
+            }
+            Token::Comment(text) => {
+                let id = document.allocate(NodeKind::Comment(text));
+                self.created.push(id);
+                let target = self.target();
+                document.append_raw(target, id);
+            }
+        }
+    }
+
+    fn start(
+        &mut self,
+        document: &mut Document,
+        name: String,
+        attrs: BTreeMap<String, String>,
+        self_closing: bool,
+    ) {
+        let foreign = self.stack.iter().any(|&(open, _)| {
+            document
+                .element(open)
+                .is_some_and(|element| element.namespace != Namespace::Html)
+        });
+        if self.whole_document && !foreign {
+            match name.as_str() {
+                "html" => {
+                    match self.html {
+                        Some(html) => Self::merge_attributes(document, html, attrs),
+                        None => {
+                            let target = self.target();
+                            let html = self.insert(document, target, name, attrs, false);
+                            self.html = Some(html);
+                        }
+                    }
+                    return;
+                }
+                "head" => {
+                    if self.head.is_none() && self.body.is_none() {
+                        self.ensure_html(document);
+                        let target = self.target();
+                        let head = self.insert(document, target, name, attrs, false);
+                        self.head = Some(head);
+                    }
+                    return;
+                }
+                "body" => {
+                    match self.body {
+                        Some(body) => Self::merge_attributes(document, body, attrs),
+                        None => {
+                            self.ensure_head(document);
+                            self.leave_head(document);
+                            let target = self.target();
+                            let body = self.insert(document, target, name, attrs, false);
+                            self.body = Some(body);
+                        }
+                    }
+                    return;
+                }
+                _ if self.body.is_none() && HEAD_CONTENT.contains(&name.as_str()) => {
+                    let head = self.ensure_head(document);
+                    let inside = self.stack.iter().any(|&(open, _)| open == head);
+                    let target = if inside { self.target() } else { head };
+                    self.insert(document, target, name, attrs, self_closing);
+                    return;
+                }
+                _ => self.ensure_body(document),
+            }
+        }
+        if !foreign {
+            self.imply_end_tags(document, &name);
+        }
+        let target = self.target();
+        self.insert(document, target, name, attrs, self_closing);
+    }
+
+    // closes what a start tag implies is finished, and opens the table sections it needs
+    fn imply_end_tags(&mut self, document: &mut Document, name: &str) {
+        match name {
+            "li" => {
+                if let Some(index) = self.in_scope(document, &["li"], &["ol", "ul"]) {
+                    self.stack.truncate(index);
+                }
+            }
+            "dd" | "dt" => {
+                if let Some(index) = self.in_scope(document, &["dd", "dt"], &["dl"]) {
+                    self.stack.truncate(index);
+                }
+            }
+            "option" => {
+                if self.current(document).as_deref() == Some("option") {
+                    self.stack.pop();
+                }
+                return;
+            }
+            "optgroup" => {
+                if self.current(document).as_deref() == Some("option") {
+                    self.stack.pop();
+                }
+                if self.current(document).as_deref() == Some("optgroup") {
+                    self.stack.pop();
+                }
+                return;
+            }
+            "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => {
+                if let Some(index) = self.in_table_scope(
+                    document,
+                    &["tbody", "thead", "tfoot", "caption", "colgroup"],
+                ) {
+                    self.stack.truncate(index);
+                }
+                return;
+            }
+            "tr" => {
+                if let Some(index) = self.in_table_scope(document, &["tr"]) {
+                    self.stack.truncate(index);
+                }
+                if self.current(document).as_deref() == Some("table") {
+                    self.implied(document, "tbody");
+                }
+                return;
+            }
+            "td" | "th" => {
+                if let Some(index) = self.in_table_scope(document, &["td", "th"]) {
+                    self.stack.truncate(index);
+                }
+                if self.current(document).as_deref() == Some("table") {
+                    self.implied(document, "tbody");
+                }
+                if matches!(
+                    self.current(document).as_deref(),
+                    Some("tbody" | "thead" | "tfoot")
+                ) {
+                    self.implied(document, "tr");
+                }
+                return;
+            }
+            "col" => {
+                if self.current(document).as_deref() == Some("table") {
+                    self.implied(document, "colgroup");
+                }
+                return;
+            }
+            _ => {}
+        }
+        if CLOSES_PARAGRAPH.contains(&name) {
+            self.close_paragraph(document);
+        }
+        if is_heading(name)
+            && self
+                .current(document)
+                .is_some_and(|current| is_heading(&current))
+        {
+            self.stack.pop();
+        }
+    }
+
+    fn end(&mut self, document: &mut Document, name: &str) {
+        if self.whole_document && matches!(name, "html" | "body") {
+            return;
+        }
+        if self.whole_document && name == "head" {
+            self.leave_head(document);
+            return;
+        }
+        if name == "p" && self.in_scope(document, &["p"], &["button"]).is_none() {
+            // a closing p with no paragraph open stands for an empty one
+            self.implied(document, "p");
+        }
+        let found = if is_heading(name) {
+            self.in_scope(document, &["h1", "h2", "h3", "h4", "h5", "h6"], &[])
+        } else {
+            self.stack
+                .iter()
+                .rposition(|&(open, _)| Self::name(document, open) == name)
+        };
+        if let Some(index) = found {
+            self.stack.truncate(index);
+        }
+    }
+
+    // a whole document always has its html, head and body
+    fn finish(&mut self, document: &mut Document) {
+        if self.whole_document {
+            self.ensure_body(document);
+        }
+    }
+}
+
 fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let mut cursor = 0;
@@ -2211,7 +2621,6 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
             })?;
             tokens.push(Token::End {
                 name: name.to_ascii_lowercase(),
-                offset: start,
             });
         } else {
             let (name, attrs, self_closing) = parse_start_tag(raw, start)?;
@@ -2390,7 +2799,6 @@ enum Token {
     },
     End {
         name: String,
-        offset: usize,
     },
     Text(String),
     Comment(String),
@@ -2464,12 +2872,51 @@ mod tests {
         let document =
             Document::parse(r#"<main data-kind='demo'><p>Hello <span>world</span></p></main>"#)
                 .expect("document should parse");
-        let main = document.document_element().expect("main should exist");
+        let html = document.document_element().expect("html should exist");
+        let names = |id| {
+            document
+                .element_children(id)
+                .filter_map(|child| document.element(child).map(|element| element.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(document.element(html).expect("html").name, "html");
+        assert_eq!(names(html), ["head", "body"]);
+        let main = element_named(&document, "main");
         let element = document.element(main).expect("main is an element");
-        assert_eq!(element.name, "main");
         assert_eq!(element.attr("data-kind"), Some("demo"));
         assert_eq!(document.children(main).len(), 1);
         assert_eq!(document.text_content(main), "Hello world");
+    }
+
+    #[test]
+    fn builds_implied_document_elements_and_end_tags() {
+        let outline = |document: &Document| {
+            let html = document.document_element().expect("html");
+            document.outer_html(html)
+        };
+        let document = Document::parse(
+            "<!doctype html><title>t</title><link rel=icon href=a><p>one<p>two<ul><li>a<li>b</ul><dl><dt>x<dd>y</dl><select><option>1<option>2</select><table><tr><td>c<td>d<tr><th>e</table></p><h1>h<h2>i</h2>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            outline(&document),
+            "<html><head><title>t</title><link href=\"a\" rel=\"icon\"></head><body><p>one</p><p>two</p><ul><li>a</li><li>b</li></ul><dl><dt>x</dt><dd>y</dd></dl><select><option>1</option><option>2</option></select><table><tbody><tr><td>c</td><td>d</td></tr><tr><th>e</th></tr></tbody></table><p></p><h1>h</h1><h2>i</h2></body></html>"
+        );
+        let explicit = Document::parse(
+            "<html lang=en><head><style>p{}</style></head>\n<body class=app><p>x</p></body></html>\n<body id=late>",
+        )
+        .expect("document should parse");
+        assert_eq!(
+            outline(&explicit),
+            "<html lang=\"en\"><head><style>p{}</style></head>\n<body class=\"app\" id=\"late\"><p>x</p>\n</body></html>"
+        );
+        let empty = Document::parse("").expect("an empty document parses");
+        assert_eq!(outline(&empty), "<html><head></head><body></body></html>");
+        let svg = Document::parse("<svg><p>kept</p></svg>").expect("document should parse");
+        assert_eq!(
+            outline(&svg),
+            "<html><head></head><body><svg><p>kept</p></svg></body></html>"
+        );
     }
 
     #[test]
@@ -2478,7 +2925,7 @@ mod tests {
             "<main>a<!-- note -->b<template id='row'><li>item</li></template></main>",
         )
         .expect("document should parse");
-        let main = document.document_element().expect("main should exist");
+        let main = element_named(&document, "main");
         assert_eq!(document.children(main).len(), 4);
         assert_eq!(
             document.character_data(document.children(main)[1]),
@@ -2523,7 +2970,7 @@ mod tests {
         assert_eq!(tree.role, "document");
         let main = &tree.children[0];
         assert_eq!(main.role, "main");
-        assert_eq!(main.node, document.document_element().expect("main"));
+        assert_eq!(main.node, element_named(&document, "main"));
         let summary = main
             .children
             .iter()
@@ -2775,7 +3222,9 @@ mod tests {
             .parse_fragment("<b>bold</b> text")
             .expect("fragment parses");
         assert_eq!(document.children(fragment).len(), 2);
-        assert!(document.parse_fragment("<b></i>").is_err());
+        // an end tag with nothing open to close is dropped
+        let stray = document.parse_fragment("<b></i>").expect("fragment parses");
+        assert_eq!(document.inner_html(stray), "<b></b>");
         assert_eq!(document.node_text_offset(tail), Some(5));
         assert_eq!(document.text_point(7), Some((tail, 2)));
     }

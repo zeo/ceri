@@ -14227,7 +14227,7 @@ mod tests {
 
     fn document(source: &str) -> Rc<RefCell<Document>> {
         Rc::new(RefCell::new(
-            Document::parse(source).expect("document should parse"),
+            Document::parse_markup(source).expect("document should parse"),
         ))
     }
 
