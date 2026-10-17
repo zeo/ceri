@@ -705,6 +705,20 @@ impl Default for LayoutEnvironment {
 }
 
 thread_local! {
+    // the soonest milliseconds until an animation the cascade applied changes what it shows
+    static ANIMATION_WAKE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn take_animation_wake() -> Option<u64> {
+    ANIMATION_WAKE.with(std::cell::Cell::take)
+}
+
+fn note_animation_wake(delay: u64) {
+    ANIMATION_WAKE
+        .with(|wake| wake.set(Some(wake.get().map_or(delay, |soonest| soonest.min(delay)))));
+}
+
+thread_local! {
     static LAYOUT_ENVIRONMENT: std::cell::Cell<LayoutEnvironment> =
         const { std::cell::Cell::new(LayoutEnvironment {
             viewport: crate::layout::Size { width: 800.0, height: 600.0 },
@@ -1805,6 +1819,37 @@ pub(crate) struct Transition {
 
 pub(crate) const MAX_TRANSITIONS: usize = 6;
 
+impl Animation {
+    // milliseconds from a time since the animation started until its output next changes:
+    // the end of its delay, the next step of a stepped timing, at once for a continuous one,
+    // and never once it has finished
+    pub(crate) fn next_change(&self, now: u64) -> Option<u64> {
+        if self.duration == 0 {
+            return None;
+        }
+        if now < self.delay {
+            return Some(self.delay - now);
+        }
+        let elapsed = (now - self.delay) as f64;
+        let duration = self.duration as f64;
+        let remaining = self
+            .iterations
+            .map(|iterations| f64::from(iterations) * duration - elapsed);
+        if remaining.is_some_and(|remaining| remaining <= 0.0) {
+            return None;
+        }
+        let change = match self.timing {
+            Timing::Steps(count, _) => {
+                let step = duration / f64::from(count.max(1));
+                step - elapsed % step
+            }
+            Timing::Linear | Timing::CubicBezier(..) => 0.0,
+        };
+        let change = remaining.map_or(change, |remaining| change.min(remaining));
+        Some(change.ceil() as u64)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Animation {
     pub(crate) name: String,
@@ -2137,6 +2182,9 @@ impl Stylesheet {
                 .and_then(|node| state.animation_starts.get(&node).copied())
                 .unwrap_or(0);
             let now = state.clock.saturating_sub(started);
+            if let Some(delay) = animation.next_change(now) {
+                note_animation_wake(delay);
+            }
             for (property, value) in self.animated_values(&animation, now, &base_values) {
                 let Some(value) = resolve_custom_value(&value, custom_properties) else {
                     continue;
@@ -6679,6 +6727,31 @@ mod tests {
         let (x, y) = style_at(100, true).translate;
         assert_eq!(x.resolve(100.0, 16.0), Some(0.0));
         assert_eq!(y.resolve(100.0, 16.0), Some(-6.0));
+    }
+
+    #[test]
+    fn animations_report_when_their_output_next_changes() {
+        let animation = |timing: Timing, iterations: Option<f32>| Animation {
+            name: "blink".to_string(),
+            duration: 1000,
+            delay: 200,
+            timing,
+            iterations,
+            alternate: false,
+        };
+        let stepped = animation(Timing::Steps(2, StepPosition::End), None);
+        assert_eq!(stepped.next_change(50), Some(150), "waits out the delay");
+        assert_eq!(stepped.next_change(200), Some(500));
+        assert_eq!(stepped.next_change(950), Some(250));
+        assert_eq!(stepped.next_change(1300), Some(400));
+        assert_eq!(animation(Timing::Linear, None).next_change(600), Some(0));
+        let once = animation(Timing::Steps(4, StepPosition::End), Some(1.0));
+        assert_eq!(once.next_change(1100), Some(100));
+        assert_eq!(
+            once.next_change(1200),
+            None,
+            "a finished animation never changes"
+        );
     }
 
     #[test]

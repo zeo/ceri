@@ -1,12 +1,15 @@
 use crate::AccessibilityNode;
+use crate::bridge::Waker;
 use crate::layout::Size;
 use crate::navigation::{
     Browser, NavigationError, NavigationFailure, NavigationStatus, UserPreferences,
 };
 use crate::paint::Canvas;
 pub use crate::script::KeyModifiers;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
@@ -148,6 +151,10 @@ pub enum EngineWorkerEvent {
         request_id: u64,
         failure: Option<NavigationFailure>,
     },
+    // a live worker's page changed on its own and has a new frame to render
+    Invalidated,
+    // a live worker's own clock failed
+    Failed(NavigationError),
 }
 
 enum EngineWorkerCommand {
@@ -156,6 +163,8 @@ enum EngineWorkerCommand {
     Render { request_id: u64 },
     Accessibility { request_id: u64 },
     NavigationFailure { request_id: u64 },
+    // work arrived from another thread
+    Wake,
     Shutdown,
 }
 
@@ -185,6 +194,50 @@ impl EngineWorker {
                 };
                 let _ = ready.send(Ok(()));
                 run_engine_worker(EngineHost::new(browser, viewport), command_receiver, events);
+            })
+            .map_err(|error| format!("could not start engine worker: {error}"))?;
+        match ready_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                commands,
+                events: event_receiver,
+                next_request_id: 1,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("engine worker stopped during initialization".to_string()),
+        }
+    }
+
+    // a worker whose page keeps real time, waking itself for timers and animation, and
+    // calling notify whenever it has an event to poll
+    pub fn spawn_live<F>(viewport: Size, factory: F, notify: Waker) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<Browser, String> + Send + 'static,
+    {
+        let (commands, command_receiver) = mpsc::sync_channel(64);
+        let (events, event_receiver) = mpsc::channel();
+        let (ready, ready_receiver) = mpsc::channel();
+        let wake = commands.clone();
+        thread::Builder::new()
+            .name("ceri-engine".to_string())
+            .spawn(move || {
+                let mut browser = match factory() {
+                    Ok(browser) => browser,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                // a full queue already holds a command that will wake the worker
+                browser.set_waker(Arc::new(move || {
+                    let _ = wake.try_send(EngineWorkerCommand::Wake);
+                }));
+                let _ = ready.send(Ok(()));
+                run_live_engine_worker(
+                    EngineHost::new(browser, viewport),
+                    command_receiver,
+                    events,
+                    notify,
+                );
             })
             .map_err(|error| format!("could not start engine worker: {error}"))?;
         match ready_receiver.recv() {
@@ -274,35 +327,101 @@ fn run_engine_worker(
     events: Sender<EngineWorkerEvent>,
 ) {
     while let Ok(command) = commands.recv() {
-        let event = match command {
-            EngineWorkerCommand::Navigate { request_id, url } => EngineWorkerEvent::Navigated {
-                request_id,
-                result: host.navigate(&url),
-            },
-            EngineWorkerCommand::Input { request_id, event } => EngineWorkerEvent::Input {
-                request_id,
-                result: host.input(event),
-            },
-            EngineWorkerCommand::Render { request_id } => EngineWorkerEvent::Frame {
-                request_id,
-                result: host.render(),
-            },
-            EngineWorkerCommand::Accessibility { request_id } => EngineWorkerEvent::Accessibility {
-                request_id,
-                tree: host.accessibility_tree(),
-            },
-            EngineWorkerCommand::NavigationFailure { request_id } => {
-                EngineWorkerEvent::NavigationFailure {
-                    request_id,
-                    failure: host.last_navigation_failure().cloned(),
-                }
-            }
-            EngineWorkerCommand::Shutdown => break,
+        let Some(event) = answer(&mut host, command) else {
+            break;
         };
         if events.send(event).is_err() {
             break;
         }
     }
+}
+
+// a worker that keeps its page's clock in real time and sleeps until the page, a command or
+// a waker has work for it
+fn run_live_engine_worker(
+    mut host: EngineHost,
+    commands: Receiver<EngineWorkerCommand>,
+    events: Sender<EngineWorkerEvent>,
+    notify: Waker,
+) {
+    let send = |event| {
+        let sent = events.send(event).is_ok();
+        notify();
+        sent
+    };
+    let mut last_tick = Instant::now();
+    let mut announced = false;
+    loop {
+        let command = match host.next_wake() {
+            Some(delay) => match commands.recv_timeout(Duration::from_millis(delay.max(1))) {
+                Ok(command) => Some(command),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match commands.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            },
+        };
+        let elapsed = last_tick.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        last_tick += Duration::from_millis(elapsed);
+        // the clock starts with the first page
+        if host.browser.current_url().is_some()
+            && let Err(error) = host.input(InputEvent::AdvanceTime(elapsed))
+        {
+            send(EngineWorkerEvent::Failed(error));
+            break;
+        }
+        let event = match command {
+            Some(EngineWorkerCommand::Shutdown) => break,
+            Some(command) => answer(&mut host, command),
+            None => None,
+        };
+        if let Some(event) = event {
+            if matches!(event, EngineWorkerEvent::Frame { .. }) {
+                announced = false;
+            }
+            if !send(event) {
+                break;
+            }
+        }
+        if host.is_dirty() && !announced {
+            announced = true;
+            if !send(EngineWorkerEvent::Invalidated) {
+                break;
+            }
+        }
+    }
+}
+
+fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineWorkerEvent> {
+    Some(match command {
+        EngineWorkerCommand::Navigate { request_id, url } => EngineWorkerEvent::Navigated {
+            request_id,
+            result: host.navigate(&url),
+        },
+        EngineWorkerCommand::Input { request_id, event } => EngineWorkerEvent::Input {
+            request_id,
+            result: host.input(event),
+        },
+        EngineWorkerCommand::Render { request_id } => EngineWorkerEvent::Frame {
+            request_id,
+            result: host.render(),
+        },
+        EngineWorkerCommand::Accessibility { request_id } => EngineWorkerEvent::Accessibility {
+            request_id,
+            tree: host.accessibility_tree(),
+        },
+        EngineWorkerCommand::NavigationFailure { request_id } => {
+            EngineWorkerEvent::NavigationFailure {
+                request_id,
+                failure: host.last_navigation_failure().cloned(),
+            }
+        }
+        // the clock tick before every command already pumped the page
+        EngineWorkerCommand::Wake => return None,
+        EngineWorkerCommand::Shutdown => return None,
+    })
 }
 
 impl EngineHost {
@@ -594,6 +713,17 @@ impl EngineHost {
         Ok(Some(frame))
     }
 
+    // milliseconds until the page has work of its own
+    pub fn next_wake(&self) -> Option<u64> {
+        self.browser.current_url()?;
+        self.browser.next_wake()
+    }
+
+    // whether a render would produce a new frame
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     fn pump_workers(&mut self) -> Result<(), NavigationError> {
         if self.browser.current_url().is_some() {
             self.dirty |= self.browser.pump()? > 0;
@@ -628,6 +758,115 @@ mod tests {
             )
             .expect("HTML resource should be accepted");
         resources
+    }
+
+    #[test]
+    fn live_workers_wake_for_timers_and_command_replies_and_sleep_when_idle() {
+        use crate::bridge::{Capabilities, CommandCall, CommandReply, CommandRouter, Grant};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct Later;
+
+        impl CommandRouter for Later {
+            fn invoke(&self, _call: CommandCall, reply: CommandReply) {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(30));
+                    reply.send(Ok("\"late\"".to_string()));
+                });
+            }
+        }
+
+        let notified = Arc::new(AtomicUsize::new(0));
+        let counter = notified.clone();
+        let mut worker = EngineWorker::spawn_live(
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+            || {
+                Ok(Browser::new(bundle(
+                    r#"<p id="status">idle</p><script>
+                        const status = document.getElementById("status");
+                        setTimeout(() => { status.textContent = "timer"; }, 40);
+                        setTimeout(() => {
+                            window.ceri.invoke("later").then((reply) => { status.textContent = reply; });
+                        }, 1000);
+                    </script>"#,
+                ))
+                .with_host_bridge(crate::script::HostBridge::new(
+                    Rc::new(Later),
+                    Capabilities::new(vec![Grant {
+                        windows: vec!["*".to_string()],
+                        origins: vec!["*".to_string()],
+                        commands: vec!["later".to_string()],
+                    }]),
+                    "main",
+                )))
+            },
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .expect("worker should start");
+        worker
+            .navigate("https://app.ceri.invalid/")
+            .expect("navigation should queue");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let wait_for = |worker: &EngineWorker, want: &dyn Fn(&EngineWorkerEvent) -> bool| loop {
+            assert!(
+                Instant::now() < deadline,
+                "the worker should report in time"
+            );
+            if worker.poll().iter().any(want) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        wait_for(&worker, &|event| {
+            matches!(event, EngineWorkerEvent::Navigated { .. })
+        });
+        worker.render().expect("render should queue");
+        // the timer fires on the worker's own clock, with nothing sent to it
+        wait_for(&worker, &|event| {
+            matches!(event, EngineWorkerEvent::Invalidated)
+        });
+        worker.render().expect("render should queue");
+        wait_for(&worker, &|event| {
+            matches!(event, EngineWorkerEvent::Frame { .. })
+        });
+        thread::sleep(Duration::from_millis(100));
+        worker.poll();
+        let quiet = notified.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            notified.load(Ordering::SeqCst),
+            quiet,
+            "an idle page does not wake anyone"
+        );
+        // the reply lands from another thread and wakes the worker to settle it
+        let says_late = |node: &AccessibilityNode| {
+            fn find(node: &AccessibilityNode) -> bool {
+                node.name == "late" || node.children.iter().any(find)
+            }
+            find(node)
+        };
+        loop {
+            assert!(Instant::now() < deadline, "the reply should settle");
+            worker.accessibility_tree().expect("tree should queue");
+            let settled = loop {
+                if let EngineWorkerEvent::Accessibility { tree, .. } =
+                    worker.wait().expect("the worker answers")
+                {
+                    break tree.as_ref().is_some_and(says_late);
+                }
+            };
+            if settled {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        worker.shutdown();
     }
 
     struct ThreadRecordingProvider {
@@ -1963,6 +2202,53 @@ mod tests {
             "{}",
             status_text(&host)
         );
+    }
+
+    #[test]
+    fn stepped_animations_sleep_until_their_next_step_and_unused_keyframes_never_wake() {
+        let page = |rules: &str| {
+            let mut host = EngineHost::new(
+                Browser::new(bundle(&format!(
+                    "<style>@keyframes blink {{ from {{ background: #ff0000 }} to {{ background: #0000ff }} }} #dot {{ width: 20px; height: 20px }} {rules}</style><div id=\"dot\"></div>"
+                ))),
+                Size {
+                    width: 40.0,
+                    height: 40.0,
+                },
+            );
+            host.navigate("https://app.ceri.invalid/")
+                .expect("page should load");
+            host
+        };
+        let color = |host: &mut EngineHost| {
+            let frame = host
+                .render()
+                .expect("render")
+                .expect("a changed page renders");
+            let pixel =
+                &frame.canvas.rgba_pixels()[(5 * frame.canvas.width() as usize + 5) * 4..][..3];
+            [pixel[0], pixel[1], pixel[2]]
+        };
+        let mut blinking = page("#dot { animation: blink 1s steps(2, end) infinite }");
+        assert_eq!(color(&mut blinking), [255, 0, 0]);
+        assert_eq!(blinking.next_wake(), Some(500));
+        blinking.input(InputEvent::AdvanceTime(499)).expect("tick");
+        assert_eq!(blinking.next_wake(), Some(1));
+        blinking.input(InputEvent::AdvanceTime(1)).expect("tick");
+        assert_eq!(
+            color(&mut blinking),
+            [128, 0, 128],
+            "the second of two steps is halfway"
+        );
+        assert_eq!(blinking.next_wake(), Some(500));
+        let mut unused = page("");
+        color(&mut unused);
+        assert_eq!(
+            unused.next_wake(),
+            None,
+            "keyframes no element runs never wake the page"
+        );
+        assert!(!unused.browser().has_active_animations());
     }
 
     #[test]

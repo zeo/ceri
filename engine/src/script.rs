@@ -3202,6 +3202,21 @@ impl ScriptRuntime {
         self.tasks.len()
     }
 
+    // milliseconds of page clock until the next timer or animation frame is due
+    pub fn next_task_delay(&self) -> Option<u64> {
+        self.tasks
+            .iter()
+            .map(|task| task.due.saturating_sub(self.clock))
+            .min()
+    }
+
+    // workers post messages from their own threads, which the page only hears when pumped
+    pub fn has_live_workers(&self) -> bool {
+        self.workers
+            .iter()
+            .any(|worker| !worker.borrow().terminated)
+    }
+
     pub(crate) fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
         self.pending_navigation.take()
     }

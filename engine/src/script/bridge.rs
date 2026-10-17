@@ -5,7 +5,7 @@ use super::object::Property;
 use super::operations::plain_object;
 use super::*;
 use crate::bridge::{
-    Capabilities, CommandCall, CommandError, CommandReply, CommandResult, CommandRouter,
+    Capabilities, CommandCall, CommandError, CommandReply, CommandResult, CommandRouter, Waker,
 };
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -34,6 +34,7 @@ impl HostBridge {
 pub(super) struct BridgeState {
     bridge: HostBridge,
     origin: String,
+    waker: Option<Waker>,
     sender: Sender<CommandResult>,
     receiver: Receiver<CommandResult>,
     pending: HashMap<u64, PromiseHandle>,
@@ -43,11 +44,17 @@ pub(super) struct BridgeState {
 }
 
 impl ScriptRuntime {
-    pub(crate) fn set_host_bridge(&mut self, bridge: HostBridge, origin: String) {
+    pub(crate) fn set_host_bridge(
+        &mut self,
+        bridge: HostBridge,
+        origin: String,
+        waker: Option<Waker>,
+    ) {
         let (sender, receiver) = channel();
         self.bridge = Some(Box::new(BridgeState {
             bridge,
             origin,
+            waker,
             sender,
             receiver,
             pending: HashMap::new(),
@@ -149,7 +156,7 @@ impl ScriptRuntime {
             command,
             payload,
         };
-        let reply = CommandReply::new(id, state.sender.clone());
+        let reply = CommandReply::new(id, state.sender.clone()).with_waker(state.waker.clone());
         let router = state.bridge.router.clone();
         router.invoke(call, reply);
         self.settle_command_replies()?;

@@ -1,3 +1,4 @@
+use crate::bridge::Waker;
 use crate::css::ColorScheme;
 use crate::host::{
     EngineWorker, EngineWorkerEvent, Frame, InputEvent, KeyModifiers, PointerButton,
@@ -8,7 +9,7 @@ use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
@@ -90,19 +91,24 @@ where
         width: config.width.max(1) as f32,
         height: config.height.max(1) as f32,
     };
-    let mut worker = EngineWorker::spawn(viewport, factory.clone())?;
-    worker.navigate(config.start_url.clone())?;
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
+    let proxy = event_loop.create_proxy();
+    // a worker with something to show wakes the loop, which otherwise sleeps
+    let notify: Waker = Arc::new(move || {
+        let _ = proxy.send_event(());
+    });
+    let mut worker = EngineWorker::spawn_live(viewport, factory.clone(), notify.clone())?;
+    worker.navigate(config.start_url.clone())?;
     let context =
         Context::new(event_loop.owned_display_handle()).map_err(|error| error.to_string())?;
     let mut app = App {
         config,
         context,
         factory,
+        notify,
         restarts: 0,
         worker,
         navigation_pending: true,
-        time_request: None,
         render_request: None,
         latest_frame: None,
         applied_title: None,
@@ -114,7 +120,6 @@ where
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
         preferences: UserPreferences::default(),
-        last_tick: Instant::now(),
     };
     event_loop
         .run_app(&mut app)
@@ -125,10 +130,10 @@ struct App<F> {
     config: WindowConfig,
     context: Context<OwnedDisplayHandle>,
     factory: F,
+    notify: Waker,
     restarts: u8,
     worker: EngineWorker,
     navigation_pending: bool,
-    time_request: Option<u64>,
     render_request: Option<u64>,
     latest_frame: Option<Frame>,
     applied_title: Option<String>,
@@ -140,7 +145,6 @@ struct App<F> {
     cursor: (f32, f32),
     modifiers: ModifiersState,
     preferences: UserPreferences,
-    last_tick: Instant,
 }
 
 impl<F> App<F>
@@ -159,13 +163,17 @@ where
         let factory = self.factory.clone();
         let detail = detail.to_string();
         let reason = detail.clone();
-        let spawned = EngineWorker::spawn(self.viewport, move || {
-            let mut browser = factory()?;
-            if recovering {
-                browser.show_recovery(500, &reason);
-            }
-            Ok(browser)
-        });
+        let spawned = EngineWorker::spawn_live(
+            self.viewport,
+            move || {
+                let mut browser = factory()?;
+                if recovering {
+                    browser.show_recovery(500, &reason);
+                }
+                Ok(browser)
+            },
+            self.notify.clone(),
+        );
         match spawned {
             Ok(mut worker) => {
                 if !recovering && worker.navigate(self.config.start_url.clone()).is_err() {
@@ -176,7 +184,6 @@ where
                 eprintln!("ceri: the engine restarted after {detail}");
                 self.worker = worker;
                 self.navigation_pending = !recovering;
-                self.time_request = None;
                 self.render_request = None;
                 self.latest_frame = None;
                 self.request_redraw();
@@ -197,10 +204,6 @@ where
     }
 
     fn submit(&mut self, event_loop: &ActiveEventLoop, event: InputEvent) -> bool {
-        let is_clock_tick = matches!(event, InputEvent::AdvanceTime(_));
-        if is_clock_tick && self.time_request.is_some() {
-            return true;
-        }
         let resize = match &event {
             InputEvent::Resize(viewport) => Some(*viewport),
             _ => None,
@@ -210,10 +213,7 @@ where
             _ => None,
         };
         match self.worker.input(event) {
-            Ok(request_id) => {
-                if is_clock_tick {
-                    self.time_request = Some(request_id);
-                }
+            Ok(_) => {
                 if let Some(viewport) = resize {
                     self.viewport = viewport;
                 }
@@ -239,20 +239,15 @@ where
                         Err(error) => return self.recover(event_loop, &error.to_string()),
                     }
                 }
-                EngineWorkerEvent::Input { request_id, result } => {
-                    if self.time_request == Some(request_id) {
-                        self.time_request = None;
-                    }
-                    match result {
-                        Ok(result) => {
-                            if let Some(cursor) = result.cursor {
-                                self.apply_cursor(cursor);
-                            }
-                            request_redraw = true;
+                EngineWorkerEvent::Input { result, .. } => match result {
+                    Ok(result) => {
+                        if let Some(cursor) = result.cursor {
+                            self.apply_cursor(cursor);
                         }
-                        Err(error) => return self.recover(event_loop, &error.to_string()),
+                        request_redraw = true;
                     }
-                }
+                    Err(error) => return self.recover(event_loop, &error.to_string()),
+                },
                 EngineWorkerEvent::Frame { request_id, result } => {
                     if self.render_request == Some(request_id) {
                         self.render_request = None;
@@ -266,6 +261,10 @@ where
                         }
                         Err(error) => return self.recover(event_loop, &error.to_string()),
                     }
+                }
+                EngineWorkerEvent::Invalidated => request_redraw = true,
+                EngineWorkerEvent::Failed(error) => {
+                    return self.recover(event_loop, &error.to_string());
                 }
                 EngineWorkerEvent::Accessibility { .. }
                 | EngineWorkerEvent::NavigationFailure { .. } => {}
@@ -485,7 +484,6 @@ where
         self.applied_title = Some(self.config.title.clone());
         self.window = Some(window);
         self.surface = Some(surface);
-        self.last_tick = Instant::now();
         let scale = self.window_scale();
         if scale != self.scale {
             self.submit(event_loop, InputEvent::ScaleChanged(scale));
@@ -635,20 +633,17 @@ where
         }
     }
 
+    // a worker woke the loop
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        self.poll_worker(event_loop);
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if !self.poll_worker(event_loop) {
             return;
         }
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_tick);
-        self.last_tick = now;
-        let milliseconds = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        if milliseconds > 0 && !self.navigation_pending {
-            self.submit(event_loop, InputEvent::AdvanceTime(milliseconds));
-        }
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-            now + Duration::from_millis(16),
-        ));
+        // workers keep their own clocks and wake the loop when they have something to show
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     }
 }
 

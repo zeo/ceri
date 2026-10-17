@@ -12,7 +12,7 @@ use crate::script::{
     HostRuntimeInfo, KeyModifiers, LayoutInputs, ModuleSourceLoader, NavigationRequest,
     ScriptRuntime, StorageData, StorageHandle, ViewportMetrics, runtime_error,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -20,6 +20,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+// the milliseconds between frames while something animates
+const FRAME_INTERVAL: u64 = 16;
 
 pub const APP_ORIGIN: &str = "https://app.ceri.invalid";
 
@@ -827,6 +830,8 @@ struct Page {
     // shared with the runtime, so script can lay out the document to measure it
     layout_inputs: Rc<RefCell<LayoutInputs>>,
     animated: bool,
+    // the page clock time the last layout's animations next change what they show
+    animation_wake: Cell<Option<u64>>,
     // decoded once per document and shared by every frame; failures are remembered too
     images: RefCell<HashMap<String, Option<Rc<Image>>>>,
 }
@@ -867,6 +872,7 @@ pub struct Browser {
     motion_clock: Option<u64>,
     host_runtime_info: Option<HostRuntimeInfo>,
     host_bridge: Option<crate::script::HostBridge>,
+    waker: Option<crate::bridge::Waker>,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
     fonts: Rc<FontSet>,
@@ -967,6 +973,7 @@ impl Browser {
             motion_clock: None,
             host_runtime_info: None,
             host_bridge: None,
+            waker: None,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
@@ -1017,6 +1024,30 @@ impl Browser {
     pub fn with_host_bridge(mut self, bridge: crate::script::HostBridge) -> Self {
         self.host_bridge = Some(bridge);
         self
+    }
+
+    // called from any thread when work for this browser arrives from outside it
+    pub fn set_waker(&mut self, waker: crate::bridge::Waker) {
+        self.waker = Some(waker);
+    }
+
+    // milliseconds until the page next has work of its own: a due timer, an animation
+    // frame, or messages from its workers
+    pub fn next_wake(&self) -> Option<u64> {
+        let page = self.page.as_ref()?;
+        let motion = (!self.transitions.is_empty() || page.runtime.has_live_workers())
+            .then_some(FRAME_INTERVAL);
+        // a stepped animation sleeps until its next step; a continuous one needs every frame
+        let animation = page
+            .animation_wake
+            .get()
+            .filter(|_| !self.preferences.reduced_motion)
+            .map(|at| match at.saturating_sub(page.runtime.now()) {
+                0 => FRAME_INTERVAL,
+                delay => delay,
+            });
+        let task = page.runtime.next_task_delay();
+        motion.into_iter().chain(animation).chain(task).min()
     }
 
     // an event from the host to the page's ceri.listen callbacks
@@ -1275,7 +1306,7 @@ impl Browser {
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
         if let Some(bridge) = &self.host_bridge {
-            runtime.set_host_bridge(bridge.clone(), APP_ORIGIN.to_string());
+            runtime.set_host_bridge(bridge.clone(), APP_ORIGIN.to_string(), self.waker.clone());
         }
         if let Some(time_zone) = &self.time_zone {
             runtime.set_time_zone(time_zone.clone());
@@ -1312,6 +1343,7 @@ impl Browser {
             stylesheet: parsed_stylesheet,
             layout_inputs,
             animated,
+            animation_wake: Cell::new(None),
             images: RefCell::default(),
         });
         self.last_navigation_failure = None;
@@ -1336,8 +1368,11 @@ impl Browser {
         if self.preferences.reduced_motion {
             return false;
         }
-        let animated = self.page.as_ref().is_some_and(|page| page.animated);
-        animated || !self.transitions.is_empty()
+        let animating = self
+            .page
+            .as_ref()
+            .is_some_and(|page| page.animation_wake.get().is_some());
+        animating || !self.transitions.is_empty()
     }
 
     // records which animatable values changed, so layout can blend from the old ones
@@ -2228,6 +2263,7 @@ impl Browser {
             }
         }
         style_state.container_sizes = self.container_sizes.borrow().clone();
+        crate::css::take_animation_wake();
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         // container queries read sizes from a layout, so a change in them lays out once more
         if stylesheet.has_container_queries() {
@@ -2238,6 +2274,9 @@ impl Browser {
             }
             *self.container_sizes.borrow_mut() = style_state.container_sizes.clone();
         }
+        page.animation_wake.set(
+            crate::css::take_animation_wake().map(|delay| style_state.clock.saturating_add(delay)),
+        );
         page.layout_inputs.borrow_mut().extras = StyleState {
             hovered: self.hovered_node,
             color_scheme: style_state.color_scheme,
@@ -2715,6 +2754,7 @@ impl Browser {
             stylesheet,
             layout_inputs,
             animated: false,
+            animation_wake: Cell::new(None),
             images: RefCell::default(),
         });
     }

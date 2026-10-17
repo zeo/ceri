@@ -1,7 +1,11 @@
 // commands a page invokes on its host, events passed between them, and the allowlist that
 // decides which window and origin may call what
 
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
+
+// wakes a sleeping thread that has new work, callable from any thread
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 // a command a page invoked, with its arguments as JSON text
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,16 +47,31 @@ pub type CommandResult = (u64, Result<String, CommandError>);
 pub struct CommandReply {
     id: u64,
     sender: Sender<CommandResult>,
+    waker: Option<Waker>,
 }
 
 impl CommandReply {
     pub fn new(id: u64, sender: Sender<CommandResult>) -> Self {
-        Self { id, sender }
+        Self {
+            id,
+            sender,
+            waker: None,
+        }
+    }
+
+    // wakes the engine thread once the answer is sent
+    pub(crate) fn with_waker(mut self, waker: Option<Waker>) -> Self {
+        self.waker = waker;
+        self
     }
 
     pub fn send(self, result: Result<String, CommandError>) {
         // a page that navigated away no longer waits for the answer
-        let _ = self.sender.send((self.id, result));
+        if self.sender.send((self.id, result)).is_ok()
+            && let Some(waker) = &self.waker
+        {
+            waker();
+        }
     }
 }
 
