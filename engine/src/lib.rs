@@ -22,6 +22,8 @@ mod native_http;
 mod navigation;
 mod paint;
 mod png;
+#[cfg(all(feature = "windowed", target_os = "windows"))]
+mod presenter;
 mod script;
 mod selection;
 mod shaping;

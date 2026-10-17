@@ -18,6 +18,74 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
+// where a window's frames go: a composition swapchain, or a software surface where one cannot
+// be made
+enum Output {
+    #[cfg(target_os = "windows")]
+    Composition(crate::presenter::Presenter),
+    Software(WindowSurface),
+}
+
+impl Output {
+    fn open(context: &Context<OwnedDisplayHandle>, window: &Rc<Window>) -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let size = window.inner_size();
+            let composed = window
+                .window_handle()
+                .map_err(|error| error.to_string())
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(handle) => {
+                        crate::presenter::Presenter::new(handle.hwnd.get(), size.width, size.height)
+                    }
+                    _ => Err("the window has no Win32 handle".to_string()),
+                });
+            match composed {
+                Ok(presenter) => return Ok(Self::Composition(presenter)),
+                Err(error) => eprintln!("ceri: drawing in software, {error}"),
+            }
+        }
+        Surface::new(context, window.clone())
+            .map(Self::Software)
+            .map_err(|error| format!("window surface creation failed: {error}"))
+    }
+
+    fn present(
+        &mut self,
+        frame: &Frame,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<(), String> {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Composition(presenter) => presenter.present(
+                frame.canvas.rgba_pixels(),
+                frame.canvas.width(),
+                frame.canvas.height(),
+                (width.get(), height.get()),
+            ),
+            Self::Software(surface) => {
+                surface
+                    .resize(width, height)
+                    .map_err(|error| format!("window surface resize failed: {error}"))?;
+                let mut buffer = surface
+                    .buffer_mut()
+                    .map_err(|error| format!("window surface buffer failed: {error}"))?;
+                present_frame(
+                    frame,
+                    width.get() as usize,
+                    height.get() as usize,
+                    &mut buffer,
+                );
+                buffer
+                    .present()
+                    .map_err(|error| format!("window surface present failed: {error}"))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
     pub title: String,
@@ -116,7 +184,7 @@ where
         viewport,
         scale: 1.0,
         window: None,
-        surface: None,
+        output: None,
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
         preferences: UserPreferences::default(),
@@ -141,7 +209,7 @@ struct App<F> {
     viewport: Size,
     scale: f32,
     window: Option<Rc<Window>>,
-    surface: Option<WindowSurface>,
+    output: Option<Output>,
     cursor: (f32, f32),
     modifiers: ModifiersState,
     preferences: UserPreferences,
@@ -343,30 +411,11 @@ where
             return;
         }
         self.apply_title(&frame);
-        let Some(surface) = &mut self.surface else {
+        let Some(output) = &mut self.output else {
             return;
         };
-        if let Err(error) = surface.resize(width, height) {
-            eprintln!("ceri: window surface resize failed: {error}");
-            event_loop.exit();
-            return;
-        }
-        let mut buffer = match surface.buffer_mut() {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                eprintln!("ceri: window surface buffer failed: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        present_frame(
-            &frame,
-            size.width as usize,
-            size.height as usize,
-            &mut buffer,
-        );
-        if let Err(error) = buffer.present() {
-            eprintln!("ceri: window surface present failed: {error}");
+        if let Err(error) = output.present(&frame, width, height) {
+            eprintln!("ceri: {error}");
             event_loop.exit();
         }
     }
@@ -472,10 +521,10 @@ where
                 return;
             }
         };
-        let surface = match Surface::new(&self.context, window.clone()) {
-            Ok(surface) => surface,
+        let output = match Output::open(&self.context, &window) {
+            Ok(output) => output,
             Err(error) => {
-                eprintln!("ceri: window surface creation failed: {error}");
+                eprintln!("ceri: {error}");
                 event_loop.exit();
                 return;
             }
@@ -483,7 +532,7 @@ where
         window.set_ime_allowed(true);
         self.applied_title = Some(self.config.title.clone());
         self.window = Some(window);
-        self.surface = Some(surface);
+        self.output = Some(output);
         let scale = self.window_scale();
         if scale != self.scale {
             self.submit(event_loop, InputEvent::ScaleChanged(scale));

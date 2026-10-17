@@ -225,6 +225,7 @@ dependencies = [
  "brotli-decompressor",
  "softbuffer",
  "ureq",
+ "windows",
  "winit",
 ]
 
