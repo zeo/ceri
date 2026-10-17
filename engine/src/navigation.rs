@@ -5998,6 +5998,129 @@ mod tests {
     }
 
     #[test]
+    fn text_gate_page_paints_web_fonts_shaping_colour_decoration_and_wrapping() {
+        let mut resources = bundle(
+            r##"<html><head><style>
+                @font-face { font-family: "Ceri Web"; src: url(/fonts/ceri-test.woff2) format("woff2") }
+                @font-face { font-family: "Ceri Color"; src: url(/fonts/ceri-color.ttf) }
+                body { margin: 0; background: #ffffff; color: #000000; font: 20px/30px "Ceri Web" }
+                .row { position: absolute; left: 0; height: 30px; white-space: nowrap }
+                .box { display: inline-block }
+            </style></head><body>
+            <div class="row" style="top: 0"><span class="box" id="liga">fi</span></div>
+            <div class="row" style="top: 30px"><span class="box" id="spaced" style="letter-spacing: 0.01px">fi</span></div>
+            <div class="row" style="top: 60px"><span class="box" id="kern">AB</span></div>
+            <div class="row" style="top: 90px; font-family: 'Ceri Color'; color: #0000ff">&#x263A;&#xFE0F;</div>
+            <div class="row" style="top: 120px"><span style="text-decoration: underline #ff0000; text-shadow: 3px 3px 0 #00ff00">AB</span></div>
+            <div class="row" id="cut" style="top: 160px; width: 60px; overflow: hidden; text-overflow: ellipsis">ABABABABAB</div>
+            <div style="position: absolute; top: 200px; left: 0; width: 300px">
+                <span class="box" id="collapsed">A   A</span>
+                <span class="box" id="pre" style="white-space: pre">A   A</span>
+                <div id="prewrap" style="white-space: pre-wrap; width: 40px">AA AA</div>
+                <div id="preline" style="white-space: pre-line">A
+A</div>
+                <div id="url" style="width: 50px; overflow-wrap: anywhere">AAAAAAAAAAAAAAAA</div>
+                <div id="nowrapurl" style="width: 50px">AAAAAAAAAAAAAAAA</div>
+            </div>
+            <p id="status" style="position: absolute; top: 600px">idle</p>
+            <script>
+                const rect = (id) => document.getElementById(id).getBoundingClientRect();
+                document.getElementById("status").textContent = [
+                    rect("liga").width, rect("spaced").width, rect("kern").width,
+                    rect("collapsed").width, rect("pre").width,
+                    rect("prewrap").height, rect("preline").height,
+                    rect("url").height, rect("nowrapurl").height,
+                ].map((value) => Math.round(value)).join(",");
+            </script></body></html>"##,
+        );
+        for name in ["ceri-test.woff2", "ceri-color.ttf"] {
+            let font = std::fs::read(format!(
+                "{}/tests/fixtures/fonts/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("fixture font should exist");
+            resources
+                .insert(&format!("/fonts/{name}"), "font/ttf", font)
+                .expect("font should be accepted");
+        }
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        {
+            let document = browser.document().expect("document should exist");
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            // the fi ligature is 700 units against 600 + 600 spaced apart, AB kerns by 100, pre
+            // keeps the three spaces that collapse elsewhere, pre-wrap and pre-line and
+            // overflow-wrap give two, two and four lines, and an unbreakable word stays on one
+            assert_eq!(
+                document.element_text_content(status).as_deref(),
+                Some("14,24,22,30,42,60,60,120,30")
+            );
+        }
+        let canvas = browser
+            .paint(Size {
+                width: 320.0,
+                height: 640.0,
+            })
+            .expect("page should paint");
+        let width = canvas.width() as usize;
+        let pixel = |x: usize, y: usize| {
+            let index = (y * width + x) * 4;
+            let rgba = &canvas.rgba_pixels()[index..index + 3];
+            [rgba[0], rgba[1], rgba[2]]
+        };
+        let dark_columns = |top: usize| {
+            (0..40)
+                .filter(|&x| (top..top + 30).any(|y| pixel(x, y) == [0, 0, 0]))
+                .collect::<Vec<_>>()
+        };
+        // the ligature's bar runs unbroken over both letters; spaced apart the i stands alone
+        let ligature = dark_columns(0);
+        let spaced = dark_columns(30);
+        assert_ne!(ligature, spaced, "ligatures change the painted glyphs");
+        assert!(ligature.iter().all(|&x| x < 14) && spaced.iter().any(|&x| x >= 14));
+        assert!(
+            dark_columns(60).iter().all(|&x| x < 22),
+            "kerned glyphs paint inside their advance"
+        );
+        let has = |top: usize, bottom: usize, color: [u8; 3]| {
+            (top..bottom).any(|y| (0..60).any(|x| pixel(x, y) == color))
+        };
+        assert!(
+            has(90, 120, [255, 0, 0]),
+            "the colour glyph paints its palette red"
+        );
+        assert!(
+            has(90, 120, [0, 0, 255]),
+            "and its foreground layer in the text colour"
+        );
+        assert!(has(120, 160, [255, 0, 0]), "the underline paints");
+        assert!(has(120, 160, [0, 255, 0]), "the shadow paints");
+        let layout = browser
+            .layout(Size {
+                width: 320.0,
+                height: 640.0,
+            })
+            .expect("page should lay out");
+        let mut stack = vec![&layout.root];
+        let mut ellipsis = false;
+        while let Some(layout_box) = stack.pop() {
+            ellipsis |= layout_box
+                .text
+                .iter()
+                .any(|run| run.text.ends_with('\u{2026}'));
+            stack.extend(layout_box.children.iter());
+        }
+        assert!(ellipsis, "the clipped nowrap row ends in an ellipsis");
+        assert!(
+            (160..190).all(|y| (60..120).all(|x| pixel(x, y) == [255, 255, 255])),
+            "nothing paints past the clipped row"
+        );
+    }
+
+    #[test]
     fn stylesheets_import_layer_nest_and_query_media_supports_and_containers() {
         let mut resources = bundle(
             r##"<link rel="stylesheet" href="/main.css">

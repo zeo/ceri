@@ -447,4 +447,21 @@ mod tests {
         // the same family resolves to the same cached face
         assert!(fonts.face("sans-serif", FontStyle::NORMAL).is_some());
     }
+
+    #[test]
+    fn mixed_scripts_find_installed_faces() {
+        let fonts = SystemFonts::discover();
+        if fonts.families() == 0 {
+            return;
+        }
+        for character in ['\u{0634}', '\u{4E2D}'] {
+            let face = fonts
+                .fallback(character, FontStyle::NORMAL)
+                .unwrap_or_else(|| panic!("a desktop platform should draw {character}"));
+            assert!(face.has_glyph(character));
+        }
+        if let Some(emoji) = fonts.emoji(FontStyle::NORMAL) {
+            assert!(emoji.has_glyph('\u{1F600}'));
+        }
+    }
 }
