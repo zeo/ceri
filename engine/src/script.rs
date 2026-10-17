@@ -2817,6 +2817,19 @@ impl ScriptRuntime {
                 state.unchecked.insert(*control);
             }
         }
+        // a selected option matches :checked and is what a closed select shows
+        let options = self
+            .document
+            .borrow()
+            .find_elements_by_selector("option")
+            .unwrap_or_default();
+        for option in options {
+            if self.is_option_selected(option) {
+                state.checked.insert(option);
+            } else {
+                state.unchecked.insert(option);
+            }
+        }
         let disabled_paths = self
             .document
             .borrow()

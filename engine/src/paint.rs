@@ -3,8 +3,8 @@ use crate::css::{BackgroundImage, BackgroundSize, Color, Gradient, ObjectFit, Ov
 use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
-    BoxBorder, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect, ResolvedEdges,
-    SQUARE_CORNERS, TextRun, overflow_clip_rect, paint_order, scrollbar_metrics,
+    BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
+    ResolvedEdges, SQUARE_CORNERS, TextRun, overflow_clip_rect, paint_order, scrollbar_metrics,
     stacking_context_entries, translate_rect, visual_offset_for, visual_rect_for,
 };
 use std::fs::File;
@@ -386,6 +386,58 @@ impl Canvas {
                     continue;
                 }
                 self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
+            }
+        }
+    }
+
+    // a straight stroke with round ends, antialiased by its distance from the center line
+    fn fill_segment(
+        &mut self,
+        (from, to): ((f32, f32), (f32, f32)),
+        width: f32,
+        color: Color,
+        clip: Option<Rect>,
+    ) {
+        let scale = self.scale;
+        let device = |(x, y): (f32, f32)| ((x - self.shift.0) * scale, (y - self.shift.1) * scale);
+        let (start, end) = (device(from), device(to));
+        let half = width * scale / 2.0;
+        let clip = clip.map(|clip| self.device_shape(Shape::square(clip)));
+        let left = (start.0.min(end.0) - half - 1.0)
+            .floor()
+            .clamp(0.0, self.width as f32) as u32;
+        let right = (start.0.max(end.0) + half + 1.0)
+            .ceil()
+            .clamp(0.0, self.width as f32) as u32;
+        let top = (start.1.min(end.1) - half - 1.0)
+            .floor()
+            .clamp(0.0, self.height as f32) as u32;
+        let bottom = (start.1.max(end.1) + half + 1.0)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        let along = (end.0 - start.0, end.1 - start.1);
+        let length = along.0 * along.0 + along.1 * along.1;
+        for pixel_y in top..bottom {
+            for pixel_x in left..right {
+                let point = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+                if let Some(clip) = clip
+                    && clip.coverage(point) <= 0.0
+                {
+                    continue;
+                }
+                let t = if length > 0.0 {
+                    (((point.0 - start.0) * along.0 + (point.1 - start.1) * along.1) / length)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let nearest = (start.0 + along.0 * t, start.1 + along.1 * t);
+                let distance =
+                    ((point.0 - nearest.0).powi(2) + (point.1 - nearest.1).powi(2)).sqrt();
+                let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
+                if coverage > 0.0 {
+                    self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage));
+                }
             }
         }
     }
@@ -1136,6 +1188,152 @@ fn paint_border(
     canvas.fill_border(outer, inner, &sides, clip);
 }
 
+// the marks a form control draws over its box: a check, a dot, an arrow, a slider, a bar
+fn paint_control(
+    canvas: &mut Canvas,
+    control: ControlPaint,
+    rect: Rect,
+    opacity: f32,
+    clip: Option<Rect>,
+) {
+    let point = |x: f32, y: f32| (rect.x + rect.width * x, rect.y + rect.height * y);
+    let round = |radius: f32| [(radius, radius); 4];
+    match control {
+        ControlPaint::Checkbox { checked: true, .. } => {
+            let white = Color::WHITE.scale_alpha(opacity);
+            let stroke = (rect.width * 0.14).max(1.5);
+            canvas.fill_segment((point(0.22, 0.52), point(0.42, 0.72)), stroke, white, clip);
+            canvas.fill_segment((point(0.42, 0.72), point(0.8, 0.3)), stroke, white, clip);
+        }
+        ControlPaint::Radio {
+            checked: true,
+            accent,
+        } => {
+            let size = rect.width.min(rect.height) * 0.5;
+            let dot = Rect {
+                x: rect.x + (rect.width - size) / 2.0,
+                y: rect.y + (rect.height - size) / 2.0,
+                width: size,
+                height: size,
+            };
+            canvas.fill_shape(
+                Shape::from_rect(dot, round(size / 2.0)),
+                &Paint::Solid(accent.scale_alpha(opacity)),
+                clip,
+            );
+        }
+        ControlPaint::Select { color } => {
+            let center = (rect.x + rect.width - 11.0, rect.y + rect.height / 2.0);
+            let color = color.scale_alpha(opacity);
+            canvas.fill_segment(
+                ((center.0 - 4.0, center.1 - 2.0), (center.0, center.1 + 2.0)),
+                1.5,
+                color,
+                clip,
+            );
+            canvas.fill_segment(
+                ((center.0, center.1 + 2.0), (center.0 + 4.0, center.1 - 2.0)),
+                1.5,
+                color,
+                clip,
+            );
+        }
+        ControlPaint::Range { fraction, accent } => {
+            let thumb = rect.height.min(16.0);
+            let track_height = 4.0_f32.min(rect.height);
+            let track = Rect {
+                x: rect.x + thumb / 2.0 - 2.0,
+                y: rect.y + (rect.height - track_height) / 2.0,
+                width: (rect.width - thumb + 4.0).max(0.0),
+                height: track_height,
+            };
+            let thumb_x = rect.x + (rect.width - thumb) * fraction;
+            canvas.fill_shape(
+                Shape::from_rect(track, round(track_height / 2.0)),
+                &Paint::Solid(Color::opaque(239, 239, 239).scale_alpha(opacity)),
+                clip,
+            );
+            canvas.fill_shape(
+                Shape::from_rect(
+                    Rect {
+                        width: (thumb_x + thumb / 2.0 - track.x).max(0.0),
+                        ..track
+                    },
+                    round(track_height / 2.0),
+                ),
+                &Paint::Solid(accent.scale_alpha(opacity)),
+                clip,
+            );
+            canvas.fill_shape(
+                Shape::from_rect(
+                    Rect {
+                        x: thumb_x,
+                        y: rect.y + (rect.height - thumb) / 2.0,
+                        width: thumb,
+                        height: thumb,
+                    },
+                    round(thumb / 2.0),
+                ),
+                &Paint::Solid(accent.scale_alpha(opacity)),
+                clip,
+            );
+        }
+        ControlPaint::Progress {
+            fraction: Some(fraction),
+            accent,
+        } => fill_bar(canvas, rect, fraction, accent.scale_alpha(opacity), clip),
+        ControlPaint::Meter { fraction, color } => {
+            fill_bar(canvas, rect, fraction, color.scale_alpha(opacity), clip);
+        }
+        ControlPaint::FileButton { width } => {
+            let button = Rect {
+                width: width.min(rect.width),
+                ..rect
+            };
+            let outer = Shape::from_rect(button, round(3.0));
+            canvas.fill_shape(
+                outer,
+                &Paint::Solid(Color::opaque(239, 239, 239).scale_alpha(opacity)),
+                clip,
+            );
+            let edge = Color::opaque(118, 118, 118).scale_alpha(opacity);
+            let border = BoxBorder {
+                widths: ResolvedEdges {
+                    top: 1.0,
+                    right: 1.0,
+                    bottom: 1.0,
+                    left: 1.0,
+                },
+                styles: [BorderStyle::Solid; 4],
+                colors: [edge; 4],
+            };
+            paint_border(
+                canvas,
+                outer,
+                outer.inset(border.widths),
+                &border,
+                1.0,
+                clip,
+            );
+        }
+        _ => {}
+    }
+}
+
+// the filled part of a progress or meter bar, inside its rounded track
+fn fill_bar(canvas: &mut Canvas, rect: Rect, fraction: f32, color: Color, clip: Option<Rect>) {
+    let radius = rect.height / 2.0;
+    let bar = Rect {
+        width: rect.width * fraction.clamp(0.0, 1.0),
+        ..rect
+    };
+    canvas.fill_shape(
+        Shape::from_rect(bar, [(radius, radius); 4]),
+        &Paint::Solid(color),
+        clip,
+    );
+}
+
 // an outline traces the border box, pushed out by its offset, and takes no space
 fn paint_outline(
     canvas: &mut Canvas,
@@ -1598,6 +1796,15 @@ fn paint_box_surface(
         );
     }
     paint_border(canvas, outer, surface, &layout_box.border, opacity, clip);
+    if let Some(control) = layout_box.control {
+        let inner = Rect {
+            x: surface.x,
+            y: surface.y,
+            width: surface.width,
+            height: surface.height,
+        };
+        paint_control(canvas, control, inner, opacity, clip);
+    }
     if let Some(background) = layout_box.background_image.as_ref()
         && let Some(layer) = images
             .iter()
@@ -1727,12 +1934,14 @@ fn paint_prose_selection(
                 run.y + offset.1,
                 selected_width,
                 height,
-                Color::opaque(170, 205, 238),
+                layout_box.selection.unwrap_or(SELECTION_BACKGROUND),
                 clip,
             );
         }
     }
 }
+
+const SELECTION_BACKGROUND: Color = Color::opaque(170, 205, 238);
 
 fn width_within_run(run: &TextRun, units: usize, fonts: &crate::font::FontSet) -> f32 {
     let mut width = 0.0;
@@ -1800,7 +2009,7 @@ fn paint_control_selection(
             run.y + offset.1,
             (selected_end_char - selected_start_char) as f32 * advance,
             run.font_size.max(1.0),
-            Color::opaque(170, 205, 238),
+            layout_box.selection.unwrap_or(SELECTION_BACKGROUND),
             clip,
         );
     }
@@ -2548,6 +2757,8 @@ mod tests {
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
                 inline: false,
+                control: None,
+                selection: None,
                 scroll_content: Size {
                     width: 64.0,
                     height: 24.0,
@@ -2816,6 +3027,8 @@ mod tests {
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
                 inline: false,
+                control: None,
+                selection: None,
                 scroll_content: Size {
                     width: 20.0,
                     height: 10.0,
@@ -2940,6 +3153,8 @@ mod tests {
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
                 inline: false,
+                control: None,
+                selection: None,
                 scroll_content: Size {
                     width: 32.0,
                     height: 28.0,
@@ -3036,6 +3251,8 @@ mod tests {
                         cursor: crate::css::Cursor::Auto,
                         floated: false,
                         inline: false,
+                        control: None,
+                        selection: None,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3081,6 +3298,8 @@ mod tests {
                         cursor: crate::css::Cursor::Auto,
                         floated: false,
                         inline: false,
+                        control: None,
+                        selection: None,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3101,6 +3320,8 @@ mod tests {
                 cursor: crate::css::Cursor::Auto,
                 floated: false,
                 inline: false,
+                control: None,
+                selection: None,
                 scroll_content: Size {
                     width: 20.0,
                     height: 20.0,

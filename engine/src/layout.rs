@@ -140,6 +140,9 @@ pub struct LayoutBox {
     pub(crate) floated: bool,
     // one line's part of an inline element, painted under the text of the block it is in
     pub(crate) inline: bool,
+    pub(crate) control: Option<ControlPaint>,
+    // the ::selection background behind this box's selected text
+    pub(crate) selection: Option<Color>,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
     pub(crate) margin: ResolvedEdges,
@@ -166,6 +169,39 @@ pub(crate) struct ImageLayer {
 pub(crate) type CornerRadii = [(f32, f32); 4];
 
 pub(crate) const SQUARE_CORNERS: CornerRadii = [(0.0, 0.0); 4];
+
+// the parts of a form control paint draws over its box
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ControlPaint {
+    Checkbox {
+        checked: bool,
+        accent: Color,
+    },
+    Radio {
+        checked: bool,
+        accent: Color,
+    },
+    // the arrow at the end of a closed select
+    Select {
+        color: Color,
+    },
+    Range {
+        fraction: f32,
+        accent: Color,
+    },
+    // none is indeterminate
+    Progress {
+        fraction: Option<f32>,
+        accent: Color,
+    },
+    Meter {
+        fraction: f32,
+        color: Color,
+    },
+    FileButton {
+        width: f32,
+    },
+}
 
 // a border as painted: widths, and each side's style and color from the top clockwise
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -611,6 +647,7 @@ fn inherited_text(style: &Style) -> InheritedText {
         border_collapse: style.border_collapse,
         border_spacing: style.border_spacing,
         caption_bottom: style.caption_bottom,
+        accent_color: style.accent_color,
     }
 }
 
@@ -837,6 +874,8 @@ pub fn layout_with_state(
         cursor: Cursor::Auto,
         floated: false,
         inline: false,
+        control: None,
+        selection: None,
         scroll_content: Size {
             width: viewport.width,
             height: viewport.height,
@@ -2001,6 +2040,17 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         }
     };
     let inset = resolve_insets(style.inset, position_block, font_size);
+    let control_size = control_content_size(
+        node,
+        &style,
+        font_size,
+        style
+            .line_height
+            .resolve(font_size, font_size)
+            .unwrap_or(font_size * 1.25)
+            .max(1.0),
+        style_state,
+    );
     // an out-of-flow box with both block insets set stretches between them
     let explicit_height = resolve_height(style.height, containing_height, font_size)
         .map(inner_height)
@@ -2012,7 +2062,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     - vertical_inner)
                     .max(0.0)
             })
-        });
+        })
+        .or(control_size.1);
     let content_width = style
         .width
         .resolve(containing_width, font_size)
@@ -2032,6 +2083,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 .zip(explicit_height)
                 .map(|(ratio, height)| height * ratio)
         })
+        .or(control_size.0)
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
         .max(0.0);
     let min_width = style
@@ -2210,6 +2262,22 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     line.fit_to_floats(content_x, content_width);
     let mut text = Vec::new();
+    // ::marker, ::placeholder and ::selection style parts of this box; they are cascaded only
+    // when some rule names them
+    let pseudo_style = |pseudo: PseudoElement| {
+        stylesheet.styles_pseudo(pseudo).then(|| {
+            stylesheet.style_for(StyleContext {
+                document: node.document,
+                node: node.node,
+                pseudo: Some(pseudo),
+                parent_font_size: font_size,
+                parent_color: style.color,
+                parent_weight: style.font_weight,
+                parent_text: inherited_text(&style),
+                state: style_state,
+            })
+        })
+    };
     let control_value = text_control_value(node, style_state);
     let control_placeholder = control_value
         .as_deref()
@@ -2232,7 +2300,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     {
         let value_lines = control_text_lines(name, node.element(), value, content_width, font_size);
         let color = if control_placeholder.is_some() {
-            Color::opaque(120, 145, 155)
+            pseudo_style(PseudoElement::Placeholder)
+                .map_or(Color::opaque(117, 117, 117), |placeholder| {
+                    placeholder.color
+                })
         } else {
             style.color
         };
@@ -2303,11 +2374,20 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 1
             }
         });
+    let mut marker_style = style;
+    if style.display == Display::ListItem
+        && let Some(marker) = pseudo_style(PseudoElement::Marker)
+    {
+        marker_style.color = marker.color;
+    }
     if style.display == Display::ListItem && style.list_inside {
         match style.list_style_type.marker_text(list_ordinal) {
             Some(label) => append_inline_text(
                 &format!("{label} "),
-                inline_context,
+                InlineContext {
+                    color: text_color(&marker_style),
+                    ..inline_context
+                },
                 InlineSource {
                     node: None,
                     offset: 0,
@@ -2323,7 +2403,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     width: size,
                     height: size,
                 };
-                if let Some(mut bullet) = bullet_marker(&style, node.node, rect, font_size) {
+                if let Some(mut bullet) = bullet_marker(&marker_style, node.node, rect, font_size) {
                     // the bullet sits on the line like a word, with a space after it
                     bullet.margin.top = rect.y;
                     bullet.margin.right = font_size * 0.5;
@@ -2348,9 +2428,24 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             }
         }
     }
+    // a push button, select or file field shows a label of its own instead of its children
+    let control = control_type(node, style_state);
+    if let Some(label) = control.as_ref().and_then(control_label) {
+        append_inline_text(
+            &label,
+            inline_context,
+            InlineSource {
+                node: None,
+                offset: 0,
+            },
+            &mut text,
+            &mut line,
+        );
+    }
+    let own_children = !matches!(name, "textarea" | "select");
     for child in node.children(&generated) {
         match child {
-            Child::Text(text_node, value) if name != "textarea" => {
+            Child::Text(text_node, value) if own_children => {
                 if !value.trim().is_empty()
                     && let Some(pending) = pending_margin.take()
                 {
@@ -2363,7 +2458,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 append_inline_text(value, inline_context, source, &mut text, &mut line)
             }
             Child::Text(..) => {}
-            Child::Element(_) if name == "textarea" => {}
+            Child::Element(_) if !own_children => {}
             Child::Element(child) => {
                 let child_style =
                     stylesheet.style_for(child.style_context(child_parent, style_state));
@@ -2518,7 +2613,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     };
     if style.display == Display::ListItem && !style.list_inside {
         children.extend(outside_marker(
-            &style,
+            &marker_style,
             list_ordinal,
             node.node,
             (content_x, content_y),
@@ -2541,6 +2636,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text,
+        control: control_paint(node, &style, style_state, font_size),
+        selection: pseudo_style(PseudoElement::Selection)
+            .map(|selection| selection.background)
+            .filter(|background| background.alpha > 0),
         control_selection: node
             .own()
             .and_then(|own| style_state.text_selections.get(&own).copied()),
@@ -2565,6 +2664,23 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         scroll_offset: (0.0, 0.0),
         margin,
     };
+    // a checked box fills with the accent color, and a checked radio rings with it, unless
+    // the page painted the box itself
+    let unstyled = layout.background == Color::WHITE;
+    match layout.control {
+        Some(ControlPaint::Checkbox {
+            checked: true,
+            accent,
+        }) if unstyled => {
+            layout.background = accent;
+            layout.border.colors = [accent; 4];
+        }
+        Some(ControlPaint::Radio {
+            checked: true,
+            accent,
+        }) if unstyled => layout.border.colors = [accent; 4],
+        _ => {}
+    }
     if mode != LayoutMode::Flow {
         position_layout_box(&mut layout, style, mode, position_block, font_size);
     }
@@ -2711,6 +2827,8 @@ fn anonymous_box(
         cursor,
         floated: false,
         inline: false,
+        control: None,
+        selection: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
@@ -3522,6 +3640,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         cursor: style.cursor,
         floated: false,
         inline: false,
+        control: None,
+        selection: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -3971,6 +4091,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         cursor: style.cursor,
         floated: false,
         inline: false,
+        control: None,
+        selection: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4682,6 +4804,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         cursor: style.cursor,
         floated: false,
         inline: false,
+        control: None,
+        selection: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4725,6 +4849,258 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     );
     finalize_scroll(&mut layout, style_state);
     layout
+}
+
+// what an element draws as a form control
+#[derive(Clone, Debug, PartialEq)]
+enum ControlType {
+    Text,
+    Textarea,
+    // a push button input, with its label
+    Button(String),
+    Checkbox,
+    Radio,
+    Range,
+    File,
+    Select(String),
+    Progress,
+    Meter,
+}
+
+fn input_type(element: &Element) -> String {
+    element.attr("type").map_or_else(
+        || "text".to_string(),
+        |kind| kind.trim().to_ascii_lowercase(),
+    )
+}
+
+fn control_type(node: Subject<'_>, style_state: &StyleState) -> Option<ControlType> {
+    let element = node.element()?;
+    Some(match element.name.as_str() {
+        "textarea" => ControlType::Textarea,
+        "progress" => ControlType::Progress,
+        "meter" => ControlType::Meter,
+        "select" => ControlType::Select(select_label(node, style_state)),
+        "input" => match input_type(element).as_str() {
+            "checkbox" => ControlType::Checkbox,
+            "radio" => ControlType::Radio,
+            "range" => ControlType::Range,
+            "file" => ControlType::File,
+            "color" | "image" | "hidden" => return None,
+            kind @ ("button" | "submit" | "reset") => {
+                ControlType::Button(element.attr("value").map_or_else(
+                    || match kind {
+                        "submit" => "Submit".to_string(),
+                        "reset" => "Reset".to_string(),
+                        _ => String::new(),
+                    },
+                    str::to_string,
+                ))
+            }
+            _ => ControlType::Text,
+        },
+        _ => return None,
+    })
+}
+
+// a closed select shows its selected option, or its first when none is
+fn select_label(node: Subject<'_>, style_state: &StyleState) -> String {
+    let document = node.document;
+    let options = document
+        .descendants(node.node)
+        .filter(|descendant| {
+            document
+                .element(*descendant)
+                .is_some_and(|element| element.name == "option")
+        })
+        .collect::<Vec<_>>();
+    let chosen = options
+        .iter()
+        .find(|option| {
+            document
+                .element(**option)
+                .is_some_and(|element| style_state.is_checked(element, **option))
+        })
+        .or(options.first());
+    chosen.map_or_else(String::new, |option| {
+        let element = document.element(*option);
+        element
+            .and_then(|element| element.attr("label"))
+            .map_or_else(
+                || {
+                    document
+                        .text_content(*option)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+                str::to_string,
+            )
+    })
+}
+
+const FILE_BUTTON_LABEL: &str = "Choose File";
+const FILE_EMPTY_LABEL: &str = "No file chosen";
+
+// the content size a control takes when its width or height is auto: text fields from their
+// size, cols and rows attributes, buttons and selects from their labels
+fn control_content_size(
+    node: Subject<'_>,
+    style: &Style,
+    font_size: f32,
+    line_height: f32,
+    style_state: &StyleState,
+) -> (Option<f32>, Option<f32>) {
+    let Some(control) = control_type(node, style_state) else {
+        return (None, None);
+    };
+    let element = node.element();
+    let measure = |text: &str| {
+        measure_text(
+            text,
+            style.font_family,
+            font_size,
+            style.font_weight == FontWeight::Bold,
+            0.0,
+        )
+    };
+    let attribute = |name: &str, default: f32| {
+        element
+            .and_then(|element| element.attr(name))
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(default)
+    };
+    let character = measure("0").max(1.0);
+    match control {
+        ControlType::Text => (Some(attribute("size", 20.0) * character), Some(line_height)),
+        ControlType::Textarea => (
+            Some(attribute("cols", 20.0) * character),
+            Some(attribute("rows", 2.0) * line_height),
+        ),
+        ControlType::Button(label) => (Some(measure(&label)), Some(line_height)),
+        ControlType::Select(_) => {
+            let document = node.document;
+            let widest = document
+                .descendants(node.node)
+                .filter(|descendant| {
+                    document
+                        .element(*descendant)
+                        .is_some_and(|element| element.name == "option")
+                })
+                .map(|option| measure(document.text_content(option).trim()))
+                .fold(0.0, f32::max);
+            (Some(widest), Some(line_height))
+        }
+        ControlType::File => (
+            Some(file_button_width(&measure) + font_size * 0.4 + measure(FILE_EMPTY_LABEL)),
+            Some(line_height + 4.0),
+        ),
+        _ => (None, None),
+    }
+}
+
+fn file_button_width(measure: &dyn Fn(&str) -> f32) -> f32 {
+    measure(FILE_BUTTON_LABEL) + 14.0
+}
+
+// the text a button-like control shows inside its box
+fn control_label(control: &ControlType) -> Option<String> {
+    match control {
+        ControlType::Button(label) | ControlType::Select(label) if !label.is_empty() => {
+            Some(label.clone())
+        }
+        ControlType::File => Some(format!("{FILE_BUTTON_LABEL}  {FILE_EMPTY_LABEL}")),
+        _ => None,
+    }
+}
+
+fn number_attribute(element: &Element, name: &str) -> Option<f32> {
+    element
+        .attr(name)
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+}
+
+// what paint draws on top of a control's box
+fn control_paint(
+    node: Subject<'_>,
+    style: &Style,
+    style_state: &StyleState,
+    font_size: f32,
+) -> Option<ControlPaint> {
+    if style.appearance_none {
+        return None;
+    }
+    let control = control_type(node, style_state)?;
+    let element = node.element()?;
+    let accent = style.accent_color.unwrap_or(Color::opaque(0, 117, 255));
+    let mark = text_color(style);
+    Some(match control {
+        ControlType::Checkbox => ControlPaint::Checkbox {
+            checked: style_state.is_checked(element, node.node),
+            accent,
+        },
+        ControlType::Radio => ControlPaint::Radio {
+            checked: style_state.is_checked(element, node.node),
+            accent,
+        },
+        ControlType::Select(_) => ControlPaint::Select { color: mark },
+        ControlType::Range => {
+            let minimum = number_attribute(element, "min").unwrap_or(0.0);
+            let maximum = number_attribute(element, "max")
+                .unwrap_or(100.0)
+                .max(minimum);
+            let value = style_state
+                .control_values
+                .get(&node.node)
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .or_else(|| number_attribute(element, "value"))
+                .unwrap_or((minimum + maximum) / 2.0);
+            let fraction = if maximum > minimum {
+                ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ControlPaint::Range { fraction, accent }
+        }
+        ControlType::Progress => {
+            let maximum = number_attribute(element, "max")
+                .filter(|max| *max > 0.0)
+                .unwrap_or(1.0);
+            let fraction =
+                number_attribute(element, "value").map(|value| (value / maximum).clamp(0.0, 1.0));
+            ControlPaint::Progress { fraction, accent }
+        }
+        ControlType::Meter => {
+            let minimum = number_attribute(element, "min").unwrap_or(0.0);
+            let maximum = number_attribute(element, "max").unwrap_or(1.0).max(minimum);
+            let value = number_attribute(element, "value")
+                .unwrap_or(minimum)
+                .clamp(minimum, maximum);
+            let low = number_attribute(element, "low").unwrap_or(minimum);
+            let high = number_attribute(element, "high").unwrap_or(maximum);
+            // values past the low or high marks read as a warning
+            let color = if value < low || value > high {
+                Color::opaque(255, 185, 0)
+            } else {
+                Color::opaque(16, 124, 16)
+            };
+            let fraction = if maximum > minimum {
+                (value - minimum) / (maximum - minimum)
+            } else {
+                0.0
+            };
+            ControlPaint::Meter { fraction, color }
+        }
+        ControlType::File => {
+            let width = file_button_width(&|text: &str| {
+                measure_text(text, style.font_family, font_size, false, 0.0)
+            });
+            ControlPaint::FileButton { width }
+        }
+        _ => return None,
+    })
 }
 
 struct MaxContentInput<'a> {
@@ -4781,6 +5157,19 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             width
         };
         return extras + width.max(0.0);
+    }
+    if let (Some(width), _) = control_content_size(
+        node,
+        &style,
+        font_size,
+        style
+            .line_height
+            .resolve(font_size, font_size)
+            .unwrap_or(font_size * 1.25)
+            .max(1.0),
+        style_state,
+    ) {
+        return extras + width;
     }
     // a row of flex items, or of table cells, sits side by side as inline content does
     let row_flex = (matches!(style.display, Display::Flex | Display::InlineFlex)
@@ -5729,6 +6118,8 @@ fn apply_sticky_descendants(
 fn measure_scroll_content(layout: &LayoutBox) -> Size {
     let mut right = layout.rect.x + layout.rect.width;
     let mut bottom = layout.rect.y + layout.rect.height;
+    // rounding in the sums below must not read as overflow
+    const SLACK: f32 = 0.01;
     for child in &layout.children {
         if child.position == Position::Fixed {
             continue;
@@ -5738,9 +6129,17 @@ fn measure_scroll_content(layout: &LayoutBox) -> Size {
         bottom = bottom
             .max(child.rect.y + child.visual_offset.1 + child.rect.height + child.margin.bottom);
     }
+    let extent = |far: f32, start: f32, size: f32| {
+        let measured = far - start;
+        if measured > size + SLACK {
+            measured
+        } else {
+            size
+        }
+    };
     Size {
-        width: (right - layout.rect.x).max(layout.rect.width),
-        height: (bottom - layout.rect.y).max(layout.rect.height),
+        width: extent(right, layout.rect.x, layout.rect.width),
+        height: extent(bottom, layout.rect.y, layout.rect.height),
     }
 }
 
@@ -6829,6 +7228,124 @@ mod tests {
         assert_eq!(generated.background, Color::opaque(0, 255, 0));
     }
 
+    #[test]
+    fn form_controls_take_their_default_sizes_labels_and_drawn_parts() {
+        let document = Document::parse(
+            r#"<html><body><input id="text"><input id="short" size="5"><input type="submit"><select><option>First</option><option selected>Second</option></select><input type="checkbox" checked><input type="range" min="0" max="10" value="5"><input type="checkbox" style="appearance: none"><textarea rows="3"></textarea></body></html>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 900.0,
+                height: 400.0,
+            },
+        );
+        let mut boxes = Vec::new();
+        fn collect<'a>(layout_box: &'a LayoutBox, found: &mut Vec<&'a LayoutBox>) {
+            if matches!(layout_box.tag.as_str(), "input" | "select" | "textarea") {
+                found.push(layout_box);
+            }
+            for child in &layout_box.children {
+                collect(child, found);
+            }
+        }
+        collect(&layout.root, &mut boxes);
+        let [
+            text,
+            short,
+            submit,
+            select,
+            checkbox,
+            range,
+            plain,
+            textarea,
+        ] = boxes[..]
+        else {
+            panic!("eight controls should lay out, found {}", boxes.len());
+        };
+        assert!(
+            text.rect.width > 100.0,
+            "a text field is twenty characters wide"
+        );
+        assert!(short.rect.width < text.rect.width / 2.0);
+        assert!(
+            text.rect.height > 15.0,
+            "an empty text field is still a line tall"
+        );
+        assert_eq!(submit.text[0].text, "Submit");
+        assert_eq!(select.text[0].text, "Second");
+        assert!(matches!(select.control, Some(ControlPaint::Select { .. })));
+        assert_eq!(
+            checkbox.control,
+            Some(ControlPaint::Checkbox {
+                checked: true,
+                accent: Color::opaque(0, 117, 255)
+            })
+        );
+        assert_eq!(checkbox.background, Color::opaque(0, 117, 255));
+        assert_eq!(checkbox.rect.width, 15.0, "13px with a 1px border");
+        assert!(matches!(
+            range.control,
+            Some(ControlPaint::Range { fraction, .. }) if (fraction - 0.5).abs() < 1e-6
+        ));
+        assert_eq!(plain.control, None);
+        assert!(textarea.rect.height > text.rect.height * 2.0, "three rows");
+
+        let canvas = crate::paint::paint(&layout);
+        let pixel = |x: f32, y: f32| {
+            let index = (y as usize * canvas.width() as usize + x as usize) * 4;
+            canvas.rgba_pixels()[index..index + 3].to_vec()
+        };
+        let corner = (checkbox.rect.x + 2.5, checkbox.rect.y + 2.5);
+        assert_eq!(
+            pixel(corner.0, corner.1),
+            vec![0, 117, 255],
+            "a checked box fills"
+        );
+        let mark = (
+            checkbox.rect.x + 1.0 + 13.0 * 0.42,
+            checkbox.rect.y + 1.0 + 13.0 * 0.72,
+        );
+        assert_eq!(
+            pixel(mark.0, mark.1),
+            vec![255, 255, 255],
+            "with a white check"
+        );
+    }
+
+    #[test]
+    fn placeholder_marker_and_selection_pseudo_elements_style_their_parts() {
+        let document = Document::parse(
+            r#"<html><body><input placeholder="hint"><ul><li>item</li></ul><p>text</p></body></html>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "input::placeholder { color: #ff0000 } li::marker { color: #00ff00 } p::selection { background: #0000ff }",
+        )
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+        );
+        let input = find_box(&layout.root, "input").expect("input");
+        assert_eq!(input.text[0].color, Color::opaque(255, 0, 0));
+        let marker = find_box(&layout.root, "::marker").expect("marker");
+        assert_eq!(marker.background, Color::opaque(0, 255, 0));
+        let paragraph = find_box(&layout.root, "p").expect("paragraph");
+        assert_eq!(paragraph.selection, Some(Color::opaque(0, 0, 255)));
+        assert_eq!(
+            find_box(&layout.root, "li").and_then(|li| li.selection),
+            None
+        );
+    }
+
     fn find_box<'a>(layout_box: &'a LayoutBox, tag: &str) -> Option<&'a LayoutBox> {
         if layout_box.tag == tag {
             return Some(layout_box);
@@ -6948,7 +7465,7 @@ mod tests {
         let textarea = &result.root.children[1];
         assert_eq!(input.control_value.as_deref(), Some(""));
         assert_eq!(input.text[0].text, "your name");
-        assert_eq!(input.text[0].color, Color::opaque(120, 145, 155));
+        assert_eq!(input.text[0].color, Color::opaque(117, 117, 117));
         assert_eq!(textarea.control_value.as_deref(), Some(""));
         assert_eq!(
             textarea
@@ -7043,7 +7560,7 @@ mod tests {
     #[test]
     fn textarea_layout_wraps_to_content_width_and_honors_wrap_off() {
         let document = Document::parse(
-            "<textarea id='wrapped' style='display: block; width: 24px; height: 80px'>old</textarea><textarea id='off' wrap='off' style='display: block; width: 24px; height: 80px'>old</textarea>",
+            "<textarea id='wrapped' style='display: block; width: 24px; height: 80px; padding: 0; border: 0; font-size: 16px'>old</textarea><textarea id='off' wrap='off' style='display: block; width: 24px; height: 80px; padding: 0; border: 0; font-size: 16px'>old</textarea>",
         )
         .expect("textarea document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");

@@ -7357,7 +7357,7 @@ mod tests {
     #[test]
     fn clicks_land_on_scaled_and_rotated_controls() {
         let mut browser = Browser::new(bundle(
-            "<style>body { margin: 0; } button { display: block; width: 40px; height: 20px; border: 0; }</style><button id=\"scaled\" style=\"transform: scale(2); transform-origin: 0 0\">a</button><button id=\"turned\" style=\"position: absolute; left: 100px; top: 0; transform: rotate(90deg)\">b</button><p id=\"status\">idle</p><script>for (const id of ['scaled', 'turned']) { document.getElementById(id).addEventListener('click', () => { document.getElementById('status').textContent = id; }); }</script>",
+            "<style>body { margin: 0; } button { display: block; width: 40px; height: 20px; border: 0; padding: 0; }</style><button id=\"scaled\" style=\"transform: scale(2); transform-origin: 0 0\">a</button><button id=\"turned\" style=\"position: absolute; left: 100px; top: 0; transform: rotate(90deg)\">b</button><p id=\"status\">idle</p><script>for (const id of ['scaled', 'turned']) { document.getElementById(id).addEventListener('click', () => { document.getElementById('status').textContent = id; }); }</script>",
         ));
         browser
             .navigate("https://app.ceri.invalid/")
@@ -7462,7 +7462,7 @@ mod tests {
     fn dynamic_pseudo_classes_follow_pointer_focus_and_checked_state() {
         let mut browser = Browser::new(bundle(
             r##"<style>
-                button { display: block; width: 120px; height: 40px; background: #111111; }
+                button { display: block; width: 120px; height: 40px; background: #111111; border: 0; }
                 button:hover { background: #ff0000; }
                 button:focus { border: 3px solid #00ff00; }
                 input { display: block; width: 24px; height: 24px; background: #111111; }

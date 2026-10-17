@@ -659,6 +659,7 @@ pub(crate) struct InheritedText {
     pub(crate) border_collapse: bool,
     pub(crate) border_spacing: (f32, f32),
     pub(crate) caption_bottom: bool,
+    pub(crate) accent_color: Option<Color>,
 }
 
 impl Default for InheritedText {
@@ -674,6 +675,7 @@ impl Default for InheritedText {
             border_collapse: false,
             border_spacing: (0.0, 0.0),
             caption_bottom: false,
+            accent_color: None,
         }
     }
 }
@@ -830,12 +832,14 @@ impl StyleState {
             .is_some_and(|hovered| document.is_inclusive_ancestor(node, hovered))
     }
 
-    fn is_checked(&self, element: &Element, node: NodeId) -> bool {
+    pub(crate) fn is_checked(&self, element: &Element, node: NodeId) -> bool {
         if self.checked.contains(&node) {
             return true;
         }
         if self.unchecked.contains(&node) {
             false
+        } else if element.name == "option" {
+            element.attr("selected").is_some()
         } else {
             element.attr("checked").is_some()
         }
@@ -932,6 +936,10 @@ pub(crate) struct Style {
     pub container_type: Option<bool>,
     pub container_name: Option<u32>,
     pub border_collapse: bool,
+    // none is auto, the platform accent
+    pub accent_color: Option<Color>,
+    // appearance: none, which draws a control as a plain box
+    pub appearance_none: bool,
     // horizontal and vertical
     pub border_spacing: (f32, f32),
     pub caption_bottom: bool,
@@ -1101,6 +1109,8 @@ impl Style {
             container_type: None,
             container_name: None,
             border_collapse: parent_text.border_collapse,
+            accent_color: parent_text.accent_color,
+            appearance_none: false,
             border_spacing: parent_text.border_spacing,
             caption_bottom: parent_text.caption_bottom,
             table_fixed: false,
@@ -1175,44 +1185,13 @@ impl Style {
             backface_hidden: false,
         };
         match name {
-            "body" => {
-                style.margin = Edges::all(Length::px(8.0));
-                style.background = Color::WHITE;
-            }
-            "h1" => {
-                style.margin = Edges::vertical(Length::em(0.67));
-                style.font_size = Length::em(2.0);
-                style.font_weight = FontWeight::Bold;
-            }
-            "h2" => {
-                style.margin = Edges::vertical(Length::em(0.83));
-                style.font_size = Length::em(1.5);
-                style.font_weight = FontWeight::Bold;
-            }
-            "p" => style.margin = Edges::vertical(Length::em(1.0)),
-            "ul" | "ol" | "menu" => {
-                style.margin = Edges::vertical(Length::em(1.0));
-                style.padding.left = Length::px(40.0);
-                style.list_style_type = if name == "ol" {
-                    ListStyleType::Decimal
-                } else {
-                    ListStyleType::Disc
-                };
-            }
-            "dd" => style.margin.left = Length::px(40.0),
+            // the canvas behind a page is white unless the page says otherwise
+            "body" => style.background = Color::WHITE,
+            // collapsing and spacing do not inherit into a table from outside it
             "table" => {
-                style.border_spacing = (2.0, 2.0);
+                style.border_spacing = (0.0, 0.0);
                 style.border_collapse = false;
             }
-            "td" | "th" => {
-                style.padding = Edges::all(Length::px(1.0));
-                if name == "th" {
-                    style.font_weight = FontWeight::Bold;
-                    style.text_align = TextAlign::Center;
-                }
-            }
-            "caption" => style.text_align = TextAlign::Center,
-            "strong" | "b" => style.font_weight = FontWeight::Bold,
             _ => {}
         }
         style
@@ -1228,15 +1207,6 @@ impl Edges {
             left: value,
         }
     }
-
-    fn vertical(value: Length) -> Self {
-        Self {
-            top: value,
-            right: Length::px(0.0),
-            bottom: value,
-            left: Length::px(0.0),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1248,6 +1218,23 @@ pub struct Stylesheet {
     motion_rules: Vec<usize>,
     // shadow root style elements, by their text
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
+    // the pseudo-elements some rule styles, so the rest are not cascaded for nothing
+    styled_pseudo_elements: Vec<PseudoElement>,
+}
+
+fn styled_pseudo_elements(rules: &[Rule]) -> Vec<PseudoElement> {
+    let mut found = Vec::new();
+    for selector in rules.iter().flat_map(|rule| &rule.selectors) {
+        if let Some(pseudo) = selector
+            .parts
+            .last()
+            .and_then(|part| part.compound.pseudo_element)
+            && !found.contains(&pseudo)
+        {
+            found.push(pseudo);
+        }
+    }
+    found
 }
 
 fn motion_rules(rules: &[Rule]) -> Vec<usize> {
@@ -1309,6 +1296,18 @@ impl RuleIndex {
             bucket.dedup();
         }
         index
+    }
+
+    // whether any rule could match the element, without building the list
+    fn has_candidates(&self, subject: &Element) -> bool {
+        !self.universal.is_empty()
+            || self.by_tag.contains_key(&subject.name)
+            || subject
+                .attr("id")
+                .is_some_and(|id| self.by_id.contains_key(id))
+            || subject
+                .classes()
+                .any(|class| self.by_class.contains_key(class))
     }
 
     fn candidates(&self, subject: &Element) -> Vec<usize> {
@@ -1633,12 +1632,14 @@ impl Stylesheet {
         let (rules, keyframes) = parse_stylesheet(&source, None)?;
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
+        let styled_pseudo = styled_pseudo_elements(&rules);
         Ok(Self {
             rules,
             keyframes,
             index,
             motion_rules,
             shadow_sheets: RefCell::default(),
+            styled_pseudo_elements: styled_pseudo,
         })
     }
 
@@ -1649,6 +1650,7 @@ impl Stylesheet {
         let (rules, keyframes) = parse_stylesheet(&source, Some(&mut dropped)).unwrap_or_default();
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
+        let styled_pseudo = styled_pseudo_elements(&rules);
         (
             Self {
                 rules,
@@ -1656,6 +1658,7 @@ impl Stylesheet {
                 index,
                 motion_rules,
                 shadow_sheets: RefCell::default(),
+                styled_pseudo_elements: styled_pseudo,
             },
             dropped,
         )
@@ -1856,43 +1859,14 @@ impl Stylesheet {
             parent_weight,
             parent_text,
         );
-        // nested unordered lists step from discs to circles to squares, without margins
-        if pseudo.is_none() && matches!(name, "ul" | "menu") {
-            let depth = document
-                .ancestors(node)
-                .filter(|ancestor| {
-                    document.element(*ancestor).is_some_and(|element| {
-                        matches!(element.name.as_str(), "ul" | "ol" | "menu")
-                    })
-                })
-                .count();
-            if depth > 0 {
-                style.list_style_type = if depth == 1 {
-                    ListStyleType::Circle
-                } else {
-                    ListStyleType::Square
-                };
-            }
-        }
+        // the user agent hides elements with the hidden attribute, below any author display
         if pseudo.is_none()
-            && matches!(name, "ul" | "ol" | "menu")
-            && document.ancestors(node).any(|ancestor| {
-                document
-                    .element(ancestor)
-                    .is_some_and(|element| matches!(element.name.as_str(), "ul" | "ol" | "menu"))
-            })
-        {
-            style.margin.top = Length::px(0.0);
-            style.margin.bottom = Length::px(0.0);
-        }
-        // links show a pointer, as the user agent's :any-link rule does
-        if pseudo.is_none()
-            && name == "a"
             && document
                 .element(node)
-                .is_some_and(|element| element.attrs.contains_key("href"))
+                .and_then(|element| element.attr("hidden"))
+                .is_some_and(|hidden| !hidden.eq_ignore_ascii_case("until-found"))
         {
-            style.cursor = Cursor::Pointer;
+            style.display = Display::None;
         }
         let values = self.cascaded_values(document, node, pseudo, state);
         let empty_properties = BTreeMap::new();
@@ -2037,6 +2011,7 @@ impl Stylesheet {
                 border_collapse: style.border_collapse,
                 border_spacing: style.border_spacing,
                 caption_bottom: style.caption_bottom,
+                accent_color: style.accent_color,
             };
             computed = Some((style, font_size));
         }
@@ -2077,7 +2052,38 @@ impl Stylesheet {
         state: &StyleState,
         host_only: bool,
     ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
-        let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> = HashMap::new();
+        let mut values = HashMap::new();
+        self.collect_declarations(
+            CascadeTarget {
+                element,
+                document,
+                node,
+                pseudo,
+                state,
+                host_only,
+            },
+            &mut values,
+        );
+        values
+    }
+
+    // adds the declarations of matching rules, keeping whichever wins the cascade
+    fn collect_declarations<'a>(
+        &'a self,
+        target: CascadeTarget<'_>,
+        values: &mut HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)>,
+    ) {
+        let CascadeTarget {
+            element,
+            document,
+            node,
+            pseudo,
+            state,
+            host_only,
+        } = target;
+        if !self.index.has_candidates(element) {
+            return;
+        }
         for position in self.index.candidates(element) {
             let Some(rule) = self.rules.get(position) else {
                 continue;
@@ -2110,7 +2116,6 @@ impl Stylesheet {
                 }
             }
         }
-        values
     }
 
     fn matched_declarations(
@@ -2174,6 +2179,12 @@ impl Stylesheet {
         })
     }
 
+    // whether this sheet or the user agent's styles the pseudo-element
+    pub(crate) fn styles_pseudo(&self, pseudo: PseudoElement) -> bool {
+        self.styled_pseudo_elements.contains(&pseudo)
+            || user_agent_sheet().styled_pseudo_elements.contains(&pseudo)
+    }
+
     pub(crate) fn has_container_queries(&self) -> bool {
         self.rules.iter().any(|rule| {
             rule.conditions
@@ -2232,7 +2243,19 @@ impl Stylesheet {
                 })
                 .unwrap_or_default()
         } else {
-            self.borrowed_declarations(element, document, node, pseudo, state, false)
+            // the user agent's rules go in first and lose to any author rule for a property
+            let mut values = HashMap::new();
+            let target = CascadeTarget {
+                element,
+                document,
+                node,
+                pseudo,
+                state,
+                host_only: false,
+            };
+            user_agent_sheet().collect_declarations(target, &mut values);
+            self.collect_declarations(target, &mut values);
+            values
         };
         if shadows
             && let Some(shadow) = document.shadow_root(node)
@@ -2246,6 +2269,13 @@ impl Stylesheet {
                     order,
                     Cow::Owned(value),
                 ));
+            }
+        }
+        if in_shadow {
+            for (property, value) in user_agent_sheet()
+                .borrowed_declarations(element, document, node, pseudo, state, false)
+            {
+                values.entry(property).or_insert(value);
             }
         }
         let mut inline_dropped = Vec::new();
@@ -2335,6 +2365,11 @@ struct CompoundSelector {
 pub(crate) enum PseudoElement {
     Before,
     After,
+    // the hint text of an empty text field
+    Placeholder,
+    // the highlight behind selected text
+    Selection,
+    Marker,
     // a pseudo-element the engine does not draw, such as ::placeholder; its rules parse and
     // never apply
     Unrendered,
@@ -2345,6 +2380,9 @@ impl PseudoElement {
         match self {
             Self::Before => "::before",
             Self::After => "::after",
+            Self::Placeholder => "::placeholder",
+            Self::Selection => "::selection",
+            Self::Marker => "::marker",
             Self::Unrendered => "::unrendered",
         }
     }
@@ -2513,8 +2551,10 @@ struct Specificity(u32, u32, u32);
 // inline style, then !important rules, then !important inline style; cascade layers sit
 // between those tiers and the id count
 const IMPORTANT: u32 = 1 << 30;
-const LAYER_SHIFT: u32 = 20;
-const UNLAYERED: u32 = 511;
+const LAYER_SHIFT: u32 = 19;
+const UNLAYERED: u32 = 1023;
+// the user agent's rules sit below every author layer
+const USER_AGENT_LAYER: u32 = 0;
 
 impl Specificity {
     const INLINE: Self = Self(1 << 29, 0, 0);
@@ -2984,10 +3024,12 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 let element = match name.as_str() {
                     "before" => Some(PseudoElement::Before),
                     "after" => Some(PseudoElement::After),
-                    "placeholder"
-                    | "selection"
-                    | "marker"
-                    | "backdrop"
+                    "placeholder" | "-webkit-input-placeholder" | "-moz-placeholder" => {
+                        Some(PseudoElement::Placeholder)
+                    }
+                    "selection" | "-moz-selection" => Some(PseudoElement::Selection),
+                    "marker" => Some(PseudoElement::Marker),
+                    "backdrop"
                     | "first-line"
                     | "first-letter"
                     | "file-selector-button"
@@ -3650,8 +3692,7 @@ impl RuleSink<'_> {
             } else {
                 ranks
                     .get(&(rule.layer as usize))
-                    .copied()
-                    .unwrap_or(UNLAYERED - 1)
+                    .map_or(UNLAYERED - 1, |rank| rank + 1)
                     .min(UNLAYERED - 1)
             };
         }
@@ -3905,7 +3946,9 @@ fn parse_container_name(value: &str) -> Option<u32> {
 
 // the properties this engine applies, for @supports
 const SUPPORTED_PROPERTIES: &[&str] = &[
+    "accent-color",
     "align-content",
+    "appearance",
     "align-items",
     "align-self",
     "animation",
@@ -4244,6 +4287,88 @@ fn parse_declarations(
     Ok(declarations)
 }
 
+// the rendering defaults of the HTML standard for the properties this engine applies
+const USER_AGENT_CSS: &str = r#"
+body { margin: 8px }
+p, blockquote, figure, dl, ul, ol, menu, pre, listing, xmp, plaintext { margin-top: 1em; margin-bottom: 1em }
+blockquote, figure { margin-left: 40px; margin-right: 40px }
+h1 { margin-top: 0.67em; margin-bottom: 0.67em; font-size: 2em; font-weight: bold }
+h2 { margin-top: 0.83em; margin-bottom: 0.83em; font-size: 1.5em; font-weight: bold }
+h3 { margin-top: 1em; margin-bottom: 1em; font-size: 1.17em; font-weight: bold }
+h4 { margin-top: 1.33em; margin-bottom: 1.33em; font-weight: bold }
+h5 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; font-weight: bold }
+h6 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; font-weight: bold }
+b, strong, th, optgroup { font-weight: bold }
+small, sub, sup { font-size: 0.83em }
+code, kbd, pre, samp, tt, listing, xmp, plaintext { font-family: monospace }
+mark { background-color: yellow; color: black }
+a:any-link { color: #0000ee; cursor: pointer }
+center, th, caption { text-align: center }
+ul, ol, menu { padding-left: 40px }
+ul, menu { list-style-type: disc }
+ol { list-style-type: decimal }
+ul ul, ol ul, menu ul, ul ol, ol ol, menu ol, ul menu, ol menu, menu menu { margin-top: 0; margin-bottom: 0 }
+ul ul, ol ul, menu ul, ul menu, ol menu, menu menu { list-style-type: circle }
+:is(ul, ol, menu) :is(ul, ol, menu) ul, :is(ul, ol, menu) :is(ul, ol, menu) menu { list-style-type: square }
+dd { margin-left: 40px }
+table { border-spacing: 2px; border-collapse: separate }
+td, th { padding: 1px }
+hr { margin: 0.5em auto; border-style: inset; border-width: 1px; color: gray; overflow: hidden }
+fieldset { margin-left: 2px; margin-right: 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0 }
+legend { padding-left: 2px; padding-right: 2px }
+iframe { border: 2px inset }
+dialog:not([open]), input[type="hidden" i], datalist, template { display: none }
+dialog { position: absolute; left: 0; right: 0; margin: auto; border: solid; padding: 1em; background-color: white; color: black }
+input, button, select, textarea { font-size: 13.333px; font-family: sans-serif; color: black; letter-spacing: normal; text-transform: none; text-align: start; margin: 0 }
+input, textarea, select, button, meter, progress { display: inline-block; cursor: default }
+input:not([type]), input[type="text" i], input[type="search" i], input[type="email" i], input[type="url" i], input[type="tel" i], input[type="password" i], input[type="number" i], input[type="date" i], input[type="datetime-local" i], input[type="month" i], input[type="week" i], input[type="time" i], textarea {
+  padding: 1px 2px; border: 1px solid #767676; border-radius: 2px; background-color: white; cursor: text
+}
+textarea { padding: 2px; overflow: auto }
+button, input[type="button" i], input[type="submit" i], input[type="reset" i], input[type="file" i]::file-selector-button, select {
+  padding: 1px 6px; border: 1px solid #767676; border-radius: 3px; background-color: #efefef; text-align: center
+}
+select { padding: 1px 20px 1px 4px; text-align: start; background-color: white }
+input[type="checkbox" i], input[type="radio" i] { width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; background-color: white }
+input[type="radio" i] { border-radius: 50%; margin: 3px 3px 0 5px }
+input[type="range" i] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; background-color: transparent }
+input[type="color" i] { width: 50px; height: 27px; padding: 1px 2px; border: 1px solid #767676; border-radius: 2px; background-color: #efefef }
+input[type="file" i] { padding: 0; border: none }
+progress { width: 10em; height: 1em; border-radius: 0.5em; background-color: #efefef; border: 1px solid #c0c0c0; overflow: hidden }
+meter { width: 5em; height: 1em; border-radius: 0.5em; background-color: #efefef; border: 1px solid #c0c0c0; overflow: hidden }
+option, optgroup { display: block }
+input::placeholder, textarea::placeholder { color: #757575 }
+input:disabled, button:disabled, select:disabled, textarea:disabled { color: #6d6d6d; cursor: default }
+button:disabled, select:disabled, input[type="button" i]:disabled, input[type="submit" i]:disabled, input[type="reset" i]:disabled { background-color: #f4f4f4; border-color: #c4c4c4 }
+"#;
+
+thread_local! {
+    // parsed once for each thread that styles, and kept for its life so rules can borrow it
+    static USER_AGENT_SHEET: &'static Stylesheet = {
+        let mut sheet = Stylesheet::parse(USER_AGENT_CSS).expect("the user agent stylesheet parses");
+        for rule in &mut sheet.rules {
+            rule.layer = USER_AGENT_LAYER;
+        }
+        Box::leak(Box::new(sheet))
+    };
+}
+
+fn user_agent_sheet() -> &'static Stylesheet {
+    USER_AGENT_SHEET.with(|sheet| *sheet)
+}
+
+// what the cascade is collecting declarations for
+#[derive(Clone, Copy)]
+struct CascadeTarget<'b> {
+    element: &'b Element,
+    document: &'b Document,
+    node: NodeId,
+    pseudo: Option<PseudoElement>,
+    state: &'b StyleState,
+    // only rules that name the shadow host, as a shadow tree's own sheet styles its host
+    host_only: bool,
+}
+
 thread_local! {
     // the element's color while its declarations apply, for currentColor
     static CURRENT_COLOR: std::cell::Cell<Color> = const { std::cell::Cell::new(Color::BLACK) };
@@ -4343,6 +4468,16 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "list-style-position" => style.list_inside = value.trim().eq_ignore_ascii_case("inside"),
         "border-collapse" => style.border_collapse = value.trim().eq_ignore_ascii_case("collapse"),
+        "appearance" | "-webkit-appearance" | "-moz-appearance" => {
+            style.appearance_none = value.trim().eq_ignore_ascii_case("none");
+        }
+        "accent-color" => {
+            style.accent_color = if value.trim().eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                parse_color(value).or(style.accent_color)
+            };
+        }
         "container-type" => style.container_type = parse_container_type(value),
         "container-name" => style.container_name = parse_container_name(value),
         "container" => {
