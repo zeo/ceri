@@ -1262,6 +1262,7 @@ impl Browser {
             runtime.report(format!("dropped CSS rule: {dropped}"));
         }
         let parsed_stylesheet = Rc::new(parsed_stylesheet);
+        self.load_web_fonts(&url, &parsed_stylesheet);
         let layout_inputs = self.layout_inputs(parsed_stylesheet.clone());
         runtime.set_layout_inputs(layout_inputs.clone());
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
@@ -1355,7 +1356,7 @@ impl Browser {
                 pseudo: None,
                 parent_font_size: 16.0,
                 parent_color: crate::css::Color::BLACK,
-                parent_weight: crate::css::FontWeight::Normal,
+                parent_weight: crate::css::FontWeight::NORMAL,
                 parent_text: Default::default(),
                 state: &state,
             });
@@ -2522,6 +2523,12 @@ impl Browser {
                     }
                     let text = String::from_utf8(resource.body)
                         .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
+                    // urls in an external sheet are relative to it, not to the page
+                    let text = crate::css::absolutize_urls(&text, &|reference| {
+                        url.resolve(reference)
+                            .ok()
+                            .map(|absolute| absolute.to_string())
+                    });
                     self.expand_imports(text, &url, 0)
                 }
             };
@@ -2565,6 +2572,28 @@ impl Browser {
         }
         expanded.push_str(&rest);
         expanded
+    }
+
+    // fetches each @font-face rule's first source that loads and parses; a rule with none is
+    // skipped, and its family falls back to installed faces
+    fn load_web_fonts(&self, base: &AppUrl, stylesheet: &Stylesheet) {
+        self.fonts.clear_web_faces();
+        for rule in stylesheet.font_faces() {
+            let face = rule.sources.iter().find_map(|source| {
+                let url = base.resolve(source).ok()?;
+                let resource = self.load_subresource(&url).ok()?;
+                crate::font::FontFace::parse(resource.body).ok()
+            });
+            if let Some(face) = face {
+                self.fonts.add_web_face(
+                    &rule.family,
+                    rule.weights,
+                    rule.italic,
+                    rule.ranges.clone(),
+                    Rc::new(face),
+                );
+            }
+        }
     }
 
     fn execute_scripts(
@@ -5920,6 +5949,51 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn font_face_rules_load_woff2_faces_relative_to_their_stylesheet() {
+        let mut resources = bundle(
+            r##"<link rel="stylesheet" href="/styles/fonts.css">
+            <style>body { margin: 0 } .test { font-family: "Ceri Web"; font-size: 20px; display: inline-block }</style>
+            <div><span class="test" id="web">A A</span><span class="test" id="missing" style="font-family: Nowhere">A A</span></div>
+            <p id="status">idle</p>
+            <script>
+                document.getElementById("status").textContent = [
+                    document.getElementById("web").getBoundingClientRect().width,
+                    document.getElementById("missing").getBoundingClientRect().width,
+                ].join(",");
+            </script>"##,
+        );
+        resources
+            .insert(
+                "/styles/fonts.css",
+                "text/css",
+                b"@font-face { font-family: 'Ceri Web'; src: url(missing.woff2) format('woff2'), url(../fonts/ceri-test.woff2) format('woff2'); }"
+                    .to_vec(),
+            )
+            .expect("stylesheet should be accepted");
+        let font = std::fs::read(format!(
+            "{}/tests/fixtures/fonts/ceri-test.woff2",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture font should exist");
+        resources
+            .insert("/fonts/ceri-test.woff2", "font/woff2", font)
+            .expect("font should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        // two 600 unit letters and a 300 unit space at 20px from the web font; a family with
+        // no face borrows the web font's letters and keeps the builtin space
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("30,36")
         );
     }
 

@@ -9,7 +9,7 @@ use crate::css::{
     Clear, Cursor, Float, ListStyleType, OverflowWrap, SpaceCollapse, VerticalAlign, Visibility,
 };
 use crate::dom::{Document, Element, NodeId, NodeKind};
-use crate::font::FontStack;
+use crate::font::{FontStack, FontStyle};
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
 use crate::image::Image;
 use crate::linebreak::{WordBreak, break_opportunities};
@@ -47,7 +47,7 @@ pub struct TextRun {
     pub letter_spacing: f32,
     pub font_stack: FontStack,
     pub color: Color,
-    pub bold: bool,
+    pub font: FontStyle,
     // DOM text node that produced this run, so prose can be selected by pointer;
     // node_offset is where the word starts, past any leading space in text
     pub node: Option<NodeId>,
@@ -368,7 +368,7 @@ impl InlineLine {
             letter_spacing: 0.0,
             font_stack: FontStack::default(),
             color: Color::transparent(),
-            bold: false,
+            font: FontStyle::NORMAL,
             node: None,
             node_offset: 0,
             source_len: 0,
@@ -497,7 +497,7 @@ struct InlineFragment {
     letter_spacing: f32,
     font_stack: FontStack,
     color: Color,
-    bold: bool,
+    font: FontStyle,
     node: Option<NodeId>,
     node_offset: usize,
     source_len: usize,
@@ -588,7 +588,7 @@ impl<'a> Subject<'a> {
                 pseudo: Some(pseudo),
                 parent_font_size: 16.0,
                 parent_color: Color::BLACK,
-                parent_weight: FontWeight::Normal,
+                parent_weight: FontWeight::NORMAL,
                 parent_text: InheritedText::default(),
                 state,
             })
@@ -671,6 +671,7 @@ fn inherited_text(style: &Style) -> InheritedText {
         word_break: style.word_break,
         overflow_wrap: style.overflow_wrap,
         rtl: style.rtl,
+        italic: style.italic,
     }
 }
 
@@ -911,7 +912,7 @@ pub fn layout_with_state(
     let root_parent = ParentStyle {
         font_size: 16.0,
         color: Color::BLACK,
-        weight: FontWeight::Normal,
+        weight: FontWeight::NORMAL,
         text: InheritedText::default(),
         opacity: 1.0,
     };
@@ -951,7 +952,7 @@ pub fn layout_with_state(
                         font_size: 16.0,
                         line_height: 20.0,
                         color: Color::BLACK,
-                        weight: FontWeight::Normal,
+                        weight: FontWeight::NORMAL,
                         text: InheritedText::default(),
                         opacity: 1.0,
                         content_width: viewport.width,
@@ -1147,7 +1148,7 @@ fn offset_within_run(run: &TextRun, x: f32) -> usize {
     let mut pen = run.x;
     for character in run.text.chars() {
         let advance =
-            fonts.advance(character, run.font_stack, run.font_size, run.bold) + run.letter_spacing;
+            fonts.advance(character, run.font_stack, run.font_size, run.font) + run.letter_spacing;
         if x < pen + advance / 2.0 {
             return offset;
         }
@@ -2343,14 +2344,14 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                     value_line,
                     style.font_family,
                     font_size,
-                    style.font_weight == FontWeight::Bold,
+                    font_style(&style),
                     letter_spacing,
                 ),
                 font_size,
                 letter_spacing,
                 font_stack: style.font_family,
                 color,
-                bold: style.font_weight == FontWeight::Bold,
+                font: font_style(&style),
                 node: None,
                 node_offset: 0,
                 source_len: 0,
@@ -2443,7 +2444,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         letter_spacing: 0.0,
                         font_stack: style.font_family,
                         color: Color::transparent(),
-                        bold: false,
+                        font: FontStyle::NORMAL,
                         node: None,
                         node_offset: 0,
                         source_len: 0,
@@ -2928,7 +2929,10 @@ fn text_intrinsic_widths(pieces: &[(Option<NodeId>, &str)], context: InlineConte
         .letter_spacing
         .resolve(context.font_size, context.font_size)
         .unwrap_or(0.0);
-    let bold = context.weight == FontWeight::Bold;
+    let font = FontStyle {
+        weight: context.weight.0,
+        italic: context.text.italic,
+    };
     let joined = pieces
         .iter()
         .map(|(_, value)| *value)
@@ -2940,7 +2944,7 @@ fn text_intrinsic_widths(pieces: &[(Option<NodeId>, &str)], context: InlineConte
             value,
             context.text.family,
             context.font_size,
-            bold,
+            font,
             letter_spacing,
         )
     };
@@ -5031,15 +5035,8 @@ fn control_content_size(
         return (None, None);
     };
     let element = node.element();
-    let measure = |text: &str| {
-        measure_text(
-            text,
-            style.font_family,
-            font_size,
-            style.font_weight == FontWeight::Bold,
-            0.0,
-        )
-    };
+    let measure =
+        |text: &str| measure_text(text, style.font_family, font_size, font_style(style), 0.0);
     let attribute = |name: &str, default: f32| {
         element
             .and_then(|element| element.attr(name))
@@ -5171,7 +5168,7 @@ fn control_paint(
         }
         ControlType::File => {
             let width = file_button_width(&|text: &str| {
-                measure_text(text, style.font_family, font_size, false, 0.0)
+                measure_text(text, style.font_family, font_size, FontStyle::NORMAL, 0.0)
             });
             ControlPaint::FileButton { width }
         }
@@ -5257,7 +5254,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         .letter_spacing
         .resolve(font_size, font_size)
         .unwrap_or(0.0);
-    let bold = style.font_weight == FontWeight::Bold;
+    let font = font_style(&style);
     let child_parent = ParentStyle {
         font_size,
         color: style.color,
@@ -5272,7 +5269,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             Child::Text(_, value) => {
                 let transformed = style.text_transform.apply(value);
                 let measure = |text: &str| {
-                    measure_text(text, style.font_family, font_size, bold, letter_spacing)
+                    measure_text(text, style.font_family, font_size, font, letter_spacing)
                 };
                 let (narrowest, widest) =
                     text_extents(&transformed, &inherited_text(&style), &measure);
@@ -6389,7 +6386,10 @@ fn append_inline_text(
             .letter_spacing
             .resolve(context.font_size, context.font_size)
             .unwrap_or(0.0),
-        bold: context.weight == FontWeight::Bold,
+        font: FontStyle {
+            weight: context.weight.0,
+            italic: context.text.italic,
+        },
         levels: None,
         space: 0.0,
         leading: half_leading(context.line_height, context.text.family, context.font_size),
@@ -6415,7 +6415,7 @@ struct TextPlacer {
     context: InlineContext,
     source: InlineSource,
     letter_spacing: f32,
-    bold: bool,
+    font: FontStyle,
     // each UTF-16 unit's bidi level, when some text is right to left
     levels: Option<Vec<u8>>,
     // measured once for the node: a space, and half the leading
@@ -6458,7 +6458,7 @@ impl TextPlacer {
             text,
             self.context.text.family,
             self.context.font_size,
-            self.bold,
+            self.font,
             self.letter_spacing,
         )
     }
@@ -6762,7 +6762,7 @@ impl TextPlacer {
             letter_spacing: self.letter_spacing,
             font_stack: self.context.text.family,
             color: self.context.color.scale_alpha(self.context.opacity),
-            bold: self.bold,
+            font: self.font,
             node: self.source.node,
             node_offset: offset,
             source_len,
@@ -6856,7 +6856,7 @@ fn append_atomic(
         letter_spacing: 0.0,
         font_stack: context.text.family,
         color: Color::transparent(),
-        bold: false,
+        font: FontStyle::NORMAL,
         node: None,
         node_offset: 0,
         source_len: 0,
@@ -6933,7 +6933,7 @@ fn flush_line(
             letter_spacing: fragment.letter_spacing,
             font_stack: fragment.font_stack,
             color: fragment.color,
-            bold: fragment.bold,
+            font: fragment.font,
             node: fragment.node,
             node_offset: fragment.node_offset,
             source_len: fragment.source_len,
@@ -7045,12 +7045,12 @@ fn outside_marker(
     let color = text_color(style);
     let gap = font_size * 0.5;
     if let Some(label) = style.list_style_type.marker_text(ordinal) {
-        let bold = style.font_weight == FontWeight::Bold;
+        let font = font_style(style);
         let letter_spacing = style
             .letter_spacing
             .resolve(font_size, font_size)
             .unwrap_or(0.0);
-        let width = measure_text(&label, style.font_family, font_size, bold, letter_spacing);
+        let width = measure_text(&label, style.font_family, font_size, font, letter_spacing);
         let rect = Rect {
             x: content_x - gap - width,
             y: content_y + half_leading(line_height, style.font_family, font_size),
@@ -7066,7 +7066,7 @@ fn outside_marker(
             letter_spacing,
             font_stack: style.font_family,
             color,
-            bold,
+            font,
             node: None,
             node_offset: 0,
             source_len: 0,
@@ -7154,8 +7154,13 @@ fn visual_fragments(fragments: Vec<InlineFragment>, base: u8) -> Vec<InlineFragm
         .collect()
 }
 
-// characters in reverse with each base kept before its marks, brackets mirrored
+// characters in reverse with each base kept before its marks, brackets mirrored; a space
+// that joins the piece to what comes before stays in front
 fn reversed_for_display(text: &str) -> String {
+    let (lead, text) = match text.strip_prefix(' ') {
+        Some(rest) => (" ", rest),
+        None => ("", text),
+    };
     let mut clusters: Vec<String> = Vec::new();
     for character in text.chars() {
         match clusters.last_mut() {
@@ -7163,7 +7168,7 @@ fn reversed_for_display(text: &str) -> String {
             _ => clusters.push(mirrored(character).to_string()),
         }
     }
-    clusters.into_iter().rev().collect()
+    lead.to_string() + &clusters.into_iter().rev().collect::<String>()
 }
 
 // takes a float out of the line and puts it as high and as far to its side as the floats
@@ -7346,7 +7351,7 @@ fn root_font_size(
             ParentStyle {
                 font_size: INITIAL_FONT_SIZE,
                 color: Color::BLACK,
-                weight: FontWeight::Normal,
+                weight: FontWeight::NORMAL,
                 text: InheritedText::default(),
                 opacity: 1.0,
             },
@@ -7363,14 +7368,22 @@ fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
     (line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0
 }
 
+// the weight and slant a style asks its font for
+fn font_style(style: &Style) -> FontStyle {
+    FontStyle {
+        weight: style.font_weight.0,
+        italic: style.italic,
+    }
+}
+
 fn measure_text(
     text: &str,
     stack: FontStack,
     font_size: f32,
-    bold: bool,
+    font: FontStyle,
     letter_spacing: f32,
 ) -> f32 {
-    crate::font::active_fonts().measure(text, stack, font_size, bold)
+    crate::font::active_fonts().measure(text, stack, font_size, font)
         + letter_spacing * text.chars().count() as f32
 }
 
@@ -7449,7 +7462,7 @@ fn control_text_lines(
     font_size: f32,
 ) -> Vec<String> {
     let max_characters = (content_width
-        / measure_text("X", FontStack::default(), font_size, false, 0.0).max(1.0))
+        / measure_text("X", FontStack::default(), font_size, FontStyle::NORMAL, 0.0).max(1.0))
     .floor()
     .max(1.0) as usize;
     let mut lines = Vec::new();

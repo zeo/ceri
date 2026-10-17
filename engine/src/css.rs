@@ -497,7 +497,7 @@ impl LengthTerms {
                     '0',
                     crate::font::FontStack::default(),
                     font_size,
-                    false,
+                    crate::font::FontStyle::NORMAL,
                 )
     }
 
@@ -690,6 +690,7 @@ pub(crate) struct InheritedText {
     pub(crate) word_break: crate::linebreak::WordBreak,
     pub(crate) overflow_wrap: OverflowWrap,
     pub(crate) rtl: bool,
+    pub(crate) italic: bool,
 }
 
 impl Default for InheritedText {
@@ -713,6 +714,7 @@ impl Default for InheritedText {
             word_break: crate::linebreak::WordBreak::Normal,
             overflow_wrap: OverflowWrap::Normal,
             rtl: false,
+            italic: false,
         }
     }
 }
@@ -764,10 +766,45 @@ pub(crate) enum TextAlign {
     Right,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FontWeight {
-    Normal,
-    Bold,
+// a css font weight from 1 to 1000
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FontWeight(pub(crate) u16);
+
+impl FontWeight {
+    pub(crate) const NORMAL: Self = Self(400);
+    pub(crate) const BOLD: Self = Self(700);
+
+    // bolder and lighter step between the weights fonts commonly have
+    fn bolder(self) -> Self {
+        Self(match self.0 {
+            0..350 => 400,
+            350..550 => 700,
+            _ => 900,
+        })
+    }
+
+    fn lighter(self) -> Self {
+        Self(match self.0 {
+            0..550 => 100,
+            550..750 => 400,
+            _ => 700,
+        })
+    }
+
+    fn parse(value: &str, base: Self) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "normal" => Self::NORMAL,
+            "bold" => Self::BOLD,
+            "bolder" => base.bolder(),
+            "lighter" => base.lighter(),
+            number => Self(
+                number
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|weight| (1.0..=1000.0).contains(weight))? as u16,
+            ),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1006,6 +1043,8 @@ pub(crate) struct Style {
     pub overflow_wrap: OverflowWrap,
     // direction: rtl
     pub rtl: bool,
+    // font-style italic or oblique
+    pub italic: bool,
     // top, right, bottom and left
     pub border: [BorderSide; 4],
     pub outline: OutlineStyle,
@@ -1187,6 +1226,7 @@ impl Style {
             word_break: parent_text.word_break,
             overflow_wrap: parent_text.overflow_wrap,
             rtl: parent_text.rtl,
+            italic: parent_text.italic,
             border: [BorderSide::INITIAL; 4],
             outline: OutlineStyle::INITIAL,
             text_align: parent_text.text_align,
@@ -1274,6 +1314,7 @@ pub struct Stylesheet {
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
     // the pseudo-elements some rule styles, so the rest are not cascaded for nothing
     styled_pseudo_elements: Vec<PseudoElement>,
+    font_faces: Vec<FontFaceRule>,
 }
 
 fn styled_pseudo_elements(rules: &[Rule]) -> Vec<PseudoElement> {
@@ -1683,7 +1724,7 @@ impl Stylesheet {
 impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = strip_comments(source);
-        let (rules, keyframes) = parse_stylesheet(&source, None)?;
+        let (rules, keyframes, font_faces) = parse_stylesheet(&source, None)?;
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         let styled_pseudo = styled_pseudo_elements(&rules);
@@ -1694,6 +1735,7 @@ impl Stylesheet {
             motion_rules,
             shadow_sheets: RefCell::default(),
             styled_pseudo_elements: styled_pseudo,
+            font_faces,
         })
     }
 
@@ -1701,7 +1743,8 @@ impl Stylesheet {
     pub fn parse_recovering(source: &str) -> (Self, Vec<String>) {
         let source = strip_comments(source);
         let mut dropped = Vec::new();
-        let (rules, keyframes) = parse_stylesheet(&source, Some(&mut dropped)).unwrap_or_default();
+        let (rules, keyframes, font_faces) =
+            parse_stylesheet(&source, Some(&mut dropped)).unwrap_or_default();
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         let styled_pseudo = styled_pseudo_elements(&rules);
@@ -1713,6 +1756,7 @@ impl Stylesheet {
                 motion_rules,
                 shadow_sheets: RefCell::default(),
                 styled_pseudo_elements: styled_pseudo,
+                font_faces,
             },
             dropped,
         )
@@ -2045,7 +2089,7 @@ impl Stylesheet {
         chain.reverse();
         let mut font_size = 16.0;
         let mut color = Color::BLACK;
-        let mut weight = FontWeight::Normal;
+        let mut weight = FontWeight::NORMAL;
         let mut text = InheritedText::default();
         let mut computed = None;
         for current in chain {
@@ -2085,6 +2129,7 @@ impl Stylesheet {
                 word_break: style.word_break,
                 overflow_wrap: style.overflow_wrap,
                 rtl: style.rtl,
+                italic: style.italic,
             };
             computed = Some((style, font_size));
         }
@@ -2256,6 +2301,10 @@ impl Stylesheet {
     pub(crate) fn styles_pseudo(&self, pseudo: PseudoElement) -> bool {
         self.styled_pseudo_elements.contains(&pseudo)
             || user_agent_sheet().styled_pseudo_elements.contains(&pseudo)
+    }
+
+    pub(crate) fn font_faces(&self) -> &[FontFaceRule] {
+        &self.font_faces
     }
 
     pub(crate) fn has_container_queries(&self) -> bool {
@@ -3729,7 +3778,133 @@ struct RuleSink<'a> {
     // layer ids from lowest to highest precedence
     layer_order: Vec<usize>,
     anonymous_layers: usize,
+    font_faces: Vec<FontFaceRule>,
     dropped: Option<&'a mut Vec<String>>,
+}
+
+// an @font-face rule: where a family's face for some weights and slant can be fetched
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FontFaceRule {
+    pub(crate) family: String,
+    // urls in order of preference, with formats this engine cannot read left out
+    pub(crate) sources: Vec<String>,
+    pub(crate) weights: (u16, u16),
+    pub(crate) italic: bool,
+    pub(crate) ranges: Vec<(u32, u32)>,
+}
+
+fn parse_font_face(body: &str) -> Option<FontFaceRule> {
+    let declarations = parse_declarations(body, Some(&mut Vec::new())).ok()?;
+    let value = |name: &str| {
+        declarations
+            .iter()
+            .rev()
+            .find(|declaration| declaration.property == name)
+            .map(|declaration| declaration.value.as_str())
+    };
+    let family = value("font-family")?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .to_string();
+    let sources = split_top_level(value("src")?)
+        .into_iter()
+        .filter_map(|source| {
+            let source = source.trim();
+            let url = source.strip_prefix("url(")?;
+            let end = url.find(')')?;
+            let format = source[4 + end + 1..].trim().to_ascii_lowercase();
+            let readable = format.is_empty()
+                || ["woff2", "woff", "truetype", "opentype", "collection"]
+                    .iter()
+                    .any(|kind| format.contains(kind));
+            readable.then(|| url[..end].trim().trim_matches(['"', '\'']).to_string())
+        })
+        .collect::<Vec<_>>();
+    if family.is_empty() || sources.is_empty() {
+        return None;
+    }
+    let weights = value("font-weight").map_or((400, 400), |weight| {
+        let mut parts = weight
+            .split_ascii_whitespace()
+            .filter_map(|part| FontWeight::parse(part, FontWeight::NORMAL));
+        match (parts.next(), parts.next()) {
+            (Some(low), Some(high)) => (low.0.min(high.0), low.0.max(high.0)),
+            (Some(single), None) => (single.0, single.0),
+            _ => (400, 400),
+        }
+    });
+    let italic = value("font-style").is_some_and(|style| {
+        let style = style.trim().to_ascii_lowercase();
+        style.starts_with("italic") || style.starts_with("oblique")
+    });
+    let ranges = value("unicode-range").map_or_else(Vec::new, parse_unicode_ranges);
+    Some(FontFaceRule {
+        family,
+        sources,
+        weights,
+        italic,
+        ranges,
+    })
+}
+
+// unicode-range: U+41, U+0-7F, U+4??
+fn parse_unicode_ranges(value: &str) -> Vec<(u32, u32)> {
+    value
+        .split(',')
+        .filter_map(|range| {
+            let range = range.trim();
+            let digits = range
+                .strip_prefix("U+")
+                .or_else(|| range.strip_prefix("u+"))?;
+            let parse = |text: &str| u32::from_str_radix(text, 16).ok();
+            if let Some((first, last)) = digits.split_once('-') {
+                return Some((parse(first)?, parse(last)?));
+            }
+            if digits.contains('?') {
+                return Some((
+                    parse(&digits.replace('?', "0"))?,
+                    parse(&digits.replace('?', "F"))?,
+                ));
+            }
+            let point = parse(digits)?;
+            Some((point, point))
+        })
+        .filter(|(first, last)| first <= last && *last <= 0x10FFFF)
+        .collect()
+}
+
+// rewrites each url() in a stylesheet with what resolve makes of it, so rules keep pointing
+// at what their own sheet meant once its text is merged with others
+pub(crate) fn absolutize_urls(source: &str, resolve: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("url(") {
+        let (before, after) = rest.split_at(start + 4);
+        output.push_str(before);
+        let Some(end) = after.find(')') else {
+            rest = after;
+            break;
+        };
+        let inner = after[..end].trim();
+        let quote = inner
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '"' | '\''));
+        let reference = inner.trim_matches(['"', '\'']);
+        match resolve(reference)
+            .filter(|_| !reference.starts_with("data:") && !reference.starts_with('#'))
+        {
+            Some(absolute) => {
+                let quote = quote.map_or(String::new(), String::from);
+                output.push_str(&format!("{quote}{absolute}{quote}"));
+            }
+            None => output.push_str(&after[..end]),
+        }
+        rest = &after[end..];
+    }
+    output.push_str(rest);
+    output
 }
 
 impl RuleSink<'_> {
@@ -3752,7 +3927,7 @@ impl RuleSink<'_> {
         id
     }
 
-    fn finish(mut self) -> (Vec<Rule>, Vec<Keyframes>) {
+    fn finish(mut self) -> ParsedSheet {
         let ranks = self
             .layer_order
             .iter()
@@ -3769,7 +3944,7 @@ impl RuleSink<'_> {
                     .min(UNLAYERED - 1)
             };
         }
-        (self.rules, self.keyframes)
+        (self.rules, self.keyframes, self.font_faces)
     }
 }
 
@@ -3781,16 +3956,20 @@ struct RuleScope {
     parent: Option<String>,
 }
 
+// a stylesheet's rules, keyframes and font faces
+type ParsedSheet = (Vec<Rule>, Vec<Keyframes>, Vec<FontFaceRule>);
+
 fn parse_stylesheet(
     source: &str,
     dropped: Option<&mut Vec<String>>,
-) -> Result<(Vec<Rule>, Vec<Keyframes>), String> {
+) -> Result<ParsedSheet, String> {
     let mut sink = RuleSink {
         rules: Vec::new(),
         keyframes: Vec::new(),
         layer_names: Vec::new(),
         layer_order: Vec::new(),
         anonymous_layers: 0,
+        font_faces: Vec::new(),
         dropped,
     };
     parse_rules(source, &RuleScope::default(), &mut sink)?;
@@ -3894,6 +4073,13 @@ fn parse_at_rule(
             let full = scoped_layer(scope, &layer);
             sink.layer(&full);
             inner.layer = Some(full);
+        }
+        "font-face" => {
+            match parse_font_face(body) {
+                Some(rule) => sink.font_faces.push(rule),
+                None => sink.drop_or_fail(format!("unusable @font-face rule: {header}"))?,
+            }
+            return Ok(());
         }
         "keyframes" | "-webkit-keyframes" => {
             match parse_keyframes(prelude, body) {
@@ -4017,9 +4203,51 @@ fn parse_container_name(value: &str) -> Option<u32> {
         .map(crate::grid::intern_name)
 }
 
+// font: style and weight words, then a size with an optional line height, then the families
+fn apply_font_shorthand(style: &mut Style, value: &str) {
+    let words = split_words(value);
+    let Some(size_index) = words.iter().position(|word| {
+        parse_length(word.split('/').next().unwrap_or(word)).is_some()
+            && !word.chars().all(|character| character.is_ascii_digit())
+    }) else {
+        return;
+    };
+    let families = words[size_index + 1..].join(" ");
+    if families.trim().is_empty() {
+        return;
+    }
+    // the shorthand resets what it leaves out
+    style.italic = false;
+    style.font_weight = FontWeight::NORMAL;
+    style.line_height = Length::em(NORMAL_LINE_HEIGHT);
+    style.line_height_absolute = false;
+    for word in &words[..size_index] {
+        match word.to_ascii_lowercase().as_str() {
+            "italic" | "oblique" => style.italic = true,
+            "normal" | "small-caps" => {}
+            other => {
+                if let Some(weight) = FontWeight::parse(other, style.font_weight) {
+                    style.font_weight = weight;
+                }
+            }
+        }
+    }
+    let mut size = words[size_index].splitn(2, '/');
+    if let Some(font_size) = size.next().and_then(parse_length) {
+        style.font_size = font_size;
+    }
+    if let Some((height, absolute)) = size.next().and_then(parse_line_height) {
+        style.line_height = height;
+        style.line_height_absolute = absolute;
+    }
+    style.font_family = crate::font::intern_font_stack(&families);
+}
+
 // the properties this engine applies, for @supports
 const SUPPORTED_PROPERTIES: &[&str] = &[
     "accent-color",
+    "font",
+    "font-style",
     "direction",
     "word-wrap",
     "overflow-wrap",
@@ -4197,7 +4425,7 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
                     "div",
                     16.0,
                     Color::BLACK,
-                    FontWeight::Normal,
+                    FontWeight::NORMAL,
                     InheritedText::default(),
                 );
                 apply_declaration(&mut style, "display", &keyword);
@@ -4378,7 +4606,9 @@ h3 { margin-top: 1em; margin-bottom: 1em; font-size: 1.17em; font-weight: bold }
 h4 { margin-top: 1.33em; margin-bottom: 1.33em; font-weight: bold }
 h5 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; font-weight: bold }
 h6 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; font-weight: bold }
-b, strong, th, optgroup { font-weight: bold }
+b, strong { font-weight: bolder }
+th, optgroup { font-weight: bold }
+em, i, cite, var, dfn, address { font-style: italic }
 small, sub, sup { font-size: 0.83em }
 code, kbd, pre, samp, tt, listing, xmp, plaintext { font-family: monospace }
 pre, listing, xmp, plaintext { white-space: pre }
@@ -4828,10 +5058,22 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             }
         }
         "font-weight" => {
-            if value.trim().eq_ignore_ascii_case("bold") || value.trim() == "700" {
-                style.font_weight = FontWeight::Bold;
-            }
+            style.font_weight =
+                FontWeight::parse(value, style.font_weight).unwrap_or(style.font_weight);
         }
+        "font-style" => match value
+            .trim()
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "italic" | "oblique" => style.italic = true,
+            "normal" => style.italic = false,
+            _ => {}
+        },
+        "font" => apply_font_shorthand(style, value),
         "flex-direction" => {
             if let Some(direction) = parse_flex_direction(value) {
                 style.flex_direction = direction;
@@ -6123,7 +6365,7 @@ mod tests {
             pseudo: None,
             parent_font_size: 16.0,
             parent_color: Color::BLACK,
-            parent_weight: FontWeight::Normal,
+            parent_weight: FontWeight::NORMAL,
             parent_text: InheritedText::default(),
             state,
         }
@@ -6446,7 +6688,7 @@ mod tests {
                 &[],
                 16.0,
                 Color::BLACK,
-                FontWeight::Normal
+                FontWeight::NORMAL
             )
             .color,
             Color::opaque(66, 211, 180)
@@ -6514,7 +6756,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(style.display, Display::Block);
         let mut element = Element::new("div");
@@ -6525,7 +6767,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(style.display, Display::Flex);
         assert_eq!(style.flex_direction, FlexDirection::Column);
@@ -6551,7 +6793,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(style.position, Position::Absolute);
         assert_eq!(style.z_index, Some(-2));
@@ -6567,7 +6809,7 @@ mod tests {
             .attrs
             .insert("class".to_string(), "scroll".to_string());
         assert_eq!(
-            style_within(&auto, &scroll, &[], 16.0, Color::BLACK, FontWeight::Normal,).overflow,
+            style_within(&auto, &scroll, &[], 16.0, Color::BLACK, FontWeight::NORMAL,).overflow,
             Overflow::Auto
         );
         let sticky = Stylesheet::parse(".sticky { position: sticky; top: 4px; }")
@@ -6582,7 +6824,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(sticky_style.position, Position::Sticky);
         assert_eq!(sticky_style.inset.top, Length::px(4.0));
@@ -6604,7 +6846,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(style.display, Display::Grid);
         let columns = style.grid_template_columns.list();
@@ -6638,7 +6880,7 @@ mod tests {
             &[&shell],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         let direct_style = style_within(
             &stylesheet,
@@ -6646,7 +6888,7 @@ mod tests {
             &[&shell],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(card_style.color, Color::opaque(255, 0, 0));
         assert_eq!(direct_style.color, Color::opaque(0, 0, 255));
@@ -6666,7 +6908,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(card_style.color, Color::opaque(0, 0, 255));
 
@@ -6680,7 +6922,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(muted_style.color, Color::opaque(255, 0, 0));
 
@@ -6692,7 +6934,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(panel_style.background, Color::opaque(0, 128, 0));
 
@@ -6830,7 +7072,7 @@ mod tests {
             &[],
             16.0,
             Color::BLACK,
-            FontWeight::Normal,
+            FontWeight::NORMAL,
         );
         assert_eq!(style.color, Color::opaque(255, 0, 0));
         assert_eq!(style.background, Color::opaque(0, 0, 255));

@@ -120,7 +120,6 @@ const INHERITED: &[(&str, &str)] = &[
     ("overflow-wrap", "normal"),
     ("word-spacing", "0px"),
     ("direction", "ltr"),
-    ("font-style", "normal"),
     ("font-variant", "normal"),
     ("list-style-type", "disc"),
     ("text-indent", "0px"),
@@ -130,6 +129,7 @@ const INHERITED: &[(&str, &str)] = &[
 
 const COMPUTED: &[&str] = &[
     "display",
+    "font-style",
     "position",
     "color",
     "background-color",
@@ -558,7 +558,7 @@ impl ScriptRuntime {
                 pseudo: None,
                 parent_font_size: 16.0,
                 parent_color: crate::Color::BLACK,
-                parent_weight: FontWeight::Normal,
+                parent_weight: FontWeight::NORMAL,
                 parent_text: crate::css::InheritedText::default(),
                 state: &state,
             })
@@ -1009,11 +1009,8 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         "background-color" => color_text(style.background),
         "opacity" => number_to_string(f64::from(style.opacity)),
         "font-size" => px(font_size),
-        "font-weight" => match style.font_weight {
-            FontWeight::Normal => "400",
-            FontWeight::Bold => "700",
-        }
-        .to_string(),
+        "font-weight" => style.font_weight.0.to_string(),
+        "font-style" => if style.italic { "italic" } else { "normal" }.to_string(),
         "font-family" => inherited("font-family").unwrap_or_else(|| "sans-serif".to_string()),
         "line-height" => style
             .line_height

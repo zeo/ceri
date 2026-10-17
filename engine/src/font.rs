@@ -18,9 +18,14 @@ pub struct FontFace {
     long_loca: bool,
     loca: (usize, usize),
     glyf: (usize, usize),
+    // the PostScript outlines of an OpenType CFF font, used when it has no glyf table
+    cff: Option<crate::cff::CffFont>,
     hmtx: (usize, usize),
     horizontal_metrics: u16,
     characters: BTreeMap<u32, u16>,
+    // usWeightClass and the italic flag, from OS/2 and head
+    weight: u16,
+    italic: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -46,13 +51,25 @@ pub struct GlyphBitmap {
 
 impl FontFace {
     pub fn parse(data: Vec<u8>) -> Result<Self, String> {
+        let data = if crate::woff::is_woff(&data) {
+            crate::woff::decode(&data)?
+        } else {
+            data
+        };
         let tables = read_table_directory(&data)?;
         let head = *tables.get(b"head").ok_or("font has no head table")?;
         let hhea = *tables.get(b"hhea").ok_or("font has no hhea table")?;
         let maxp = *tables.get(b"maxp").ok_or("font has no maxp table")?;
         let hmtx = *tables.get(b"hmtx").ok_or("font has no hmtx table")?;
-        let loca = *tables.get(b"loca").ok_or("font has no loca table")?;
-        let glyf = *tables.get(b"glyf").ok_or("font has no glyf table")?;
+        let (loca, glyf, cff) = match (tables.get(b"loca"), tables.get(b"glyf")) {
+            (Some(loca), Some(glyf)) => (*loca, *glyf, None),
+            _ => {
+                let table = tables
+                    .get(b"CFF ")
+                    .ok_or("font has neither glyf nor CFF outlines")?;
+                ((0, 0), (0, 0), Some(crate::cff::parse(&data, table.0)?))
+            }
+        };
         let cmap = *tables.get(b"cmap").ok_or("font has no cmap table")?;
 
         let units_per_em = f32::from(read_u16(&data, head.0 + 18)?);
@@ -73,6 +90,20 @@ impl FontFace {
         if characters.is_empty() {
             return Err("font has no usable unicode character map".to_string());
         }
+        let os2 = tables.get(b"OS/2").map(|table| table.0);
+        let weight = os2
+            .and_then(|os2| read_u16(&data, os2 + 4).ok())
+            .filter(|weight| (1..=1000).contains(weight))
+            .unwrap_or(400);
+        let italic = os2
+            .and_then(|os2| read_u16(&data, os2 + 62).ok())
+            .map(|selection| selection & 1 != 0)
+            .or_else(|| {
+                read_u16(&data, head.0 + 44)
+                    .ok()
+                    .map(|style| style & 2 != 0)
+            })
+            .unwrap_or(false);
 
         Ok(Self {
             data,
@@ -84,9 +115,12 @@ impl FontFace {
             long_loca,
             loca,
             glyf,
+            cff,
             hmtx,
             horizontal_metrics,
             characters,
+            weight,
+            italic,
         })
     }
 
@@ -106,6 +140,18 @@ impl FontFace {
         (self.ascent + self.descent + self.line_gap) / self.units_per_em * size
     }
 
+    pub fn weight(&self) -> u16 {
+        self.weight
+    }
+
+    pub fn is_italic(&self) -> bool {
+        self.italic
+    }
+
+    pub fn has_glyph(&self, character: char) -> bool {
+        self.characters.contains_key(&u32::from(character))
+    }
+
     pub fn glyph_for(&self, character: char) -> u16 {
         self.characters
             .get(&u32::from(character))
@@ -122,6 +168,9 @@ impl FontFace {
     }
 
     pub fn outline(&self, glyph: u16) -> Option<Outline> {
+        if let Some(cff) = &self.cff {
+            return cff.outline(&self.data, glyph);
+        }
         let mut outline = Outline::default();
         self.append_outline(glyph, (1.0, 0.0, 0.0, 1.0), (0.0, 0.0), 0, &mut outline)?;
         Some(outline)
@@ -560,13 +609,36 @@ fn accumulate_segment(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GlyphKey {
-    family: FontStack,
+    face: usize,
     glyph: u16,
     size: u32,
-    bold: bool,
+    synthetic_bold: bool,
+    synthetic_italic: bool,
 }
 
-type FaceCache = HashMap<(FontStack, bool), Option<Rc<FontFace>>>;
+// the weight and slant text asks for
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FontStyle {
+    pub weight: u16,
+    pub italic: bool,
+}
+
+impl FontStyle {
+    pub const NORMAL: Self = Self {
+        weight: 400,
+        italic: false,
+    };
+
+    pub fn is_bold(self) -> bool {
+        self.weight >= 600
+    }
+}
+
+impl Default for FontStyle {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
 
 // a css font-family list, interned so inherited style values stay copyable
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -622,9 +694,14 @@ pub fn font_stack_families(stack: FontStack) -> Option<Rc<[String]>> {
     FONT_STACKS.with(|table| table.borrow().families.get(stack.0 as usize - 1).cloned())
 }
 
-// the host owns font discovery, the engine only asks for a family by name
+// the host owns font discovery, the engine only asks for a family by name and style
 pub trait FontSource {
-    fn face(&self, family: &str, bold: bool) -> Option<Rc<FontFace>>;
+    fn face(&self, family: &str, style: FontStyle) -> Option<Rc<FontFace>>;
+
+    // a face that can draw a character none of the requested families have
+    fn fallback(&self, _character: char, _style: FontStyle) -> Option<Rc<FontFace>> {
+        None
+    }
 }
 
 struct SingleFaceSource {
@@ -633,18 +710,83 @@ struct SingleFaceSource {
 }
 
 impl FontSource for SingleFaceSource {
-    fn face(&self, _family: &str, bold: bool) -> Option<Rc<FontFace>> {
-        if bold {
+    fn face(&self, _family: &str, style: FontStyle) -> Option<Rc<FontFace>> {
+        if style.is_bold() {
             return self.bold.clone().or_else(|| Some(self.regular.clone()));
         }
         Some(self.regular.clone())
     }
 }
 
+// a face loaded from an @font-face rule, for one family, weight range and slant
+struct WebFace {
+    family: String,
+    weights: (u16, u16),
+    italic: bool,
+    // code point ranges the face is used for, all of them when empty
+    ranges: Rc<[(u32, u32)]>,
+    face: Rc<FontFace>,
+}
+
+// a face in a stack, limited to an @font-face unicode-range when it has one
+#[derive(Clone)]
+struct StackFace {
+    face: Rc<FontFace>,
+    ranges: Rc<[(u32, u32)]>,
+}
+
+impl StackFace {
+    fn covers(&self, character: char) -> bool {
+        let point = u32::from(character);
+        (self.ranges.is_empty()
+            || self
+                .ranges
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&point)))
+            && self.face.has_glyph(character)
+    }
+}
+
+// a face with the synthesis it needs to stand in for the style asked for
+#[derive(Clone)]
+pub(crate) struct ChosenFace {
+    pub(crate) face: Rc<FontFace>,
+    pub(crate) synthetic_bold: bool,
+    pub(crate) synthetic_italic: bool,
+}
+
+impl ChosenFace {
+    fn new(face: Rc<FontFace>, style: FontStyle) -> Self {
+        Self {
+            synthetic_bold: style.weight >= 600 && face.weight() <= 500,
+            synthetic_italic: style.italic && !face.is_italic(),
+            face,
+        }
+    }
+
+    // emboldening widens each glyph by a twenty-fourth of the em
+    fn advance(&self, character: char, size: f32) -> f32 {
+        let advance = self.face.advance(self.face.glyph_for(character), size);
+        if self.synthetic_bold {
+            advance + size / 24.0
+        } else {
+            advance
+        }
+    }
+}
+
+type FaceList = Rc<[StackFace]>;
+
+// the face each missing character fell back to, by style
+type FallbackCache = HashMap<(char, FontStyle), Option<Rc<FontFace>>>;
+
 // text metrics and rasterized glyphs for the whole engine, cached per face and size
 pub struct FontSet {
     source: Option<Rc<dyn FontSource>>,
-    faces: RefCell<FaceCache>,
+    web_faces: RefCell<Vec<WebFace>>,
+    // the faces a stack's families supply, in order
+    stacks: RefCell<HashMap<(FontStack, FontStyle), FaceList>>,
+    fallbacks: RefCell<FallbackCache>,
     glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
 }
 
@@ -659,16 +801,17 @@ impl FontSet {
     pub fn builtin() -> Self {
         Self {
             source: None,
-            faces: RefCell::new(HashMap::new()),
-            glyphs: RefCell::new(HashMap::new()),
+            web_faces: RefCell::default(),
+            stacks: RefCell::default(),
+            fallbacks: RefCell::default(),
+            glyphs: RefCell::default(),
         }
     }
 
     pub fn from_source(source: Rc<dyn FontSource>) -> Self {
         Self {
             source: Some(source),
-            faces: RefCell::new(HashMap::new()),
-            glyphs: RefCell::new(HashMap::new()),
+            ..Self::builtin()
         }
     }
 
@@ -677,28 +820,56 @@ impl FontSet {
     }
 
     pub fn is_builtin(&self) -> bool {
-        self.source.is_none()
+        self.source.is_none() && self.web_faces.borrow().is_empty()
     }
 
-    pub fn measure(&self, text: &str, stack: FontStack, size: f32, bold: bool) -> f32 {
-        match self.face(stack, bold) {
-            Some(face) => text
-                .chars()
-                .map(|character| face.advance(face.glyph_for(character), size))
-                .sum(),
-            None => text.chars().count() as f32 * builtin_advance(size),
+    // registers a face from an @font-face rule; it is chosen before installed faces
+    pub(crate) fn add_web_face(
+        &self,
+        family: &str,
+        weights: (u16, u16),
+        italic: bool,
+        ranges: Vec<(u32, u32)>,
+        face: Rc<FontFace>,
+    ) {
+        self.web_faces.borrow_mut().push(WebFace {
+            family: family.to_ascii_lowercase(),
+            weights,
+            italic,
+            ranges: ranges.into(),
+            face,
+        });
+        self.stacks.borrow_mut().clear();
+        self.fallbacks.borrow_mut().clear();
+    }
+
+    pub(crate) fn clear_web_faces(&self) {
+        if !self.web_faces.borrow().is_empty() {
+            self.web_faces.borrow_mut().clear();
+            self.stacks.borrow_mut().clear();
+            self.fallbacks.borrow_mut().clear();
+            self.glyphs.borrow_mut().clear();
         }
     }
 
-    pub fn advance(&self, character: char, stack: FontStack, size: f32, bold: bool) -> f32 {
-        match self.face(stack, bold) {
-            Some(face) => face.advance(face.glyph_for(character), size),
+    pub fn measure(&self, text: &str, stack: FontStack, size: f32, style: FontStyle) -> f32 {
+        if self.is_builtin() {
+            return text.chars().count() as f32 * builtin_advance(size);
+        }
+        text.chars()
+            .map(|character| self.advance(character, stack, size, style))
+            .sum()
+    }
+
+    pub fn advance(&self, character: char, stack: FontStack, size: f32, style: FontStyle) -> f32 {
+        match self.face_for(character, stack, style) {
+            Some(chosen) => chosen.advance(character, size),
             None => builtin_advance(size),
         }
     }
 
     pub fn ascent(&self, stack: FontStack, size: f32) -> f32 {
-        match self.face(stack, false) {
+        match self.primary(stack, FontStyle::NORMAL) {
             Some(face) => face.ascent(size),
             None => size,
         }
@@ -706,14 +877,14 @@ impl FontSet {
 
     // the height of a glyph box, ascent plus descent, which half-leading centres in a line
     pub fn content_height(&self, stack: FontStack, size: f32) -> f32 {
-        match self.face(stack, false) {
+        match self.primary(stack, FontStyle::NORMAL) {
             Some(face) => face.ascent(size) + face.descent(size),
             None => size,
         }
     }
 
     pub fn line_height(&self, stack: FontStack, size: f32) -> f32 {
-        match self.face(stack, false) {
+        match self.primary(stack, FontStyle::NORMAL) {
             Some(face) => face.line_height(size),
             None => size * 1.25,
         }
@@ -724,46 +895,186 @@ impl FontSet {
         character: char,
         stack: FontStack,
         size: f32,
-        bold: bool,
+        style: FontStyle,
     ) -> Option<Rc<GlyphBitmap>> {
-        let face = self.face(stack, bold)?;
-        let glyph = face.glyph_for(character);
+        let chosen = self.face_for(character, stack, style)?;
+        let glyph = chosen.face.glyph_for(character);
         let key = GlyphKey {
-            family: stack,
+            face: Rc::as_ptr(&chosen.face) as usize,
             glyph,
             size: size.to_bits(),
-            bold,
+            synthetic_bold: chosen.synthetic_bold,
+            synthetic_italic: chosen.synthetic_italic,
         };
         if let Some(cached) = self.glyphs.borrow().get(&key) {
             return cached.clone();
         }
-        let bitmap = face
+        let bitmap = chosen
+            .face
             .outline(glyph)
-            .and_then(|outline| rasterize(&outline, size / face.units_per_em(), 0.0))
+            .map(|outline| {
+                if chosen.synthetic_italic {
+                    oblique(outline)
+                } else {
+                    outline
+                }
+            })
+            .and_then(|outline| rasterize(&outline, size / chosen.face.units_per_em(), 0.0))
+            .map(|bitmap| {
+                if chosen.synthetic_bold {
+                    embolden(bitmap, (size / 24.0).round().max(1.0) as usize)
+                } else {
+                    bitmap
+                }
+            })
             .map(Rc::new);
         self.glyphs.borrow_mut().insert(key, bitmap.clone());
         bitmap
     }
 
-    // the first family the host can supply wins, matching css font fallback
-    fn face(&self, stack: FontStack, bold: bool) -> Option<Rc<FontFace>> {
-        let source = self.source.as_ref()?;
-        if let Some(cached) = self.faces.borrow().get(&(stack, bold)) {
+    // the face that draws a character: the first family in the stack that has it, then an
+    // installed face that does, then the first family anyway
+    pub(crate) fn face_for(
+        &self,
+        character: char,
+        stack: FontStack,
+        style: FontStyle,
+    ) -> Option<ChosenFace> {
+        let faces = self.stack_faces(stack, style);
+        if let Some(entry) = faces.iter().find(|entry| entry.covers(character)) {
+            return Some(ChosenFace::new(entry.face.clone(), style));
+        }
+        if !character.is_whitespace()
+            && !character.is_control()
+            && let Some(face) = self.fallback(character, style)
+        {
+            return Some(ChosenFace::new(face, style));
+        }
+        faces
+            .first()
+            .map(|entry| ChosenFace::new(entry.face.clone(), style))
+    }
+
+    fn primary(&self, stack: FontStack, style: FontStyle) -> Option<Rc<FontFace>> {
+        self.stack_faces(stack, style)
+            .first()
+            .map(|entry| entry.face.clone())
+    }
+
+    fn fallback(&self, character: char, style: FontStyle) -> Option<Rc<FontFace>> {
+        if let Some(cached) = self.fallbacks.borrow().get(&(character, style)) {
             return cached.clone();
         }
+        let face = self
+            .web_faces
+            .borrow()
+            .iter()
+            .find(|web| web.face.has_glyph(character))
+            .map(|web| web.face.clone())
+            .or_else(|| self.source.as_ref()?.fallback(character, style));
+        self.fallbacks
+            .borrow_mut()
+            .insert((character, style), face.clone());
+        face
+    }
+
+    fn stack_faces(&self, stack: FontStack, style: FontStyle) -> FaceList {
+        if let Some(cached) = self.stacks.borrow().get(&(stack, style)) {
+            return cached.clone();
+        }
+        let mut faces: Vec<StackFace> = Vec::new();
         let families = font_stack_families(stack);
-        let mut face = None;
-        if let Some(families) = families.as_deref() {
-            for family in families {
-                face = source.face(family, bold);
-                if face.is_some() {
-                    break;
-                }
+        let mut push = |entry: StackFace| {
+            if !faces
+                .iter()
+                .any(|known| Rc::ptr_eq(&known.face, &entry.face) && known.ranges == entry.ranges)
+            {
+                faces.push(entry);
+            }
+        };
+        for family in families
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .chain(["sans-serif"])
+        {
+            for entry in self.web_faces_for(family, style) {
+                push(entry);
+            }
+            if let Some(face) = self
+                .source
+                .as_ref()
+                .and_then(|source| source.face(family, style))
+            {
+                push(StackFace {
+                    face,
+                    ranges: Rc::from([]),
+                });
             }
         }
-        let face = face.or_else(|| source.face("sans-serif", bold));
-        self.faces.borrow_mut().insert((stack, bold), face.clone());
-        face
+        let faces: FaceList = faces.into();
+        self.stacks
+            .borrow_mut()
+            .insert((stack, style), faces.clone());
+        faces
+    }
+
+    // the @font-face faces of a family, nearest in slant and weight first, each covering only
+    // its unicode-range
+    fn web_faces_for(&self, family: &str, style: FontStyle) -> Vec<StackFace> {
+        let web_faces = self.web_faces.borrow();
+        let mut matching = web_faces
+            .iter()
+            .filter(|web| web.family == family)
+            .collect::<Vec<_>>();
+        let distance = |web: &&WebFace| {
+            let (low, high) = web.weights;
+            let weight = if style.weight < low {
+                low - style.weight
+            } else {
+                style.weight.saturating_sub(high)
+            };
+            (u16::from(web.italic != style.italic), weight)
+        };
+        matching.sort_by_key(distance);
+        matching
+            .into_iter()
+            .map(|web| StackFace {
+                face: web.face.clone(),
+                ranges: web.ranges.clone(),
+            })
+            .collect()
+    }
+}
+
+// slants an outline as a synthetic italic does, about a fifth of the height
+fn oblique(mut outline: Outline) -> Outline {
+    for contour in &mut outline.contours {
+        for point in contour {
+            point.x += point.y * 0.2;
+        }
+    }
+    outline
+}
+
+// thickens a glyph to the right, as a synthetic bold does
+fn embolden(bitmap: GlyphBitmap, strength: usize) -> GlyphBitmap {
+    let width = bitmap.width + strength;
+    let mut coverage = vec![0_u8; width * bitmap.height];
+    for row in 0..bitmap.height {
+        for column in 0..bitmap.width {
+            let value = bitmap.coverage[row * bitmap.width + column];
+            for shift in 0..=strength {
+                let target = &mut coverage[row * width + column + shift];
+                *target = (*target).max(value);
+            }
+        }
+    }
+    GlyphBitmap {
+        width,
+        coverage,
+        ..bitmap
     }
 }
 
@@ -805,7 +1116,7 @@ fn read_table_directory(data: &[u8]) -> Result<BTreeMap<[u8; 4], (usize, usize)>
     let offset = match version {
         0x0001_0000 | 0x7472_7565 => 0,
         0x7474_6366 => read_u32(data, 12).ok_or("font collection has no first face")? as usize,
-        0x4f54_544f => return Err("OpenType CFF outlines are not supported".to_string()),
+        0x4f54_544f => 0,
         other => return Err(format!("unsupported font format {other:#x}")),
     };
     let table_count = read_u16(data, offset + 4).map_err(|error| error.to_string())?;
@@ -1092,20 +1403,52 @@ mod tests {
         assert_eq!(outside, 0, "pixels past the outline should stay empty");
     }
 
+    fn fixture(name: &str) -> FontFace {
+        let path = format!("{}/tests/fixtures/fonts/{name}", env!("CARGO_MANIFEST_DIR"));
+        FontFace::parse(std::fs::read(&path).expect("fixture font should exist"))
+            .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+    }
+
+    #[test]
+    fn truetype_cff_woff_and_woff2_files_give_the_same_glyphs() {
+        let faces = [
+            "ceri-test.ttf",
+            "ceri-test.otf",
+            "ceri-test.woff",
+            "ceri-test.woff2",
+        ]
+        .map(fixture);
+        for face in &faces {
+            assert_eq!(face.units_per_em(), 1000.0);
+            assert_eq!(face.weight(), 400);
+            assert!(face.has_glyph('A') && !face.has_glyph('Z'));
+            assert_eq!(face.advance(face.glyph_for('A'), 1000.0), 600.0);
+            let bitmap = rasterize(
+                &face.outline(face.glyph_for('A')).expect("A has an outline"),
+                0.05,
+                0.0,
+            )
+            .expect("A rasterizes");
+            // the left stem of the A is solid
+            let row = bitmap.height / 2;
+            assert!(bitmap.coverage[row * bitmap.width + 1] > 200);
+        }
+    }
+
     #[test]
     fn font_set_measures_with_the_face_and_falls_back_to_the_builtin_metrics() {
         let face = Rc::new(FontFace::parse(synthetic_font()).expect("font"));
         let fonts = FontSet::new(face, None);
         let stack = intern_font_stack("Test Face, sans-serif");
         assert!(!fonts.is_builtin());
-        assert!((fonts.measure("AA", stack, 100.0, false) - 120.0).abs() < 0.01);
-        assert!(fonts.glyph('A', stack, 20.0, false).is_some());
+        assert!((fonts.measure("AA", stack, 100.0, FontStyle::NORMAL) - 120.0).abs() < 0.01);
+        assert!(fonts.glyph('A', stack, 20.0, FontStyle::NORMAL).is_some());
 
         let builtin = FontSet::builtin();
         assert!(builtin.is_builtin());
-        assert_eq!(builtin.measure("AAA", stack, 12.0, false), 18.0);
+        assert_eq!(builtin.measure("AAA", stack, 12.0, FontStyle::NORMAL), 18.0);
         assert_eq!(builtin.line_height(stack, 16.0), 20.0);
-        assert!(builtin.glyph('A', stack, 16.0, false).is_none());
+        assert!(builtin.glyph('A', stack, 16.0, FontStyle::NORMAL).is_none());
     }
 
     #[test]
@@ -1129,17 +1472,17 @@ mod tests {
 
         struct OnlyTahoma(Rc<FontFace>);
         impl FontSource for OnlyTahoma {
-            fn face(&self, family: &str, _bold: bool) -> Option<Rc<FontFace>> {
+            fn face(&self, family: &str, _style: FontStyle) -> Option<Rc<FontFace>> {
                 (family == "tahoma").then(|| self.0.clone())
             }
         }
 
         let face = Rc::new(FontFace::parse(synthetic_font()).expect("font"));
         let fonts = FontSet::from_source(Rc::new(OnlyTahoma(face)));
-        assert!((fonts.measure("A", first, 1000.0, false) - 600.0).abs() < 0.01);
+        assert!((fonts.measure("A", first, 1000.0, FontStyle::NORMAL) - 600.0).abs() < 0.01);
         // an unavailable stack falls back to the builtin metrics rather than measuring zero
         assert_eq!(
-            fonts.measure("A", other, 1000.0, false),
+            fonts.measure("A", other, 1000.0, FontStyle::NORMAL),
             builtin_advance(1000.0)
         );
     }

@@ -1,5 +1,6 @@
 mod bidi;
 mod border;
+mod cff;
 mod colors;
 mod css;
 mod dom;
@@ -30,13 +31,16 @@ mod unicode_tables;
 mod wasm;
 #[cfg(feature = "windowed")]
 mod window;
+mod woff;
 
 pub use css::{Color, ColorScheme, Cursor, Display, Stylesheet};
 pub use dom::{
     AccessibilityNode, Document, DomError, Element, Namespace, NodeId, NodeKind, ParseError,
     ScriptSource, StylesheetSource,
 };
-pub use font::{FontFace, FontSet, FontSource, FontStack, GlyphBitmap, intern_font_stack};
+pub use font::{
+    FontFace, FontSet, FontSource, FontStack, FontStyle, GlyphBitmap, intern_font_stack,
+};
 pub use host::{
     EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, KeyModifiers,
     PointerButton,

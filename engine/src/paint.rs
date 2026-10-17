@@ -1951,7 +1951,7 @@ fn width_within_run(run: &TextRun, units: usize, fonts: &crate::font::FontSet) -
             break;
         }
         width +=
-            fonts.advance(character, run.font_stack, run.font_size, run.bold) + run.letter_spacing;
+            fonts.advance(character, run.font_stack, run.font_size, run.font) + run.letter_spacing;
         consumed += character.len_utf16();
     }
     width
@@ -2508,7 +2508,11 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f
         for (row, bits) in glyph.iter().enumerate() {
             for column in 0..5 {
                 if bits & (1 << (4 - column)) != 0 {
-                    let width = if run.bold { pixel + 1.0 } else { pixel };
+                    let width = if run.font.is_bold() {
+                        pixel + 1.0
+                    } else {
+                        pixel
+                    };
                     fill_rect_optional(
                         canvas,
                         x + column as f32 * pixel + offset.0,
@@ -2545,7 +2549,7 @@ fn paint_outline_text(
         height: clip.height * scale,
     });
     for character in run.text.chars() {
-        if let Some(glyph) = fonts.glyph(character, run.font_stack, device_size, run.bold) {
+        if let Some(glyph) = fonts.glyph(character, run.font_stack, device_size, run.font) {
             canvas.blend_coverage(
                 pen.round() as i32 + glyph.left,
                 baseline.round() as i32 + glyph.top,
@@ -2554,7 +2558,7 @@ fn paint_outline_text(
                 device_clip,
             );
         }
-        pen += fonts.advance(character, run.font_stack, device_size, run.bold)
+        pen += fonts.advance(character, run.font_stack, device_size, run.font)
             + run.letter_spacing * scale;
     }
 }
@@ -2735,7 +2739,7 @@ mod tests {
                     letter_spacing: 0.0,
                     font_stack: crate::font::FontStack::default(),
                     color: Color::BLACK,
-                    bold: false,
+                    font: crate::font::FontStyle::NORMAL,
                     node: Some(node(&[1, 0])),
                     node_offset: 0,
                     source_len: 6,
@@ -3005,7 +3009,7 @@ mod tests {
                     letter_spacing: 0.0,
                     font_stack: crate::font::FontStack::default(),
                     color: Color::WHITE,
-                    bold: false,
+                    font: crate::font::FontStyle::NORMAL,
                     node: None,
                     node_offset: 0,
                     source_len: 0,
@@ -3116,7 +3120,7 @@ mod tests {
                         letter_spacing: 0.0,
                         font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
-                        bold: false,
+                        font: crate::font::FontStyle::NORMAL,
                         node: None,
                         node_offset: 0,
                         source_len: 0,
@@ -3130,7 +3134,7 @@ mod tests {
                         letter_spacing: 0.0,
                         font_stack: crate::font::FontStack::default(),
                         color: Color::WHITE,
-                        bold: false,
+                        font: crate::font::FontStyle::NORMAL,
                         node: None,
                         node_offset: 0,
                         source_len: 0,
