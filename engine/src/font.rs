@@ -704,6 +704,14 @@ impl FontSet {
         }
     }
 
+    // the height of a glyph box, ascent plus descent, which half-leading centres in a line
+    pub fn content_height(&self, stack: FontStack, size: f32) -> f32 {
+        match self.face(stack, false) {
+            Some(face) => face.ascent(size) + face.descent(size),
+            None => size,
+        }
+    }
+
     pub fn line_height(&self, stack: FontStack, size: f32) -> f32 {
         match self.face(stack, false) {
             Some(face) => face.line_height(size),

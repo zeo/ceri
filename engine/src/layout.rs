@@ -648,6 +648,8 @@ fn inherited_text(style: &Style) -> InheritedText {
         border_spacing: style.border_spacing,
         caption_bottom: style.caption_bottom,
         accent_color: style.accent_color,
+        text_align: style.text_align,
+        line_height: style.line_height,
     }
 }
 
@@ -2311,7 +2313,9 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             text.push(TextRun {
                 text: value_line.clone(),
                 x: content_x,
-                y: content_y + line_index as f32 * line_height,
+                y: content_y
+                    + line_index as f32 * line_height
+                    + half_leading(line_height, style.font_family, font_size),
                 width: measure_text(
                     value_line,
                     style.font_family,
@@ -6561,9 +6565,14 @@ fn flush_line(
             continue;
         }
         text.push(TextRun {
+            y: top
+                + half_leading(
+                    fragment.line_height,
+                    fragment.font_stack,
+                    fragment.font_size,
+                ),
             text: fragment.text,
             x,
-            y: top,
             width: fragment.width,
             font_size: fragment.font_size,
             letter_spacing: fragment.letter_spacing,
@@ -6586,10 +6595,19 @@ fn flush_line(
                 starts.contains_key(&decoration),
                 ends.contains_key(&decoration),
             ),
-            if stretched {
-                line.y + (line.height - line.decorations[decoration].line_height).max(0.0)
-            } else {
-                line.y
+            {
+                let decoration = &line.decorations[decoration];
+                let line_top = if stretched {
+                    line.y + (line.height - decoration.line_height).max(0.0)
+                } else {
+                    line.y
+                };
+                line_top
+                    + half_leading(
+                        decoration.line_height,
+                        decoration.style.font_family,
+                        decoration.font_size,
+                    )
             },
         );
         line.placed.push(fragment);
@@ -6617,7 +6635,6 @@ fn inline_fragment_box(
         tag,
         style,
         font_size,
-        line_height,
         padding,
         border,
         ..
@@ -6627,7 +6644,7 @@ fn inline_fragment_box(
         right: if last { border.right } else { 0.0 },
         ..*border
     };
-    let content_height = line_height.min(font_size * 1.25);
+    let content_height = crate::font::active_fonts().content_height(style.font_family, *font_size);
     let rect = Rect {
         x: start,
         y: text_top - padding.top - border.top,
@@ -6681,7 +6698,7 @@ fn outside_marker(
         let width = measure_text(&label, style.font_family, font_size, bold, letter_spacing);
         let rect = Rect {
             x: content_x - gap - width,
-            y: content_y,
+            y: content_y + half_leading(line_height, style.font_family, font_size),
             width,
             height: line_height,
         };
@@ -6943,6 +6960,11 @@ fn root_font_size(
         .resolve(viewport.width, INITIAL_FONT_SIZE)
         .filter(|size| size.is_finite() && *size > 0.0)
         .unwrap_or(INITIAL_FONT_SIZE)
+}
+
+// the space above a glyph box that centres it in its line, half the leading
+fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
+    (line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0
 }
 
 fn measure_text(
@@ -7343,6 +7365,47 @@ mod tests {
         assert_eq!(
             find_box(&layout.root, "li").and_then(|li| li.selection),
             None
+        );
+    }
+
+    #[test]
+    fn text_align_and_line_height_inherit_and_lines_centre_their_glyphs() {
+        let document = Document::parse(
+            r#"<html><body><main style="text-align: right; line-height: 2"><p>a</p></main><section style="line-height: 30px; font-size: 10px"><p style="font-size: 20px">b</p></section></body></html>"#,
+        )
+        .expect("document should parse");
+        let stylesheet =
+            Stylesheet::parse("body, p { margin: 0 }").expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 200.0,
+            },
+        );
+        let paragraphs = {
+            fn collect<'a>(layout_box: &'a LayoutBox, found: &mut Vec<&'a LayoutBox>) {
+                if layout_box.tag == "p" {
+                    found.push(layout_box);
+                }
+                for child in &layout_box.children {
+                    collect(child, found);
+                }
+            }
+            let mut found = Vec::new();
+            collect(&layout.root, &mut found);
+            found
+        };
+        let factor = paragraphs[0];
+        assert!(factor.text[0].x > 150.0, "text-align inherits from main");
+        assert_eq!(factor.rect.height, 32.0, "line-height 2 of a 16px font");
+        // a 32px line around a 16px glyph box leaves 8px above it
+        assert_eq!(factor.text[0].y - factor.rect.y, 8.0);
+        let pixels = paragraphs[1];
+        assert_eq!(
+            pixels.rect.height, 30.0,
+            "a pixel line-height inherits as pixels"
         );
     }
 

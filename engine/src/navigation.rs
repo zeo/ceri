@@ -5904,7 +5904,8 @@ mod tests {
             height: 80.0,
         };
         let canvas = browser.paint(viewport).expect("stacking page should paint");
-        let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
+        // below the button's label, where only its background shows
+        let pixel = &canvas.rgba_pixels()[(27 * canvas.width() as usize + 4) * 4..];
         assert_eq!(&pixel[..4], &[0, 255, 0, 255]);
         assert!(
             browser
@@ -6148,7 +6149,7 @@ mod tests {
         let status = document.find_element_by_id("status").expect("status");
         assert_eq!(
             document.element_text_content(status).as_deref(),
-            Some("true,20,true")
+            Some("true,16,true")
         );
         let layout = browser.layout(viewport).expect("layout should build");
         let link = document.find_element_by_id("link").expect("link");
@@ -6211,7 +6212,7 @@ mod tests {
         let status = document.find_element_by_id("status").expect("status");
         assert_eq!(
             document.element_text_content(status).as_deref(),
-            Some("0,220,100,30,100,0,80,40,70,true,true,0,1")
+            Some("0,220,100,30,100,0,80,40,70,true,true,2,1")
         );
     }
 

@@ -660,6 +660,9 @@ pub(crate) struct InheritedText {
     pub(crate) border_spacing: (f32, f32),
     pub(crate) caption_bottom: bool,
     pub(crate) accent_color: Option<Color>,
+    pub(crate) text_align: TextAlign,
+    // a factor of the font size, or a length an ancestor already turned into pixels
+    pub(crate) line_height: Length,
 }
 
 impl Default for InheritedText {
@@ -676,6 +679,8 @@ impl Default for InheritedText {
             border_spacing: (0.0, 0.0),
             caption_bottom: false,
             accent_color: None,
+            text_align: TextAlign::Left,
+            line_height: Length::em(NORMAL_LINE_HEIGHT),
         }
     }
 }
@@ -958,6 +963,8 @@ pub(crate) struct Style {
     pub color: Color,
     pub font_size: Length,
     pub line_height: Length,
+    // a line-height with units, which descendants inherit in pixels rather than as a factor
+    pub line_height_absolute: bool,
     // top, right, bottom and left
     pub border: [BorderSide; 4],
     pub outline: OutlineStyle,
@@ -1132,10 +1139,11 @@ impl Style {
             background: Color::transparent(),
             color: parent_color,
             font_size: Length::px(parent_font_size),
-            line_height: Length::em(1.25),
+            line_height: parent_text.line_height,
+            line_height_absolute: false,
             border: [BorderSide::INITIAL; 4],
             outline: OutlineStyle::INITIAL,
-            text_align: TextAlign::Left,
+            text_align: parent_text.text_align,
             text_transform: parent_text.transform,
             letter_spacing: parent_text.letter_spacing,
             font_family: parent_text.family,
@@ -1952,6 +1960,18 @@ impl Stylesheet {
                 style.height = Length::px(height as f32);
             }
         }
+        // a line height with units is computed here, so descendants inherit the pixels
+        if style.line_height_absolute {
+            let font_size = style
+                .font_size
+                .resolve(parent_font_size, parent_font_size)
+                .unwrap_or(parent_font_size);
+            let height = style
+                .line_height
+                .resolve(font_size, font_size)
+                .unwrap_or(font_size * NORMAL_LINE_HEIGHT);
+            style.line_height = Length::px(height);
+        }
         style
     }
 
@@ -2012,6 +2032,8 @@ impl Stylesheet {
                 border_spacing: style.border_spacing,
                 caption_bottom: style.caption_bottom,
                 accent_color: style.accent_color,
+                text_align: style.text_align,
+                line_height: style.line_height,
             };
             computed = Some((style, font_size));
         }
@@ -4673,7 +4695,12 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "color" => style.color = parse_color(value).unwrap_or(style.color),
         "font-size" => style.font_size = parse_length(value).unwrap_or(style.font_size),
-        "line-height" => style.line_height = parse_line_height(value).unwrap_or(style.line_height),
+        "line-height" => {
+            if let Some((height, absolute)) = parse_line_height(value) {
+                style.line_height = height;
+                style.line_height_absolute = absolute;
+            }
+        }
         "font-weight" => {
             if value.trim().eq_ignore_ascii_case("bold") || value.trim() == "700" {
                 style.font_weight = FontWeight::Bold;
@@ -4834,9 +4861,10 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "text-align" => {
             style.text_align = match value.trim().to_ascii_lowercase().as_str() {
-                "center" => TextAlign::Center,
-                "right" => TextAlign::Right,
-                _ => TextAlign::Left,
+                "center" | "-webkit-center" => TextAlign::Center,
+                "right" | "end" | "-webkit-right" => TextAlign::Right,
+                "left" | "start" | "justify" | "-webkit-left" => TextAlign::Left,
+                _ => style.text_align,
             };
         }
         "font-family" => {
@@ -5348,12 +5376,19 @@ fn split_top_level(source: &str) -> Vec<&str> {
     parts
 }
 
-fn parse_line_height(value: &str) -> Option<Length> {
+// the line height normal stands for, as a factor of the font size
+pub(crate) const NORMAL_LINE_HEIGHT: f32 = 1.25;
+
+// a plain number or normal stays a factor of the font size; a length is computed once
+fn parse_line_height(value: &str) -> Option<(Length, bool)> {
     let value = value.trim();
-    if let Ok(multiplier) = value.parse::<f32>() {
-        return Some(Length::em(multiplier));
+    if value.eq_ignore_ascii_case("normal") {
+        return Some((Length::em(NORMAL_LINE_HEIGHT), false));
     }
-    parse_length(value)
+    if let Ok(multiplier) = value.parse::<f32>() {
+        return Some((Length::em(multiplier), false));
+    }
+    parse_length(value).map(|length| (length, true))
 }
 
 fn parse_number(value: &str) -> Option<f32> {
