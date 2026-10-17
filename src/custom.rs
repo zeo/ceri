@@ -108,11 +108,11 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn host_bridge(&self) -> HostBridge {
+    fn host_bridge(&self, window: &str) -> HostBridge {
         HostBridge::new(
             Rc::new(CommandRoutes(self.commands.clone())),
             self.capabilities.clone(),
-            MAIN_WINDOW,
+            window,
         )
     }
 }
@@ -149,12 +149,12 @@ fn run_app(bridge: Bridge) -> Result<(), String> {
             bridge,
         );
     }
-    run_window(config, move || {
+    run_window(vec![config], move |window| {
         build_browser(
             assets.clone(),
             storage.clone(),
             allowed.clone(),
-            bridge.clone(),
+            bridge.host_bridge(&window.label),
         )
     })
 }
@@ -169,7 +169,7 @@ fn capture(
     bridge: Bridge,
 ) -> Result<(), String> {
     let mut host = EngineHost::new(
-        build_browser(assets, storage, allowed, bridge)?,
+        build_browser(assets, storage, allowed, bridge.host_bridge(MAIN_WINDOW))?,
         Size {
             width: config.width as f32,
             height: config.height as f32,
@@ -203,7 +203,7 @@ fn build_browser(
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
     allowed_origins: Vec<String>,
-    bridge: Bridge,
+    bridge: HostBridge,
 ) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
         .map_err(|error| format!("could not create {}: {error}", storage.display()))?;
@@ -222,7 +222,7 @@ fn build_browser(
         )
     })?
     .with_host_runtime_info(runtime_info())
-    .with_host_bridge(bridge.host_bridge())
+    .with_host_bridge(bridge)
     .with_fonts(Rc::new(system_font_set()))
     .with_clipboard_provider(Rc::new(DesktopClipboard))
     .with_time_zone(Rc::new(DesktopTimeZone))

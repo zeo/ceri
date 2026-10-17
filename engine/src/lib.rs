@@ -66,4 +66,4 @@ pub use navigation::{
 pub use paint::Canvas;
 pub use script::{HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
 #[cfg(feature = "windowed")]
-pub use window::{WindowConfig, run as run_window};
+pub use window::{WindowConfig, WindowContext, WindowControl, run as run_window};

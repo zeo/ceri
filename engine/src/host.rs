@@ -165,6 +165,8 @@ enum EngineWorkerCommand {
     NavigationFailure { request_id: u64 },
     // work arrived from another thread
     Wake,
+    // an event for the page's ceri.listen callbacks
+    HostEvent { name: String, payload: String },
     Shutdown,
 }
 
@@ -264,6 +266,14 @@ impl EngineWorker {
         let request_id = self.next_request();
         self.queue(EngineWorkerCommand::Input { request_id, event })?;
         Ok(request_id)
+    }
+
+    // an event for the page's ceri.listen callbacks
+    pub fn emit(&mut self, name: &str, payload: &str) -> Result<(), String> {
+        self.queue(EngineWorkerCommand::HostEvent {
+            name: name.to_string(),
+            payload: payload.to_string(),
+        })
     }
 
     pub fn render(&mut self) -> Result<u64, String> {
@@ -420,6 +430,12 @@ fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineW
         }
         // the clock tick before every command already pumped the page
         EngineWorkerCommand::Wake => return None,
+        EngineWorkerCommand::HostEvent { name, payload } => {
+            return match host.emit_event(&name, &payload) {
+                Ok(()) => None,
+                Err(error) => Some(EngineWorkerEvent::Failed(error)),
+            };
+        }
         EngineWorkerCommand::Shutdown => return None,
     })
 }
@@ -717,6 +733,15 @@ impl EngineHost {
     pub fn next_wake(&self) -> Option<u64> {
         self.browser.current_url()?;
         self.browser.next_wake()
+    }
+
+    // an event for the page's ceri.listen callbacks; a page with no listeners ignores it
+    pub fn emit_event(&mut self, name: &str, payload: &str) -> Result<(), NavigationError> {
+        if self.browser.current_url().is_none() {
+            return Ok(());
+        }
+        self.dirty |= self.browser.emit_event(name, payload)? > 0;
+        Ok(())
     }
 
     // whether a render would produce a new frame

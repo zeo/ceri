@@ -18,7 +18,7 @@ fn main() -> Result<(), String> {
     if let Some(base) = native_base {
         #[cfg(feature = "native-http")]
         {
-            return run_window(config, move || {
+            return run_window(vec![config], move |_| {
                 let provider =
                     NativeHttpProvider::new(base.clone()).map_err(|error| error.to_string())?;
                 Ok(Browser::with_resource_provider(
@@ -37,7 +37,7 @@ fn main() -> Result<(), String> {
         }
     }
 
-    run_window(config, || {
+    run_window(vec![config], |_| {
         let mut resources = ResourceBundle::from_directory(env!("CARGO_MANIFEST_DIR"))
             .map_err(|error| format!("could not load packaged engine resources: {error}"))?;
         resources

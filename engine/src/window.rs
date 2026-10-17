@@ -6,13 +6,14 @@ use crate::host::{
 use crate::layout::Size;
 use crate::navigation::{APP_ORIGIN, Browser, UserPreferences};
 use softbuffer::{Context, Surface};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
@@ -88,6 +89,8 @@ impl Output {
 
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
+    // names the window to commands, capabilities and events; unique among open windows
+    pub label: String,
     pub title: String,
     pub width: u32,
     pub height: u32,
@@ -103,6 +106,7 @@ pub struct WindowConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
+            label: "main".to_string(),
             title: "Ceri".to_string(),
             width: 1120,
             height: 720,
@@ -151,43 +155,79 @@ impl WindowGeometry {
     }
 }
 
-pub fn run<F>(config: WindowConfig, factory: F) -> Result<(), String>
+// opens and closes windows and passes events between them, from any thread
+#[derive(Clone)]
+pub struct WindowControl {
+    proxy: EventLoopProxy<Request>,
+}
+
+enum Request {
+    // a worker has events to poll
+    Wake,
+    Open(Box<WindowConfig>),
+    Close(String),
+    // an event for every window's listeners, or for one window's
+    Emit {
+        target: Option<String>,
+        name: String,
+        payload: String,
+    },
+}
+
+impl WindowControl {
+    pub fn open(&self, config: WindowConfig) {
+        let _ = self.proxy.send_event(Request::Open(Box::new(config)));
+    }
+
+    pub fn close(&self, label: &str) {
+        let _ = self.proxy.send_event(Request::Close(label.to_string()));
+    }
+
+    pub fn emit(&self, target: Option<&str>, name: &str, payload: &str) {
+        let _ = self.proxy.send_event(Request::Emit {
+            target: target.map(str::to_string),
+            name: name.to_string(),
+            payload: payload.to_string(),
+        });
+    }
+
+    fn waker(&self) -> Waker {
+        let proxy = self.proxy.clone();
+        Arc::new(move || {
+            let _ = proxy.send_event(Request::Wake);
+        })
+    }
+}
+
+// what a window's browser is built with
+pub struct WindowContext {
+    pub label: String,
+    pub control: WindowControl,
+}
+
+// runs windows until the last one closes; the factory builds each window's browser on that
+// window's own engine thread
+pub fn run<F>(windows: Vec<WindowConfig>, factory: F) -> Result<(), String>
 where
-    F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
+    F: Fn(&WindowContext) -> Result<Browser, String> + Send + Clone + 'static,
 {
-    let viewport = Size {
-        width: config.width.max(1) as f32,
-        height: config.height.max(1) as f32,
+    if windows.is_empty() {
+        return Err("an app needs at least one window".to_string());
+    }
+    let event_loop = EventLoop::<Request>::with_user_event()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let control = WindowControl {
+        proxy: event_loop.create_proxy(),
     };
-    let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
-    let proxy = event_loop.create_proxy();
-    // a worker with something to show wakes the loop, which otherwise sleeps
-    let notify: Waker = Arc::new(move || {
-        let _ = proxy.send_event(());
-    });
-    let mut worker = EngineWorker::spawn_live(viewport, factory.clone(), notify.clone())?;
-    worker.navigate(config.start_url.clone())?;
     let context =
         Context::new(event_loop.owned_display_handle()).map_err(|error| error.to_string())?;
     let mut app = App {
-        config,
         context,
         factory,
-        notify,
-        restarts: 0,
-        worker,
-        navigation_pending: true,
-        render_request: None,
-        latest_frame: None,
-        applied_title: None,
-        applied_cursor: None,
-        viewport,
-        scale: 1.0,
-        window: None,
-        output: None,
-        cursor: (0.0, 0.0),
-        modifiers: ModifiersState::empty(),
-        preferences: UserPreferences::default(),
+        control,
+        startup: windows,
+        windows: HashMap::new(),
     };
     event_loop
         .run_app(&mut app)
@@ -195,10 +235,20 @@ where
 }
 
 struct App<F> {
-    config: WindowConfig,
     context: Context<OwnedDisplayHandle>,
     factory: F,
-    notify: Waker,
+    control: WindowControl,
+    // the windows to open once the loop starts
+    startup: Vec<WindowConfig>,
+    windows: HashMap<WindowId, AppWindow>,
+}
+
+type Spawn = Rc<dyn Fn(Size, Option<String>) -> Result<EngineWorker, String>>;
+
+struct AppWindow {
+    config: WindowConfig,
+    // starts this window's engine, showing the recovery document with a reason
+    spawn: Spawn,
     restarts: u8,
     worker: EngineWorker,
     navigation_pending: bool,
@@ -213,40 +263,300 @@ struct App<F> {
     cursor: (f32, f32),
     modifiers: ModifiersState,
     preferences: UserPreferences,
+    closing: bool,
 }
 
 impl<F> App<F>
 where
-    F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
+    F: Fn(&WindowContext) -> Result<Browser, String> + Send + Clone + 'static,
 {
+    fn open(&mut self, event_loop: &ActiveEventLoop, config: WindowConfig) {
+        if self
+            .windows
+            .values()
+            .any(|window| window.config.label == config.label)
+        {
+            eprintln!("ceri: a window labelled {} is already open", config.label);
+            return;
+        }
+        let viewport = Size {
+            width: config.width.max(1) as f32,
+            height: config.height.max(1) as f32,
+        };
+        let factory = self.factory.clone();
+        let label = config.label.clone();
+        let control = self.control.clone();
+        let notify = control.waker();
+        let spawn: Spawn = Rc::new(move |viewport, recovery: Option<String>| {
+            let factory = factory.clone();
+            let context = WindowContext {
+                label: label.clone(),
+                control: control.clone(),
+            };
+            EngineWorker::spawn_live(
+                viewport,
+                move || {
+                    let mut browser = factory(&context)?;
+                    if let Some(reason) = recovery {
+                        browser.show_recovery(500, &reason);
+                    }
+                    Ok(browser)
+                },
+                notify.clone(),
+            )
+        });
+        let worker = match spawn(viewport, None).and_then(|mut worker| {
+            worker.navigate(config.start_url.clone())?;
+            Ok(worker)
+        }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!(
+                    "ceri: the {} window's engine did not start: {error}",
+                    config.label
+                );
+                return;
+            }
+        };
+        let mut this = AppWindow {
+            config,
+            spawn,
+            restarts: 0,
+            worker,
+            navigation_pending: true,
+            render_request: None,
+            latest_frame: None,
+            applied_title: None,
+            applied_cursor: None,
+            viewport,
+            scale: 1.0,
+            window: None,
+            output: None,
+            cursor: (0.0, 0.0),
+            modifiers: ModifiersState::empty(),
+            preferences: UserPreferences::default(),
+            closing: false,
+        };
+        let Some(id) = this.create(event_loop, &self.context) else {
+            this.worker.shutdown();
+            return;
+        };
+        self.windows.insert(id, this);
+    }
+
+    // drops closed windows, and ends the loop with the last one
+    fn sweep(&mut self, event_loop: &ActiveEventLoop) {
+        let closed = self
+            .windows
+            .iter()
+            .filter(|(_, window)| window.closing)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in closed {
+            if let Some(window) = self.windows.remove(&id) {
+                window.worker.shutdown();
+            }
+        }
+        if self.windows.is_empty() && self.startup.is_empty() {
+            event_loop.exit();
+        }
+    }
+}
+
+impl AppWindow {
+    fn create(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        context: &Context<OwnedDisplayHandle>,
+    ) -> Option<WindowId> {
+        let remembered = self
+            .config
+            .geometry_path
+            .as_deref()
+            .and_then(WindowGeometry::read);
+        let mut attributes = Window::default_attributes()
+            .with_title(self.config.title.clone())
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                self.config.minimum_width.max(1),
+                self.config.minimum_height.max(1),
+            ))
+            .with_inner_size(match remembered {
+                Some(geometry) => {
+                    winit::dpi::PhysicalSize::new(geometry.width, geometry.height).into()
+                }
+                None => winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                    self.config.width as f64,
+                    self.config.height as f64,
+                )),
+            });
+        if let Some(geometry) = remembered {
+            attributes =
+                attributes.with_position(winit::dpi::PhysicalPosition::new(geometry.x, geometry.y));
+        }
+        if let Some((rgba, size)) = self.config.icon.clone()
+            && let Ok(icon) = winit::window::Icon::from_rgba(rgba, size, size)
+        {
+            attributes = attributes.with_window_icon(Some(icon));
+        }
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Rc::new(window),
+            Err(error) => {
+                eprintln!("ceri: window creation failed: {error}");
+                return None;
+            }
+        };
+        let output = match Output::open(context, &window) {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("ceri: {error}");
+                return None;
+            }
+        };
+        window.set_ime_allowed(true);
+        self.applied_title = Some(self.config.title.clone());
+        self.window = Some(window);
+        self.output = Some(output);
+        let scale = self.window_scale();
+        if scale != self.scale {
+            self.submit(InputEvent::ScaleChanged(scale));
+        }
+        let scheme = self.window_color_scheme();
+        if scheme != self.preferences.color_scheme {
+            self.apply_preferences(scheme);
+        }
+        self.request_redraw();
+        self.window.as_ref().map(|window| window.id())
+    }
+
+    fn window_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.remember_geometry();
+                self.closing = true;
+            }
+            WindowEvent::Focused(false) => {
+                self.submit(InputEvent::Blur);
+            }
+            WindowEvent::Resized(size) => {
+                let viewport = layout_viewport(size.width, size.height, self.window_scale());
+                self.submit(InputEvent::Resize(viewport));
+                self.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.submit(InputEvent::ScaleChanged(scale_factor as f32));
+                self.request_redraw();
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                let scheme = match theme {
+                    Theme::Dark => ColorScheme::Dark,
+                    Theme::Light => ColorScheme::Light,
+                };
+                self.apply_preferences(scheme);
+                self.request_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = f64::from(self.scale);
+                self.cursor = ((position.x / scale) as f32, (position.y / scale) as f32);
+                self.submit(InputEvent::PointerMove {
+                    x: self.cursor.0,
+                    y: self.cursor.1,
+                });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (delta_x, delta_y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 40.0, -y * 40.0),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        let scale = f64::from(self.scale);
+                        ((position.x / scale) as f32, -(position.y / scale) as f32)
+                    }
+                };
+                let (x, y) = self.cursor;
+                self.submit(InputEvent::Scroll {
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                });
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let Some(button) = Self::pointer_button(button) else {
+                    return;
+                };
+                let (x, y) = self.cursor;
+                let event = match state {
+                    ElementState::Pressed => InputEvent::PointerDown { x, y, button },
+                    ElementState::Released => InputEvent::PointerUp { x, y, button },
+                };
+                if !self.submit(event) {
+                    return;
+                }
+                if state == ElementState::Released && button == PointerButton::Primary {
+                    self.submit(InputEvent::Click { x, y });
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let key = match event.logical_key {
+                    Key::Character(character) => character.to_string(),
+                    Key::Named(NamedKey::Space) => " ".to_string(),
+                    Key::Named(named) => format!("{named:?}"),
+                    other => format!("{other:?}"),
+                };
+                // winit names codes after KeyboardEvent.code, except Meta, which it calls Super
+                let code = match event.physical_key {
+                    PhysicalKey::Code(KeyCode::SuperLeft) => "MetaLeft".to_string(),
+                    PhysicalKey::Code(KeyCode::SuperRight) => "MetaRight".to_string(),
+                    PhysicalKey::Code(code) => format!("{code:?}"),
+                    PhysicalKey::Unidentified(_) => String::new(),
+                };
+                self.submit(InputEvent::Key {
+                    key,
+                    code,
+                    modifiers: KeyModifiers {
+                        shift: self.modifiers.shift_key(),
+                        control: self.modifiers.control_key(),
+                        alt: self.modifiers.alt_key(),
+                        meta: self.modifiers.super_key(),
+                    },
+                    repeat: event.repeat,
+                    pressed: event.state == ElementState::Pressed,
+                });
+            }
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                self.submit(InputEvent::CompositionUpdate {
+                    text: text.to_string(),
+                    cursor,
+                });
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.submit(InputEvent::CompositionCommit {
+                    text: text.to_string(),
+                });
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.submit(InputEvent::CompositionCancel);
+            }
+            WindowEvent::RedrawRequested => self.redraw(),
+            _ => {}
+        }
+    }
+
     // one restart, then the engine's own recovery document
-    fn recover(&mut self, event_loop: &ActiveEventLoop, detail: &str) -> bool {
+    fn recover(&mut self, detail: &str) -> bool {
         self.restarts = self.restarts.saturating_add(1);
         if self.restarts > 2 {
             eprintln!("ceri: the engine stopped again, closing the window");
-            event_loop.exit();
+            self.closing = true;
             return false;
         }
         let recovering = self.restarts > 1;
-        let factory = self.factory.clone();
-        let detail = detail.to_string();
-        let reason = detail.clone();
-        let spawned = EngineWorker::spawn_live(
-            self.viewport,
-            move || {
-                let mut browser = factory()?;
-                if recovering {
-                    browser.show_recovery(500, &reason);
-                }
-                Ok(browser)
-            },
-            self.notify.clone(),
-        );
-        match spawned {
+        match (self.spawn)(self.viewport, recovering.then(|| detail.to_string())) {
             Ok(mut worker) => {
                 if !recovering && worker.navigate(self.config.start_url.clone()).is_err() {
                     eprintln!("ceri: the restarted engine refused the app URL");
-                    event_loop.exit();
+                    self.closing = true;
                     return false;
                 }
                 eprintln!("ceri: the engine restarted after {detail}");
@@ -259,8 +569,23 @@ where
             }
             Err(error) => {
                 eprintln!("ceri: the engine could not restart: {error}");
-                event_loop.exit();
+                self.closing = true;
                 false
+            }
+        }
+    }
+
+    fn deliver(&mut self, name: &str, payload: &str) {
+        match self.worker.emit(name, payload) {
+            Ok(_) => {}
+            Err(error) if error == "engine worker queue is full" => {
+                eprintln!(
+                    "ceri: the {} window dropped the {name} event",
+                    self.config.label
+                );
+            }
+            Err(error) => {
+                self.recover(&error);
             }
         }
     }
@@ -271,7 +596,7 @@ where
         }
     }
 
-    fn submit(&mut self, event_loop: &ActiveEventLoop, event: InputEvent) -> bool {
+    fn submit(&mut self, event: InputEvent) -> bool {
         let resize = match &event {
             InputEvent::Resize(viewport) => Some(*viewport),
             _ => None,
@@ -292,11 +617,11 @@ where
                 true
             }
             Err(error) if error == "engine worker queue is full" => true,
-            Err(error) => self.recover(event_loop, &error),
+            Err(error) => self.recover(&error),
         }
     }
 
-    fn poll_worker(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    fn poll_worker(&mut self) -> bool {
         let mut request_redraw = false;
         for event in self.worker.poll() {
             match event {
@@ -304,7 +629,7 @@ where
                     self.navigation_pending = false;
                     match result {
                         Ok(_) => request_redraw = true,
-                        Err(error) => return self.recover(event_loop, &error.to_string()),
+                        Err(error) => return self.recover(&error.to_string()),
                     }
                 }
                 EngineWorkerEvent::Input { result, .. } => match result {
@@ -314,7 +639,7 @@ where
                         }
                         request_redraw = true;
                     }
-                    Err(error) => return self.recover(event_loop, &error.to_string()),
+                    Err(error) => return self.recover(&error.to_string()),
                 },
                 EngineWorkerEvent::Frame { request_id, result } => {
                     if self.render_request == Some(request_id) {
@@ -327,12 +652,12 @@ where
                                 request_redraw = true;
                             }
                         }
-                        Err(error) => return self.recover(event_loop, &error.to_string()),
+                        Err(error) => return self.recover(&error.to_string()),
                     }
                 }
                 EngineWorkerEvent::Invalidated => request_redraw = true,
                 EngineWorkerEvent::Failed(error) => {
-                    return self.recover(event_loop, &error.to_string());
+                    return self.recover(&error.to_string());
                 }
                 EngineWorkerEvent::Accessibility { .. }
                 | EngineWorkerEvent::NavigationFailure { .. } => {}
@@ -371,8 +696,8 @@ where
         self.applied_title = Some(title);
     }
 
-    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.poll_worker(event_loop) {
+    fn redraw(&mut self) {
+        if !self.poll_worker() {
             return;
         }
         let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
@@ -384,11 +709,11 @@ where
             return;
         };
         let scale = self.window_scale();
-        if self.scale != scale && !self.submit(event_loop, InputEvent::ScaleChanged(scale)) {
+        if self.scale != scale && !self.submit(InputEvent::ScaleChanged(scale)) {
             return;
         }
         let viewport = layout_viewport(size.width, size.height, scale);
-        if self.viewport != viewport && !self.submit(event_loop, InputEvent::Resize(viewport)) {
+        if self.viewport != viewport && !self.submit(InputEvent::Resize(viewport)) {
             return;
         }
         if self.navigation_pending {
@@ -399,7 +724,7 @@ where
                 Ok(request_id) => self.render_request = Some(request_id),
                 Err(error) if error == "engine worker queue is full" => {}
                 Err(error) => {
-                    self.recover(event_loop, &error);
+                    self.recover(&error);
                     return;
                 }
             }
@@ -416,7 +741,7 @@ where
         };
         if let Err(error) = output.present(&frame, width, height) {
             eprintln!("ceri: {error}");
-            event_loop.exit();
+            self.closing = true;
         }
     }
 
@@ -448,12 +773,12 @@ where
         }
     }
 
-    fn apply_preferences(&mut self, event_loop: &ActiveEventLoop, scheme: ColorScheme) {
+    fn apply_preferences(&mut self, scheme: ColorScheme) {
         let preferences = UserPreferences {
             color_scheme: scheme,
             ..self.preferences
         };
-        if self.submit(event_loop, InputEvent::PreferencesChanged(preferences)) {
+        if self.submit(InputEvent::PreferencesChanged(preferences)) {
             self.preferences = preferences;
         }
     }
@@ -475,73 +800,18 @@ where
     }
 }
 
-impl<F> ApplicationHandler for App<F>
+impl<F> ApplicationHandler<Request> for App<F>
 where
-    F: Fn() -> Result<Browser, String> + Send + Clone + 'static,
+    F: Fn(&WindowContext) -> Result<Browser, String> + Send + Clone + 'static,
 {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            self.request_redraw();
-            return;
+        for config in std::mem::take(&mut self.startup) {
+            self.open(event_loop, config);
         }
-        let remembered = self
-            .config
-            .geometry_path
-            .as_deref()
-            .and_then(WindowGeometry::read);
-        let mut attributes = Window::default_attributes()
-            .with_title(self.config.title.clone())
-            .with_min_inner_size(winit::dpi::LogicalSize::new(
-                self.config.minimum_width.max(1),
-                self.config.minimum_height.max(1),
-            ))
-            .with_inner_size(match remembered {
-                Some(geometry) => {
-                    winit::dpi::PhysicalSize::new(geometry.width, geometry.height).into()
-                }
-                None => winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
-                    self.config.width as f64,
-                    self.config.height as f64,
-                )),
-            });
-        if let Some(geometry) = remembered {
-            attributes =
-                attributes.with_position(winit::dpi::PhysicalPosition::new(geometry.x, geometry.y));
+        for window in self.windows.values() {
+            window.request_redraw();
         }
-        if let Some((rgba, size)) = self.config.icon.clone()
-            && let Ok(icon) = winit::window::Icon::from_rgba(rgba, size, size)
-        {
-            attributes = attributes.with_window_icon(Some(icon));
-        }
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Rc::new(window),
-            Err(error) => {
-                eprintln!("ceri: window creation failed: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let output = match Output::open(&self.context, &window) {
-            Ok(output) => output,
-            Err(error) => {
-                eprintln!("ceri: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-        window.set_ime_allowed(true);
-        self.applied_title = Some(self.config.title.clone());
-        self.window = Some(window);
-        self.output = Some(output);
-        let scale = self.window_scale();
-        if scale != self.scale {
-            self.submit(event_loop, InputEvent::ScaleChanged(scale));
-        }
-        let scheme = self.window_color_scheme();
-        if scheme != self.preferences.color_scheme {
-            self.apply_preferences(event_loop, scheme);
-        }
-        self.request_redraw();
+        self.sweep(event_loop);
     }
 
     fn window_event(
@@ -550,147 +820,51 @@ where
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if self.window.as_ref().map(|window| window.id()) != Some(window_id) {
-            return;
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.window_event(event);
         }
-        match event {
-            WindowEvent::CloseRequested => {
-                self.remember_geometry();
-                event_loop.exit();
-            }
-            WindowEvent::Focused(false) => {
-                self.submit(event_loop, InputEvent::Blur);
-            }
-            WindowEvent::Resized(size) => {
-                let viewport = layout_viewport(size.width, size.height, self.window_scale());
-                self.submit(event_loop, InputEvent::Resize(viewport));
-                self.request_redraw();
-            }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.submit(event_loop, InputEvent::ScaleChanged(scale_factor as f32));
-                self.request_redraw();
-            }
-            WindowEvent::ThemeChanged(theme) => {
-                let scheme = match theme {
-                    Theme::Dark => ColorScheme::Dark,
-                    Theme::Light => ColorScheme::Light,
-                };
-                self.apply_preferences(event_loop, scheme);
-                self.request_redraw();
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let scale = f64::from(self.scale);
-                self.cursor = ((position.x / scale) as f32, (position.y / scale) as f32);
-                self.submit(
-                    event_loop,
-                    InputEvent::PointerMove {
-                        x: self.cursor.0,
-                        y: self.cursor.1,
-                    },
-                );
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (delta_x, delta_y) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x * 40.0, -y * 40.0),
-                    MouseScrollDelta::PixelDelta(position) => {
-                        let scale = f64::from(self.scale);
-                        ((position.x / scale) as f32, -(position.y / scale) as f32)
-                    }
-                };
-                let (x, y) = self.cursor;
-                self.submit(
-                    event_loop,
-                    InputEvent::Scroll {
-                        x,
-                        y,
-                        delta_x,
-                        delta_y,
-                    },
-                );
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let Some(button) = Self::pointer_button(button) else {
-                    return;
-                };
-                let (x, y) = self.cursor;
-                let event = match state {
-                    ElementState::Pressed => InputEvent::PointerDown { x, y, button },
-                    ElementState::Released => InputEvent::PointerUp { x, y, button },
-                };
-                if !self.submit(event_loop, event) {
-                    return;
-                }
-                if state == ElementState::Released && button == PointerButton::Primary {
-                    self.submit(event_loop, InputEvent::Click { x, y });
-                }
-            }
-            WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers.state();
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                let key = match event.logical_key {
-                    Key::Character(character) => character.to_string(),
-                    Key::Named(NamedKey::Space) => " ".to_string(),
-                    Key::Named(named) => format!("{named:?}"),
-                    other => format!("{other:?}"),
-                };
-                // winit names codes after KeyboardEvent.code, except Meta, which it calls Super
-                let code = match event.physical_key {
-                    PhysicalKey::Code(KeyCode::SuperLeft) => "MetaLeft".to_string(),
-                    PhysicalKey::Code(KeyCode::SuperRight) => "MetaRight".to_string(),
-                    PhysicalKey::Code(code) => format!("{code:?}"),
-                    PhysicalKey::Unidentified(_) => String::new(),
-                };
-                self.submit(
-                    event_loop,
-                    InputEvent::Key {
-                        key,
-                        code,
-                        modifiers: KeyModifiers {
-                            shift: self.modifiers.shift_key(),
-                            control: self.modifiers.control_key(),
-                            alt: self.modifiers.alt_key(),
-                            meta: self.modifiers.super_key(),
-                        },
-                        repeat: event.repeat,
-                        pressed: event.state == ElementState::Pressed,
-                    },
-                );
-            }
-            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
-                self.submit(
-                    event_loop,
-                    InputEvent::CompositionUpdate {
-                        text: text.to_string(),
-                        cursor,
-                    },
-                );
-            }
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                self.submit(
-                    event_loop,
-                    InputEvent::CompositionCommit {
-                        text: text.to_string(),
-                    },
-                );
-            }
-            WindowEvent::Ime(Ime::Disabled) => {
-                self.submit(event_loop, InputEvent::CompositionCancel);
-            }
-            WindowEvent::RedrawRequested => self.redraw(event_loop),
-            _ => {}
-        }
+        self.sweep(event_loop);
     }
 
-    // a worker woke the loop
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
-        self.poll_worker(event_loop);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, request: Request) {
+        match request {
+            Request::Wake => {
+                for window in self.windows.values_mut() {
+                    window.poll_worker();
+                }
+            }
+            Request::Open(config) => self.open(event_loop, *config),
+            Request::Close(label) => {
+                for window in self.windows.values_mut() {
+                    if window.config.label == label {
+                        window.remember_geometry();
+                        window.closing = true;
+                    }
+                }
+            }
+            Request::Emit {
+                target,
+                name,
+                payload,
+            } => {
+                for window in self.windows.values_mut() {
+                    if target
+                        .as_ref()
+                        .is_none_or(|label| *label == window.config.label)
+                    {
+                        window.deliver(&name, &payload);
+                    }
+                }
+            }
+        }
+        self.sweep(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.poll_worker(event_loop) {
-            return;
+        for window in self.windows.values_mut() {
+            window.poll_worker();
         }
+        self.sweep(event_loop);
         // workers keep their own clocks and wake the loop when they have something to show
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     }
