@@ -1893,9 +1893,21 @@ fn paint_box_text(
         return;
     }
     paint_control_selection(canvas, layout_box, clip, offset);
-    paint_prose_selection(canvas, layout_box, prose_selections, clip, offset);
+    let selected = paint_prose_selection(canvas, layout_box, prose_selections, clip, offset);
     for run in &layout_box.text {
         paint_text(canvas, run, clip, offset);
+    }
+    // selected text takes the ::selection color, drawn again inside the highlight
+    if let Some(color) = layout_box.selection_color {
+        for (index, area) in selected {
+            let run = TextRun {
+                color,
+                ..layout_box.text[index].clone()
+            };
+            if let Some(area) = intersect_clip(clip, area) {
+                paint_text(canvas, &run, Some(area), offset);
+            }
+        }
     }
     paint_control_caret(canvas, layout_box, clip, offset);
 }
@@ -1907,9 +1919,10 @@ fn paint_prose_selection(
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     offset: (f32, f32),
-) {
+) -> Vec<(usize, Rect)> {
+    let mut selected = Vec::new();
     for span in prose_selections {
-        for run in &layout_box.text {
+        for (index, run) in layout_box.text.iter().enumerate() {
             if run.node != Some(span.node) || run.text.trim().is_empty() {
                 continue;
             }
@@ -1928,22 +1941,50 @@ fn paint_prose_selection(
             let prefix_width = width_within_run(run, selected_start, &fonts);
             let end_width = width_within_run(run, selected_end, &fonts);
             let selected_width = (end_width - prefix_width).max(0.0);
+            let area = Rect {
+                x: run.x + offset.0 + prefix_width,
+                y: run.y + offset.1,
+                width: selected_width,
+                height,
+            };
             fill_rect_optional(
                 canvas,
-                run.x + offset.0 + prefix_width,
-                run.y + offset.1,
-                selected_width,
-                height,
+                area.x,
+                area.y,
+                area.width,
+                area.height,
                 layout_box.selection.unwrap_or(SELECTION_BACKGROUND),
                 clip,
             );
+            selected.push((index, area));
         }
     }
+    selected
 }
 
 const SELECTION_BACKGROUND: Color = Color::opaque(170, 205, 238);
 
 fn width_within_run(run: &TextRun, units: usize, fonts: &crate::font::FontSet) -> f32 {
+    let mut consumed = 0;
+    let mut prefix = String::new();
+    for character in run.text.chars() {
+        if consumed >= units {
+            break;
+        }
+        prefix.push(character);
+        consumed += character.len_utf16();
+    }
+    // the prefix measured as the run draws it, shaped and spaced
+    if !fonts.is_builtin() {
+        let shaped = fonts.shape(
+            &prefix,
+            run.font_stack,
+            run.font_size,
+            run.font,
+            run.letter_spacing == 0.0,
+        );
+        return shaped.width + run.letter_spacing * shaped.glyphs.len() as f32;
+    }
     let mut width = 0.0;
     let mut consumed = 0;
     for character in run.text.chars() {
@@ -2002,12 +2043,13 @@ fn paint_control_selection(
         }
         let selected_start_char = utf16_char_offset(&run.text, selected_start - line_start);
         let selected_end_char = utf16_char_offset(&run.text, selected_end - line_start);
-        let advance = text_advance(run.font_size);
+        let from = width_of_characters(run, selected_start_char);
+        let to = width_of_characters(run, selected_end_char);
         fill_rect_optional(
             canvas,
-            run.x + offset.0 + selected_start_char as f32 * advance,
+            run.x + offset.0 + from,
             run.y + offset.1,
-            (selected_end_char - selected_start_char) as f32 * advance,
+            (to - from).max(0.0),
             run.font_size.max(1.0),
             layout_box.selection.unwrap_or(SELECTION_BACKGROUND),
             clip,
@@ -2076,10 +2118,17 @@ fn control_text_position(layout_box: &LayoutBox, value: &str, offset: usize) -> 
     let run = layout_box.text.get(line_index)?;
     let line_offset = offset.saturating_sub(line_start).min(line_end - line_start);
     let character_offset = utf16_char_offset(&run.text, line_offset);
-    Some((
-        run.x + character_offset as f32 * text_advance(run.font_size),
-        run.y,
-    ))
+    Some((run.x + width_of_characters(run, character_offset), run.y))
+}
+
+// the width of a run's first characters as the font draws them
+fn width_of_characters(run: &TextRun, characters: usize) -> f32 {
+    let fonts = crate::font::active_fonts();
+    if fonts.is_builtin() {
+        return characters as f32 * text_advance(run.font_size);
+    }
+    let units = run.text.chars().take(characters).map(char::len_utf16).sum();
+    width_within_run(run, units, &fonts)
 }
 
 fn text_advance(font_size: f32) -> f32 {
@@ -2495,6 +2544,197 @@ fn background_placement(
 }
 
 fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
+    if let Some(shadow) = run.decoration.shadow
+        && shadow.color.alpha > 0
+    {
+        paint_text_shadow(canvas, run, shadow, clip, offset);
+    }
+    paint_glyphs(canvas, run, clip, offset);
+    if run.decoration.has_lines() {
+        paint_decoration_lines(canvas, run, clip, offset);
+    }
+}
+
+// a shadow is the run drawn again in the shadow's color, offset, and blurred in a layer of
+// its own when it has a blur radius
+fn paint_text_shadow(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    shadow: crate::css::TextShadow,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
+    let shadowed = TextRun {
+        color: shadow.color,
+        decoration: crate::css::TextDecoration {
+            shadow: None,
+            ..run.decoration
+        },
+        ..run.clone()
+    };
+    let at = (offset.0 + shadow.x, offset.1 + shadow.y);
+    if shadow.blur <= 0.0 {
+        paint_glyphs(canvas, &shadowed, clip, at);
+        if shadowed.decoration.has_lines() {
+            paint_decoration_lines(canvas, &shadowed, clip, at);
+        }
+        return;
+    }
+    let reach = shadow.blur * 2.0;
+    let area = Rect {
+        x: run.x + at.0 - reach,
+        y: run.y + at.1 - reach,
+        width: run.width + reach * 2.0,
+        height: run.font_size * 1.5 + reach * 2.0,
+    };
+    let Some(bounds) = DeviceBounds::of(canvas, area, clip) else {
+        return;
+    };
+    let mut layer = canvas.layer(bounds);
+    paint_glyphs(&mut layer, &shadowed, None, at);
+    if shadowed.decoration.has_lines() {
+        paint_decoration_lines(&mut layer, &shadowed, None, at);
+    }
+    // three box blurs approach a gaussian with the blur radius as twice its deviation
+    let radius = ((shadow.blur / 2.0) * canvas.scale).round().max(1.0) as usize;
+    for _ in 0..3 {
+        box_blur(&mut layer, radius);
+    }
+    canvas.composite(layer, bounds, 1.0);
+}
+
+// a box blur of a layer's premultiplied pixels, horizontally then vertically
+fn box_blur(layer: &mut Canvas, radius: usize) {
+    let (width, height) = (layer.width as usize, layer.height as usize);
+    let mut buffer = layer.pixels.clone();
+    let window = (radius * 2 + 1) as u32;
+    for (pass, (outer, inner, stride_outer, stride_inner)) in
+        [(height, width, width * 4, 4), (width, height, 4, width * 4)]
+            .into_iter()
+            .enumerate()
+    {
+        let (source, target) = if pass == 0 {
+            (&layer.pixels, &mut buffer)
+        } else {
+            (&buffer.clone(), &mut layer.pixels)
+        };
+        for line in 0..outer {
+            let base = line * stride_outer;
+            for channel in 0..4 {
+                let at =
+                    |position: usize| u32::from(source[base + position * stride_inner + channel]);
+                let mut sum = 0_u32;
+                for position in 0..=radius.min(inner.saturating_sub(1)) {
+                    sum += at(position);
+                }
+                for position in 0..inner {
+                    target[base + position * stride_inner + channel] = (sum / window) as u8;
+                    if position + radius + 1 < inner {
+                        sum += at(position + radius + 1);
+                    }
+                    if position >= radius {
+                        sum -= at(position - radius);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// underline, overline and line-through, placed from the font's ascent, in the decoration's
+// style and color
+fn paint_decoration_lines(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
+    let fonts = crate::font::active_fonts();
+    let decoration = run.decoration;
+    let size = run.font_size;
+    let ascent = fonts.ascent(run.font_stack, size);
+    let baseline = run.y + offset.1 + ascent;
+    let thickness = decoration.thickness.unwrap_or((size / 14.0).max(1.0));
+    let color = decoration.color.unwrap_or(run.color);
+    // a space a run picked up after its last word belongs to the text that follows, so the
+    // lines stop at the word
+    let trailing = run.text.len() - run.text.trim_end_matches(' ').len();
+    let tail = if trailing > 0 {
+        fonts.measure(&" ".repeat(trailing), run.font_stack, size, run.font)
+            + run.letter_spacing * trailing as f32
+    } else {
+        0.0
+    };
+    let left = run.x + offset.0 + if run.rtl { tail } else { 0.0 };
+    let width = (run.width - tail).max(0.0);
+    let mut lines = Vec::new();
+    if decoration.underline {
+        lines.push(baseline + (size * 0.1).max(1.0));
+    }
+    if decoration.overline {
+        lines.push(baseline - ascent);
+    }
+    if decoration.line_through {
+        lines.push(baseline - size * 0.3);
+    }
+    for top in lines {
+        match decoration.style {
+            crate::css::DecorationStyle::Solid => {
+                fill_rect_optional(canvas, left, top, width, thickness, color, clip);
+            }
+            crate::css::DecorationStyle::Double => {
+                fill_rect_optional(canvas, left, top, width, thickness, color, clip);
+                fill_rect_optional(
+                    canvas,
+                    left,
+                    top + thickness * 2.0,
+                    width,
+                    thickness,
+                    color,
+                    clip,
+                );
+            }
+            crate::css::DecorationStyle::Dotted | crate::css::DecorationStyle::Dashed => {
+                let dash = if decoration.style == crate::css::DecorationStyle::Dotted {
+                    thickness
+                } else {
+                    thickness * 3.0
+                };
+                let mut x = left;
+                while x < left + width {
+                    fill_rect_optional(
+                        canvas,
+                        x,
+                        top,
+                        dash.min(left + width - x),
+                        thickness,
+                        color,
+                        clip,
+                    );
+                    x += dash * 2.0;
+                }
+            }
+            crate::css::DecorationStyle::Wavy => {
+                let period = thickness * 4.0;
+                let mut x = left;
+                let mut up = true;
+                while x < left + width {
+                    let next = (x + period / 2.0).min(left + width);
+                    let (from, to) = if up {
+                        (top + thickness, top - thickness)
+                    } else {
+                        (top - thickness, top + thickness)
+                    };
+                    canvas.fill_segment(((x, from), (next, to)), thickness, color, clip);
+                    x = next;
+                    up = !up;
+                }
+            }
+        }
+    }
+}
+
+fn paint_glyphs(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
     let fonts = crate::font::active_fonts();
     if !fonts.is_builtin() {
         paint_outline_text(canvas, run, clip, offset, &fonts);
@@ -2770,6 +3010,7 @@ mod tests {
                     node_offset: 0,
                     source_len: 6,
                     rtl: false,
+                    decoration: Default::default(),
                 }],
                 control_value: None,
                 control_selection: None,
@@ -2790,6 +3031,7 @@ mod tests {
                 inline: false,
                 control: None,
                 selection: None,
+                selection_color: None,
                 scroll_content: Size {
                     width: 64.0,
                     height: 24.0,
@@ -3001,6 +3243,54 @@ mod tests {
     }
 
     #[test]
+    fn text_decorations_shadows_and_ellipses_paint() {
+        let document = Document::parse(
+            "<html><body><p id='under'>ab</p><p id='shadow'>ab</p><p id='cut'>abcdefghijklmnop</p></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "html, body, p { margin: 0; background: #ffffff; color: #000000; font-size: 20px; line-height: 30px } #under { text-decoration: underline #ff0000 } #shadow { text-shadow: 3px 3px 0 #00ff00 } #cut { width: 60px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }",
+        )
+        .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        );
+        let canvas = paint(&layout);
+        let row_has = |y: usize, color: [u8; 3]| {
+            (0..40).any(|x| {
+                let index = (y * canvas.width() as usize + x) * 4;
+                canvas.rgba_pixels()[index..index + 3] == color
+            })
+        };
+        // a 20px glyph box centred in a 30px line has its baseline 25px down; the underline sits
+        // two pixels below it
+        assert!(
+            row_has(27, [255, 0, 0]),
+            "the underline is drawn in its color"
+        );
+        assert!(
+            (30..60).any(|y| row_has(y, [0, 255, 0])),
+            "the shadow is drawn"
+        );
+        let cut = &layout.root.children[0].children[0].children[2];
+        let text = cut
+            .text
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.ends_with('\u{2026}'),
+            "an overflowing nowrap line ends in an ellipsis: {text}"
+        );
+        assert!(cut.text.iter().map(|run| run.width).sum::<f32>() <= 60.0);
+    }
+
+    #[test]
     fn painting_changes_pixels_and_writes_a_ppm_header() {
         let document = LayoutDocument {
             viewport: Size {
@@ -3041,6 +3331,7 @@ mod tests {
                     node_offset: 0,
                     source_len: 0,
                     rtl: false,
+                    decoration: Default::default(),
                 }],
                 control_value: None,
                 control_selection: None,
@@ -3061,6 +3352,7 @@ mod tests {
                 inline: false,
                 control: None,
                 selection: None,
+                selection_color: None,
                 scroll_content: Size {
                     width: 20.0,
                     height: 10.0,
@@ -3153,6 +3445,7 @@ mod tests {
                         node_offset: 0,
                         source_len: 0,
                         rtl: false,
+                        decoration: Default::default(),
                     },
                     TextRun {
                         text: "CD".to_string(),
@@ -3168,6 +3461,7 @@ mod tests {
                         node_offset: 0,
                         source_len: 0,
                         rtl: false,
+                        decoration: Default::default(),
                     },
                 ],
                 control_value: Some("ABCD".to_string()),
@@ -3189,6 +3483,7 @@ mod tests {
                 inline: false,
                 control: None,
                 selection: None,
+                selection_color: None,
                 scroll_content: Size {
                     width: 32.0,
                     height: 28.0,
@@ -3287,6 +3582,7 @@ mod tests {
                         inline: false,
                         control: None,
                         selection: None,
+                        selection_color: None,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3334,6 +3630,7 @@ mod tests {
                         inline: false,
                         control: None,
                         selection: None,
+                        selection_color: None,
                         scroll_content: Size {
                             width: 10.0,
                             height: 10.0,
@@ -3356,6 +3653,7 @@ mod tests {
                 inline: false,
                 control: None,
                 selection: None,
+                selection_color: None,
                 scroll_content: Size {
                     width: 20.0,
                     height: 20.0,

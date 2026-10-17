@@ -74,6 +74,98 @@ impl Display {
     }
 }
 
+// lines drawn through text, which an element's descendants draw too, and the text's shadow
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextDecoration {
+    pub(crate) underline: bool,
+    pub(crate) overline: bool,
+    pub(crate) line_through: bool,
+    pub(crate) style: DecorationStyle,
+    // none follows the text's color
+    pub(crate) color: Option<Color>,
+    pub(crate) thickness: Option<f32>,
+    pub(crate) shadow: Option<TextShadow>,
+}
+
+impl TextDecoration {
+    pub(crate) fn has_lines(&self) -> bool {
+        self.underline || self.overline || self.line_through
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecorationStyle {
+    #[default]
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextShadow {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) blur: f32,
+    pub(crate) color: Color,
+}
+
+// the decoration keywords of text-decoration and its longhands, added to what the element
+// already draws, since an element cannot take back a line its ancestor draws
+fn apply_decoration(
+    decoration: &mut TextDecoration,
+    value: &str,
+    color: &dyn Fn(&str) -> Option<Color>,
+) {
+    for word in split_words(value) {
+        match word.to_ascii_lowercase().as_str() {
+            "underline" => decoration.underline = true,
+            "overline" => decoration.overline = true,
+            "line-through" => decoration.line_through = true,
+            "none" | "auto" | "from-font" => {}
+            "solid" => decoration.style = DecorationStyle::Solid,
+            "double" => decoration.style = DecorationStyle::Double,
+            "dotted" => decoration.style = DecorationStyle::Dotted,
+            "dashed" => decoration.style = DecorationStyle::Dashed,
+            "wavy" => decoration.style = DecorationStyle::Wavy,
+            other => {
+                if let Some(parsed) = color(other) {
+                    decoration.color = Some(parsed);
+                } else if let Some(thickness) =
+                    parse_length(other).and_then(|length| length.resolve(0.0, 16.0))
+                {
+                    decoration.thickness = Some(thickness.max(0.0));
+                }
+            }
+        }
+    }
+}
+
+// the first shadow of a text-shadow list: offsets, blur and color in any order
+fn parse_text_shadow(value: &str) -> Option<TextShadow> {
+    let first = split_top_level(value).into_iter().next()?.trim();
+    if first.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut lengths = Vec::new();
+    let mut shadow_color = None;
+    for word in split_words(first) {
+        if let Some(length) = parse_length(word).and_then(|length| length.resolve(0.0, 16.0)) {
+            lengths.push(length);
+        } else {
+            shadow_color = parse_color(word);
+        }
+    }
+    let (x, y) = (*lengths.first()?, *lengths.get(1)?);
+    Some(TextShadow {
+        x,
+        y,
+        blur: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+        color: shadow_color.unwrap_or(CURRENT_COLOR.with(std::cell::Cell::get)),
+    })
+}
+
 // how white space in text is kept (white-space-collapse)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpaceCollapse {
@@ -691,6 +783,7 @@ pub(crate) struct InheritedText {
     pub(crate) overflow_wrap: OverflowWrap,
     pub(crate) rtl: bool,
     pub(crate) italic: bool,
+    pub(crate) decoration: TextDecoration,
 }
 
 impl Default for InheritedText {
@@ -715,6 +808,15 @@ impl Default for InheritedText {
             overflow_wrap: OverflowWrap::Normal,
             rtl: false,
             italic: false,
+            decoration: TextDecoration {
+                underline: false,
+                overline: false,
+                line_through: false,
+                style: DecorationStyle::Solid,
+                color: None,
+                thickness: None,
+                shadow: None,
+            },
         }
     }
 }
@@ -1045,6 +1147,9 @@ pub(crate) struct Style {
     pub rtl: bool,
     // font-style italic or oblique
     pub italic: bool,
+    // the lines this element and its ancestors draw through its text, and its text shadow
+    pub text_decoration: TextDecoration,
+    pub text_overflow_ellipsis: bool,
     // top, right, bottom and left
     pub border: [BorderSide; 4],
     pub outline: OutlineStyle,
@@ -1227,6 +1332,8 @@ impl Style {
             overflow_wrap: parent_text.overflow_wrap,
             rtl: parent_text.rtl,
             italic: parent_text.italic,
+            text_decoration: parent_text.decoration,
+            text_overflow_ellipsis: false,
             border: [BorderSide::INITIAL; 4],
             outline: OutlineStyle::INITIAL,
             text_align: parent_text.text_align,
@@ -2130,6 +2237,7 @@ impl Stylesheet {
                 overflow_wrap: style.overflow_wrap,
                 rtl: style.rtl,
                 italic: style.italic,
+                decoration: style.text_decoration,
             };
             computed = Some((style, font_size));
         }
@@ -4246,6 +4354,13 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
 // the properties this engine applies, for @supports
 const SUPPORTED_PROPERTIES: &[&str] = &[
     "accent-color",
+    "text-decoration",
+    "text-decoration-line",
+    "text-decoration-style",
+    "text-decoration-color",
+    "text-decoration-thickness",
+    "text-shadow",
+    "text-overflow",
     "font",
     "font-style",
     "direction",
@@ -4618,7 +4733,9 @@ textarea { white-space: pre-wrap }
 nobr { white-space: nowrap }
 td[nowrap], th[nowrap] { white-space: nowrap }
 mark { background-color: yellow; color: black }
-a:any-link { color: #0000ee; cursor: pointer }
+a:any-link { color: #0000ee; cursor: pointer; text-decoration: underline }
+u, ins { text-decoration: underline }
+s, strike, del { text-decoration: line-through }
 center, th, caption { text-align: center }
 ul, ol, menu { padding-left: 40px }
 ul, menu { list-style-type: disc }
@@ -4784,6 +4901,17 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "list-style-position" => style.list_inside = value.trim().eq_ignore_ascii_case("inside"),
         "border-collapse" => style.border_collapse = value.trim().eq_ignore_ascii_case("collapse"),
+        "text-decoration"
+        | "text-decoration-line"
+        | "text-decoration-style"
+        | "text-decoration-color"
+        | "text-decoration-thickness" => {
+            apply_decoration(&mut style.text_decoration, value, &parse_color)
+        }
+        "text-shadow" => style.text_decoration.shadow = parse_text_shadow(value),
+        "text-overflow" => {
+            style.text_overflow_ellipsis = value.trim().eq_ignore_ascii_case("ellipsis");
+        }
         "direction" => match value.trim().to_ascii_lowercase().as_str() {
             "rtl" => style.rtl = true,
             "ltr" => style.rtl = false,

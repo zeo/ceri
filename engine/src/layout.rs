@@ -50,6 +50,7 @@ pub struct TextRun {
     pub font: FontStyle,
     // drawn right to left, with its glyphs shaped in logical order
     pub rtl: bool,
+    pub(crate) decoration: crate::css::TextDecoration,
     // DOM text node that produced this run, so prose can be selected by pointer;
     // node_offset is where the word starts, past any leading space in text
     pub node: Option<NodeId>,
@@ -149,6 +150,8 @@ pub struct LayoutBox {
     pub(crate) control: Option<ControlPaint>,
     // the ::selection background behind this box's selected text
     pub(crate) selection: Option<Color>,
+    // the ::selection text color, when it differs from the box's own
+    pub(crate) selection_color: Option<Color>,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
     pub(crate) margin: ResolvedEdges,
@@ -330,6 +333,8 @@ struct InlineLine {
     trailing_space: bool,
     // the paragraph runs right to left
     rtl: bool,
+    // text-overflow: ellipsis on a block that clips its overflow
+    ellipsis: bool,
     fragments: Vec<InlineFragment>,
     // inline-block and replaced boxes already placed by a flushed line
     placed: Vec<LayoutBox>,
@@ -375,6 +380,7 @@ impl InlineLine {
             node_offset: 0,
             source_len: 0,
             rtl: false,
+            decoration: Default::default(),
             line_height: 0.0,
             atomic: None,
             edge: Some((decoration, opening)),
@@ -505,6 +511,7 @@ struct InlineFragment {
     node_offset: usize,
     source_len: usize,
     rtl: bool,
+    decoration: crate::css::TextDecoration,
     line_height: f32,
     // an inline-block or replaced element that sits on the line like a word
     atomic: Option<Box<LayoutBox>>,
@@ -676,6 +683,7 @@ fn inherited_text(style: &Style) -> InheritedText {
         overflow_wrap: style.overflow_wrap,
         rtl: style.rtl,
         italic: style.italic,
+        decoration: style.text_decoration,
     }
 }
 
@@ -904,6 +912,7 @@ pub fn layout_with_state(
         inline: false,
         control: None,
         selection: None,
+        selection_color: None,
         scroll_content: Size {
             width: viewport.width,
             height: viewport.height,
@@ -945,6 +954,7 @@ pub fn layout_with_state(
                 open_inlines: Vec::new(),
                 trailing_space: false,
                 rtl: false,
+                ellipsis: false,
                 fragments: Vec::new(),
                 placed: Vec::new(),
             };
@@ -1147,16 +1157,23 @@ impl ProseRun {
 }
 
 fn offset_within_run(run: &TextRun, x: f32) -> usize {
-    let fonts = crate::font::active_fonts();
+    // boundaries are measured as the run draws, so kerning and ligatures move them too
     let mut offset = 0;
-    let mut pen = run.x;
+    let mut previous = 0.0;
+    let mut prefix = String::new();
     for character in run.text.chars() {
-        let advance =
-            fonts.advance(character, run.font_stack, run.font_size, run.font) + run.letter_spacing;
-        if x < pen + advance / 2.0 {
+        prefix.push(character);
+        let width = measure_text(
+            &prefix,
+            run.font_stack,
+            run.font_size,
+            run.font,
+            run.letter_spacing,
+        );
+        if x < run.x + (previous + width) / 2.0 {
             return offset;
         }
-        pen += advance;
+        previous = width;
         offset += character.len_utf16();
     }
     offset
@@ -2278,6 +2295,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let mut line = InlineLine {
         trailing_space: false,
         rtl: style.rtl,
+        ellipsis: style.text_overflow_ellipsis && style.overflow_axes()[0].clips(),
         y: content_y,
         used: 0.0,
         height: line_height,
@@ -2360,6 +2378,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 node_offset: 0,
                 source_len: 0,
                 rtl: false,
+                decoration: Default::default(),
             });
         }
         line.y = content_y + value_lines.len() as f32 * line_height;
@@ -2454,6 +2473,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                         node_offset: 0,
                         source_len: 0,
                         rtl: false,
+                        decoration: Default::default(),
                         line_height,
                         atomic: Some(Box::new(bullet)),
                         edge: None,
@@ -2647,6 +2667,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         height: border_box_height,
         ..rect
     };
+    let selection_style = pseudo_style(PseudoElement::Selection);
     if style.display == Display::ListItem && !style.list_inside {
         children.extend(outside_marker(
             &marker_style,
@@ -2673,9 +2694,12 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         outline: box_outline(&style),
         text,
         control: control_paint(node, &style, style_state, font_size),
-        selection: pseudo_style(PseudoElement::Selection)
+        selection: selection_style
             .map(|selection| selection.background)
             .filter(|background| background.alpha > 0),
+        selection_color: selection_style
+            .map(|selection| selection.color)
+            .filter(|color| *color != style.color),
         control_selection: node
             .own()
             .and_then(|own| style_state.text_selections.get(&own).copied()),
@@ -2865,6 +2889,7 @@ fn anonymous_box(
         inline: false,
         control: None,
         selection: None,
+        selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
@@ -2896,6 +2921,7 @@ fn layout_text_item(
         open_inlines: Vec::new(),
         trailing_space: false,
         rtl: context.text.rtl,
+        ellipsis: false,
         fragments: Vec::new(),
         placed: Vec::new(),
     };
@@ -3728,6 +3754,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         inline: false,
         control: None,
         selection: None,
+        selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4179,6 +4206,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         inline: false,
         control: None,
         selection: None,
+        selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -4892,6 +4920,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         inline: false,
         control: None,
         selection: None,
+        selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         margin,
@@ -6773,6 +6802,7 @@ impl TextPlacer {
             node_offset: offset,
             source_len,
             rtl: false,
+            decoration: self.context.text.decoration,
             line_height: self.context.line_height,
             atomic: None,
             edge: None,
@@ -6868,6 +6898,7 @@ fn append_atomic(
         node_offset: 0,
         source_len: 0,
         rtl: false,
+        decoration: Default::default(),
         line_height: outer_height,
         atomic: Some(Box::new(laid_out)),
         edge: None,
@@ -6887,6 +6918,9 @@ fn flush_line(
         return;
     }
     let available = line.available(content_width);
+    if line.ellipsis && line.used > available + 0.5 {
+        truncate_with_ellipsis(line, available);
+    }
     let end = (available - line.used).max(0.0);
     let offset = match (align, line.rtl) {
         (TextAlign::Left, _) | (TextAlign::Start, false) | (TextAlign::End, true) => 0.0,
@@ -6946,6 +6980,7 @@ fn flush_line(
             node_offset: fragment.node_offset,
             source_len: fragment.source_len,
             rtl: fragment.rtl,
+            decoration: fragment.decoration,
         });
         x += fragment.width;
     }
@@ -7080,6 +7115,7 @@ fn outside_marker(
             node_offset: 0,
             source_len: 0,
             rtl: false,
+            decoration: Default::default(),
         };
         let mut marker = anonymous_box(node, rect, vec![run], (font_size, style.cursor), 1.0);
         marker.tag = "::marker".to_string();
@@ -7191,6 +7227,91 @@ fn reversed_for_display(text: &str) -> String {
         }
     }
     lead.to_string() + &clusters.into_iter().rev().collect::<String>()
+}
+
+// cuts a line that overflows its clipping block where an ellipsis still fits, and ends it
+// with one in the style of the last text kept
+fn truncate_with_ellipsis(line: &mut InlineLine, available: f32) {
+    let measure = |text: &str, fragment: &InlineFragment| {
+        measure_text(
+            text,
+            fragment.font_stack,
+            fragment.font_size,
+            fragment.font,
+            fragment.letter_spacing,
+        )
+    };
+    let Some(template) = line
+        .fragments
+        .iter()
+        .rev()
+        .find(|fragment| fragment.edge.is_none() && fragment.atomic.is_none())
+        .map(clone_text_fragment)
+    else {
+        return;
+    };
+    let ellipsis = "\u{2026}";
+    let ellipsis_width = measure(ellipsis, &template);
+    let limit = (available - ellipsis_width).max(0.0);
+    let mut used = 0.0;
+    let mut kept = Vec::new();
+    for mut fragment in std::mem::take(&mut line.fragments) {
+        if used + fragment.width <= limit {
+            used += fragment.width;
+            kept.push(fragment);
+            continue;
+        }
+        if fragment.edge.is_none() && fragment.atomic.is_none() {
+            // as many whole characters of the crossing piece as fit
+            let mut cut = String::new();
+            for character in fragment.text.chars() {
+                cut.push(character);
+                if used + measure(&cut, &fragment) > limit {
+                    cut.pop();
+                    break;
+                }
+            }
+            if !cut.is_empty() {
+                fragment.width = measure(&cut, &fragment);
+                fragment.source_len = cut.encode_utf16().count().min(fragment.source_len);
+                fragment.text = cut;
+                used += fragment.width;
+                kept.push(fragment);
+            }
+        }
+        break;
+    }
+    kept.push(InlineFragment {
+        text: ellipsis.to_string(),
+        width: ellipsis_width,
+        node: None,
+        source_len: 0,
+        ..template
+    });
+    line.fragments = kept;
+    line.used = used + ellipsis_width;
+}
+
+fn clone_text_fragment(fragment: &InlineFragment) -> InlineFragment {
+    InlineFragment {
+        text: fragment.text.clone(),
+        width: fragment.width,
+        font_size: fragment.font_size,
+        letter_spacing: fragment.letter_spacing,
+        font_stack: fragment.font_stack,
+        color: fragment.color,
+        font: fragment.font,
+        node: fragment.node,
+        node_offset: fragment.node_offset,
+        source_len: fragment.source_len,
+        rtl: fragment.rtl,
+        decoration: fragment.decoration,
+        line_height: fragment.line_height,
+        atomic: None,
+        edge: None,
+        level: fragment.level,
+        leading: fragment.leading,
+    }
 }
 
 // takes a float out of the line and puts it as high and as far to its side as the floats
