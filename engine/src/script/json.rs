@@ -458,7 +458,7 @@ impl ScriptRuntime {
                 return Err(self.type_error("Do not know how to serialize a BigInt"));
             }
             ref callable if is_callable(callable) => None,
-            Value::Array(_) => Some(self.serialize_array(state, &value)?),
+            ref array if self.is_array(array)? => Some(self.serialize_array(state, &value)?),
             _ => Some(self.serialize_object(state, &value)?),
         })
     }
@@ -524,7 +524,15 @@ impl ScriptRuntime {
         state.indent = format!("{}{}", state.indent, state.gap);
         let length = match value {
             Value::Array(array) => array.borrow().len(),
-            _ => 0,
+            proxy => {
+                let length = self.get_property(proxy, "length")?;
+                let length = self.coerce_number(length)?;
+                if length.is_nan() || length <= 0.0 {
+                    0
+                } else {
+                    length.min(MAX_RUNTIME_ARRAY_LENGTH as f64) as usize
+                }
+            }
         };
         let mut parts = Vec::with_capacity(length);
         for index in 0..length {

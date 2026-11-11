@@ -6825,11 +6825,10 @@ impl ScriptRuntime {
             Builtin::NumberIsFinite => Ok(Value::Bool(arguments.first().is_some_and(
                 |value| matches!(value, Value::Number(number) if number.is_finite()),
             ))),
-            Builtin::ArrayIsArray => Ok(Value::Bool(
-                arguments
-                    .first()
-                    .is_some_and(|value| matches!(value, Value::Array(_))),
-            )),
+            Builtin::ArrayIsArray => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                Ok(Value::Bool(self.is_array(&value)?))
+            }
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
                     Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
@@ -19222,6 +19221,39 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("1/2/2026, 3:04:05 PM|02/01/2026, 15:04:05|15:04|en-GB|en-GB|en-GB")
+        );
+    }
+
+    #[test]
+    fn a_proxy_over_an_array_is_an_array_to_is_array_and_json() {
+        let document = document(r#"<html><body><p id="status"></p></body></html>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const list = new Proxy([1, { a: [2] }], {
+                    get: (target, key) => {
+                        const value = Reflect.get(target, key);
+                        return value && typeof value === "object" ? new Proxy(value, {}) : value;
+                    },
+                });
+                const { proxy, revoke } = Proxy.revocable([], {});
+                revoke();
+                let revoked = "";
+                try { Array.isArray(proxy); } catch (error) { revoked = error.constructor.name; }
+                document.getElementById("status").textContent = [
+                    Array.isArray(list),
+                    Array.isArray(new Proxy({}, {})),
+                    JSON.stringify(list),
+                    Object.prototype.toString.call(list),
+                    revoked,
+                ].join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(r#"true|false|[1,{"a":[2]}]|[object Array]|TypeError"#)
         );
     }
 

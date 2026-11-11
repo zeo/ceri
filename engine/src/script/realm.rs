@@ -2644,7 +2644,7 @@ impl ScriptRuntime {
         let builtin = match this {
             Value::Undefined => return Ok("[object Undefined]".to_string()),
             Value::Null => return Ok("[object Null]".to_string()),
-            Value::Array(_) => "Array",
+            array if self.is_array(array)? => "Array",
             Value::Bool(_) => "Boolean",
             Value::Number(_) => "Number",
             Value::String(_) => "String",

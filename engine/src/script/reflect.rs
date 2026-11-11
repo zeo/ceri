@@ -72,6 +72,25 @@ pub(super) fn proxy_of(object: &ObjectHandle) -> Option<Rc<ProxyData>> {
 }
 
 impl ScriptRuntime {
+    // IsArray, which sees through a proxy to its target
+    pub(super) fn is_array(&mut self, value: &Value) -> Result<bool, ScriptError> {
+        let proxy = match value {
+            Value::Array(_) => return Ok(true),
+            Value::Object(object) => proxy_of(object),
+            _ => None,
+        };
+        let Some(proxy) = proxy else {
+            return Ok(false);
+        };
+        let target = proxy.target.borrow().clone();
+        match target {
+            Some(target) => self.is_array(&target),
+            None => {
+                Err(self.type_error("Cannot perform 'IsArray' on a proxy that has been revoked"))
+            }
+        }
+    }
+
     // the target and the named trap of a proxy; a revoked proxy throws
     pub(super) fn proxy_trap(
         &mut self,
