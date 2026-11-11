@@ -138,6 +138,11 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         ],
     },
     EventInterface {
+        name: "DragEvent",
+        parent: "MouseEvent",
+        members: &[("dataTransfer", Any)],
+    },
+    EventInterface {
         name: "WheelEvent",
         parent: "MouseEvent",
         members: &[
@@ -444,6 +449,7 @@ fn event_defaults(event_type: &str) -> (&'static str, bool, bool) {
             ("PointerEvent", false, false)
         }
         "wheel" => ("WheelEvent", true, true),
+        "dragstart" => ("DragEvent", true, true),
         "keydown" | "keyup" | "keypress" => ("KeyboardEvent", true, true),
         "beforeinput" => ("InputEvent", true, true),
         "input" => ("InputEvent", true, false),
@@ -642,7 +648,7 @@ impl ScriptRuntime {
                     set("inputType", Value::String(input_type.into()));
                 }
                 "CompositionEvent" => set("data", Value::String(fields.data.clone().into())),
-                "PointerEvent" | "MouseEvent" | "WheelEvent" => {
+                "PointerEvent" | "MouseEvent" | "WheelEvent" | "DragEvent" => {
                     let pointer = self.pointer;
                     let scroll = self.document_scroll_offset();
                     for name in ["clientX", "x", "screenX", "offsetX"] {
@@ -1638,6 +1644,20 @@ impl ScriptRuntime {
         }
         self.drain_microtasks()?;
         Ok(handled)
+    }
+
+    // the dragstart of a press that moved far enough on a draggable element
+    pub(crate) fn dispatch_drag_start(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        if !self.document.borrow().is_connected(node) {
+            return Ok(false);
+        }
+        let started = self.fire(
+            ListenerTarget::Node(node),
+            "dragstart",
+            HostEventFields::default(),
+        )?;
+        self.drain_microtasks()?;
+        Ok(started.handled)
     }
 
     // out, leave, over and enter events as the pointer moves from one node to another

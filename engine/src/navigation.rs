@@ -1853,6 +1853,42 @@ impl Browser {
             .is_some_and(|(style, _)| style.drag_region)
     }
 
+    // the element a press here would drag: the nearest one whose draggable is true, which by
+    // default an image or a link is
+    pub fn drag_source_at(&self, viewport: Size, x: f32, y: f32) -> Option<NodeId> {
+        let page = self.page.as_ref()?;
+        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let node = self.layout(viewport).ok()?.hit_test(x, y)?;
+        let document = page.document.borrow();
+        std::iter::once(node)
+            .chain(document.ancestors(node))
+            .find(|&node| {
+                let Some(element) = document.element(node) else {
+                    return false;
+                };
+                match element.attr("draggable").map(str::to_ascii_lowercase) {
+                    Some(value) if value == "true" => true,
+                    Some(value) if value == "false" => false,
+                    _ => {
+                        element.namespace == crate::dom::Namespace::Html
+                            && (element.name == "img"
+                                || element.name == "a" && element.attr("href").is_some())
+                    }
+                }
+            })
+    }
+
+    // dragstart reports where the press began, as Blink fires it with the press event
+    pub fn start_drag(&mut self, source: NodeId, x: f32, y: f32) -> Result<bool, NavigationError> {
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime.set_pointer_position(x, y);
+        let handled = page
+            .runtime
+            .dispatch_drag_start(source)
+            .map_err(|error| NavigationError::Script(error.to_string()))?;
+        Ok(self.process_pending_navigation()?.is_some() || handled)
+    }
+
     // moves a scrollbar thumb so the pointer stays grabbed at its press offset
     pub fn drag_thumb(
         &mut self,

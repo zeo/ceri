@@ -126,6 +126,8 @@ pub struct EngineHost {
     last_press: Option<Press>,
     // the press in progress went to a drag region, so its release and click stay out of the page
     region_press: bool,
+    // where a primary press on a draggable element began, until it moves far enough to drag
+    drag_press: Option<(f32, f32, crate::dom::NodeId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +137,12 @@ struct Press {
     y: f32,
     count: u32,
 }
+
+// how far a press moves before it drags, in CSS pixels along either axis, as in Blink
+#[cfg(target_os = "macos")]
+const DRAG_THRESHOLD: f32 = 3.0;
+#[cfg(not(target_os = "macos"))]
+const DRAG_THRESHOLD: f32 = 4.0;
 
 // the platform defaults on Windows; a press inside both continues the series
 const MULTI_CLICK_MILLISECONDS: u64 = 500;
@@ -500,6 +508,7 @@ impl EngineHost {
             clock: 0,
             last_press: None,
             region_press: false,
+            drag_press: None,
         }
     }
 
@@ -609,6 +618,17 @@ impl EngineHost {
                 let dispatched = self
                     .browser
                     .dispatch_at(self.viewport, x, y, "pointermove")?;
+                let started = match self.drag_press {
+                    Some((from_x, from_y, source))
+                        if (x - from_x).abs() >= DRAG_THRESHOLD
+                            || (y - from_y).abs() >= DRAG_THRESHOLD =>
+                    {
+                        self.drag_press = None;
+                        self.selecting = false;
+                        self.browser.start_drag(source, from_x, from_y)?
+                    }
+                    _ => false,
+                };
                 let dragged = match (&self.selecting_thumb, &self.range_drag) {
                     (Some(drag), _) => self.browser.drag_thumb(drag, x, y)?,
                     (_, Some(drag)) => self.browser.drag_range(drag, x)?,
@@ -617,7 +637,7 @@ impl EngineHost {
                 let extended =
                     self.selecting && self.browser.select_at(self.viewport, x, y, true)?;
                 InputResult {
-                    handled: dispatched || dragged || extended,
+                    handled: dispatched || started || dragged || extended,
                     frame_requested: dragged || extended,
                     cursor: Some(self.browser.cursor()),
                     ..InputResult::default()
@@ -664,6 +684,10 @@ impl EngineHost {
                     self.range_drag = self.browser.press_range(self.viewport, x, y)?;
                 }
                 let grabbed = thumb_drag.is_some() || self.range_drag.is_some();
+                self.drag_press = (primary && !grabbed)
+                    .then(|| self.browser.drag_source_at(self.viewport, x, y))
+                    .flatten()
+                    .map(|source| (x, y, source));
                 // a press on a scrollbar thumb or a slider drags it and leaves the selection alone
                 let selected = primary
                     && !grabbed
@@ -682,6 +706,9 @@ impl EngineHost {
             }
             InputEvent::PointerUp { x, y, button } => {
                 self.browser.set_pointer_button(button_index(button), false);
+                if button == PointerButton::Primary {
+                    self.drag_press = None;
+                }
                 let released = if button == PointerButton::Primary {
                     self.selecting = false;
                     self.selecting_thumb = None;
@@ -2209,6 +2236,48 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("enter,down:0:1:20,mousedown,up:0,click:10,a:KeyA:false,a:KeyA:true,keyup:KeyA")
+        );
+    }
+
+    #[test]
+    fn a_press_that_moves_four_pixels_on_a_draggable_element_starts_a_drag() {
+        let browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } li, p { display: block; width: 100px; height: 40px; margin: 0 }</style><ul style="margin: 0; padding: 0"><li id="card" draggable="true"><span>one</span></li></ul><p id="plain">two</p><p id="status"></p><script>
+                const seen = [];
+                document.addEventListener("dragstart", (event) => {
+                    seen.push(event.target.id + ":" + (event instanceof DragEvent) + ":" + event.cancelable + ":" + event.clientX);
+                    event.preventDefault();
+                    document.getElementById("status").textContent = seen.join(",");
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        press(&mut host, (10.0, 10.0));
+        drag(&mut host, (13.0, 12.0));
+        drag(&mut host, (14.0, 12.0));
+        drag(&mut host, (30.0, 12.0));
+        release(&mut host, (30.0, 12.0));
+        press(&mut host, (10.0, 50.0));
+        drag(&mut host, (40.0, 50.0));
+        release(&mut host, (40.0, 50.0));
+        drag(&mut host, (10.0, 10.0));
+        drag(&mut host, (40.0, 10.0));
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("card:true:true:10")
         );
     }
 
