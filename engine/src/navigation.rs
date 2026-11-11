@@ -6658,6 +6658,12 @@ A</div>
             fn invoke(&self, call: CommandCall, reply: CommandReply) {
                 match call.command.as_str() {
                     "greet" => reply.send(Ok(format!("{{\"echo\":{}}}", call.payload))),
+                    "upload" => reply.send(Ok(format!(
+                        "\"{:?} {} {}\"",
+                        call.body,
+                        call.header("clip").unwrap_or_default(),
+                        call.header("at").unwrap_or_default()
+                    ))),
                     "slow" => *self.later.borrow_mut() = Some(reply),
                     other => reply.send(Err(CommandError::unknown(other))),
                 }
@@ -6679,6 +6685,7 @@ A</div>
                 "greet".to_string(),
                 "slow".to_string(),
                 "missing".to_string(),
+                "upload".to_string(),
             ],
         }]);
         let mut browser = Browser::new(bundle(
@@ -6690,6 +6697,8 @@ A</div>
                 window.ceri.invoke("slow").then((reply) => log("slow:" + reply));
                 window.ceri.invoke("delete").catch((error) => log(error.name + ":" + error.code));
                 window.ceri.invoke("missing").catch((error) => log("missing:" + error.code));
+                window.ceri.invoke("upload", new Uint8Array([1, 2, 255]).subarray(1), { headers: { Clip: "a%20b", at: 5 } }).then((reply) => log("upload:" + reply));
+                window.ceri.invoke("upload", new Uint8Array([9]).buffer).then((reply) => log("buffer:" + reply));
                 window.ceri.listen("tick", (event) => log("tick:" + event.payload.n)).then((unlisten) => document.getElementById("stop").addEventListener("click", unlisten));
                 window.ceri.emit("ready", [1]);
             </script>"##,
@@ -6710,13 +6719,22 @@ A</div>
         };
         assert_eq!(
             status(&browser),
-            "main:true|greet:ceri|CeriBridgeError:denied|missing:unknown-command|"
+            "main:true|greet:ceri|CeriBridgeError:denied|missing:unknown-command|upload:Some([2, 255]) a%20b 5|buffer:Some([9])  |"
         );
         let calls = router.calls.borrow().clone();
-        assert_eq!(calls.len(), 3, "a denied command never reaches the router");
+        assert_eq!(calls.len(), 5, "a denied command never reaches the router");
         assert_eq!(calls[0].origin, APP_ORIGIN);
         assert_eq!(calls[0].payload, "{\"name\":\"ceri\"}");
+        assert_eq!((&calls[0].body, calls[0].headers.len()), (&None, 0));
         assert_eq!(calls[1].payload, "{}");
+        assert_eq!(calls[3].payload, "null");
+        assert_eq!(
+            calls[3].headers,
+            [
+                ("clip".to_string(), "a%20b".to_string()),
+                ("at".to_string(), "5".to_string())
+            ]
+        );
         assert_eq!(*router.events.borrow(), ["main:ready:[1]"]);
         router
             .later

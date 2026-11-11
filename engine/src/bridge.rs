@@ -7,13 +7,25 @@ use std::sync::mpsc::Sender;
 // wakes a sleeping thread that has new work, callable from any thread
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
-// a command a page invoked, with its arguments as JSON text
-#[derive(Clone, Debug, PartialEq, Eq)]
+// a command a page invoked, with its arguments as JSON text, or the raw bytes of an
+// ArrayBuffer or typed array as its body with null arguments, and the headers it named
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandCall {
     pub window: String,
     pub origin: String,
     pub command: String,
     pub payload: String,
+    pub body: Option<Vec<u8>>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl CommandCall {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 // why a command failed; the page sees the code and message on a CeriBridgeError

@@ -9,6 +9,8 @@ use crate::bridge::{
 };
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+type Request = (String, Option<Vec<u8>>, Vec<(String, String)>);
+
 // what a page's window.ceri talks to
 #[derive(Clone)]
 pub struct HostBridge {
@@ -108,13 +110,39 @@ impl ScriptRuntime {
         }
     }
 
+    // invoke(command, arguments, { headers }) as Tauri's invoke takes them
+    fn invoke_request(&mut self, arguments: &[Value]) -> Result<Request, ScriptError> {
+        let body = match arguments.get(1).map(Value::resolve) {
+            Some(Value::Bytes(bytes)) => Some(bytes.borrow().clone()),
+            Some(Value::TypedArray(array)) => Some(uint8_array_bytes(&array.borrow())),
+            _ => None,
+        };
+        let payload = match body {
+            Some(_) => "null".to_string(),
+            None => self.payload_text(arguments.get(1))?,
+        };
+        let headers = match arguments.get(2).map(Value::resolve) {
+            None | Some(Value::Undefined) => Value::Undefined,
+            Some(options) => self.get_property(&options, "headers")?,
+        };
+        let headers = match headers {
+            Value::Undefined => Vec::new(),
+            headers => self
+                .own_enumerable_entries(&headers)?
+                .into_iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.string_value()))
+                .collect(),
+        };
+        Ok((payload, body, headers))
+    }
+
     pub(super) fn ceri_invoke(&mut self, arguments: &[Value]) -> Result<Value, ScriptError> {
         let command = arguments
             .first()
             .map(Value::string_value)
             .unwrap_or_default();
-        let payload = match self.payload_text(arguments.get(1)) {
-            Ok(payload) => payload,
+        let (payload, body, headers) = match self.invoke_request(arguments) {
+            Ok(request) => request,
             Err(error) => {
                 let thrown = self.take_thrown(error);
                 let message = self.thrown_message(&thrown);
@@ -155,6 +183,8 @@ impl ScriptRuntime {
             origin: state.origin.clone(),
             command,
             payload,
+            body,
+            headers,
         };
         let reply = CommandReply::new(id, state.sender.clone()).with_waker(state.waker.clone());
         let router = state.bridge.router.clone();

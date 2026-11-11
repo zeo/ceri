@@ -80,14 +80,14 @@ function asBridgeError(error) {
   return new CeriBridgeError(code, message);
 }
 
-export function invoke(command, args) {
+export function invoke(command, args, options) {
   let host;
   try {
     host = bridge();
   } catch (error) {
     return Promise.reject(error);
   }
-  return host.invoke(command, args).catch((error) => {
+  return host.invoke(command, args, options).catch((error) => {
     throw asBridgeError(error);
   });
 }

@@ -254,6 +254,7 @@ mod tests {
             origin: ceri_engine::APP_ORIGIN.to_string(),
             command: command.to_string(),
             payload: "{\"n\":2}".to_string(),
+            ..Default::default()
         }
     }
 

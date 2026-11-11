@@ -31,7 +31,12 @@ export interface HostEvent<T = unknown> {
 
 export type Unlisten = () => void;
 
-export function invoke<T = unknown>(command: string, args?: unknown): Promise<T>;
+// an ArrayBuffer or typed array arrives in Rust as the call's raw body
+export interface InvokeOptions {
+  headers?: Record<string, string>;
+}
+
+export function invoke<T = unknown>(command: string, args?: unknown, options?: InvokeOptions): Promise<T>;
 
 export function listen<T = unknown>(event: string, handler: (event: HostEvent<T>) => void): Promise<Unlisten>;
 
@@ -129,7 +134,7 @@ export function fileSrc(path: string): string;
 
 export interface CeriHost {
   readonly windowLabel: string;
-  invoke(command: string, args?: unknown): Promise<unknown>;
+  invoke(command: string, args?: unknown, options?: InvokeOptions): Promise<unknown>;
   listen(event: string, handler: (event: HostEvent) => void): Promise<Unlisten>;
   emit(event: string, payload?: unknown): Promise<void>;
 }

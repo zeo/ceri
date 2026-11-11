@@ -822,6 +822,7 @@ mod tests {
             origin: ceri_engine::APP_ORIGIN.to_string(),
             command: "greet".to_string(),
             payload: payload.to_string(),
+            ..Default::default()
         };
         assert_eq!(
             handler(&call("{\"name\":\"ceri\"}")),
