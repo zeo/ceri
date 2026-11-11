@@ -393,6 +393,12 @@ impl InlineLine {
         (content_width - self.left - self.right).max(0.0)
     }
 
+    // a line measured piece by piece lands a rounding error past the width the same text
+    // measured whole, so overflow starts one layout unit (1/64 px) beyond the line
+    fn overflows(&self, width: f32, content_width: f32) -> bool {
+        width > self.available(content_width) + 1.0 / 64.0
+    }
+
     // a fresh line narrows to the floats beside it
     fn fit_to_floats(&mut self, content_x: f32, content_width: f32) {
         if let Some(floats) = &self.floats {
@@ -403,7 +409,7 @@ impl InlineLine {
     // moves an empty line down past floats until something this wide fits beside them
     fn make_room(&mut self, width: f32, content_x: f32, content_width: f32) {
         while !self.has_content()
-            && width > self.available(content_width)
+            && self.overflows(width, content_width)
             && (self.left > 0.0 || self.right > 0.0)
         {
             let Some(bottom) = self
@@ -6806,7 +6812,7 @@ impl TextPlacer {
         let width = self.measure(spaces);
         if breakable
             && line.has_content()
-            && line.used + width > line.available(self.context.content_width)
+            && line.overflows(line.used + width, self.context.content_width)
         {
             flush_line(
                 line,
@@ -6851,7 +6857,7 @@ impl TextPlacer {
         if self.context.text.wrap
             && breakable
             && line.has_content()
-            && line.used + space_width + word_width > line.available(content_width)
+            && line.overflows(line.used + space_width + word_width, content_width)
         {
             flush_line(line, text, content_x, content_width, self.context.align);
             // the space that broke the line is not drawn at the start of the next
@@ -6878,7 +6884,7 @@ impl TextPlacer {
         // a word too wide for any line breaks between its characters when overflow-wrap allows
         if self.context.text.wrap
             && self.context.text.overflow_wrap != OverflowWrap::Normal
-            && word_width > line.available(content_width)
+            && line.overflows(word_width, content_width)
             && word.chars().nth(1).is_some()
         {
             if space_width > 0.0 {
@@ -6890,7 +6896,7 @@ impl TextPlacer {
                 let mut candidate = piece.clone();
                 candidate.push(character);
                 if !piece.is_empty()
-                    && line.used + self.measure(&candidate) > line.available(content_width)
+                    && line.overflows(line.used + self.measure(&candidate), content_width)
                 {
                     let width = self.measure(&piece);
                     let length = piece.encode_utf16().count();
@@ -7026,7 +7032,7 @@ fn append_atomic(
         line.fit_to_floats(context.content_x, context.content_width);
         line.make_room(outer_width, context.content_x, context.content_width);
     }
-    if line.has_content() && line.used + outer_width > line.available(context.content_width) {
+    if line.has_content() && line.overflows(line.used + outer_width, context.content_width) {
         flush_line(
             line,
             text,
@@ -8899,6 +8905,29 @@ mod tests {
                 "{display}"
             );
         }
+    }
+
+    #[test]
+    fn a_line_overflows_only_past_a_layout_unit_beyond_its_width() {
+        let line = InlineLine {
+            y: 0.0,
+            used: 0.0,
+            height: 0.0,
+            left: 0.0,
+            right: 0.0,
+            band: 1.0,
+            floats: None,
+            decorations: Vec::new(),
+            open_inlines: Vec::new(),
+            trailing_space: false,
+            rtl: false,
+            ellipsis: false,
+            fragments: Vec::new(),
+            placed: Vec::new(),
+        };
+        // three pieces of a line that measured 68.49325 whole
+        assert!(!line.overflows(22.831085 + 7.610362 + 38.05181, 68.49325));
+        assert!(line.overflows(68.6, 68.49325));
     }
 
     #[test]
