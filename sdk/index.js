@@ -115,3 +115,33 @@ export function emit(event, payload) {
 export function windowLabel() {
   return bridge().windowLabel;
 }
+
+function command(name) {
+  return (args) => invoke(name, args);
+}
+
+// the page's own window; the app origin may always drive it
+export const appWindow = Object.freeze({
+  show: command("window:show"),
+  hide: command("window:hide"),
+  focus: command("window:focus"),
+  minimize: command("window:minimize"),
+  unminimize: command("window:unminimize"),
+  maximize: command("window:maximize"),
+  unmaximize: command("window:unmaximize"),
+  toggleMaximize: command("window:toggle-maximize"),
+  center: command("window:center"),
+  requestAttention: command("window:request-attention"),
+  close: command("window:close"),
+  setFullscreen: (on) => invoke("window:set-fullscreen", { on }),
+  setAlwaysOnTop: (on) => invoke("window:set-always-on-top", { on }),
+  setZoom: (zoom) => invoke("window:set-zoom", { zoom }),
+  setTitle: (title) => invoke("window:set-title", { title }),
+  state: command("window:state"),
+  isMaximized: () => invoke("window:state").then((state) => state.maximized),
+  onResized: (handler) => listen("window:resized", (event) => handler(event.payload)),
+});
+
+export function appVersion() {
+  return invoke("app:version");
+}

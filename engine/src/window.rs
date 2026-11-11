@@ -538,10 +538,7 @@ where
                 notify.clone(),
             )
         });
-        let worker = match spawn(viewport, None).and_then(|mut worker| {
-            worker.navigate(config.start_url.clone())?;
-            Ok(worker)
-        }) {
+        let worker = match spawn(viewport, None) {
             Ok(worker) => worker,
             Err(error) => {
                 eprintln!(
@@ -580,6 +577,16 @@ where
             this.worker.shutdown();
             return;
         };
+        // the page starts once the window has published the state it may ask for
+        if let Err(error) = this.worker.navigate(this.config.start_url.clone()) {
+            eprintln!(
+                "ceri: the {} window's engine did not start: {error}",
+                this.config.label
+            );
+            this.worker.shutdown();
+            self.control.published().windows.remove(&this.config.label);
+            return;
+        }
         self.windows.insert(id, this);
     }
 

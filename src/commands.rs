@@ -1,7 +1,11 @@
 // the commands an app registers for its pages to invoke, by name; payloads and results are
 // JSON text
 
-use ceri_engine::{CommandCall, CommandError, CommandReply, CommandRouter};
+use ceri_engine::{
+    CommandCall, CommandError, CommandReply, CommandRouter, WindowAction, WindowControl,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
@@ -43,12 +47,105 @@ impl Commands {
     }
 }
 
-// routes a page's calls into an app's commands
-pub struct CommandRoutes(pub Arc<Commands>);
+// routes a page's calls into the window's own commands and the app's
+pub struct CommandRoutes {
+    pub commands: Arc<Commands>,
+    pub control: Option<WindowControl>,
+    pub version: Option<String>,
+}
+
+impl CommandRoutes {
+    // commands every app has, for the page to drive its own window
+    fn builtin(&self, call: &CommandCall) -> Option<Result<String, CommandError>> {
+        if call.command == "app:version" {
+            return Some(match &self.version {
+                Some(version) => json(version),
+                None => Err(CommandError::failed("the app has no version")),
+            });
+        }
+        let control = self.control.as_ref()?;
+        let label = call.window.as_str();
+        let act = |action| {
+            control.act(label, action);
+            Ok("null".to_string())
+        };
+        Some(match call.command.as_str() {
+            "window:show" => act(WindowAction::Show),
+            "window:hide" => act(WindowAction::Hide),
+            "window:focus" => act(WindowAction::Focus),
+            "window:minimize" => act(WindowAction::Minimize),
+            "window:unminimize" => act(WindowAction::Unminimize),
+            "window:maximize" => act(WindowAction::Maximize),
+            "window:unmaximize" => act(WindowAction::Unmaximize),
+            "window:toggle-maximize" => act(WindowAction::ToggleMaximize),
+            "window:center" => act(WindowAction::Center),
+            "window:request-attention" => act(WindowAction::RequestAttention),
+            "window:close" => {
+                control.close(label);
+                Ok("null".to_string())
+            }
+            "window:set-fullscreen" => arguments::<Switch>(call)
+                .and_then(|switch| act(WindowAction::Fullscreen(switch.on))),
+            "window:set-always-on-top" => arguments::<Switch>(call)
+                .and_then(|switch| act(WindowAction::AlwaysOnTop(switch.on))),
+            "window:set-zoom" => {
+                arguments::<Zoom>(call).and_then(|zoom| act(WindowAction::Zoom(zoom.zoom)))
+            }
+            "window:set-title" => {
+                arguments::<Title>(call).and_then(|title| act(WindowAction::Title(title.title)))
+            }
+            "window:state" => match control.state(label) {
+                Some(state) => json(&serde_json::json!({
+                    "maximized": state.maximized,
+                    "minimized": state.minimized,
+                    "fullscreen": state.fullscreen,
+                    "focused": state.focused,
+                    "visible": state.visible,
+                    "zoom": state.zoom,
+                    "scale": state.scale,
+                    "position": { "x": state.position.0, "y": state.position.1 },
+                    "size": { "width": state.size.0, "height": state.size.1 },
+                })),
+                None => Err(CommandError::failed(format!(
+                    "the {label} window is not open"
+                ))),
+            },
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct Switch {
+    on: bool,
+}
+
+#[derive(Deserialize)]
+struct Zoom {
+    zoom: f32,
+}
+
+#[derive(Deserialize)]
+struct Title {
+    title: String,
+}
+
+fn arguments<T: DeserializeOwned>(call: &CommandCall) -> Result<T, CommandError> {
+    serde_json::from_str(&call.payload)
+        .map_err(|error| CommandError::new("invalid-payload", error.to_string()))
+}
+
+fn json(value: &impl Serialize) -> Result<String, CommandError> {
+    serde_json::to_string(value).map_err(|error| CommandError::failed(error.to_string()))
+}
 
 impl CommandRouter for CommandRoutes {
     fn invoke(&self, call: CommandCall, reply: CommandReply) {
-        let Some(registered) = self.0.registered.get(&call.command).cloned() else {
+        if let Some(answer) = self.builtin(&call) {
+            reply.send(answer);
+            return;
+        }
+        let Some(registered) = self.commands.registered.get(&call.command).cloned() else {
             reply.send(Err(CommandError::unknown(&call.command)));
             return;
         };
@@ -90,7 +187,11 @@ mod tests {
                 thread::current().name().unwrap_or_default()
             ))
         });
-        let routes = CommandRoutes(Arc::new(commands));
+        let routes = CommandRoutes {
+            commands: Arc::new(commands),
+            control: None,
+            version: Some("1.2.3".to_string()),
+        };
         let (sender, receiver) = channel();
         let ask = |command: &str, id| {
             routes.invoke(call(command), CommandReply::new(id, sender.clone()));
@@ -106,6 +207,12 @@ mod tests {
         assert_eq!(
             ask("nothing", 3),
             (3, Err(CommandError::unknown("nothing")))
+        );
+        assert_eq!(ask("app:version", 4), (4, Ok("\"1.2.3\"".to_string())));
+        assert_eq!(
+            ask("window:minimize", 5),
+            (5, Err(CommandError::unknown("window:minimize"))),
+            "without a window loop the window commands are not there"
         );
     }
 }

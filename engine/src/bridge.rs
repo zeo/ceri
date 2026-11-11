@@ -103,6 +103,11 @@ impl Capabilities {
         Self { grants }
     }
 
+    pub fn grant(mut self, grant: Grant) -> Self {
+        self.grants.push(grant);
+        self
+    }
+
     pub fn permits(&self, window: &str, origin: &str, command: &str) -> bool {
         self.grants.iter().any(|grant| {
             matches_any(&grant.windows, window)

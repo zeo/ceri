@@ -4,34 +4,124 @@ use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
-    AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost, ExternalRequest, FontSet,
-    HostBridge, HostRuntimeInfo, NavigationError, Resource, ResourceBundle, ResourceProvider,
-    ResourceResponse, Size, WindowConfig, mime_type_for, run_window,
+    APP_ORIGIN, AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost,
+    ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, NavigationError,
+    Resource, ResourceBundle, ResourceProvider, ResourceResponse, Size, WindowConfig,
+    WindowControl, mime_type_for, run_window_with,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
 const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 
-// the label of the window an app opens with
-const MAIN_WINDOW: &str = "main";
-
-// an app: its commands and the capabilities that say which pages may invoke them
+// reaches the running app's windows from commands, hooks and threads; quiet until the loop runs
 #[derive(Clone, Default)]
+pub struct AppHandle {
+    control: Arc<OnceLock<WindowControl>>,
+}
+
+impl AppHandle {
+    fn attach(&self, control: &WindowControl) {
+        let _ = self.control.set(control.clone());
+    }
+
+    // opens, acts on, reads and closes windows once the loop runs
+    pub fn windows(&self) -> Option<&WindowControl> {
+        self.control.get()
+    }
+
+    // an event for every window's listeners
+    pub fn emit(&self, event: &str, payload: &impl Serialize) {
+        self.send(None, event, payload);
+    }
+
+    pub fn emit_to(&self, window: &str, event: &str, payload: &impl Serialize) {
+        self.send(Some(window), event, payload);
+    }
+
+    fn send(&self, target: Option<&str>, event: &str, payload: &impl Serialize) {
+        let Some(control) = self.windows() else {
+            return;
+        };
+        match serde_json::to_string(payload) {
+            Ok(payload) => control.emit(target, event, &payload),
+            Err(error) => eprintln!("ceri: the {event} event is not JSON: {error}"),
+        }
+    }
+}
+
+// an app: its windows, its commands and the capabilities that say which pages may invoke them
+#[derive(Default)]
 pub struct App {
     commands: Commands,
     capabilities: Capabilities,
+    windows: Vec<WindowConfig>,
+    version: Option<String>,
+    lifecycle: Lifecycle,
+    handle: AppHandle,
 }
 
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn handle(&self) -> AppHandle {
+        self.handle.clone()
+    }
+
+    // a window to open at launch; an app that names none opens one main window, and a start
+    // URL that is a path is a path under the app origin
+    pub fn window(mut self, config: WindowConfig) -> Self {
+        self.windows.push(config);
+        self
+    }
+
+    // what app:version answers pages with
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    // stays running with every window closed, until the app exits
+    pub fn keep_running(mut self) -> Self {
+        self.lifecycle.keep_running = true;
+        self
+    }
+
+    // runs on the loop's thread once the launch windows are open
+    pub fn on_start(mut self, hook: impl FnOnce(&AppHandle) + 'static) -> Self {
+        let handle = self.handle.clone();
+        self.lifecycle.started = Some(Box::new(move |_| hook(&handle)));
+        self
+    }
+
+    // answers whether a window may close when its user or the app asks
+    pub fn on_close_requested(
+        mut self,
+        mut hook: impl FnMut(&AppHandle, &str) -> bool + 'static,
+    ) -> Self {
+        let handle = self.handle.clone();
+        self.lifecycle.close_requested = Some(Box::new(move |_, label| hook(&handle, label)));
+        self
+    }
+
+    pub fn on_closed(mut self, mut hook: impl FnMut(&AppHandle, &str) + 'static) -> Self {
+        let handle = self.handle.clone();
+        self.lifecycle.closed = Some(Box::new(move |_, label| hook(&handle, label)));
+        self
+    }
+
+    // after the last window has gone, before run returns
+    pub fn on_exit(mut self, hook: impl FnOnce() + 'static) -> Self {
+        self.lifecycle.exiting = Some(Box::new(hook));
+        self
     }
 
     // a command quick enough to answer on the engine thread, its arguments and result in
@@ -72,16 +162,36 @@ impl App {
         self
     }
 
+    // the app origin may always drive its own window and read the app version
     pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
         self
     }
 
-    pub fn run(self) -> Result<(), String> {
-        run_app(Bridge {
-            commands: Arc::new(self.commands),
-            capabilities: self.capabilities,
-        })
+    pub fn run(mut self) -> Result<(), String> {
+        let handle = self.handle.clone();
+        let started = self.lifecycle.started.take();
+        self.lifecycle.started = Some(Box::new(move |control| {
+            handle.attach(control);
+            if let Some(started) = started {
+                started(control);
+            }
+        }));
+        let capabilities = self.capabilities.grant(Grant {
+            windows: vec!["*".to_string()],
+            origins: vec![APP_ORIGIN.to_string()],
+            commands: vec!["window:*".to_string(), "app:*".to_string()],
+        });
+        run_app(
+            Bridge {
+                commands: Arc::new(self.commands),
+                capabilities,
+                version: self.version,
+            },
+            self.windows,
+            self.lifecycle,
+            self.handle,
+        )
     }
 }
 
@@ -105,12 +215,17 @@ where
 struct Bridge {
     commands: Arc<Commands>,
     capabilities: Capabilities,
+    version: Option<String>,
 }
 
 impl Bridge {
-    fn host_bridge(&self, window: &str) -> HostBridge {
+    fn host_bridge(&self, window: &str, control: Option<&WindowControl>) -> HostBridge {
         HostBridge::new(
-            Rc::new(CommandRoutes(self.commands.clone())),
+            Rc::new(CommandRoutes {
+                commands: self.commands.clone(),
+                control: control.cloned(),
+                version: self.version.clone(),
+            }),
             self.capabilities.clone(),
             window,
         )
@@ -118,10 +233,15 @@ impl Bridge {
 }
 
 pub fn run() -> Result<(), String> {
-    App::new().run()
+    App::new().version(env!("CARGO_PKG_VERSION")).run()
 }
 
-fn run_app(bridge: Bridge) -> Result<(), String> {
+fn run_app(
+    bridge: Bridge,
+    windows: Vec<WindowConfig>,
+    lifecycle: Lifecycle,
+    handle: AppHandle,
+) -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let launch = launch::resolve(
         launch::switch_value(arguments.clone(), ASSETS_SWITCH).map(PathBuf::from),
@@ -130,33 +250,69 @@ fn run_app(bridge: Bridge) -> Result<(), String> {
     let storage = launch::profile_path().map(|profile| profile.join("storage"))?;
     let allowed = allowed_origins(&arguments)?;
     let assets = launch.assets.clone();
-    let config = WindowConfig {
-        title: "Ceri".to_string(),
-        start_url: launch.initial_url.clone(),
-        icon: app_icon(launch.assets.as_ref()),
-        geometry_path: launch::profile_path()
-            .ok()
-            .map(|profile| profile.join("window")),
-        ..WindowConfig::default()
+    let icon = app_icon(launch.assets.as_ref());
+    let windows = match windows.is_empty() && !lifecycle.keep_running {
+        true => vec![WindowConfig {
+            title: "Ceri".to_string(),
+            start_url: launch.initial_url.clone(),
+            geometry_path: launch::profile_path()
+                .ok()
+                .map(|profile| profile.join("window")),
+            ..WindowConfig::default()
+        }],
+        false => windows,
     };
+    let windows: Vec<_> = windows
+        .into_iter()
+        .map(|config| WindowConfig {
+            start_url: app_url(&config.start_url),
+            icon: config.icon.clone().or_else(|| icon.clone()),
+            ..config
+        })
+        .collect();
     if let Some(path) = launch::switch_value(arguments, SCREENSHOT_SWITCH) {
-        return capture(
-            &config,
-            PathBuf::from(path),
-            assets,
-            storage,
-            allowed,
-            bridge,
-        );
+        let config = windows.first().cloned().unwrap_or_else(|| WindowConfig {
+            start_url: launch.initial_url.clone(),
+            ..WindowConfig::default()
+        });
+        // the engine needs a worker's stack, more than the main thread has on windows
+        return std::thread::Builder::new()
+            .name("ceri-engine".to_string())
+            .spawn(move || {
+                capture(
+                    &config,
+                    PathBuf::from(path),
+                    assets,
+                    storage,
+                    allowed,
+                    bridge,
+                )
+            })
+            .map_err(|error| format!("could not start the capture: {error}"))?
+            .join()
+            .map_err(|_| "the capture stopped with a panic".to_string())?;
     }
-    run_window(vec![config], move |window| {
-        build_browser(
-            assets.clone(),
-            storage.clone(),
-            allowed.clone(),
-            bridge.host_bridge(&window.label),
-        )
-    })
+    run_window_with(
+        windows,
+        move |window| {
+            handle.attach(&window.control);
+            build_browser(
+                assets.clone(),
+                storage.clone(),
+                allowed.clone(),
+                bridge.host_bridge(&window.label, Some(&window.control)),
+            )
+        },
+        lifecycle,
+    )
+}
+
+// a start URL that is a path means one under the app origin
+fn app_url(url: &str) -> String {
+    match url.starts_with('/') {
+        true => format!("{APP_ORIGIN}{url}"),
+        false => url.to_string(),
+    }
 }
 
 // renders one frame without opening a window, for smoke checks and release shots
@@ -169,7 +325,12 @@ fn capture(
     bridge: Bridge,
 ) -> Result<(), String> {
     let mut host = EngineHost::new(
-        build_browser(assets, storage, allowed, bridge.host_bridge(MAIN_WINDOW))?,
+        build_browser(
+            assets,
+            storage,
+            allowed,
+            bridge.host_bridge(&config.label, None),
+        )?,
         Size {
             width: config.width as f32,
             height: config.height as f32,
@@ -377,9 +538,7 @@ fn is_document_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CommandCall, MAIN_WINDOW, PackagedAssets, allowed_origins, is_document_path, typed,
-    };
+    use super::{CommandCall, PackagedAssets, allowed_origins, is_document_path, typed};
     use crate::assets::AssetOrigin;
     use ceri_engine::{AppUrl, ExternalRequest, ResourceProvider};
     use std::collections::BTreeMap;
@@ -483,7 +642,7 @@ mod tests {
     fn typed_commands_read_and_write_serde_shapes() {
         let handler = typed(|greeting: Greeting| Ok(vec![format!("hello {}", greeting.name)]));
         let call = |payload: &str| CommandCall {
-            window: MAIN_WINDOW.to_string(),
+            window: "main".to_string(),
             origin: ceri_engine::APP_ORIGIN.to_string(),
             command: "greet".to_string(),
             payload: payload.to_string(),
