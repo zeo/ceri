@@ -879,7 +879,7 @@ impl Default for InheritedText {
             caption_bottom: false,
             accent_color: None,
             text_align: TextAlign::Start,
-            line_height: Length::em(NORMAL_LINE_HEIGHT),
+            line_height: Length::Auto,
             space_collapse: SpaceCollapse::Collapse,
             wrap: true,
             word_break: crate::linebreak::WordBreak::Normal,
@@ -2270,7 +2270,7 @@ impl Stylesheet {
             let height = style
                 .line_height
                 .resolve(font_size, font_size)
-                .unwrap_or(font_size * NORMAL_LINE_HEIGHT);
+                .unwrap_or_else(|| crate::layout::normal_line_height(style.font_family, font_size));
             style.line_height = Length::px(height);
         }
         style
@@ -4431,7 +4431,7 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
     // the shorthand resets what it leaves out
     style.italic = false;
     style.font_weight = FontWeight::NORMAL;
-    style.line_height = Length::em(NORMAL_LINE_HEIGHT);
+    style.line_height = Length::Auto;
     style.line_height_absolute = false;
     for word in &words[..size_index] {
         match word.to_ascii_lowercase().as_str() {
@@ -5992,14 +5992,12 @@ fn split_top_level(source: &str) -> Vec<&str> {
     parts
 }
 
-// the line height normal stands for, as a factor of the font size
-pub(crate) const NORMAL_LINE_HEIGHT: f32 = 1.25;
-
-// a plain number or normal stays a factor of the font size; a length is computed once
+// normal stays auto, for each element's own font to size; a plain number stays a factor of
+// the font size; a length is computed once
 fn parse_line_height(value: &str) -> Option<(Length, bool)> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("normal") {
-        return Some((Length::em(NORMAL_LINE_HEIGHT), false));
+        return Some((Length::Auto, false));
     }
     if let Ok(multiplier) = value.parse::<f32>() {
         return Some((Length::em(multiplier), false));

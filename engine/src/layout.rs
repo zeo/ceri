@@ -2141,7 +2141,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         style
             .line_height
             .resolve(font_size, font_size)
-            .unwrap_or(font_size * 1.25)
+            .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
             .max(1.0),
         style_state,
     );
@@ -2336,7 +2336,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let line_height = style
         .line_height
         .resolve(font_size, font_size)
-        .unwrap_or(font_size * 1.25)
+        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
         .max(1.0);
     // a box that starts a formatting context keeps a float area of its own
     let float_area = match floats {
@@ -3279,7 +3279,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let line_height = style
         .line_height
         .resolve(font_size, font_size)
-        .unwrap_or(font_size * 1.25)
+        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
         .max(1.0);
     let text_context = InlineContext {
         font_size,
@@ -3927,7 +3927,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let line_height = style
         .line_height
         .resolve(font_size, font_size)
-        .unwrap_or(font_size * 1.25)
+        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
         .max(1.0);
     let text_context = InlineContext {
         font_size,
@@ -5411,7 +5411,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         style
             .line_height
             .resolve(font_size, font_size)
-            .unwrap_or(font_size * 1.25)
+            .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
             .max(1.0),
         style_state,
     ) {
@@ -6490,7 +6490,7 @@ fn append_inline_element(
     let line_height = style
         .line_height
         .resolve(font_size, font_size)
-        .unwrap_or(font_size * 1.25)
+        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
         .max(1.0);
     let child_context = InlineContext {
         font_size,
@@ -7656,6 +7656,11 @@ fn root_font_size(
         .resolve(viewport.width, INITIAL_FONT_SIZE)
         .filter(|size| size.is_finite() && *size > 0.0)
         .unwrap_or(INITIAL_FONT_SIZE)
+}
+
+// line-height normal takes the primary face's ascent, descent and line gap
+pub(crate) fn normal_line_height(stack: FontStack, font_size: f32) -> f32 {
+    crate::font::active_fonts().line_height(stack, font_size)
 }
 
 // the space above a glyph box that centres it in its line, half the leading
