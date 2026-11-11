@@ -1568,7 +1568,7 @@ fn append_positioned_nodes(
             node,
             containing_x: 0.0,
             containing_y: 0.0,
-            containing_width: containing_block.width,
+            containing_width: block.width,
             containing_height: (block.height > 0.0).then_some(block.height),
             size_override: (None, None),
             floats: None,
@@ -2184,6 +2184,27 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                 .map(|(ratio, height)| height * ratio)
         })
         .or(control_size.0)
+        .or_else(|| {
+            // an out-of-flow box with an auto width shrinks to fit the room its insets leave
+            (mode != LayoutMode::Flow).then(|| {
+                let measure = |minimum: bool| {
+                    intrinsic_width(
+                        MaxContentInput {
+                            node,
+                            stylesheet,
+                            style_state,
+                            parent,
+                            containing_width,
+                            own_width: true,
+                        },
+                        minimum,
+                    )
+                };
+                let room =
+                    position_block.width - inset.left.unwrap_or(0.0) - inset.right.unwrap_or(0.0);
+                measure(false).min(room.max(measure(true))) - horizontal_extras
+            })
+        })
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
         .max(0.0);
     let min_width = style
@@ -8928,6 +8949,33 @@ mod tests {
         // three pieces of a line that measured 68.49325 whole
         assert!(!line.overflows(22.831085 + 7.610362 + 38.05181, 68.49325));
         assert!(line.overflows(68.6, 68.49325));
+    }
+
+    #[test]
+    fn an_out_of_flow_box_with_an_auto_width_shrinks_to_fit_its_insets() {
+        let document = Document::parse_markup(
+            "<style>* { margin: 0; } p { position: absolute; left: 10px; } section { position: absolute; left: 0; right: 0; } aside { position: fixed; left: 150px; }</style><p>hi</p><section>x</section><aside>a b c d e f g h i j k l m n</aside>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+        );
+        let width = |tag: &str| find_box(&result.root, tag).expect(tag).rect.width;
+        assert!(width("p") > 0.0 && width("p") < 40.0, "{}", width("p"));
+        assert_eq!(width("section"), 200.0);
+        assert!(width("aside") <= 50.0, "{}", width("aside"));
+        let aside = find_box(&result.root, "aside").expect("aside");
+        let runs = collect_text_runs(aside);
+        assert!(
+            runs.iter().any(|run| run.y > runs[0].y),
+            "the fixed box wraps in the room it has"
+        );
     }
 
     #[test]
