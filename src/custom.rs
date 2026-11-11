@@ -3,6 +3,7 @@ use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
 use crate::files::FileScope;
 use crate::fonts::SystemFonts;
+use crate::instance;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use crate::tray::{Tray, TrayConfig, TrayEvent};
 use ceri_engine::{
@@ -13,6 +14,7 @@ use ceri_engine::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -81,7 +83,10 @@ pub struct App {
     lifecycle: Lifecycle,
     handle: AppHandle,
     tray: Option<TrayRequest>,
+    single_instance: Option<LaunchRequest>,
 }
+
+type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
 
 type TrayRequest = (TrayConfig, Box<dyn Fn(&AppHandle, TrayEvent) + Send + Sync>);
 
@@ -121,6 +126,16 @@ impl App {
         on_event: impl Fn(&AppHandle, TrayEvent) + Send + Sync + 'static,
     ) -> Self {
         self.tray = Some((config, Box::new(on_event)));
+        self
+    }
+
+    // a later launch hands its arguments and working directory to this copy and exits; they
+    // arrive on their own thread, perhaps before the windows open
+    pub fn single_instance(
+        mut self,
+        on_launch: impl Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync + 'static,
+    ) -> Self {
+        self.single_instance = Some(Box::new(on_launch));
         self
     }
 
@@ -231,6 +246,7 @@ impl App {
             self.lifecycle,
             self.handle,
             self.tray,
+            self.single_instance,
         )
     }
 }
@@ -301,6 +317,7 @@ fn run_app(
     lifecycle: Lifecycle,
     handle: AppHandle,
     tray: Option<TrayRequest>,
+    single_instance: Option<LaunchRequest>,
 ) -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let launch = launch::resolve(
@@ -332,7 +349,7 @@ fn run_app(
             ..config
         })
         .collect();
-    if let Some(path) = launch::switch_value(arguments, SCREENSHOT_SWITCH) {
+    if let Some(path) = launch::switch_value(arguments.clone(), SCREENSHOT_SWITCH) {
         let config = windows.first().cloned().unwrap_or_else(|| WindowConfig {
             start_url: launch.initial_url.clone(),
             ..WindowConfig::default()
@@ -354,6 +371,18 @@ fn run_app(
             .join()
             .map_err(|_| "the capture stopped with a panic".to_string())?;
     }
+    let _instance = match single_instance {
+        Some(on_launch) => {
+            let launches = handle.clone();
+            let on_launch: instance::LaunchHandler =
+                Box::new(move |arguments, directory| on_launch(&launches, arguments, directory));
+            match instance::claim(&profile, identifier, &arguments, on_launch)? {
+                Some(instance) => Some(instance),
+                None => return Ok(()),
+            }
+        }
+        None => None,
+    };
     if let Some((config, on_event)) = tray {
         let events = handle.clone();
         let config = TrayConfig {

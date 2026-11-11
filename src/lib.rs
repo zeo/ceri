@@ -10,6 +10,7 @@ pub mod dirs;
 mod files;
 mod fonts;
 mod http;
+mod instance;
 mod tray;
 
 pub use ceri_engine::{
