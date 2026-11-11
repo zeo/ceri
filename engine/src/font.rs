@@ -1179,16 +1179,6 @@ impl ChosenFace {
             face,
         }
     }
-
-    // emboldening widens each glyph by a twenty-fourth of the em
-    fn advance(&self, character: char, size: f32) -> f32 {
-        let advance = self.face.advance(self.face.glyph_for(character), size);
-        if self.synthetic_bold {
-            advance + size / 24.0
-        } else {
-            advance
-        }
-    }
 }
 
 type FaceList = Rc<[StackFace]>;
@@ -1346,11 +1336,6 @@ impl FontSet {
             match chosen {
                 Some(chosen) => {
                     let scale = size / chosen.face.units_per_em();
-                    let extra = if chosen.synthetic_bold {
-                        size / 24.0
-                    } else {
-                        0.0
-                    };
                     // variation selectors only choose the face and take no room
                     let visible = characters[start..end]
                         .iter()
@@ -1360,7 +1345,7 @@ impl FontSet {
                     for shaped in
                         crate::shaping::Shaper::new(&chosen.face).shape(&visible, ligatures)
                     {
-                        let advance = shaped.advance * scale + extra;
+                        let advance = shaped.advance * scale;
                         glyphs.push(RunGlyph {
                             face: Some(chosen.clone()),
                             glyph: shaped.glyph,
@@ -1398,7 +1383,7 @@ impl FontSet {
 
     pub fn advance(&self, character: char, stack: FontStack, size: f32, style: FontStyle) -> f32 {
         match self.face_for(character, stack, style) {
-            Some(chosen) => chosen.advance(character, size),
+            Some(chosen) => chosen.face.advance(chosen.face.glyph_for(character), size),
             None => builtin_advance(size),
         }
     }
@@ -2217,9 +2202,38 @@ mod tests {
             .face_for('A', intern_font_stack("Ceri Test"), FontStyle::NORMAL)
             .expect("the fixture covers A");
         let glyph = chosen.face.glyph_for('A');
-        let bitmap = |x| fonts.glyph_bitmap(&chosen, glyph, 20.0, x, 0.0).expect("A rasterizes");
+        let bitmap = |x| {
+            fonts
+                .glyph_bitmap(&chosen, glyph, 20.0, x, 0.0)
+                .expect("A rasterizes")
+        };
         assert!(Rc::ptr_eq(&bitmap(2.25), &bitmap(-0.75)));
         assert!(!Rc::ptr_eq(&bitmap(2.25), &bitmap(2.5)));
+    }
+
+    #[test]
+    fn synthetic_bold_thickens_glyphs_but_keeps_their_advances() {
+        let fonts = FontSet::new(Rc::new(fixture("ceri-test.ttf")), None);
+        let stack = intern_font_stack("Ceri Test");
+        let bold = fonts.face_for('A', stack, weight(700)).expect("A");
+        assert!(bold.synthetic_bold);
+        assert_eq!(
+            fonts.measure("AA", stack, 20.0, weight(700)),
+            fonts.measure("AA", stack, 20.0, FontStyle::NORMAL)
+        );
+        assert_eq!(
+            fonts.advance('A', stack, 20.0, weight(700)),
+            fonts.advance('A', stack, 20.0, FontStyle::NORMAL)
+        );
+        let regular = fonts.face_for('A', stack, FontStyle::NORMAL).expect("A");
+        let glyph = regular.face.glyph_for('A');
+        let thick = fonts
+            .glyph_bitmap(&bold, glyph, 20.0, 0.0, 0.0)
+            .expect("bold A");
+        let thin = fonts
+            .glyph_bitmap(&regular, glyph, 20.0, 0.0, 0.0)
+            .expect("A");
+        assert_eq!(thick.width, thin.width + 1);
     }
 
     #[test]
