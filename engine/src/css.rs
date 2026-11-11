@@ -2306,7 +2306,16 @@ impl Stylesheet {
                 } else {
                     inherited
                 };
-                reset_inherited_property(&mut style, &from, &property);
+                if !reset_inherited_property(&mut style, &from, &property) {
+                    let from = match keyword {
+                        "inherit" => self.parent_style(context),
+                        "revert" | "revert-layer" => Some(inherited),
+                        _ => Some(initial()),
+                    };
+                    if let Some(from) = from {
+                        reset_property(&mut style, &from, &property);
+                    }
+                }
                 continue;
             }
             if property == "animation" || property == "animation-name" {
@@ -2388,6 +2397,24 @@ impl Stylesheet {
             style.line_height = Length::px(height);
         }
         style
+    }
+
+    // the parent's own cascade, for a property that does not inherit by default; its
+    // inherited values are approximated by the child's, which only its own non-inherited
+    // properties are read from anyway
+    fn parent_style(&self, context: StyleContext<'_>) -> Option<Style> {
+        let node = match context.pseudo {
+            Some(_) => context.node,
+            None => context
+                .document
+                .parent(context.node)
+                .filter(|&parent| context.document.element(parent).is_some())?,
+        };
+        Some(self.style_for(StyleContext {
+            node,
+            pseudo: None,
+            ..context
+        }))
     }
 
     pub(crate) fn has_transitions(&self) -> bool {
@@ -4541,7 +4568,8 @@ fn css_wide_keyword(value: &str) -> Option<&'static str> {
 
 // copies an inherited property from the style holding its parent or initial value; other
 // properties need the parent's full style, which the cascade does not see, so they keep theirs
-fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) {
+// false when the property does not inherit by default
+fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> bool {
     match property {
         "font" => {
             style.font_family = from.font_family;
@@ -4594,6 +4622,63 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) {
         "word-break" => style.word_break = from.word_break,
         "overflow-wrap" | "word-wrap" => style.overflow_wrap = from.overflow_wrap,
         "direction" => style.rtl = from.rtl,
+        _ => return false,
+    }
+    true
+}
+
+fn reset_property(style: &mut Style, from: &Style, property: &str) {
+    let sides = |style: &mut Style, copy: fn(&mut BorderSide, &BorderSide)| {
+        for (side, from) in style.border.iter_mut().zip(&from.border) {
+            copy(side, from);
+        }
+    };
+    match property {
+        "display" => style.display = from.display,
+        "position" => style.position = from.position,
+        "z-index" => style.z_index = from.z_index,
+        "inset" => style.inset = from.inset,
+        "overflow" => {
+            style.overflow = from.overflow;
+            style.overflow_x = from.overflow_x;
+            style.overflow_y = from.overflow_y;
+        }
+        "width" => style.width = from.width,
+        "height" => style.height = from.height,
+        "min-width" => style.min_width = from.min_width,
+        "max-width" => style.max_width = from.max_width,
+        "min-height" => style.min_height = from.min_height,
+        "max-height" => style.max_height = from.max_height,
+        "box-sizing" => style.box_sizing = from.box_sizing,
+        "margin" => style.margin = from.margin,
+        "padding" => style.padding = from.padding,
+        "background" => {
+            style.background = from.background;
+            style.backgrounds = from.backgrounds;
+        }
+        "background-color" => style.background = from.background,
+        "background-image" => style.backgrounds = from.backgrounds,
+        "border" => style.border = from.border,
+        "border-color" => sides(style, |side, from| side.color = from.color),
+        "border-width" => sides(style, |side, from| side.width = from.width),
+        "border-style" => sides(style, |side, from| side.style = from.style),
+        "border-radius" => style.border_radius = from.border_radius,
+        "outline" => style.outline = from.outline,
+        "box-shadow" => style.shadows = from.shadows,
+        "opacity" => style.opacity = from.opacity,
+        "gap" => {
+            style.gap = from.gap;
+            style.row_gap = from.row_gap;
+        }
+        "column-gap" => style.gap = from.gap,
+        "row-gap" => style.row_gap = from.row_gap,
+        "flex-direction" => style.flex_direction = from.flex_direction,
+        "flex-wrap" => style.flex_wrap = from.flex_wrap,
+        "justify-content" => style.justify_content = from.justify_content,
+        "align-items" => style.align_items = from.align_items,
+        "transform" => style.transform = from.transform,
+        "text-overflow" => style.text_overflow_ellipsis = from.text_overflow_ellipsis,
+        "vertical-align" => style.vertical_align = from.vertical_align,
         _ => {}
     }
 }
@@ -7042,6 +7127,39 @@ mod tests {
         assert_eq!(style.color, parent_color);
         assert_eq!(style.cursor, Cursor::Pointer);
         assert_eq!(style.border, [BorderSide::INITIAL; 4]);
+    }
+
+    #[test]
+    fn inherit_copies_a_non_inherited_property_from_the_parent() {
+        let stylesheet = Stylesheet::parse(
+            "nav { border-radius: 9px; border: 2px solid #0f0; padding: 4px; display: flex }
+             i { border-radius: inherit; border-color: inherit; padding: inherit; display: initial }
+             b { padding: 3px; padding: unset }",
+        )
+        .expect("stylesheet should parse");
+        let nav = Element::new("nav");
+        let style = style_within(
+            &stylesheet,
+            &Element::new("i"),
+            &[&nav],
+            16.0,
+            Color::BLACK,
+            FontWeight::NORMAL,
+        );
+        assert_eq!(style.border_radius[0].0, Length::px(9.0));
+        assert_eq!(style.border[0].color, Some(Color::opaque(0, 255, 0)));
+        assert_eq!(style.border[0].width, BorderSide::INITIAL.width);
+        assert_eq!(style.padding.left, Length::px(4.0));
+        assert_eq!(style.display, Display::Inline);
+        let style = style_within(
+            &stylesheet,
+            &Element::new("b"),
+            &[&nav],
+            16.0,
+            Color::BLACK,
+            FontWeight::NORMAL,
+        );
+        assert_eq!(style.padding.left, Length::px(0.0));
     }
 
     fn style_within(
