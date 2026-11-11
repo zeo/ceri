@@ -966,6 +966,306 @@ fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]))
 }
 
+const LUMA_QUANT: [u16; 64] = [
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113,
+    92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+];
+const CHROMA_QUANT: [u16; 64] = [
+    17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+];
+// the example tables of ITU T.81 annex K.3, as counts per code length and then values
+const LUMA_DC: ([u8; 16], &[u8]) = (
+    [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+);
+const CHROMA_DC: ([u8; 16], &[u8]) = (
+    [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+);
+const LUMA_AC: ([u8; 16], &[u8]) = (
+    [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d],
+    &[
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
+        0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52,
+        0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25,
+        0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45,
+        0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64,
+        0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83,
+        0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+        0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+        0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3,
+        0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
+        0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+    ],
+);
+const CHROMA_AC: ([u8; 16], &[u8]) = (
+    [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77],
+    &[
+        0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61,
+        0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33,
+        0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18,
+        0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44,
+        0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63,
+        0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+        0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
+        0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca,
+        0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
+        0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+    ],
+);
+
+// baseline YCbCr the way Chromium has libjpeg-turbo write canvas images: its fixed-point
+// color conversion, 4:2:0 with its biased box downsampling below quality 100 and 4:4:4 at it,
+// the islow integer DCT and the scaled annex K quantization tables; `rgb` is tightly packed
+pub(crate) fn encode_jpeg(width: u32, height: u32, rgb: &[u8], quality: u8) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || width > 65535 || height > 65535 {
+        return None;
+    }
+    let (width, height) = (width as usize, height as usize);
+    let quality = u32::from(quality.clamp(1, 100));
+    let factor = if quality == 100 { 1 } else { 2 };
+    let mcu = 8 * factor;
+    let (padded_width, padded_height) = (width.div_ceil(mcu) * mcu, height.div_ceil(mcu) * mcu);
+    let fix = |value: f64| (value * 65536.0 + 0.5) as i32;
+    let chroma_offset = (128 << 16) + (1 << 15) - 1;
+    let mut planes = [(); 3].map(|_| vec![0_u8; padded_width * padded_height]);
+    // samples past the edges repeat the last column and row, as libjpeg pads them
+    for y in 0..padded_height {
+        for x in 0..padded_width {
+            let at = (y.min(height - 1) * width + x.min(width - 1)) * 3;
+            let [red, green, blue] = [rgb[at], rgb[at + 1], rgb[at + 2]].map(i32::from);
+            let index = y * padded_width + x;
+            planes[0][index] =
+                ((fix(0.299) * red + fix(0.587) * green + fix(0.114) * blue + (1 << 15)) >> 16)
+                    as u8;
+            planes[1][index] =
+                ((-fix(0.16874) * red - fix(0.33126) * green + fix(0.5) * blue + chroma_offset)
+                    >> 16) as u8;
+            planes[2][index] = ((fix(0.5) * red - fix(0.41869) * green - fix(0.08131) * blue
+                + chroma_offset)
+                >> 16) as u8;
+        }
+    }
+    let (chroma_width, chroma_height) = (padded_width / factor, padded_height / factor);
+    let [luma, blue, red] = planes;
+    let [blue, red] = [blue, red].map(|plane| {
+        if factor == 1 {
+            return plane;
+        }
+        let mut half = Vec::with_capacity(chroma_width * chroma_height);
+        for y in 0..chroma_height {
+            let (top, bottom) = (2 * y * padded_width, (2 * y + 1) * padded_width);
+            for x in 0..chroma_width {
+                let sum: u32 = [top, bottom]
+                    .iter()
+                    .flat_map(|row| [plane[row + 2 * x], plane[row + 2 * x + 1]])
+                    .map(u32::from)
+                    .sum();
+                // the rounding bias alternates 1, 2 along the row
+                half.push(((sum + 1 + (x as u32 & 1)) >> 2) as u8);
+            }
+        }
+        half
+    });
+
+    let scale = if quality < 50 {
+        5000 / quality
+    } else {
+        200 - 2 * quality
+    };
+    let tables = [LUMA_QUANT, CHROMA_QUANT]
+        .map(|table| table.map(|base| ((u32::from(base) * scale + 50) / 100).clamp(1, 255) as u16));
+
+    let mut file = vec![0xff, 0xd8];
+    let mut segment = |marker: u8, body: &[u8]| {
+        file.extend_from_slice(&[0xff, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    };
+    segment(0xe0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+    for (id, table) in tables.iter().enumerate() {
+        let mut body = vec![id as u8];
+        body.extend(ZIGZAG.iter().map(|&natural| table[natural] as u8));
+        segment(0xdb, &body);
+    }
+    let mut frame = vec![8];
+    frame.extend_from_slice(&(height as u16).to_be_bytes());
+    frame.extend_from_slice(&(width as u16).to_be_bytes());
+    frame.extend_from_slice(&[3, 1, 0x11 * factor as u8, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    segment(0xc0, &frame);
+    let huffman = [LUMA_DC, LUMA_AC, CHROMA_DC, CHROMA_AC];
+    for ((counts, values), class_id) in huffman.iter().zip([0x00, 0x10, 0x01, 0x11]) {
+        let mut body = vec![class_id];
+        body.extend_from_slice(counts);
+        body.extend_from_slice(values);
+        segment(0xc4, &body);
+    }
+    segment(0xda, &[3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
+
+    let codes = huffman.map(|(counts, values)| {
+        let mut codes = [(0_u16, 0_u8); 256];
+        let mut code = 0_u16;
+        let mut values = values.iter();
+        for (length, &count) in (1..=16).zip(&counts) {
+            for &value in values.by_ref().take(usize::from(count)) {
+                codes[usize::from(value)] = (code, length);
+                code += 1;
+            }
+            code <<= 1;
+        }
+        codes
+    });
+    let mut writer = EntropyWriter::default();
+    let mut previous_dc = [0_i32; 3];
+    for mcu_y in 0..padded_height / mcu {
+        for mcu_x in 0..padded_width / mcu {
+            let mut blocks = Vec::with_capacity(6);
+            for (dy, dx) in (0..factor).flat_map(|dy| (0..factor).map(move |dx| (dy, dx))) {
+                let (top, left) = (mcu_y * mcu + dy * 8, mcu_x * mcu + dx * 8);
+                blocks.push((0, &luma, padded_width, top, left));
+            }
+            blocks.push((1, &blue, chroma_width, mcu_y * 8, mcu_x * 8));
+            blocks.push((2, &red, chroma_width, mcu_y * 8, mcu_x * 8));
+            for (component, plane, stride, top, left) in blocks {
+                let mut block = [0_i32; 64];
+                for (index, sample) in block.iter_mut().enumerate() {
+                    *sample = i32::from(plane[(top + index / 8) * stride + left + index % 8]) - 128;
+                }
+                forward_dct(&mut block);
+                let table = &tables[usize::from(component > 0)];
+                for (coefficient, &step) in block.iter_mut().zip(table) {
+                    let divisor = i32::from(step) << 3;
+                    *coefficient =
+                        coefficient.signum() * ((coefficient.abs() + divisor / 2) / divisor);
+                }
+                let (dc_codes, ac_codes) = (
+                    &codes[usize::from(component > 0) * 2],
+                    &codes[usize::from(component > 0) * 2 + 1],
+                );
+                writer.value(block[0] - previous_dc[component], 0, dc_codes);
+                previous_dc[component] = block[0];
+                let mut run = 0;
+                for &natural in &ZIGZAG[1..] {
+                    if block[natural] == 0 {
+                        run += 1;
+                        continue;
+                    }
+                    while run > 15 {
+                        writer.code(ac_codes[0xf0]);
+                        run -= 16;
+                    }
+                    writer.value(block[natural], run, ac_codes);
+                    run = 0;
+                }
+                if run > 0 {
+                    writer.code(ac_codes[0]);
+                }
+            }
+        }
+    }
+    writer.flush();
+    file.extend_from_slice(&writer.bytes);
+    file.extend_from_slice(&[0xff, 0xd9]);
+    Some(file)
+}
+
+#[derive(Default)]
+struct EntropyWriter {
+    bytes: Vec<u8>,
+    bits: u32,
+    count: u32,
+}
+
+impl EntropyWriter {
+    fn put(&mut self, value: u32, length: u8) {
+        self.bits = (self.bits << length) | (value & ((1 << length) - 1));
+        self.count += u32::from(length);
+        while self.count >= 8 {
+            let byte = (self.bits >> (self.count - 8)) as u8;
+            self.bytes.push(byte);
+            if byte == 0xff {
+                self.bytes.push(0);
+            }
+            self.count -= 8;
+        }
+    }
+
+    fn code(&mut self, (code, length): (u16, u8)) {
+        self.put(u32::from(code), length);
+    }
+
+    // a coefficient as its run and size category, then its low bits in one's complement
+    fn value(&mut self, value: i32, run: u8, codes: &[(u16, u8); 256]) {
+        let size = (32 - value.unsigned_abs().leading_zeros()) as u8;
+        self.code(codes[usize::from(run << 4 | size)]);
+        let bits = if value < 0 { value - 1 } else { value };
+        self.put(bits as u32, size);
+    }
+
+    fn flush(&mut self) {
+        let pad = (8 - self.count % 8) % 8;
+        self.put((1 << pad) - 1, pad as u8);
+    }
+}
+
+// the jfdctint transform of libjpeg: Loeffler, Ligtenberg and Moschytz in 13-bit fixed point,
+// with outputs scaled up by 8
+fn forward_dct(block: &mut [i32; 64]) {
+    const CONST_BITS: u32 = 13;
+    const PASS1_BITS: u32 = 2;
+    let descale = |value: i32, shift: u32| (value + (1 << (shift - 1))) >> shift;
+    for pass in 0..2 {
+        let odd_shift = if pass == 0 {
+            CONST_BITS - PASS1_BITS
+        } else {
+            CONST_BITS + PASS1_BITS
+        };
+        for line in 0..8 {
+            let at = |index: usize| {
+                if pass == 0 {
+                    line * 8 + index
+                } else {
+                    index * 8 + line
+                }
+            };
+            let sample = |index: usize| block[at(index)];
+            let (tmp0, tmp7) = (sample(0) + sample(7), sample(0) - sample(7));
+            let (tmp1, tmp6) = (sample(1) + sample(6), sample(1) - sample(6));
+            let (tmp2, tmp5) = (sample(2) + sample(5), sample(2) - sample(5));
+            let (tmp3, tmp4) = (sample(3) + sample(4), sample(3) - sample(4));
+            let (tmp10, tmp13) = (tmp0 + tmp3, tmp0 - tmp3);
+            let (tmp11, tmp12) = (tmp1 + tmp2, tmp1 - tmp2);
+            let mut output = [0_i32; 8];
+            if pass == 0 {
+                output[0] = (tmp10 + tmp11) << PASS1_BITS;
+                output[4] = (tmp10 - tmp11) << PASS1_BITS;
+            } else {
+                output[0] = descale(tmp10 + tmp11, PASS1_BITS);
+                output[4] = descale(tmp10 - tmp11, PASS1_BITS);
+            }
+            let z1 = (tmp12 + tmp13) * 4433;
+            output[2] = descale(z1 + tmp13 * 6270, odd_shift);
+            output[6] = descale(z1 - tmp12 * 15137, odd_shift);
+            let z5 = (tmp4 + tmp5 + tmp6 + tmp7) * 9633;
+            let z1 = (tmp4 + tmp7) * -7373;
+            let z2 = (tmp5 + tmp6) * -20995;
+            let z3 = (tmp4 + tmp6) * -16069 + z5;
+            let z4 = (tmp5 + tmp7) * -3196 + z5;
+            output[7] = descale(tmp4 * 2446 + z1 + z3, odd_shift);
+            output[5] = descale(tmp5 * 16819 + z2 + z4, odd_shift);
+            output[3] = descale(tmp6 * 25172 + z2 + z3, odd_shift);
+            output[1] = descale(tmp7 * 12299 + z1 + z4, odd_shift);
+            for (index, value) in output.into_iter().enumerate() {
+                block[at(index)] = value;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,5 +1330,39 @@ mod tests {
             .expect("baseline frame marker");
         arithmetic[frame + 1] = 0xc9;
         assert!(decode_jpeg(&arithmetic).is_err());
+    }
+
+    // byte-for-byte pixel agreement with libjpeg-turbo was checked outside the test suite,
+    // so this only guards that the stream stays decodable and close to its source
+    #[test]
+    fn encoded_images_decode_close_to_their_source() {
+        let (width, height) = (37, 21);
+        let rgb = (0..height)
+            .flat_map(|y| (0..width).flat_map(move |x| [x * 6, y * 11, 200 - x * 3]))
+            .map(|value| value as u8)
+            .collect::<Vec<_>>();
+        for quality in [100, 92, 30] {
+            let image = decode_jpeg(&encode_jpeg(width, height, &rgb, quality).expect("encodes"))
+                .expect("decodes");
+            assert_eq!((image.width, image.height), (width, height));
+            let worst = image
+                .pixels
+                .iter()
+                .zip(rgb.chunks_exact(3))
+                .flat_map(|(pixel, source)| {
+                    [pixel.red, pixel.green, pixel.blue]
+                        .into_iter()
+                        .zip(source)
+                        .map(|(decoded, &source)| decoded.abs_diff(source))
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst <= if quality == 30 { 24 } else { 8 },
+                "q{quality} off by {worst}"
+            );
+        }
+        assert!(encode_jpeg(0, 4, &[], 92).is_none());
+        assert!(encode_jpeg(70_000, 1, &[0; 210_000], 92).is_none());
     }
 }

@@ -3,6 +3,7 @@
 // before anything is allocated
 
 use crate::css::Color;
+use crate::deflate::zlib_compress;
 use crate::image::{Image, ImageError, check_dimensions};
 use crate::inflate::zlib_decompress;
 
@@ -287,6 +288,73 @@ fn unfilter(
     Ok(rows)
 }
 
+// 8-bit RGB (3 channels) or RGBA (4) from tightly packed rows, each row filtered with the
+// filter whose output has the smallest sum of absolute signed bytes, as libpng picks them
+pub(crate) fn encode_png(width: u32, height: u32, channels: usize, pixels: &[u8]) -> Vec<u8> {
+    let stride = width as usize * channels;
+    let mut raw = Vec::with_capacity((stride + 1) * height as usize);
+    let blank = vec![0; stride];
+    let mut above = &blank[..];
+    let mut candidate = vec![0; stride];
+    let mut best = vec![0; stride];
+    for row in pixels.chunks_exact(stride.max(1)).take(height as usize) {
+        let mut best_score = u64::MAX;
+        let mut best_filter = 0;
+        for filter in 0..5_u8 {
+            for index in 0..stride {
+                let left = if index >= channels {
+                    row[index - channels]
+                } else {
+                    0
+                };
+                let upper_left = if index >= channels {
+                    above[index - channels]
+                } else {
+                    0
+                };
+                let predicted = match filter {
+                    0 => 0,
+                    1 => left,
+                    2 => above[index],
+                    3 => ((u16::from(left) + u16::from(above[index])) / 2) as u8,
+                    _ => paeth(left, above[index], upper_left),
+                };
+                candidate[index] = row[index].wrapping_sub(predicted);
+            }
+            let score = candidate
+                .iter()
+                .map(|&byte| u64::from((byte as i8).unsigned_abs()))
+                .sum();
+            if score < best_score {
+                best_score = score;
+                best_filter = filter;
+                std::mem::swap(&mut best, &mut candidate);
+            }
+        }
+        raw.push(best_filter);
+        raw.extend_from_slice(&best);
+        above = row;
+    }
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, if channels == 4 { 6 } else { 2 }, 0, 0, 0]);
+    let mut file = SIGNATURE.to_vec();
+    for (kind, body) in [
+        (b"IHDR", header),
+        (b"IDAT", zlib_compress(&raw)),
+        (b"IEND", Vec::new()),
+    ] {
+        file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        let start = file.len();
+        file.extend_from_slice(kind);
+        file.extend_from_slice(&body);
+        let crc = crc32(&file[start..]);
+        file.extend_from_slice(&crc.to_be_bytes());
+    }
+    file
+}
+
 fn paeth(left: u8, above: u8, upper_left: u8) -> u8 {
     let estimate = i16::from(left) + i16::from(above) - i16::from(upper_left);
     let to_left = (estimate - i16::from(left)).abs();
@@ -454,6 +522,43 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn encoded_images_decode_to_the_same_pixels() {
+        let (width, height) = (29, 17);
+        let pixels = (0..width * height)
+            .flat_map(|index| {
+                let (x, y) = (index % width, index / width);
+                [x * 8, y * 15, (x * y) % 251, 255 - (x + y) * 3]
+            })
+            .map(|value| value as u8)
+            .collect::<Vec<_>>();
+        let image = decode_png(&encode_png(width, height, 4, &pixels)).expect("rgba decodes");
+        assert_eq!(
+            image
+                .pixels
+                .iter()
+                .map(|&pixel| rgba(pixel))
+                .collect::<Vec<_>>()
+                .concat(),
+            pixels
+        );
+        let rgb = pixels
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect::<Vec<_>>();
+        let image = decode_png(&encode_png(width, height, 3, &rgb)).expect("rgb decodes");
+        assert!(
+            image
+                .pixels
+                .iter()
+                .zip(rgb.chunks_exact(3))
+                .all(|(pixel, source)| {
+                    [pixel.red, pixel.green, pixel.blue, pixel.alpha]
+                        == [source[0], source[1], source[2], 255]
+                })
         );
     }
 }

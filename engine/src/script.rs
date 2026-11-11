@@ -9444,13 +9444,17 @@ impl ScriptRuntime {
 
     // a host step that runs as its own task once the current one finishes
     fn schedule_native_task(&mut self, native: Native) {
+        self.schedule_callback(Value::Builtin(Builtin::Native(native)), Vec::new());
+    }
+
+    fn schedule_callback(&mut self, callback: Value, arguments: Vec<Value>) {
         let id = self.next_task_id;
         self.next_task_id = self.next_task_id.saturating_add(1);
         self.tasks.push(ScheduledTask {
             id,
             due: self.clock,
-            callback: Value::Builtin(Builtin::Native(native)),
-            arguments: Vec::new(),
+            callback,
+            arguments,
             kind: TaskKind::Timeout,
         });
     }
@@ -19056,7 +19060,10 @@ mod tests {
                 seen.push(pixel(ctx, 20, 0));
                 canvas.width = canvas.width;
                 seen.push(pixel(ctx, 4, 5), ctx.fillStyle, copy.width);
-                for (const attempt of [() => ctx.getImageData(0, 0, 0, 1), () => ctx.drawImage({}, 0, 0), () => ctx.drawImage(copy, 0, 0, 1)]) {
+                const empty = document.createElement("canvas");
+                empty.width = 0;
+                seen.push(empty.toDataURL(), copy.toDataURL("IMAGE/JPEG", 0.5).slice(0, 23), copy.toDataURL("image/webp").slice(0, 22));
+                for (const attempt of [() => ctx.getImageData(0, 0, 0, 1), () => ctx.drawImage({}, 0, 0), () => ctx.drawImage(copy, 0, 0, 1), () => canvas.toBlob(null)]) {
                     try { attempt(); } catch (error) { seen.push(error.name); }
                 }
                 document.getElementById("status").textContent = seen.join(",");
@@ -19070,9 +19077,59 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "300,150,true,null,255 0 0 255,0 0 0 0,#ff0000,255 0 0 255,9 0 0 255,0 0 0 0,#000000,4,IndexSizeError,TypeError,TypeError"
+                "300,150,true,null,255 0 0 255,0 0 0 0,#ff0000,255 0 0 255,9 0 0 255,0 0 0 0,#000000,4,data:,,data:image/jpeg;base64,,data:image/png;base64,,IndexSizeError,TypeError,TypeError,TypeError"
             )
         );
+    }
+
+    #[test]
+    fn canvases_export_straight_pngs_and_hand_blobs_over_in_a_later_task() {
+        let document = document(
+            r#"<canvas id="art" width="3" height="2"></canvas><p id="status">idle</p><p id="url"></p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const canvas = document.getElementById("art");
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "rgba(255, 0, 0, 0.5)";
+                ctx.fillRect(0, 0, 2, 2);
+                document.getElementById("url").textContent = canvas.toDataURL();
+                const seen = [];
+                canvas.toBlob((blob) => {
+                    seen.push(blob.type, blob.size > 0);
+                    blob.arrayBuffer().then((bytes) => {
+                        const view = new Uint8Array(bytes);
+                        seen.push(view[0], view[1], view[view.length - 1]);
+                        document.getElementById("status").textContent = seen.join(",");
+                    });
+                }, "image/jpeg", 0.82);
+                seen.push("sync");
+                "#,
+            )
+            .expect("canvas export should execute");
+        let text = |id: &str| {
+            let document = document.borrow();
+            let node = document
+                .find_element_by_id(id)
+                .expect("element should exist");
+            document.element_text_content(node).unwrap_or_default()
+        };
+        assert_eq!(text("status"), "idle");
+        runtime.advance_time(1).expect("the blob task should run");
+        assert_eq!(text("status"), "sync,image/jpeg,true,255,216,217");
+        let (mime, bytes) = crate::image::decode_data_url(&text("url")).expect("data url");
+        let image = crate::png::decode_png(&bytes).expect("png should decode");
+        assert_eq!(
+            (mime.as_str(), image.width, image.height),
+            ("image/png", 3, 2)
+        );
+        let pixel = |index: usize| {
+            let color = image.pixels[index];
+            [color.red, color.green, color.blue, color.alpha]
+        };
+        assert_eq!((pixel(0), pixel(2)), ([255, 0, 0, 128], [0, 0, 0, 0]));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::layout::{
     overflow_clip_rect, paint_order, part_box, scrollbar_metrics, stacking_context_entries,
     thumb_placement, translate_rect, visual_offset_for, visual_rect_for,
 };
+use crate::png::encode_png;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -176,24 +177,14 @@ impl Canvas {
     }
 
     pub fn write_png(&self, path: &Path) -> io::Result<()> {
-        let mut raw = Vec::with_capacity((self.width as usize * 3 + 1) * self.height as usize);
+        let mut rgb = Vec::with_capacity(self.width as usize * 3 * self.height as usize);
         for row in 0..self.height as usize {
-            raw.push(0);
             let start = row * self.bytes_per_row();
             for pixel in self.pixels[start..start + self.width as usize * 4].chunks_exact(4) {
-                raw.extend_from_slice(&pixel[..3]);
+                rgb.extend_from_slice(&pixel[..3]);
             }
         }
-        let mut header = Vec::with_capacity(13);
-        header.extend_from_slice(&self.width.to_be_bytes());
-        header.extend_from_slice(&self.height.to_be_bytes());
-        header.extend_from_slice(&[8, 2, 0, 0, 0]);
-
-        let mut file = File::create(path)?;
-        file.write_all(&[137, 80, 78, 71, 13, 10, 26, 10])?;
-        write_png_chunk(&mut file, b"IHDR", &header)?;
-        write_png_chunk(&mut file, b"IDAT", &zlib_stored(&raw))?;
-        write_png_chunk(&mut file, b"IEND", &[])
+        std::fs::write(path, encode_png(self.width, self.height, 3, &rgb))
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
@@ -1016,59 +1007,6 @@ fn fades_without_layer(layout_box: &LayoutBox) -> bool {
             <= 1
         && !matches!(layout_box.tag.as_str(), "img" | "canvas" | "svg")
         && layout_box.overflow == Overflow::Visible
-}
-
-fn write_png_chunk(file: &mut File, kind: &[u8; 4], body: &[u8]) -> io::Result<()> {
-    file.write_all(&(body.len() as u32).to_be_bytes())?;
-    file.write_all(kind)?;
-    file.write_all(body)?;
-    let mut checked = Vec::with_capacity(4 + body.len());
-    checked.extend_from_slice(kind);
-    checked.extend_from_slice(body);
-    file.write_all(&crc32(&checked).to_be_bytes())
-}
-
-// stored deflate blocks keep the writer dependency-free at the cost of file size
-fn zlib_stored(raw: &[u8]) -> Vec<u8> {
-    let mut stream = vec![0x78, 0x01];
-    let mut blocks = raw.chunks(0xffff).peekable();
-    if raw.is_empty() {
-        stream.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
-    }
-    while let Some(block) = blocks.next() {
-        stream.push(u8::from(blocks.peek().is_none()));
-        let length = block.len() as u16;
-        stream.extend_from_slice(&length.to_le_bytes());
-        stream.extend_from_slice(&(!length).to_le_bytes());
-        stream.extend_from_slice(block);
-    }
-    stream.extend_from_slice(&adler32(raw).to_be_bytes());
-    stream
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let carry = crc & 1;
-            crc >>= 1;
-            if carry != 0 {
-                crc ^= 0xedb8_8320;
-            }
-        }
-    }
-    !crc
-}
-
-fn adler32(bytes: &[u8]) -> u32 {
-    let mut low = 1_u32;
-    let mut high = 0_u32;
-    for byte in bytes {
-        low = (low + u32::from(*byte)) % 65521;
-        high = (high + low) % 65521;
-    }
-    (high << 16) | low
 }
 
 #[derive(Clone, Copy, Debug)]

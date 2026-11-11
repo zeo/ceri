@@ -461,6 +461,8 @@ static INTERFACES: &[Interface] = &[
             ("width", ReadWrite),
             ("height", ReadWrite),
             ("getContext", Method(1)),
+            ("toDataURL", Method(0)),
+            ("toBlob", Method(1)),
         ],
     },
     Interface {
@@ -1249,6 +1251,9 @@ impl ScriptRuntime {
             }
             ("width" | "height", Access::Set) => {
                 self.canvas_element_member(handle, member.name(), Some(first))?
+            }
+            ("toDataURL" | "toBlob", Access::Call) => {
+                self.export_canvas(node, member.name(), arguments)?
             }
             ("naturalWidth" | "naturalHeight" | "complete" | "currentSrc", Access::Get)
             | ("decode", Access::Call) => self.image_member(node, member.name()),

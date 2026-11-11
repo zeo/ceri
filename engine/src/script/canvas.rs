@@ -207,6 +207,27 @@ impl Bitmap {
         });
     }
 
+    // a PNG, or for "image/jpeg" a JPEG blended onto black, which premultiplied colour already is
+    fn encode(&self, mime: &str, quality: u8) -> Option<Vec<u8>> {
+        if self.pixels.is_empty() {
+            return None;
+        }
+        if mime == "image/jpeg" {
+            let rgb = self
+                .pixels
+                .iter()
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]);
+            return crate::jpeg::encode_jpeg(
+                self.width,
+                self.height,
+                &rgb.collect::<Vec<_>>(),
+                quality,
+            );
+        }
+        let rgba = self.image_data(0, 0, self.width, self.height);
+        Some(crate::png::encode_png(self.width, self.height, 4, &rgba))
+    }
+
     // straight RGBA for a region, transparent black wherever it leaves the bitmap
     fn image_data(&self, x: i64, y: i64, width: u32, height: u32) -> Vec<u8> {
         let mut data = vec![0; width as usize * height as usize * 4];
@@ -277,6 +298,27 @@ fn non_negative_integer(value: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|&value| value <= i32::MAX as u32)
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let word = chunk
+            .iter()
+            .zip([16, 8, 0])
+            .fold(0_u32, |word, (&byte, shift)| {
+                word | u32::from(byte) << shift
+            });
+        for index in 0..4 {
+            text.push(if index <= chunk.len() {
+                char::from(ALPHABET[(word >> (18 - 6 * index) & 63) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    text
 }
 
 fn is_html(document: &Document, node: NodeId, name: &str) -> bool {
@@ -363,6 +405,67 @@ impl ScriptRuntime {
             }
             _ => Value::Undefined,
         })
+    }
+
+    // toDataURL(type, quality) and toBlob(callback, type, quality); types other than PNG and
+    // JPEG fall back to PNG, and quality outside 0 to 1 means Chromium's default of 92
+    pub(super) fn export_canvas(
+        &mut self,
+        node: NodeId,
+        name: &str,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+        if name == "toBlob" && !is_callable(&callback) {
+            return Err(self.type_error(
+                "Failed to execute 'toBlob' on 'HTMLCanvasElement': parameter 1 is not of type 'BlobCallback'.",
+            ));
+        }
+        let options = arguments
+            .get(usize::from(name == "toBlob")..)
+            .unwrap_or_default();
+        let mime = match options.first() {
+            None | Some(Value::Undefined) => "image/png",
+            Some(value)
+                if self
+                    .coerce_string(value.clone())?
+                    .eq_ignore_ascii_case("image/jpeg") =>
+            {
+                "image/jpeg"
+            }
+            Some(_) => "image/png",
+        };
+        let quality = match options.get(1) {
+            Some(&Value::Number(quality)) if (0.0..=1.0).contains(&quality) => {
+                (quality * 100.0 + 0.5) as u8
+            }
+            _ => 92,
+        };
+        let encoded = match self.canvas_contexts.get(&node) {
+            Some(context) => context.borrow().bitmap.encode(mime, quality),
+            None => {
+                let (width, height) = canvas_size(&self.document.borrow(), node);
+                Bitmap::new(width, height).encode(mime, quality)
+            }
+        };
+        if name == "toDataURL" {
+            return Ok(Value::String(
+                encoded
+                    .map_or_else(
+                        || "data:,".to_string(),
+                        |bytes| format!("data:{mime};base64,{}", base64(&bytes)),
+                    )
+                    .into(),
+            ));
+        }
+        let blob = encoded.map_or(Value::Null, |bytes| {
+            Value::Blob(Rc::new(BlobData {
+                bytes,
+                mime_type: mime.to_string(),
+            }))
+        });
+        self.schedule_callback(callback, vec![blob]);
+        Ok(Value::Undefined)
     }
 
     pub(super) fn canvas_context_property(
@@ -705,6 +808,14 @@ mod tests {
         let mut exact = Bitmap::new(2, 1);
         exact.draw_image(&source, (0.0, 0.0, 2.0, 1.0), (0.0, 0.0, 2.0, 1.0));
         assert_eq!(exact.pixels, source.pixels);
+    }
+
+    #[test]
+    fn base64_pads_partial_groups() {
+        assert_eq!(
+            ["", "f", "fo", "foo", "foob"].map(|text| base64(text.as_bytes())),
+            ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg=="]
+        );
     }
 
     #[test]
