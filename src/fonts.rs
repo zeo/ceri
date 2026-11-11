@@ -58,6 +58,14 @@ impl SystemFonts {
             .iter()
             .filter(|face| face.family == family)
             .collect::<Vec<_>>();
+        // a width variant that is not installed, such as arial narrow, takes its base family,
+        // as edge and chrome do on windows
+        if matching.is_empty() {
+            let base = WIDTH_WORDS
+                .iter()
+                .find_map(|word| family.strip_suffix(word)?.strip_suffix(' '))?;
+            return self.lookup(base, style);
+        }
         let slant = if matching.iter().any(|face| face.italic == style.italic) {
             style.italic
         } else {
@@ -200,6 +208,21 @@ fn weight_distance(wanted: u16, weight: u16) -> (u8, u16) {
 }
 
 // generic css families map to the faces a desktop is expected to have
+const WIDTH_WORDS: &[&str] = &[
+    "ultra condensed",
+    "extra condensed",
+    "semi condensed",
+    "condensed",
+    "narrow",
+    "compressed",
+    "semi expanded",
+    "extra expanded",
+    "ultra expanded",
+    "expanded",
+    "extended",
+    "wide",
+];
+
 fn generic_family(family: &str) -> Option<&'static str> {
     match family {
         "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" => {
@@ -405,8 +428,11 @@ fn read_name(table: &[u8], wanted: &[u16]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemFonts, generic_family, weight_distance};
+    use super::{IndexedFace, SystemFonts, generic_family, weight_distance};
     use ceri_engine::{FontSource, FontStyle};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn generic_families_map_to_platform_faces() {
@@ -414,6 +440,32 @@ mod tests {
         assert!(generic_family("monospace").is_some());
         assert!(generic_family("serif").is_some());
         assert_eq!(generic_family("Aptos Narrow"), None);
+    }
+
+    #[test]
+    fn a_missing_width_variant_takes_its_base_family() {
+        let fonts = SystemFonts {
+            faces: vec![IndexedFace {
+                family: "arial".into(),
+                path: PathBuf::from("arial.ttf"),
+                weight: 400,
+                italic: false,
+            }],
+            loaded: RefCell::new(HashMap::new()),
+            fallbacks: RefCell::new(HashMap::new()),
+        };
+        let found = |family| {
+            fonts
+                .lookup(family, FontStyle::NORMAL)
+                .map(|face| &face.path)
+        };
+        assert_eq!(found("arial narrow"), Some(&PathBuf::from("arial.ttf")));
+        assert_eq!(
+            found("arial semi condensed"),
+            Some(&PathBuf::from("arial.ttf"))
+        );
+        assert_eq!(found("aptos narrow"), None);
+        assert_eq!(found("arial bold"), None);
     }
 
     #[test]
