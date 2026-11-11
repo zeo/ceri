@@ -5166,6 +5166,7 @@ option, optgroup { display: block }
 input::placeholder, textarea::placeholder { color: #757575 }
 input:disabled, button:disabled, select:disabled, textarea:disabled { color: #6d6d6d; cursor: default }
 button:disabled, select:disabled, input[type="button" i]:disabled, input[type="submit" i]:disabled, input[type="reset" i]:disabled { background-color: #f4f4f4; border-color: #c4c4c4 }
+select:disabled { opacity: 0.7 }
 "#;
 
 thread_local! {
