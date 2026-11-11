@@ -168,19 +168,20 @@ fn lookup_subtables(
 ) -> Option<(u16, u16, Vec<usize>)> {
     let lookup_list = table + usize::from(u16_at(data, table + 8)?);
     let lookup = lookup_list + usize::from(u16_at(data, lookup_list + 2 + usize::from(index) * 2)?);
-    let mut kind = u16_at(data, lookup)?;
+    let kind = u16_at(data, lookup)?;
     let flag = u16_at(data, lookup + 2)?;
     let count = usize::from(u16_at(data, lookup + 4)?);
+    let mut wrapped = kind;
     let mut subtables = Vec::with_capacity(count);
     for subtable in 0..count {
         let mut at = lookup + usize::from(u16_at(data, lookup + 6 + subtable * 2)?);
         if kind == extension_type {
-            kind = u16_at(data, at + 2)?;
+            wrapped = u16_at(data, at + 2)?;
             at += u32_at(data, at + 4)? as usize;
         }
         subtables.push(at);
     }
-    Some((kind, flag, subtables))
+    Some((wrapped, flag, subtables))
 }
 
 struct Glyph {
@@ -645,5 +646,36 @@ fn assign_forms(characters: &[char], glyphs: &mut [Glyph]) {
             (false, true) => Form::Initial,
             (false, false) => Form::Isolated,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_extension_subtable_of_a_lookup_is_followed() {
+        let mut table = vec![0_u8; 24];
+        table[8..10].copy_from_slice(&10_u16.to_be_bytes());
+        for (at, value) in [
+            (10, 1),
+            (12, 4),
+            (14, 9),
+            (16, 0),
+            (18, 2),
+            (20, 10),
+            (22, 18),
+        ] {
+            table[at..at + 2].copy_from_slice(&u16::to_be_bytes(value));
+        }
+        for offset in [256_u32, 512] {
+            table.extend(1_u16.to_be_bytes());
+            table.extend(2_u16.to_be_bytes());
+            table.extend(offset.to_be_bytes());
+        }
+        assert_eq!(
+            lookup_subtables(&table, 0, 0, 9),
+            Some((2, 0, vec![24 + 256, 32 + 512]))
+        );
     }
 }
