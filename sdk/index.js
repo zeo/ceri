@@ -146,7 +146,16 @@ export function appVersion() {
   return invoke("app:version");
 }
 
-// the files URL of a path inside a folder the app granted, for img, video and fetch
-export function fileUrl(path) {
-  return invoke("files:url", { path });
+const FILES_ORIGIN = "https://files.ceri.invalid";
+
+// the URL a page loads an absolute file path from, once the app allows a folder holding it
+export function fileSrc(path) {
+  const drive = /^([A-Za-z]):[\\/]+(.*)$/s.exec(path);
+  const share = /^\\\\(.*)$/s.exec(path);
+  const parts = drive
+    ? [drive[1], ...drive[2].split(/[\\/]/)]
+    : share
+      ? ["UNC", ...share[1].split(/[\\/]/)]
+      : path.split("/");
+  return `${FILES_ORIGIN}/${parts.filter(Boolean).map(encodeURIComponent).join("/")}`;
 }

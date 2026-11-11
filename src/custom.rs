@@ -1,7 +1,7 @@
 use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
 use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
-use crate::files::FileGrants;
+use crate::files::FileScope;
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
@@ -25,7 +25,7 @@ const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 #[derive(Clone, Default)]
 pub struct AppHandle {
     control: Arc<OnceLock<WindowControl>>,
-    files: FileGrants,
+    files: FileScope,
 }
 
 impl AppHandle {
@@ -38,8 +38,8 @@ impl AppHandle {
         self.control.get()
     }
 
-    // the folders pages may read through files URLs, granted and revoked at any time
-    pub fn files(&self) -> &FileGrants {
+    // the folders pages may load files from, allowed and revoked at any time
+    pub fn files(&self) -> &FileScope {
         &self.files
     }
 
@@ -196,11 +196,7 @@ impl App {
         let capabilities = self.capabilities.grant(Grant {
             windows: vec!["*".to_string()],
             origins: vec![APP_ORIGIN.to_string()],
-            commands: vec![
-                "window:*".to_string(),
-                "app:*".to_string(),
-                "files:*".to_string(),
-            ],
+            commands: vec!["window:*".to_string(), "app:*".to_string()],
         });
         run_app(
             Bridge {
@@ -255,7 +251,7 @@ struct Bridge {
     commands: Arc<Commands>,
     capabilities: Capabilities,
     version: Option<String>,
-    files: FileGrants,
+    files: FileScope,
 }
 
 impl Bridge {
@@ -265,7 +261,6 @@ impl Bridge {
                 commands: self.commands.clone(),
                 control: control.cloned(),
                 version: self.version.clone(),
-                files: self.files.clone(),
             }),
             self.capabilities.clone(),
             window,
@@ -411,7 +406,7 @@ fn build_browser(
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
     allowed_origins: Vec<String>,
-    files: FileGrants,
+    files: FileScope,
     bridge: HostBridge,
 ) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
@@ -528,7 +523,7 @@ fn allowed_origins(arguments: &[std::ffi::OsString]) -> Result<Vec<String>, Stri
 struct PackagedAssets {
     assets: Arc<AssetOrigin>,
     allowed_origins: Vec<String>,
-    files: FileGrants,
+    files: FileScope,
 }
 
 impl ResourceProvider for PackagedAssets {
@@ -609,6 +604,16 @@ mod tests {
         assert!(!is_document_path("/styles.css"));
     }
 
+    fn files_url(path: &std::path::Path) -> AppUrl {
+        let path = path.to_str().expect("a unicode path").replace('\\', "/");
+        let path = path.replacen(':', "", 1);
+        AppUrl::parse(&format!(
+            "https://files.ceri.invalid/{}",
+            path.trim_start_matches('/')
+        ))
+        .expect("url")
+    }
+
     #[test]
     fn serves_packaged_files_and_reports_missing_ones() {
         let root = std::env::current_dir()
@@ -637,16 +642,16 @@ mod tests {
         let granted = std::env::temp_dir().join(format!("ceri-provider-{}", std::process::id()));
         std::fs::create_dir_all(&granted).expect("grant folder");
         std::fs::write(granted.join("frame.png"), b"png").expect("granted file");
-        provider.files.grant("shots", &granted).expect("grant");
+        provider.files.allow(&granted).expect("allow");
         let shot = provider
-            .provide(&AppUrl::parse("https://files.ceri.invalid/shots/frame.png").expect("url"))
+            .provide(&files_url(&granted.join("frame.png")))
             .expect("a granted file should resolve")
             .expect("a granted file should exist");
         assert_eq!(shot.mime_type(), "image/png");
         assert_eq!(shot.body(), b"png");
         assert!(
             provider
-                .provide(&AppUrl::parse("https://files.ceri.invalid/shots/none.png").expect("url"))
+                .provide(&files_url(&granted.join("none.png")))
                 .expect("a missing granted file should not fail")
                 .is_none()
         );

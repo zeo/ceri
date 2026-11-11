@@ -74,7 +74,7 @@ impl AppUrl {
 
         Ok(Self {
             files,
-            path: decode_path(raw_path)?,
+            path: decode_path(raw_path, files)?,
             query: query.to_string(),
             fragment: fragment.to_string(),
         })
@@ -135,15 +135,17 @@ impl AppUrl {
         let (raw_path, query, query_present) = target
             .split_once('?')
             .map_or((target, "", false), |(path, query)| (path, query, true));
+        // the reference is still escaped, so the base joins it escaped too
+        let base = encode_path(&self.path);
         let path = if raw_path.is_empty() {
-            self.path.clone()
+            base.to_string()
         } else if raw_path.starts_with('/') {
             raw_path.to_string()
         } else {
-            let directory = if self.path.ends_with('/') {
-                self.path.as_str()
+            let directory = if base.ends_with('/') {
+                &*base
             } else {
-                self.path.rsplit_once('/').map_or("/", |(directory, _)| {
+                base.rsplit_once('/').map_or("/", |(directory, _)| {
                     if directory.is_empty() { "/" } else { directory }
                 })
             };
@@ -155,7 +157,7 @@ impl AppUrl {
         };
         Ok(Self {
             files: self.files,
-            path: resolve_reference_path(&path)?,
+            path: resolve_reference_path(&path, self.files)?,
             query: if query_present {
                 query.to_string()
             } else if raw_path.is_empty() {
@@ -170,7 +172,7 @@ impl AppUrl {
 
 impl fmt::Display for AppUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}{}", self.origin(), self.path)?;
+        write!(formatter, "{}{}", self.origin(), encode_path(&self.path))?;
         if !self.query.is_empty() {
             write!(formatter, "?{}", self.query)?;
         }
@@ -178,6 +180,19 @@ impl fmt::Display for AppUrl {
             write!(formatter, "#{}", self.fragment)?;
         }
         Ok(())
+    }
+}
+
+// the characters a decoded path may hold that would end it or start an escape in a URL
+fn encode_path(path: &str) -> std::borrow::Cow<'_, str> {
+    match path.contains(['%', '?', '#', ':']) {
+        true => path
+            .replace('%', "%25")
+            .replace('?', "%3F")
+            .replace('#', "%23")
+            .replace(':', "%3A")
+            .into(),
+        false => path.into(),
     }
 }
 
@@ -3022,7 +3037,7 @@ fn normalize_resource_path(path: &str) -> Result<String, NavigationError> {
     if path.contains(['?', '#']) {
         return Err(NavigationError::InvalidResourcePath(path.to_string()));
     }
-    let path = decode_path(path)
+    let path = decode_path(path, false)
         .map_err(|error| NavigationError::InvalidResourcePath(format!("{path}: {error}")))?;
     Ok(if path == "/" {
         "/index.html".to_string()
@@ -3031,14 +3046,15 @@ fn normalize_resource_path(path: &str) -> Result<String, NavigationError> {
     })
 }
 
-fn decode_path(raw_path: &str) -> Result<String, NavigationError> {
-    let path = decode_path_bytes(raw_path)?;
+// a files path holds a file's own name, where an escaped colon is allowed outside windows
+fn decode_path(raw_path: &str, files: bool) -> Result<String, NavigationError> {
+    let path = decode_path_bytes(raw_path, files)?;
     validate_path(&path)?;
     Ok(path)
 }
 
-fn resolve_reference_path(raw_path: &str) -> Result<String, NavigationError> {
-    let path = decode_path_bytes(raw_path)?;
+fn resolve_reference_path(raw_path: &str, files: bool) -> Result<String, NavigationError> {
+    let path = decode_path_bytes(raw_path, files)?;
     if path == "/" {
         return Ok(path);
     }
@@ -3067,7 +3083,7 @@ fn resolve_reference_path(raw_path: &str) -> Result<String, NavigationError> {
     Ok(normalized)
 }
 
-fn decode_path_bytes(raw_path: &str) -> Result<String, NavigationError> {
+fn decode_path_bytes(raw_path: &str, files: bool) -> Result<String, NavigationError> {
     if !raw_path.starts_with('/') {
         return Err(NavigationError::InvalidUrl(raw_path.to_string()));
     }
@@ -3086,7 +3102,9 @@ fn decode_path_bytes(raw_path: &str) -> Result<String, NavigationError> {
                 .and_then(|value| hex_value(*value))
                 .ok_or(NavigationError::InvalidPercentEncoding)?;
             let value = (high << 4) | low;
-            reject_path_byte(value, true)?;
+            if !(files && value == b':') {
+                reject_path_byte(value, true)?;
+            }
             decoded.push(value);
             cursor += 3;
             continue;
@@ -7545,6 +7563,32 @@ A</div>
             document.borrow().element_text_content(status).as_deref(),
             Some("200 {\"message\":\"from bundle\"}")
         );
+    }
+
+    #[test]
+    fn urls_print_back_to_what_they_parse_from() {
+        let clip =
+            AppUrl::parse("https://files.ceri.invalid/home/ana/Clip%2019%3A42%20%2325%25.mp4")
+                .expect("a files path may hold an escaped colon");
+        assert_eq!(clip.path(), "/home/ana/Clip 19:42 #25%.mp4");
+        assert_eq!(
+            clip.to_string(),
+            "https://files.ceri.invalid/home/ana/Clip 19%3A42 %2325%25.mp4"
+        );
+        assert_eq!(AppUrl::parse(&clip.to_string()).expect("reparses"), clip);
+        let sibling = clip
+            .resolve("cover%231.png?v=2")
+            .expect("relative reference");
+        assert_eq!(sibling.path(), "/home/ana/cover#1.png");
+        assert_eq!(sibling.query(), "v=2");
+        assert!(matches!(
+            AppUrl::parse("https://app.ceri.invalid/a%3Ab"),
+            Err(NavigationError::Colon)
+        ));
+        let page = AppUrl::parse("https://app.ceri.invalid/notes/100%25%23.html").expect("url");
+        assert_eq!(page.path(), "/notes/100%#.html");
+        assert_eq!(AppUrl::parse(&page.to_string()).expect("reparses"), page);
+        assert_eq!(page.resolve("").expect("same document"), page);
     }
 
     #[test]

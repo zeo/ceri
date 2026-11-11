@@ -14,4 +14,4 @@ pub use ceri_engine::{
     WindowAction, WindowConfig, WindowControl, WindowState,
 };
 pub use custom::{App, AppHandle, run};
-pub use files::FileGrants;
+pub use files::FileScope;
