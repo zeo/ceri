@@ -361,17 +361,36 @@ fn run_live_engine_worker(
     };
     let mut last_tick = Instant::now();
     let mut announced = false;
+    let mut held = None;
     loop {
-        let command = match host.next_wake() {
-            Some(delay) => match commands.recv_timeout(Duration::from_millis(delay.max(1))) {
-                Ok(command) => Some(command),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
+        let command = match held.take() {
+            Some(command) => Some(command),
+            None => match host.next_wake() {
+                Some(delay) => match commands.recv_timeout(Duration::from_millis(delay.max(1))) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+                None => match commands.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => break,
+                },
             },
-            None => match commands.recv() {
-                Ok(command) => Some(command),
-                Err(_) => break,
-            },
+        };
+        // only the newest of a run of queued pointer moves matters, so a fast mouse cannot
+        // queue more work than one frame needs
+        let command = match command {
+            Some(mut command) if is_pointer_move(&command) => {
+                while let Ok(next) = commands.try_recv() {
+                    if !is_pointer_move(&next) {
+                        held = Some(next);
+                        break;
+                    }
+                    command = next;
+                }
+                Some(command)
+            }
+            other => other,
         };
         let elapsed = last_tick.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         last_tick += Duration::from_millis(elapsed);
@@ -402,6 +421,16 @@ fn run_live_engine_worker(
             }
         }
     }
+}
+
+fn is_pointer_move(command: &EngineWorkerCommand) -> bool {
+    matches!(
+        command,
+        EngineWorkerCommand::Input {
+            event: InputEvent::PointerMove { .. },
+            ..
+        }
+    )
 }
 
 fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineWorkerEvent> {
@@ -891,6 +920,81 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+        worker.shutdown();
+    }
+
+    #[test]
+    fn live_workers_answer_a_run_of_queued_pointer_moves_with_the_newest() {
+        use std::time::{Duration, Instant};
+
+        let mut worker = EngineWorker::spawn_live(
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            || {
+                Ok(Browser::new(bundle(
+                    r#"<main style="height: 100px"><p id="status">none</p></main><script>
+                        let moves = 0;
+                        let x = 0;
+                        // keeps the worker busy while the test queues its moves
+                        for (let i = 0; i < 300000; i++) {}
+                        document.addEventListener("pointermove", (event) => {
+                            moves += 1;
+                            x = event.clientX;
+                        });
+                        document.addEventListener("click", () => {
+                            document.getElementById("status").textContent = `moves ${moves} x ${x}`;
+                        });
+                    </script>"#,
+                )))
+            },
+            Arc::new(|| {}),
+        )
+        .expect("worker should start");
+        worker
+            .navigate("https://app.ceri.invalid/")
+            .expect("navigation should queue");
+        for x in 1..=40 {
+            worker
+                .input(InputEvent::PointerMove {
+                    x: x as f32,
+                    y: 20.0,
+                })
+                .expect("move should queue");
+        }
+        worker
+            .input(InputEvent::Click { x: 40.0, y: 20.0 })
+            .expect("click should queue");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            assert!(Instant::now() < deadline, "the click should land");
+            worker.accessibility_tree().expect("tree should queue");
+            let tree = loop {
+                if let EngineWorkerEvent::Accessibility { tree, .. } =
+                    worker.wait().expect("the worker answers")
+                {
+                    break tree;
+                }
+            };
+            fn find(node: &AccessibilityNode) -> Option<String> {
+                if node.name.starts_with("moves ") {
+                    return Some(node.name.clone());
+                }
+                node.children.iter().find_map(find)
+            }
+            if let Some(status) = tree.as_ref().and_then(find) {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let moves: u32 = status
+            .split(' ')
+            .nth(1)
+            .and_then(|count| count.parse().ok())
+            .expect("status should count moves");
+        assert!(status.ends_with(" x 40"), "the newest move wins: {status}");
+        assert!(moves < 40, "queued moves should merge: {status}");
         worker.shutdown();
     }
 
