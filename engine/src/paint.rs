@@ -176,10 +176,10 @@ impl Canvas {
             width * self.scale,
             height * self.scale,
         );
-        let left = (x.floor().max(0.0) as u32).min(self.width);
-        let top = (y.floor().max(0.0) as u32).min(self.height);
-        let right = ((x + width).ceil().max(0.0) as u32).min(self.width);
-        let bottom = ((y + height).ceil().max(0.0) as u32).min(self.height);
+        // edges snap to the nearest device pixel, as browsers snap boxes, so a 1px border at a
+        // fractional offset stays one pixel and neighbouring boxes neither overlap nor gap
+        let (left, right) = snap_span(x, width, self.width);
+        let (top, bottom) = snap_span(y, height, self.height);
         if right <= left || bottom <= top {
             return;
         }
@@ -1176,6 +1176,16 @@ fn border_pixel(style: BorderStyle, color: Color, side: usize, spot: BorderSpot)
         BorderStyle::Ridge => (if lit == inner_half { color } else { shade }, 1.0),
         _ => (color, 1.0),
     }
+}
+
+// the device pixels a span covers once its edges snap, never thinner than one pixel
+fn snap_span(start: f32, length: f32, limit: u32) -> (u32, u32) {
+    let first = start.round();
+    let last = (start + length).round().max(first + 1.0);
+    (
+        (first.max(0.0) as u32).min(limit),
+        (last.max(0.0) as u32).min(limit),
+    )
 }
 
 fn paint_border(
@@ -3040,6 +3050,14 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rect_edges_snap_to_whole_device_pixels() {
+        assert_eq!(snap_span(538.7, 1.0, 1000), (539, 540));
+        assert_eq!(snap_span(10.2, 0.3, 1000), (10, 11));
+        assert_eq!(snap_span(0.5, 10.0, 1000).1, snap_span(10.5, 5.0, 1000).0);
+        assert_eq!(snap_span(-4.0, 10.0, 3), (0, 3));
+    }
 
     // node ids for hand-built layout trees, taken from one fixed document shape
     fn node(path: &[usize]) -> NodeId {
