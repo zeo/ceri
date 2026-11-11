@@ -1755,6 +1755,37 @@ impl Browser {
         self.layout(viewport).ok()?.thumb_drag_at(x, y)
     }
 
+    // whether a press at a point lands in an app-region drag area, which moves the window
+    // instead of reaching the page
+    pub fn drag_region_at(&self, viewport: Size, x: f32, y: f32) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let Some(node) = self
+            .layout(viewport)
+            .ok()
+            .and_then(|layout| layout.hit_test(x, y))
+        else {
+            return false;
+        };
+        let document = page.document.borrow();
+        let Some(element) = std::iter::once(node)
+            .chain(document.ancestors(node))
+            .find(|&node| document.element(node).is_some())
+        else {
+            return false;
+        };
+        let mut state = page.runtime.style_state(self.hovered_node);
+        state.viewport_width = viewport.width;
+        state.viewport_height = viewport.height;
+        state.color_scheme = self.preferences.color_scheme;
+        state.reduced_motion = self.preferences.reduced_motion;
+        page.stylesheet
+            .computed_style(&document, element, &state)
+            .is_some_and(|(style, _)| style.drag_region)
+    }
+
     // moves a scrollbar thumb so the pointer stays grabbed at its press offset
     pub fn drag_thumb(
         &mut self,

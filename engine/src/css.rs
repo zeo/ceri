@@ -851,6 +851,7 @@ pub(crate) struct InheritedText {
     pub(crate) family: crate::font::FontStack,
     pub(crate) visibility: Visibility,
     pub(crate) cursor: Cursor,
+    pub(crate) drag_region: bool,
     pub(crate) pointer_events: bool,
     pub(crate) selectable: bool,
     pub(crate) list_style_type: ListStyleType,
@@ -883,6 +884,7 @@ impl Default for InheritedText {
             family: crate::font::FontStack::default(),
             visibility: Visibility::Visible,
             cursor: Cursor::Auto,
+            drag_region: false,
             pointer_events: true,
             selectable: true,
             list_style_type: ListStyleType::Disc,
@@ -914,6 +916,7 @@ pub(crate) fn inherited_text(style: &Style) -> InheritedText {
         family: style.font_family,
         visibility: style.visibility,
         cursor: style.cursor,
+        drag_region: style.drag_region,
         pointer_events: style.pointer_events,
         selectable: style.selectable,
         list_style_type: style.list_style_type,
@@ -1302,6 +1305,9 @@ pub(crate) struct Style {
     pub overflow_y: Overflow,
     pub visibility: Visibility,
     pub cursor: Cursor,
+    // app-region drag, carried down to descendants until one says no-drag, so a press on the
+    // innermost element answers for the regions around it
+    pub(crate) drag_region: bool,
     pub(crate) svg: crate::svg::Presentation,
     // pointer-events other than none, and user-select other than none
     pub(crate) pointer_events: bool,
@@ -1482,6 +1488,7 @@ impl Style {
             overflow_y: Overflow::Visible,
             visibility: parent_text.visibility,
             cursor: parent_text.cursor,
+            drag_region: parent_text.drag_region,
             svg: parent_text.svg,
             pointer_events: parent_text.pointer_events,
             selectable: parent_text.selectable,
@@ -4714,6 +4721,7 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "text-shadow" => style.text_decoration.shadow = from.text_decoration.shadow,
         "visibility" => style.visibility = from.visibility,
         "cursor" => style.cursor = from.cursor,
+        "app-region" | "-webkit-app-region" => style.drag_region = from.drag_region,
         "pointer-events" => style.pointer_events = from.pointer_events,
         "user-select" | "-webkit-user-select" => style.selectable = from.selectable,
         "list-style" => {
@@ -4842,7 +4850,9 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
 
 // the properties this engine applies, for @supports
 const SUPPORTED_PROPERTIES: &[&str] = &[
+    "-webkit-app-region",
     "accent-color",
+    "app-region",
     "fill",
     "fill-opacity",
     "fill-rule",
@@ -5414,6 +5424,11 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "cursor" => style.cursor = Cursor::parse(value).unwrap_or(style.cursor),
+        "app-region" | "-webkit-app-region" => match value.trim().to_ascii_lowercase().as_str() {
+            "drag" => style.drag_region = true,
+            "no-drag" => style.drag_region = false,
+            _ => {}
+        },
         "pointer-events" => style.pointer_events = !value.trim().eq_ignore_ascii_case("none"),
         "user-select" | "-webkit-user-select" => {
             style.selectable = !value.trim().eq_ignore_ascii_case("none");

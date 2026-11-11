@@ -1,7 +1,7 @@
 use crate::bridge::Waker;
 use crate::css::ColorScheme;
 use crate::host::{
-    EngineWorker, EngineWorkerEvent, Frame, InputEvent, KeyModifiers, PointerButton,
+    EngineWorker, EngineWorkerEvent, Frame, InputEvent, KeyModifiers, PointerButton, RegionPress,
 };
 use crate::layout::Size;
 use crate::navigation::{APP_ORIGIN, Browser, UserPreferences};
@@ -637,6 +637,9 @@ impl AppWindow {
                         if let Some(cursor) = result.cursor {
                             self.apply_cursor(cursor);
                         }
+                        if let Some(region) = result.region {
+                            self.answer_region(region);
+                        }
                         request_redraw = true;
                     }
                     Err(error) => return self.recover(&error.to_string()),
@@ -680,6 +683,20 @@ impl AppWindow {
             window.set_cursor(icon);
         }
         self.applied_cursor = Some(cursor);
+    }
+
+    fn answer_region(&self, region: RegionPress) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        match region {
+            // the press may already be over when the engine answers, and the platform then ends
+            // the move at once
+            RegionPress::Move => {
+                let _ = window.drag_window();
+            }
+            RegionPress::ToggleMaximize => window.set_maximized(!window.is_maximized()),
+        }
     }
 
     fn apply_title(&mut self, frame: &Frame) {

@@ -93,6 +93,14 @@ pub struct InputResult {
     pub frame_requested: bool,
     // the pointer shape after a pointer move, for the host to show
     pub cursor: Option<crate::css::Cursor>,
+    // a press on an app-region drag area, which the window answers instead of the page
+    pub region: Option<RegionPress>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionPress {
+    Move,
+    ToggleMaximize,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +123,8 @@ pub struct EngineHost {
     // milliseconds of host clock, used to count rapid presses as one series
     clock: u64,
     last_press: Option<Press>,
+    // the press in progress went to a drag region, so its release and click stay out of the page
+    region_press: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -487,6 +497,7 @@ impl EngineHost {
             dirty: true,
             clock: 0,
             last_press: None,
+            region_press: false,
         }
     }
 
@@ -609,7 +620,27 @@ impl EngineHost {
                     ..InputResult::default()
                 }
             }
+            InputEvent::PointerDown { x, y, button }
+                if button == PointerButton::Primary
+                    && self.browser.drag_region_at(self.viewport, x, y) =>
+            {
+                self.region_press = true;
+                let region = if self.count_press(x, y) >= 2 {
+                    self.last_press = None;
+                    RegionPress::ToggleMaximize
+                } else {
+                    RegionPress::Move
+                };
+                InputResult {
+                    region: Some(region),
+                    ..InputResult::default()
+                }
+            }
+            InputEvent::PointerUp { .. } | InputEvent::Click { .. } if self.region_press => {
+                InputResult::default()
+            }
             InputEvent::PointerDown { x, y, button } => {
+                self.region_press = false;
                 self.browser.set_pointer_button(button_index(button), true);
                 let dispatched = self
                     .browser
@@ -1195,6 +1226,73 @@ mod tests {
             document.borrow().element_text_content(status).as_deref(),
             Some("clicked")
         );
+    }
+
+    #[test]
+    fn host_answers_presses_on_drag_regions_instead_of_the_page() {
+        let browser = Browser::new(bundle(
+            r#"<style>
+                body { margin: 0; }
+                #bar { app-region: drag; height: 20px; }
+                #close { -webkit-app-region: no-drag; width: 20px; height: 20px; margin-left: auto; }
+            </style>
+            <div id="bar"><div id="close"></div></div>
+            <p id="status">idle</p>
+            <script>
+                const status = document.getElementById("status");
+                document.getElementById("bar").addEventListener("pointerdown", () => {
+                    status.textContent = "bar";
+                });
+                document.getElementById("close").addEventListener("click", () => {
+                    status.textContent = "close";
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("drag region page should load");
+        let status = |host: &EngineHost| {
+            let document = host.browser().document().expect("document should exist");
+            let document = document.borrow();
+            let status = document
+                .find_element_by_id("status")
+                .expect("status should exist");
+            document.element_text_content(status)
+        };
+        let press = |host: &mut EngineHost, x: f32| {
+            host.input(InputEvent::PointerDown {
+                x,
+                y: 10.0,
+                button: PointerButton::Primary,
+            })
+            .expect("press should be accepted")
+            .region
+        };
+        let release = |host: &mut EngineHost, x: f32| {
+            host.input(InputEvent::PointerUp {
+                x,
+                y: 10.0,
+                button: PointerButton::Primary,
+            })
+            .expect("release should be accepted");
+            host.input(InputEvent::Click { x, y: 10.0 })
+                .expect("click should be accepted");
+        };
+
+        assert_eq!(press(&mut host, 10.0), Some(RegionPress::Move));
+        release(&mut host, 10.0);
+        assert_eq!(status(&host).as_deref(), Some("idle"));
+        assert_eq!(press(&mut host, 10.0), Some(RegionPress::ToggleMaximize));
+        release(&mut host, 10.0);
+        assert_eq!(press(&mut host, 110.0), None);
+        release(&mut host, 110.0);
+        assert_eq!(status(&host).as_deref(), Some("close"));
     }
 
     #[test]
