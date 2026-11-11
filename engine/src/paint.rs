@@ -7,8 +7,9 @@ use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
     BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
-    ResolvedEdges, SQUARE_CORNERS, TextRun, overflow_clip_rect, paint_order, scrollbar_metrics,
-    stacking_context_entries, translate_rect, visual_offset_for, visual_rect_for,
+    ResolvedEdges, SQUARE_CORNERS, StackingContextEntry, TextRun, overflow_clip_rect, paint_order,
+    scrollbar_metrics, stacking_context_entries, translate_rect, visual_offset_for,
+    visual_rect_for,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -54,6 +55,13 @@ enum Mask {
         even_odd: bool,
         points: Vec<(f32, f32)>,
     },
+    // a mask-image's alpha over device rows from its corner; outside it nothing shows
+    Alpha {
+        left: u32,
+        top: u32,
+        width: u32,
+        alpha: Vec<u8>,
+    },
 }
 
 fn mask_coverage(masks: &[Mask], point: (f32, f32)) -> f32 {
@@ -66,6 +74,20 @@ impl Mask {
             Self::Rounded(shape) => shape.coverage(point),
             Self::Polygon { even_odd, points } => {
                 crate::clip_path::polygon_coverage(points, *even_odd, point)
+            }
+            Self::Alpha {
+                left,
+                top,
+                width,
+                alpha,
+            } => {
+                let (x, y) = (point.0 - *left as f32, point.1 - *top as f32);
+                if x < 0.0 || y < 0.0 || x >= *width as f32 {
+                    return 0.0;
+                }
+                alpha
+                    .get(y as usize * *width as usize + x as usize)
+                    .map_or(0.0, |&alpha| f32::from(alpha) / 255.0)
             }
         }
     }
@@ -744,6 +766,42 @@ impl Canvas {
                 });
             }
         }
+    }
+
+    // the mask layers paint like backgrounds placed from the border box, and their alpha
+    // becomes coverage for the whole subtree
+    fn push_image_mask(&mut self, layout_box: &LayoutBox, images: &[ImageLayer], rect: Rect) {
+        let mask = match DeviceBounds::of(self, rect, None) {
+            Some(bounds) => {
+                let outer = Shape::from_rect(rect, layout_box.radii);
+                let mut layer = self.layer(bounds);
+                paint_layers(
+                    &mut layer,
+                    &layout_box.masks,
+                    layout_box,
+                    images,
+                    outer,
+                    outer,
+                    1.0,
+                    None,
+                );
+                let alpha = layer.pixels.chunks_exact(4).map(|pixel| pixel[3]).collect();
+                recycle_layer(layer.pixels);
+                Mask::Alpha {
+                    left: bounds.left,
+                    top: bounds.top,
+                    width: bounds.right - bounds.left,
+                    alpha,
+                }
+            }
+            None => Mask::Alpha {
+                left: 0,
+                top: 0,
+                width: 0,
+                alpha: Vec::new(),
+            },
+        };
+        self.masks.push(mask);
     }
 
     fn pop_mask(&mut self) {
@@ -2104,6 +2162,9 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
         }
         canvas.push_clip_path(region, (rect.x, rect.y));
     }
+    if !layout_box.masks.is_empty() {
+        canvas.push_image_mask(layout_box, images, rect);
+    }
     let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
     let mask = overflow_mask(layout_box, rect);
     if let Some(mask) = mask {
@@ -2112,15 +2173,7 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
-        paint_context(
-            canvas,
-            entry.layout,
-            commands,
-            images,
-            prose_selections,
-            entry.clip,
-            entry.ancestor_offset,
-        );
+        paint_context_entry(canvas, entry, commands, images, prose_selections);
     }
     paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
     paint_box_text(
@@ -2141,22 +2194,46 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     );
     paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
     for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
-        paint_context(
-            canvas,
-            entry.layout,
-            commands,
-            images,
-            prose_selections,
-            entry.clip,
-            entry.ancestor_offset,
-        );
+        paint_context_entry(canvas, entry, commands, images, prose_selections);
     }
     if mask.is_some() {
         canvas.pop_mask();
     }
     paint_scrollbars(canvas, layout_box, offset, clip);
     paint_outline(canvas, layout_box, rect, opacity, clip);
+    if !layout_box.masks.is_empty() {
+        canvas.pop_mask();
+    }
     if layout_box.clip_path.is_some() {
+        canvas.pop_mask();
+    }
+}
+
+fn paint_context_entry(
+    canvas: &mut Canvas,
+    entry: &StackingContextEntry<'_>,
+    commands: &[CanvasCommand],
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+) {
+    let masks = entry
+        .clippers
+        .iter()
+        .filter_map(|&(clipper, offset)| overflow_mask(clipper, visual_rect_for(clipper, offset)))
+        .collect::<Vec<_>>();
+    for &mask in &masks {
+        canvas.push_mask(mask);
+    }
+    paint_context(
+        canvas,
+        entry.layout,
+        commands,
+        images,
+        prose_selections,
+        entry.clip,
+        entry.ancestor_offset,
+    );
+    for _ in &masks {
         canvas.pop_mask();
     }
 }
@@ -2324,20 +2401,44 @@ fn paint_backgrounds(
         let color = layout_box.background.scale_alpha(opacity);
         canvas.fill_shape(outer, &Paint::Solid(color), clip);
     }
+    paint_layers(
+        canvas,
+        &layout_box.backgrounds,
+        layout_box,
+        images,
+        surface,
+        outer,
+        opacity,
+        clip,
+    );
+}
+
+// layers take their place from `origin` and paint across `painted`, the last lowest
+#[allow(clippy::too_many_arguments)]
+fn paint_layers(
+    canvas: &mut Canvas,
+    layers: &[BackgroundLayer],
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    origin: Shape,
+    painted: Shape,
+    opacity: f32,
+    clip: Option<Rect>,
+) {
     let area = Rect {
-        x: surface.x,
-        y: surface.y,
-        width: surface.width,
-        height: surface.height,
+        x: origin.x,
+        y: origin.y,
+        width: origin.width,
+        height: origin.height,
     };
     let font_size = layout_box.font_size;
-    for layer in layout_box.backgrounds.iter().rev() {
+    for layer in layers.iter().rev() {
         let repeat = (layer.repeat.x, layer.repeat.y);
         match &layer.image {
             LayerImage::Gradient(gradient) => {
                 let tile = background_placement(area, None, layer, font_size);
                 if let Some(ramp) = Ramp::new(canvas, gradient, tile, repeat, font_size, opacity) {
-                    canvas.fill_shape(outer, &Paint::Ramp(ramp), clip);
+                    canvas.fill_shape(painted, &Paint::Ramp(ramp), clip);
                 }
             }
             LayerImage::Url(source) => {
@@ -2352,7 +2453,7 @@ fn paint_backgrounds(
                     ImageDraw {
                         image: &found.image,
                         placement: background_placement(area, Some(natural), layer, font_size),
-                        area: surface,
+                        area: origin,
                         clip,
                         opacity,
                         repeat,
@@ -3536,6 +3637,7 @@ mod tests {
                 },
                 background: Color::opaque(245, 248, 250),
                 backgrounds: Vec::new(),
+                masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -3669,6 +3771,85 @@ mod tests {
             [255, 255, 255],
             "past the closest side is clear"
         );
+    }
+
+    #[test]
+    fn mask_images_scale_the_box_and_its_subtree_by_their_alpha() {
+        let document = Document::parse_markup(
+            "<html><body><div id='a'><p></p></div><div id='b'></div></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #ffffff } div { width: 40px; height: 40px; background: #ff0000 }",
+            "#a { mask-image: linear-gradient(to right, transparent 50%, #000 50%) }",
+            "p { margin: 0; width: 80px; height: 10px; background: #0000ff }",
+            "#b { -webkit-mask: linear-gradient(#000, #000) 0 0 / 10px 10px no-repeat }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        ));
+        let pixel = |x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            <[u8; 3]>::try_from(&canvas.rgba_pixels()[index..index + 3]).expect("a pixel")
+        };
+        assert_eq!(
+            pixel(10, 20),
+            [255, 255, 255],
+            "the transparent half hides the box"
+        );
+        assert_eq!(pixel(30, 20), [255, 0, 0]);
+        assert_eq!(pixel(10, 5), [255, 255, 255], "the mask covers descendants");
+        assert_eq!(pixel(30, 5), [0, 0, 255]);
+        assert_eq!(
+            pixel(60, 5),
+            [255, 255, 255],
+            "nothing shows past the border box"
+        );
+        assert_eq!(pixel(5, 45), [255, 0, 0]);
+        assert_eq!(
+            pixel(15, 45),
+            [255, 255, 255],
+            "an unrepeated tile masks the rest"
+        );
+        assert_eq!(pixel(5, 55), [255, 255, 255]);
+    }
+
+    #[test]
+    fn rounded_overflow_cuts_contexts_painted_by_a_stacking_ancestor() {
+        let document = Document::parse_markup(
+            "<html><body><div id='frame'><div id='faded'></div></div></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #ffffff }",
+            "#frame { position: relative; width: 40px; height: 40px; border-radius: 20px; overflow: hidden }",
+            "#faded { width: 40px; height: 40px; background: #000000; opacity: 0.5 }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        ));
+        let pixel = |x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            <[u8; 3]>::try_from(&canvas.rgba_pixels()[index..index + 3]).expect("a pixel")
+        };
+        assert_eq!(
+            pixel(1, 1),
+            [255, 255, 255],
+            "the frame's rounded corner cuts the fade"
+        );
+        assert!((120..136).contains(&pixel(20, 20)[0]));
     }
 
     #[test]
@@ -3911,6 +4092,7 @@ mod tests {
                 },
                 background: Color::opaque(10, 20, 30),
                 backgrounds: Vec::new(),
+                masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -4026,6 +4208,7 @@ mod tests {
                 },
                 background: Color::opaque(10, 20, 30),
                 backgrounds: Vec::new(),
+                masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -4134,6 +4317,7 @@ mod tests {
                 },
                 background: Color::opaque(245, 248, 250),
                 backgrounds: Vec::new(),
+                masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -4160,6 +4344,7 @@ mod tests {
                         },
                         background: Color::transparent(),
                         backgrounds: Vec::new(),
+                        masks: Vec::new(),
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,
@@ -4210,6 +4395,7 @@ mod tests {
                         },
                         background: Color::opaque(0, 0, 255),
                         backgrounds: Vec::new(),
+                        masks: Vec::new(),
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,

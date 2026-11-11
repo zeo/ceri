@@ -1345,6 +1345,7 @@ pub(crate) struct Style {
     pub border_radius: CornerLengths,
     pub opacity: f32,
     pub(crate) backgrounds: Option<LayerList>,
+    pub(crate) masks: Option<LayerList>,
     pub shadows: Option<ShadowList>,
     // width over height, from aspect-ratio or a replaced element's natural size
     pub aspect_ratio: Option<f32>,
@@ -1364,6 +1365,10 @@ pub(crate) struct Style {
 impl Style {
     pub(crate) fn layers(&self) -> Vec<BackgroundLayer> {
         self.backgrounds.map(LayerList::layers).unwrap_or_default()
+    }
+
+    pub(crate) fn mask_layers(&self) -> Vec<BackgroundLayer> {
+        self.masks.map(LayerList::layers).unwrap_or_default()
     }
 
     pub(crate) fn has_transform(&self) -> bool {
@@ -1507,6 +1512,7 @@ impl Style {
             border_radius: SQUARE_CORNERS,
             opacity: 1.0,
             backgrounds: None,
+            masks: None,
             shadows: None,
             aspect_ratio: None,
             object_fit: ObjectFit::Fill,
@@ -4534,6 +4540,11 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "-webkit-text-stroke",
     "-webkit-text-stroke-width",
     "-webkit-text-stroke-color",
+    "-webkit-mask",
+    "-webkit-mask-image",
+    "-webkit-mask-position",
+    "-webkit-mask-repeat",
+    "-webkit-mask-size",
     "text-overflow",
     "font",
     "font-style",
@@ -4649,6 +4660,11 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "margin-left",
     "margin-right",
     "margin-top",
+    "mask",
+    "mask-image",
+    "mask-position",
+    "mask-repeat",
+    "mask-size",
     "max-height",
     "max-width",
     "min-height",
@@ -5252,7 +5268,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             }
         }
         "background" => {
-            if let Some((layers, color)) = parse_background_shorthand(value) {
+            if let Some((layers, color)) = parse_layer_shorthand(value, false) {
                 style.backgrounds = Some(intern_layers(None, property, value, layers));
                 style.background = color;
             }
@@ -5260,6 +5276,23 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "background-image" | "background-size" | "background-position" | "background-repeat" => {
             if let Some(list) = edit_layers(style.backgrounds, property, value) {
                 style.backgrounds = Some(list);
+            }
+        }
+        "mask" | "-webkit-mask" => {
+            if let Some((layers, _)) = parse_layer_shorthand(value, true) {
+                style.masks = Some(intern_layers(None, property, value, layers));
+            }
+        }
+        "mask-image"
+        | "mask-size"
+        | "mask-position"
+        | "mask-repeat"
+        | "-webkit-mask-image"
+        | "-webkit-mask-size"
+        | "-webkit-mask-position"
+        | "-webkit-mask-repeat" => {
+            if let Some(list) = edit_layers(style.masks, property, value) {
+                style.masks = Some(list);
             }
         }
         "aspect-ratio" => {
@@ -6495,7 +6528,8 @@ fn parse_url(word: &str) -> Option<&str> {
 }
 
 // every layer of the shorthand resets all four lists; only the last may carry the color
-fn parse_background_shorthand(value: &str) -> Option<(Layers, Color)> {
+// a mask takes no color, and its mode and composite words are the alpha and add it draws with
+fn parse_layer_shorthand(value: &str, mask: bool) -> Option<(Layers, Color)> {
     let mut layers = Layers::default();
     let mut background = Color::transparent();
     let parts = split_top_level(value);
@@ -6543,13 +6577,16 @@ fn parse_background_shorthand(value: &str) -> Option<(Layers, Color)> {
                 "repeat" | "no-repeat" | "repeat-x" | "repeat-y"
             ) {
                 repeat.push(word);
-            } else if index + 1 == parts.len()
+            } else if !mask
+                && index + 1 == parts.len()
                 && let Some(color) = parse_color(word)
             {
                 background = color;
             } else if !matches!(
-                lower.as_str(),
-                "scroll" | "fixed" | "local" | "border-box" | "padding-box" | "content-box"
+                (mask, lower.as_str()),
+                (_, "border-box" | "padding-box" | "content-box")
+                    | (false, "scroll" | "fixed" | "local")
+                    | (true, "alpha" | "match-source" | "add")
             ) {
                 positions.push(word);
             }
@@ -7159,6 +7196,9 @@ mod tests {
             ".gloss { background: radial-gradient(ellipse 95% 100% at 50% 0%, #000 50%, transparent 82%), url(x.png) center; }",
             ".cleared { background-color: red; background: none; }",
             ".single { background: linear-gradient(red); }",
+            ".masked { mask: url(x.png) center / contain no-repeat alpha, linear-gradient(#000, transparent) add; }",
+            ".tinted { mask: linear-gradient(red, blue) red; }",
+            ".prefixed { -webkit-mask-image: linear-gradient(#000, transparent); -webkit-mask-size: 4px; }",
         ))
         .expect("stylesheet should parse");
         let style = |class: &str| {
@@ -7226,6 +7266,23 @@ mod tests {
         assert!(
             style("single").layers().is_empty(),
             "a gradient with one stop is invalid"
+        );
+
+        let masked = style("masked");
+        assert!(masked.layers().is_empty(), "a mask is not a background");
+        let masked = masked.mask_layers();
+        assert_eq!(masked.len(), 2);
+        assert!(matches!(masked[0].image, LayerImage::Url(_)));
+        assert_eq!(masked[0].size, BackgroundSize::Contain);
+        assert_eq!(masked[0].repeat, BackgroundRepeat { x: false, y: false });
+        assert!(
+            style("tinted").mask_layers().is_empty(),
+            "a mask takes no color"
+        );
+        let prefixed = style("prefixed").mask_layers();
+        assert_eq!(
+            prefixed[0].size,
+            BackgroundSize::Explicit(Length::px(4.0), Length::Auto)
         );
     }
 

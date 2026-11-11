@@ -118,6 +118,8 @@ pub struct LayoutBox {
     pub background: Color,
     // first layer on top
     pub(crate) backgrounds: Vec<crate::css::BackgroundLayer>,
+    // the mask-image layers, whose alpha scales everything the box and its subtree paint
+    pub(crate) masks: Vec<crate::css::BackgroundLayer>,
     pub(crate) object_fit: crate::css::ObjectFit,
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<crate::transform::Matrix>,
@@ -904,6 +906,7 @@ pub fn layout_with_state(
         },
         background: Color::transparent(),
         backgrounds: Vec::new(),
+        masks: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
@@ -1825,6 +1828,9 @@ fn hit_test_non_context(
 pub(crate) struct StackingContextEntry<'a> {
     pub(crate) layout: &'a LayoutBox,
     pub(crate) clip: Option<Rect>,
+    // clipping boxes between the context and its stacking ancestor, with their ancestor
+    // offsets, so their rounded corners still cut the context
+    pub(crate) clippers: Vec<(&'a LayoutBox, (f32, f32))>,
     pub(crate) ancestor_offset: (f32, f32),
     pub(crate) z_index: i32,
     pub(crate) order: usize,
@@ -1837,7 +1843,15 @@ pub(crate) fn stacking_context_entries(
 ) -> Vec<StackingContextEntry<'_>> {
     let mut entries = Vec::new();
     let mut order = 0;
-    collect_stacking_contexts(layout, clip, ancestor_offset, &mut order, &mut entries);
+    let mut clippers = Vec::new();
+    collect_stacking_contexts(
+        layout,
+        clip,
+        ancestor_offset,
+        &mut order,
+        &mut clippers,
+        &mut entries,
+    );
     entries
 }
 
@@ -1846,6 +1860,7 @@ fn collect_stacking_contexts<'a>(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
     order: &mut usize,
+    clippers: &mut Vec<(&'a LayoutBox, (f32, f32))>,
     entries: &mut Vec<StackingContextEntry<'a>>,
 ) {
     let visual_offset = visual_offset_for(layout, ancestor_offset);
@@ -1858,12 +1873,20 @@ fn collect_stacking_contexts<'a>(
             entries.push(StackingContextEntry {
                 layout: child,
                 clip: child_clip,
+                clippers: clippers.clone(),
                 ancestor_offset: visual_offset,
                 z_index: child.z_index,
                 order: child_order,
             });
         } else {
-            collect_stacking_contexts(child, child_clip, visual_offset, order, entries);
+            let clips = child.overflow.clips();
+            if clips {
+                clippers.push((child, visual_offset));
+            }
+            collect_stacking_contexts(child, child_clip, visual_offset, order, clippers, entries);
+            if clips {
+                clippers.pop();
+            }
         }
     }
 }
@@ -2805,6 +2828,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         rect,
         background: style.background,
         backgrounds: style.layers(),
+        masks: style.mask_layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -2984,6 +3008,7 @@ fn anonymous_box(
         rect,
         background: Color::transparent(),
         backgrounds: Vec::new(),
+        masks: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
@@ -3894,6 +3919,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         rect,
         background: style.background,
         backgrounds: style.layers(),
+        masks: style.mask_layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -4372,6 +4398,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         rect,
         background: style.background,
         backgrounds: style.layers(),
+        masks: style.mask_layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -4996,6 +5023,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         section.tag = subject.name().to_string();
         section.background = section_style.background;
         section.backgrounds = section_style.layers();
+        section.masks = section_style.mask_layers();
         section.visible = section_style.visibility == Visibility::Visible;
         section.pointer_events = section_style.pointer_events;
         section.selectable = section_style.selectable;
@@ -5091,6 +5119,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         rect,
         background: style.background,
         backgrounds: style.layers(),
+        masks: style.mask_layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -6265,6 +6294,7 @@ fn creates_stacking_context(style: Style) -> bool {
     style.has_transform()
         || style.perspective.is_some()
         || style.clip_path.is_some()
+        || style.masks.is_some_and(|masks| !masks.layers().is_empty())
         || matches!(style.position, Position::Fixed | Position::Sticky)
         || (style.position != Position::Static && style.z_index.is_some())
 }

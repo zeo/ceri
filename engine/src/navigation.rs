@@ -2888,12 +2888,12 @@ fn collect_motion_candidates(
         .collect()
 }
 
-// image elements and boxes with background images, in tree order
+// image elements and boxes with background or mask images, in tree order
 fn collect_image_sources(
     layout: &crate::layout::LayoutBox,
     sources: &mut Vec<(NodeId, Option<crate::image::ImageSource>)>,
 ) {
-    for layer in &layout.backgrounds {
+    for layer in layout.backgrounds.iter().chain(&layout.masks) {
         if let crate::css::LayerImage::Url(source) = layer.image {
             sources.push((layout.node, Some(source)));
         }
