@@ -146,8 +146,10 @@ Text fields behave like native fields: a pointer press places the caret, a drag 
 
 Page text selects the same way outside form fields. A drag can cross paragraphs and inline elements, a double click takes a word, a triple click takes the block, and a drag after a double click grows by whole words. Shift with an arrow, Home or End extends the selection by character, word or line, and Ctrl or Cmd with A selects every rendered line. Copy writes the text as it is drawn, with a line break between blocks, so `<script>` and `<style>` contents never reach the clipboard.
 
+A primary press that moves 4 CSS pixels (3 on macOS) on an element whose `draggable` is true, which by default an image or a link is, fires a cancelable `dragstart` `DragEvent` at that element with the press position, as Blink does. Its `dataTransfer` is still `null`, and nothing is dragged when the page leaves it uncanceled. An app that runs the drag itself, such as an OLE drag of files on Windows, calls it from `WindowControl::run_on_loop`, which runs a task on the thread that owns the native windows.
+
 Scrollbars behave like native scrollbars: the wheel scrolls from anywhere over the gutter, and pressing the thumb drags it with the pointer while it stays grabbed at its press offset.
 
-The window takes its caption from `document.title`, its icon from the packaged favicon, and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document.
+The window takes its caption from `document.title`, its icon from the packaged favicon (or the PNG or SVG an app passes to `App::icon`), and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document.
 
 Not covered yet: media playback, WebGL and other GPU APIs, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, multi-process renderer isolation with a sandbox, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.

@@ -53,19 +53,26 @@ impl AppHandle {
     }
 
     // an event for every window's listeners
-    pub fn emit(&self, event: &str, payload: &impl Serialize) {
+    pub fn emit(&self, event: &str, payload: impl Serialize) {
         self.send(None, event, payload);
     }
 
-    pub fn emit_to(&self, window: &str, event: &str, payload: &impl Serialize) {
+    pub fn emit_to(&self, window: &str, event: &str, payload: impl Serialize) {
         self.send(Some(window), event, payload);
     }
 
-    fn send(&self, target: Option<&str>, event: &str, payload: &impl Serialize) {
+    // closes every window without asking and ends the loop, once it runs
+    pub fn exit(&self) {
+        if let Some(control) = self.windows() {
+            control.exit();
+        }
+    }
+
+    fn send(&self, target: Option<&str>, event: &str, payload: impl Serialize) {
         let Some(control) = self.windows() else {
             return;
         };
-        match serde_json::to_string(payload) {
+        match serde_json::to_string(&payload) {
             Ok(payload) => control.emit(target, event, &payload),
             Err(error) => eprintln!("ceri: the {event} event is not JSON: {error}"),
         }
@@ -85,6 +92,7 @@ pub struct App {
     tray: Option<TrayRequest>,
     single_instance: Option<LaunchRequest>,
     assets: Option<EmbeddedAssets>,
+    icon: Option<Vec<u8>>,
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
@@ -110,6 +118,12 @@ impl App {
     // names the app's own profile folder, as a reverse domain such as com.example.notes
     pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
+        self
+    }
+
+    // a PNG or SVG for every window and the tray, in place of the pages' favicon
+    pub fn icon(mut self, image: impl Into<Vec<u8>>) -> Self {
+        self.icon = Some(image.into());
         self
     }
 
@@ -253,6 +267,7 @@ impl App {
                 version: self.version,
                 files: self.handle.files.clone(),
                 embedded: self.assets,
+                icon: self.icon,
             },
             &identifier,
             self.windows,
@@ -305,6 +320,7 @@ struct Bridge {
     files: FileScope,
     // the pages compiled into the app, served unless a folder is named at launch
     embedded: Option<EmbeddedAssets>,
+    icon: Option<Vec<u8>>,
 }
 
 impl Bridge {
@@ -344,7 +360,10 @@ fn run_app(
     let storage = profile.join("storage");
     let allowed = allowed_origins(&arguments)?;
     let assets = launch.assets.clone();
-    let icon_source = app_icon_source(launch.assets.as_ref());
+    let icon_source = bridge
+        .icon
+        .clone()
+        .or_else(|| app_icon_source(launch.assets.as_ref()));
     let icon = icon_source
         .as_deref()
         .and_then(|source| ceri_engine::rasterize_icon(source, 64));

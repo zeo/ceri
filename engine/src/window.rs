@@ -327,6 +327,7 @@ enum Request {
         name: String,
         payload: String,
     },
+    Run(Box<dyn FnOnce() + Send>),
     Exit,
 }
 
@@ -360,6 +361,12 @@ impl WindowControl {
             name: name.to_string(),
             payload: payload.to_string(),
         });
+    }
+
+    // runs a task on the loop's thread, which owns the native windows, for platform calls that
+    // have to come from it, such as an OLE drag on Windows
+    pub fn run_on_loop(&self, task: impl FnOnce() + Send + 'static) {
+        let _ = self.proxy.send_event(Request::Run(Box::new(task)));
     }
 
     // closes every window without asking and ends the loop
@@ -1446,6 +1453,7 @@ where
                     }
                 }
             }
+            Request::Run(task) => task(),
             Request::Exit => {
                 for window in self.windows.values_mut() {
                     window.remember_geometry();
