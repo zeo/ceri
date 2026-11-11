@@ -109,7 +109,7 @@ mod platform {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
-    use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
+    use windows::Win32::Foundation::{ERROR_NO_DATA, ERROR_PIPE_CONNECTED, HANDLE};
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND, SECURITY_ANONYMOUS,
     };
@@ -157,8 +157,10 @@ mod platform {
                 loop {
                     // SAFETY: the pipe handle stays open for the life of the process
                     let connected = unsafe { ConnectNamedPipe(pipe, None) };
+                    // a launch that wrote and closed before this call still left its bytes to read
                     if let Err(error) = connected
                         && error.code() != ERROR_PIPE_CONNECTED.to_hresult()
+                        && error.code() != ERROR_NO_DATA.to_hresult()
                     {
                         eprintln!("ceri: stopped taking later launches: {error}");
                         return;

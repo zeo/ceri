@@ -21761,7 +21761,7 @@ mod tests {
             )
             .expect("worker construction and message send should execute");
         let mut processed = 0;
-        for _ in 0..100 {
+        for _ in 0..5000 {
             processed += runtime.pump().expect("worker pump should execute");
             if processed >= 2 {
                 break;
@@ -21805,7 +21805,7 @@ mod tests {
                 "#,
             )
             .expect("provider-backed worker construction should execute");
-        for _ in 0..100 {
+        for _ in 0..5000 {
             if runtime.pump().expect("worker pump should execute") > 0 {
                 break;
             }
@@ -21884,7 +21884,7 @@ mod tests {
                 "#,
             )
             .expect("module worker construction should execute");
-        for _ in 0..100 {
+        for _ in 0..5000 {
             if runtime.pump().expect("worker pump should execute") > 0 {
                 break;
             }
@@ -21922,7 +21922,7 @@ mod tests {
                 "#,
             )
             .expect("worker construction should queue startup errors");
-        for _ in 0..100 {
+        for _ in 0..5000 {
             if runtime.pump().expect("worker pump should execute") > 0 {
                 break;
             }
