@@ -407,10 +407,7 @@ impl ScriptRuntime {
                     this.clone()
                 };
                 let mut results = Vec::new();
-                loop {
-                    let Some(found) = self.exec_raw(&receiver, &data, &subject)? else {
-                        break;
-                    };
+                while let Some(found) = self.exec_raw(&receiver, &data, &subject)? {
                     let (start, end) = found.captures[0].unwrap_or((0, 0));
                     if matches!(method, M::Match) {
                         results.push(Value::String(from_units(&subject[start..end]).into()));
@@ -458,10 +455,7 @@ impl ScriptRuntime {
                     self.set_last_index(&this, 0)?;
                 }
                 let mut matches = Vec::new();
-                loop {
-                    let Some(found) = self.exec_raw(&this, &data, &subject)? else {
-                        break;
-                    };
+                while let Some(found) = self.exec_raw(&this, &data, &subject)? {
                     let (start, end) = found.captures[0].unwrap_or((0, 0));
                     matches.push(found);
                     if !flags.global {

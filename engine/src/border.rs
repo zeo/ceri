@@ -114,10 +114,8 @@ fn parse_side(value: &str, color: &dyn Fn(&str) -> Option<Color>) -> Option<Bord
             side.style = style;
         } else if let Some(width) = parse_width(word) {
             side.width = width;
-        } else if let Some(parsed) = color(word) {
-            side.color = Some(parsed);
         } else {
-            return None;
+            side.color = Some(color(word)?);
         }
     }
     Some(side)

@@ -1879,7 +1879,8 @@ fn parse_timing(value: &str) -> Option<Timing> {
                     return None;
                 }
                 Timing::CubicBezier(*x1, *y1, *x2, *y2)
-            } else if let Some(values) = arguments("steps") {
+            } else {
+                let values = arguments("steps")?;
                 let count = values
                     .first()?
                     .parse::<u32>()
@@ -1893,8 +1894,6 @@ fn parse_timing(value: &str) -> Option<Timing> {
                     _ => return None,
                 };
                 Timing::Steps(count, position)
-            } else {
-                return None;
             }
         }
     })

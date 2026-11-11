@@ -91,7 +91,7 @@ impl<'a> Reader<'a> {
 
 // a plain sfnt from its tables, sorted by tag, each padded to four bytes
 fn build_sfnt(flavor: u32, mut tables: Vec<([u8; 4], Vec<u8>)>) -> Result<Vec<u8>, String> {
-    tables.sort_by(|left, right| left.0.cmp(&right.0));
+    tables.sort_by_key(|table| table.0);
     let count = tables.len();
     let mut output = Vec::new();
     output.extend_from_slice(&flavor.to_be_bytes());

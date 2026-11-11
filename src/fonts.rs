@@ -705,7 +705,7 @@ fn read_face_names(path: &Path) -> Option<IndexedFace> {
     file.read_exact(&mut directory).ok()?;
     let mut name_table = None;
     let mut os2_table = None;
-    for record in directory.chunks_exact(16) {
+    for record in directory.as_chunks::<16>().0 {
         let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]);
         let length = u32::from_be_bytes([record[12], record[13], record[14], record[15]]);
         match &record[..4] {
@@ -765,7 +765,9 @@ fn read_name(table: &[u8], wanted: &[u16]) -> Option<String> {
                 bytes.iter().map(|byte| char::from(*byte)).collect()
             } else {
                 bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
                     .collect::<Vec<_>>()
                     .iter()

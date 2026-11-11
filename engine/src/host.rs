@@ -1872,7 +1872,9 @@ mod tests {
         let canvas = layout.paint();
         let pixels = canvas.rgba_pixels();
         let highlight_count = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel[..3] == [170, 205, 238])
             .count();
         assert!(
@@ -2770,7 +2772,9 @@ mod tests {
             .chunks_exact(width * 4)
             .enumerate()
             .filter(|(_, row)| {
-                row.chunks_exact(4)
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|pixel| pixel[..3] == [170, 205, 238])
             })
             .map(|(row, _)| row as f32)

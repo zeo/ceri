@@ -399,7 +399,7 @@ mod tests {
         .expect("fixture");
         let (rgba, size) = rasterize_icon(&png, 16).expect("PNG icon");
         assert_eq!((rgba.len(), size), (16 * 16 * 4, 16));
-        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
     }
 
     #[test]

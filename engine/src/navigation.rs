@@ -8008,14 +8008,16 @@ A</div>
         assert!(
             canvas
                 .rgba_pixels()
-                .chunks_exact(4)
-                .any(|pixel| pixel == [110, 231, 197, 255])
+                .as_chunks::<4>()
+                .0
+                .contains(&[110, 231, 197, 255])
         );
         assert!(
             canvas
                 .rgba_pixels()
-                .chunks_exact(4)
-                .any(|pixel| pixel == [224, 108, 117, 255])
+                .as_chunks::<4>()
+                .0
+                .contains(&[224, 108, 117, 255])
         );
     }
 

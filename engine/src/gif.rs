@@ -40,7 +40,9 @@ impl<'a> Reader<'a> {
         let size = 2_usize << (flags & 7);
         Ok(self
             .take(size * 3)?
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|entry| [entry[0], entry[1], entry[2]])
             .collect())
     }

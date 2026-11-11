@@ -1517,6 +1517,8 @@ fn resize_direction(size: (f64, f64), at: (f64, f64), scale: f64) -> Option<Resi
     })
 }
 
+// c_ulong is 32 bits on windows, so the xlib conversion only looks useless on linux
+#[allow(clippy::useless_conversion)]
 fn native_handle(window: &Window) -> Option<NativeHandle> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match window.window_handle().ok()?.as_raw() {
@@ -1558,7 +1560,7 @@ fn present_frame(frame: &Frame, width: usize, height: usize, buffer: &mut [u32])
     for row in 0..copy_height {
         let source = &pixels[row * stride..row * stride + canvas_width * 4];
         let target = &mut buffer[row * width..row * width + copy_width];
-        for (pixel, rgba) in target.iter_mut().zip(source.chunks_exact(4)) {
+        for (pixel, rgba) in target.iter_mut().zip(source.as_chunks::<4>().0.iter()) {
             *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
         }
     }

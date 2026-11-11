@@ -421,10 +421,7 @@ impl ScriptRuntime {
         let ancestors = document.ancestors(node).collect::<Vec<_>>();
         drop(document);
         for ancestor in ancestors {
-            let name = match self.document.borrow().element(ancestor) {
-                Some(element) => element.name.clone(),
-                None => return None,
-            };
+            let name = self.document.borrow().element(ancestor)?.name.clone();
             if name == "body" {
                 return Some(ancestor);
             }

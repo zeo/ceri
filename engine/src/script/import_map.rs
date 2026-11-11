@@ -58,7 +58,7 @@ fn mappings(value: Option<&Value>, base: &AppUrl) -> Result<Vec<(String, String)
         }
         table.push((key, resolved));
     }
-    table.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    table.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
     Ok(table)
 }
 
@@ -97,7 +97,7 @@ impl ImportMap {
                 scopes.push((prefix.to_string(), mappings(Some(table), base)?));
             }
         }
-        scopes.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+        scopes.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
         Ok(Self { imports, scopes })
     }
 
@@ -109,14 +109,14 @@ impl ImportMap {
             }
         }
         self.imports
-            .sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+            .sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
         for (prefix, table) in other.scopes {
             if !self.scopes.iter().any(|(existing, _)| *existing == prefix) {
                 self.scopes.push((prefix, table));
             }
         }
         self.scopes
-            .sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+            .sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
     }
 
     // the address a specifier imported from the referrer maps to, if the map names it

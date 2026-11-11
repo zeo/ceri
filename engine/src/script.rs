@@ -12235,7 +12235,7 @@ fn parse_form_urlencoded(query: &str) -> Result<Vec<(String, String)>, ScriptErr
     query
         .split('&')
         .map(|entry| {
-            let (name, value) = entry.split_once('=').map_or((entry, ""), |pair| pair);
+            let (name, value) = entry.split_once('=').unwrap_or((entry, ""));
             Ok((decode_form_component(name)?, decode_form_component(value)?))
         })
         .collect()
@@ -13567,7 +13567,7 @@ fn sha1_digest(data: &[u8]) -> Vec<u8> {
         0x1032_5476,
         0xC3D2_E1F0,
     ];
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0.iter() {
         let mut words = [0u32; 80];
         for (index, word) in words[..16].iter_mut().enumerate() {
             let offset = index * 4;
@@ -13703,7 +13703,7 @@ fn sha256_digest(data: &[u8]) -> Vec<u8> {
     padded.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
 
     let mut state = SHA256_INITIAL_STATE;
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0.iter() {
         let mut words = [0u32; 64];
         for (index, word) in words[..16].iter_mut().enumerate() {
             let offset = index * 4;
@@ -13877,7 +13877,7 @@ fn sha512_digest(data: &[u8], initial_state: [u64; 8], output_words: usize) -> V
     padded.extend_from_slice(&(data.len() as u128 * 8).to_be_bytes());
 
     let mut state = initial_state;
-    for chunk in padded.chunks_exact(128) {
+    for chunk in padded.as_chunks::<128>().0.iter() {
         let mut words = [0u64; 80];
         for (index, word) in words[..16].iter_mut().enumerate() {
             let offset = index * 8;
@@ -19972,7 +19972,9 @@ mod tests {
     fn subtle_digest_matches_hash_vectors_and_script_promises() {
         let hex_bytes = |hex: &str| {
             hex.as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     u8::from_str_radix(std::str::from_utf8(pair).expect("hex should be UTF-8"), 16)
                         .expect("hex should parse")

@@ -107,7 +107,9 @@ fn decode_utf16(
 ) -> Result<(String, Vec<u8>), ()> {
     let whole = bytes.len() / 2 * 2;
     let mut units: Vec<u16> = bytes[..whole]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             if big_endian {
                 u16::from_be_bytes([pair[0], pair[1]])

@@ -93,7 +93,7 @@ impl Canvas {
 
     fn device(width: u32, height: u32, scale: f32, background: Color) -> Self {
         let mut pixels = vec![0; width as usize * height as usize * 4];
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[background.red, background.green, background.blue, 255]);
         }
         Self {
@@ -134,7 +134,9 @@ impl Canvas {
             self.background.blue,
         ];
         self.pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel[..3] != background)
             .count()
     }
@@ -142,7 +144,7 @@ impl Canvas {
     pub fn write_ppm(&self, path: &Path) -> io::Result<()> {
         let mut file = File::create(path)?;
         write!(file, "P6\n{} {}\n255\n", self.width, self.height)?;
-        for pixel in self.pixels.chunks_exact(4) {
+        for pixel in self.pixels.as_chunks::<4>().0.iter() {
             file.write_all(&pixel[..3])?;
         }
         Ok(())
@@ -168,7 +170,11 @@ impl Canvas {
         let padding = vec![0; row_stride - self.width as usize * 3];
         for row in 0..self.height {
             let start = row as usize * self.width as usize * 4;
-            for pixel in self.pixels[start..start + self.width as usize * 4].chunks_exact(4) {
+            for pixel in self.pixels[start..start + self.width as usize * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+            {
                 file.write_all(&[pixel[2], pixel[1], pixel[0]])?;
             }
             file.write_all(&padding)?;
@@ -180,7 +186,11 @@ impl Canvas {
         let mut rgb = Vec::with_capacity(self.width as usize * 3 * self.height as usize);
         for row in 0..self.height as usize {
             let start = row * self.bytes_per_row();
-            for pixel in self.pixels[start..start + self.width as usize * 4].chunks_exact(4) {
+            for pixel in self.pixels[start..start + self.width as usize * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+            {
                 rgb.extend_from_slice(&pixel[..3]);
             }
         }
@@ -211,7 +221,7 @@ impl Canvas {
             for pixel_y in top..bottom {
                 let start = pixel_y as usize * stride + left as usize * 4;
                 let end = pixel_y as usize * stride + right as usize * 4;
-                for slot in self.pixels[start..end].chunks_exact_mut(4) {
+                for slot in self.pixels[start..end].as_chunks_mut::<4>().0.iter_mut() {
                     slot.copy_from_slice(&sample);
                 }
             }
@@ -770,7 +780,13 @@ impl Canvas {
                     1.0,
                     None,
                 );
-                let alpha = layer.pixels.chunks_exact(4).map(|pixel| pixel[3]).collect();
+                let alpha = layer
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| pixel[3])
+                    .collect();
                 recycle_layer(layer.pixels);
                 Mask::Alpha {
                     left: bounds.left,
@@ -865,8 +881,10 @@ impl Canvas {
             let start = row as usize * stride + bounds.left as usize * 4;
             let end = row as usize * stride + bounds.right as usize * 4;
             for (column, (target, source)) in self.pixels[start..end]
-                .chunks_exact_mut(4)
-                .zip(source_row.chunks_exact(4))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(source_row.as_chunks::<4>().0.iter())
                 .enumerate()
             {
                 if source[3] == 0 {

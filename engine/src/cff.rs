@@ -387,7 +387,7 @@ impl Charstring<'_> {
                     self.stack.clear();
                 }
                 5 => {
-                    for pair in std::mem::take(&mut self.stack).chunks_exact(2) {
+                    for pair in std::mem::take(&mut self.stack).as_chunks::<2>().0.iter() {
                         self.line_to(pair[0], pair[1]);
                     }
                 }
@@ -403,14 +403,14 @@ impl Charstring<'_> {
                     }
                 }
                 8 => {
-                    for curve in std::mem::take(&mut self.stack).chunks_exact(6) {
+                    for curve in std::mem::take(&mut self.stack).as_chunks::<6>().0.iter() {
                         self.curve_to((curve[0], curve[1], curve[2], curve[3], curve[4], curve[5]));
                     }
                 }
                 24 => {
                     let stack = std::mem::take(&mut self.stack);
                     let curves = stack.len().saturating_sub(2) / 6;
-                    for curve in stack.chunks_exact(6).take(curves) {
+                    for curve in stack.as_chunks::<6>().0.iter().take(curves) {
                         self.curve_to((curve[0], curve[1], curve[2], curve[3], curve[4], curve[5]));
                     }
                     if let [dx, dy] = stack[curves * 6..] {
@@ -420,7 +420,7 @@ impl Charstring<'_> {
                 25 => {
                     let stack = std::mem::take(&mut self.stack);
                     let lines = stack.len().saturating_sub(6) / 2;
-                    for pair in stack.chunks_exact(2).take(lines) {
+                    for pair in stack.as_chunks::<2>().0.iter().take(lines) {
                         self.line_to(pair[0], pair[1]);
                     }
                     if let [a, b, c, d, e, f] = stack[lines * 2..] {
@@ -434,7 +434,7 @@ impl Charstring<'_> {
                     } else {
                         0.0
                     };
-                    for curve in stack.chunks_exact(4) {
+                    for curve in stack.as_chunks::<4>().0.iter() {
                         if byte == 26 {
                             self.curve_to((first, curve[0], curve[1], curve[2], 0.0, curve[3]));
                         } else {

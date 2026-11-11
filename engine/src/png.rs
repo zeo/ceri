@@ -96,7 +96,9 @@ pub(crate) fn decode_png(bytes: &[u8]) -> Result<Image, ImageError> {
                     return Err(error("bad palette"));
                 }
                 palette = body
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|entry| [entry[0], entry[1], entry[2]])
                     .collect();
             }
@@ -167,12 +169,12 @@ pub(crate) fn decode_png(bytes: &[u8]) -> Result<Image, ImageError> {
         match (header.depth, header.color_type) {
             // the common 8-bit layouts skip per-sample unpacking
             (8, 6) => {
-                for (pixel, rgba) in image.pixels.iter_mut().zip(rows.chunks_exact(4)) {
+                for (pixel, rgba) in image.pixels.iter_mut().zip(rows.as_chunks::<4>().0.iter()) {
                     *pixel = Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]);
                 }
             }
             (8, 2) if opaque_rgb => {
-                for (pixel, rgb) in image.pixels.iter_mut().zip(rows.chunks_exact(3)) {
+                for (pixel, rgb) in image.pixels.iter_mut().zip(rows.as_chunks::<3>().0.iter()) {
                     *pixel = Color::rgba(rgb[0], rgb[1], rgb[2], 255);
                 }
             }
@@ -546,7 +548,9 @@ mod tests {
             pixels
         );
         let rgb = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect::<Vec<_>>();
         let image = decode_png(&encode_png(width, height, 3, &rgb)).expect("rgb decodes");
@@ -554,7 +558,7 @@ mod tests {
             image
                 .pixels
                 .iter()
-                .zip(rgb.chunks_exact(3))
+                .zip(rgb.as_chunks::<3>().0.iter())
                 .all(|(pixel, source)| {
                     [pixel.red, pixel.green, pixel.blue, pixel.alpha]
                         == [source[0], source[1], source[2], 255]

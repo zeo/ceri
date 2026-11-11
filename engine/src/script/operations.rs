@@ -1281,11 +1281,9 @@ impl ScriptRuntime {
                         return self.index(object.clone(), Value::Number(number));
                     }
                 }
-                Value::TypedArray(array) => {
-                    if number >= 0.0 && number.fract() == 0.0 {
-                        let value = super::typed::read_element(&array.borrow(), number as usize);
-                        return Ok(value.unwrap_or(Value::Undefined));
-                    }
+                Value::TypedArray(array) if number >= 0.0 && number.fract() == 0.0 => {
+                    let value = super::typed::read_element(&array.borrow(), number as usize);
+                    return Ok(value.unwrap_or(Value::Undefined));
                 }
                 _ => {}
             }

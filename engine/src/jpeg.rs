@@ -855,7 +855,7 @@ fn idct(block: &mut [f32; 64]) {
             block[row * 8 + column] = value;
         }
     }
-    for row in block.chunks_exact_mut(8) {
+    for row in block.as_chunks_mut::<8>().0.iter_mut() {
         let output = idct_line([
             row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7],
         ]);
@@ -1348,7 +1348,7 @@ mod tests {
             let worst = image
                 .pixels
                 .iter()
-                .zip(rgb.chunks_exact(3))
+                .zip(rgb.as_chunks::<3>().0.iter())
                 .flat_map(|(pixel, source)| {
                     [pixel.red, pixel.green, pixel.blue]
                         .into_iter()
