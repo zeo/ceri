@@ -1,15 +1,15 @@
 use crate::border::BorderStyle;
 use crate::css::{
     BackgroundLayer, BackgroundSize, Color, Gradient, GradientKind, GradientStop, LayerImage,
-    ObjectFit, Overflow, Radial, RadialSize,
+    ObjectFit, Overflow, PseudoElement, Radial, RadialSize, Style,
 };
 use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
     BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
-    ResolvedEdges, SQUARE_CORNERS, StackingContextEntry, TextRun, overflow_clip_rect, paint_order,
-    scrollbar_metrics, stacking_context_entries, translate_rect, visual_offset_for,
-    visual_rect_for,
+    ResolvedEdges, SQUARE_CORNERS, Scrollbar, StackingContextEntry, TextRun, ThumbPlacement,
+    overflow_clip_rect, paint_order, part_box, scrollbar_metrics, stacking_context_entries,
+    thumb_placement, translate_rect, visual_offset_for, visual_rect_for,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -2225,7 +2225,7 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     if mask.is_some() {
         canvas.pop_mask();
     }
-    paint_scrollbars(canvas, layout_box, offset, clip);
+    paint_scrollbars(canvas, layout_box, images, (offset, opacity), clip);
     paint_outline(canvas, layout_box, rect, opacity, clip);
     if !layout_box.masks.is_empty() {
         canvas.pop_mask();
@@ -2335,7 +2335,13 @@ fn paint_non_context_subtree(
     if mask.is_some() {
         canvas.pop_mask();
     }
-    paint_scrollbars(canvas, layout_box, offset, clip);
+    paint_scrollbars(
+        canvas,
+        layout_box,
+        images,
+        (offset, layout_box.opacity),
+        clip,
+    );
     paint_outline(canvas, layout_box, rect, layout_box.opacity, clip);
 }
 
@@ -2864,75 +2870,20 @@ fn paint_canvas_commands(
 fn paint_scrollbars(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
-    offset: (f32, f32),
+    images: &[ImageLayer],
+    (offset, opacity): ((f32, f32), f32),
     clip: Option<Rect>,
 ) {
     if !layout_box.visible {
         return;
     }
     let metrics = scrollbar_metrics(layout_box);
-    let track_color = Color::opaque(232, 236, 240);
-    let thumb_color = Color::opaque(126, 138, 150);
-    if let Some(track) = metrics.vertical_track {
-        let track = translate_rect(track, offset);
-        fill_rect_optional(
-            canvas,
-            track.x,
-            track.y,
-            track.width,
-            track.height,
-            track_color,
-            clip,
-        );
-        let thumb = scrollbar_thumb(
-            track,
-            metrics.scrollport.height,
-            layout_box.scroll_content.height,
-            layout_box.scroll_offset.1,
-            (layout_box.scroll_content.height - metrics.scrollport.height).max(0.0),
-            true,
-        );
-        fill_rect_optional(
-            canvas,
-            thumb.x,
-            thumb.y,
-            thumb.width,
-            thumb.height,
-            thumb_color,
-            clip,
-        );
-    }
-    if let Some(track) = metrics.horizontal_track {
-        let track = translate_rect(track, offset);
-        fill_rect_optional(
-            canvas,
-            track.x,
-            track.y,
-            track.width,
-            track.height,
-            track_color,
-            clip,
-        );
-        let thumb = scrollbar_thumb(
-            track,
-            metrics.scrollport.width,
-            layout_box.scroll_content.width,
-            layout_box.scroll_offset.0,
-            (layout_box.scroll_content.width - metrics.scrollport.width).max(0.0),
-            false,
-        );
-        fill_rect_optional(
-            canvas,
-            thumb.x,
-            thumb.y,
-            thumb.width,
-            thumb.height,
-            thumb_color,
-            clip,
-        );
-    }
-    if let (Some(vertical), Some(horizontal)) = (metrics.vertical_track, metrics.horizontal_track) {
-        let corner = translate_rect(
+    let bars = [
+        (metrics.vertical_track, true),
+        (metrics.horizontal_track, false),
+    ];
+    let corner = match bars {
+        [(Some(vertical), _), (Some(horizontal), _)] => Some(translate_rect(
             Rect {
                 x: vertical.x,
                 y: horizontal.y,
@@ -2940,56 +2891,153 @@ fn paint_scrollbars(
                 height: horizontal.height,
             },
             offset,
-        );
-        fill_rect_optional(
-            canvas,
-            corner.x,
-            corner.y,
-            corner.width,
-            corner.height,
-            track_color,
+        )),
+        _ => None,
+    };
+    let placed = |vertical: bool| {
+        thumb_placement(layout_box, &metrics, vertical).map(|placement| ThumbPlacement {
+            region: translate_rect(placement.region, offset),
+            thumb: translate_rect(placement.thumb, offset),
+            ..placement
+        })
+    };
+    let (thumb_color, track_color) = match &layout_box.scrollbar {
+        Scrollbar::Hidden => return,
+        Scrollbar::Styled(parts) => {
+            let mut surface = |pseudo: PseudoElement, style: &Style, rect: Rect| {
+                let part = part_box(
+                    layout_box.node,
+                    pseudo,
+                    style,
+                    rect,
+                    (layout_box.font_size, layout_box.cursor),
+                );
+                paint_box_surface(
+                    canvas,
+                    &part,
+                    images,
+                    clip,
+                    (0.0, 0.0),
+                    rect,
+                    opacity * part.opacity,
+                );
+            };
+            for (track, vertical) in bars {
+                let Some(track) = track.map(|track| translate_rect(track, offset)) else {
+                    continue;
+                };
+                surface(PseudoElement::Scrollbar, &parts.bar, track);
+                if let Some(style) = &parts.track {
+                    surface(PseudoElement::ScrollbarTrack, style, track);
+                }
+                if let (Some(style), Some(placement)) = (&parts.thumb, placed(vertical)) {
+                    surface(PseudoElement::ScrollbarThumb, style, placement.thumb);
+                }
+            }
+            match (corner, &parts.corner) {
+                (Some(corner), Some(style)) => {
+                    surface(PseudoElement::ScrollbarCorner, style, corner);
+                }
+                (Some(corner), None) => {
+                    canvas.fill_shape(
+                        Shape::square(corner),
+                        &Paint::Solid(Color::WHITE.scale_alpha(opacity)),
+                        clip,
+                    );
+                }
+                (None, _) => {}
+            }
+            return;
+        }
+        Scrollbar::Standard {
+            colors: Some(colors),
+            ..
+        } => *colors,
+        Scrollbar::Native | Scrollbar::Standard { .. } => {
+            (Color::opaque(139, 139, 139), Color::opaque(252, 252, 252))
+        }
+    };
+    let solid = |color: Color| Paint::Solid(color.scale_alpha(opacity));
+    for (track, vertical) in bars {
+        let (Some(track), Some(placement)) = (track, placed(vertical)) else {
+            continue;
+        };
+        let track = translate_rect(track, offset);
+        canvas.fill_shape(Shape::square(track), &solid(track_color), clip);
+        // fluent arrows: a triangle in each end button pointing out of the bar
+        let (thickness, start, end) = if vertical {
+            (track.width, track.y, track.y + track.height)
+        } else {
+            (track.height, track.x, track.x + track.width)
+        };
+        let middle = if vertical {
+            track.x + thickness / 2.0
+        } else {
+            track.y + thickness / 2.0
+        };
+        let button = placement.button;
+        for (apex, base) in [
+            (start + 0.4 * button, start + 0.8 * button),
+            (end - 0.4 * button, end - 0.8 * button),
+        ] {
+            fill_arrow(
+                canvas,
+                (apex, base),
+                (middle, 0.3 * thickness),
+                vertical,
+                &solid(thumb_color),
+                clip,
+            );
+        }
+        let thumb = placement.thumb;
+        let radius = thumb.width.min(thumb.height) / 2.0;
+        canvas.fill_shape(
+            Shape::from_rect(thumb, [(radius, radius); 4]),
+            &solid(thumb_color),
             clip,
         );
     }
+    if let Some(corner) = corner {
+        canvas.fill_shape(Shape::square(corner), &solid(track_color), clip);
+    }
 }
 
-fn scrollbar_thumb(
-    track: Rect,
-    viewport_extent: f32,
-    content_extent: f32,
-    offset: f32,
-    max_offset: f32,
+// a triangle from an apex to a base centered across the bar, built from one-pixel slabs whose
+// fractional ends antialias its slopes
+fn fill_arrow(
+    canvas: &mut Canvas,
+    (apex, base): (f32, f32),
+    (middle, half_width): (f32, f32),
     vertical: bool,
-) -> Rect {
-    let track_extent = if vertical { track.height } else { track.width };
-    let minimum = 8.0_f32.min(track_extent);
-    let thumb_extent = if content_extent > 0.0 {
-        (track_extent * (viewport_extent / content_extent).clamp(0.0, 1.0))
-            .max(minimum)
-            .min(track_extent)
-    } else {
-        track_extent
-    };
-    let travel = (track_extent - thumb_extent).max(0.0);
-    let progress = if max_offset > 0.0 {
-        (offset / max_offset).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if vertical {
-        Rect {
-            x: track.x,
-            y: track.y + travel * progress,
-            width: track.width,
-            height: thumb_extent,
-        }
-    } else {
-        Rect {
-            x: track.x + travel * progress,
-            y: track.y,
-            width: thumb_extent,
-            height: track.height,
-        }
+    paint: &Paint,
+    clip: Option<Rect>,
+) {
+    let height = (base - apex).abs();
+    if height <= 0.0 {
+        return;
+    }
+    let (low, high) = (apex.min(base), apex.max(base));
+    let mut along = low.floor();
+    while along < high {
+        let (from, to) = (along.max(low), (along + 1.0).min(high));
+        let spread = half_width * ((from + to) / 2.0 - apex).abs() / height;
+        let slab = if vertical {
+            Rect {
+                x: middle - spread,
+                y: from,
+                width: 2.0 * spread,
+                height: to - from,
+            }
+        } else {
+            Rect {
+                x: from,
+                y: middle - spread,
+                width: to - from,
+                height: 2.0 * spread,
+            }
+        };
+        canvas.fill_shape(Shape::square(slab), paint, clip);
+        along += 1.0;
     }
 }
 
@@ -3853,6 +3901,7 @@ mod tests {
                 },
                 scroll_offset: (0.0, 0.0),
                 svg: None,
+                scrollbar: Default::default(),
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -4309,6 +4358,7 @@ mod tests {
                 },
                 scroll_offset: (0.0, 0.0),
                 svg: None,
+                scrollbar: Default::default(),
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -4444,6 +4494,7 @@ mod tests {
                 },
                 scroll_offset: (0.0, 0.0),
                 svg: None,
+                scrollbar: Default::default(),
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -4548,6 +4599,7 @@ mod tests {
                         },
                         scroll_offset: (0.0, 0.0),
                         svg: None,
+                        scrollbar: Default::default(),
                         margin: Default::default(),
                     },
                     LayoutBox {
@@ -4600,6 +4652,7 @@ mod tests {
                         },
                         scroll_offset: (0.0, 0.0),
                         svg: None,
+                        scrollbar: Default::default(),
                         margin: Default::default(),
                     },
                 ],
@@ -4626,6 +4679,7 @@ mod tests {
                 },
                 scroll_offset: (0.0, 0.0),
                 svg: None,
+                scrollbar: Default::default(),
                 margin: Default::default(),
             },
             images: Vec::new(),

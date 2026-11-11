@@ -622,8 +622,12 @@ impl EngineHost {
                 let thumb_drag = primary
                     .then(|| self.browser.thumb_at(self.viewport, x, y))
                     .flatten();
-                if let Some(drag) = &thumb_drag {
-                    self.selecting_thumb = Some(drag.clone());
+                match &thumb_drag {
+                    Some(drag) if drag.page != 0.0 => {
+                        self.browser.page_by_bar(drag)?;
+                    }
+                    Some(drag) => self.selecting_thumb = Some(drag.clone()),
+                    None => {}
                 }
                 if primary && thumb_drag.is_none() {
                     self.range_drag = self.browser.press_range(self.viewport, x, y)?;
@@ -1358,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn dragging_the_scrollbar_thumb_scrolls_with_the_pointer() {
+    fn dragging_the_scrollbar_thumb_scrolls_and_the_track_and_buttons_page() {
         let browser = Browser::new(bundle(
             r#"<style>
                 #viewport { width: 60px; height: 60px; overflow: auto; margin: 0; }
@@ -1375,42 +1379,64 @@ mod tests {
         );
         host.navigate("https://app.ceri.invalid/")
             .expect("scrollbar page should load");
-
-        // the vertical thumb sits at the top of the track beside the viewport
-        let press = InputEvent::PointerDown {
-            x: 53.0,
-            y: 5.0,
-            button: PointerButton::Primary,
+        let offset = |host: &EngineHost| {
+            host.browser()
+                .layout(host.viewport())
+                .expect("page should layout")
+                .body()
+                .children[0]
+                .scroll_offset
+                .1
         };
-        let pressed = host.input(press).expect("thumb press should be accepted");
-        assert!(pressed.handled, "pressing the thumb should start a drag");
+        let press = |host: &mut EngineHost, y: f32| {
+            let pressed = host
+                .input(InputEvent::PointerDown {
+                    x: 52.0,
+                    y,
+                    button: PointerButton::Primary,
+                })
+                .expect("bar press should be accepted");
+            assert!(pressed.handled && pressed.frame_requested);
+            host.input(InputEvent::PointerUp {
+                x: 52.0,
+                y,
+                button: PointerButton::Primary,
+            })
+            .expect("release should be accepted");
+        };
 
-        // dragging down by half the track pulls the content with the pointer
-        let drag = InputEvent::PointerMove { x: 53.0, y: 20.0 };
-        let moved = host.input(drag).expect("thumb drag should be accepted");
-        assert!(moved.handled, "dragging should scroll");
-        assert!(moved.frame_requested);
-        let layout = host
-            .browser()
-            .layout(host.viewport())
-            .expect("dragged page should layout");
-        let offset = layout.body().children[0].scroll_offset.1;
-        assert!(
-            offset > 5.0,
-            "a downward drag should scroll down, got {offset}"
-        );
-
-        // releasing ends the drag so later moves stop scrolling
-        host.input(InputEvent::PointerUp {
-            x: 53.0,
+        // the 15px bar has a 15px arrow button at each end, and the 8px thumb starts 3px
+        // below the top one, at y 18, sliding 16px for 240px of scrolling
+        host.input(InputEvent::PointerDown {
+            x: 52.0,
             y: 20.0,
             button: PointerButton::Primary,
         })
+        .expect("thumb press should be accepted");
+        let moved = host
+            .input(InputEvent::PointerMove { x: 52.0, y: 30.0 })
+            .expect("thumb drag should be accepted");
+        assert!(moved.handled && moved.frame_requested);
+        assert_eq!(offset(&host), 150.0);
+        host.input(InputEvent::PointerUp {
+            x: 52.0,
+            y: 30.0,
+            button: PointerButton::Primary,
+        })
         .expect("release should be accepted");
-        let idle = host
-            .input(InputEvent::PointerMove { x: 53.0, y: 40.0 })
+        host.input(InputEvent::PointerMove { x: 52.0, y: 40.0 })
             .expect("post-release move should be accepted");
-        assert!(!idle.handled, "moving after release should not scroll");
+        assert_eq!(offset(&host), 150.0, "a move after release does not drag");
+
+        // the track below the thumb pages by 0.875 of the 60px view, the down arrow by a line
+        press(&mut host, 40.0);
+        assert_eq!(offset(&host), 202.5);
+        press(&mut host, 55.0);
+        assert_eq!(offset(&host), 240.0);
+        press(&mut host, 22.0);
+        assert_eq!(offset(&host), 187.5);
+        press(&mut host, 5.0);
+        assert_eq!(offset(&host), 147.5);
     }
 
     #[test]
