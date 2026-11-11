@@ -5626,22 +5626,51 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     };
     let mut inline = 0.0_f32;
     let mut widest_block = 0.0_f32;
-    for child in node.children(&NO_GENERATED_CONTENT) {
-        match child {
+    let text = inherited_text(&style);
+    // flex and grid containers drop the spaces around their items
+    let keeps_spaces = !matches!(
+        style.display,
+        Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid
+    ) && !row_flex
+        && !matches!(
+            text.space_collapse,
+            SpaceCollapse::Preserve | SpaceCollapse::BreakSpaces
+        );
+    let children = node.children(&NO_GENERATED_CONTENT);
+    let mut joined = String::new();
+    let mut after_element = false;
+    for (index, child) in children.iter().enumerate() {
+        match *child {
             Child::Text(_, value) => {
-                let transformed = style.text_transform.apply(value);
+                // adjacent text nodes read as one, so spaces at their seams survive collapsing
+                joined.push_str(value);
+                if matches!(children.get(index + 1), Some(Child::Text(..))) {
+                    continue;
+                }
+                let value = style.text_transform.apply(&std::mem::take(&mut joined));
                 let measure = |text: &str| {
                     measure_text(text, style.font_family, font_size, font, letter_spacing)
                 };
-                let (narrowest, widest) =
-                    text_extents(&transformed, &inherited_text(&style), &measure);
+                let (narrowest, widest) = text_extents(&value, &text, &measure);
                 if minimum {
                     widest_block = widest_block.max(narrowest);
                 } else {
-                    inline += widest;
+                    // a collapsed space beside an element still takes its width on the line
+                    let edges = [
+                        after_element && value.starts_with(|c: char| c.is_ascii_whitespace()),
+                        index + 1 < children.len()
+                            && value.ends_with(|c: char| c.is_ascii_whitespace()),
+                    ];
+                    let spaces = match edges.iter().filter(|edge| **edge).count() {
+                        _ if !keeps_spaces => 0,
+                        2 if value.trim_ascii().is_empty() => 1,
+                        count => count,
+                    };
+                    inline += widest + spaces as f32 * measure(" ");
                 }
             }
             Child::Element(child) => {
+                after_element = true;
                 let width = intrinsic_width(
                     MaxContentInput {
                         node: child,
@@ -8612,6 +8641,49 @@ mod tests {
         assert!((baseline(run("Alt")) - baseline(press)).abs() < 0.01);
         assert!((baseline(press) - baseline(run("2")) - (16.0 / 3.0 + 1.0)).abs() < 0.01);
         assert!((baseline(press) - baseline(run("up")) - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_shrunk_box_fits_text_split_across_nodes_on_one_line() {
+        let mut document = Document::parse_markup(concat!(
+            "<style>* { margin: 0 } main { display: flex } span { margin-left: auto } ",
+            "i { display: inline-block }</style>",
+            "<main><b>A</b><span id='split'>9 clips in 3 sessions, </span></main>",
+            "<main><b>A</b><span id='inline'>9 clips in <i>3</i> sessions</span></main>",
+        ))
+        .expect("document should parse");
+        let split = document.find_element_by_id("split").expect("split span");
+        let tail = document.create_text("684.0 MB");
+        document.append_child(split, tail).expect("text appends");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 200.0,
+            },
+        );
+        fn rows<'a>(layout: &'a LayoutBox, found: &mut Vec<&'a LayoutBox>) {
+            if layout.tag == "main" {
+                found.push(layout);
+            }
+            for child in &layout.children {
+                rows(child, found);
+            }
+        }
+        let mut found = Vec::new();
+        rows(&result.root, &mut found);
+        let rows = found;
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let runs = collect_text_runs(row);
+            assert!(runs.len() > 2, "{runs:?}");
+            assert!(
+                runs.iter().all(|run| run.y == runs[0].y),
+                "one line: {runs:?}"
+            );
+        }
     }
 
     #[test]
