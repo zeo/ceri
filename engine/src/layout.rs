@@ -5639,6 +5639,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     let children = node.children(&NO_GENERATED_CONTENT);
     let mut joined = String::new();
     let mut after_element = false;
+    let mut flex_items = 0_usize;
     for (index, child) in children.iter().enumerate() {
         match *child {
             Child::Text(_, value) => {
@@ -5702,8 +5703,15 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                 } else {
                     widest_block = widest_block.max(width);
                 }
+                if side_by_side && row_flex && child_display != Display::None {
+                    flex_items += 1;
+                }
             }
         }
+    }
+    if style.display != Display::TableRow && flex_items > 1 {
+        let gap = style.gap.resolve(0.0, font_size).unwrap_or(0.0).max(0.0);
+        inline += gap * (flex_items - 1) as f32;
     }
     extras + bounded(inline.max(widest_block).min(containing_width.max(0.0)))
 }
@@ -9386,6 +9394,23 @@ mod tests {
             );
             assert_eq!(find_box(&result.root, "em").expect("em").rect.width, 90.0);
         }
+    }
+
+    #[test]
+    fn a_flex_row_counts_its_gaps_in_its_max_content_width() {
+        let markup = "<style>* { margin: 0; } section { display: flex; } nav { display: flex; gap: 8px; } i { width: 30px; } b { width: 20px; } u { width: 10px; }</style><section><nav><i></i><b></b><u></u></nav></section>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 100.0,
+            },
+        );
+        assert_eq!(find_box(&result.root, "nav").expect("nav").rect.width, 76.0);
+        assert_eq!(find_box(&result.root, "u").expect("u").rect.width, 10.0);
     }
 
     #[test]
