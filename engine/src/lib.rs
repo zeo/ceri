@@ -26,6 +26,7 @@ mod paint;
 mod png;
 #[cfg(all(feature = "windowed", target_os = "windows"))]
 mod presenter;
+mod range;
 mod script;
 mod selection;
 mod shaping;

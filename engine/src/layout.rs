@@ -6,7 +6,8 @@ use crate::css::{
     TextAlign, inherited_text,
 };
 use crate::css::{
-    Clear, Cursor, Float, ListStyleType, OverflowWrap, SpaceCollapse, VerticalAlign, Visibility,
+    Clear, Cursor, Float, ListStyleType, OverflowWrap, ScrollbarWidth, SpaceCollapse,
+    VerticalAlign, Visibility,
 };
 use crate::dom::{Document, Element, Namespace, NodeId, NodeKind};
 use crate::font::{FontStack, FontStyle};
@@ -14,6 +15,7 @@ use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks
 use crate::image::Image;
 use crate::linebreak::{WordBreak, break_opportunities};
 use crate::media::ContainerSize;
+use crate::range::RangeBounds;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -165,6 +167,7 @@ pub struct LayoutBox {
     pub(crate) scroll_offset: (f32, f32),
     // the shapes an outer svg element draws in its content box
     pub(crate) svg: Option<Rc<crate::svg::Scene>>,
+    pub(crate) scrollbar: Scrollbar,
     pub(crate) margin: ResolvedEdges,
 }
 
@@ -208,6 +211,12 @@ pub(crate) enum ControlPaint {
     Range {
         fraction: f32,
         accent: Color,
+        disabled: bool,
+        // the page draws the track and thumb as boxes, under appearance: none
+        styled: bool,
+        // where the thumb's left edge starts from the box's left edge, and how far it travels
+        travel: (f32, f32),
+        thumb: f32,
     },
     // none is indeterminate
     Progress {
@@ -756,6 +765,7 @@ impl InlineContext {
             italic: self.text.italic,
             variations: self.text.font_variations,
             optical_size: optical_size(self.text.optical_sizing, self.font_size),
+            features: self.text.font_features,
         }
     }
 }
@@ -866,6 +876,17 @@ struct ContainingBlock {
     height: f32,
 }
 
+// absolutely positioned descendants place and size themselves against the padding box
+fn padding_block(layout: &LayoutBox) -> ContainingBlock {
+    let border = layout.border.widths;
+    ContainingBlock {
+        x: layout.rect.x + border.left,
+        y: layout.rect.y + border.top,
+        width: (layout.rect.width - border.left - border.right).max(0.0),
+        height: (layout.rect.height - border.top - border.bottom).max(0.0),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LayoutMode {
     Flow,
@@ -971,20 +992,42 @@ pub fn layout_with_state(
         },
         scroll_offset: (0.0, 0.0),
         svg: None,
+        scrollbar: Scrollbar::default(),
         margin: ResolvedEdges::default(),
     };
+    // the root element's scrollbar styles draw the viewport's bars
+    if let Some(html) = document.document_element() {
+        let font_size = root_font_size(document, stylesheet, viewport, style_state);
+        let style = stylesheet.style_for(Subject::new(document, html).style_context(
+            ParentStyle {
+                font_size,
+                color: Color::BLACK,
+                weight: FontWeight::NORMAL,
+                text: InheritedText::default(),
+                opacity: 1.0,
+            },
+            style_state,
+        ));
+        // the viewport scrolls whatever the root's own overflow
+        let style = Style {
+            overflow: Overflow::Auto,
+            ..style
+        };
+        root.scrollbar =
+            scrollbar_for(stylesheet, (document, html), &style, font_size, style_state);
+    }
     root.children = layout_document_children(document, stylesheet, viewport, style_state);
-    finalize_scroll(&mut root, style_state);
+    finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     // a classic vertical scrollbar takes its width from the initial and fixed containing
     // blocks, while vw, resolved from the layout environment, keeps the whole viewport
-    if scrollbar_metrics(&root).vertical_track.is_some() {
+    if let Some(bar) = scrollbar_metrics(&root).vertical_track {
         let scrollport = Size {
-            width: (viewport.width - SCROLLBAR_THICKNESS).max(0.0),
+            width: (viewport.width - bar.width).max(0.0),
             ..viewport
         };
         CONTAINERS.with(|containers| containers.borrow_mut().clear());
         root.children = layout_document_children(document, stylesheet, scrollport, style_state);
-        finalize_scroll(&mut root, style_state);
+        finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     }
     LayoutDocument {
         viewport,
@@ -1403,6 +1446,72 @@ impl LayoutDocument {
     pub(crate) fn thumb_drag_at(&self, x: f32, y: f32) -> Option<ThumbDrag> {
         thumb_drag_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
+
+    // an enabled range input under a pointer press, and where its thumb travels
+    pub(crate) fn range_drag_at(&self, x: f32, y: f32) -> Option<RangeDrag> {
+        let hit = hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))?;
+        range_drag_box(&self.root, hit.layout.node, x, (0.0, 0.0))
+    }
+}
+
+// a range input being dragged, in viewport coordinates; ancestor transforms are not mapped
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RangeDrag {
+    pub(crate) node: NodeId,
+    // where the thumb's center sits at the minimum, and how far it travels to the maximum
+    pub(crate) start: f32,
+    pub(crate) length: f32,
+    // the pointer's offset from the thumb's center when the press landed on the thumb, so it
+    // does not jump; a press on the track centers the thumb under the pointer
+    pub(crate) grab: f32,
+    // the value at the press, which change compares against on release
+    pub(crate) pressed: String,
+}
+
+impl RangeDrag {
+    pub(crate) fn fraction(&self, x: f32) -> f64 {
+        if self.length > 0.0 {
+            f64::from(((x - self.grab - self.start) / self.length).clamp(0.0, 1.0))
+        } else {
+            0.0
+        }
+    }
+}
+
+fn range_drag_box(
+    layout_box: &LayoutBox,
+    node: NodeId,
+    x: f32,
+    ancestor_offset: (f32, f32),
+) -> Option<RangeDrag> {
+    if layout_box.node == node
+        && let Some(ControlPaint::Range {
+            fraction,
+            disabled: false,
+            travel: (start, length),
+            thumb,
+            ..
+        }) = layout_box.control
+    {
+        let start = visual_rect_for(layout_box, ancestor_offset).x + start + thumb / 2.0;
+        let center = start + fraction * length;
+        return Some(RangeDrag {
+            node,
+            start,
+            length,
+            grab: if (x - center).abs() <= thumb / 2.0 {
+                x - center
+            } else {
+                0.0
+            },
+            pressed: String::new(),
+        });
+    }
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    layout_box
+        .children
+        .iter()
+        .find_map(|child| range_drag_box(child, node, x, offset))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1416,7 +1525,7 @@ pub(crate) struct ScrollTarget {
 #[derive(Clone, Debug)]
 pub struct ThumbDrag {
     pub(crate) node: NodeId,
-    // track rectangle and thumb geometry in viewport coordinates
+    // the stretch the thumb slides along and the thumb's length, in viewport coordinates
     pub track: Rect,
     pub vertical: bool,
     pub thumb_extent: f32,
@@ -1424,9 +1533,121 @@ pub struct ThumbDrag {
     pub grab: f32,
     pub(crate) offset: (f32, f32),
     pub(crate) max_offset: f32,
+    // a press off the thumb scrolls by this much instead of dragging: a page of 0.875 of the
+    // visible length on the track, or a 40px line on an arrow button
+    pub(crate) page: f32,
 }
 
-pub(crate) const SCROLLBAR_THICKNESS: f32 = 12.0;
+// the classic bar edge draws, and its scrollbar-width: thin version
+pub(crate) const SCROLLBAR_THICKNESS: f32 = 15.0;
+const THIN_SCROLLBAR_THICKNESS: f32 = 10.0;
+
+// how a scroll container draws its bars
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum Scrollbar {
+    #[default]
+    Native,
+    // the platform's bars, narrowed by scrollbar-width: thin and recolored by scrollbar-color
+    // as (thumb, track)
+    Standard {
+        thin: bool,
+        colors: Option<(Color, Color)>,
+    },
+    // the ::-webkit-scrollbar pieces some rule styles, with no arrow buttons
+    Styled(Box<ScrollbarParts>),
+    Hidden,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScrollbarParts {
+    // the vertical bar's width and the horizontal bar's height
+    pub(crate) thickness: (f32, f32),
+    pub(crate) bar: Style,
+    pub(crate) track: Option<Style>,
+    pub(crate) thumb: Option<Style>,
+    pub(crate) corner: Option<Style>,
+}
+
+impl Scrollbar {
+    fn thickness(&self) -> (f32, f32) {
+        match self {
+            Self::Native | Self::Standard { thin: false, .. } => {
+                (SCROLLBAR_THICKNESS, SCROLLBAR_THICKNESS)
+            }
+            Self::Standard { thin: true, .. } => {
+                (THIN_SCROLLBAR_THICKNESS, THIN_SCROLLBAR_THICKNESS)
+            }
+            Self::Styled(parts) => parts.thickness,
+            Self::Hidden => (0.0, 0.0),
+        }
+    }
+
+    // the native thumb is a pill narrower than its bar, centered across it
+    pub(crate) fn native_thumb(&self) -> Option<f32> {
+        match self {
+            Self::Native | Self::Standard { thin: false, .. } => Some(9.0),
+            Self::Standard { thin: true, .. } => Some(6.0),
+            Self::Styled(_) | Self::Hidden => None,
+        }
+    }
+}
+
+// the standard properties win over ::-webkit-scrollbar, whose parts count only when some rule
+// for them matches the element
+fn scrollbar_for(
+    stylesheet: &Stylesheet,
+    (document, node): (&Document, NodeId),
+    style: &Style,
+    font_size: f32,
+    state: &StyleState,
+) -> Scrollbar {
+    if style.overflow != Overflow::Auto {
+        return Scrollbar::Native;
+    }
+    let matched = |pseudo: PseudoElement| {
+        let context = StyleContext {
+            document,
+            node,
+            pseudo: Some(pseudo),
+            parent_font_size: font_size,
+            parent_color: style.color,
+            parent_weight: style.font_weight,
+            parent_text: inherited_text(style),
+            state,
+        };
+        (stylesheet.styles_pseudo(pseudo) && !stylesheet.declared_values(context).is_empty())
+            .then(|| stylesheet.style_for(context))
+    };
+    let thin = match style.scrollbar_width {
+        ScrollbarWidth::None => return Scrollbar::Hidden,
+        ScrollbarWidth::Thin => true,
+        ScrollbarWidth::Auto => false,
+    };
+    if thin || style.scrollbar_color.is_some() {
+        return Scrollbar::Standard {
+            thin,
+            colors: style.scrollbar_color,
+        };
+    }
+    let Some(bar) = matched(PseudoElement::Scrollbar) else {
+        return Scrollbar::Native;
+    };
+    if bar.display == Display::None {
+        return Scrollbar::Hidden;
+    }
+    let size = |length: Length| {
+        length
+            .resolve(0.0, font_size)
+            .map_or(SCROLLBAR_THICKNESS, |size| size.max(0.0))
+    };
+    Scrollbar::Styled(Box::new(ScrollbarParts {
+        thickness: (size(bar.width), size(bar.height)),
+        bar,
+        track: matched(PseudoElement::ScrollbarTrack),
+        thumb: matched(PseudoElement::ScrollbarThumb),
+        corner: matched(PseudoElement::ScrollbarCorner),
+    }))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollbarMetrics {
@@ -1435,9 +1656,11 @@ pub(crate) struct ScrollbarMetrics {
     pub(crate) horizontal_track: Option<Rect>,
 }
 
+// the bars sit inside the border, and the scrollport is the border box less them
 pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
     let rect = layout.rect;
     let scroll_container = layout.is_document() || layout.overflow == Overflow::Auto;
+    let (thickness_x, thickness_y) = layout.scrollbar.thickness();
     if !scroll_container {
         return ScrollbarMetrics {
             scrollport: rect,
@@ -1446,23 +1669,32 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
         };
     }
     let [user_x, user_y] = user_scroll_axes(layout);
+    let user_x = user_x && thickness_y > 0.0;
+    let user_y = user_y && thickness_x > 0.0;
     let mut vertical = user_y && layout.scroll_content.height > rect.height;
     let mut horizontal = user_x
         && layout.scroll_content.width
-            > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+            > (rect.width - if vertical { thickness_x } else { 0.0 }).max(0.0);
     vertical = user_y
         && layout.scroll_content.height
-            > (rect.height - if horizontal { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+            > (rect.height - if horizontal { thickness_y } else { 0.0 }).max(0.0);
     horizontal = user_x
         && layout.scroll_content.width
-            > (rect.width - if vertical { SCROLLBAR_THICKNESS } else { 0.0 }).max(0.0);
+            > (rect.width - if vertical { thickness_x } else { 0.0 }).max(0.0);
+    let border = layout.border.widths;
+    let inner = Rect {
+        x: rect.x + border.left,
+        y: rect.y + border.top,
+        width: (rect.width - border.left - border.right).max(0.0),
+        height: (rect.height - border.top - border.bottom).max(0.0),
+    };
     let vertical_width = if vertical {
-        SCROLLBAR_THICKNESS.min(rect.width)
+        thickness_x.min(inner.width)
     } else {
         0.0
     };
     let horizontal_height = if horizontal {
-        SCROLLBAR_THICKNESS.min(rect.height)
+        thickness_y.min(inner.height)
     } else {
         0.0
     };
@@ -1473,15 +1705,15 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
         height: (rect.height - horizontal_height).max(0.0),
     };
     let vertical_track = vertical.then_some(Rect {
-        x: scrollport.x + scrollport.width,
-        y: scrollport.y,
+        x: inner.x + inner.width - vertical_width,
+        y: inner.y,
         width: vertical_width,
-        height: scrollport.height,
+        height: (inner.height - horizontal_height).max(0.0),
     });
     let horizontal_track = horizontal.then_some(Rect {
-        x: scrollport.x,
-        y: scrollport.y + scrollport.height,
-        width: scrollport.width,
+        x: inner.x,
+        y: inner.y + inner.height - horizontal_height,
+        width: (inner.width - vertical_width).max(0.0),
         height: horizontal_height,
     });
     ScrollbarMetrics {
@@ -1489,6 +1721,118 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
         vertical_track,
         horizontal_track,
     }
+}
+
+// where a bar's thumb sits: the stretch it slides along, the thumb, and the scroll range it
+// maps onto
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ThumbPlacement {
+    pub(crate) region: Rect,
+    pub(crate) thumb: Rect,
+    pub(crate) max_offset: f32,
+    // the padding box's visible length along the bar, less the other bar
+    pub(crate) visible: f32,
+    // the length of the arrow button at each end of a native bar
+    pub(crate) button: f32,
+}
+
+pub(crate) fn thumb_placement(
+    layout: &LayoutBox,
+    metrics: &ScrollbarMetrics,
+    vertical: bool,
+) -> Option<ThumbPlacement> {
+    let track = if vertical {
+        metrics.vertical_track
+    } else {
+        metrics.horizontal_track
+    }?;
+    let border = layout.border.widths;
+    let (borders, client, content, offset) = if vertical {
+        (
+            border.top + border.bottom,
+            metrics.scrollport.height,
+            layout.scroll_content.height,
+            layout.scroll_offset.1,
+        )
+    } else {
+        (
+            border.left + border.right,
+            metrics.scrollport.width,
+            layout.scroll_content.width,
+            layout.scroll_offset.0,
+        )
+    };
+    let max_offset = (content - client).max(0.0);
+    // the native bar keeps a square arrow button at each end, and its thumb slides between them
+    // inset as far as it is from the bar's sides
+    let mut button = 0.0;
+    let region = match layout.scrollbar.native_thumb() {
+        Some(pill) => {
+            let thickness = if vertical { track.width } else { track.height };
+            let length = if vertical { track.height } else { track.width };
+            let inset = ((thickness - pill) / 2.0).max(0.0);
+            button = thickness.min(length / 2.0);
+            let along = (length - 2.0 * (button + inset)).max(0.0);
+            let across = (thickness - 2.0 * inset).max(0.0);
+            if vertical {
+                Rect {
+                    x: track.x + inset,
+                    y: track.y + button + inset,
+                    width: across,
+                    height: along,
+                }
+            } else {
+                Rect {
+                    x: track.x + button + inset,
+                    y: track.y + inset,
+                    width: along,
+                    height: across,
+                }
+            }
+        }
+        None => track,
+    };
+    let length = if vertical {
+        region.height
+    } else {
+        region.width
+    };
+    let visible = (client - borders).max(0.0);
+    let scrolled = content - borders;
+    let thumb_length = if scrolled > 0.0 {
+        (length * (visible / scrolled).clamp(0.0, 1.0))
+            .round()
+            .max(8.0_f32.min(length))
+            .min(length)
+    } else {
+        length
+    };
+    let progress = if max_offset > 0.0 {
+        (offset / max_offset).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let start = ((length - thumb_length) * progress).round();
+    let thumb = if vertical {
+        Rect {
+            y: region.y + start,
+            height: thumb_length,
+            ..region
+        }
+    } else {
+        Rect {
+            x: region.x + start,
+            width: thumb_length,
+            ..region
+        }
+    };
+    Some(ThumbPlacement {
+        region,
+        thumb,
+        max_offset,
+        visible,
+        button,
+    })
 }
 
 // the axes a user can scroll with a wheel or scrollbar; hidden ones scroll only from script
@@ -1502,6 +1846,7 @@ fn user_scroll_axes(layout: &LayoutBox) -> [bool; 2] {
 // what an overflow container clips its content to: the padding box, less any scrollbar, on
 // the axes that clip
 pub(crate) fn overflow_clip_rect(layout: &LayoutBox) -> Rect {
+    // the scrollport is the border box less the bars, which sit inside the border
     const UNCLIPPED: f32 = 1.0e9;
     let scrollport = scrollbar_metrics(layout).scrollport;
     let border = layout.border.widths;
@@ -1513,16 +1858,16 @@ pub(crate) fn overflow_clip_rect(layout: &LayoutBox) -> Rect {
     };
     let (left, right) = if clip_x {
         (
-            scrollport.x.max(rect.x + border.left),
-            (scrollport.x + scrollport.width).min(rect.x + rect.width - border.right),
+            rect.x + border.left,
+            scrollport.x + scrollport.width - border.right,
         )
     } else {
         (-UNCLIPPED, UNCLIPPED)
     };
     let (top, bottom) = if clip_y {
         (
-            scrollport.y.max(rect.y + border.top),
-            (scrollport.y + scrollport.height).min(rect.y + rect.height - border.bottom),
+            rect.y + border.top,
+            scrollport.y + scrollport.height - border.bottom,
         )
     } else {
         (-UNCLIPPED, UNCLIPPED)
@@ -1649,20 +1994,12 @@ fn index_boxes(
 ) {
     let offset = visual_offset_for(layout, ancestor_offset);
     if !layout.tag.starts_with("::") {
-        let content = if layout.is_document() || layout.overflow != Overflow::Visible {
-            layout.scroll_content
-        } else {
-            Size {
-                width: layout.rect.width,
-                height: layout.rect.height,
-            }
-        };
         index.entry(layout.node).or_default().push(BoxGeometry {
             rect: translate_rect(layout.rect, offset),
             border: layout.border.widths,
             position: layout.position,
             scrollport: translate_rect(scrollbar_metrics(layout).scrollport, offset),
-            scroll_size: content,
+            scroll_size: layout.scroll_content,
         });
     }
     // text nodes are measured by the runs they produced
@@ -2094,47 +2431,43 @@ fn thumb_drag_box(
         if !contains_point(track, x, y) {
             continue;
         }
-        let extent = |rect: Rect| if vertical { rect.height } else { rect.width };
-        let viewport_extent = if vertical {
-            metrics.scrollport.height
-        } else {
-            metrics.scrollport.width
+        let Some(placement) = thumb_placement(layout_box, &metrics, vertical) else {
+            continue;
         };
-        let content_extent = if vertical {
-            layout_box.scroll_content.height
+        let region = translate_rect(placement.region, visual_offset);
+        let thumb = translate_rect(placement.thumb, visual_offset);
+        let pointer = if vertical { y } else { x };
+        let (thumb_start, thumb_extent) = if vertical {
+            (thumb.y, thumb.height)
         } else {
-            layout_box.scroll_content.width
+            (thumb.x, thumb.width)
         };
-        let offset_along = if vertical {
-            layout_box.scroll_offset.1
+        let (track_start, track_end) = if vertical {
+            (track.y, track.y + track.height)
         } else {
-            layout_box.scroll_offset.0
+            (track.x, track.x + track.width)
         };
-        let max_offset = (content_extent - viewport_extent).max(0.0);
-        let minimum = 8.0_f32.min(extent(track));
-        let thumb_extent = if content_extent > 0.0 {
-            (extent(track) * (viewport_extent / content_extent).clamp(0.0, 1.0))
-                .max(minimum)
-                .min(extent(track))
-        } else {
-            extent(track)
-        };
-        let travel = (extent(track) - thumb_extent).max(0.0);
-        let progress = if max_offset > 0.0 {
-            (offset_along / max_offset).clamp(0.0, 1.0)
+        let page = if pointer < track_start + placement.button {
+            -40.0
+        } else if pointer >= track_end - placement.button {
+            40.0
+        } else if pointer < thumb_start {
+            -0.875 * placement.visible
+        } else if pointer >= thumb_start + thumb_extent {
+            0.875 * placement.visible
         } else {
             0.0
         };
-        let pointer_along = if vertical { y } else { x } - if vertical { track.y } else { track.x };
         return Some(ThumbDrag {
             node: layout_box.node,
-            track,
+            track: region,
             vertical,
             thumb_extent,
             // where the pointer sits inside the thumb, kept through the drag
-            grab: (pointer_along - travel * progress).clamp(0.0, thumb_extent),
+            grab: pointer - thumb_start,
             offset: layout_box.scroll_offset,
-            max_offset,
+            max_offset: placement.max_offset,
+            page,
         });
     }
     None
@@ -2164,10 +2497,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     // a vertical scrollbar sits between the border and the padding, so the content box gives
     // up its width and the content lays out again
     if user_scroll_axes(&layout)[1]
-        && layout.rect.width > SCROLLBAR_THICKNESS
-        && scrollbar_metrics(&layout).vertical_track.is_some()
+        && let Some(bar) = scrollbar_metrics(&layout).vertical_track
+        && layout.rect.width > bar.width
     {
-        return layout_element_with_gutter(input, SCROLLBAR_THICKNESS);
+        return layout_element_with_gutter(input, bar.width);
     }
     Some(layout)
 }
@@ -2487,20 +2820,20 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let mut text = Vec::new();
     // ::marker, ::placeholder and ::selection style parts of this box; they are cascaded only
     // when some rule names them
-    let pseudo_style = |pseudo: PseudoElement| {
-        stylesheet.styles_pseudo(pseudo).then(|| {
-            stylesheet.style_for(StyleContext {
-                document: node.document,
-                node: node.node,
-                pseudo: Some(pseudo),
-                parent_font_size: font_size,
-                parent_color: style.color,
-                parent_weight: style.font_weight,
-                parent_text: inherited_text(&style),
-                state: style_state,
-            })
+    let part_style = |pseudo: PseudoElement| {
+        stylesheet.style_for(StyleContext {
+            document: node.document,
+            node: node.node,
+            pseudo: Some(pseudo),
+            parent_font_size: font_size,
+            parent_color: style.color,
+            parent_weight: style.font_weight,
+            parent_text: inherited_text(&style),
+            state: style_state,
         })
     };
+    let pseudo_style =
+        |pseudo: PseudoElement| stylesheet.styles_pseudo(pseudo).then(|| part_style(pseudo));
     let control_value = text_control_value(node, style_state);
     let control_placeholder = control_value
         .as_deref()
@@ -2873,6 +3206,37 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             &style_of,
         ))
     });
+    let mut control = control_paint(node, &style, style_state, font_size);
+    if let Some(ControlPaint::Range {
+        fraction,
+        accent,
+        styled,
+        travel,
+        thumb,
+        ..
+    }) = &mut control
+    {
+        if *styled {
+            let (track, start, (length, width)) = slider_parts(
+                node.node,
+                [PseudoElement::SliderTrack, PseudoElement::SliderThumb].map(part_style),
+                Rect {
+                    x: content_x,
+                    y: content_y,
+                    width: content_width,
+                    height: content_height,
+                },
+                (*fraction, *accent),
+                (font_size, style.cursor),
+            );
+            children.push(track);
+            *travel = (start - rect.x, length);
+            *thumb = width;
+        } else {
+            *travel = (content_x - rect.x, (content_width - 16.0).max(0.0));
+            *thumb = 16.0;
+        }
+    }
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -2890,7 +3254,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text,
-        control: control_paint(node, &style, style_state, font_size),
+        control,
         selection: selection_style
             .map(|selection| selection.background)
             .filter(|background| background.alpha > 0),
@@ -2922,6 +3286,13 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg,
+        scrollbar: scrollbar_for(
+            stylesheet,
+            (node.document, node.node),
+            &style,
+            font_size,
+            style_state,
+        ),
         margin,
     };
     // a checked box fills with the accent color, and a checked radio rings with it, unless
@@ -2946,12 +3317,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     }
     apply_relative_offset(&mut layout, style, containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -2968,7 +3334,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     Some(layout)
 }
 
@@ -3096,8 +3462,152 @@ fn anonymous_box(
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        scrollbar: Scrollbar::default(),
         margin: ResolvedEdges::default(),
     }
+}
+
+// a slider or scrollbar part, drawn as a box of its own style that belongs to the element
+pub(crate) fn part_box(
+    node: NodeId,
+    pseudo: PseudoElement,
+    style: &Style,
+    rect: Rect,
+    (font_size, cursor): (f32, Cursor),
+) -> LayoutBox {
+    let mut part = LayoutBox {
+        tag: pseudo.tag().to_string(),
+        background: style.background,
+        backgrounds: style.layers(),
+        radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
+        shadows: resolve_shadows(style.shadows, rect.width, font_size),
+        border: BoxBorder::of(style),
+        visible: style.visibility == Visibility::Visible,
+        ..anonymous_box(node, rect, Vec::new(), (font_size, cursor), style.opacity)
+    };
+    brighten(&mut part, style.brightness);
+    part
+}
+
+// filter: brightness() scales every color a part paints, which matches filtering its pixels
+fn brighten(part: &mut LayoutBox, factor: f32) {
+    if factor == 1.0 {
+        return;
+    }
+    let scale = |color: Color| {
+        let channel = |value: u8| (f32::from(value) * factor).round().clamp(0.0, 255.0) as u8;
+        Color::rgba(
+            channel(color.red),
+            channel(color.green),
+            channel(color.blue),
+            color.alpha,
+        )
+    };
+    part.background = scale(part.background);
+    for layer in &mut part.backgrounds {
+        if let crate::css::LayerImage::Gradient(gradient) = &mut layer.image {
+            for stop in &mut gradient.stops {
+                stop.color = scale(stop.color);
+            }
+        }
+    }
+    part.border.colors = part.border.colors.map(scale);
+    for shadow in &mut part.shadows {
+        shadow.color = scale(shadow.color);
+    }
+}
+
+// the track and thumb of a range input under appearance: none, placed as chromium does: the
+// track centered in the content box, the thumb a child of it that travels its content width;
+// returns the track, where the thumb's travel starts, and the travel and thumb widths
+fn slider_parts(
+    node: NodeId,
+    [track_style, thumb_style]: [Style; 2],
+    content: Rect,
+    (fraction, accent): (f32, Color),
+    (font_size, cursor): (f32, Cursor),
+) -> (LayoutBox, f32, (f32, f32)) {
+    let inset = |style: &Style| {
+        let padding = resolve_edges(style.padding, content.width, font_size);
+        let border = used_border(style);
+        ResolvedEdges {
+            top: padding.top + border.top,
+            right: padding.right + border.right,
+            bottom: padding.bottom + border.bottom,
+            left: padding.left + border.left,
+        }
+    };
+    let border_box = |style: &Style, length: Length, containing: f32, inner: f32| {
+        length
+            .resolve(containing, font_size)
+            .map(|size| match style.box_sizing {
+                crate::css::BoxSizing::BorderBox => size.max(inner),
+                crate::css::BoxSizing::ContentBox => size.max(0.0) + inner,
+            })
+    };
+    let track_inset = inset(&track_style);
+    let track_inner = (content.width - track_inset.left - track_inset.right).max(0.0);
+    let thumb_inset = inset(&thumb_style);
+    // a thumb left at appearance: auto keeps the platform's circle
+    let native_thumb = !thumb_style.appearance_none;
+    let thumb_size = |length: Length, containing: f32, inner: f32| {
+        if native_thumb {
+            16.0
+        } else {
+            border_box(&thumb_style, length, containing, inner).unwrap_or(inner)
+        }
+    };
+    let thumb_width = thumb_size(
+        thumb_style.width,
+        track_inner,
+        thumb_inset.left + thumb_inset.right,
+    );
+    let thumb_height = thumb_size(
+        thumb_style.height,
+        0.0,
+        thumb_inset.top + thumb_inset.bottom,
+    );
+    let track_vertical = track_inset.top + track_inset.bottom;
+    let track_height = border_box(
+        &track_style,
+        track_style.height,
+        content.height,
+        track_vertical,
+    )
+    .unwrap_or(thumb_height + track_vertical);
+    let track = Rect {
+        y: content.y + (content.height - track_height) / 2.0,
+        height: track_height,
+        ..content
+    };
+    let margin = resolve_margins(thumb_style.margin, track_inner, font_size);
+    let start = track.x + track_inset.left + margin.left;
+    let travel = (track_inner - margin.left - margin.right - thumb_width).max(0.0);
+    let mut thumb = part_box(
+        node,
+        PseudoElement::SliderThumb,
+        &thumb_style,
+        Rect {
+            x: start + fraction * travel,
+            y: track.y + track_inset.top + margin.top,
+            width: thumb_width,
+            height: thumb_height,
+        },
+        (font_size, cursor),
+    );
+    if native_thumb {
+        thumb.background = accent;
+        thumb.radii = [(8.0, 8.0); 4];
+    }
+    let mut track = part_box(
+        node,
+        PseudoElement::SliderTrack,
+        &track_style,
+        track,
+        (font_size, cursor),
+    );
+    track.children.push(thumb);
+    (track, start, (travel, thumb_width))
 }
 
 // lays out a run of text at a width, as an anonymous block
@@ -4049,6 +4559,13 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        scrollbar: scrollbar_for(
+            stylesheet,
+            (node.document, node.node),
+            &style,
+            font_size,
+            style_state,
+        ),
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -4066,12 +4583,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -4088,7 +4600,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     layout
 }
 
@@ -4530,6 +5042,13 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        scrollbar: scrollbar_for(
+            stylesheet,
+            (node.document, node.node),
+            &style,
+            font_size,
+            style_state,
+        ),
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -4547,12 +5066,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -4569,7 +5083,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     layout
 }
 
@@ -5252,6 +5766,13 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        scrollbar: scrollbar_for(
+            stylesheet,
+            (node.document, node.node),
+            &style,
+            font_size,
+            style_state,
+        ),
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -5269,12 +5790,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -5291,7 +5807,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     layout
 }
 
@@ -5473,10 +5989,10 @@ fn control_paint(
     style_state: &StyleState,
     font_size: f32,
 ) -> Option<ControlPaint> {
-    if style.appearance_none {
+    let control = control_type(node, style_state)?;
+    if style.appearance_none && !matches!(control, ControlType::Range) {
         return None;
     }
-    let control = control_type(node, style_state)?;
     let element = node.element()?;
     let accent = style.accent_color.unwrap_or(Color::opaque(0, 117, 255));
     let mark = text_color(style);
@@ -5491,22 +6007,22 @@ fn control_paint(
         },
         ControlType::Select(_) => ControlPaint::Select { color: mark },
         ControlType::Range => {
-            let minimum = number_attribute(element, "min").unwrap_or(0.0);
-            let maximum = number_attribute(element, "max")
-                .unwrap_or(100.0)
-                .max(minimum);
-            let value = style_state
-                .control_values
-                .get(&node.node)
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .or_else(|| number_attribute(element, "value"))
-                .unwrap_or((minimum + maximum) / 2.0);
-            let fraction = if maximum > minimum {
-                ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            ControlPaint::Range { fraction, accent }
+            let bounds = RangeBounds::of(element);
+            let value = bounds.sanitize(
+                style_state
+                    .control_values
+                    .get(&node.node)
+                    .map(String::as_str)
+                    .or_else(|| element.attr("value")),
+            );
+            ControlPaint::Range {
+                fraction: bounds.fraction(value) as f32,
+                accent,
+                disabled: style_state.is_disabled(element, node.node),
+                styled: style.appearance_none,
+                travel: (0.0, 0.0),
+                thumb: 0.0,
+            }
         }
         ControlType::Progress => {
             let maximum = number_attribute(element, "max")
@@ -6540,12 +7056,12 @@ fn apply_relative_offset(
     );
 }
 
-fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
+fn finalize_scroll(layout: &mut LayoutBox, padding: ResolvedEdges, style_state: &StyleState) {
     let size = Size {
         width: layout.rect.width,
         height: layout.rect.height,
     };
-    layout.scroll_content = measure_scroll_content(layout, size);
+    layout.scroll_content = measure_scroll_content(layout, padding, size);
     let is_document = layout.is_document();
     // clip never scrolls; hidden scrolls only when script asks
     if !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden) && !is_document {
@@ -6558,7 +7074,7 @@ fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
         width: gutter.width,
         height: gutter.height,
     };
-    layout.scroll_content = measure_scroll_content(layout, floor);
+    layout.scroll_content = measure_scroll_content(layout, padding, floor);
     let scrollport = scrollbar_metrics(layout).scrollport;
     layout.scroll_content.width = layout.scroll_content.width.max(scrollport.width);
     layout.scroll_content.height = layout.scroll_content.height.max(scrollport.height);
@@ -6631,19 +7147,29 @@ fn apply_sticky_descendants(
     }
 }
 
-fn measure_scroll_content(layout: &LayoutBox, floor: Size) -> Size {
+// in border box coordinates, so the extent counts both borders as the scrollport does
+fn measure_scroll_content(layout: &LayoutBox, padding: ResolvedEdges, floor: Size) -> Size {
     let mut right = layout.rect.x + floor.width;
     let mut bottom = layout.rect.y + floor.height;
+    let border = layout.border.widths;
     // rounding in the sums below must not read as overflow
     const SLACK: f32 = 0.01;
     for child in &layout.children {
         if child.position == Position::Fixed {
             continue;
         }
-        right =
-            right.max(child.rect.x + child.visual_offset.0 + child.rect.width + child.margin.right);
-        bottom = bottom
-            .max(child.rect.y + child.visual_offset.1 + child.rect.height + child.margin.bottom);
+        // as in chromium, in-flow margin boxes carry the end padding and border with them,
+        // while an absolutely positioned box reaches only as far as its border box
+        let (end_x, end_y) = if child.position == Position::Absolute {
+            (border.right, border.bottom)
+        } else {
+            (
+                child.margin.right + padding.right + border.right,
+                child.margin.bottom + padding.bottom + border.bottom,
+            )
+        };
+        right = right.max(child.rect.x + child.visual_offset.0 + child.rect.width + end_x);
+        bottom = bottom.max(child.rect.y + child.visual_offset.1 + child.rect.height + end_y);
     }
     let extent = |far: f32, start: f32, size: f32| {
         let measured = far - start;
@@ -8033,13 +8559,14 @@ fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
     (line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0
 }
 
-// the weight, slant, axis settings and optical size a style asks its font for
+// the weight, slant, axis settings, optical size and features a style asks its font for
 fn font_style(style: &Style, font_size: f32) -> FontStyle {
     FontStyle {
         weight: style.font_weight.0,
         italic: style.italic,
         variations: style.font_variations,
         optical_size: optical_size(style.optical_sizing, font_size),
+        features: style.font_features,
     }
 }
 
@@ -8335,6 +8862,97 @@ mod tests {
             "an absolute generated box stretches between its insets"
         );
         assert_eq!(generated.background, Color::opaque(0, 255, 0));
+    }
+
+    #[test]
+    fn a_styled_slider_lays_out_its_track_and_thumb_from_their_rules() {
+        let document = Document::parse_markup(
+            r#"<html><body><input type="range" value="25"><input type="range" style="appearance: auto" value="0"></body></html>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "body { margin: 0 } input { margin: 0; vertical-align: top }
+             input[type=range] { appearance: none; width: 180px; height: 16px }
+             input::-webkit-slider-runnable-track { height: 4px; border-radius: 2px }
+             input::-webkit-slider-thumb { appearance: none; width: 14px; height: 14px;
+                 margin-top: -5px; border: 1px solid #111; background: #404040;
+                 box-shadow: 0 1px 2px #20202080; filter: brightness(2) }",
+        )
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 100.0,
+            },
+        );
+        let mut inputs = Vec::new();
+        fn collect<'a>(layout_box: &'a LayoutBox, found: &mut Vec<&'a LayoutBox>) {
+            if layout_box.tag == "input" {
+                found.push(layout_box);
+            }
+            for child in &layout_box.children {
+                collect(child, found);
+            }
+        }
+        collect(&layout.root, &mut inputs);
+        let [styled, native] = inputs[..] else {
+            panic!("two sliders should lay out, found {}", inputs.len());
+        };
+        assert_eq!(
+            styled.control,
+            Some(ControlPaint::Range {
+                fraction: 0.25,
+                accent: Color::opaque(0, 117, 255),
+                disabled: false,
+                styled: true,
+                travel: (0.0, 166.0),
+                thumb: 14.0,
+            })
+        );
+        let [track] = &styled.children[..] else {
+            panic!("the slider should hold its track");
+        };
+        assert_eq!(track.tag, "::-webkit-slider-runnable-track");
+        assert_eq!(
+            track.rect,
+            Rect {
+                x: 0.0,
+                y: 6.0,
+                width: 180.0,
+                height: 4.0
+            }
+        );
+        let [thumb] = &track.children[..] else {
+            panic!("the track should hold its thumb");
+        };
+        // the thumb travels the track less its own width, and its margin lifts it over the track
+        assert_eq!(
+            thumb.rect,
+            Rect {
+                x: 41.5,
+                y: 1.0,
+                width: 14.0,
+                height: 14.0
+            }
+        );
+        // brightness(2) doubles every color the thumb paints and keeps their alpha
+        assert_eq!(thumb.background, Color::opaque(128, 128, 128));
+        assert_eq!(thumb.border.colors[0], Color::opaque(34, 34, 34));
+        assert_eq!(thumb.shadows[0].color, Color::rgba(64, 64, 64, 128));
+
+        // appearance: auto keeps the platform slider, whose thumb starts at the content edge
+        assert!(native.children.is_empty());
+        assert!(matches!(
+            native.control,
+            Some(ControlPaint::Range {
+                styled: false,
+                travel: (0.0, 164.0),
+                thumb: 16.0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -9167,6 +9785,31 @@ mod tests {
     }
 
     #[test]
+    fn absolute_children_place_against_the_padding_box_of_a_bordered_ancestor() {
+        let document = Document::parse_markup(
+            "<style>body { margin: 0 } .stage { position: relative; width: 100px; height: 50px; border-style: solid; border-width: 3px 7px 2px 5px; padding: 4px } .fill { position: absolute; left: 0; top: 0; width: 100%; height: 100% } .corner { position: absolute; right: 0; bottom: 0; width: 10px; height: 10px }</style><div class='stage'><div class='fill'></div><div class='corner'></div></div><div class='stage' style='display: flex'><div class='fill'></div><div class='corner'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 200.0,
+            },
+        );
+        for stage in &result.root.children[..2] {
+            let top = stage.rect.y;
+            let fill = stage.children[0].rect;
+            let corner = stage.children[1].rect;
+            assert_eq!((fill.x, fill.y - top), (5.0, 3.0));
+            assert_eq!((fill.width, fill.height), (108.0, 58.0));
+            assert_eq!((corner.x, corner.y - top), (103.0, 51.0));
+        }
+    }
+
+    #[test]
     fn hidden_overflow_clips_paint_and_hit_testing() {
         let document = Document::parse_markup(
             "<style>#clip { width: 20px; height: 20px; overflow: hidden; margin: 0; } #child { width: 40px; height: 40px; margin: 0; background: #ff0000; }</style><div id='clip'><div id='child'></div></div>",
@@ -9295,6 +9938,38 @@ mod tests {
     }
 
     #[test]
+    fn scroll_extent_ends_with_the_padding_after_the_children_margin_boxes() {
+        let document = Document::parse_markup(
+            "<style>body { margin: 0 } #scroller { width: 100px; height: 100px; padding: 10px; border: 4px solid red; overflow: auto } #content { width: 300px; height: 300px; margin: 0 7px 5px 0 }</style><div id='scroller'><div id='content'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state
+            .scroll_offsets
+            .insert(document.node_at(&[1]), (1000.0, 1000.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 400.0,
+            },
+            &state,
+        );
+        let scroller = &result.root.children[0];
+        // chromium: scrollWidth 327 and scrollHeight 325 inside the 4px borders, 105px client
+        assert_eq!(
+            scroller.scroll_content,
+            Size {
+                width: 335.0,
+                height: 333.0
+            }
+        );
+        assert_eq!(scroller.scroll_offset, (222.0, 220.0));
+    }
+
+    #[test]
     fn auto_overflow_scrolls_paint_and_hit_testing_with_bounded_offsets() {
         let document = Document::parse_markup(
             "<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='content'></div></div>",
@@ -9333,8 +10008,8 @@ mod tests {
             .scroll_target_at(10.0, 10.0)
             .expect("point should resolve to the scroll container");
         assert_eq!(target.node, document.node_at(&[1]));
-        assert_eq!(target.max_x, 52.0);
-        assert_eq!(target.max_y, 52.0);
+        assert_eq!(target.max_x, 55.0);
+        assert_eq!(target.max_y, 55.0);
         let canvas = result.paint();
         let inside = ((4 * canvas.width() + 10) * 4) as usize;
         let outside = ((4 * canvas.width() + 50) * 4) as usize;
@@ -9346,55 +10021,87 @@ mod tests {
     }
 
     #[test]
-    fn scrollbars_reserve_the_scrollport_and_paint_overflow_tracks() {
-        let document = Document::parse_markup(
-            "<style>#viewport { width: 40px; height: 40px; overflow: auto; margin: 0; } #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }</style><div id='viewport'><div id='content'></div></div>",
-        )
-        .expect("document should parse");
+    fn scrollbars_sit_inside_the_border_in_the_look_their_styles_pick() {
+        let markup = "<style>body { margin: 0; } .box { width: 80px; height: 80px; overflow: auto; border: 2px solid #000; } .box div { width: 160px; height: 120px; background: #f00; } #thin { scrollbar-width: thin; } #color { scrollbar-color: #0f0 #00f; } .wk::-webkit-scrollbar { width: 12px; height: 8px; } .wk::-webkit-scrollbar-thumb { background: #ff0; } .wk::-webkit-scrollbar-thumb:hover { background: #f0f; } .wk::-webkit-scrollbar-track { background: #0ff; } #both { scrollbar-width: thin; } #hidden::-webkit-scrollbar { display: none; } #none { scrollbar-width: none; } #zero::-webkit-scrollbar { width: 0; height: 0; }</style><div class='box' id='native'><div></div></div><div class='box' id='thin'><div></div></div><div class='box' id='color'><div></div></div><div class='box wk' id='wk'><div></div></div><div class='box wk' id='both'><div></div></div><div class='box' id='hidden'><div></div></div><div class='box' id='none'><div></div></div><div class='box' id='zero'><div></div></div>";
+        let document = Document::parse_markup(markup).expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
-        let result = layout(
-            &document,
-            &stylesheet,
-            Size {
-                width: 80.0,
-                height: 80.0,
-            },
-        );
-        let viewport = &result.root.children[0];
-        let metrics = scrollbar_metrics(viewport);
-        assert_eq!(metrics.scrollport.width, 28.0);
-        assert_eq!(metrics.scrollport.height, 28.0);
-        assert_eq!(metrics.vertical_track.unwrap().width, SCROLLBAR_THICKNESS);
+        let viewport = Size {
+            width: 200.0,
+            height: 700.0,
+        };
+        let paint = |state: &StyleState| {
+            let result = layout_with_state(&document, &stylesheet, viewport, state);
+            let canvas = result.paint();
+            (result, canvas)
+        };
+        let (result, canvas) = paint(&StyleState::default());
+        let pixel = |canvas: &crate::paint::Canvas, x: u32, y: u32| {
+            let at = ((y * canvas.width() + x) * 4) as usize;
+            <[u8; 4]>::try_from(&canvas.rgba_pixels()[at..at + 4]).unwrap()
+        };
+        let metrics = |index: usize| scrollbar_metrics(&result.body().children[index]);
+        let tracks = |index: usize| {
+            let metrics = metrics(index);
+            (metrics.vertical_track, metrics.horizontal_track)
+        };
         assert_eq!(
-            metrics.horizontal_track.unwrap().height,
-            SCROLLBAR_THICKNESS
+            tracks(0),
+            (
+                Some(Rect {
+                    x: 67.0,
+                    y: 2.0,
+                    width: 15.0,
+                    height: 65.0
+                }),
+                Some(Rect {
+                    x: 2.0,
+                    y: 67.0,
+                    width: 65.0,
+                    height: 15.0
+                })
+            )
         );
-        let canvas = result.paint();
-        let content = ((4 * canvas.width() + 10) * 4) as usize;
-        let vertical_thumb = ((4 * canvas.width() + 35) * 4) as usize;
-        let horizontal_thumb = ((34 * canvas.width() + 4) * 4) as usize;
-        let vertical_track = ((20 * canvas.width() + 35) * 4) as usize;
-        let horizontal_track = ((34 * canvas.width() + 20) * 4) as usize;
+        assert_eq!(metrics(0).scrollport.width, 69.0);
+        // the native thumb is a 9px pill between the arrow buttons, 3px in from each side
+        let placement = thumb_placement(&result.body().children[0], &metrics(0), true).unwrap();
         assert_eq!(
-            &canvas.rgba_pixels()[content..content + 4],
-            [255, 0, 0, 255]
+            placement.thumb,
+            Rect {
+                x: 70.0,
+                y: 20.0,
+                width: 9.0,
+                height: 16.0
+            }
         );
+        assert_eq!(pixel(&canvas, 10, 10), [255, 0, 0, 255]);
+        assert_eq!(pixel(&canvas, 74, 28), [139, 139, 139, 255]);
+        assert_eq!(pixel(&canvas, 68, 40), [252, 252, 252, 255]);
+        assert_eq!(pixel(&canvas, 74, 74), [252, 252, 252, 255]);
+        assert_eq!(pixel(&canvas, 83, 40), [0, 0, 0, 255]);
+        assert_eq!(tracks(1).0.map(|track| track.width), Some(10.0));
+        assert_eq!(pixel(&canvas, 74, 2 * 84 + 28), [0, 255, 0, 255]);
+        assert_eq!(pixel(&canvas, 68, 2 * 84 + 40), [0, 0, 255, 255]);
+        // webkit parts fill the bar with no buttons, and a corner no rule styles is white
+        let wk = 3 * 84;
         assert_eq!(
-            &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
-            [126, 138, 150, 255]
+            tracks(3).0.map(|track| (track.width, track.height)),
+            Some((12.0, 72.0))
         );
-        assert_eq!(
-            &canvas.rgba_pixels()[horizontal_thumb..horizontal_thumb + 4],
-            [126, 138, 150, 255]
-        );
-        assert_eq!(
-            &canvas.rgba_pixels()[vertical_track..vertical_track + 4],
-            [232, 236, 240, 255]
-        );
-        assert_eq!(
-            &canvas.rgba_pixels()[horizontal_track..horizontal_track + 4],
-            [232, 236, 240, 255]
-        );
+        assert_eq!(pixel(&canvas, 76, wk + 20), [255, 255, 0, 255]);
+        assert_eq!(pixel(&canvas, 76, wk + 60), [0, 255, 255, 255]);
+        assert_eq!(pixel(&canvas, 76, wk + 78), [255, 255, 255, 255]);
+        assert_eq!(tracks(4).0.map(|track| track.width), Some(10.0));
+        for index in 5..8 {
+            assert_eq!(tracks(index), (None, None));
+        }
+        let hovered = StyleState {
+            hovered_part: Some((
+                document.find_element_by_id("wk").unwrap(),
+                PseudoElement::ScrollbarThumb,
+            )),
+            ..StyleState::default()
+        };
+        assert_eq!(pixel(&paint(&hovered).1, 76, wk + 20), [255, 0, 255, 255]);
     }
 
     #[test]

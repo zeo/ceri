@@ -5,7 +5,7 @@ use crate::dom::{AccessibilityNode, Document, NodeId, ScriptSource, StylesheetSo
 use crate::font::FontSet;
 use crate::image::Image;
 use crate::layout::{
-    ImageLayer, LayoutDocument, Size, ThumbDrag, layout_with_state as build_layout,
+    ImageLayer, LayoutDocument, RangeDrag, Size, ThumbDrag, layout_with_state as build_layout,
 };
 use crate::paint::Canvas;
 use crate::script::{
@@ -917,6 +917,8 @@ pub struct Browser {
     local_storage: StorageHandle,
     session_storage: StorageHandle,
     hovered_node: Option<NodeId>,
+    // the scrollbar thumb under the pointer, which ::-webkit-scrollbar-thumb:hover matches
+    hovered_thumb: Option<NodeId>,
     // query container sizes from the last layout, which container queries read
     container_sizes:
         std::cell::RefCell<std::collections::BTreeMap<NodeId, crate::media::ContainerSize>>,
@@ -1035,6 +1037,7 @@ impl Browser {
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_node: None,
+            hovered_thumb: None,
             container_sizes: std::cell::RefCell::default(),
             cursor: crate::css::Cursor::Default,
             transitions: BTreeMap::new(),
@@ -1435,6 +1438,7 @@ impl Browser {
         });
         self.last_navigation_failure = None;
         self.hovered_node = None;
+        self.hovered_thumb = None;
         self.commit_new_document(url, commit);
         if let Some(request) = pending_navigation {
             return self.follow_navigation(request, redirect_depth);
@@ -1879,10 +1883,24 @@ impl Browser {
         } else {
             drag.offset.0
         };
-        let offset = if drag.vertical {
-            (drag.offset.0, offset_along)
+        self.scroll_from_bar(drag, offset_along)
+    }
+
+    // a press on a bar off its thumb scrolls a page or a line toward the pointer
+    pub(crate) fn page_by_bar(&mut self, drag: &ThumbDrag) -> Result<bool, NavigationError> {
+        let along = if drag.vertical {
+            drag.offset.1
         } else {
-            (offset_along, drag.offset.1)
+            drag.offset.0
+        };
+        self.scroll_from_bar(drag, (along + drag.page).clamp(0.0, drag.max_offset))
+    }
+
+    fn scroll_from_bar(&mut self, drag: &ThumbDrag, along: f32) -> Result<bool, NavigationError> {
+        let offset = if drag.vertical {
+            (drag.offset.0, along)
+        } else {
+            (along, drag.offset.1)
         };
         if offset == drag.offset {
             return Ok(false);
@@ -1908,6 +1926,46 @@ impl Browser {
         } else {
             Ok(changed)
         }
+    }
+
+    // a press on a range input starts dragging its thumb, which centers under a press on the
+    // track at once and fires input
+    pub(crate) fn press_range(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<RangeDrag>, NavigationError> {
+        let drag = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?.range_drag_at(x, y)
+        };
+        let Some(mut drag) = drag else {
+            return Ok(None);
+        };
+        let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+        drag.pressed = page.runtime.control_value(drag.node).unwrap_or_default();
+        self.drag_range(&drag, x)?;
+        Ok(Some(drag))
+    }
+
+    pub(crate) fn drag_range(&mut self, drag: &RangeDrag, x: f32) -> Result<bool, NavigationError> {
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let changed = page
+            .runtime
+            .drag_range(drag.node, drag.fraction(x))
+            .map_err(|error| NavigationError::Script(error.to_string()))?;
+        Ok(self.process_pending_navigation()?.is_some() || changed)
+    }
+
+    // the drag ended; change fires if the value moved since the press
+    pub(crate) fn release_range(&mut self, drag: &RangeDrag) -> Result<(), NavigationError> {
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime
+            .release_range(drag.node, &drag.pressed)
+            .map_err(|error| NavigationError::Script(error.to_string()))?;
+        self.process_pending_navigation()?;
+        Ok(())
     }
 
     // a pointer press or drag over a text control or prose moves or extends its selection;
@@ -2142,6 +2200,13 @@ impl Browser {
         let layout = self.layout(viewport)?;
         let node = layout.hit_test(x, y);
         let moved_cursor = (event == "pointermove").then(|| layout.cursor_at(x, y));
+        let thumb_changed = event == "pointermove" && {
+            let thumb = layout
+                .thumb_drag_at(x, y)
+                .filter(|drag| drag.page == 0.0)
+                .map(|drag| drag.node);
+            std::mem::replace(&mut self.hovered_thumb, thumb) != thumb
+        };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime.set_pointer_position(x, y);
         let hover_changed = if event == "pointermove" && self.hovered_node != node {
@@ -2151,7 +2216,7 @@ impl Browser {
                 .map_err(|error| NavigationError::Script(error.to_string()))?;
             true
         } else {
-            false
+            thumb_changed
         };
         if let Some(cursor) = moved_cursor {
             // hover rules can change the cursor, so a hover change reads it from the new styles
@@ -2354,6 +2419,9 @@ impl Browser {
         let document = document.borrow();
         let stylesheet = &page.stylesheet;
         let mut style_state = page.runtime.style_state(self.hovered_node);
+        style_state.hovered_part = self
+            .hovered_thumb
+            .map(|node| (node, crate::css::PseudoElement::ScrollbarThumb));
         style_state.viewport_width = viewport.width;
         style_state.viewport_height = viewport.height;
         style_state.color_scheme = self.preferences.color_scheme;
@@ -5186,6 +5254,38 @@ mod tests {
     }
 
     #[test]
+    fn scroll_sizes_count_end_padding_and_leave_out_borders() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } .scroller { overflow: auto; width: 100px; height: 100px; padding: 10px; border: 4px solid red } .block { width: 300px; height: 300px; margin: 0 7px 5px 0; flex: none } .line { display: inline-block; width: 300px; height: 20px } #plain { width: 50px; height: 20px; border: 3px solid red } #visible { position: relative; width: 50px; height: 20px; padding: 6px; border: 4px solid red } #visible > div { position: absolute; left: 0; top: 0; width: 80px; height: 30px; margin: 0 5px 5px 0 }</style><div class="scroller" id="block"><div class="block"></div></div><div class="scroller" id="flex" style="display: flex"><div class="block"></div></div><div class="scroller" id="line"><span class="line"></span></div><div id="plain"></div><div id="visible"><div></div></div><p id="status">idle</p><script>
+                document.getElementById("status").textContent = ["block", "flex", "line", "plain", "visible"]
+                    .map((id) => {
+                        const box = document.getElementById(id);
+                        return [box.scrollWidth, box.scrollHeight, box.clientWidth, box.clientHeight].join("x");
+                    })
+                    .join(",");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("scroll size page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        // what chromium reports for the same markup
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("327x325x105x105,327x325x105x105,320x105x120x105,50x20x50x20,80x32x62x32")
+        );
+    }
+
+    #[test]
     fn performance_timeline_idle_callbacks_and_event_target_objects() {
         let mut browser = Browser::new(bundle(
             r#"<p id="status">idle</p><script>
@@ -7194,8 +7294,8 @@ A</div>
     fn browser_paints_scrollbars_and_scrolls_from_the_reserved_gutter() {
         let mut browser = Browser::new(bundle(
             r##"<style>
-                #viewport { width: 40px; height: 40px; overflow: auto; margin: 0; }
-                #content { width: 80px; height: 60px; margin: 0; background: #ff0000; }
+                #viewport { width: 80px; height: 80px; overflow: auto; margin: 0; }
+                #content { width: 160px; height: 120px; margin: 0; background: #ff0000; }
             </style>
             <div id="viewport"><div id="content"></div></div>"##,
         ));
@@ -7203,40 +7303,40 @@ A</div>
             .navigate("https://app.ceri.invalid/")
             .expect("scrollbar page should load");
         let viewport = Size {
-            width: 80.0,
-            height: 80.0,
+            width: 120.0,
+            height: 120.0,
         };
         let canvas = browser
             .paint(viewport)
             .expect("scrollbar page should paint");
         let content = ((4 * canvas.width() + 10) * 4) as usize;
-        let vertical_thumb = ((4 * canvas.width() + 35) * 4) as usize;
-        let horizontal_thumb = ((34 * canvas.width() + 4) * 4) as usize;
-        let vertical_track = ((20 * canvas.width() + 35) * 4) as usize;
-        let horizontal_track = ((34 * canvas.width() + 20) * 4) as usize;
+        let vertical_thumb = ((25 * canvas.width() + 72) * 4) as usize;
+        let horizontal_thumb = ((72 * canvas.width() + 24) * 4) as usize;
+        let vertical_track = ((40 * canvas.width() + 66) * 4) as usize;
+        let horizontal_track = ((66 * canvas.width() + 40) * 4) as usize;
         assert_eq!(
             &canvas.rgba_pixels()[content..content + 4],
             [255, 0, 0, 255]
         );
         assert_eq!(
             &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
-            [126, 138, 150, 255]
+            [139, 139, 139, 255]
         );
         assert_eq!(
             &canvas.rgba_pixels()[horizontal_thumb..horizontal_thumb + 4],
-            [126, 138, 150, 255]
+            [139, 139, 139, 255]
         );
         assert_eq!(
             &canvas.rgba_pixels()[vertical_track..vertical_track + 4],
-            [232, 236, 240, 255]
+            [252, 252, 252, 255]
         );
         assert_eq!(
             &canvas.rgba_pixels()[horizontal_track..horizontal_track + 4],
-            [232, 236, 240, 255]
+            [252, 252, 252, 255]
         );
         assert!(
             browser
-                .scroll_at(viewport, 35.0, 20.0, 0.0, 10.0)
+                .scroll_at(viewport, 72.0, 40.0, 0.0, 10.0)
                 .expect("wheel input over the scrollbar should scroll")
         );
         let layout = browser
@@ -7276,11 +7376,11 @@ A</div>
         let vertical_thumb = ((20 * canvas.width() + 115) * 4) as usize;
         assert_eq!(
             &canvas.rgba_pixels()[vertical_track..vertical_track + 4],
-            [232, 236, 240, 255]
+            [252, 252, 252, 255]
         );
         assert_eq!(
             &canvas.rgba_pixels()[vertical_thumb..vertical_thumb + 4],
-            [126, 138, 150, 255]
+            [139, 139, 139, 255]
         );
         assert!(
             browser

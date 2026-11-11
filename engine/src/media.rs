@@ -541,5 +541,14 @@ mod tests {
         assert!(supports("(display: flex) and (not (display: contents))"));
         assert!(!supports("(colour: red)"));
         assert!(supports("selector(a > b) or (display: nonsense)"));
+        assert!(supports(
+            "(font-variant-numeric: tabular-nums slashed-zero) and (font-kerning: none)"
+        ));
+        assert!(supports("(font-feature-settings: 'ss01' on, 'salt' 2)"));
+        assert!(!supports(
+            "(font-variant-numeric: tabular-nums proportional-nums)"
+        ));
+        assert!(!supports("(font-variant-ligatures: fancy)"));
+        assert!(!supports("(font-feature-settings: ss01)"));
     }
 }

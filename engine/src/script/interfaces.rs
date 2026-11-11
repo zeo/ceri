@@ -359,6 +359,7 @@ static INTERFACES: &[Interface] = &[
         parent: "HTMLElement",
         members: &[
             ("value", ReadWrite),
+            ("valueAsNumber", ReadWrite),
             ("defaultValue", ReadWrite),
             ("checked", ReadWrite),
             ("defaultChecked", ReadWrite),

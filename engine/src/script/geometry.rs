@@ -477,17 +477,19 @@ impl ScriptRuntime {
                     return Ok(Some(Value::Number(0.0)));
                 };
                 let border = geometry.border;
-                number(if name == "scrollWidth" {
-                    geometry
-                        .scroll_size
-                        .width
-                        .max((geometry.scrollport.width - border.left - border.right).max(0.0))
-                } else {
-                    geometry
-                        .scroll_size
-                        .height
-                        .max((geometry.scrollport.height - border.top - border.bottom).max(0.0))
-                })
+                // the scroll size and scrollport both span the borders, which scrollWidth leaves out
+                number(
+                    if name == "scrollWidth" {
+                        geometry.scroll_size.width.max(geometry.scrollport.width)
+                            - border.left
+                            - border.right
+                    } else {
+                        geometry.scroll_size.height.max(geometry.scrollport.height)
+                            - border.top
+                            - border.bottom
+                    }
+                    .max(0.0),
+                )
             }
             "offsetWidth" | "offsetHeight" => {
                 let rect = self.bounding_box(node).unwrap_or_default();

@@ -1,6 +1,6 @@
 # builds the small fonts the font tests read: one face drawn here from rectangles, written as
 # TrueType, as OpenType CFF, and as WOFF and WOFF2 wrappings of the TrueType file, and a colour
-# face with COLR layers and a CBDT bitmap
+# face with COLR layers and a CBDT bitmap, and a digits face with tnum, ss01, zero and salt
 #
 #     python engine/tools/test_fonts.py <output directory>
 #
@@ -71,6 +71,45 @@ def build(cff):
     return builder.font
 
 
+def build_features():
+    # digits for the feature tests: tnum widens the one from 300 to 600 units, ss01 swaps it for
+    # a 400 unit one in a lookup listed before tnum's, zero slashes the zero, and salt offers the
+    # slashed zero and the tabular one as the zero's first and second alternates
+    shapes = {
+        ".notdef": [(50, 0, 450, 700)],
+        "space": [],
+        "zero": [(50, 0, 150, 700), (450, 0, 550, 700), (50, 0, 550, 100), (50, 600, 550, 700)],
+        "one": [(100, 0, 200, 700)],
+        "zero.slash": [(50, 0, 150, 700), (450, 0, 550, 700), (50, 0, 550, 100), (50, 600, 550, 700), (250, 300, 350, 400)],
+        "one.tnum": [(250, 0, 350, 700)],
+        "one.alt": [(100, 0, 200, 700), (0, 600, 100, 700)],
+    }
+    advances = {"zero": 600, "one": 300, "zero.slash": 600, "one.tnum": 600, "one.alt": 400, "space": 300}
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder(list(shapes))
+    builder.setupCharacterMap({0x20: "space", 0x30: "zero", 0x31: "one"})
+    glyphs = {}
+    for name, boxes in shapes.items():
+        pen = TTGlyphPen(None)
+        draw(pen, boxes)
+        glyphs[name] = pen.glyph()
+    builder.setupGlyf(glyphs)
+    builder.setupHorizontalMetrics({name: (advances.get(name, 500), 0) for name in shapes})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({"familyName": "Ceri Features", "styleName": "Regular"})
+    builder.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=800, usWinDescent=200, usWeightClass=400)
+    builder.setupPost()
+    builder.addOpenTypeFeatures(
+        "languagesystem DFLT dflt; languagesystem latn dflt;"
+        "lookup ALT { sub one by one.alt; } ALT;"
+        "feature ss01 { lookup ALT; } ss01;"
+        "feature tnum { sub one by one.tnum; } tnum;"
+        "feature zero { sub zero by zero.slash; } zero;"
+        "feature salt { sub zero from [zero.slash one.tnum]; } salt;"
+    )
+    return builder.font
+
+
 def png(width, height, rgba):
     def chunk(tag, data):
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
@@ -131,6 +170,7 @@ def main():
     build(cff=False).save(output / "ceri-test.ttf")
     build(cff=True).save(output / "ceri-test.otf")
     build_color().save(output / "ceri-color.ttf")
+    build_features().save(output / "ceri-features.ttf")
     for flavor in ("woff", "woff2"):
         font = TTFont(output / "ceri-test.ttf")
         font.flavor = flavor

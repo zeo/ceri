@@ -118,6 +118,7 @@ pub struct EngineHost {
     scale: f32,
     selecting: bool,
     selecting_thumb: Option<crate::ThumbDrag>,
+    range_drag: Option<crate::layout::RangeDrag>,
     next_frame: u64,
     dirty: bool,
     // milliseconds of host clock, used to count rapid presses as one series
@@ -493,6 +494,7 @@ impl EngineHost {
             scale,
             selecting: false,
             selecting_thumb: None,
+            range_drag: None,
             next_frame: 1,
             dirty: true,
             clock: 0,
@@ -607,8 +609,9 @@ impl EngineHost {
                 let dispatched = self
                     .browser
                     .dispatch_at(self.viewport, x, y, "pointermove")?;
-                let dragged = match &self.selecting_thumb {
-                    Some(drag) => self.browser.drag_thumb(drag, x, y)?,
+                let dragged = match (&self.selecting_thumb, &self.range_drag) {
+                    (Some(drag), _) => self.browser.drag_thumb(drag, x, y)?,
+                    (_, Some(drag)) => self.browser.drag_range(drag, x)?,
                     _ => false,
                 };
                 let extended =
@@ -650,12 +653,20 @@ impl EngineHost {
                 let thumb_drag = primary
                     .then(|| self.browser.thumb_at(self.viewport, x, y))
                     .flatten();
-                if let Some(drag) = &thumb_drag {
-                    self.selecting_thumb = Some(drag.clone());
+                match &thumb_drag {
+                    Some(drag) if drag.page != 0.0 => {
+                        self.browser.page_by_bar(drag)?;
+                    }
+                    Some(drag) => self.selecting_thumb = Some(drag.clone()),
+                    None => {}
                 }
-                // a press on a scrollbar thumb drags it and leaves the selection alone
+                if primary && thumb_drag.is_none() {
+                    self.range_drag = self.browser.press_range(self.viewport, x, y)?;
+                }
+                let grabbed = thumb_drag.is_some() || self.range_drag.is_some();
+                // a press on a scrollbar thumb or a slider drags it and leaves the selection alone
                 let selected = primary
-                    && thumb_drag.is_none()
+                    && !grabbed
                     && if count >= 2 {
                         self.browser
                             .select_unit_at(self.viewport, x, y, count.min(3))?
@@ -664,19 +675,27 @@ impl EngineHost {
                     };
                 self.selecting = selected;
                 InputResult {
-                    handled: dispatched || thumb_drag.is_some() || selected,
-                    frame_requested: thumb_drag.is_some() || selected,
+                    handled: dispatched || grabbed || selected,
+                    frame_requested: grabbed || selected,
                     ..InputResult::default()
                 }
             }
             InputEvent::PointerUp { x, y, button } => {
                 self.browser.set_pointer_button(button_index(button), false);
-                if button == PointerButton::Primary {
+                let released = if button == PointerButton::Primary {
                     self.selecting = false;
                     self.selecting_thumb = None;
+                    self.range_drag.take()
+                } else {
+                    None
+                };
+                let handled = self.browser.dispatch_at(self.viewport, x, y, "pointerup")?;
+                if let Some(drag) = &released {
+                    self.browser.release_range(drag)?;
                 }
                 InputResult {
-                    handled: self.browser.dispatch_at(self.viewport, x, y, "pointerup")?,
+                    handled: handled || released.is_some(),
+                    frame_requested: released.is_some(),
                     ..InputResult::default()
                 }
             }
@@ -1356,7 +1375,92 @@ mod tests {
     }
 
     #[test]
-    fn dragging_the_scrollbar_thumb_scrolls_with_the_pointer() {
+    fn a_slider_follows_the_pointer_and_the_keys_and_reports_input_then_change() {
+        let mut host = EngineHost::new(
+            Browser::new(bundle(
+                r#"<input type="range" id="slider" style="width: 116px; margin: 0">
+                <p id="log"></p><p id="model"></p><script>
+                    const slider = document.getElementById("slider");
+                    const log = document.getElementById("log");
+                    slider.addEventListener("input", () => { log.textContent += "i" + slider.value + " "; });
+                    slider.addEventListener("change", () => { log.textContent += "c" + slider.value + " "; });
+                    const probe = document.createElement("input");
+                    probe.type = "range";
+                    probe.step = "5";
+                    probe.value = "33.4";
+                    const snapped = probe.value;
+                    probe.valueAsNumber = 71;
+                    document.getElementById("model").textContent =
+                        snapped + " " + probe.value + " " + probe.valueAsNumber + " " + slider.valueAsNumber;
+                </script>"#,
+            )),
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("slider page should load");
+        let text = |host: &EngineHost, id: &str| {
+            let document = host.browser().document().expect("document should exist");
+            let node = document
+                .borrow()
+                .find_element_by_id(id)
+                .expect("element should exist");
+            document
+                .borrow()
+                .element_text_content(node)
+                .unwrap_or_default()
+        };
+        assert_eq!(text(&host, "model"), "35 70 70 50");
+        let press = |x: f32| InputEvent::PointerDown {
+            x,
+            y: 8.0,
+            button: PointerButton::Primary,
+        };
+        let release = |x: f32| InputEvent::PointerUp {
+            x,
+            y: 8.0,
+            button: PointerButton::Primary,
+        };
+
+        // the thumb's center travels from x 8 to 108, so a press on the track at 83 jumps to 75
+        assert!(host.input(press(83.0)).expect("press").frame_requested);
+        host.input(InputEvent::PointerMove { x: 33.0, y: 40.0 })
+            .expect("drag");
+        host.input(release(33.0)).expect("release");
+        assert_eq!(text(&host, "log"), "i75 i25 c25 ");
+
+        // a press on the thumb keeps the pointer's offset in it instead of jumping
+        host.input(press(30.0)).expect("thumb press");
+        host.input(InputEvent::PointerMove { x: 50.0, y: 8.0 })
+            .expect("thumb drag");
+        host.input(release(50.0)).expect("thumb release");
+        assert_eq!(text(&host, "log"), "i75 i25 c25 i45 c45 ");
+
+        // the press focused the slider, so the keys step it
+        for key in ["ArrowRight", "PageDown", "End", "End"] {
+            host.input(InputEvent::KeyDown {
+                key: key.to_string(),
+            })
+            .expect("key should be accepted");
+        }
+        assert_eq!(
+            text(&host, "log"),
+            "i75 i25 c25 i45 c45 i46 c46 i36 c36 i100 c100 "
+        );
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("slider page should layout");
+        assert!(matches!(
+            layout.body().children[0].control,
+            Some(crate::layout::ControlPaint::Range { fraction, .. }) if fraction == 1.0
+        ));
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_thumb_scrolls_and_the_track_and_buttons_page() {
         let browser = Browser::new(bundle(
             r#"<style>
                 #viewport { width: 60px; height: 60px; overflow: auto; margin: 0; }
@@ -1373,42 +1477,64 @@ mod tests {
         );
         host.navigate("https://app.ceri.invalid/")
             .expect("scrollbar page should load");
-
-        // the vertical thumb sits at the top of the track beside the viewport
-        let press = InputEvent::PointerDown {
-            x: 53.0,
-            y: 5.0,
-            button: PointerButton::Primary,
+        let offset = |host: &EngineHost| {
+            host.browser()
+                .layout(host.viewport())
+                .expect("page should layout")
+                .body()
+                .children[0]
+                .scroll_offset
+                .1
         };
-        let pressed = host.input(press).expect("thumb press should be accepted");
-        assert!(pressed.handled, "pressing the thumb should start a drag");
+        let press = |host: &mut EngineHost, y: f32| {
+            let pressed = host
+                .input(InputEvent::PointerDown {
+                    x: 52.0,
+                    y,
+                    button: PointerButton::Primary,
+                })
+                .expect("bar press should be accepted");
+            assert!(pressed.handled && pressed.frame_requested);
+            host.input(InputEvent::PointerUp {
+                x: 52.0,
+                y,
+                button: PointerButton::Primary,
+            })
+            .expect("release should be accepted");
+        };
 
-        // dragging down by half the track pulls the content with the pointer
-        let drag = InputEvent::PointerMove { x: 53.0, y: 20.0 };
-        let moved = host.input(drag).expect("thumb drag should be accepted");
-        assert!(moved.handled, "dragging should scroll");
-        assert!(moved.frame_requested);
-        let layout = host
-            .browser()
-            .layout(host.viewport())
-            .expect("dragged page should layout");
-        let offset = layout.body().children[0].scroll_offset.1;
-        assert!(
-            offset > 5.0,
-            "a downward drag should scroll down, got {offset}"
-        );
-
-        // releasing ends the drag so later moves stop scrolling
-        host.input(InputEvent::PointerUp {
-            x: 53.0,
+        // the 15px bar has a 15px arrow button at each end, and the 8px thumb starts 3px
+        // below the top one, at y 18, sliding 16px for 240px of scrolling
+        host.input(InputEvent::PointerDown {
+            x: 52.0,
             y: 20.0,
             button: PointerButton::Primary,
         })
+        .expect("thumb press should be accepted");
+        let moved = host
+            .input(InputEvent::PointerMove { x: 52.0, y: 30.0 })
+            .expect("thumb drag should be accepted");
+        assert!(moved.handled && moved.frame_requested);
+        assert_eq!(offset(&host), 150.0);
+        host.input(InputEvent::PointerUp {
+            x: 52.0,
+            y: 30.0,
+            button: PointerButton::Primary,
+        })
         .expect("release should be accepted");
-        let idle = host
-            .input(InputEvent::PointerMove { x: 53.0, y: 40.0 })
+        host.input(InputEvent::PointerMove { x: 52.0, y: 40.0 })
             .expect("post-release move should be accepted");
-        assert!(!idle.handled, "moving after release should not scroll");
+        assert_eq!(offset(&host), 150.0, "a move after release does not drag");
+
+        // the track below the thumb pages by 0.875 of the 60px view, the down arrow by a line
+        press(&mut host, 40.0);
+        assert_eq!(offset(&host), 202.5);
+        press(&mut host, 55.0);
+        assert_eq!(offset(&host), 240.0);
+        press(&mut host, 22.0);
+        assert_eq!(offset(&host), 187.5);
+        press(&mut host, 5.0);
+        assert_eq!(offset(&host), 147.5);
     }
 
     #[test]

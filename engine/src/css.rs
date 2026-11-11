@@ -369,6 +369,13 @@ impl Position {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollbarWidth {
+    Auto,
+    Thin,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Overflow {
     Visible,
     Hidden,
@@ -860,6 +867,7 @@ pub(crate) struct InheritedText {
     pub(crate) border_spacing: (f32, f32),
     pub(crate) caption_bottom: bool,
     pub(crate) accent_color: Option<Color>,
+    pub(crate) scrollbar_color: Option<(Color, Color)>,
     pub(crate) text_align: TextAlign,
     // a factor of the font size, or a length an ancestor already turned into pixels
     pub(crate) line_height: Length,
@@ -872,6 +880,7 @@ pub(crate) struct InheritedText {
     pub(crate) italic: bool,
     pub(crate) font_variations: crate::font::FontVariations,
     pub(crate) optical_sizing: bool,
+    pub(crate) font_features: crate::font::FontFeatures,
     pub(crate) decoration: TextDecoration,
     pub(crate) svg: crate::svg::Presentation,
 }
@@ -893,6 +902,7 @@ impl Default for InheritedText {
             border_spacing: (0.0, 0.0),
             caption_bottom: false,
             accent_color: None,
+            scrollbar_color: None,
             text_align: TextAlign::Start,
             line_height: Length::Auto,
             space_collapse: SpaceCollapse::Collapse,
@@ -903,6 +913,7 @@ impl Default for InheritedText {
             italic: false,
             font_variations: crate::font::FontVariations::default(),
             optical_sizing: true,
+            font_features: crate::font::FontFeatures::default(),
             decoration: TextDecoration::default(),
             svg: crate::svg::Presentation::default(),
         }
@@ -925,6 +936,7 @@ pub(crate) fn inherited_text(style: &Style) -> InheritedText {
         border_spacing: style.border_spacing,
         caption_bottom: style.caption_bottom,
         accent_color: style.accent_color,
+        scrollbar_color: style.scrollbar_color,
         text_align: style.text_align,
         line_height: style.line_height,
         space_collapse: style.space_collapse,
@@ -935,6 +947,7 @@ pub(crate) fn inherited_text(style: &Style) -> InheritedText {
         italic: style.italic,
         font_variations: style.font_variations,
         optical_sizing: style.optical_sizing,
+        font_features: style.font_features,
         decoration: style.text_decoration,
         svg: style.svg,
     }
@@ -1099,6 +1112,8 @@ pub(crate) struct TransitionState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StyleState {
     pub(crate) hovered: Option<NodeId>,
+    // a scrollbar or slider part under the pointer, which its :hover rules match
+    pub(crate) hovered_part: Option<(NodeId, PseudoElement)>,
     pub(crate) focused: Option<NodeId>,
     pub(crate) focus_visible: bool,
     // the element the primary pointer button is pressed on
@@ -1144,7 +1159,7 @@ impl StyleState {
         }
     }
 
-    fn is_disabled(&self, element: &Element, node: NodeId) -> bool {
+    pub(crate) fn is_disabled(&self, element: &Element, node: NodeId) -> bool {
         self.disabled.contains(&node) || element.attrs.contains_key("disabled")
     }
 }
@@ -1324,6 +1339,11 @@ pub(crate) struct Style {
     pub accent_color: Option<Color>,
     // appearance: none, which draws a control as a plain box
     pub appearance_none: bool,
+    // the thumb and track colors, none for the platform's
+    pub scrollbar_color: Option<(Color, Color)>,
+    pub scrollbar_width: ScrollbarWidth,
+    // the product of the filter's brightness() functions; other filter functions are not drawn
+    pub brightness: f32,
     // horizontal and vertical
     pub border_spacing: (f32, f32),
     pub caption_bottom: bool,
@@ -1355,6 +1375,7 @@ pub(crate) struct Style {
     pub font_variations: crate::font::FontVariations,
     // font-optical-sizing auto
     pub optical_sizing: bool,
+    pub font_features: crate::font::FontFeatures,
     // the lines this element and its ancestors draw through its text, and its text shadow
     pub text_decoration: TextDecoration,
     pub text_overflow_ellipsis: bool,
@@ -1501,6 +1522,9 @@ impl Style {
             border_collapse: parent_text.border_collapse,
             accent_color: parent_text.accent_color,
             appearance_none: false,
+            scrollbar_color: parent_text.scrollbar_color,
+            scrollbar_width: ScrollbarWidth::Auto,
+            brightness: 1.0,
             border_spacing: parent_text.border_spacing,
             caption_bottom: parent_text.caption_bottom,
             table_fixed: false,
@@ -1532,6 +1556,7 @@ impl Style {
             italic: parent_text.italic,
             font_variations: parent_text.font_variations,
             optical_sizing: parent_text.optical_sizing,
+            font_features: parent_text.font_features,
             text_decoration: parent_text.decoration,
             text_overflow_ellipsis: false,
             border: [BorderSide::INITIAL; 4],
@@ -2948,6 +2973,7 @@ struct CompoundSelector {
     attributes: Vec<AttributeSelector>,
     pseudo_classes: Vec<PseudoClass>,
     pseudo_element: Option<PseudoElement>,
+    part_hover: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2959,6 +2985,14 @@ pub(crate) enum PseudoElement {
     // the highlight behind selected text
     Selection,
     Marker,
+    // the parts of an input type=range, which draw only under appearance: none
+    SliderTrack,
+    SliderThumb,
+    // the parts of a scrollbar; ::-webkit-scrollbar itself sizes the bars
+    Scrollbar,
+    ScrollbarTrack,
+    ScrollbarThumb,
+    ScrollbarCorner,
     // a pseudo-element the engine does not draw, such as ::placeholder; its rules parse and
     // never apply
     Unrendered,
@@ -2972,8 +3006,26 @@ impl PseudoElement {
             Self::Placeholder => "::placeholder",
             Self::Selection => "::selection",
             Self::Marker => "::marker",
+            Self::SliderTrack => "::-webkit-slider-runnable-track",
+            Self::SliderThumb => "::-webkit-slider-thumb",
+            Self::Scrollbar => "::-webkit-scrollbar",
+            Self::ScrollbarTrack => "::-webkit-scrollbar-track",
+            Self::ScrollbarThumb => "::-webkit-scrollbar-thumb",
+            Self::ScrollbarCorner => "::-webkit-scrollbar-corner",
             Self::Unrendered => "::unrendered",
         }
+    }
+
+    pub(crate) fn is_control_part(self) -> bool {
+        matches!(
+            self,
+            Self::SliderTrack
+                | Self::SliderThumb
+                | Self::Scrollbar
+                | Self::ScrollbarTrack
+                | Self::ScrollbarThumb
+                | Self::ScrollbarCorner
+        )
     }
 }
 
@@ -3237,6 +3289,8 @@ impl Selector {
             return false;
         };
         last.compound.pseudo_element == pseudo
+            && (!last.compound.part_hover
+                || pseudo.is_some_and(|part| state.hovered_part == Some((node, part))))
             && self.matches_part(self.parts.len() - 1, document, node, state)
     }
 
@@ -3362,7 +3416,9 @@ impl CompoundSelector {
                 });
         Specificity(
             u32::from(self.id.is_some()) + pseudo_specificity.0,
-            (self.classes.len() + self.attributes.len()) as u32 + pseudo_specificity.1,
+            (self.classes.len() + self.attributes.len()) as u32
+                + u32::from(self.part_hover)
+                + pseudo_specificity.1,
             u32::from(self.tag.is_some())
                 + u32::from(self.pseudo_element.is_some())
                 + pseudo_specificity.2,
@@ -3593,6 +3649,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
         attributes: Vec::new(),
         pseudo_classes: Vec::new(),
         pseudo_element: None,
+        part_hover: false,
     };
     let start = *cursor;
     while *cursor < source.len() {
@@ -3620,6 +3677,12 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                     }
                     "selection" | "-moz-selection" => Some(PseudoElement::Selection),
                     "marker" => Some(PseudoElement::Marker),
+                    "-webkit-slider-runnable-track" => Some(PseudoElement::SliderTrack),
+                    "-webkit-slider-thumb" => Some(PseudoElement::SliderThumb),
+                    "-webkit-scrollbar" => Some(PseudoElement::Scrollbar),
+                    "-webkit-scrollbar-track" => Some(PseudoElement::ScrollbarTrack),
+                    "-webkit-scrollbar-thumb" => Some(PseudoElement::ScrollbarThumb),
+                    "-webkit-scrollbar-corner" => Some(PseudoElement::ScrollbarCorner),
                     "backdrop"
                     | "first-line"
                     | "first-letter"
@@ -3646,6 +3709,15 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 }
                 if double {
                     return Err(format!("unsupported pseudo element: ::{name}"));
+                }
+                // :hover after a part names the hovered part, not the hovered element
+                if name == "hover"
+                    && selector
+                        .pseudo_element
+                        .is_some_and(PseudoElement::is_control_part)
+                {
+                    selector.part_hover = true;
+                    continue;
                 }
                 let functional = source.as_bytes().get(*cursor) == Some(&b'(');
                 let pseudo = if name == "not" {
@@ -4658,6 +4730,30 @@ fn drop_or_fail(dropped: Option<&mut Vec<String>>, error: String) -> Result<(), 
     }
 }
 
+// none, or a list of filter functions whose brightness() factors multiply
+fn parse_brightness(value: &str) -> Option<f32> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Some(1.0);
+    }
+    let mut brightness = 1.0;
+    for word in split_words(value) {
+        let Some(argument) = word
+            .strip_prefix("brightness(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let argument = argument.trim();
+        let factor = match argument.strip_suffix('%') {
+            Some(percent) => parse_number(percent)? / 100.0,
+            None if argument.is_empty() => 1.0,
+            None => parse_number(argument)?,
+        };
+        brightness *= factor.max(0.0);
+    }
+    Some(brightness)
+}
+
 fn parse_container_type(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "size" => Some(true),
@@ -4694,6 +4790,7 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
             style.italic = from.italic;
             style.font_variations = from.font_variations;
             style.optical_sizing = from.optical_sizing;
+            style.font_features = from.font_features;
             style.line_height = from.line_height;
             style.line_height_absolute = from.line_height_absolute;
         }
@@ -4703,6 +4800,10 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "font-style" => style.italic = from.italic,
         "font-variation-settings" => style.font_variations = from.font_variations,
         "font-optical-sizing" => style.optical_sizing = from.optical_sizing,
+        "font-variant-ligatures" => style.font_features.ligatures = from.font_features.ligatures,
+        "font-variant-numeric" => style.font_features.numeric = from.font_features.numeric,
+        "font-kerning" => style.font_features.no_kerning = from.font_features.no_kerning,
+        "font-feature-settings" => style.font_features.settings = from.font_features.settings,
         "line-height" => {
             style.line_height = from.line_height;
             style.line_height_absolute = from.line_height_absolute;
@@ -4734,6 +4835,7 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "border-spacing" => style.border_spacing = from.border_spacing,
         "caption-side" => style.caption_bottom = from.caption_bottom,
         "accent-color" => style.accent_color = from.accent_color,
+        "scrollbar-color" => style.scrollbar_color = from.scrollbar_color,
         "white-space" => {
             style.space_collapse = from.space_collapse;
             style.wrap = from.wrap;
@@ -4824,6 +4926,7 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
     style.font_weight = FontWeight::NORMAL;
     style.font_variations = crate::font::FontVariations::default();
     style.optical_sizing = true;
+    style.font_features = crate::font::FontFeatures::default();
     style.line_height = Length::Auto;
     style.line_height_absolute = false;
     for word in &words[..size_index] {
@@ -4853,6 +4956,8 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "-webkit-app-region",
     "accent-color",
     "app-region",
+    "scrollbar-color",
+    "scrollbar-width",
     "fill",
     "fill-opacity",
     "fill-rule",
@@ -4881,6 +4986,10 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "font-style",
     "font-variation-settings",
     "font-optical-sizing",
+    "font-variant-ligatures",
+    "font-variant-numeric",
+    "font-kerning",
+    "font-feature-settings",
     "direction",
     "word-wrap",
     "overflow-wrap",
@@ -5077,6 +5186,13 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "static" | "relative" | "absolute" | "fixed" | "sticky"
         ),
+        "font-variant-ligatures" => crate::font::parse_variant_ligatures(value).is_some(),
+        "font-variant-numeric" => crate::font::parse_variant_numeric(value).is_some(),
+        "font-kerning" => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "auto" | "normal" | "none"
+        ),
+        "font-feature-settings" => crate::font::parse_feature_settings(value).is_some(),
         _ => true,
     }
 }
@@ -5293,6 +5409,7 @@ select { padding: 1px 20px 1px 4px; text-align: start; background-color: white }
 input[type="checkbox" i], input[type="radio" i] { width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; background-color: white }
 input[type="radio" i] { border-radius: 50%; margin: 3px 3px 0 5px }
 input[type="range" i] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; background-color: transparent }
+input[type="range" i]::-webkit-slider-runnable-track, input[type="range" i]::-webkit-slider-thumb { display: block; box-sizing: border-box }
 input[type="color" i] { width: 50px; height: 27px; padding: 1px 2px; border: 1px solid #767676; border-radius: 2px; background-color: #efefef }
 input[type="file" i] { padding: 0; border: none }
 progress { width: 10em; height: 1em; border-radius: 0.5em; background-color: #efefef; border: 1px solid #c0c0c0; overflow: hidden }
@@ -5533,6 +5650,27 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 parse_color(value).or(style.accent_color)
             };
         }
+        "scrollbar-color" => {
+            let words = split_words(value);
+            match words.as_slice() {
+                [auto] if auto.eq_ignore_ascii_case("auto") => style.scrollbar_color = None,
+                [thumb, track] => {
+                    if let (Some(thumb), Some(track)) = (parse_color(thumb), parse_color(track)) {
+                        style.scrollbar_color = Some((thumb, track));
+                    }
+                }
+                _ => {}
+            }
+        }
+        "scrollbar-width" => {
+            style.scrollbar_width = match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => ScrollbarWidth::Auto,
+                "thin" => ScrollbarWidth::Thin,
+                "none" => ScrollbarWidth::None,
+                _ => style.scrollbar_width,
+            };
+        }
+        "filter" => style.brightness = parse_brightness(value).unwrap_or(style.brightness),
         "container-type" => style.container_type = parse_container_type(value),
         "container-name" => style.container_name = parse_container_name(value),
         "container" => {
@@ -5772,6 +5910,26 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             "none" => style.optical_sizing = false,
             _ => {}
         },
+        "font-variant-ligatures" => {
+            if let Some(ligatures) = crate::font::parse_variant_ligatures(value) {
+                style.font_features.ligatures = ligatures;
+            }
+        }
+        "font-variant-numeric" => {
+            if let Some(numeric) = crate::font::parse_variant_numeric(value) {
+                style.font_features.numeric = numeric;
+            }
+        }
+        "font-kerning" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "normal" => style.font_features.no_kerning = false,
+            "none" => style.font_features.no_kerning = true,
+            _ => {}
+        },
+        "font-feature-settings" => {
+            if let Some(settings) = crate::font::parse_feature_settings(value) {
+                style.font_features.settings = settings;
+            }
+        }
         "font" => apply_font_shorthand(style, value),
         "flex-direction" => {
             if let Some(direction) = parse_flex_direction(value) {
@@ -7377,6 +7535,130 @@ mod tests {
             crate::font::FontVariations::default()
         );
         assert!(emphasis.optical_sizing);
+    }
+
+    #[test]
+    fn font_feature_properties_inherit_one_by_one_and_the_font_shorthand_resets_them() {
+        let stylesheet = Stylesheet::parse(
+            "p { font-variant-numeric: tabular-nums; font-variant-ligatures: none;
+                 font-kerning: none; font-feature-settings: 'ss01' }
+             em { font-variant-numeric: initial; font-feature-settings: 'tnum' 0, 'zero' }
+             b { font: 12px mono; font-variant-numeric: oldstyle-nums }
+             i { font-variant-numeric: tabular-nums tabular-nums; font-kerning: sideways }",
+        )
+        .expect("stylesheet should parse");
+        let style = |tag: &str, parent: Option<&Style>| {
+            let element = Element::new(tag);
+            let placed = placed(&element, &[]);
+            stylesheet.style_for(StyleContext {
+                parent_text: parent.map_or(InheritedText::default(), inherited_text),
+                ..context(&placed, &StyleState::default())
+            })
+        };
+        let paragraph = style("p", None);
+        let expected = crate::font::FontFeatures {
+            ligatures: crate::font::parse_variant_ligatures("none").expect("ligatures"),
+            numeric: crate::font::parse_variant_numeric("tabular-nums").expect("numeric"),
+            no_kerning: true,
+            settings: crate::font::parse_feature_settings("\"ss01\" 1").expect("settings"),
+        };
+        assert_eq!(paragraph.font_features, expected);
+        let emphasis = style("em", Some(&paragraph));
+        assert_eq!(
+            emphasis.font_features,
+            crate::font::FontFeatures {
+                numeric: 0,
+                settings: crate::font::parse_feature_settings("'tnum' off, 'zero' on")
+                    .expect("settings"),
+                ..expected
+            }
+        );
+        let bold = style("b", Some(&paragraph));
+        assert_eq!(
+            bold.font_features,
+            crate::font::FontFeatures {
+                numeric: crate::font::parse_variant_numeric("oldstyle-nums").expect("numeric"),
+                ..crate::font::FontFeatures::default()
+            }
+        );
+        // invalid values leave the inherited ones
+        assert_eq!(style("i", Some(&paragraph)).font_features, expected);
+    }
+
+    #[test]
+    fn control_parts_cascade_with_their_own_hover() {
+        let stylesheet = Stylesheet::parse(
+            "input::-webkit-slider-thumb { width: 14px; filter: drop-shadow(0 0 1px red) brightness(150%) }
+             input:hover::-webkit-slider-thumb { filter: brightness(1.15) }
+             div::-webkit-scrollbar-thumb { background: #111 }
+             div::-webkit-scrollbar-thumb:hover { background: #575757 }
+             div { scrollbar-color: #c33 #333; scrollbar-width: thin }
+             div::-moz-progress-bar { width: 99px }",
+        )
+        .expect("stylesheet should parse");
+        let slider = placed(&Element::new("input"), &[]);
+        let thumb = |state: &StyleState| {
+            stylesheet.style_for(StyleContext {
+                pseudo: Some(PseudoElement::SliderThumb),
+                ..context(&slider, state)
+            })
+        };
+        let resting = thumb(&StyleState::default());
+        assert_eq!(resting.width, Length::px(14.0));
+        assert!((resting.brightness - 1.5).abs() < 1e-6);
+        let hovered = thumb(&StyleState {
+            hovered: Some(slider.1),
+            ..StyleState::default()
+        });
+        assert!((hovered.brightness - 1.15).abs() < 1e-6);
+
+        let scroller = placed(&Element::new("div"), &[]);
+        let part = |pseudo: PseudoElement, hovered_part: Option<PseudoElement>| {
+            stylesheet.style_for(StyleContext {
+                pseudo: Some(pseudo),
+                ..context(
+                    &scroller,
+                    &StyleState {
+                        hovered: Some(scroller.1),
+                        hovered_part: hovered_part.map(|part| (scroller.1, part)),
+                        ..StyleState::default()
+                    },
+                )
+            })
+        };
+        let thumb = PseudoElement::ScrollbarThumb;
+        assert_eq!(part(thumb, None).background, Color::opaque(17, 17, 17));
+        // hovering the element, or another of its parts, leaves the thumb at rest
+        assert_eq!(
+            part(thumb, Some(PseudoElement::ScrollbarTrack)).background,
+            Color::opaque(17, 17, 17)
+        );
+        assert_eq!(
+            part(thumb, Some(thumb)).background,
+            Color::opaque(87, 87, 87)
+        );
+        // other vendor parts stay unrendered rather than styling the scrollbar
+        assert_eq!(part(PseudoElement::Scrollbar, None).width, Length::Auto);
+
+        let style = stylesheet.style_for(context(&scroller, &StyleState::default()));
+        assert_eq!(
+            style.scrollbar_color,
+            Some((Color::opaque(204, 51, 51), Color::opaque(51, 51, 51)))
+        );
+        assert_eq!(style.scrollbar_width, ScrollbarWidth::Thin);
+        assert_eq!(style.brightness, 1.0);
+        assert!(!stylesheet.styles_pseudo(PseudoElement::ScrollbarCorner));
+        // the inherited thumb and track colors reach the children of a scroller
+        let child = placed(&Element::new("p"), &[&Element::new("div")]);
+        let inherited = stylesheet.style_for(StyleContext {
+            parent_text: InheritedText {
+                scrollbar_color: style.scrollbar_color,
+                ..InheritedText::default()
+            },
+            ..context(&child, &StyleState::default())
+        });
+        assert_eq!(inherited.scrollbar_color, style.scrollbar_color);
+        assert_eq!(inherited.scrollbar_width, ScrollbarWidth::Auto);
     }
 
     #[test]
