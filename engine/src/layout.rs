@@ -876,6 +876,17 @@ struct ContainingBlock {
     height: f32,
 }
 
+// absolutely positioned descendants place and size themselves against the padding box
+fn padding_block(layout: &LayoutBox) -> ContainingBlock {
+    let border = layout.border.widths;
+    ContainingBlock {
+        x: layout.rect.x + border.left,
+        y: layout.rect.y + border.top,
+        width: (layout.rect.width - border.left - border.right).max(0.0),
+        height: (layout.rect.height - border.top - border.bottom).max(0.0),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LayoutMode {
     Flow,
@@ -3314,12 +3325,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     }
     apply_relative_offset(&mut layout, style, containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -4585,12 +4591,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -5073,12 +5074,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -5802,12 +5798,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
-    let positioned_block = ContainingBlock {
-        x: layout.rect.x,
-        y: layout.rect.y,
-        width: layout.rect.width,
-        height: layout.rect.height,
-    };
+    let positioned_block = padding_block(&layout);
     append_positioned_nodes(
         &mut layout.children,
         positioned,
@@ -9789,6 +9780,31 @@ mod tests {
         let overlay = &wrapper.children[0];
         assert_eq!(overlay.node, document.node_at(&[1, 0, 0]));
         assert_eq!(overlay.rect.y, 80.0);
+    }
+
+    #[test]
+    fn absolute_children_place_against_the_padding_box_of_a_bordered_ancestor() {
+        let document = Document::parse_markup(
+            "<style>body { margin: 0 } .stage { position: relative; width: 100px; height: 50px; border-style: solid; border-width: 3px 7px 2px 5px; padding: 4px } .fill { position: absolute; left: 0; top: 0; width: 100%; height: 100% } .corner { position: absolute; right: 0; bottom: 0; width: 10px; height: 10px }</style><div class='stage'><div class='fill'></div><div class='corner'></div></div><div class='stage' style='display: flex'><div class='fill'></div><div class='corner'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 200.0,
+            },
+        );
+        for stage in &result.root.children[..2] {
+            let top = stage.rect.y;
+            let fill = stage.children[0].rect;
+            let corner = stage.children[1].rect;
+            assert_eq!((fill.x, fill.y - top), (5.0, 3.0));
+            assert_eq!((fill.width, fill.height), (108.0, 58.0));
+            assert_eq!((corner.x, corner.y - top), (103.0, 51.0));
+        }
     }
 
     #[test]
