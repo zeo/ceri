@@ -1,6 +1,6 @@
 use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
 use crate::commands::{CommandRoutes, Commands};
-use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone};
+use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
@@ -231,7 +231,10 @@ fn build_browser(
     .with_clipboard_provider(Rc::new(DesktopClipboard))
     .with_time_zone(Rc::new(DesktopTimeZone))
     .with_file_picker(Rc::new(DesktopFilePicker));
-    Ok(browser)
+    Ok(match user_locale() {
+        Some(locale) => browser.with_locale(locale),
+        None => browser,
+    })
 }
 
 // the packaged favicon becomes the window and taskbar icon

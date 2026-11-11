@@ -31,6 +31,18 @@ impl TimeZone for DesktopTimeZone {
     }
 }
 
+// the user's region setting as a BCP 47 tag, so Intl formats dates and numbers the way the OS does
+pub fn user_locale() -> Option<String> {
+    platform::user_locale()
+}
+
+// turns a POSIX locale such as en_GB.UTF-8@euro into en-GB
+#[cfg(any(not(target_os = "windows"), test))]
+fn posix_locale_tag(value: &str) -> Option<String> {
+    let name = value.split(['.', '@']).next()?;
+    (!name.is_empty() && name != "C" && name != "POSIX").then(|| name.replace('_', "-"))
+}
+
 pub struct DesktopFilePicker;
 
 impl FilePicker for DesktopFilePicker {
@@ -84,6 +96,7 @@ fn read_selection(path: &Path) -> Result<FileSelection, NavigationError> {
 mod platform {
     use std::path::PathBuf;
     use windows::Win32::Foundation::{FILETIME, GlobalFree, HANDLE, HGLOBAL, SYSTEMTIME};
+    use windows::Win32::Globalization::GetUserDefaultLocaleName;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
         OpenClipboard, SetClipboardData,
@@ -145,6 +158,14 @@ mod platform {
             (i64::from(local_file.dwHighDateTime) << 32) | i64::from(local_file.dwLowDateTime);
         // whole milliseconds were dropped from the round trip, so compare at minute precision
         ((local_ticks - ticks) as f64 / 600_000_000.0).round() as i32
+    }
+
+    pub(super) fn user_locale() -> Option<String> {
+        // LOCALE_NAME_MAX_LENGTH, the terminator included
+        let mut name = [0u16; 85];
+        // SAFETY: the buffer outlives the call and its length bounds the write
+        let length = unsafe { GetUserDefaultLocaleName(&mut name) };
+        (length > 1).then(|| String::from_utf16_lossy(&name[..length as usize - 1]))
     }
 
     pub(super) fn zone_name(utc_milliseconds: f64) -> Option<String> {
@@ -410,6 +431,13 @@ mod platform {
         None
     }
 
+    pub(super) fn user_locale() -> Option<String> {
+        ["LC_ALL", "LC_TIME", "LANG"]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+            .and_then(|value| super::posix_locale_tag(&value))
+    }
+
     pub(super) fn read_clipboard_text() -> Result<String, String> {
         Err("the desktop clipboard adapter currently covers Windows only".to_string())
     }
@@ -428,8 +456,17 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopClipboard, DesktopFilePicker};
+    use super::{DesktopClipboard, DesktopFilePicker, posix_locale_tag, user_locale};
     use ceri_engine::{ClipboardProvider, FilePickerRequest};
+
+    #[test]
+    fn locales_come_out_as_bcp_47_tags() {
+        assert_eq!(posix_locale_tag("en_GB.UTF-8").as_deref(), Some("en-GB"));
+        assert_eq!(posix_locale_tag("de_DE@euro").as_deref(), Some("de-DE"));
+        assert_eq!(posix_locale_tag("C.UTF-8"), None);
+        assert_eq!(posix_locale_tag("POSIX"), None);
+        assert!(user_locale().is_none_or(|tag| !tag.is_empty() && !tag.contains('_')));
+    }
 
     #[test]
     fn clipboard_round_trips_text_on_the_host() {

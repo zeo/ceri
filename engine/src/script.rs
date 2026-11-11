@@ -568,6 +568,8 @@ pub struct ScriptRuntime {
     // wall-clock milliseconds when the page clock started
     time_origin: f64,
     time_zone: Rc<dyn dates::TimeZone>,
+    // the locale Intl and navigator.language fall back to
+    locale: String,
     host_runtime_info: Option<HostRuntimeInfo>,
     bridge: Option<Box<bridge::BridgeState>>,
     module_cache: BTreeMap<String, ModuleNamespace>,
@@ -1578,6 +1580,7 @@ impl ScriptRuntime {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0.0, |elapsed| elapsed.as_millis() as f64),
             time_zone: Rc::new(dates::Utc),
+            locale: "en-US".to_string(),
             host_runtime_info,
             module_cache: BTreeMap::new(),
             workers: Vec::new(),
@@ -1980,6 +1983,10 @@ impl ScriptRuntime {
 
     pub(crate) fn set_time_zone(&mut self, time_zone: Rc<dyn dates::TimeZone>) {
         self.time_zone = time_zone;
+    }
+
+    pub(crate) fn set_locale(&mut self, locale: String) {
+        self.locale = locale;
     }
 
     pub(crate) fn set_file_picker(&mut self, file_picker: Option<Rc<dyn FilePicker>>) {
@@ -3465,6 +3472,10 @@ impl ScriptRuntime {
             },
             Value::Navigator => match property {
                 "clipboard" => Ok(Value::Clipboard),
+                "language" => Ok(Value::String(self.locale.as_str().into())),
+                "languages" => Ok(Value::Array(Rc::new(RefCell::new(vec![Value::String(
+                    self.locale.as_str().into(),
+                )])))),
                 _ => Err(runtime_error(format!(
                     "navigator has no property {property}"
                 ))),
@@ -19180,6 +19191,42 @@ mod tests {
                 .style_property(created, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn intl_and_navigator_default_to_the_host_locale() {
+        let document = document("<main><p id='status'>idle</p></main>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let before = "new Date(Date.UTC(2026, 0, 2, 15, 4, 5)).toLocaleString()";
+        runtime
+            .execute(&format!(
+                "document.getElementById('status').dataset.before = {before};"
+            ))
+            .expect("default locale formats");
+        runtime.set_locale("en-GB".to_string());
+        runtime
+            .execute(&format!(
+                r##"
+                const date = new Date(Date.UTC(2026, 0, 2, 15, 4, 5));
+                document.getElementById("status").textContent = [
+                    document.getElementById("status").dataset.before,
+                    {before},
+                    date.toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit" }}),
+                    new Intl.NumberFormat().resolvedOptions().locale,
+                    navigator.language,
+                    navigator.languages.join(),
+                ].join("|");
+                "##
+            ))
+            .expect("host locale formats");
+        let status = document
+            .borrow()
+            .find_element_by_selector("#status")
+            .expect("status");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("1/2/2026, 3:04:05 PM|02/01/2026, 15:04:05|15:04|en-GB|en-GB|en-GB")
         );
     }
 

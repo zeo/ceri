@@ -848,6 +848,7 @@ pub struct Browser {
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     time_zone: Option<Rc<dyn crate::TimeZone>>,
+    locale: Option<String>,
     last_navigation_failure: Option<NavigationFailure>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
@@ -965,6 +966,7 @@ impl Browser {
             file_picker: None,
             clipboard_provider: None,
             time_zone: None,
+            locale: None,
             last_navigation_failure: None,
             page: None,
             current_url: None,
@@ -1024,6 +1026,12 @@ impl Browser {
     // the local time zone scripts see through Date; without one, local time is UTC
     pub fn with_time_zone(mut self, time_zone: Rc<dyn crate::TimeZone>) -> Self {
         self.time_zone = Some(time_zone);
+        self
+    }
+
+    // the default locale for Intl and navigator.language; without one, en-US
+    pub fn with_locale(mut self, locale: String) -> Self {
+        self.locale = Some(locale);
         self
     }
 
@@ -1323,6 +1331,9 @@ impl Browser {
         }
         if let Some(time_zone) = &self.time_zone {
             runtime.set_time_zone(time_zone.clone());
+        }
+        if let Some(locale) = &self.locale {
+            runtime.set_locale(locale.clone());
         }
         runtime.set_viewport_metrics(self.viewport);
         let (parsed_stylesheet, dropped_rules) = Stylesheet::parse_recovering(&stylesheet);
@@ -2781,6 +2792,9 @@ impl Browser {
                 runtime.set_clipboard_provider(self.clipboard_provider.clone());
                 if let Some(time_zone) = &self.time_zone {
                     runtime.set_time_zone(time_zone.clone());
+                }
+                if let Some(locale) = &self.locale {
+                    runtime.set_locale(locale.clone());
                 }
                 runtime.set_viewport_metrics(self.viewport);
                 runtime.set_layout_inputs(layout_inputs.clone());

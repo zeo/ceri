@@ -307,22 +307,6 @@ fn time_text(local: f64, offset: i32, zone: Option<String>) -> String {
 }
 
 // the en-US formats toLocaleString uses: 1/15/2024, 3:04:05 PM
-fn locale_date(local: f64) -> String {
-    let p = parts(local);
-    format!("{}/{}/{}", p.month as i64 + 1, p.date as i64, p.year as i64)
-}
-
-fn locale_time(local: f64) -> String {
-    let p = parts(local);
-    let hour = p.hours as i64 % 12;
-    let hour = if hour == 0 { 12 } else { hour };
-    let meridiem = if p.hours < 12.0 { "AM" } else { "PM" };
-    format!(
-        "{hour}:{:02}:{:02} {meridiem}",
-        p.minutes as i64, p.seconds as i64
-    )
-}
-
 // ---- parsing ----
 
 fn digits(text: &[u8], position: &mut usize, count: usize) -> Option<f64> {
@@ -890,35 +874,25 @@ impl ScriptRuntime {
                 if time.is_nan() {
                     return Ok(Value::String("Invalid Date".into()));
                 }
-                if matches!(
-                    method,
-                    M::ToLocaleString | M::ToLocaleDateString | M::ToLocaleTimeString
-                ) && !arguments.is_empty()
-                {
-                    let mut options =
-                        self.date_options(&argument(&arguments, 0), &argument(&arguments, 1))?;
-                    if options.is_empty() {
-                        options.fill_defaults(
-                            matches!(method, M::ToLocaleString | M::ToLocaleDateString),
-                            matches!(method, M::ToLocaleString | M::ToLocaleTimeString),
-                        );
-                    }
-                    return Ok(Value::String(
-                        self.format_date_with(&options, &this)?.into(),
-                    ));
-                }
-                let local = self.local(time);
                 let text = match method {
-                    M::ToDateString => date_text(local),
+                    M::ToDateString => date_text(self.local(time)),
                     M::ToTimeString => time_text(
-                        local,
+                        self.local(time),
                         self.time_zone.offset_minutes(time),
                         self.time_zone.name(time),
                     ),
                     M::ToUtcString => utc_string(time),
-                    M::ToLocaleDateString => locale_date(local),
-                    M::ToLocaleTimeString => locale_time(local),
-                    _ => format!("{}, {}", locale_date(local), locale_time(local)),
+                    _ => {
+                        let mut options =
+                            self.date_options(&argument(&arguments, 0), &argument(&arguments, 1))?;
+                        if options.is_empty() {
+                            options.fill_defaults(
+                                matches!(method, M::ToLocaleString | M::ToLocaleDateString),
+                                matches!(method, M::ToLocaleString | M::ToLocaleTimeString),
+                            );
+                        }
+                        self.format_date_with(&options, &this)?
+                    }
                 };
                 Ok(Value::String(text.into()))
             }

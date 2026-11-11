@@ -773,11 +773,11 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 impl ScriptRuntime {
     fn locale_argument(&mut self, value: &Value) -> Result<String, ScriptError> {
         Ok(match value {
-            Value::Undefined => "en-US".to_string(),
+            Value::Undefined => self.locale.clone(),
             Value::String(text) => text.to_string(),
             Value::Array(list) => match list.borrow().first() {
                 Some(Value::String(text)) => text.to_string(),
-                _ => "en-US".to_string(),
+                _ => self.locale.clone(),
             },
             other => self.coerce_string(other.clone())?,
         })
@@ -1109,7 +1109,10 @@ impl ScriptRuntime {
                             }),
                         ),
                     ],
-                    _ => vec![("locale".to_string(), Value::String("en-US".into()))],
+                    _ => vec![(
+                        "locale".to_string(),
+                        Value::String(self.locale.as_str().into()),
+                    )],
                 };
                 Ok(self.object_from_entries(entries))
             }
