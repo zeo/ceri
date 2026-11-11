@@ -4,6 +4,7 @@ use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_
 use crate::files::FileScope;
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
+use crate::tray::{Tray, TrayConfig, TrayEvent};
 use ceri_engine::{
     APP_ORIGIN, AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost,
     ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, NavigationError,
@@ -26,6 +27,7 @@ const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 pub struct AppHandle {
     control: Arc<OnceLock<WindowControl>>,
     files: FileScope,
+    tray: Arc<OnceLock<Tray>>,
 }
 
 impl AppHandle {
@@ -41,6 +43,11 @@ impl AppHandle {
     // the folders pages may load files from, allowed and revoked at any time
     pub fn files(&self) -> &FileScope {
         &self.files
+    }
+
+    // the notification area icon the app asked for, there from before the loop runs
+    pub fn tray(&self) -> Option<&Tray> {
+        self.tray.get()
     }
 
     // an event for every window's listeners
@@ -73,7 +80,10 @@ pub struct App {
     version: Option<String>,
     lifecycle: Lifecycle,
     handle: AppHandle,
+    tray: Option<TrayRequest>,
 }
+
+type TrayRequest = (TrayConfig, Box<dyn Fn(&AppHandle, TrayEvent) + Send + Sync>);
 
 impl App {
     pub fn new() -> Self {
@@ -100,6 +110,17 @@ impl App {
     // what app:version answers pages with
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
+        self
+    }
+
+    // an icon in the notification area with a native menu; events arrive on the loop's thread
+    // on Windows and on a tray thread elsewhere
+    pub fn tray(
+        mut self,
+        config: TrayConfig,
+        on_event: impl Fn(&AppHandle, TrayEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.tray = Some((config, Box::new(on_event)));
         self
     }
 
@@ -209,6 +230,7 @@ impl App {
             self.windows,
             self.lifecycle,
             self.handle,
+            self.tray,
         )
     }
 }
@@ -278,6 +300,7 @@ fn run_app(
     windows: Vec<WindowConfig>,
     lifecycle: Lifecycle,
     handle: AppHandle,
+    tray: Option<TrayRequest>,
 ) -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let launch = launch::resolve(
@@ -288,7 +311,10 @@ fn run_app(
     let storage = profile.join("storage");
     let allowed = allowed_origins(&arguments)?;
     let assets = launch.assets.clone();
-    let icon = app_icon(launch.assets.as_ref());
+    let icon_source = app_icon_source(launch.assets.as_ref());
+    let icon = icon_source
+        .as_deref()
+        .and_then(|source| ceri_engine::rasterize_icon(source, 64));
     let windows = match windows.is_empty() && !lifecycle.keep_running {
         true => vec![WindowConfig {
             title: "Ceri".to_string(),
@@ -328,7 +354,21 @@ fn run_app(
             .join()
             .map_err(|_| "the capture stopped with a panic".to_string())?;
     }
-    run_window_with(
+    if let Some((config, on_event)) = tray {
+        let events = handle.clone();
+        let config = TrayConfig {
+            icon: config.icon.or(icon_source),
+            ..config
+        };
+        let tray = Tray::create(
+            identifier,
+            config,
+            Box::new(move |event| on_event(&events, event)),
+        );
+        let _ = handle.tray.set(tray);
+    }
+    let tray = handle.tray.clone();
+    let result = run_window_with(
         windows,
         move |window| {
             handle.attach(&window.control);
@@ -341,7 +381,11 @@ fn run_app(
             )
         },
         lifecycle,
-    )
+    );
+    if let Some(tray) = tray.get() {
+        tray.remove();
+    }
+    result
 }
 
 // a start URL that is a path means one under the app origin
@@ -438,8 +482,8 @@ fn build_browser(
     })
 }
 
-// the packaged favicon becomes the window and taskbar icon
-fn app_icon(assets: &AssetOrigin) -> Option<(Vec<u8>, u32)> {
+// the bytes of the first packaged favicon that decodes, for the window, taskbar and tray icons
+fn app_icon_source(assets: &AssetOrigin) -> Option<Vec<u8>> {
     for candidate in [
         "/web/favicon.svg",
         "/web/favicon.png",
@@ -456,8 +500,8 @@ fn app_icon(assets: &AssetOrigin) -> Option<(Vec<u8>, u32)> {
             continue;
         };
         let source = fs::read(&asset.path).ok()?;
-        if let Some(icon) = ceri_engine::rasterize_icon(&source, 64) {
-            return Some(icon);
+        if ceri_engine::rasterize_icon(&source, 16).is_some() {
+            return Some(source);
         }
     }
     None
