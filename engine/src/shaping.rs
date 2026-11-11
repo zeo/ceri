@@ -1,5 +1,5 @@
-// glyph selection and positioning from a font's OpenType tables: GSUB single, multiple and
-// ligature substitutions (directly, through extensions, and from chained contexts), Arabic
+// glyph selection and positioning from a font's OpenType tables: GSUB single, multiple,
+// alternate and ligature substitutions (directly, through extensions, and from chained contexts), Arabic
 // joining forms, and GPOS pair kerning with the legacy kern table as a fallback
 
 use crate::font::FontFace;
@@ -109,15 +109,20 @@ fn class_of(data: &[u8], table: usize, glyph: u16) -> u16 {
     lookup().unwrap_or(0)
 }
 
+const MAX_FEATURE_LOOKUPS: usize = 4096;
+
+// a feature tag and the value it is set to
+type Feature = ([u8; 4], u32);
+
 // the lookups, in lookup list order, that a script's default language system turns on for the
-// features asked for
+// features asked for, each with the feature tag and value that turned it on
 fn feature_lookups(
     data: &[u8],
     table: usize,
     scripts: &[&[u8; 4]],
-    features: &[&[u8; 4]],
-) -> Vec<(u16, [u8; 4])> {
-    let find = || -> Option<Vec<(u16, [u8; 4])>> {
+    features: &[Feature],
+) -> Vec<(u16, Feature)> {
+    let find = || -> Option<Vec<(u16, Feature)>> {
         let script_list = table + usize::from(u16_at(data, table + 4)?);
         let feature_list = table + usize::from(u16_at(data, table + 6)?);
         let script_count = usize::from(u16_at(data, script_list)?);
@@ -143,13 +148,13 @@ fn feature_lookups(
             let feature = usize::from(u16_at(data, language + 6 + index * 2)?);
             let record = feature_list + 2 + feature * 6;
             let tag = data.get(record..record + 4)?;
-            let Some(wanted) = features.iter().find(|wanted| wanted.as_slice() == tag) else {
+            let Some(wanted) = features.iter().find(|(wanted, _)| wanted.as_slice() == tag) else {
                 continue;
             };
             let feature_table = feature_list + usize::from(u16_at(data, record + 4)?);
             let lookup_count = usize::from(u16_at(data, feature_table + 2)?);
-            for lookup in 0..lookup_count {
-                lookups.push((u16_at(data, feature_table + 4 + lookup * 2)?, **wanted));
+            for lookup in 0..lookup_count.min(MAX_FEATURE_LOOKUPS - lookups.len()) {
+                lookups.push((u16_at(data, feature_table + 4 + lookup * 2)?, *wanted));
             }
         }
         lookups.sort_unstable_by_key(|(index, _)| *index);
@@ -222,8 +227,10 @@ impl<'a> Shaper<'a> {
         flag & 0x0008 != 0 && self.is_mark(glyph)
     }
 
-    // shapes characters in logical order; the glyphs come back in logical order too
-    pub(crate) fn shape(&self, characters: &[char], ligatures: bool) -> Vec<ShapedGlyph> {
+    // shapes characters in logical order with the default features set by the overrides in
+    // order, zero turning one off and higher values picking alternates; the glyphs come back in
+    // logical order too
+    pub(crate) fn shape(&self, characters: &[char], overrides: &[Feature]) -> Vec<ShapedGlyph> {
         let mut glyphs = characters
             .iter()
             .enumerate()
@@ -239,21 +246,26 @@ impl<'a> Shaper<'a> {
         if arabic {
             assign_forms(characters, &mut glyphs);
         }
+        let mut features = [*b"ccmp", *b"locl", *b"liga", *b"clig", *b"calt", *b"kern"]
+            .map(|tag| (tag, 1))
+            .to_vec();
+        if arabic {
+            features.extend([*b"isol", *b"init", *b"medi", *b"fina", *b"rlig"].map(|tag| (tag, 1)));
+        }
+        for &(tag, value) in overrides {
+            features.retain(|(known, _)| *known != tag);
+            if value != 0 {
+                features.push((tag, value));
+            }
+        }
         if let Some(gsub) = self.face.table(b"GSUB") {
             let scripts: &[&[u8; 4]] = if arabic {
                 &[b"arab", b"DFLT", b"latn"]
             } else {
                 &[b"latn", b"DFLT", b"cyrl", b"grek"]
             };
-            let mut features: Vec<&[u8; 4]> = vec![b"ccmp", b"locl"];
-            if arabic {
-                features.extend([b"isol", b"init", b"medi", b"fina", b"rlig"]);
-            }
-            if ligatures {
-                features.extend([b"liga", b"clig", b"calt"]);
-            }
             for (lookup, feature) in feature_lookups(self.data, gsub, scripts, &features) {
-                self.substitute(gsub, lookup, &feature, &mut glyphs);
+                self.substitute(gsub, lookup, feature, &mut glyphs);
                 if glyphs.len() > MAX_SHAPED_GLYPHS {
                     break;
                 }
@@ -268,15 +280,23 @@ impl<'a> Shaper<'a> {
                 cluster: glyph.cluster,
             })
             .collect::<Vec<_>>();
-        self.kern(&mut shaped, arabic);
+        if features.iter().any(|(tag, _)| tag == b"kern") {
+            self.kern(&mut shaped, arabic);
+        }
         shaped
     }
 
-    fn substitute(&self, gsub: usize, lookup: u16, feature: &[u8; 4], glyphs: &mut Vec<Glyph>) {
+    fn substitute(
+        &self,
+        gsub: usize,
+        lookup: u16,
+        (feature, value): Feature,
+        glyphs: &mut Vec<Glyph>,
+    ) {
         let Some((kind, flag, subtables)) = lookup_subtables(self.data, gsub, lookup, 7) else {
             return;
         };
-        let wanted_form = match feature {
+        let wanted_form = match &feature {
             b"isol" => Some(Form::Isolated),
             b"init" => Some(Form::Initial),
             b"medi" => Some(Form::Medial),
@@ -294,7 +314,7 @@ impl<'a> Shaper<'a> {
             let mut applied = false;
             for &subtable in &subtables {
                 if let Some(advance) =
-                    self.apply_substitution(gsub, kind, flag, subtable, glyphs, index)
+                    self.apply_substitution(gsub, (kind, flag, value), subtable, glyphs, index)
                 {
                     index += advance;
                     applied = true;
@@ -307,12 +327,12 @@ impl<'a> Shaper<'a> {
         }
     }
 
-    // applies one substitution subtable at a position; returns how far to move on
+    // applies one substitution subtable of a lookup's kind and flag, for a feature value, at a
+    // position; returns how far to move on
     fn apply_substitution(
         &self,
         gsub: usize,
-        kind: u16,
-        flag: u16,
+        (kind, flag, value): (u16, u16, u32),
         subtable: usize,
         glyphs: &mut Vec<Glyph>,
         index: usize,
@@ -356,6 +376,21 @@ impl<'a> Shaper<'a> {
                 glyphs.splice(index..=index, replacement);
                 Some(length.max(1))
             }
+            // the value picks an alternate from one, as harfbuzz does, and out of range picks none
+            3 => {
+                let covered = coverage(
+                    data,
+                    subtable + usize::from(u16_at(data, subtable + 2)?),
+                    glyph,
+                )?;
+                let set = subtable + usize::from(u16_at(data, subtable + 6 + covered * 2)?);
+                let count = u32::from(u16_at(data, set)?);
+                if value == 0 || value > count {
+                    return None;
+                }
+                glyphs[index].id = u16_at(data, set + 2 * value as usize)?;
+                Some(1)
+            }
             4 => {
                 let covered = coverage(
                     data,
@@ -393,7 +428,7 @@ impl<'a> Shaper<'a> {
                 }
                 None
             }
-            6 => self.chained_context(gsub, subtable, glyphs, index),
+            6 => self.chained_context(gsub, value, subtable, glyphs, index),
             _ => None,
         }
     }
@@ -403,6 +438,7 @@ impl<'a> Shaper<'a> {
     fn chained_context(
         &self,
         gsub: usize,
+        value: u32,
         subtable: usize,
         glyphs: &mut Vec<Glyph>,
         index: usize,
@@ -455,7 +491,13 @@ impl<'a> Shaper<'a> {
                     if kind != 6
                         && index + position < glyphs.len()
                         && self
-                            .apply_substitution(gsub, kind, flag, nested, glyphs, index + position)
+                            .apply_substitution(
+                                gsub,
+                                (kind, flag, value),
+                                nested,
+                                glyphs,
+                                index + position,
+                            )
                             .is_some()
                     {
                         break;
@@ -475,7 +517,7 @@ impl<'a> Shaper<'a> {
             } else {
                 &[b"latn", b"DFLT"]
             };
-            let lookups = feature_lookups(data, gpos, scripts, &[b"kern"]);
+            let lookups = feature_lookups(data, gpos, scripts, &[(*b"kern", 1)]);
             if !lookups.is_empty() {
                 for (lookup, _) in lookups {
                     let Some((kind, flag, subtables)) = lookup_subtables(data, gpos, lookup, 9)

@@ -756,6 +756,7 @@ impl InlineContext {
             italic: self.text.italic,
             variations: self.text.font_variations,
             optical_size: optical_size(self.text.optical_sizing, self.font_size),
+            features: self.text.font_features,
         }
     }
 }
@@ -8033,13 +8034,14 @@ fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
     (line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0
 }
 
-// the weight, slant, axis settings and optical size a style asks its font for
+// the weight, slant, axis settings, optical size and features a style asks its font for
 fn font_style(style: &Style, font_size: f32) -> FontStyle {
     FontStyle {
         weight: style.font_weight.0,
         italic: style.italic,
         variations: style.font_variations,
         optical_size: optical_size(style.optical_sizing, font_size),
+        features: style.font_features,
     }
 }
 

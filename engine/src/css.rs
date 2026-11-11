@@ -871,6 +871,7 @@ pub(crate) struct InheritedText {
     pub(crate) italic: bool,
     pub(crate) font_variations: crate::font::FontVariations,
     pub(crate) optical_sizing: bool,
+    pub(crate) font_features: crate::font::FontFeatures,
     pub(crate) decoration: TextDecoration,
     pub(crate) svg: crate::svg::Presentation,
 }
@@ -901,6 +902,7 @@ impl Default for InheritedText {
             italic: false,
             font_variations: crate::font::FontVariations::default(),
             optical_sizing: true,
+            font_features: crate::font::FontFeatures::default(),
             decoration: TextDecoration::default(),
             svg: crate::svg::Presentation::default(),
         }
@@ -932,6 +934,7 @@ pub(crate) fn inherited_text(style: &Style) -> InheritedText {
         italic: style.italic,
         font_variations: style.font_variations,
         optical_sizing: style.optical_sizing,
+        font_features: style.font_features,
         decoration: style.text_decoration,
         svg: style.svg,
     }
@@ -1349,6 +1352,7 @@ pub(crate) struct Style {
     pub font_variations: crate::font::FontVariations,
     // font-optical-sizing auto
     pub optical_sizing: bool,
+    pub font_features: crate::font::FontFeatures,
     // the lines this element and its ancestors draw through its text, and its text shadow
     pub text_decoration: TextDecoration,
     pub text_overflow_ellipsis: bool,
@@ -1525,6 +1529,7 @@ impl Style {
             italic: parent_text.italic,
             font_variations: parent_text.font_variations,
             optical_sizing: parent_text.optical_sizing,
+            font_features: parent_text.font_features,
             text_decoration: parent_text.decoration,
             text_overflow_ellipsis: false,
             border: [BorderSide::INITIAL; 4],
@@ -4687,6 +4692,7 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
             style.italic = from.italic;
             style.font_variations = from.font_variations;
             style.optical_sizing = from.optical_sizing;
+            style.font_features = from.font_features;
             style.line_height = from.line_height;
             style.line_height_absolute = from.line_height_absolute;
         }
@@ -4696,6 +4702,10 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "font-style" => style.italic = from.italic,
         "font-variation-settings" => style.font_variations = from.font_variations,
         "font-optical-sizing" => style.optical_sizing = from.optical_sizing,
+        "font-variant-ligatures" => style.font_features.ligatures = from.font_features.ligatures,
+        "font-variant-numeric" => style.font_features.numeric = from.font_features.numeric,
+        "font-kerning" => style.font_features.no_kerning = from.font_features.no_kerning,
+        "font-feature-settings" => style.font_features.settings = from.font_features.settings,
         "line-height" => {
             style.line_height = from.line_height;
             style.line_height_absolute = from.line_height_absolute;
@@ -4816,6 +4826,7 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
     style.font_weight = FontWeight::NORMAL;
     style.font_variations = crate::font::FontVariations::default();
     style.optical_sizing = true;
+    style.font_features = crate::font::FontFeatures::default();
     style.line_height = Length::Auto;
     style.line_height_absolute = false;
     for word in &words[..size_index] {
@@ -4871,6 +4882,10 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "font-style",
     "font-variation-settings",
     "font-optical-sizing",
+    "font-variant-ligatures",
+    "font-variant-numeric",
+    "font-kerning",
+    "font-feature-settings",
     "direction",
     "word-wrap",
     "overflow-wrap",
@@ -5067,6 +5082,13 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "static" | "relative" | "absolute" | "fixed" | "sticky"
         ),
+        "font-variant-ligatures" => crate::font::parse_variant_ligatures(value).is_some(),
+        "font-variant-numeric" => crate::font::parse_variant_numeric(value).is_some(),
+        "font-kerning" => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "auto" | "normal" | "none"
+        ),
+        "font-feature-settings" => crate::font::parse_feature_settings(value).is_some(),
         _ => true,
     }
 }
@@ -5757,6 +5779,26 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             "none" => style.optical_sizing = false,
             _ => {}
         },
+        "font-variant-ligatures" => {
+            if let Some(ligatures) = crate::font::parse_variant_ligatures(value) {
+                style.font_features.ligatures = ligatures;
+            }
+        }
+        "font-variant-numeric" => {
+            if let Some(numeric) = crate::font::parse_variant_numeric(value) {
+                style.font_features.numeric = numeric;
+            }
+        }
+        "font-kerning" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "normal" => style.font_features.no_kerning = false,
+            "none" => style.font_features.no_kerning = true,
+            _ => {}
+        },
+        "font-feature-settings" => {
+            if let Some(settings) = crate::font::parse_feature_settings(value) {
+                style.font_features.settings = settings;
+            }
+        }
         "font" => apply_font_shorthand(style, value),
         "flex-direction" => {
             if let Some(direction) = parse_flex_direction(value) {
@@ -7362,6 +7404,54 @@ mod tests {
             crate::font::FontVariations::default()
         );
         assert!(emphasis.optical_sizing);
+    }
+
+    #[test]
+    fn font_feature_properties_inherit_one_by_one_and_the_font_shorthand_resets_them() {
+        let stylesheet = Stylesheet::parse(
+            "p { font-variant-numeric: tabular-nums; font-variant-ligatures: none;
+                 font-kerning: none; font-feature-settings: 'ss01' }
+             em { font-variant-numeric: initial; font-feature-settings: 'tnum' 0, 'zero' }
+             b { font: 12px mono; font-variant-numeric: oldstyle-nums }
+             i { font-variant-numeric: tabular-nums tabular-nums; font-kerning: sideways }",
+        )
+        .expect("stylesheet should parse");
+        let style = |tag: &str, parent: Option<&Style>| {
+            let element = Element::new(tag);
+            let placed = placed(&element, &[]);
+            stylesheet.style_for(StyleContext {
+                parent_text: parent.map_or(InheritedText::default(), inherited_text),
+                ..context(&placed, &StyleState::default())
+            })
+        };
+        let paragraph = style("p", None);
+        let expected = crate::font::FontFeatures {
+            ligatures: crate::font::parse_variant_ligatures("none").expect("ligatures"),
+            numeric: crate::font::parse_variant_numeric("tabular-nums").expect("numeric"),
+            no_kerning: true,
+            settings: crate::font::parse_feature_settings("\"ss01\" 1").expect("settings"),
+        };
+        assert_eq!(paragraph.font_features, expected);
+        let emphasis = style("em", Some(&paragraph));
+        assert_eq!(
+            emphasis.font_features,
+            crate::font::FontFeatures {
+                numeric: 0,
+                settings: crate::font::parse_feature_settings("'tnum' off, 'zero' on")
+                    .expect("settings"),
+                ..expected
+            }
+        );
+        let bold = style("b", Some(&paragraph));
+        assert_eq!(
+            bold.font_features,
+            crate::font::FontFeatures {
+                numeric: crate::font::parse_variant_numeric("oldstyle-nums").expect("numeric"),
+                ..crate::font::FontFeatures::default()
+            }
+        );
+        // invalid values leave the inherited ones
+        assert_eq!(style("i", Some(&paragraph)).font_features, expected);
     }
 
     #[test]

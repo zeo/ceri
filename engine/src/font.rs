@@ -977,6 +977,7 @@ pub struct FontStyle {
     // the opsz font-optical-sizing auto asks for, the font size in css pixels as f32 bits, or
     // zero when optical sizing is off
     pub optical_size: u32,
+    pub features: FontFeatures,
 }
 
 impl FontStyle {
@@ -985,6 +986,12 @@ impl FontStyle {
         italic: false,
         variations: FontVariations(0),
         optical_size: 0,
+        features: FontFeatures {
+            ligatures: 0,
+            numeric: 0,
+            no_kerning: false,
+            settings: FontFeatureSettings(0),
+        },
     };
 
     pub fn is_bold(self) -> bool {
@@ -1058,9 +1065,66 @@ pub struct FontVariations(u32);
 
 type AxisSettings = Rc<[([u8; 4], f32)]>;
 
+const MAX_TAG_SETTINGS: usize = 64;
+
 thread_local! {
-    static FONT_VARIATIONS: RefCell<(Vec<AxisSettings>, HashMap<String, FontVariations>)> =
-        RefCell::default();
+    // the tag and value lists of font-variation-settings and font-feature-settings
+    static TAG_LISTS: RefCell<(Vec<AxisSettings>, HashMap<String, u32>)> = RefCell::default();
+}
+
+// a list of quoted four letter tags, each followed by what value_of reads as its value, interned
+// as a nonzero id
+fn parse_tag_list(value: &str, value_of: impl Fn(&str) -> Option<f32>) -> Option<u32> {
+    let settings = value
+        .split(',')
+        .take(MAX_TAG_SETTINGS + 1)
+        .map(|setting| {
+            let setting = setting.trim();
+            let quote = setting
+                .chars()
+                .next()
+                .filter(|&quote| quote == '"' || quote == '\'')?;
+            let (tag, rest) = setting[1..].split_once(quote)?;
+            let tag: [u8; 4] = tag.as_bytes().try_into().ok()?;
+            let number = value_of(rest.trim())?;
+            (tag.iter().all(|byte| (0x20..=0x7E).contains(byte))).then_some((tag, number))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if settings.len() > MAX_TAG_SETTINGS {
+        return None;
+    }
+    let key = settings
+        .iter()
+        .map(|(tag, number)| format!("{}={number}", String::from_utf8_lossy(tag)))
+        .collect::<Vec<_>>()
+        .join(",");
+    TAG_LISTS.with(|table| {
+        let (lists, ids) = &mut *table.borrow_mut();
+        if let Some(id) = ids.get(&key) {
+            return Some(*id);
+        }
+        if lists.len() >= MAX_FONT_STACKS {
+            return None;
+        }
+        lists.push(settings.into());
+        let id = lists.len() as u32;
+        ids.insert(key, id);
+        Some(id)
+    })
+}
+
+fn tag_list(id: u32) -> AxisSettings {
+    if id == 0 {
+        return Rc::from([]);
+    }
+    TAG_LISTS.with(|table| {
+        table
+            .borrow()
+            .0
+            .get(id as usize - 1)
+            .cloned()
+            .unwrap_or_else(|| Rc::from([]))
+    })
 }
 
 // font-variation-settings: normal, or a list of quoted four letter axis tags and values
@@ -1069,56 +1133,146 @@ pub(crate) fn parse_font_variations(value: &str) -> Option<FontVariations> {
     if value.eq_ignore_ascii_case("normal") {
         return Some(FontVariations::default());
     }
-    let settings = value
-        .split(',')
-        .map(|setting| {
-            let setting = setting.trim();
-            let quote = setting
-                .chars()
-                .next()
-                .filter(|&quote| quote == '"' || quote == '\'')?;
-            let (tag, number) = setting[1..].split_once(quote)?;
-            let tag: [u8; 4] = tag.as_bytes().try_into().ok()?;
-            let number = number
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|number| number.is_finite())?;
-            (tag.iter().all(|byte| (0x20..=0x7E).contains(byte))).then_some((tag, number))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let key = settings
-        .iter()
-        .map(|(tag, number)| format!("{}={number}", String::from_utf8_lossy(tag)))
-        .collect::<Vec<_>>()
-        .join(",");
-    FONT_VARIATIONS.with(|table| {
-        let (lists, ids) = &mut *table.borrow_mut();
-        if let Some(variations) = ids.get(&key) {
-            return Some(*variations);
-        }
-        if lists.len() >= MAX_FONT_STACKS {
-            return None;
-        }
-        lists.push(settings.into());
-        let variations = FontVariations(lists.len() as u32);
-        ids.insert(key, variations);
-        Some(variations)
+    parse_tag_list(value, |number| {
+        number
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite())
     })
+    .map(FontVariations)
 }
 
 fn font_variation_values(variations: FontVariations) -> AxisSettings {
-    if variations.0 == 0 {
-        return Rc::from([]);
+    tag_list(variations.0)
+}
+
+// the font-variant-ligatures, font-variant-numeric, font-kerning and font-feature-settings text
+// asks for, each inheriting on its own; the default is normal for all four
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FontFeatures {
+    // a bit per LIGATURE_KEYWORDS entry
+    pub ligatures: u8,
+    // a bit per NUMERIC_KEYWORDS entry
+    pub numeric: u8,
+    // font-kerning none
+    pub no_kerning: bool,
+    pub settings: FontFeatureSettings,
+}
+
+// a font-feature-settings list, interned with the variation settings; the default is normal
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FontFeatureSettings(u32);
+
+// a keyword, the group it excludes the rest of, and the features it turns on, or off for no-
+type FeatureKeyword = (&'static str, u8, &'static [[u8; 4]]);
+
+const LIGATURE_KEYWORDS: [FeatureKeyword; 8] = [
+    ("common-ligatures", 0, &[*b"liga", *b"clig"]),
+    ("no-common-ligatures", 0, &[*b"liga", *b"clig"]),
+    ("discretionary-ligatures", 1, &[*b"dlig"]),
+    ("no-discretionary-ligatures", 1, &[*b"dlig"]),
+    ("historical-ligatures", 2, &[*b"hlig"]),
+    ("no-historical-ligatures", 2, &[*b"hlig"]),
+    ("contextual", 3, &[*b"calt"]),
+    ("no-contextual", 3, &[*b"calt"]),
+];
+
+const NUMERIC_KEYWORDS: [FeatureKeyword; 8] = [
+    ("lining-nums", 0, &[*b"lnum"]),
+    ("oldstyle-nums", 0, &[*b"onum"]),
+    ("proportional-nums", 1, &[*b"pnum"]),
+    ("tabular-nums", 1, &[*b"tnum"]),
+    ("diagonal-fractions", 2, &[*b"frac"]),
+    ("stacked-fractions", 2, &[*b"afrc"]),
+    ("ordinal", 3, &[*b"ordn"]),
+    ("slashed-zero", 4, &[*b"zero"]),
+];
+
+// space separated keywords, at most one from each group, as a bit per keyword
+fn parse_feature_keywords(value: &str, keywords: &[FeatureKeyword]) -> Option<u8> {
+    let (mut bits, mut groups) = (0_u8, 0_u8);
+    for word in value.split_ascii_whitespace() {
+        let index = keywords
+            .iter()
+            .position(|(keyword, _, _)| word.eq_ignore_ascii_case(keyword))?;
+        let group = 1 << keywords[index].1;
+        if groups & group != 0 {
+            return None;
+        }
+        groups |= group;
+        bits |= 1 << index;
     }
-    FONT_VARIATIONS.with(|table| {
-        table
-            .borrow()
-            .0
-            .get(variations.0 as usize - 1)
-            .cloned()
-            .unwrap_or_else(|| Rc::from([]))
+    (groups != 0).then_some(bits)
+}
+
+pub(crate) fn parse_variant_ligatures(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(0),
+        // every no- keyword
+        "none" => Some(0b1010_1010),
+        words => parse_feature_keywords(words, &LIGATURE_KEYWORDS),
+    }
+}
+
+pub(crate) fn parse_variant_numeric(value: &str) -> Option<u8> {
+    if value.trim().eq_ignore_ascii_case("normal") {
+        return Some(0);
+    }
+    parse_feature_keywords(value, &NUMERIC_KEYWORDS)
+}
+
+// font-feature-settings: normal, or quoted tags each with on, off, a whole number or nothing
+// for on
+pub(crate) fn parse_feature_settings(value: &str) -> Option<FontFeatureSettings> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("normal") {
+        return Some(FontFeatureSettings::default());
+    }
+    parse_tag_list(value, |setting| {
+        if setting.is_empty() || setting.eq_ignore_ascii_case("on") {
+            Some(1.0)
+        } else if setting.eq_ignore_ascii_case("off") {
+            Some(0.0)
+        } else {
+            setting.parse::<u32>().ok().map(|number| number as f32)
+        }
     })
+    .map(FontFeatureSettings)
+}
+
+impl FontFeatures {
+    // the features to set over a font's defaults, zero for off, later ones winning: the variant
+    // properties and font-kerning, then letter spacing's ban on ligatures, then
+    // font-feature-settings, the order css fonts 4 gives them
+    pub(crate) fn overrides(self, ligatures: bool) -> Vec<([u8; 4], u32)> {
+        let keywords = |bits: u8, keywords: &'static [FeatureKeyword]| {
+            keywords
+                .iter()
+                .enumerate()
+                .filter(move |(index, _)| bits & (1 << index) != 0)
+                .flat_map(|(_, (keyword, _, tags))| {
+                    tags.iter()
+                        .map(|tag| (*tag, u32::from(!keyword.starts_with("no-"))))
+                })
+        };
+        let mut overrides = keywords(self.ligatures, &LIGATURE_KEYWORDS)
+            .chain(keywords(self.numeric, &NUMERIC_KEYWORDS))
+            .collect::<Vec<_>>();
+        if self.no_kerning {
+            overrides.push((*b"kern", 0));
+        }
+        // chromium also keeps discretionary and historical ligatures off under letter spacing
+        if !ligatures {
+            overrides
+                .extend([*b"liga", *b"clig", *b"calt", *b"dlig", *b"hlig"].map(|tag| (tag, 0)));
+        }
+        overrides.extend(
+            tag_list(self.settings.0)
+                .iter()
+                .map(|&(tag, value)| (tag, value as u32)),
+        );
+        overrides
+    }
 }
 
 // the host owns font discovery, the engine only asks for a family by name and style
@@ -1310,6 +1464,7 @@ impl FontSet {
             return cached.clone();
         }
         let characters = text.chars().collect::<Vec<_>>();
+        let features = style.features.overrides(ligatures);
         let mut faces: Vec<Option<ChosenFace>> = Vec::with_capacity(characters.len());
         for (index, &character) in characters.iter().enumerate() {
             // a selector or joiner stays in its base character's run, so the face sees the sequence
@@ -1363,7 +1518,7 @@ impl FontSet {
                         .filter(|&character| !crate::color_glyph::is_variation_selector(character))
                         .collect::<Vec<_>>();
                     for shaped in
-                        crate::shaping::Shaper::new(&chosen.face).shape(&visible, ligatures)
+                        crate::shaping::Shaper::new(&chosen.face).shape(&visible, &features)
                     {
                         let advance = shaped.advance * scale;
                         glyphs.push(RunGlyph {
@@ -1603,6 +1758,7 @@ impl FontSet {
         let style = FontStyle {
             variations: FontVariations::default(),
             optical_size: 0,
+            features: FontFeatures::default(),
             ..style
         };
         if let Some(cached) = self.stacks.borrow().get(&(stack, style)) {
@@ -2333,6 +2489,157 @@ mod tests {
             woff2.measure("fiAB", stack, 1000.0, FontStyle::NORMAL),
             1800.0
         );
+    }
+
+    fn features(ligatures: &str, numeric: &str, settings: &str) -> FontStyle {
+        FontStyle {
+            features: FontFeatures {
+                ligatures: parse_variant_ligatures(ligatures).expect("ligatures"),
+                numeric: parse_variant_numeric(numeric).expect("numeric"),
+                no_kerning: false,
+                settings: parse_feature_settings(settings).expect("settings"),
+            },
+            ..FontStyle::NORMAL
+        }
+    }
+
+    #[test]
+    fn css_font_features_turn_lookups_on_and_off_in_lookup_order() {
+        let fonts = FontSet::new(Rc::new(fixture("ceri-features.ttf")), None);
+        let stack = intern_font_stack("Ceri Features");
+        let glyphs = |style: FontStyle| {
+            fonts
+                .shape("10", stack, 1000.0, style, true)
+                .glyphs
+                .iter()
+                .map(|glyph| (glyph.glyph, glyph.advance))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(glyphs(FontStyle::NORMAL), vec![(3, 300.0), (2, 600.0)]);
+        let tabular = features("normal", "tabular-nums slashed-zero", "normal");
+        assert_eq!(glyphs(tabular), vec![(5, 600.0), (4, 600.0)]);
+        // ss01's lookup comes first in the font, so it takes the one before tnum can
+        let both = features("normal", "normal", "\"tnum\", 'ss01' on");
+        assert_eq!(glyphs(both), vec![(6, 400.0), (2, 600.0)]);
+        // font-feature-settings applies after the variant properties
+        let overridden = features("normal", "tabular-nums", "\"tnum\" 0");
+        assert_eq!(glyphs(overridden), vec![(3, 300.0), (2, 600.0)]);
+        // an alternate substitution takes the value as a one based index
+        let zero = |settings: &str| glyphs(features("normal", "normal", settings))[1];
+        assert_eq!(zero("'salt'"), (4, 600.0));
+        assert_eq!(zero("'salt' 2"), (5, 600.0));
+        assert_eq!(zero("'salt' 3"), (2, 600.0));
+        assert_eq!(zero("'salt' off"), (2, 600.0));
+
+        let fonts = FontSet::new(Rc::new(fixture("ceri-test.ttf")), None);
+        let stack = intern_font_stack("Ceri Test");
+        let measure = |text: &str, style: FontStyle, ligatures: bool| {
+            fonts.shape(text, stack, 1000.0, style, ligatures).width
+        };
+        assert_eq!(
+            measure("fi", features("none", "normal", "normal"), true),
+            1200.0
+        );
+        assert_eq!(
+            measure(
+                "fi",
+                features("no-common-ligatures", "normal", "normal"),
+                true
+            ),
+            1200.0
+        );
+        assert_eq!(
+            measure("fi", features("normal", "normal", "'liga' off"), true),
+            1200.0
+        );
+        // letter spacing drops ligatures unless font-feature-settings asks for them again
+        assert_eq!(measure("fi", FontStyle::NORMAL, false), 1200.0);
+        assert_eq!(
+            measure("fi", features("normal", "normal", "'liga'"), false),
+            700.0
+        );
+        // letter spacing also wins over discretionary ligatures
+        assert!(
+            features("discretionary-ligatures", "normal", "normal")
+                .features
+                .overrides(false)
+                .ends_with(&[(*b"dlig", 0), (*b"hlig", 0)])
+        );
+        let unkerned = FontStyle {
+            features: FontFeatures {
+                no_kerning: true,
+                ..FontFeatures::default()
+            },
+            ..FontStyle::NORMAL
+        };
+        assert_eq!(measure("AB", unkerned, true), 1200.0);
+        assert_eq!(
+            measure("AB", features("normal", "normal", "\"kern\" 0"), true),
+            1200.0
+        );
+        assert_eq!(measure("AB", FontStyle::NORMAL, true), 1100.0);
+    }
+
+    #[test]
+    fn font_variant_and_feature_settings_parse_as_css_fonts_4_says() {
+        assert_eq!(parse_variant_numeric("normal"), Some(0));
+        assert_eq!(
+            parse_variant_numeric("Tabular-Nums  ordinal"),
+            parse_variant_numeric("ordinal tabular-nums")
+        );
+        assert_eq!(
+            parse_variant_numeric("tabular-nums proportional-nums"),
+            None
+        );
+        assert_eq!(parse_variant_numeric("lining-nums lining-nums"), None);
+        assert_eq!(parse_variant_numeric(""), None);
+        assert_eq!(parse_variant_numeric("tabular-nums bold"), None);
+        assert_eq!(parse_variant_ligatures("none"), Some(0b1010_1010));
+        assert_eq!(
+            parse_variant_ligatures("no-common-ligatures discretionary-ligatures"),
+            Some(0b0000_0110)
+        );
+        assert_eq!(parse_variant_ligatures("contextual no-contextual"), None);
+        assert_eq!(parse_variant_ligatures("none common-ligatures"), None);
+        let numeric = FontFeatures {
+            numeric: parse_variant_numeric("oldstyle-nums stacked-fractions slashed-zero")
+                .expect("numeric"),
+            ..FontFeatures::default()
+        };
+        assert_eq!(
+            numeric.overrides(true),
+            vec![(*b"onum", 1), (*b"afrc", 1), (*b"zero", 1)]
+        );
+
+        assert_eq!(
+            parse_feature_settings(" normal "),
+            Some(FontFeatureSettings::default())
+        );
+        let settings =
+            parse_feature_settings("\"tnum\", 'liga' 0, \"ss01\" OFF, 'salt' 3").expect("settings");
+        assert_eq!(
+            tag_list(settings.0).to_vec(),
+            vec![
+                (*b"tnum", 1.0),
+                (*b"liga", 0.0),
+                (*b"ss01", 0.0),
+                (*b"salt", 3.0)
+            ]
+        );
+        for invalid in [
+            "tnum",
+            "\"tnu\"",
+            "\"tnum\" -1",
+            "\"tnum\" 1.5",
+            "\"tnum\" yes",
+            "\"t\u{e9}m\"",
+            "\"tnum\",",
+        ] {
+            assert_eq!(parse_feature_settings(invalid), None, "{invalid}");
+        }
+        let many = vec!["'tnum'"; MAX_TAG_SETTINGS + 1].join(",");
+        assert_eq!(parse_feature_settings(&many), None);
+        assert!(parse_feature_settings(&many[7..]).is_some());
     }
 
     #[test]
