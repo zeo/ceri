@@ -785,6 +785,7 @@ struct GridLayoutInput<'a> {
     mode: LayoutMode,
 }
 
+#[derive(Clone)]
 struct ElementLayoutInput<'node, 'style> {
     node: Subject<'node>,
     containing_x: f32,
@@ -869,12 +870,6 @@ pub fn layout_with_state(
         viewport,
         root_font_size: root_font_size(document, stylesheet, viewport, style_state),
     });
-    let viewport_block = ContainingBlock {
-        x: 0.0,
-        y: 0.0,
-        width: viewport.width,
-        height: viewport.height,
-    };
     let mut root = LayoutBox {
         node: document.root(),
         tag: "#document".to_string(),
@@ -923,6 +918,35 @@ pub fn layout_with_state(
         scroll_offset: (0.0, 0.0),
         margin: ResolvedEdges::default(),
     };
+    root.children = layout_document_children(document, stylesheet, viewport, style_state);
+    finalize_scroll(&mut root, style_state);
+    // a classic vertical scrollbar takes its width from the initial and fixed containing
+    // blocks, while vw, resolved from the layout environment, keeps the whole viewport
+    if scrollbar_metrics(&root).vertical_track.is_some() {
+        let scrollport = Size {
+            width: (viewport.width - SCROLLBAR_THICKNESS).max(0.0),
+            ..viewport
+        };
+        CONTAINERS.with(|containers| containers.borrow_mut().clear());
+        root.children = layout_document_children(document, stylesheet, scrollport, style_state);
+        finalize_scroll(&mut root, style_state);
+    }
+    LayoutDocument {
+        viewport,
+        root,
+        images: Vec::new(),
+        prose_selections: Vec::new(),
+    }
+}
+
+fn layout_document_children(
+    document: &Document,
+    stylesheet: &Stylesheet,
+    viewport: Size,
+    style_state: &StyleState,
+) -> Vec<LayoutBox> {
+    let viewport_block = viewport_block(viewport);
+    let mut children = Vec::new();
     let mut cursor_y = 0.0_f32;
     let mut positioned = Vec::new();
     let root_parent = ParentStyle {
@@ -984,7 +1008,7 @@ pub fn layout_with_state(
                 &style,
                 &mut line,
             );
-            root.children.append(&mut line.placed);
+            children.append(&mut line.placed);
             continue;
         }
         if let Some(child_box) = layout_element(ElementLayoutInput {
@@ -1006,11 +1030,11 @@ pub fn layout_with_state(
             },
         }) {
             cursor_y = child_box.rect.bottom() + child_box.margin.bottom;
-            root.children.push(child_box);
+            children.push(child_box);
         }
     }
     append_positioned_nodes(
-        &mut root.children,
+        &mut children,
         positioned,
         PositionedLayoutContext {
             containing_block: viewport_block,
@@ -1021,13 +1045,7 @@ pub fn layout_with_state(
             style_state,
         },
     );
-    finalize_scroll(&mut root, style_state);
-    LayoutDocument {
-        viewport,
-        root,
-        images: Vec::new(),
-        prose_selections: Vec::new(),
-    }
+    children
 }
 
 impl LayoutDocument {
@@ -2041,6 +2059,19 @@ fn intersect_rect(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
 }
 
 fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
+    let layout = layout_element_with_gutter(input.clone(), 0.0)?;
+    // a vertical scrollbar sits between the border and the padding, so the content box gives
+    // up its width and the content lays out again
+    if user_scroll_axes(&layout)[1]
+        && layout.rect.width > SCROLLBAR_THICKNESS
+        && scrollbar_metrics(&layout).vertical_track.is_some()
+    {
+        return layout_element_with_gutter(input, SCROLLBAR_THICKNESS);
+    }
+    Some(layout)
+}
+
+fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) -> Option<LayoutBox> {
     let ElementLayoutInput {
         node,
         containing_x,
@@ -2188,7 +2219,8 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
             .or_else(|| style.aspect_ratio.map(|ratio| content_width / ratio))
             .map(|height| height.min(max_height).max(min_height))
     });
-    let border_box_width = content_width + horizontal_inner;
+    let content_width = (content_width - gutter).max(0.0);
+    let border_box_width = content_width + horizontal_inner + gutter;
     let rect = Rect {
         x: if mode == LayoutMode::Flow {
             containing_x + margin.left
@@ -6206,13 +6238,27 @@ fn apply_relative_offset(
 }
 
 fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
-    layout.scroll_content = measure_scroll_content(layout);
+    let size = Size {
+        width: layout.rect.width,
+        height: layout.rect.height,
+    };
+    layout.scroll_content = measure_scroll_content(layout, size);
     let is_document = layout.is_document();
     // clip never scrolls; hidden scrolls only when script asks
     if !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden) && !is_document {
         return;
     }
+    // measured from the scrollport, the gutter one scrollbar takes cannot read as overflow
+    // on the other axis
+    let gutter = scrollbar_metrics(layout).scrollport;
+    let floor = Size {
+        width: gutter.width,
+        height: gutter.height,
+    };
+    layout.scroll_content = measure_scroll_content(layout, floor);
     let scrollport = scrollbar_metrics(layout).scrollport;
+    layout.scroll_content.width = layout.scroll_content.width.max(scrollport.width);
+    layout.scroll_content.height = layout.scroll_content.height.max(scrollport.height);
     let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
     let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
     let requested = style_state
@@ -6282,9 +6328,9 @@ fn apply_sticky_descendants(
     }
 }
 
-fn measure_scroll_content(layout: &LayoutBox) -> Size {
-    let mut right = layout.rect.x + layout.rect.width;
-    let mut bottom = layout.rect.y + layout.rect.height;
+fn measure_scroll_content(layout: &LayoutBox, floor: Size) -> Size {
+    let mut right = layout.rect.x + floor.width;
+    let mut bottom = layout.rect.y + floor.height;
     // rounding in the sums below must not read as overflow
     const SLACK: f32 = 0.01;
     for child in &layout.children {
@@ -6305,8 +6351,8 @@ fn measure_scroll_content(layout: &LayoutBox) -> Size {
         }
     };
     Size {
-        width: extent(right, layout.rect.x, layout.rect.width),
-        height: extent(bottom, layout.rect.y, layout.rect.height),
+        width: extent(right, layout.rect.x, floor.width),
+        height: extent(bottom, layout.rect.y, floor.height),
     }
 }
 
@@ -8172,7 +8218,7 @@ mod tests {
             &stylesheet,
             Size {
                 width: 200.0,
-                height: 100.0,
+                height: 200.0,
             },
         );
         let main = &result.root.children[0];
@@ -8772,6 +8818,40 @@ mod tests {
     }
 
     #[test]
+    fn a_vertical_scrollbar_takes_its_width_from_the_content_box() {
+        let widths = |display: &str| {
+            let markup = format!(
+                "<style>#port {{ display: {display}; flex-direction: column; width: 50px; height: 20px; padding: 0 4px; border: 1px solid #000; overflow: auto; margin: 0; }} #port > div {{ height: 80px; flex-shrink: 0; margin: 0; }}</style><div id='port'><div></div></div>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 200.0,
+                    height: 100.0,
+                },
+            );
+            let port = &result.root.children[0];
+            let metrics = scrollbar_metrics(port);
+            (
+                port.rect.width,
+                port.children[0].rect.width,
+                metrics.vertical_track.is_some(),
+                metrics.horizontal_track.is_some(),
+            )
+        };
+        for display in ["block", "flex", "grid"] {
+            assert_eq!(
+                widths(display),
+                (60.0, 50.0 - SCROLLBAR_THICKNESS, true, false),
+                "{display}"
+            );
+        }
+    }
+
+    #[test]
     fn auto_overflow_keeps_fixed_descendants_at_the_viewport() {
         let document = Document::parse_markup(
             "<style>#viewport { width: 40px; height: 20px; overflow: auto; margin: 0; } #content { width: 40px; height: 80px; margin: 0; } #fixed { position: fixed; left: 70px; top: 12px; width: 8px; height: 8px; margin: 0; }</style><div id='viewport'><div id='content'></div><div id='fixed'></div></div>",
@@ -8852,6 +8932,46 @@ mod tests {
     }
 
     #[test]
+    fn a_vertical_document_scrollbar_narrows_the_initial_containing_block() {
+        let viewport = Size {
+            width: 100.0,
+            height: 80.0,
+        };
+        let widths = |markup: &str| {
+            let document = Document::parse_markup(markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(&document, &stylesheet, viewport);
+            let widths: Vec<f32> = result
+                .root
+                .children
+                .iter()
+                .map(|child| child.rect.width)
+                .collect();
+            (
+                widths,
+                scrollbar_metrics(&result.root).horizontal_track.is_some(),
+            )
+        };
+        let style = "<style>div { margin: 0; } #wide { width: 100vw; height: 1px; }</style>";
+        assert_eq!(
+            widths(&format!(
+                "{style}<div style='height: 300px'></div><div id='wide'></div>"
+            )),
+            (vec![100.0 - SCROLLBAR_THICKNESS, 100.0], true)
+        );
+        assert_eq!(
+            widths(&format!(
+                "{style}<div style='height: 300px'></div><div></div>"
+            )),
+            (vec![100.0 - SCROLLBAR_THICKNESS; 2], false)
+        );
+        assert_eq!(
+            widths(&format!("{style}<div style='height: 10px'></div>")),
+            (vec![100.0], false)
+        );
+    }
+
+    #[test]
     fn sticky_children_hold_to_the_viewport_during_document_scroll() {
         let document = Document::parse_markup(
             "<style>#sticky { position: sticky; top: 0; width: 120px; height: 10px; margin: 0; background: #00ff00; } #spacer { width: 120px; height: 160px; margin: 0; background: #ff0000; }</style><div id='sticky'></div><div id='spacer'></div>",
@@ -8903,13 +9023,14 @@ mod tests {
         assert_eq!(result.root.children[1].rect.x, 70.0);
         assert_eq!(result.root.children[1].rect.y, 12.0);
         let metrics = scrollbar_metrics(&result.root);
-        assert_eq!(metrics.scrollport.height, 88.0);
+        assert_eq!(metrics.scrollport.height, 100.0);
+        assert!(metrics.horizontal_track.is_none());
         assert_eq!(metrics.vertical_track.unwrap().width, SCROLLBAR_THICKNESS);
         let target = result
             .scroll_target_at(10.0, 10.0)
             .expect("viewport should expose the document scroll target");
         assert_eq!(target.node, document.root());
-        assert_eq!(target.max_y, 72.0);
+        assert_eq!(target.max_y, 60.0);
     }
 
     #[test]
