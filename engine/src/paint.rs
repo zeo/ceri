@@ -281,6 +281,7 @@ impl Canvas {
         if color.alpha == 0 {
             return;
         }
+        let gamma = text_gamma_table(color);
         for row in 0..glyph.height {
             let pixel_y = y + row as i32;
             if pixel_y < 0 || pixel_y as u32 >= self.height {
@@ -291,7 +292,7 @@ impl Canvas {
                 if pixel_x < 0 || pixel_x as u32 >= self.width {
                     continue;
                 }
-                let coverage = glyph.coverage[row * glyph.width + column];
+                let coverage = gamma[usize::from(glyph.coverage[row * glyph.width + column])];
                 if coverage == 0 {
                     continue;
                 }
@@ -3471,6 +3472,61 @@ fn paint_outline_text(
     }
 }
 
+// the coverage correction chromium's skia applies to windows text (srgb gamma, contrast 1),
+// one table per eighth of the text colour's luminance, so light text on dark keeps its weight
+fn text_gamma_table(color: Color) -> &'static [u8; 256] {
+    static TABLES: std::sync::OnceLock<[[u8; 256]; 8]> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        std::array::from_fn(|level| {
+            let level = level as u32;
+            correcting_table(
+                ((level << 5) | (level << 2) | (level >> 1)) as f32 / 255.0,
+                1.0,
+            )
+        })
+    });
+    let channel = |value: u8| srgb_to_linear(f32::from(value) / 255.0);
+    let luma =
+        0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue);
+    let luminance = (linear_to_srgb(luma) * 255.0).round() as usize;
+    &tables[luminance.min(255) >> 5]
+}
+
+fn correcting_table(src: f32, contrast: f32) -> [u8; 256] {
+    let dst = 1.0 - src;
+    let (linear_src, linear_dst) = (srgb_to_linear(src), srgb_to_linear(dst));
+    // contrast fades out as the text approaches white
+    let contrast = contrast * linear_dst;
+    std::array::from_fn(|index| {
+        let raw = index as f32 / 255.0;
+        let alpha = raw + (1.0 - raw) * contrast * raw;
+        let result = if (src - dst).abs() < 1.0 / 256.0 {
+            alpha
+        } else {
+            let out = linear_to_srgb(linear_src * alpha + (1.0 - alpha) * linear_dst);
+            // undo the linear blend the blit does next
+            (out - dst) / (src - dst)
+        };
+        (result * 255.0).round().clamp(0.0, 255.0) as u8
+    })
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> f32 {
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 fn glyph_rows(character: char) -> [u8; 7] {
     match character.to_ascii_uppercase() {
         'A' => [
@@ -3600,6 +3656,19 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_coverage_thickens_light_text_more_than_dark_text() {
+        let white = text_gamma_table(Color::WHITE);
+        let black = text_gamma_table(Color::BLACK);
+        for table in [white, black] {
+            assert_eq!((table[0], table[255]), (0, 255));
+            assert!(table.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        // white on black follows the srgb curve, half coverage reads as about 74 percent,
+        // while contrast keeps black on white near linear
+        assert_eq!((white[128], black[128]), (188, 119));
+    }
 
     #[test]
     fn rect_edges_snap_to_whole_device_pixels() {
