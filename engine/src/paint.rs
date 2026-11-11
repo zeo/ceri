@@ -3444,6 +3444,8 @@ fn paint_outline_text(
         } else {
             pen + offset
         };
+        // glyphs rasterize at quarter pixels, so the whole pixel comes from the same rounding
+        let x = (x * 4.0).round() / 4.0;
         let colored = if stroke > 0.0 {
             None
         } else {

@@ -1156,7 +1156,7 @@ impl FontSet {
         subpixel: f32,
         stroke: f32,
     ) -> Option<Rc<GlyphBitmap>> {
-        let quarter = ((subpixel.fract() * 4.0).round() as u8) % 4;
+        let quarter = (((subpixel - subpixel.floor()) * 4.0).round() as u8) % 4;
         let key = GlyphKey {
             face: Rc::as_ptr(&chosen.face) as usize,
             glyph,
@@ -1212,7 +1212,7 @@ impl FontSet {
         if !crate::color_glyph::has_color(&chosen.face) {
             return None;
         }
-        let quarter = ((subpixel.fract() * 4.0).round() as u8) % 4;
+        let quarter = (((subpixel - subpixel.floor()) * 4.0).round() as u8) % 4;
         let key = GlyphKey {
             face: Rc::as_ptr(&chosen.face) as usize,
             glyph,
@@ -1749,6 +1749,18 @@ mod tests {
         let path = format!("{}/tests/fixtures/fonts/{name}", env!("CARGO_MANIFEST_DIR"));
         FontFace::parse(std::fs::read(&path).expect("fixture font should exist"))
             .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+    }
+
+    #[test]
+    fn a_pen_left_of_zero_rasterizes_at_its_own_quarter_pixel() {
+        let fonts = FontSet::new(Rc::new(fixture("ceri-test.ttf")), None);
+        let chosen = fonts
+            .face_for('A', intern_font_stack("Ceri Test"), FontStyle::NORMAL)
+            .expect("the fixture covers A");
+        let glyph = chosen.face.glyph_for('A');
+        let bitmap = |x| fonts.glyph_bitmap(&chosen, glyph, 20.0, x, 0.0).expect("A rasterizes");
+        assert!(Rc::ptr_eq(&bitmap(2.25), &bitmap(-0.75)));
+        assert!(!Rc::ptr_eq(&bitmap(2.25), &bitmap(2.5)));
     }
 
     #[test]
