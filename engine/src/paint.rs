@@ -2235,7 +2235,7 @@ fn paint_backdrop(
     crate::filter::apply(filters, &mut layer.pixels, size, canvas.scale, true);
     let shape = canvas.device_shape(Shape::from_rect(canvas.snap_rect(rect), layout_box.radii));
     for (row, line) in layer.pixels.chunks_exact_mut(row_bytes).enumerate() {
-        for (column, pixel) in line.chunks_exact_mut(4).enumerate() {
+        for (column, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let center = (
                 (input.left as usize + column) as f32 + 0.5,
                 (input.top as usize + row) as f32 + 0.5,

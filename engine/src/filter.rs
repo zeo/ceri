@@ -262,7 +262,7 @@ pub(crate) fn apply(
 }
 
 fn apply_matrices(pixels: &mut [u8], matrices: &[&[f32; 20]]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         if pixel[3] == 0 {
             continue;
         }
@@ -318,7 +318,7 @@ fn blur(pixels: &mut [u8], (width, height): (usize, usize), sigma: f32, mirrored
     let mut padded = vec![0; size.0 * size.1 * 4];
     for (row, target) in padded.chunks_exact_mut(size.0 * 4).enumerate() {
         let source = mirror(row as isize - pad as isize, height) * width;
-        for (column, target) in target.chunks_exact_mut(4).enumerate() {
+        for (column, target) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let index = (source + mirror(column as isize - pad as isize, width)) * 4;
             target.copy_from_slice(&pixels[index..index + 4]);
         }
@@ -364,7 +364,7 @@ fn drop_shadow(
         if !(0..height as isize).contains(&source_row) {
             continue;
         }
-        for (column, target) in target.chunks_exact_mut(4).enumerate() {
+        for (column, target) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let source_column = column as isize - shift.0;
             if !(0..width as isize).contains(&source_column) || target[3] == 255 {
                 continue;
@@ -503,7 +503,12 @@ mod tests {
                 .expect("the blur should not be an identity")
                 .pass(&mut pixels, (0, 1), line.len());
         }
-        pixels.chunks_exact(4).map(|pixel| pixel[3]).collect()
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[3])
+            .collect()
     }
 
     #[test]
