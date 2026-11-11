@@ -108,6 +108,14 @@ await emit("ready", { at: Date.now() });
 
 A payload that does not fit the argument type rejects with `invalid-payload`. `command` handlers answer on the engine thread and should return quickly. `blocking_command` handlers each run on a thread of their own, and their promises settle on the next engine frame. Capabilities deny by default: a grant names windows, origins and commands, where each pattern is `*`, an exact name or a prefix ending in `*`. A call no grant allows is rejected in the engine before it reaches the app, as a `CeriBridgeError` with code `denied`. An unregistered command rejects with `unknown-command`, a payload that is not JSON serializable with `invalid-payload`, and a handler's own `CommandError` arrives with its code and message. An ArrayBuffer or typed array payload skips JSON: its bytes reach the handler as `call.body`, with `call.payload` set to `null`. A third argument, `invoke(name, bytes, { headers })`, fills `call.headers`, which `call.header(name)` reads without regard to case. `Browser::emit_event` delivers host events to `listen` callbacks as `{ event, payload }`, and `emit` passes page events to the router's `event` hook.
 
+`ceri::command!` builds a `json_command` handler over named arguments, the way a Tauri command takes them. Each argument is read from the page's object under its camelCase name, and an `Option` argument may be left out. The body answers with any serializable value, or with a `Result` whose error is a `CommandError` or a message, which rejects with code `failed`. Naming `call` first also hands the body the call:
+
+```rust
+App::new()
+    .json_command("star", ceri::command!(|paths: Vec<PathBuf>, on: bool| star(&paths, on)))
+    .json_command("owner", ceri::command!(|call| owner(&call.window)))
+```
+
 ## Failure behavior
 
 Ceri verifies the entry document before the engine starts. Every packaged app document is served from the owned HTTPS origin, through the asset-origin policy behind a `ResourceProvider`. Missing assets, unsafe paths, navigation errors and repeated renderer termination produce a Ceri recovery document with a retry link. The browser's generic network failure page is not part of the application path.

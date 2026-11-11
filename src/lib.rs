@@ -23,6 +23,34 @@ pub use dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageL
 pub use files::FileScope;
 pub use tray::{MenuItem, Tray, TrayConfig, TrayEvent};
 
+#[doc(hidden)]
+pub mod __command {
+    pub use crate::commands::{Answer, AnswerResult, AnswerValue, Arguments};
+}
+
+// a handler for App::json_command over named arguments, read by their camelCase names from
+// the object a page passes, as a Tauri command reads them; the body answers with a value or a
+// Result whose error is a CommandError or a message, and |call, ...| also hands it the call
+#[macro_export]
+macro_rules! command {
+    (|| $body:expr) => {
+        $crate::command!(|_call| $body)
+    };
+    (|$($argument:ident : $kind:ty),+ $(,)?| $body:expr) => {
+        $crate::command!(|_call, $($argument: $kind),+| $body)
+    };
+    (|$call:ident $(, $argument:ident : $kind:ty)* $(,)?| $body:expr) => {
+        move |$call: &$crate::CommandCall| -> ::std::result::Result<::std::string::String, $crate::CommandError> {
+            #[allow(unused_imports)]
+            use $crate::__command::{AnswerResult as _, AnswerValue as _};
+            #[allow(unused_mut, unused_variables)]
+            let mut arguments = $crate::__command::Arguments::of($call)?;
+            $(let $argument: $kind = arguments.take(stringify!($argument))?;)*
+            $crate::__command::Answer($body).answer()
+        }
+    };
+}
+
 // the files ceri_build::embed compiled into this crate, for App::assets
 #[macro_export]
 macro_rules! embedded_assets {

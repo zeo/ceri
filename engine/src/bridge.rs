@@ -52,6 +52,19 @@ impl CommandError {
     }
 }
 
+// a handler's own error message, the way a Tauri command rejects with its error string
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self::failed(message)
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(message: &str) -> Self {
+        Self::failed(message)
+    }
+}
+
 // a call's id and its answer
 pub type CommandResult = (u64, Result<String, CommandError>);
 

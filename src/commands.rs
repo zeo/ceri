@@ -205,6 +205,62 @@ fn json(value: &impl Serialize) -> Result<String, CommandError> {
     serde_json::to_string(value).map_err(|error| CommandError::failed(error.to_string()))
 }
 
+// the named arguments of a call made through ceri::command!, from the object a page passes
+pub struct Arguments(serde_json::Map<String, serde_json::Value>);
+
+impl Arguments {
+    pub fn of(call: &CommandCall) -> Result<Self, CommandError> {
+        match serde_json::from_str(&call.payload) {
+            Ok(serde_json::Value::Object(arguments)) => Ok(Self(arguments)),
+            Ok(serde_json::Value::Null) => Ok(Self(serde_json::Map::new())),
+            Ok(_) => Err(CommandError::new(
+                "invalid-payload",
+                "the arguments are not an object",
+            )),
+            Err(error) => Err(CommandError::new("invalid-payload", error.to_string())),
+        }
+    }
+
+    // a Rust name read under its camelCase key; one left out reads as null, so an Option is none
+    pub fn take<T: DeserializeOwned>(&mut self, name: &str) -> Result<T, CommandError> {
+        let mut parts = name.split('_').filter(|part| !part.is_empty());
+        let mut key = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            let mut letters = part.chars();
+            key.extend(letters.next().map(|first| first.to_ascii_uppercase()));
+            key.push_str(letters.as_str());
+        }
+        let value = self.0.remove(&key).unwrap_or_default();
+        serde_json::from_value(value)
+            .map_err(|error| CommandError::new("invalid-payload", format!("{key}: {error}")))
+    }
+}
+
+// what a ceri::command! body evaluates to; a Result answers with its value or its error, and
+// anything else serializable answers with itself
+pub struct Answer<T>(pub T);
+
+pub trait AnswerResult {
+    fn answer(self) -> Result<String, CommandError>;
+}
+
+impl<R: Serialize, E: Into<CommandError>> AnswerResult for Answer<Result<R, E>> {
+    fn answer(self) -> Result<String, CommandError> {
+        json(&self.0.map_err(Into::into)?)
+    }
+}
+
+pub trait AnswerValue {
+    fn answer(self) -> Result<String, CommandError>;
+}
+
+// taken by reference, so method lookup tries a Result's own answer first
+impl<T: Serialize> AnswerValue for &Answer<T> {
+    fn answer(self) -> Result<String, CommandError> {
+        json(&self.0)
+    }
+}
+
 impl CommandRouter for CommandRoutes {
     fn invoke(&self, call: CommandCall, reply: CommandReply) {
         if let Some(answer) = self.builtin(&call) {
@@ -309,5 +365,42 @@ mod tests {
         };
         assert_eq!(id, 7);
         assert_eq!(answer.expect_err("a bad payload").code, "invalid-payload");
+    }
+
+    #[test]
+    fn typed_commands_read_named_arguments_and_answer_values_or_results() {
+        let with = |payload: &str| CommandCall {
+            window: "main".to_string(),
+            payload: payload.to_string(),
+            ..Default::default()
+        };
+        let count = crate::command!(|paths: Vec<String>, mic_device: Option<String>| paths.len()
+            + mic_device.map_or(0, |device| device.len()));
+        assert_eq!(
+            count(&with(r#"{"paths":["a","b"],"micDevice":"xyz"}"#)),
+            Ok("5".to_string())
+        );
+        assert_eq!(count(&with(r#"{"paths":[]}"#)), Ok("0".to_string()));
+        let wrong = count(&with(r#"{"paths":1}"#)).expect_err("paths is a list");
+        assert_eq!(wrong.code, "invalid-payload");
+        assert!(wrong.message.starts_with("paths: "), "{}", wrong.message);
+        assert_eq!(
+            count(&with("[]")).expect_err("not an object").code,
+            "invalid-payload"
+        );
+
+        let refuse = crate::command!(|on: bool| if on { Ok(1) } else { Err("off".to_string()) });
+        assert_eq!(refuse(&with(r#"{"on":true}"#)), Ok("1".to_string()));
+        assert_eq!(
+            refuse(&with(r#"{"on":false}"#)),
+            Err(CommandError::failed("off"))
+        );
+
+        let window = crate::command!(|call| call.window.clone());
+        assert_eq!(window(&with("{}")), Ok("\"main\"".to_string()));
+        let both = crate::command!(|call, n: u8| format!("{} {n}", call.window));
+        assert_eq!(both(&with(r#"{"n":2}"#)), Ok("\"main 2\"".to_string()));
+        let nothing = crate::command!(|| Ok::<_, CommandError>(()));
+        assert_eq!(nothing(&with("null")), Ok("null".to_string()));
     }
 }
