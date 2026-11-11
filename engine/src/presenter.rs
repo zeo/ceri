@@ -149,9 +149,9 @@ impl Presenter {
         for (row, target) in self.staging.chunks_exact_mut(row_bytes).enumerate() {
             let source_row = row.min(height as usize - 1) * width as usize * 4;
             let source = &rgba[source_row..source_row + width as usize * 4];
-            for (column, to) in target.chunks_exact_mut(4).enumerate() {
+            for (column, to) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let from = &source[column.min(width as usize - 1) * 4..][..4];
-                to.copy_from_slice(&[from[2], from[1], from[0], from[3]]);
+                *to = [from[2], from[1], from[0], from[3]];
             }
         }
         let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
