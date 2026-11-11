@@ -729,6 +729,8 @@ struct InlineElementInput<'a> {
 struct FlexLayoutInput<'a> {
     // the container's own content height when it is definite
     content_height: Option<f32>,
+    // min-height and max-height of the content box, which bound an auto height
+    height_bounds: (f32, f32),
     parent_opacity: f32,
     node: Subject<'a>,
     style: Style,
@@ -763,6 +765,7 @@ struct GridItem<'a> {
 
 struct GridLayoutInput<'a> {
     content_height: Option<f32>,
+    height_bounds: (f32, f32),
     parent_opacity: f32,
     node: Subject<'a>,
     style: Style,
@@ -2231,6 +2234,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     if matches!(style.display, Display::Flex | Display::InlineFlex) {
         return Some(layout_flex_element(FlexLayoutInput {
             content_height: explicit_height,
+            height_bounds: (min_height, max_height),
             parent_opacity: parent.opacity,
             node,
             style,
@@ -2253,6 +2257,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     if matches!(style.display, Display::Table | Display::InlineTable) {
         return Some(layout_table_element(GridLayoutInput {
             content_height: explicit_height,
+            height_bounds: (min_height, max_height),
             parent_opacity: parent.opacity,
             node,
             style,
@@ -2275,6 +2280,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     if matches!(style.display, Display::Grid | Display::InlineGrid) {
         return Some(layout_grid_element(GridLayoutInput {
             content_height: explicit_height,
+            height_bounds: (min_height, max_height),
             parent_opacity: parent.opacity,
             node,
             style,
@@ -3190,6 +3196,7 @@ fn resolve_flexible_lengths(items: &mut [&mut FlexItem<'_>], available: f32, gap
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let FlexLayoutInput {
         content_height,
+        height_bounds,
         parent_opacity,
         node,
         style,
@@ -3517,12 +3524,17 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             .sum::<f32>()
             + main_gap * line.len().saturating_sub(1) as f32
     };
-    let container_main = available_main.unwrap_or_else(|| {
-        lines
-            .iter()
-            .map(|line| line_main_size(&items, line))
-            .fold(0.0, f32::max)
+    let content_main = lines
+        .iter()
+        .map(|line| line_main_size(&items, line))
+        .fold(0.0, f32::max);
+    let container_main = available_main.unwrap_or(if row {
+        content_main
+    } else {
+        content_main.min(height_bounds.1).max(height_bounds.0)
     });
+    // a column whose min-height or max-height moved its height flexes its items into it
+    let main_definite = available_main.is_some() || container_main != content_main;
     for line in &lines {
         let gaps = main_gap * line.len().saturating_sub(1) as f32;
         let mut line_items = items
@@ -3531,7 +3543,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             .filter(|(index, _)| line.contains(index))
             .map(|(_, item)| item)
             .collect::<Vec<_>>();
-        if available_main.is_some() {
+        if main_definite {
             resolve_flexible_lengths(&mut line_items, container_main, gaps, row);
         }
     }
@@ -3573,12 +3585,19 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 .fold(0.0, f32::max)
         })
         .collect::<Vec<_>>();
-    if single_line && let Some(cross) = available_cross {
-        line_cross[0] = cross;
+    let bound_cross = |cross: f32| {
+        if row {
+            cross.min(height_bounds.1).max(height_bounds.0)
+        } else {
+            cross
+        }
+    };
+    if single_line {
+        line_cross[0] = available_cross.unwrap_or_else(|| bound_cross(line_cross[0]));
     }
     let cross_used =
         line_cross.iter().sum::<f32>() + cross_gap * lines.len().saturating_sub(1) as f32;
-    let container_cross = available_cross.unwrap_or(cross_used);
+    let container_cross = available_cross.unwrap_or_else(|| bound_cross(cross_used));
     // align-content shares leftover cross space among lines
     let free_cross = container_cross - cross_used;
     let (mut cross_cursor, line_extra) = if lines.len() > 1 || wrap {
@@ -3816,6 +3835,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
 fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let GridLayoutInput {
         content_height,
+        height_bounds,
         parent_opacity,
         node,
         style,
@@ -4121,29 +4141,39 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         .iter()
         .map(|item| (item.area[1].0, item.area[1].1))
         .collect::<Vec<_>>();
-    let row_sizes = size_grid_tracks(
-        GridAxis {
-            tracks: &row_tracks,
-            collapsed: &row_collapsed,
-            available: content_height,
-            gap: row_gap,
-            font_size,
-            stretch: style.align_content == AlignContent::Stretch,
-        },
-        &row_items,
-        &mut |index| {
-            let item = &items[index];
-            let height = item
-                .layout
-                .as_ref()
-                .map_or(0.0, |layout| layout.rect.height)
-                + item.margin.top
-                + item.margin.bottom;
-            (height, height)
-        },
-    );
+    let size_rows = |available: Option<f32>| {
+        size_grid_tracks(
+            GridAxis {
+                tracks: &row_tracks,
+                collapsed: &row_collapsed,
+                available,
+                gap: row_gap,
+                font_size,
+                stretch: style.align_content == AlignContent::Stretch,
+            },
+            &row_items,
+            &mut |index| {
+                let item = &items[index];
+                let height = item
+                    .layout
+                    .as_ref()
+                    .map_or(0.0, |layout| layout.rect.height)
+                    + item.margin.top
+                    + item.margin.bottom;
+                (height, height)
+            },
+        )
+    };
+    let mut row_sizes = size_rows(content_height);
     let rows_total = grid_tracks_total(&row_sizes, &row_collapsed, row_gap);
-    let content_height = content_height.unwrap_or(rows_total);
+    let content_height = content_height.unwrap_or_else(|| {
+        // an auto height kept within min-height and max-height sizes the rows again in it
+        let bounded = rows_total.min(height_bounds.1).max(height_bounds.0);
+        if bounded != rows_total {
+            row_sizes = size_rows(Some(bounded));
+        }
+        bounded
+    });
     let row_offsets = grid_track_offsets(
         &row_sizes,
         &row_collapsed,
@@ -4300,6 +4330,7 @@ fn table_span(cell: Subject<'_>, attribute: &str, limit: usize) -> usize {
 fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let GridLayoutInput {
         content_height,
+        height_bounds: _,
         parent_opacity,
         node,
         style,
@@ -5266,18 +5297,35 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         + padding.right
         + style.border[1].used_width()
         + style.border[3].used_width();
-    if own_width && let Some(width) = style.width.resolve(containing_width, font_size) {
-        // a border-box width already holds the padding and border
-        let inner = padding.left
-            + padding.right
-            + style.border[1].used_width()
-            + style.border[3].used_width();
-        let width = if style.box_sizing == crate::css::BoxSizing::BorderBox {
+    // a border-box width already holds the padding and border
+    let inner =
+        padding.left + padding.right + style.border[1].used_width() + style.border[3].used_width();
+    let content_box = |width: f32| {
+        if style.box_sizing == crate::css::BoxSizing::BorderBox {
             (width - inner).max(0.0)
         } else {
             width
-        };
-        return extras + width.max(0.0);
+        }
+    };
+    let bounds = (
+        style
+            .min_width
+            .resolve(containing_width, font_size)
+            .map_or(0.0, content_box),
+        style
+            .max_width
+            .resolve(containing_width, font_size)
+            .map_or(f32::INFINITY, content_box),
+    );
+    let bounded = |width: f32| {
+        if own_width {
+            width.min(bounds.1).max(bounds.0)
+        } else {
+            width
+        }
+    };
+    if own_width && let Some(width) = style.width.resolve(containing_width, font_size) {
+        return extras + bounded(content_box(width).max(0.0));
     }
     if let (Some(width), _) = control_content_size(
         node,
@@ -5362,7 +5410,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             }
         }
     }
-    extras + inline.max(widest_block).min(containing_width.max(0.0))
+    extras + bounded(inline.max(widest_block).min(containing_width.max(0.0)))
 }
 
 // one axis of the explicit grid, with auto repeats expanded
@@ -8694,6 +8742,33 @@ mod tests {
             &canvas.rgba_pixels()[horizontal_track..horizontal_track + 4],
             [232, 236, 240, 255]
         );
+    }
+
+    #[test]
+    fn min_and_max_sizes_bound_auto_heights_and_shrink_to_fit_widths() {
+        for display in ["flex; flex-direction: column", "grid"] {
+            let markup = format!(
+                "<style>* {{ margin: 0; }} #tall {{ display: {display}; max-height: 30px; }} #short {{ display: {display}; min-height: 50px; }} #tall div {{ height: 100px; flex-shrink: 0; }} span {{ display: inline-block; max-width: 40px; min-width: 0; }} em {{ display: inline-block; min-width: 90px; }}</style><div id='tall'><div></div></div><div id='short'></div><p><span>a b c d e f g h i j k</span><em>x</em></p>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 400.0,
+                    height: 400.0,
+                },
+            );
+            let children = &result.root.children;
+            assert_eq!(children[0].rect.height, 30.0, "{display}");
+            assert_eq!(children[1].rect.height, 50.0, "{display}");
+            assert_eq!(
+                find_box(&result.root, "span").expect("span").rect.width,
+                40.0
+            );
+            assert_eq!(find_box(&result.root, "em").expect("em").rect.width, 90.0);
+        }
     }
 
     #[test]
