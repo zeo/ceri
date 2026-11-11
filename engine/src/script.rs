@@ -10,6 +10,7 @@ mod dates;
 mod encoding;
 mod events;
 mod geometry;
+mod images;
 mod import_map;
 mod interfaces;
 mod intl;
@@ -40,6 +41,7 @@ use realm::{Intrinsics, Native, create_intrinsics};
 pub use bridge::HostBridge;
 pub use dates::TimeZone;
 pub(crate) use geometry::LayoutInputs;
+pub(crate) use images::image_key;
 
 use crate::Color;
 use crate::css::StyleState;
@@ -530,6 +532,9 @@ pub struct ScriptRuntime {
     observers: HashMap<u32, observers::ObserverRecord>,
     next_observer: u32,
     xhr: HashMap<u32, xhr::XhrState>,
+    // decoded images by URL, shared with layout so a picture is decoded once per document
+    images: images::ImageCache,
+    image_loads: HashMap<NodeId, images::ImageLoad>,
     custom_definitions: Vec<custom::Definition>,
     // custom elements by the index of their definition
     custom_states: HashMap<NodeId, usize>,
@@ -1546,6 +1551,8 @@ impl ScriptRuntime {
             observers: HashMap::new(),
             next_observer: 0,
             xhr: HashMap::new(),
+            images: RefCell::default(),
+            image_loads: HashMap::new(),
             custom_definitions: Vec::new(),
             custom_states: HashMap::new(),
             construction_stack: Vec::new(),
@@ -6012,7 +6019,22 @@ impl ScriptRuntime {
         {
             self.normalize_select_selection(node, false);
         }
+        // setting src to the value it already has still loads it again
+        if name.eq_ignore_ascii_case("src") {
+            self.update_image(node);
+        }
         changed
+    }
+
+    // parses markup into a new fragment, starting loads for the images in it
+    fn parse_fragment(&mut self, source: &str) -> Result<NodeId, ScriptError> {
+        let fragment = self
+            .document
+            .borrow_mut()
+            .parse_fragment(source)
+            .map_err(|error| runtime_error(error.to_string()))?;
+        self.load_images_in(fragment);
+        Ok(fragment)
     }
 
     fn set_element_inner_html(
@@ -6024,11 +6046,7 @@ impl ScriptRuntime {
         if self.document.borrow().element(node).is_none() {
             return Ok(false);
         }
-        let fragment = self
-            .document
-            .borrow_mut()
-            .parse_fragment(&source)
-            .map_err(|error| runtime_error(error.to_string()))?;
+        let fragment = self.parse_fragment(&source)?;
         let target = self
             .document
             .borrow_mut()
@@ -6070,11 +6088,7 @@ impl ScriptRuntime {
                 "outerHTML cannot replace a direct child of the document",
             )));
         }
-        let fragment = self
-            .document
-            .borrow_mut()
-            .parse_fragment(&source)
-            .map_err(|error| runtime_error(error.to_string()))?;
+        let fragment = self.parse_fragment(&source)?;
         self.insert_node(parent, fragment, Some(target))?;
         self.remove_node(target)?;
         Ok(true)
@@ -6186,6 +6200,9 @@ impl ScriptRuntime {
                 .is_some_and(|element| element.name == "select")
         {
             self.normalize_select_selection(node, false);
+        }
+        if changed && name.eq_ignore_ascii_case("src") {
+            self.update_image(node);
         }
         changed
     }
@@ -8544,11 +8561,7 @@ impl ScriptRuntime {
                 let Some(parent) = parent else {
                     return Ok(Value::Undefined);
                 };
-                let fragment = self
-                    .document
-                    .borrow_mut()
-                    .parse_fragment(&source)
-                    .map_err(|error| runtime_error(error.to_string()))?;
+                let fragment = self.parse_fragment(&source)?;
                 self.insert_node(parent, fragment, reference)?;
                 Ok(Value::Undefined)
             }
@@ -8591,6 +8604,7 @@ impl ScriptRuntime {
                     .borrow_mut()
                     .clone_node(handle.id, deep)
                     .ok_or_else(|| runtime_error("node is no longer in the document"))?;
+                self.load_images_in(copy);
                 Ok(self.node_value(copy))
             }
             Builtin::ElementSetAttribute(handle) => {

@@ -1051,11 +1051,7 @@ impl ScriptRuntime {
             "createContextualFragment" => {
                 let source =
                     self.coerce_string(arguments.first().cloned().unwrap_or(Value::Undefined))?;
-                let fragment = self
-                    .document
-                    .borrow_mut()
-                    .parse_fragment(&source)
-                    .map_err(|error| runtime_error(error.to_string()))?;
+                let fragment = self.parse_fragment(&source)?;
                 self.node_value(fragment)
             }
             _ => Value::String(self.range_text(live).into()),

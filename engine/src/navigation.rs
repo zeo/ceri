@@ -13,8 +13,8 @@ use crate::script::{
     ScriptRuntime, StorageData, StorageHandle, ViewportMetrics, runtime_error,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -890,7 +890,6 @@ struct Page {
     // the page clock time the last layout's animations next change what they show
     animation_wake: Cell<Option<u64>>,
     // decoded once per document and shared by every frame; failures are remembered too
-    images: RefCell<HashMap<String, Option<Rc<Image>>>>,
 }
 
 enum HistoryCommit {
@@ -1408,6 +1407,7 @@ impl Browser {
         self.load_web_fonts(&url, &parsed_stylesheet);
         let layout_inputs = self.layout_inputs(parsed_stylesheet.clone());
         runtime.set_layout_inputs(layout_inputs.clone());
+        runtime.load_document_images();
         if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -1432,7 +1432,6 @@ impl Browser {
             layout_inputs,
             animated,
             animation_wake: Cell::new(None),
-            images: RefCell::default(),
         });
         self.last_navigation_failure = None;
         self.hovered_node = None;
@@ -2494,12 +2493,8 @@ impl Browser {
     // decodes an image reference once per document, from data: URLs or app-origin resources
     fn image_for(&self, page: &Page, base: &AppUrl, reference: &str) -> Option<Rc<Image>> {
         let reference = reference.trim();
-        let key = if reference.len() > 5 && reference[..5].eq_ignore_ascii_case("data:") {
-            reference.to_string()
-        } else {
-            base.resolve(reference).ok()?.to_string()
-        };
-        if let Some(cached) = page.images.borrow().get(&key) {
+        let key = crate::script::image_key(base, reference)?;
+        if let Some(cached) = page.runtime.image_cache().borrow().get(&key) {
             return cached.clone();
         }
         let decoded = if let Some((mime_type, bytes)) = crate::image::decode_data_url(&key) {
@@ -2513,7 +2508,10 @@ impl Browser {
                 })
         }
         .map(Rc::new);
-        page.images.borrow_mut().insert(key, decoded.clone());
+        page.runtime
+            .image_cache()
+            .borrow_mut()
+            .insert(key, decoded.clone());
         decoded
     }
 
@@ -2901,7 +2899,6 @@ impl Browser {
             layout_inputs,
             animated: false,
             animation_wake: Cell::new(None),
-            images: RefCell::default(),
         });
     }
 }
@@ -5318,6 +5315,65 @@ mod tests {
             document.element_text_content(status).as_deref(),
             Some(
                 "state:1,sent:1,sync:200:13,missing:404,InvalidStateError,state:2,state:3,state:4,load:200:42:13:application/json,end:true:4"
+            )
+        );
+    }
+
+    #[test]
+    fn images_load_from_a_task_with_natural_sizes_and_decode() {
+        let mut resources = bundle(
+            r#"<p id="status">idle</p><img id="parsed" src="/shot.png"><script>
+                const log = [];
+                const parsed = document.getElementById("parsed");
+                parsed.onload = () => log.push("parsed:" + parsed.naturalWidth);
+                const img = new Image(4);
+                log.push([img instanceof HTMLImageElement, Image.prototype === HTMLImageElement.prototype, img.getAttribute("width"), img.complete].join(":"));
+                img.crossOrigin = "anonymous";
+                log.push(img.crossOrigin + ":" + img.decoding);
+                img.src = "/shot.png";
+                log.push("set:" + img.complete + ":" + img.naturalWidth);
+                img.addEventListener("load", () => log.push("load:" + img.naturalWidth + "x" + img.naturalHeight + ":" + img.complete + ":" + img.currentSrc));
+                img.decode().then(() => {
+                    log.push("decoded:" + img.naturalWidth);
+                    const again = new Image();
+                    again.src = "/shot.png";
+                    log.push("cached:" + again.complete + ":" + again.naturalWidth);
+                    const missing = new Image();
+                    missing.onerror = () => log.push("error:" + missing.complete + ":" + missing.naturalWidth);
+                    missing.src = "/missing.png";
+                    missing.decode().catch((error) => {
+                        log.push(error.name);
+                        document.getElementById("status").textContent = log.join(",");
+                    });
+                });
+                const holder = document.createElement("div");
+                holder.innerHTML = '<img src="/shot.png">';
+                holder.firstChild.onload = () => log.push("inner");
+                const replaced = new Image();
+                replaced.src = "/shot.png";
+                replaced.decode().catch((error) => log.push("replaced:" + error.name));
+                replaced.removeAttribute("src");
+                log.push("removed:" + replaced.complete);
+            </script>"#,
+        );
+        let (mime_type, png) = crate::image::decode_data_url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHCAIAAABcElBNAAAAJHRFWHRDb21tZW50AGFuY2lsbGFyeSBjaHVua3MgYXJlIHNraXBwZWQXJBj8AAAAQElEQVR42mNgYNAQZjVW47Kz5Pf0EQmJl4wvkstqVS6dodGwWrd7n9G0i+YLn9isYWSXNxVm5SaImNjleYlBzHx2erxCwNKhtwAAAEFJREFUPAQRC0g5KzdBxKA8O9NsQYnn0vqYVV3566c2bVkwdefqFfu27T588NyJMw/PXv9y6RH79beMWrvKiPEHAPIZMLzOFGjtAAAAAElFTkSuQmCC").expect("fixture");
+        resources
+            .insert("/shot.png", &mime_type, png)
+            .expect("image should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("image page should load");
+        for _ in 0..4 {
+            browser.advance_time(0).expect("image tasks should run");
+        }
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some(
+                "true:true:4:true,anonymous:auto,set:false:0,removed:true,replaced:EncodingError,parsed:13,load:13x7:true:https://app.ceri.invalid/shot.png,decoded:13,cached:true:13,inner,error:true:0,EncodingError"
             )
         );
     }

@@ -476,7 +476,20 @@ static INTERFACES: &[Interface] = &[
     Interface {
         name: "HTMLImageElement",
         parent: "HTMLElement",
-        members: &[("src", Attr("src")), ("alt", Attr("alt"))],
+        members: &[
+            ("src", Attr("src")),
+            ("alt", Attr("alt")),
+            ("srcset", Attr("srcset")),
+            ("sizes", Attr("sizes")),
+            ("crossOrigin", ReadWrite),
+            ("decoding", ReadWrite),
+            ("loading", ReadWrite),
+            ("naturalWidth", ReadOnly),
+            ("naturalHeight", ReadOnly),
+            ("complete", ReadOnly),
+            ("currentSrc", ReadOnly),
+            ("decode", Method(0)),
+        ],
     },
     Interface {
         name: "HTMLMediaElement",
@@ -731,6 +744,18 @@ pub(super) fn create(
         globals.push((interface.name, Value::Object(constructor)));
         prototypes.insert(interface.name, prototype);
     }
+    // the legacy factory shares HTMLImageElement's prototype rather than owning one
+    let image = build.function(Native::DomConstructor("Image"), "Image", 0);
+    image.borrow_mut().define(
+        "prototype".to_string(),
+        Property {
+            slot: Slot::Data(Value::Object(prototypes["HTMLImageElement"].clone())),
+            enumerable: false,
+            writable: false,
+            configurable: false,
+        },
+    );
+    globals.push(("Image", Value::Object(image)));
     DomInterfaces { prototypes }
 }
 
@@ -1214,6 +1239,48 @@ impl ScriptRuntime {
             }
             ("defaultView", Access::Get) => Value::Window,
             ("readyState", Access::Get) => Value::String("complete".into()),
+            ("naturalWidth" | "naturalHeight" | "complete" | "currentSrc", Access::Get)
+            | ("decode", Access::Call) => self.image_member(node, member.name()),
+            ("crossOrigin", Access::Get) => {
+                match self.document.borrow().attribute(node, "crossorigin") {
+                    None => Value::Null,
+                    Some(mode) if mode.eq_ignore_ascii_case("use-credentials") => {
+                        Value::String("use-credentials".into())
+                    }
+                    Some(_) => Value::String("anonymous".into()),
+                }
+            }
+            ("crossOrigin", Access::Set) => {
+                if matches!(first, Value::Null) {
+                    self.remove_element_attribute(handle, "crossorigin");
+                } else {
+                    let mode = self.coerce_string(first)?;
+                    self.set_element_attribute(handle, "crossorigin", mode);
+                }
+                Value::Undefined
+            }
+            ("decoding" | "loading", Access::Get) => {
+                let (keywords, default): (&[&str], &str) = match member.name() {
+                    "decoding" => (&["sync", "async", "auto"], "auto"),
+                    _ => (&["lazy", "eager"], "eager"),
+                };
+                let document = self.document.borrow();
+                let keyword = document
+                    .attribute(node, member.name())
+                    .and_then(|value| {
+                        keywords
+                            .iter()
+                            .find(|keyword| keyword.eq_ignore_ascii_case(value))
+                    })
+                    .copied()
+                    .unwrap_or(default);
+                Value::String(keyword.into())
+            }
+            ("decoding" | "loading", Access::Set) => {
+                let keyword = self.coerce_string(first)?;
+                self.set_element_attribute(handle, member.name(), keyword);
+                Value::Undefined
+            }
             ("hasAttribute", Access::Call) => {
                 let name = self.coerce_string(first)?;
                 Value::Bool(self.document.borrow().attribute(node, &name).is_some())
@@ -1547,11 +1614,7 @@ impl ScriptRuntime {
                     Value::String(self.document.borrow().inner_html(node).into())
                 } else {
                     let source = self.coerce_string(first)?;
-                    let fragment = self
-                        .document
-                        .borrow_mut()
-                        .parse_fragment(&source)
-                        .map_err(|error| runtime_error(error.to_string()))?;
+                    let fragment = self.parse_fragment(&source)?;
                     self.replace_children_quietly(node, Some(fragment));
                     Value::Undefined
                 }
@@ -1585,6 +1648,9 @@ impl ScriptRuntime {
             if !values_equal(&own, &new_target) {
                 return self.construct_custom_element(&new_target);
             }
+        }
+        if interface == "Image" {
+            return self.construct_image(&arguments);
         }
         if interface == "EventTarget" {
             let prototype = match new_target {
