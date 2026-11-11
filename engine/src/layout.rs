@@ -7077,10 +7077,23 @@ impl TextPlacer {
             line.fit_to_floats(content_x, content_width);
             line.make_room(word_width, content_x, content_width);
         }
-        let mut space_width = if space_before && line.has_content() {
-            self.space
-        } else {
-            0.0
+        let after_opening = line
+            .fragments
+            .last()
+            .is_some_and(|fragment| matches!(fragment.edge, Some((_, true))));
+        // a space before an element's first word belongs to the text before the element, in
+        // that text's font
+        let spaced = space_before && line.has_content();
+        let mut space_width = match line.text_before_edges() {
+            _ if !spaced => 0.0,
+            Some(previous) if after_opening => measure_text(
+                " ",
+                previous.font_stack,
+                previous.font_size,
+                previous.font,
+                previous.letter_spacing,
+            ),
+            _ => self.space,
         };
         if self.context.text.wrap
             && breakable
@@ -7091,12 +7104,8 @@ impl TextPlacer {
             // the space that broke the line is not drawn at the start of the next
             space_width = 0.0;
         }
-        // a space before an element's first word belongs to the text before the element
         if space_width > 0.0
-            && line
-                .fragments
-                .last()
-                .is_some_and(|fragment| matches!(fragment.edge, Some((_, true))))
+            && after_opening
             && let Some(previous) = line.text_before_edges()
         {
             previous.text.push(' ');
@@ -8650,6 +8659,7 @@ mod tests {
             "i { display: inline-block }</style>",
             "<main><b>A</b><span id='split'>9 clips in 3 sessions, </span></main>",
             "<main><b>A</b><span id='inline'>9 clips in <i>3</i> sessions</span></main>",
+            "<main><b>A</b><span>9 clips, <em style='font-size: 32px'>684</em></span></main>",
         ))
         .expect("document should parse");
         let split = document.find_element_by_id("split").expect("split span");
@@ -8675,12 +8685,15 @@ mod tests {
         let mut found = Vec::new();
         rows(&result.root, &mut found);
         let rows = found;
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         for row in rows {
-            let runs = collect_text_runs(row);
-            assert!(runs.len() > 2, "{runs:?}");
+            let runs = collect_text_runs(find_box(row, "span").expect("span box"));
+            assert!(runs.len() > 1, "{runs:?}");
+            let fonts = crate::font::active_fonts();
+            let baseline = |run: &TextRun| run.y + fonts.ascent(run.font_stack, run.font_size);
             assert!(
-                runs.iter().all(|run| run.y == runs[0].y),
+                runs.iter()
+                    .all(|run| (baseline(run) - baseline(&runs[0])).abs() < 0.01),
                 "one line: {runs:?}"
             );
         }
