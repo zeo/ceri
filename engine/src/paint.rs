@@ -541,6 +541,19 @@ impl Canvas {
         }
     }
 
+    // chromium snaps a box's border box to device pixels before rounding its corners, so a
+    // rounded box at a fractional offset lands on the same pixels a square one would
+    fn snap_rect(&self, rect: Rect) -> Rect {
+        let edge = |at: f32, shift: f32| ((at - shift) * self.scale).round() / self.scale + shift;
+        let (left, top) = (edge(rect.x, self.shift.0), edge(rect.y, self.shift.1));
+        Rect {
+            x: left,
+            y: top,
+            width: edge(rect.x + rect.width, self.shift.0) - left,
+            height: edge(rect.y + rect.height, self.shift.1) - top,
+        }
+    }
+
     fn device_shape(&self, shape: Shape) -> Shape {
         Shape {
             x: shape.x - self.shift.0,
@@ -2363,7 +2376,7 @@ fn paint_box_surface(
     if !layout_box.visible {
         return content_clip;
     }
-    let outer = Shape::from_rect(rect, layout_box.radii);
+    let outer = Shape::from_rect(canvas.snap_rect(rect), layout_box.radii);
     let surface = outer.inset(layout_box.border.widths);
     for shadow in layout_box
         .shadows
@@ -4062,6 +4075,41 @@ mod tests {
             "the frame's rounded corner cuts the fade"
         );
         assert!((120..136).contains(&pixel(20, 20)[0]));
+    }
+
+    #[test]
+    fn rounded_boxes_snap_to_device_pixels_like_square_ones() {
+        let document = Document::parse_markup("<html><body><div id='track'></div></body></html>")
+            .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "html, body { margin: 0; background: #ffffff } #track { margin: 10.5px 0 0 0.5px; width: 40px; height: 4px; border-radius: 2px; background: #ff0000 }",
+        )
+        .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 48.0,
+                height: 24.0,
+            },
+        );
+        let canvas = paint(&layout);
+        let pixel = |x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            canvas.rgba_pixels()[index..index + 3].to_vec()
+        };
+        let column = (8..18).map(|y| pixel(20, y)).collect::<Vec<_>>();
+        let red = vec![255, 0, 0];
+        let white = vec![255, 255, 255];
+        assert_eq!(column[..3], [white.clone(), white.clone(), white.clone()]);
+        assert_eq!(column[3..7], [red.clone(), red.clone(), red.clone(), red]);
+        assert_eq!(column[7..], [white.clone(), white.clone(), white]);
+        assert_eq!(pixel(0, 13), vec![255, 255, 255]);
+        assert_ne!(
+            pixel(1, 11),
+            vec![255, 0, 0],
+            "the corner should stay rounded"
+        );
     }
 
     #[test]
