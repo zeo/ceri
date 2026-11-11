@@ -62,6 +62,7 @@ pub struct App {
     commands: Commands,
     capabilities: Capabilities,
     windows: Vec<WindowConfig>,
+    identifier: Option<String>,
     version: Option<String>,
     lifecycle: Lifecycle,
     handle: AppHandle,
@@ -80,6 +81,12 @@ impl App {
     // URL that is a path is a path under the app origin
     pub fn window(mut self, config: WindowConfig) -> Self {
         self.windows.push(config);
+        self
+    }
+
+    // names the app's own profile folder, as a reverse domain such as com.example.notes
+    pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
+        self.identifier = Some(identifier.into());
         self
     }
 
@@ -169,6 +176,8 @@ impl App {
     }
 
     pub fn run(mut self) -> Result<(), String> {
+        let identifier = self.identifier.take().unwrap_or_else(|| "Ceri".to_string());
+        check_identifier(&identifier)?;
         let handle = self.handle.clone();
         let started = self.lifecycle.started.take();
         self.lifecycle.started = Some(Box::new(move |control| {
@@ -188,10 +197,28 @@ impl App {
                 capabilities,
                 version: self.version,
             },
+            &identifier,
             self.windows,
             self.lifecycle,
             self.handle,
         )
+    }
+}
+
+// the identifier becomes a folder name, so it keeps to characters every file system takes
+fn check_identifier(identifier: &str) -> Result<(), String> {
+    let usable = !identifier.is_empty()
+        && identifier.len() <= 128
+        && !identifier.starts_with('.')
+        && !identifier.ends_with('.')
+        && identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    match usable {
+        true => Ok(()),
+        false => Err(format!(
+            "the app identifier {identifier:?} must be letters, digits, dots, hyphens and underscores"
+        )),
     }
 }
 
@@ -238,6 +265,7 @@ pub fn run() -> Result<(), String> {
 
 fn run_app(
     bridge: Bridge,
+    identifier: &str,
     windows: Vec<WindowConfig>,
     lifecycle: Lifecycle,
     handle: AppHandle,
@@ -247,7 +275,8 @@ fn run_app(
         launch::switch_value(arguments.clone(), ASSETS_SWITCH).map(PathBuf::from),
         launch::switch_value(arguments.clone(), ENTRY_SWITCH),
     )?;
-    let storage = launch::profile_path().map(|profile| profile.join("storage"))?;
+    let profile = launch::profile_path(identifier)?;
+    let storage = profile.join("storage");
     let allowed = allowed_origins(&arguments)?;
     let assets = launch.assets.clone();
     let icon = app_icon(launch.assets.as_ref());
@@ -255,9 +284,7 @@ fn run_app(
         true => vec![WindowConfig {
             title: "Ceri".to_string(),
             start_url: launch.initial_url.clone(),
-            geometry_path: launch::profile_path()
-                .ok()
-                .map(|profile| profile.join("window")),
+            geometry_path: Some(profile.join("window")),
             ..WindowConfig::default()
         }],
         false => windows,
@@ -538,7 +565,9 @@ fn is_document_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandCall, PackagedAssets, allowed_origins, is_document_path, typed};
+    use super::{
+        CommandCall, PackagedAssets, allowed_origins, check_identifier, is_document_path, typed,
+    };
     use crate::assets::AssetOrigin;
     use ceri_engine::{AppUrl, ExternalRequest, ResourceProvider};
     use std::collections::BTreeMap;
@@ -631,6 +660,25 @@ mod tests {
         assert!(
             allowed_origins(&[OsString::from("--ceri-allow-origin=http://insecure.test")]).is_err()
         );
+    }
+
+    #[test]
+    fn identifiers_are_folder_names() {
+        for identifier in ["Ceri", "lt.rot.clip-recorder", "com.example.notes_2"] {
+            assert!(check_identifier(identifier).is_ok(), "{identifier}");
+        }
+        for identifier in [
+            "",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "a:b",
+            "notes.",
+            "caf\u{e9}",
+        ] {
+            assert!(check_identifier(identifier).is_err(), "{identifier}");
+        }
     }
 
     #[derive(serde::Deserialize)]

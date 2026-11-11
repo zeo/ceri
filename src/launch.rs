@@ -101,25 +101,10 @@ pub fn default_asset_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-pub fn profile_path() -> Result<PathBuf, String> {
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library").join("Application Support"));
-
-    #[cfg(target_os = "linux")]
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        });
-
-    base.map(|path| path.join("Ceri").join("profile"))
+// each app keeps its pages' storage and window state under its own identifier
+pub fn profile_path(identifier: &str) -> Result<PathBuf, String> {
+    crate::dirs::local_data()
+        .map(|path| path.join(identifier).join("profile"))
         .ok_or_else(|| "could not resolve a per-user profile directory".to_string())
 }
 

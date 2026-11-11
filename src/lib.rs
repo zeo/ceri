@@ -4,6 +4,7 @@ pub mod launch;
 mod commands;
 mod custom;
 mod desktop;
+pub mod dirs;
 mod fonts;
 mod http;
 
