@@ -1,14 +1,11 @@
 use ceri_engine::{ExternalRequest, NavigationError, ResourceResponse};
 
-const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-
 pub fn request(request: &ExternalRequest) -> Result<ResourceResponse, NavigationError> {
     platform::request(request)
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::MAX_RESPONSE_BYTES;
     use ceri_engine::{ExternalRequest, NavigationError, ResourceResponse};
     use std::collections::BTreeMap;
     use std::ffi::c_void;
@@ -21,6 +18,7 @@ mod platform {
     };
     use windows::core::PCWSTR;
 
+    const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
     const TIMEOUT_MILLISECONDS: i32 = 30_000;
     const READ_CHUNK: usize = 64 * 1024;
 
