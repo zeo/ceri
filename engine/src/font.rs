@@ -689,7 +689,7 @@ pub fn rasterize_stroke(
 
 // winds every polygon the same way, so where they overlap their coverage adds up instead of
 // cancelling
-fn push_polygon(segments: &mut Vec<Segment>, points: &[(f32, f32)]) {
+pub(crate) fn push_polygon(segments: &mut Vec<Segment>, points: &[(f32, f32)]) {
     let edges = || {
         points
             .iter()
@@ -723,38 +723,58 @@ fn coverage_bitmap(segments: &[Segment]) -> Option<GlyphBitmap> {
     if width * height > MAX_GLYPH_PIXELS {
         return None;
     }
-
-    let mut area = vec![0.0_f32; width * height + 4];
-    for segment in segments {
-        accumulate_segment(
-            &mut area,
-            width,
-            height,
-            (segment.0.0 - left, segment.0.1 - top),
-            (segment.1.0 - left, segment.1.1 - top),
-        );
-    }
-
-    let mut coverage = vec![0_u8; width * height];
-    for row in 0..height {
-        let mut accumulator = 0.0_f32;
-        for column in 0..width {
-            accumulator += area[row * width + column];
-            let value = (accumulator.abs().min(1.0) * 255.0).round();
-            coverage[row * width + column] = value as u8;
-        }
-    }
-
     Some(GlyphBitmap {
         left: left as i32,
         top: top as i32,
         width,
         height,
-        coverage,
+        coverage: coverage_grid(segments, (left, top), width, height, false),
     })
 }
 
-type Segment = ((f32, f32), (f32, f32));
+// coverage of the closed edges over a grid whose top left pixel sits at `origin`; edges may
+// reach past the grid, and the part of an edge left of it still winds the pixels to its right
+pub(crate) fn coverage_grid(
+    segments: &[Segment],
+    origin: (f32, f32),
+    width: usize,
+    height: usize,
+    even_odd: bool,
+) -> Vec<u8> {
+    let mut area = vec![0.0_f32; width * height + 4];
+    let mut accumulate = |from: (f32, f32), to: (f32, f32)| {
+        accumulate_segment(&mut area, width, height, from, to);
+    };
+    for segment in segments {
+        let from = (segment.0.0 - origin.0, segment.0.1 - origin.1);
+        let to = (segment.1.0 - origin.0, segment.1.1 - origin.1);
+        if (from.0 < 0.0) != (to.0 < 0.0) {
+            let t = from.0 / (from.0 - to.0);
+            let crossing = (0.0, from.1 + (to.1 - from.1) * t);
+            accumulate((from.0.max(0.0), from.1), crossing);
+            accumulate(crossing, (to.0.max(0.0), to.1));
+        } else {
+            accumulate((from.0.max(0.0), from.1), (to.0.max(0.0), to.1));
+        }
+    }
+    let mut coverage = vec![0_u8; width * height];
+    for row in 0..height {
+        let mut accumulator = 0.0_f32;
+        for column in 0..width {
+            accumulator += area[row * width + column];
+            let winding = if even_odd {
+                let folded = accumulator.abs() % 2.0;
+                if folded > 1.0 { 2.0 - folded } else { folded }
+            } else {
+                accumulator.abs().min(1.0)
+            };
+            coverage[row * width + column] = (winding * 255.0).round() as u8;
+        }
+    }
+    coverage
+}
+
+pub(crate) type Segment = ((f32, f32), (f32, f32));
 
 fn flatten_contour(
     contour: &[OutlinePoint],
@@ -1871,6 +1891,36 @@ fn read_f2dot14(data: &[u8], offset: usize) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_grids_keep_edges_left_of_the_grid_and_fold_even_odd() {
+        let mut square = Vec::new();
+        push_polygon(
+            &mut square,
+            &[(-2.0, 0.0), (2.0, 0.0), (2.0, 2.0), (-2.0, 2.0)],
+        );
+        assert_eq!(
+            coverage_grid(&square, (0.0, 0.0), 4, 2, false),
+            [255, 255, 0, 0, 255, 255, 0, 0]
+        );
+        let mut nested = Vec::new();
+        push_polygon(
+            &mut nested,
+            &[(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (0.0, 1.0)],
+        );
+        push_polygon(
+            &mut nested,
+            &[(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)],
+        );
+        assert_eq!(
+            coverage_grid(&nested, (0.0, 0.0), 3, 1, true),
+            [255, 0, 255]
+        );
+        assert_eq!(
+            coverage_grid(&nested, (0.0, 0.0), 3, 1, false),
+            [255, 255, 255]
+        );
+    }
 
     // a one-glyph font built in memory, so the parser is tested without a font file
     fn synthetic_font() -> Vec<u8> {
