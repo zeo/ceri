@@ -20,6 +20,8 @@ struct IndexedFace {
 // installed faces indexed by family name, read from each file's name table
 pub struct SystemFonts {
     faces: Vec<IndexedFace>,
+    // families the platform font configuration prefers for a name, in priority order
+    preferred: HashMap<String, Vec<String>>,
     loaded: RefCell<HashMap<PathBuf, Option<Rc<FontFace>>>>,
     // what each character fell back to, so the search runs once per character
     fallbacks: RefCell<HashMap<char, Option<PathBuf>>>,
@@ -27,8 +29,9 @@ pub struct SystemFonts {
 
 impl SystemFonts {
     pub fn discover() -> Self {
+        let (directories, preferred) = font_locations();
         let mut faces = Vec::new();
-        for directory in font_directories() {
+        for directory in directories {
             index_directory(&directory, &mut faces, 0);
         }
         faces.sort_by(|left, right| {
@@ -40,6 +43,7 @@ impl SystemFonts {
         });
         Self {
             faces,
+            preferred,
             loaded: RefCell::new(HashMap::new()),
             fallbacks: RefCell::new(HashMap::new()),
         }
@@ -49,23 +53,40 @@ impl SystemFonts {
         self.faces.len()
     }
 
+    // an installed family first, then what the font configuration prefers for the name or its
+    // css generic, then the platform's default for the generic
+    fn lookup(&self, family: &str, style: FontStyle) -> Option<&IndexedFace> {
+        if let Some(face) = self.installed(family, style) {
+            return Some(face);
+        }
+        let preferred = [Some(family), css_generic(family)]
+            .into_iter()
+            .flatten()
+            .filter_map(|name| self.preferred.get(name))
+            .flatten()
+            .find_map(|name| self.installed(name, style));
+        if preferred.is_some() {
+            return preferred;
+        }
+        if let Some(default) = generic_family(family) {
+            return self.installed(default, style);
+        }
+        // a width variant that is not installed, such as arial narrow, takes its base family,
+        // as edge and chrome do on windows
+        let base = WIDTH_WORDS
+            .iter()
+            .find_map(|word| family.strip_suffix(word)?.strip_suffix(' '))?;
+        self.lookup(base, style)
+    }
+
     // the css font matching order: slant first, then the weight nearest in the direction
     // the requested weight leans
-    fn lookup(&self, family: &str, style: FontStyle) -> Option<&IndexedFace> {
-        let family = generic_family(family).unwrap_or(family);
+    fn installed(&self, family: &str, style: FontStyle) -> Option<&IndexedFace> {
         let matching = self
             .faces
             .iter()
             .filter(|face| face.family == family)
             .collect::<Vec<_>>();
-        // a width variant that is not installed, such as arial narrow, takes its base family,
-        // as edge and chrome do on windows
-        if matching.is_empty() {
-            let base = WIDTH_WORDS
-                .iter()
-                .find_map(|word| family.strip_suffix(word)?.strip_suffix(' '))?;
-            return self.lookup(base, style);
-        }
         let slant = if matching.iter().any(|face| face.italic == style.italic) {
             style.italic
         } else {
@@ -223,36 +244,31 @@ const WIDTH_WORDS: &[&str] = &[
     "wide",
 ];
 
-fn generic_family(family: &str) -> Option<&'static str> {
+fn css_generic(family: &str) -> Option<&'static str> {
     match family {
-        "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" => {
-            Some(if cfg!(target_os = "windows") {
-                "segoe ui"
-            } else if cfg!(target_os = "macos") {
-                "helvetica"
-            } else {
-                "dejavu sans"
-            })
-        }
-        "serif" | "ui-serif" => Some(if cfg!(target_os = "windows") {
-            "times new roman"
-        } else if cfg!(target_os = "macos") {
-            "times"
-        } else {
-            "dejavu serif"
-        }),
-        "monospace" | "ui-monospace" => Some(if cfg!(target_os = "windows") {
-            "consolas"
-        } else if cfg!(target_os = "macos") {
-            "menlo"
-        } else {
-            "dejavu sans mono"
-        }),
+        "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" => Some("sans-serif"),
+        "serif" | "ui-serif" => Some("serif"),
+        "monospace" | "ui-monospace" => Some("monospace"),
         _ => None,
     }
 }
 
-fn font_directories() -> Vec<PathBuf> {
+fn generic_family(family: &str) -> Option<&'static str> {
+    Some(match css_generic(family)? {
+        "sans-serif" if cfg!(target_os = "windows") => "segoe ui",
+        "sans-serif" if cfg!(target_os = "macos") => "helvetica",
+        "sans-serif" => "dejavu sans",
+        "serif" if cfg!(target_os = "windows") => "times new roman",
+        "serif" if cfg!(target_os = "macos") => "times",
+        "serif" => "dejavu serif",
+        _ if cfg!(target_os = "windows") => "consolas",
+        _ if cfg!(target_os = "macos") => "menlo",
+        _ => "dejavu sans mono",
+    })
+}
+
+// the directories to index and the preferred families for a name
+fn font_locations() -> (Vec<PathBuf>, HashMap<String, Vec<String>>) {
     let mut directories = Vec::new();
     #[cfg(target_os = "windows")]
     {
@@ -279,13 +295,352 @@ fn font_directories() -> Vec<PathBuf> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         directories.push(PathBuf::from("/usr/share/fonts"));
         directories.push(PathBuf::from("/usr/local/share/fonts"));
-        if let Some(home) = std::env::var_os("HOME") {
-            directories.push(PathBuf::from(home).join(".local/share/fonts"));
+        if let Some(home) = &home {
+            directories.push(home.join(".local/share/fonts"));
+            directories.push(home.join(".fonts"));
+        }
+        let config = fontconfig::system(home);
+        for directory in config.directories {
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        (directories, config.preferred)
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        (directories, HashMap::new())
+    }
+}
+
+// the subset of fontconfig's xml that decides where fonts live and which families stand in for
+// a name: dir, include and alias prefer lists
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+mod fontconfig {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    const MAX_INCLUDE_DEPTH: u8 = 16;
+
+    #[derive(Debug, Default)]
+    pub(super) struct FontConfig {
+        pub(super) directories: Vec<PathBuf>,
+        pub(super) preferred: HashMap<String, Vec<String>>,
+    }
+
+    pub(super) struct Roots {
+        pub(super) home: Option<PathBuf>,
+        pub(super) config_home: Option<PathBuf>,
+        pub(super) data_home: Option<PathBuf>,
+        // where relative includes such as conf.d resolve, /etc/fonts on a normal install
+        pub(super) system: PathBuf,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Entry {
+        Directory(PathBuf),
+        Include(PathBuf),
+        Prefer(String, Vec<String>),
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(super) fn system(home: Option<PathBuf>) -> FontConfig {
+        let xdg = |name: &str, fallback: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| home.as_ref().map(|home| home.join(fallback)))
+        };
+        let roots = Roots {
+            config_home: xdg("XDG_CONFIG_HOME", ".config"),
+            data_home: xdg("XDG_DATA_HOME", ".local/share"),
+            home: home.clone(),
+            system: PathBuf::from("/etc/fonts"),
+        };
+        let mut config = FontConfig::default();
+        read(&roots.system.join("fonts.conf"), &roots, &mut config, 0);
+        config
+    }
+
+    // includes load in place, so an earlier file's prefer list ranks first as in fontconfig
+    pub(super) fn read(path: &Path, roots: &Roots, config: &mut FontConfig, depth: u8) {
+        if depth > MAX_INCLUDE_DEPTH {
+            return;
+        }
+        if path.is_dir() {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            let mut files = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|file| {
+                    file.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(|first: char| first.is_ascii_digit())
+                                && name.ends_with(".conf")
+                        })
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            for file in files {
+                read(&file, roots, config, depth + 1);
+            }
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let current = path.parent().unwrap_or(Path::new("/"));
+        for entry in parse(&text, current, roots) {
+            match entry {
+                Entry::Directory(directory) => config.directories.push(directory),
+                Entry::Include(file) => read(&file, roots, config, depth + 1),
+                Entry::Prefer(family, preferred) => config
+                    .preferred
+                    .entry(family)
+                    .or_default()
+                    .extend(preferred),
+            }
         }
     }
-    directories
+
+    fn parse(text: &str, current: &Path, roots: &Roots) -> Vec<Entry> {
+        let mut entries = Vec::new();
+        let mut open: Vec<(&str, &str)> = Vec::new();
+        let mut alias: Option<(String, Vec<String>)> = None;
+        let mut rest = text;
+        while let Some(start) = rest.find('<') {
+            let content = decode(rest[..start].trim());
+            rest = &rest[start..];
+            if !content.is_empty() {
+                let names = open.iter().rev().map(|(name, _)| *name).collect::<Vec<_>>();
+                let attributes = open.last().map_or("", |(_, attributes)| *attributes);
+                match names.as_slice() {
+                    ["dir", "fontconfig", ..] => {
+                        let base = roots.data_home.as_deref();
+                        if let Some(path) = resolve(&content, attributes, base, current, roots) {
+                            entries.push(Entry::Directory(path));
+                        }
+                    }
+                    ["include", "fontconfig", ..] => {
+                        let base = roots.config_home.as_deref();
+                        if let Some(path) = resolve(&content, attributes, base, current, roots) {
+                            let path = if path.is_relative() {
+                                roots.system.join(path)
+                            } else {
+                                path
+                            };
+                            entries.push(Entry::Include(path));
+                        }
+                    }
+                    ["family", "alias", ..] => {
+                        if let Some((family, _)) = &mut alias {
+                            *family = content.to_lowercase();
+                        }
+                    }
+                    ["family", "prefer", "alias", ..] => {
+                        if let Some((_, preferred)) = &mut alias {
+                            preferred.push(content.to_lowercase());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let skip_to = if rest.starts_with("<!--") { "-->" } else { ">" };
+            let Some(end) = rest.find(skip_to) else {
+                break;
+            };
+            let tag = &rest[1..end];
+            rest = &rest[end + skip_to.len()..];
+            if tag.starts_with(['!', '?']) {
+                continue;
+            }
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if let Some(position) = open.iter().rposition(|(open, _)| *open == name) {
+                    open.truncate(position);
+                }
+                if name == "alias"
+                    && let Some((family, preferred)) = alias.take()
+                    && !family.is_empty()
+                    && !preferred.is_empty()
+                {
+                    entries.push(Entry::Prefer(family, preferred));
+                }
+                continue;
+            }
+            if tag.ends_with('/') {
+                continue;
+            }
+            let (name, attributes) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
+            if name == "alias" {
+                alias = Some((String::new(), Vec::new()));
+            }
+            open.push((name, attributes));
+        }
+        entries
+    }
+
+    // "~" is the home directory, prefix="xdg" an xdg base directory and prefix="relative" the
+    // directory of the file being read; anything else is taken as written
+    fn resolve(
+        value: &str,
+        attributes: &str,
+        xdg: Option<&Path>,
+        current: &Path,
+        roots: &Roots,
+    ) -> Option<PathBuf> {
+        if value == "~" {
+            return roots.home.clone();
+        }
+        if let Some(rest) = value.strip_prefix("~/") {
+            return Some(roots.home.as_ref()?.join(rest));
+        }
+        let value = Path::new(value);
+        if value.is_absolute() {
+            return Some(value.to_path_buf());
+        }
+        match attribute(attributes, "prefix") {
+            Some("xdg") => Some(xdg?.join(value)),
+            Some("relative") => Some(current.join(value)),
+            _ => Some(value.to_path_buf()),
+        }
+    }
+
+    fn attribute<'a>(mut attributes: &'a str, wanted: &str) -> Option<&'a str> {
+        loop {
+            let (name, rest) = attributes.split_once('=')?;
+            let rest = rest.trim_start();
+            let quote = rest
+                .chars()
+                .next()
+                .filter(|quote| matches!(quote, '"' | '\''))?;
+            let (value, rest) = rest[1..].split_once(quote)?;
+            if name.trim() == wanted {
+                return Some(value);
+            }
+            attributes = rest;
+        }
+    }
+
+    fn decode(text: &str) -> String {
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Entry, FontConfig, Roots, parse, read};
+        use std::path::{Path, PathBuf};
+
+        fn roots(system: PathBuf) -> Roots {
+            Roots {
+                home: Some(PathBuf::from("/home/user")),
+                config_home: Some(PathBuf::from("/home/user/.config")),
+                data_home: Some(PathBuf::from("/home/user/.local/share")),
+                system,
+            }
+        }
+
+        #[test]
+        fn directories_includes_and_prefer_lists_are_read() {
+            let text = r#"<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <!-- <dir>/commented/out</dir> -->
+  <dir>/usr/share/fonts</dir>
+  <dir prefix="xdg">fonts</dir>
+  <dir>~/.fonts</dir>
+  <dir prefix='relative'>extra</dir>
+  <match target="pattern">
+    <test name="family"><string>mono</string></test>
+    <edit name="family" mode="assign"><string>monospace</string></edit>
+  </match>
+  <include ignore_missing="yes">conf.d</include>
+  <include ignore_missing="yes" prefix="xdg">fontconfig/fonts.conf</include>
+  <alias>
+    <family>Sans-Serif</family>
+    <prefer>
+      <family>Noto Sans</family>
+      <family>Fira &amp; Friends</family> <!-- a comment between families -->
+    </prefer>
+    <default><family>DejaVu Sans</family></default>
+  </alias>
+  <alias binding="same">
+    <family>Arial</family>
+    <accept><family>Liberation Sans</family></accept>
+  </alias>
+  <selectfont><rejectfont><glob>*.dpkg-tmp</glob></rejectfont></selectfont>
+</fontconfig>"#;
+            let entries = parse(
+                text,
+                Path::new("/etc/fonts"),
+                &roots(PathBuf::from("/etc/fonts")),
+            );
+            assert_eq!(
+                entries,
+                vec![
+                    Entry::Directory(PathBuf::from("/usr/share/fonts")),
+                    Entry::Directory(PathBuf::from("/home/user/.local/share/fonts")),
+                    Entry::Directory(PathBuf::from("/home/user/.fonts")),
+                    Entry::Directory(PathBuf::from("/etc/fonts/extra")),
+                    Entry::Include(PathBuf::from("/etc/fonts/conf.d")),
+                    Entry::Include(PathBuf::from("/home/user/.config/fontconfig/fonts.conf")),
+                    Entry::Prefer(
+                        "sans-serif".into(),
+                        vec!["noto sans".into(), "fira & friends".into()]
+                    ),
+                ]
+            );
+        }
+
+        #[test]
+        fn included_directories_load_numbered_files_in_order() {
+            let root = std::env::temp_dir().join(format!("ceri-fontconfig-{}", std::process::id()));
+            let conf_d = root.join("conf.d");
+            std::fs::create_dir_all(&conf_d).unwrap();
+            let prefer = |family: &str| {
+                format!(
+                    "<fontconfig><alias><family>sans-serif</family><prefer><family>{family}</family></prefer></alias></fontconfig>"
+                )
+            };
+            std::fs::write(
+                root.join("fonts.conf"),
+                "<fontconfig><dir>/opt/fonts</dir><include>conf.d</include><include>fonts.conf</include></fontconfig>",
+            )
+            .unwrap();
+            std::fs::write(conf_d.join("60-latin.conf"), prefer("DejaVu Sans")).unwrap();
+            std::fs::write(conf_d.join("50-user.conf"), prefer("Inter")).unwrap();
+            std::fs::write(conf_d.join("README"), prefer("Ignored")).unwrap();
+            std::fs::write(conf_d.join("local.conf"), prefer("Ignored")).unwrap();
+            let mut config = FontConfig::default();
+            read(
+                &root.join("fonts.conf"),
+                &roots(root.clone()),
+                &mut config,
+                0,
+            );
+            std::fs::remove_dir_all(&root).unwrap();
+            // the file including itself stops at the depth limit, listing its dir once per level
+            assert!(
+                config
+                    .directories
+                    .iter()
+                    .all(|path| path == Path::new("/opt/fonts"))
+            );
+            let sans = &config.preferred["sans-serif"];
+            assert_eq!(&sans[..2], ["inter", "dejavu sans"]);
+            assert!(!sans.iter().any(|family| family == "ignored"));
+        }
+    }
 }
 
 fn index_directory(directory: &Path, faces: &mut Vec<IndexedFace>, depth: u8) {
@@ -451,6 +806,7 @@ mod tests {
                 weight: 400,
                 italic: false,
             }],
+            preferred: HashMap::new(),
             loaded: RefCell::new(HashMap::new()),
             fallbacks: RefCell::new(HashMap::new()),
         };
@@ -466,6 +822,47 @@ mod tests {
         );
         assert_eq!(found("aptos narrow"), None);
         assert_eq!(found("arial bold"), None);
+    }
+
+    #[test]
+    fn configured_preferences_pick_the_first_installed_family() {
+        let face = |family: &str| IndexedFace {
+            family: family.into(),
+            path: PathBuf::from(format!("{family}.ttf")),
+            weight: 400,
+            italic: false,
+        };
+        let list = |families: &[&str]| families.iter().map(|family| family.to_string()).collect();
+        let fonts = SystemFonts {
+            faces: vec![
+                face("cantarell"),
+                face("liberation sans"),
+                face("fira mono"),
+            ],
+            preferred: HashMap::from([
+                (
+                    "sans-serif".to_string(),
+                    list(&["noto sans", "liberation sans"]),
+                ),
+                ("system-ui".to_string(), list(&["inter"])),
+                ("monospace".to_string(), list(&["noto mono"])),
+                ("helvetica".to_string(), list(&["cantarell"])),
+            ]),
+            loaded: RefCell::new(HashMap::new()),
+            fallbacks: RefCell::new(HashMap::new()),
+        };
+        let found = |family| {
+            fonts
+                .lookup(family, FontStyle::NORMAL)
+                .map(|face| face.family.as_str())
+        };
+        assert_eq!(found("sans-serif"), Some("liberation sans"));
+        // system-ui has its own list, then falls back to the sans-serif one
+        assert_eq!(found("system-ui"), Some("liberation sans"));
+        assert_eq!(found("helvetica"), Some("cantarell"));
+        assert_eq!(found("fira mono"), Some("fira mono"));
+        // neither a preferred family nor the platform default is installed
+        assert_eq!(found("monospace"), None);
     }
 
     #[test]
@@ -506,11 +903,22 @@ mod tests {
         if fonts.families() == 0 {
             return;
         }
+        // windows always ships these scripts, a linux install only has what its packages added
+        let installed = |character| {
+            fonts.faces.iter().any(|face| {
+                fonts
+                    .load(&face.path)
+                    .is_some_and(|loaded| loaded.has_glyph(character))
+            })
+        };
         for character in ['\u{0634}', '\u{4E2D}'] {
-            let face = fonts
-                .fallback(character, FontStyle::NORMAL)
-                .unwrap_or_else(|| panic!("a desktop platform should draw {character}"));
-            assert!(face.has_glyph(character));
+            match fonts.fallback(character, FontStyle::NORMAL) {
+                Some(face) => assert!(face.has_glyph(character)),
+                None => assert!(
+                    !cfg!(target_os = "windows") && !installed(character),
+                    "an installed face draws {character}, so fallback should find it"
+                ),
+            }
         }
         if let Some(emoji) = fonts.emoji(FontStyle::NORMAL) {
             assert!(emoji.has_glyph('\u{1F600}'));
