@@ -1167,6 +1167,24 @@ pub(crate) struct BoxShadow {
     pub blur: Length,
     pub spread: Length,
     pub color: Color,
+    pub inset: bool,
+}
+
+// a box-shadow list kept outside the copyable computed style, first shadow on top
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ShadowList(u32);
+
+thread_local! {
+    static SHADOW_LISTS: RefCell<crate::intern::Table<[BoxShadow]>> =
+        RefCell::new(crate::intern::Table::new());
+}
+
+impl ShadowList {
+    pub(crate) fn shadows(self) -> Rc<[BoxShadow]> {
+        SHADOW_LISTS
+            .with(|lists| lists.borrow().get(self.0))
+            .unwrap_or_else(|| Rc::from(Vec::new()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1267,7 +1285,7 @@ pub(crate) struct Style {
     pub border_radius: CornerLengths,
     pub opacity: f32,
     pub gradient: Option<Gradient>,
-    pub shadow: Option<BoxShadow>,
+    pub shadows: Option<ShadowList>,
     // width over height, from aspect-ratio or a replaced element's natural size
     pub aspect_ratio: Option<f32>,
     pub object_fit: ObjectFit,
@@ -1449,7 +1467,7 @@ impl Style {
             border_radius: SQUARE_CORNERS,
             opacity: 1.0,
             gradient: None,
-            shadow: None,
+            shadows: None,
             aspect_ratio: None,
             object_fit: ObjectFit::Fill,
             background_image: None,
@@ -5320,7 +5338,11 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             }
         }
         "box-shadow" => {
-            style.shadow = parse_box_shadow(value);
+            if value.trim().eq_ignore_ascii_case("none") {
+                style.shadows = None;
+            } else if let Some(shadows) = parse_box_shadows(value) {
+                style.shadows = Some(shadows);
+            }
         }
         "color" => style.color = parse_color(value).unwrap_or(style.color),
         "font-size" => style.font_size = parse_length(value).unwrap_or(style.font_size),
@@ -5969,23 +5991,44 @@ fn parse_linear_gradient(value: &str) -> Option<Gradient> {
     })
 }
 
-fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("none") {
-        return None;
+// keyed by the current color too, which a shadow without its own color takes
+fn parse_box_shadows(value: &str) -> Option<ShadowList> {
+    let current = CURRENT_COLOR.with(std::cell::Cell::get);
+    let key = format!(
+        "{}|{:02x}{:02x}{:02x}{:02x}",
+        value.trim(),
+        current.red,
+        current.green,
+        current.blue,
+        current.alpha
+    );
+    if let Some(id) = SHADOW_LISTS.with(|lists| lists.borrow().find(&key)) {
+        return Some(ShadowList(id));
     }
-    // inset shadows and shadow lists stay outside this slice
-    if value.to_ascii_lowercase().contains("inset") || split_top_level(value).len() > 1 {
-        return None;
-    }
+    let shadows = split_top_level(value)
+        .into_iter()
+        .map(|shadow| parse_box_shadow(shadow, current))
+        .collect::<Option<Rc<[BoxShadow]>>>()?;
+    Some(ShadowList(
+        SHADOW_LISTS.with(|lists| lists.borrow_mut().insert(&key, shadows)),
+    ))
+}
+
+// two to four lengths, an optional color and an optional inset keyword, in any order
+fn parse_box_shadow(value: &str, current: Color) -> Option<BoxShadow> {
     let mut lengths = Vec::new();
-    let mut color = Color::opaque(0, 0, 0);
+    let mut color = None;
+    let mut inset = false;
     for token in split_words(value) {
         if let Some(length) = parse_length(token) {
             lengths.push(length);
-            continue;
+        } else if token.eq_ignore_ascii_case("inset") && !inset {
+            inset = true;
+        } else if color.is_none() {
+            color = Some(parse_color(token)?);
+        } else {
+            return None;
         }
-        color = parse_color(token)?;
     }
     if lengths.len() < 2 || lengths.len() > 4 {
         return None;
@@ -5995,7 +6038,8 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
         offset_y: lengths[1],
         blur: lengths.get(2).copied().unwrap_or(Length::px(0.0)),
         spread: lengths.get(3).copied().unwrap_or(Length::px(0.0)),
-        color,
+        color: color.unwrap_or(current),
+        inset,
     })
 }
 
@@ -6918,7 +6962,7 @@ mod tests {
         assert_eq!(style.border_radius[0].0.resolve(0.0, 16.0), Some(18.0));
         assert_eq!(style.border_radius[1].1.resolve(0.0, 16.0), Some(8.0));
         assert_eq!(style.opacity, 0.4);
-        let shadow = style.shadow.expect("shadow should parse");
+        let shadow = style.shadows.expect("shadow should parse").shadows()[0];
         assert_eq!(shadow.offset_x.resolve(0.0, 16.0), Some(0.0));
         assert_eq!(shadow.offset_y.resolve(0.0, 16.0), Some(10.0));
         assert_eq!(shadow.blur.resolve(0.0, 16.0), Some(30.0));
@@ -6932,7 +6976,7 @@ mod tests {
         let none = Stylesheet::parse(".card { box-shadow: none; background: #101010; }")
             .expect("stylesheet should parse")
             .style_for(context(&placed(&card, &[]), &StyleState::default()));
-        assert!(none.shadow.is_none());
+        assert!(none.shadows.is_none());
         assert!(none.gradient.is_none());
         assert_eq!(none.background, Color::opaque(16, 16, 16));
     }
@@ -6991,9 +7035,23 @@ mod tests {
         assert_eq!(style.margin.top, parse_length("min(1rem, 2vw)").unwrap());
         apply_declaration(&mut style, "box-shadow", "0 4px 12px rgba(0, 0, 0, 0.5)");
         let shadow = style
-            .shadow
-            .expect("a shadow with an rgba color should parse");
+            .shadows
+            .expect("a shadow with an rgba color should parse")
+            .shadows()[0];
         assert_eq!((shadow.blur, shadow.color.alpha), (Length::px(12.0), 128));
+        apply_declaration(&mut style, "color", "#00ff00");
+        apply_declaration(
+            &mut style,
+            "box-shadow",
+            "inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 2px 8px",
+        );
+        let shadows = style.shadows.expect("a shadow list should parse").shadows();
+        assert_eq!(shadows.len(), 2);
+        assert!(shadows[0].inset && !shadows[1].inset);
+        assert_eq!(shadows[0].color.alpha, 26);
+        assert_eq!(shadows[1].color, Color::opaque(0, 255, 0));
+        apply_declaration(&mut style, "box-shadow", "0 1px red blue");
+        assert_eq!(style.shadows.map(|list| list.shadows().len()), Some(2));
     }
 
     #[test]

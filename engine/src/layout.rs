@@ -106,6 +106,7 @@ pub struct ResolvedShadow {
     pub blur: f32,
     pub spread: f32,
     pub color: Color,
+    pub inset: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,7 +126,8 @@ pub struct LayoutBox {
     pub(crate) clip_path: Option<crate::clip_path::ClipRegion>,
     pub(crate) radii: CornerRadii,
     pub opacity: f32,
-    pub shadow: Option<ResolvedShadow>,
+    // first on top, as declared
+    pub shadows: Vec<ResolvedShadow>,
     pub(crate) border: BoxBorder,
     pub(crate) outline: Option<BoxOutline>,
     pub text: Vec<TextRun>,
@@ -652,25 +654,33 @@ impl<'a> Subject<'a> {
 
 const NO_GENERATED_CONTENT: [Option<String>; 2] = [None, None];
 
-fn resolve_shadow(
-    shadow: Option<crate::css::BoxShadow>,
+fn resolve_shadows(
+    shadows: Option<crate::css::ShadowList>,
     containing_width: f32,
     font_size: f32,
-) -> Option<ResolvedShadow> {
-    let shadow = shadow?;
+) -> Vec<ResolvedShadow> {
+    let Some(shadows) = shadows else {
+        return Vec::new();
+    };
     let resolve = |length: crate::css::Length| {
         length
             .resolve(containing_width, font_size)
             .unwrap_or(0.0)
             .clamp(-2048.0, 2048.0)
     };
-    Some(ResolvedShadow {
-        offset_x: resolve(shadow.offset_x),
-        offset_y: resolve(shadow.offset_y),
-        blur: resolve(shadow.blur).max(0.0),
-        spread: resolve(shadow.spread),
-        color: shadow.color,
-    })
+    shadows
+        .shadows()
+        .iter()
+        .filter(|shadow| shadow.color.alpha > 0)
+        .map(|shadow| ResolvedShadow {
+            offset_x: resolve(shadow.offset_x),
+            offset_y: resolve(shadow.offset_y),
+            blur: resolve(shadow.blur).max(0.0),
+            spread: resolve(shadow.spread),
+            color: shadow.color,
+            inset: shadow.inset,
+        })
+        .collect()
 }
 
 fn inherited_text(style: &Style) -> InheritedText {
@@ -901,7 +911,7 @@ pub fn layout_with_state(
         clip_path: None,
         radii: SQUARE_CORNERS,
         opacity: 1.0,
-        shadow: None,
+        shadows: Vec::new(),
         border: BoxBorder::NONE,
         outline: None,
         text: Vec::new(),
@@ -2803,7 +2813,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: style.opacity * parent.opacity,
-        shadow: resolve_shadow(style.shadow, content_width, font_size),
+        shadows: resolve_shadows(style.shadows, content_width, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text,
@@ -2983,7 +2993,7 @@ fn anonymous_box(
         clip_path: None,
         radii: SQUARE_CORNERS,
         opacity,
-        shadow: None,
+        shadows: Vec::new(),
         border: BoxBorder::NONE,
         outline: None,
         text,
@@ -3894,7 +3904,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
-        shadow: resolve_shadow(style.shadow, content_width, font_size),
+        shadows: resolve_shadows(style.shadows, content_width, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -4373,7 +4383,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
-        shadow: resolve_shadow(style.shadow, content_width, font_size),
+        shadows: resolve_shadows(style.shadows, content_width, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -5093,7 +5103,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
-        shadow: resolve_shadow(style.shadow, content_width, font_size),
+        shadows: resolve_shadows(style.shadows, content_width, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -8849,6 +8859,52 @@ mod tests {
         assert_eq!(pixel(5, 20), [255, 0, 0, 255]);
         assert_eq!(pixel(38, 2), pixel(78, 78));
         assert_eq!(pixel(60, 10), pixel(78, 78));
+    }
+
+    #[test]
+    fn shadow_lists_stack_outside_the_border_box_and_inset_inside_the_padding_box() {
+        let document = Document::parse_markup(
+            "<style>div { position: absolute; top: 20px; width: 40px; height: 40px; } #card { left: 20px; background: rgba(0, 0, 255, 0.5); box-shadow: inset 0 0 0 4px #00ff00, 10px 0 0 #ff0000, 20px 0 0 #000000; } #soft { left: 110px; box-shadow: 0 0 10px #000000; }</style><div id='card'></div><div id='soft'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let canvas = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 180.0,
+                height: 80.0,
+            },
+        )
+        .paint();
+        let pixel = |x: u32, y: u32| {
+            let index = ((y * canvas.width() + x) * 4) as usize;
+            canvas.rgba_pixels()[index..index + 4].to_vec()
+        };
+        assert_eq!(pixel(22, 40), [0, 255, 0, 255]);
+        let page = pixel(178, 78);
+        let middle = pixel(40, 40);
+        assert!(
+            (0..2).all(|channel| middle[channel].abs_diff(page[channel] / 2) <= 1),
+            "no outer shadow under a translucent box: {middle:?}"
+        );
+        assert_eq!(
+            pixel(65, 40),
+            [255, 0, 0, 255],
+            "the first shadow is on top"
+        );
+        assert_eq!(pixel(75, 40), [0, 0, 0, 255]);
+        assert_eq!(pixel(85, 40), page);
+        let edge = pixel(109, 40)[0];
+        assert!(
+            (120..150).contains(&edge),
+            "a blurred edge is half covered: {edge}"
+        );
+        assert!(
+            page[0] - pixel(100, 40)[0] <= 10,
+            "the blur fades out by its radius"
+        );
+        assert_eq!(pixel(130, 40), page, "nothing paints under the box");
     }
 
     #[test]

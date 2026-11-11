@@ -664,6 +664,57 @@ impl Canvas {
         sum
     }
 
+    // one pass over the shadow's reach; an outer shadow shows only outside `frame` and an
+    // inset one only inside it
+    fn fill_shadow(&mut self, shadow: ShadowFill, clip: Option<Rect>) {
+        let ShadowFill {
+            shape,
+            blur,
+            frame,
+            inset,
+            color,
+        } = shadow;
+        if color.alpha == 0 {
+            return;
+        }
+        let shape = self.device_shape(shape);
+        let frame = self.device_shape(frame);
+        let clip = clip.map(|clip| self.device_shape(Shape::square(clip)));
+        // the css blur radius is twice the gaussian's standard deviation
+        let sigma = blur * self.scale / 2.0;
+        let reach = if inset {
+            frame
+        } else {
+            shape.outset(blur * self.scale)
+        };
+        let left = reach.x.floor().clamp(0.0, self.width as f32) as u32;
+        let top = reach.y.floor().clamp(0.0, self.height as f32) as u32;
+        let right = (reach.x + reach.width).ceil().clamp(0.0, self.width as f32) as u32;
+        let bottom = (reach.y + reach.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        for pixel_y in top..bottom {
+            for pixel_x in left..right {
+                let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+                if let Some(clip) = clip
+                    && clip.coverage(center) <= 0.0
+                {
+                    continue;
+                }
+                let inside = shadow_coverage(frame, 0.0, center);
+                let shade = if inset { inside } else { 1.0 - inside };
+                if shade <= 0.0 {
+                    continue;
+                }
+                let covered = shadow_coverage(shape, sigma, center);
+                let alpha = shade * if inset { 1.0 - covered } else { covered };
+                if alpha > 0.0 {
+                    self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(alpha.min(1.0)));
+                }
+            }
+        }
+    }
+
     fn push_mask(&mut self, shape: Shape) {
         let device = self.device_shape(shape);
         self.masks.push(Mask::Rounded(device));
@@ -859,7 +910,7 @@ impl DeviceBounds {
 fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let mut bounds = visual_rect_for(layout_box, ancestor_offset);
-    if let Some(shadow) = layout_box.shadow {
+    for shadow in layout_box.shadows.iter().filter(|shadow| !shadow.inset) {
         let reach = shadow.blur + shadow.spread.max(0.0);
         bounds = union_rect(
             bounds,
@@ -903,7 +954,7 @@ fn union_rect(first: Rect, second: Rect) -> Rect {
 fn fades_without_layer(layout_box: &LayoutBox) -> bool {
     layout_box.children.is_empty()
         && layout_box.text.is_empty()
-        && layout_box.shadow.is_none()
+        && layout_box.shadows.is_empty()
         && (layout_box.border.is_none()
             || (layout_box.background.alpha == 0 && layout_box.gradient.is_none()))
         && layout_box.background_image.is_none()
@@ -1114,33 +1165,106 @@ impl Paint {
     }
 }
 
+struct ShadowFill {
+    shape: Shape,
+    blur: f32,
+    // the border box an outer shadow stays outside of, or the padding box an inset one fills
+    frame: Shape,
+    inset: bool,
+    color: Color,
+}
+
+// how much of a pixel a shape covers once blurred by a gaussian of deviation `sigma`, in
+// device pixels; a blurred edge is the error function of the distance to it, exact axis by
+// axis for a square shape; unblurred square edges snap to whole pixels as filled boxes do
+fn shadow_coverage(shape: Shape, sigma: f32, point: (f32, f32)) -> f32 {
+    let sharp = sigma < 0.5;
+    let scale = sigma * std::f32::consts::SQRT_2;
+    if shape.is_square() {
+        let axis = |start: f32, length: f32, at: f32| {
+            if length <= 0.0 {
+                0.0
+            } else if sharp {
+                let first = start.round();
+                let last = (start + length).round().max(first + 1.0);
+                if (first..last).contains(&at) {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.5 * (erf((at - start) / scale) - erf((at - start - length) / scale))
+            }
+        };
+        return axis(shape.x, shape.width, point.0) * axis(shape.y, shape.height, point.1);
+    }
+    if sharp {
+        return (0.5 - shape.signed_distance(point)).clamp(0.0, 1.0);
+    }
+    // a rounded shape blurs row by row, as gpui draws shadows: each row is a span whose ends
+    // follow the corner curve and blurs exactly across, and four rows under the gaussian sum
+    // the blur down
+    let half = (shape.width / 2.0, shape.height / 2.0);
+    let local = (point.0 - shape.x - half.0, point.1 - shape.y - half.1);
+    let corner = match (local.0 > 0.0, local.1 > 0.0) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+        (false, true) => 3,
+    };
+    let (radius_x, radius_y) = shape.radii[corner];
+    let radius = ((radius_x + radius_y) / 2.0).min(half.0).min(half.1);
+    let start = (-3.0 * sigma).clamp(local.1 - half.1, local.1 + half.1);
+    let end = (3.0 * sigma).clamp(local.1 - half.1, local.1 + half.1);
+    let step = (end - start) / 4.0;
+    (0..4)
+        .map(|sample| {
+            let offset = start + step * (sample as f32 + 0.5);
+            let row = (half.1 - radius - (local.1 - offset).abs()).min(0.0);
+            let reach = half.0 - radius + (radius * radius - row * row).max(0.0).sqrt();
+            let span = 0.5 * (erf((local.0 + reach) / scale) - erf((local.0 - reach) / scale));
+            let weight = (-offset * offset / (2.0 * sigma * sigma)).exp()
+                / (sigma * (2.0 * std::f32::consts::PI).sqrt());
+            span * weight * step
+        })
+        .sum()
+}
+
+// abramowitz and stegun 7.1.26, within 1.5e-7
+fn erf(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let poly = t
+        * (0.254_829_6
+            + t * (-0.284_496_74 + t * (1.421_413_7 + t * (-1.453_152 + t * 1.061_405_4))));
+    (1.0 - poly * (-x * x).exp()).copysign(x)
+}
+
+// an outer shadow grows from the border box and an inset one shrinks from the padding box
 fn paint_shadow(
     canvas: &mut Canvas,
     shadow: &crate::layout::ResolvedShadow,
-    rect: Rect,
-    radii: CornerRadii,
+    border_box: Shape,
+    padding_box: Shape,
     opacity: f32,
     clip: Option<Rect>,
 ) {
-    let mut base = Shape::from_rect(rect, radii).outset(shadow.spread);
+    let (frame, mut base) = if shadow.inset {
+        (padding_box, padding_box.outset(-shadow.spread))
+    } else {
+        (border_box, border_box.outset(shadow.spread))
+    };
     base.x += shadow.offset_x;
     base.y += shadow.offset_y;
-    let color = shadow.color.scale_alpha(opacity);
-    if shadow.blur <= 0.0 {
-        canvas.fill_shape(base, &Paint::Solid(color), clip);
-        return;
-    }
-    // concentric rings approximate a gaussian falloff without an offscreen buffer
-    let steps = shadow.blur.ceil().clamp(1.0, 24.0) as usize;
-    let step = shadow.blur / steps as f32;
-    for ring in (0..=steps).rev() {
-        let falloff = 1.0 - (ring as f32 / (steps as f32 + 1.0));
-        canvas.fill_shape(
-            base.outset(step * ring as f32),
-            &Paint::Solid(color.scale_alpha(falloff * falloff / steps as f32 * 2.0)),
-            clip,
-        );
-    }
+    canvas.fill_shadow(
+        ShadowFill {
+            shape: base,
+            blur: shadow.blur,
+            frame,
+            inset: shadow.inset,
+            color: shadow.color.scale_alpha(opacity),
+        },
+        clip,
+    );
 }
 
 struct BorderSides {
@@ -1887,12 +2011,16 @@ fn paint_box_surface(
     if !layout_box.visible {
         return content_clip;
     }
-    let radii = layout_box.radii;
-    if let Some(shadow) = layout_box.shadow.as_ref() {
-        paint_shadow(canvas, shadow, rect, radii, opacity, clip);
-    }
-    let outer = Shape::from_rect(rect, radii);
+    let outer = Shape::from_rect(rect, layout_box.radii);
     let surface = outer.inset(layout_box.border.widths);
+    for shadow in layout_box
+        .shadows
+        .iter()
+        .rev()
+        .filter(|shadow| !shadow.inset)
+    {
+        paint_shadow(canvas, shadow, outer, surface, opacity, clip);
+    }
     if let Some(gradient) = layout_box.gradient {
         canvas.fill_shape(outer, &Paint::Gradient(gradient.scale_alpha(opacity)), clip);
     } else if layout_box.background.alpha > 0 {
@@ -1939,6 +2067,14 @@ fn paint_box_surface(
                 repeat: (background.repeat.x, background.repeat.y),
             },
         );
+    }
+    for shadow in layout_box
+        .shadows
+        .iter()
+        .rev()
+        .filter(|shadow| shadow.inset)
+    {
+        paint_shadow(canvas, shadow, outer, surface, opacity, clip);
     }
     if layout_box.tag == "img"
         && let Some(layer) = images
@@ -3143,7 +3279,7 @@ mod tests {
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
-                shadow: None,
+                shadows: Vec::new(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: vec![TextRun {
@@ -3467,7 +3603,7 @@ mod tests {
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
-                shadow: None,
+                shadows: Vec::new(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: vec![TextRun {
@@ -3583,7 +3719,7 @@ mod tests {
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
-                shadow: None,
+                shadows: Vec::new(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: vec![
@@ -3692,7 +3828,7 @@ mod tests {
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
-                shadow: None,
+                shadows: Vec::new(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: Vec::new(),
@@ -3719,7 +3855,7 @@ mod tests {
                         clip_path: None,
                         radii: SQUARE_CORNERS,
                         opacity: 1.0,
-                        shadow: None,
+                        shadows: Vec::new(),
                         border: BoxBorder::NONE,
                         outline: None,
                         text: Vec::new(),
@@ -3770,7 +3906,7 @@ mod tests {
                         clip_path: None,
                         radii: SQUARE_CORNERS,
                         opacity: 1.0,
-                        shadow: None,
+                        shadows: Vec::new(),
                         border: BoxBorder::NONE,
                         outline: None,
                         text: Vec::new(),
