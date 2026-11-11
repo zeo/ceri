@@ -1,5 +1,5 @@
 use crate::css::Color;
-use crate::dom::{Document, Element, NodeId};
+use crate::dom::Document;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -10,8 +10,6 @@ const MAX_IMAGE_PIXELS: usize = 4_000_000;
 // decoded raster images are larger than rasterized SVG, but still bounded before allocation
 const MAX_RASTER_DIMENSION: u32 = 16_384;
 const MAX_RASTER_PIXELS: usize = 40_000_000;
-const MAX_SVG_DEPTH: usize = 64;
-const MAX_LINE_STEPS: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Image {
@@ -97,23 +95,6 @@ impl fmt::Display for ImageError {
 }
 
 impl std::error::Error for ImageError {}
-
-#[derive(Clone, Copy)]
-struct PaintStyle {
-    fill: Option<Color>,
-    stroke: Option<Color>,
-    stroke_width: f32,
-}
-
-impl Default for PaintStyle {
-    fn default() -> Self {
-        Self {
-            fill: Some(Color::BLACK),
-            stroke: None,
-            stroke_width: 1.0,
-        }
-    }
-}
 
 // decodes any supported image by its leading bytes, falling back to the declared type for SVG
 pub(crate) fn decode_image(bytes: &[u8], mime_type: &str) -> Result<Image, ImageError> {
@@ -302,9 +283,7 @@ pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
     let root = document
         .element(root_node)
         .expect("the svg root is an element");
-    let (view_x, view_y, view_width, view_height) = root
-        .attr("viewbox")
-        .and_then(parse_view_box)
+    let (_, _, view_width, view_height) = crate::svg::view_box(root)
         .or_else(|| {
             let width = root.attr("width").and_then(parse_scalar)?;
             let height = root.attr("height").and_then(parse_scalar)?;
@@ -336,251 +315,23 @@ pub(crate) fn parse_svg(source: &str) -> Result<Image, ImageError> {
         return Err(ImageError("SVG image is too large".to_string()));
     }
     let mut image = Image::new(width, height);
-    let scale_x = width as f32 / view_width;
-    let scale_y = height as f32 / view_height;
-    render_element(
-        &mut image,
+    let stylesheet = crate::css::Stylesheet::parse("").map_err(ImageError)?;
+    let state = crate::css::StyleState::default();
+    let (style, font_size) = stylesheet
+        .computed_style(&document, root_node, &state)
+        .ok_or_else(|| ImageError("SVG has no root element".to_string()))?;
+    let style_of = |node, parent: &crate::css::Style, parent_font_size| {
+        stylesheet.child_style(&document, node, parent, parent_font_size, &state)
+    };
+    let scene = crate::svg::build(
         &document,
         root_node,
-        PaintStyle::default(),
-        (view_x, view_y, scale_x, scale_y),
-        0,
+        (&style, font_size),
+        (0.0, 0.0, width as f32, height as f32),
+        &style_of,
     );
+    crate::svg::rasterize(&scene, &mut image, crate::svg::IDENTITY);
     Ok(image)
-}
-
-fn render_element(
-    image: &mut Image,
-    document: &Document,
-    node: NodeId,
-    parent_style: PaintStyle,
-    viewport: (f32, f32, f32, f32),
-    depth: usize,
-) {
-    if depth > MAX_SVG_DEPTH {
-        return;
-    }
-    let Some(element) = document.element(node) else {
-        return;
-    };
-    let style = parse_style(element, parent_style);
-    let (view_x, view_y, scale_x, scale_y) = viewport;
-    match element.name.as_str() {
-        "rect" => {
-            let x = scalar_attr(element, "x").unwrap_or(0.0);
-            let y = scalar_attr(element, "y").unwrap_or(0.0);
-            let width = scalar_attr(element, "width").unwrap_or(0.0);
-            let height = scalar_attr(element, "height").unwrap_or(0.0);
-            draw_rect(
-                image,
-                map_x(x, view_x, scale_x),
-                map_y(y, view_y, scale_y),
-                width * scale_x,
-                height * scale_y,
-                style,
-            );
-        }
-        "circle" => {
-            let cx = scalar_attr(element, "cx").unwrap_or(0.0);
-            let cy = scalar_attr(element, "cy").unwrap_or(0.0);
-            let radius = scalar_attr(element, "r").unwrap_or(0.0);
-            draw_circle(
-                image,
-                map_x(cx, view_x, scale_x),
-                map_y(cy, view_y, scale_y),
-                radius * scale_x.min(scale_y),
-                style,
-            );
-        }
-        "line" => {
-            let x1 = scalar_attr(element, "x1").unwrap_or(0.0);
-            let y1 = scalar_attr(element, "y1").unwrap_or(0.0);
-            let x2 = scalar_attr(element, "x2").unwrap_or(0.0);
-            let y2 = scalar_attr(element, "y2").unwrap_or(0.0);
-            draw_line(
-                image,
-                map_x(x1, view_x, scale_x),
-                map_y(y1, view_y, scale_y),
-                map_x(x2, view_x, scale_x),
-                map_y(y2, view_y, scale_y),
-                style,
-            );
-        }
-        _ => {}
-    }
-    for child in document.element_children(node) {
-        render_element(image, document, child, style, viewport, depth + 1);
-    }
-}
-
-fn draw_rect(image: &mut Image, x: f32, y: f32, width: f32, height: f32, style: PaintStyle) {
-    if let Some(fill) = style.fill {
-        let left = x.floor().clamp(0.0, image.width as f32) as i32;
-        let top = y.floor().clamp(0.0, image.height as f32) as i32;
-        let right = (x + width).ceil().clamp(0.0, image.width as f32) as i32;
-        let bottom = (y + height).ceil().clamp(0.0, image.height as f32) as i32;
-        for pixel_y in top..bottom {
-            for pixel_x in left..right {
-                image.blend_pixel(pixel_x, pixel_y, fill);
-            }
-        }
-    }
-    if let Some(stroke) = style.stroke {
-        let thickness = style.stroke_width.max(1.0);
-        draw_rect_outline(image, x, y, width, height, thickness, stroke);
-    }
-}
-
-fn draw_rect_outline(
-    image: &mut Image,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    thickness: f32,
-    color: Color,
-) {
-    draw_rect(
-        image,
-        x,
-        y,
-        width,
-        thickness,
-        PaintStyle {
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 1.0,
-        },
-    );
-    draw_rect(
-        image,
-        x,
-        y + height - thickness,
-        width,
-        thickness,
-        PaintStyle {
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 1.0,
-        },
-    );
-    draw_rect(
-        image,
-        x,
-        y,
-        thickness,
-        height,
-        PaintStyle {
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 1.0,
-        },
-    );
-    draw_rect(
-        image,
-        x + width - thickness,
-        y,
-        thickness,
-        height,
-        PaintStyle {
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 1.0,
-        },
-    );
-}
-
-fn draw_circle(image: &mut Image, cx: f32, cy: f32, radius: f32, style: PaintStyle) {
-    let left = (cx - radius).floor().clamp(0.0, image.width as f32) as i32;
-    let top = (cy - radius).floor().clamp(0.0, image.height as f32) as i32;
-    let right = (cx + radius).ceil().clamp(0.0, image.width as f32) as i32;
-    let bottom = (cy + radius).ceil().clamp(0.0, image.height as f32) as i32;
-    let stroke_width = style.stroke_width.max(1.0).min(MAX_IMAGE_DIMENSION as f32);
-    for pixel_y in top..bottom {
-        for pixel_x in left..right {
-            let dx = pixel_x as f32 + 0.5 - cx;
-            let dy = pixel_y as f32 + 0.5 - cy;
-            let distance = (dx * dx + dy * dy).sqrt();
-            if let Some(fill) = style.fill
-                && distance <= radius
-            {
-                image.blend_pixel(pixel_x, pixel_y, fill);
-            }
-            if let Some(stroke) = style.stroke
-                && (distance - radius).abs() <= stroke_width / 2.0
-            {
-                image.blend_pixel(pixel_x, pixel_y, stroke);
-            }
-        }
-    }
-}
-
-fn draw_line(image: &mut Image, x1: f32, y1: f32, x2: f32, y2: f32, style: PaintStyle) {
-    let Some(color) = style.stroke.or(style.fill) else {
-        return;
-    };
-    let distance = (x2 - x1).hypot(y2 - y1).ceil().max(1.0);
-    if !distance.is_finite() || distance as usize > MAX_LINE_STEPS {
-        return;
-    }
-    let distance = distance as usize;
-    let radius = style.stroke_width.max(1.0).min(MAX_IMAGE_DIMENSION as f32) / 2.0;
-    for step in 0..=distance {
-        let progress = step as f32 / distance as f32;
-        let x = x1 + (x2 - x1) * progress;
-        let y = y1 + (y2 - y1) * progress;
-        let left = (x - radius).floor() as i32;
-        let top = (y - radius).floor() as i32;
-        let right = (x + radius).ceil() as i32;
-        let bottom = (y + radius).ceil() as i32;
-        for pixel_y in top..bottom {
-            for pixel_x in left..right {
-                image.blend_pixel(pixel_x, pixel_y, color);
-            }
-        }
-    }
-}
-
-fn parse_style(element: &Element, mut style: PaintStyle) -> PaintStyle {
-    for (name, value) in &element.attrs {
-        match name.as_str() {
-            "fill" => style.fill = parse_paint(value),
-            "stroke" => style.stroke = parse_paint(value),
-            "stroke-width" => {
-                style.stroke_width = parse_scalar(value).unwrap_or(style.stroke_width)
-            }
-            "style" => {
-                for declaration in value.split(';') {
-                    let Some((property, value)) = declaration.split_once(':') else {
-                        continue;
-                    };
-                    match property.trim().to_ascii_lowercase().as_str() {
-                        "fill" => style.fill = parse_paint(value.trim()),
-                        "stroke" => style.stroke = parse_paint(value.trim()),
-                        "stroke-width" => {
-                            style.stroke_width =
-                                parse_scalar(value.trim()).unwrap_or(style.stroke_width)
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    style
-}
-
-fn parse_paint(value: &str) -> Option<Color> {
-    if value.trim().eq_ignore_ascii_case("none") {
-        None
-    } else {
-        Color::parse(value)
-    }
-}
-
-fn scalar_attr(element: &Element, name: &str) -> Option<f32> {
-    element.attr(name).and_then(parse_scalar)
 }
 
 fn parse_scalar(value: &str) -> Option<f32> {
@@ -600,27 +351,6 @@ fn parse_dimension(value: f32, name: &str) -> Result<u32, ImageError> {
         )));
     }
     Ok(value.round().max(1.0) as u32)
-}
-
-fn parse_view_box(value: &str) -> Option<(f32, f32, f32, f32)> {
-    let values = value
-        .split(|character: char| character.is_ascii_whitespace() || character == ',')
-        .filter(|value| !value.is_empty())
-        .map(str::parse::<f32>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    if values.len() != 4 || values.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    Some((values[0], values[1], values[2], values[3]))
-}
-
-fn map_x(value: f32, view_x: f32, scale: f32) -> f32 {
-    (value - view_x) * scale
-}
-
-fn map_y(value: f32, view_y: f32, scale: f32) -> f32 {
-    (value - view_y) * scale
 }
 
 #[cfg(test)]
@@ -685,6 +415,23 @@ mod tests {
         assert_eq!(image.pixel(2, 3), Color::opaque(255, 0, 0));
         assert_eq!(image.pixel(15, 6), Color::opaque(0, 0, 255));
         assert_eq!(image.pixel(0, 0).alpha, 0);
+    }
+
+    #[test]
+    fn strokes_svg_paths_with_round_caps_in_the_current_color() {
+        let image = parse_svg(
+            r##"<svg width="20" height="10" color="#ff0000">
+                <path d="M5 5H15" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+            </svg>"##,
+        )
+        .expect("svg should parse");
+        assert_eq!(image.pixel(10, 4), Color::opaque(255, 0, 0));
+        assert!(
+            image.pixel(3, 5).alpha > 128,
+            "the round cap reaches past the end"
+        );
+        assert_eq!(image.pixel(1, 5).alpha, 0);
+        assert_eq!(image.pixel(10, 1).alpha, 0);
     }
 
     #[test]
