@@ -57,6 +57,18 @@ fn main() {
 
 and the app hands the files over with `App::new().assets(ceri::embedded_assets!())`. Cargo rebuilds when anything under the folder changes. A `--ceri-assets` folder on the command line still wins over the compiled-in files.
 
+The same build script can give a Windows executable its file icon, version details and a Common Controls v6 manifest, written as a resource file the MSVC linker takes directly, so no `rc.exe` is needed:
+
+```rust
+ceri_build::resources(ceri_build::Resources {
+    icon: Some(std::path::Path::new("icons/icon.ico")),
+    company: Some("rot"),
+    ..Default::default()
+});
+```
+
+The product name defaults to the package name, the file description to the product name, and both versions come from the package version. On other targets, and on the GNU toolchain, the call does nothing.
+
 ### Commands
 
 An app registers named commands in Rust and grants pages the right to call them. A command takes its arguments and returns its result as serde types; `json_command` and `blocking_json_command` work on the raw call and its JSON text instead:

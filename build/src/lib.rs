@@ -1,6 +1,9 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+mod resources;
+pub use resources::{Resources, resources};
+
 // from an app's build script: compiles every file under the folder into the app, where
 // ceri::embedded_assets!() hands them to App::assets
 pub fn embed(folder: impl AsRef<Path>) {
