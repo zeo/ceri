@@ -1,12 +1,14 @@
 // the commands an app registers for its pages to invoke, by name; payloads and results are
 // JSON text
 
+use crate::files::FileGrants;
 use ceri_engine::{
     CommandCall, CommandError, CommandReply, CommandRouter, WindowAction, WindowControl,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -52,6 +54,7 @@ pub struct CommandRoutes {
     pub commands: Arc<Commands>,
     pub control: Option<WindowControl>,
     pub version: Option<String>,
+    pub files: FileGrants,
 }
 
 impl CommandRoutes {
@@ -62,6 +65,14 @@ impl CommandRoutes {
                 Some(version) => json(version),
                 None => Err(CommandError::failed("the app has no version")),
             });
+        }
+        if call.command == "files:url" {
+            return Some(arguments::<FilePath>(call).and_then(
+                |file| match self.files.url(&file.path) {
+                    Some(url) => json(&url),
+                    None => Err(CommandError::failed("the path is outside every file grant")),
+                },
+            ));
         }
         let control = self.control.as_ref()?;
         let label = call.window.as_str();
@@ -113,6 +124,11 @@ impl CommandRoutes {
             _ => return None,
         })
     }
+}
+
+#[derive(Deserialize)]
+struct FilePath {
+    path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -191,6 +207,7 @@ mod tests {
             commands: Arc::new(commands),
             control: None,
             version: Some("1.2.3".to_string()),
+            files: FileGrants::default(),
         };
         let (sender, receiver) = channel();
         let ask = |command: &str, id| {

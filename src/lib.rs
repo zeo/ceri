@@ -5,6 +5,7 @@ mod commands;
 mod custom;
 mod desktop;
 pub mod dirs;
+mod files;
 mod fonts;
 mod http;
 
@@ -13,3 +14,4 @@ pub use ceri_engine::{
     WindowAction, WindowConfig, WindowControl, WindowState,
 };
 pub use custom::{App, AppHandle, run};
+pub use files::FileGrants;

@@ -47,9 +47,9 @@ use crate::dom::{
     AccessibilityNode, Boundary, Document, DomError, Element, LiveRange, NodeId, NodeKind,
 };
 use crate::navigation::{
-    APP_ORIGIN, AppUrl, ClipboardProvider, FilePicker, FilePickerRequest, NavigationError,
-    Resource, ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
-    ResourceResponse, is_http_redirect, is_javascript, is_json, normalize_headers,
+    AppUrl, ClipboardProvider, FilePicker, FilePickerRequest, NavigationError, Resource,
+    ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
+    is_http_redirect, is_javascript, is_json, normalize_headers,
 };
 use crate::paint::CanvasCommand;
 use crate::text::{next_word_boundary, previous_word_boundary};
@@ -675,7 +675,7 @@ fn resolve_runtime_request(
     request: &ResourceRequest,
 ) -> Result<Option<Resource>, ScriptError> {
     if request.method() == "GET"
-        && let Some(resource) = resources.resource(request.url().path()).cloned()
+        && let Some(resource) = resources.resource_at(request.url()).cloned()
     {
         return Ok(Some(resource));
     }
@@ -696,7 +696,7 @@ fn resolve_runtime_response_with_redirects(
     let mut redirected = false;
     for _ in 0..=MAX_FETCH_REDIRECTS {
         let response = if request.method() == "GET"
-            && let Some(resource) = resources.resource(request.url().path()).cloned()
+            && let Some(resource) = resources.resource_at(request.url()).cloned()
         {
             Some(ResourceResponse::from_resource(resource))
         } else {
@@ -3731,10 +3731,9 @@ impl ScriptRuntime {
                 let url = url.borrow();
                 match property {
                     "href" => Ok(Value::String(url.to_string().into())),
-                    "origin" => Ok(Value::String(APP_ORIGIN.to_string().into())),
+                    "origin" => Ok(Value::String(url.origin().to_string().into())),
                     "protocol" => Ok(Value::String("https:".to_string().into())),
-                    "host" => Ok(Value::String("app.ceri.invalid".to_string().into())),
-                    "hostname" => Ok(Value::String("app.ceri.invalid".to_string().into())),
+                    "host" | "hostname" => Ok(Value::String(url.host().to_string().into())),
                     "pathname" => Ok(Value::String(url.path().to_string().into())),
                     "search" => Ok(Value::String(
                         (if url.query().is_empty() {
@@ -3771,9 +3770,11 @@ impl ScriptRuntime {
             },
             Value::Url(url) => match property {
                 "href" => Ok(Value::String(url.borrow().url.to_string().into())),
-                "origin" => Ok(Value::String(APP_ORIGIN.to_string().into())),
+                "origin" => Ok(Value::String(url.borrow().url.origin().to_string().into())),
                 "protocol" => Ok(Value::String("https:".to_string().into())),
-                "host" | "hostname" => Ok(Value::String("app.ceri.invalid".to_string().into())),
+                "host" | "hostname" => {
+                    Ok(Value::String(url.borrow().url.host().to_string().into()))
+                }
                 "pathname" => Ok(Value::String(url.borrow().url.path().to_string().into())),
                 "search" => Ok(Value::String(search_component(&url.borrow().url).into())),
                 "hash" => Ok(Value::String(fragment_component(&url.borrow().url).into())),
@@ -4522,6 +4523,12 @@ impl ScriptRuntime {
         let url = base_url
             .resolve(&reference)
             .map_err(|error| runtime_error(error.to_string()))?;
+        // a worker runs with the page's own powers, so only the app's scripts may start one
+        if url.is_files() {
+            return Err(runtime_error(format!(
+                "SecurityError: a worker script must come from the app origin, not {url}"
+            )));
+        }
         let mut name = String::new();
         let mut worker_type = WorkerScriptType::Classic;
         if let Some(options) = arguments.get(1).map(Value::resolve) {

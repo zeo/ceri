@@ -86,6 +86,8 @@ export const appWindow: AppWindow;
 
 export function appVersion(): Promise<string>;
 
+export function fileUrl(path: string): Promise<string>;
+
 export interface CeriHost {
   readonly windowLabel: string;
   invoke(command: string, args?: unknown): Promise<unknown>;

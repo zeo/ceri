@@ -1,6 +1,7 @@
 use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
 use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
+use crate::files::FileGrants;
 use crate::fonts::SystemFonts;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use ceri_engine::{
@@ -12,7 +13,7 @@ use ceri_engine::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +25,7 @@ const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 #[derive(Clone, Default)]
 pub struct AppHandle {
     control: Arc<OnceLock<WindowControl>>,
+    files: FileGrants,
 }
 
 impl AppHandle {
@@ -34,6 +36,11 @@ impl AppHandle {
     // opens, acts on, reads and closes windows once the loop runs
     pub fn windows(&self) -> Option<&WindowControl> {
         self.control.get()
+    }
+
+    // the folders pages may read through files URLs, granted and revoked at any time
+    pub fn files(&self) -> &FileGrants {
+        &self.files
     }
 
     // an event for every window's listeners
@@ -189,13 +196,18 @@ impl App {
         let capabilities = self.capabilities.grant(Grant {
             windows: vec!["*".to_string()],
             origins: vec![APP_ORIGIN.to_string()],
-            commands: vec!["window:*".to_string(), "app:*".to_string()],
+            commands: vec![
+                "window:*".to_string(),
+                "app:*".to_string(),
+                "files:*".to_string(),
+            ],
         });
         run_app(
             Bridge {
                 commands: Arc::new(self.commands),
                 capabilities,
                 version: self.version,
+                files: self.handle.files.clone(),
             },
             &identifier,
             self.windows,
@@ -243,6 +255,7 @@ struct Bridge {
     commands: Arc<Commands>,
     capabilities: Capabilities,
     version: Option<String>,
+    files: FileGrants,
 }
 
 impl Bridge {
@@ -252,6 +265,7 @@ impl Bridge {
                 commands: self.commands.clone(),
                 control: control.cloned(),
                 version: self.version.clone(),
+                files: self.files.clone(),
             }),
             self.capabilities.clone(),
             window,
@@ -327,6 +341,7 @@ fn run_app(
                 assets.clone(),
                 storage.clone(),
                 allowed.clone(),
+                bridge.files.clone(),
                 bridge.host_bridge(&window.label, Some(&window.control)),
             )
         },
@@ -356,6 +371,7 @@ fn capture(
             assets,
             storage,
             allowed,
+            bridge.files.clone(),
             bridge.host_bridge(&config.label, None),
         )?,
         Size {
@@ -395,6 +411,7 @@ fn build_browser(
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
     allowed_origins: Vec<String>,
+    files: FileGrants,
     bridge: HostBridge,
 ) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
@@ -404,6 +421,7 @@ fn build_browser(
         Rc::new(PackagedAssets {
             assets,
             allowed_origins,
+            files,
         }),
     )
     .with_storage_directory(&storage)
@@ -510,10 +528,17 @@ fn allowed_origins(arguments: &[std::ffi::OsString]) -> Result<Vec<String>, Stri
 struct PackagedAssets {
     assets: Arc<AssetOrigin>,
     allowed_origins: Vec<String>,
+    files: FileGrants,
 }
 
 impl ResourceProvider for PackagedAssets {
     fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+        if url.is_files() {
+            let Some(path) = self.files.resolve(url.path()) else {
+                return Ok(None);
+            };
+            return read_resource(&path).map(Some);
+        }
         let request = url.to_string();
         let target = if is_document_path(url.path()) {
             RequestTarget::TopLevelNavigation
@@ -534,13 +559,7 @@ impl ResourceProvider for PackagedAssets {
                 )));
             }
         };
-        let body = fs::read(&asset.path).map_err(|error| {
-            NavigationError::ResourceProvider(format!(
-                "could not read {}: {error}",
-                asset.path.display()
-            ))
-        })?;
-        Ok(Some(Resource::new(mime_type_for(&asset.path), body)))
+        read_resource(&asset.path).map(Some)
     }
 
     fn provide_external(
@@ -556,6 +575,13 @@ impl ResourceProvider for PackagedAssets {
         }
         crate::http::request(request).map(Some)
     }
+}
+
+fn read_resource(path: &Path) -> Result<Resource, NavigationError> {
+    let body = fs::read(path).map_err(|error| {
+        NavigationError::ResourceProvider(format!("could not read {}: {error}", path.display()))
+    })?;
+    Ok(Resource::new(mime_type_for(path), body))
 }
 
 fn is_document_path(path: &str) -> bool {
@@ -591,6 +617,7 @@ mod tests {
         let provider = PackagedAssets {
             assets: Arc::new(AssetOrigin::new(&root).expect("web root should exist")),
             allowed_origins: Vec::new(),
+            files: Default::default(),
         };
 
         let index = provider
@@ -606,6 +633,24 @@ mod tests {
                 .expect("missing subresources should not fail")
                 .is_none()
         );
+
+        let granted = std::env::temp_dir().join(format!("ceri-provider-{}", std::process::id()));
+        std::fs::create_dir_all(&granted).expect("grant folder");
+        std::fs::write(granted.join("frame.png"), b"png").expect("granted file");
+        provider.files.grant("shots", &granted).expect("grant");
+        let shot = provider
+            .provide(&AppUrl::parse("https://files.ceri.invalid/shots/frame.png").expect("url"))
+            .expect("a granted file should resolve")
+            .expect("a granted file should exist");
+        assert_eq!(shot.mime_type(), "image/png");
+        assert_eq!(shot.body(), b"png");
+        assert!(
+            provider
+                .provide(&AppUrl::parse("https://files.ceri.invalid/shots/none.png").expect("url"))
+                .expect("a missing granted file should not fail")
+                .is_none()
+        );
+        std::fs::remove_dir_all(&granted).expect("cleanup");
     }
 
     #[test]
@@ -616,6 +661,7 @@ mod tests {
         let provider = PackagedAssets {
             assets: Arc::new(AssetOrigin::new(&root).expect("web root should exist")),
             allowed_origins: vec!["https://api.example.test".to_string()],
+            files: Default::default(),
         };
         let refused = ExternalRequest::new(
             "https://other.example.test/data",

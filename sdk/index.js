@@ -145,3 +145,8 @@ export const appWindow = Object.freeze({
 export function appVersion() {
   return invoke("app:version");
 }
+
+// the files URL of a path inside a folder the app granted, for img, video and fetch
+export function fileUrl(path) {
+  return invoke("files:url", { path });
+}

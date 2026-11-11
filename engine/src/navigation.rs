@@ -26,8 +26,12 @@ const FRAME_INTERVAL: u64 = 16;
 
 pub const APP_ORIGIN: &str = "https://app.ceri.invalid";
 
+// files the app grants pages, served as subresources only: no document ever loads from it
+pub const FILES_ORIGIN: &str = "https://files.ceri.invalid";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppUrl {
+    files: bool,
     path: String,
     query: String,
     fragment: String,
@@ -51,9 +55,13 @@ impl AppUrl {
         if authority.contains(':') {
             return Err(NavigationError::Port);
         }
-        if !authority.eq_ignore_ascii_case("app.ceri.invalid") {
+        let files = if authority.eq_ignore_ascii_case(host_of(APP_ORIGIN)) {
+            false
+        } else if authority.eq_ignore_ascii_case(host_of(FILES_ORIGIN)) {
+            true
+        } else {
             return Err(NavigationError::WrongOrigin);
-        }
+        };
 
         let target = &remainder[authority_end..];
         let (target, fragment) = target
@@ -65,10 +73,26 @@ impl AppUrl {
         let raw_path = if raw_path.is_empty() { "/" } else { raw_path };
 
         Ok(Self {
+            files,
             path: decode_path(raw_path)?,
             query: query.to_string(),
             fragment: fragment.to_string(),
         })
+    }
+
+    pub fn origin(&self) -> &'static str {
+        match self.files {
+            true => FILES_ORIGIN,
+            false => APP_ORIGIN,
+        }
+    }
+
+    pub fn host(&self) -> &'static str {
+        host_of(self.origin())
+    }
+
+    pub fn is_files(&self) -> bool {
+        self.files
     }
 
     pub fn path(&self) -> &str {
@@ -89,6 +113,7 @@ impl AppUrl {
         fragment: impl Into<String>,
     ) -> Self {
         Self {
+            files: self.files,
             path: self.path.clone(),
             query: query.into(),
             fragment: fragment.into(),
@@ -97,7 +122,7 @@ impl AppUrl {
 
     pub fn with_path(&self, path: &str) -> Result<Self, NavigationError> {
         let path = if path.is_empty() { "/" } else { path };
-        Self::parse(&format!("{APP_ORIGIN}{path}"))
+        Self::parse(&format!("{}{path}", self.origin()))
     }
 
     pub fn resolve(&self, reference: &str) -> Result<Self, NavigationError> {
@@ -129,6 +154,7 @@ impl AppUrl {
             }
         };
         Ok(Self {
+            files: self.files,
             path: resolve_reference_path(&path)?,
             query: if query_present {
                 query.to_string()
@@ -144,7 +170,7 @@ impl AppUrl {
 
 impl fmt::Display for AppUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{APP_ORIGIN}{}", self.path)?;
+        write!(formatter, "{}{}", self.origin(), self.path)?;
         if !self.query.is_empty() {
             write!(formatter, "?{}", self.query)?;
         }
@@ -153,6 +179,10 @@ impl fmt::Display for AppUrl {
         }
         Ok(())
     }
+}
+
+fn host_of(origin: &'static str) -> &'static str {
+    origin.trim_start_matches("https://")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,7 +420,9 @@ pub fn external_url(reference: &str) -> Result<String, NavigationError> {
     {
         return Err(NavigationError::InvalidUrl(reference.to_string()));
     }
-    if authority.eq_ignore_ascii_case(APP_ORIGIN.trim_start_matches("https://")) {
+    if authority.eq_ignore_ascii_case(host_of(APP_ORIGIN))
+        || authority.eq_ignore_ascii_case(host_of(FILES_ORIGIN))
+    {
         return Err(NavigationError::WrongOrigin);
     }
     Ok(reference.to_string())
@@ -564,7 +596,18 @@ impl ResourceBundle {
         self.resources.get(&path)
     }
 
+    // the bundle holds the app's own files; granted files come from the provider
+    pub fn resource_at(&self, url: &AppUrl) -> Option<&Resource> {
+        match url.is_files() {
+            true => None,
+            false => self.resource(url.path()),
+        }
+    }
+
     fn load(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
+        if url.is_files() {
+            return Err(NavigationError::WrongOrigin);
+        }
         if let Some(resource) = self.resources.get(url.path()) {
             return Ok(resource.clone());
         }
@@ -577,8 +620,7 @@ impl ResourceBundle {
     }
 
     fn load_subresource(&self, url: &AppUrl) -> Result<Resource, NavigationError> {
-        self.resources
-            .get(url.path())
+        self.resource_at(url)
             .cloned()
             .ok_or_else(|| NavigationError::ResourceNotFound(url.path().to_string()))
     }
@@ -1253,6 +1295,9 @@ impl Browser {
         redirect_depth: usize,
     ) -> Result<NavigationStatus, NavigationError> {
         let requested_url = request.url().clone();
+        if requested_url.is_files() {
+            return Err(NavigationError::WrongOrigin);
+        }
         let LoadedResource { url, resource } = match self.load_navigation_request(&request) {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
@@ -1278,6 +1323,10 @@ impl Browser {
             Err(error) => return Err(error),
         };
 
+        // a redirect may not land a document on the files origin either
+        if url.is_files() {
+            return Err(NavigationError::WrongOrigin);
+        }
         if !is_html(&resource) {
             self.install_error_page(
                 &url,
@@ -7495,6 +7544,69 @@ A</div>
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("200 {\"message\":\"from bundle\"}")
+        );
+    }
+
+    #[test]
+    fn granted_files_load_as_subresources_and_never_as_documents() {
+        struct Granted;
+        impl ResourceProvider for Granted {
+            fn provide(&self, url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+                Ok((url.is_files() && url.path() == "/shots/note.txt")
+                    .then(|| Resource::new("text/plain", b"from the grant".to_vec())))
+            }
+        }
+
+        let url = AppUrl::parse("https://FILES.ceri.invalid/shots/a%20b.png?v=2")
+            .expect("files URL should parse");
+        assert!(url.is_files());
+        assert_eq!(url.path(), "/shots/a b.png");
+        assert_eq!(url.origin(), FILES_ORIGIN);
+        assert_eq!(
+            url.to_string(),
+            "https://files.ceri.invalid/shots/a b.png?v=2"
+        );
+        let sibling = url
+            .resolve("../art/c.png")
+            .expect("relative URL should resolve");
+        assert!(sibling.is_files());
+        assert_eq!(sibling.path(), "/art/c.png");
+        assert!(matches!(
+            external_url("https://files.ceri.invalid/shots/a.png"),
+            Err(NavigationError::WrongOrigin)
+        ));
+
+        // the bundle's file at the same path must not answer for the files origin
+        let mut resources = bundle(
+            r#"<p id="status">idle</p><script>fetch("https://files.ceri.invalid/shots/note.txt").then((response) => response.text()).then((body) => { document.getElementById("status").textContent = body + "|" + new URL("https://files.ceri.invalid/x").origin + "|" + location.origin; });</script>"#,
+        );
+        resources
+            .insert("/shots/note.txt", "text/plain", b"from the bundle".to_vec())
+            .expect("decoy resource should be accepted");
+        assert!(
+            resources
+                .resource_at(&url.with_path("/shots/note.txt").unwrap())
+                .is_none()
+        );
+        let mut browser = Browser::with_resource_provider(resources, Rc::new(Granted));
+        assert_eq!(
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load"),
+            NavigationStatus::Loaded
+        );
+        let document = browser.document().unwrap();
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status element should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("from the grant|https://files.ceri.invalid|https://app.ceri.invalid")
+        );
+        assert_eq!(
+            browser.navigate("https://files.ceri.invalid/shots/note.txt"),
+            Err(NavigationError::WrongOrigin)
         );
     }
 
