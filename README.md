@@ -47,6 +47,16 @@ console.log(info.engine, info.recovery);
 
 `runtimeInfo()` reads the promise-based `window.ceriQuery` bridge and validates the response shape before returning it.
 
+An app can compile its built pages into its executable instead of shipping an `assets` folder. Its build script names the folder, with `ceri-build` as a build dependency:
+
+```rust
+fn main() {
+    ceri_build::embed("web/dist");
+}
+```
+
+and the app hands the files over with `App::new().assets(ceri::embedded_assets!())`. Cargo rebuilds when anything under the folder changes. A `--ceri-assets` folder on the command line still wins over the compiled-in files.
+
 ### Commands
 
 An app registers named commands in Rust and grants pages the right to call them. A command takes its arguments and returns its result as serde types; `json_command` and `blocking_json_command` work on the raw call and its JSON text instead:

@@ -1,6 +1,6 @@
-use crate::assets::{APP_ORIGIN, AssetOrigin, AssetRoute, RequestTarget};
+use crate::assets::{APP_ORIGIN, AssetOrigin, AssetRoute, EmbeddedAssets, RequestTarget};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const ENTRY_SWITCH: &str = "ceri-entry";
@@ -12,16 +12,26 @@ pub struct LaunchConfig {
     pub initial_url: String,
 }
 
-pub fn resolve(asset_root: Option<PathBuf>, entry: Option<String>) -> Result<LaunchConfig, String> {
-    let asset_root = asset_root.unwrap_or_else(default_asset_root);
-    let assets = AssetOrigin::new(&asset_root).map_err(|error| {
-        format!(
-            "asset root {} is unavailable: {error}",
-            asset_root.display()
-        )
-    })?;
+// a folder named on the command line wins over the app's compiled-in files
+pub fn resolve(
+    asset_root: Option<PathBuf>,
+    embedded: Option<EmbeddedAssets>,
+    entry: Option<String>,
+) -> Result<LaunchConfig, String> {
+    let assets = match (asset_root, embedded) {
+        (None, Some(files)) => AssetOrigin::embedded(files),
+        (asset_root, _) => {
+            let asset_root = asset_root.unwrap_or_else(default_asset_root);
+            AssetOrigin::new(&asset_root).map_err(|error| {
+                format!(
+                    "asset root {} is unavailable: {error}",
+                    asset_root.display()
+                )
+            })?
+        }
+    };
 
-    let entry = entry.unwrap_or_else(|| detect_entry(assets.root()).to_string());
+    let entry = entry.unwrap_or_else(|| detect_entry(&assets).to_string());
     let entry = normalized_entry(&entry)?;
     let initial_url = format!("{APP_ORIGIN}{entry}");
     match assets
@@ -30,10 +40,10 @@ pub fn resolve(asset_root: Option<PathBuf>, entry: Option<String>) -> Result<Lau
     {
         AssetRoute::File(_) | AssetRoute::AppShell(_) => {}
         AssetRoute::NotFound => {
-            return Err(format!(
-                "app entry {entry} does not exist under {}",
-                assets.root().display()
-            ));
+            return Err(match assets.root() {
+                Some(root) => format!("app entry {entry} does not exist under {}", root.display()),
+                None => format!("app entry {entry} is not among the embedded assets"),
+            });
         }
         AssetRoute::Rejected(reason) => {
             return Err(format!("app entry {entry} is unsafe: {reason:?}"));
@@ -83,11 +93,13 @@ pub fn normalized_entry(entry: &str) -> Result<String, String> {
     })
 }
 
-pub fn detect_entry(asset_root: &Path) -> &'static str {
-    if asset_root.join("index.html").is_file() {
-        "/index.html"
-    } else {
-        "/web/index.html"
+pub fn detect_entry(assets: &AssetOrigin) -> &'static str {
+    match assets.route(
+        &format!("{APP_ORIGIN}/index.html"),
+        RequestTarget::Subresource,
+    ) {
+        Ok(AssetRoute::File(_)) => "/index.html",
+        _ => "/web/index.html",
     }
 }
 

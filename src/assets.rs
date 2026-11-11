@@ -10,10 +10,23 @@ pub enum RequestTarget {
     Subresource,
 }
 
+// files compiled into the app by ceri_build::embed, named by their path under the folder
+pub type EmbeddedAssets = &'static [(&'static str, &'static [u8])];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedAsset {
     pub path: PathBuf,
     pub relative_path: PathBuf,
+    pub embedded: Option<&'static [u8]>,
+}
+
+impl ResolvedAsset {
+    pub fn read(&self) -> io::Result<Vec<u8>> {
+        match self.embedded {
+            Some(bytes) => Ok(bytes.to_vec()),
+            None => fs::read(&self.path),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,7 +60,13 @@ pub enum RejectReason {
 
 #[derive(Clone, Debug)]
 pub struct AssetOrigin {
-    root: PathBuf,
+    root: Root,
+}
+
+#[derive(Clone, Debug)]
+enum Root {
+    Folder(PathBuf),
+    Embedded(EmbeddedAssets),
 }
 
 impl AssetOrigin {
@@ -60,11 +79,23 @@ impl AssetOrigin {
             ));
         }
 
-        Ok(Self { root })
+        Ok(Self {
+            root: Root::Folder(root),
+        })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub fn embedded(files: EmbeddedAssets) -> Self {
+        Self {
+            root: Root::Embedded(files),
+        }
+    }
+
+    // the folder the assets are read from, none when they are compiled in
+    pub fn root(&self) -> Option<&Path> {
+        match &self.root {
+            Root::Folder(root) => Some(root),
+            Root::Embedded(_) => None,
+        }
     }
 
     pub fn route(&self, request_url: &str, target: RequestTarget) -> io::Result<AssetRoute> {
@@ -99,7 +130,28 @@ impl AssetOrigin {
     }
 
     fn locate(&self, relative_path: &Path) -> io::Result<Located> {
-        let candidate = self.root.join(relative_path);
+        let root = match &self.root {
+            Root::Folder(root) => root,
+            Root::Embedded(files) => {
+                // the request path was decoded from UTF-8 and every segment checked
+                let name = relative_path
+                    .iter()
+                    .filter_map(|segment| segment.to_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                return Ok(files.iter().find(|(file, _)| *file == name).map_or(
+                    Located::Missing,
+                    |(_, bytes)| {
+                        Located::File(ResolvedAsset {
+                            path: relative_path.to_path_buf(),
+                            relative_path: relative_path.to_path_buf(),
+                            embedded: Some(bytes),
+                        })
+                    },
+                ));
+            }
+        };
+        let candidate = root.join(relative_path);
         let path = match fs::canonicalize(candidate) {
             Ok(path) => path,
             Err(error)
@@ -113,7 +165,7 @@ impl AssetOrigin {
             Err(error) => return Err(error),
         };
 
-        if !path.starts_with(&self.root) {
+        if !path.starts_with(root) {
             return Ok(Located::EscapesRoot);
         }
 
@@ -124,6 +176,7 @@ impl AssetOrigin {
         Ok(Located::File(ResolvedAsset {
             path,
             relative_path: relative_path.to_path_buf(),
+            embedded: None,
         }))
     }
 }
@@ -355,6 +408,52 @@ mod tests {
         assert_eq!(asset.relative_path, PathBuf::from("index.html"));
         assert!(asset.path.is_absolute());
         asset
+    }
+
+    #[test]
+    fn embedded_assets_route_as_a_folder_does() {
+        static FILES: EmbeddedAssets = &[
+            ("index.html", b"app shell"),
+            ("assets/app.js", b"application code"),
+        ];
+        let origin = AssetOrigin::embedded(FILES);
+        let route = |url: &str, target| origin.route(url, target).unwrap();
+        let AssetRoute::File(script) = route(
+            "https://app.ceri.invalid/assets/app.js?v=2",
+            RequestTarget::Subresource,
+        ) else {
+            panic!("the script is embedded");
+        };
+        assert_eq!(script.read().unwrap(), b"application code");
+        let AssetRoute::AppShell(shell) = route(
+            "https://app.ceri.invalid/library",
+            RequestTarget::TopLevelNavigation,
+        ) else {
+            panic!("an extensionless route falls back to the shell");
+        };
+        assert_eq!(shell.read().unwrap(), b"app shell");
+        assert_eq!(
+            route(
+                "https://app.ceri.invalid/assets/missing.js",
+                RequestTarget::Subresource
+            ),
+            AssetRoute::NotFound
+        );
+        assert_eq!(
+            route(
+                "https://app.ceri.invalid/assets",
+                RequestTarget::Subresource
+            ),
+            AssetRoute::NotFound
+        );
+        assert_eq!(
+            route(
+                "https://app.ceri.invalid/assets/%2e%2e/index.html",
+                RequestTarget::Subresource
+            ),
+            AssetRoute::Rejected(RejectReason::DotSegment)
+        );
+        assert_eq!(origin.root(), None);
     }
 
     #[test]

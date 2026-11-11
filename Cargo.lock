@@ -238,6 +238,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ceri-build"
+version = "0.1.0"
+
+[[package]]
 name = "ceri-engine"
 version = "0.1.0"
 dependencies = [

@@ -1,4 +1,4 @@
-use crate::assets::{AssetOrigin, AssetRoute, RequestTarget};
+use crate::assets::{AssetOrigin, AssetRoute, EmbeddedAssets, RequestTarget};
 use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
 use crate::files::FileScope;
@@ -84,6 +84,7 @@ pub struct App {
     handle: AppHandle,
     tray: Option<TrayRequest>,
     single_instance: Option<LaunchRequest>,
+    assets: Option<EmbeddedAssets>,
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
@@ -212,6 +213,13 @@ impl App {
         self
     }
 
+    // the pages the app serves, compiled in with ceri::embedded_assets!() rather than read
+    // from an assets folder beside the executable
+    pub fn assets(mut self, files: EmbeddedAssets) -> Self {
+        self.assets = Some(files);
+        self
+    }
+
     // the app origin may always drive its own window and read the app version
     pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
@@ -244,6 +252,7 @@ impl App {
                 capabilities,
                 version: self.version,
                 files: self.handle.files.clone(),
+                embedded: self.assets,
             },
             &identifier,
             self.windows,
@@ -294,6 +303,8 @@ struct Bridge {
     capabilities: Capabilities,
     version: Option<String>,
     files: FileScope,
+    // the pages compiled into the app, served unless a folder is named at launch
+    embedded: Option<EmbeddedAssets>,
 }
 
 impl Bridge {
@@ -326,6 +337,7 @@ fn run_app(
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let launch = launch::resolve(
         launch::switch_value(arguments.clone(), ASSETS_SWITCH).map(PathBuf::from),
+        bridge.embedded,
         launch::switch_value(arguments.clone(), ENTRY_SWITCH),
     )?;
     let profile = launch::profile_path(identifier)?;
@@ -532,7 +544,7 @@ fn app_icon_source(assets: &AssetOrigin) -> Option<Vec<u8>> {
         let AssetRoute::File(asset) = route else {
             continue;
         };
-        let source = fs::read(&asset.path).ok()?;
+        let source = asset.read().ok()?;
         if ceri_engine::rasterize_icon(&source, 16).is_some() {
             return Some(source);
         }
@@ -631,7 +643,10 @@ impl ResourceProvider for PackagedAssets {
                 )));
             }
         };
-        read_resource(&asset.path).map(Some)
+        let body = asset.read().map_err(|error| {
+            NavigationError::ResourceProvider(format!("could not read {}: {error}", url.path()))
+        })?;
+        Ok(Some(Resource::new(mime_type_for(&asset.path), body)))
     }
 
     fn provide_external(
