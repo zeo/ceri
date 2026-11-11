@@ -5293,7 +5293,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "gap" | "grid-gap" => {
-            let mut parts = value.split_ascii_whitespace().filter_map(parse_length);
+            let mut parts = split_words(value).into_iter().filter_map(parse_length);
             if let Some(row) = parts.next() {
                 style.row_gap = row;
                 style.gap = parts.next().unwrap_or(row);
@@ -5438,8 +5438,8 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
 }
 
 fn parse_edges(value: &str) -> Edges {
-    let mut values = value
-        .split_ascii_whitespace()
+    let mut values = split_words(value)
+        .into_iter()
         .filter_map(parse_length)
         .collect::<Vec<_>>();
     if values.is_empty() {
@@ -5878,12 +5878,12 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
         return None;
     }
     // inset shadows and shadow lists stay outside this slice
-    if value.to_ascii_lowercase().contains("inset") || value.contains(',') {
+    if value.to_ascii_lowercase().contains("inset") || split_top_level(value).len() > 1 {
         return None;
     }
     let mut lengths = Vec::new();
     let mut color = Color::opaque(0, 0, 0);
-    for token in value.split_ascii_whitespace() {
+    for token in split_words(value) {
         if let Some(length) = parse_length(token) {
             lengths.push(length);
             continue;
@@ -6869,6 +6869,36 @@ mod tests {
         assert_eq!(resolve("max(30px, 2rem)"), Some(40.0));
         assert_eq!(resolve("calc(2rem + 5%)"), Some(60.0));
         assert_eq!(parse_length("3quirks"), None);
+    }
+
+    #[test]
+    fn functions_with_spaces_stay_whole_in_gap_edges_and_shadows() {
+        let mut style = Style::default_for(
+            "div",
+            16.0,
+            Color::BLACK,
+            FontWeight::NORMAL,
+            InheritedText::default(),
+        );
+        apply_declaration(&mut style, "gap", "clamp(3rem, 7vw, 8rem) 2px");
+        assert_eq!(
+            style.row_gap,
+            parse_length("clamp(3rem, 7vw, 8rem)").unwrap()
+        );
+        assert_eq!(style.gap, Length::px(2.0));
+        apply_declaration(&mut style, "padding", "clamp(3rem, 8vh, 7rem) 0");
+        assert_eq!(
+            style.padding.top,
+            parse_length("clamp(3rem, 8vh, 7rem)").unwrap()
+        );
+        assert_eq!(style.padding.left, Length::px(0.0));
+        apply_declaration(&mut style, "margin", "min(1rem, 2vw) auto");
+        assert_eq!(style.margin.top, parse_length("min(1rem, 2vw)").unwrap());
+        apply_declaration(&mut style, "box-shadow", "0 4px 12px rgba(0, 0, 0, 0.5)");
+        let shadow = style
+            .shadow
+            .expect("a shadow with an rgba color should parse");
+        assert_eq!((shadow.blur, shadow.color.alpha), (Length::px(12.0), 128));
     }
 
     #[test]
