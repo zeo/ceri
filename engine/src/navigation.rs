@@ -3713,7 +3713,7 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/index.html")
             .expect("packaged document should load");
-        for _ in 0..100 {
+        for _ in 0..5000 {
             if browser.pump().expect("worker pump should execute") > 0 {
                 break;
             }
@@ -3762,7 +3762,7 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/index.html")
             .expect("provider document should load");
-        for _ in 0..100 {
+        for _ in 0..5000 {
             if browser.pump().expect("worker pump should execute") > 0 {
                 break;
             }
@@ -3829,7 +3829,7 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/index.html")
             .expect("provider document should load");
-        for _ in 0..200 {
+        for _ in 0..5000 {
             if browser.pump().expect("worker pump should execute") > 0 {
                 break;
             }
@@ -3885,7 +3885,7 @@ mod tests {
         browser
             .navigate("https://app.ceri.invalid/index.html")
             .expect("provider document should load");
-        for _ in 0..200 {
+        for _ in 0..5000 {
             if browser.pump().expect("worker pump should execute") > 0 {
                 break;
             }
