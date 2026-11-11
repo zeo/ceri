@@ -334,6 +334,8 @@ struct InlineLine {
     right: f32,
     // the block's line height, the band a fresh line checks floats against
     band: f32,
+    // the block's own font above and below the baseline, which every line holds
+    strut: (f32, f32),
     floats: Option<Rc<FloatArea>>,
     // inline elements seen in this block, and those still open at the start of the line
     decorations: Vec<InlineDecoration>,
@@ -355,7 +357,8 @@ struct InlineDecoration {
     tag: String,
     style: Style,
     font_size: f32,
-    line_height: f32,
+    // how far its baseline sits above the line's
+    raise: f32,
     padding: ResolvedEdges,
     border: ResolvedEdges,
     margin: ResolvedEdges,
@@ -371,6 +374,15 @@ impl InlineLine {
         self.fragments
             .iter()
             .any(|fragment| fragment.edge.is_none())
+    }
+
+    // the text just before any element edges, which owns a collapsed space that follows it
+    fn text_before_edges(&mut self) -> Option<&mut InlineFragment> {
+        self.fragments
+            .iter_mut()
+            .rev()
+            .find(|fragment| fragment.edge.is_none())
+            .filter(|fragment| fragment.atomic.is_none())
     }
 
     // the start or end of an inline element: a fragment as wide as its margin, border and
@@ -395,6 +407,8 @@ impl InlineLine {
             edge: Some((decoration, opening)),
             level: self.base_level(),
             leading: 0.0,
+            baseline: 0.0,
+            shift: LineShift::Raise(0.0),
         });
     }
 
@@ -536,6 +550,17 @@ struct InlineFragment {
     level: u8,
     // half the leading, between the top of the line and the glyph box
     leading: f32,
+    // how far below its top the baseline sits, and where the line puts it
+    baseline: f32,
+    shift: LineShift,
+}
+
+// raised above the line's baseline, or pinned to the line's top or bottom
+#[derive(Clone, Copy)]
+enum LineShift {
+    Raise(f32),
+    Top,
+    Bottom,
 }
 
 #[derive(Clone, Copy)]
@@ -732,6 +757,8 @@ struct InlineContext {
     content_width: f32,
     content_x: f32,
     align: TextAlign,
+    // how far this text's baseline sits above the line's
+    raise: f32,
 }
 
 // which DOM text node the next appended words belong to, for prose selection
@@ -1004,6 +1031,7 @@ fn layout_document_children(
                 left: 0.0,
                 right: 0.0,
                 band: 1.0,
+                strut: (0.0, 0.0),
                 floats: Some(root_floats.clone()),
                 decorations: Vec::new(),
                 open_inlines: Vec::new(),
@@ -1027,6 +1055,7 @@ fn layout_document_children(
                         content_width: viewport.width,
                         content_x: 0.0,
                         align: TextAlign::Start,
+                        raise: 0.0,
                     },
                     stylesheet,
                     style_state,
@@ -2447,6 +2476,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         left: 0.0,
         right: 0.0,
         band: line_height,
+        strut: line_extent(line_height, style.font_family, font_size),
         floats: Some(float_area.clone()),
         decorations: Vec::new(),
         open_inlines: Vec::new(),
@@ -2542,6 +2572,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         content_width,
         content_x,
         align: style.text_align,
+        raise: 0.0,
     };
     let child_parent = ParentStyle {
         font_size,
@@ -2624,6 +2655,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                         edge: None,
                         level: line.base_level(),
                         leading: 0.0,
+                        baseline: 0.0,
+                        shift: LineShift::Top,
                     });
                 }
             }
@@ -3067,6 +3100,7 @@ fn layout_text_item(
         left: 0.0,
         right: 0.0,
         band: context.line_height,
+        strut: line_extent(context.line_height, context.text.family, context.font_size),
         floats: None,
         decorations: Vec::new(),
         open_inlines: Vec::new(),
@@ -3218,17 +3252,59 @@ fn baseline_offset(layout: &LayoutBox) -> f32 {
 }
 
 fn first_baseline(layout: &LayoutBox) -> Option<f32> {
+    baselines(layout).reduce(f32::min)
+}
+
+fn last_baseline(layout: &LayoutBox) -> Option<f32> {
+    baselines(layout).reduce(f32::max)
+}
+
+fn baselines(layout: &LayoutBox) -> Box<dyn Iterator<Item = f32> + '_> {
     let fonts = crate::font::active_fonts();
     let own = layout
         .text
         .iter()
-        .map(|run| run.y + fonts.ascent(run.font_stack, run.font_size));
+        .map(move |run| run.y + fonts.ascent(run.font_stack, run.font_size));
     let nested = layout
         .children
         .iter()
         .filter(|child| !child.position.is_out_of_flow())
-        .filter_map(first_baseline);
-    own.chain(nested).reduce(f32::min)
+        .flat_map(baselines);
+    Box::new(own.chain(nested))
+}
+
+// the part of a line box a font takes above and below its baseline
+fn line_extent(line_height: f32, stack: FontStack, font_size: f32) -> (f32, f32) {
+    let above = half_leading(line_height, stack, font_size)
+        + crate::font::active_fonts().ascent(stack, font_size);
+    (above, line_height - above)
+}
+
+// where vertical-align puts a box of this height and baseline against its parent's text,
+// with percentages of the box's own line height
+fn vertical_shift(
+    align: VerticalAlign,
+    parent: &InlineContext,
+    (height, baseline): (f32, f32),
+    (font_size, line_height): (f32, f32),
+) -> LineShift {
+    let fonts = crate::font::active_fonts();
+    let (family, size) = (parent.text.family, parent.font_size);
+    let ascent = fonts.ascent(family, size);
+    let raise = match align {
+        VerticalAlign::Top => return LineShift::Top,
+        VerticalAlign::Bottom => return LineShift::Bottom,
+        VerticalAlign::Baseline => 0.0,
+        VerticalAlign::Sub => -(size / 5.0 + 1.0),
+        VerticalAlign::Super => size / 3.0 + 1.0,
+        VerticalAlign::TextTop => ascent - baseline,
+        VerticalAlign::TextBottom => {
+            height - baseline - (fonts.content_height(family, size) - ascent)
+        }
+        VerticalAlign::Middle => height / 2.0 - baseline + fonts.x_height(family, size) / 2.0,
+        VerticalAlign::Raise(length) => length.resolve(line_height, font_size).unwrap_or(0.0),
+    };
+    LineShift::Raise(parent.raise + raise)
 }
 
 // resolves flexible lengths for one line, as CSS Flexbox section 9.7 describes
@@ -3390,6 +3466,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         content_width,
         content_x: 0.0,
         align: style.text_align,
+        raise: 0.0,
     };
     let box_opacity = style.opacity * parent_opacity;
     let item_block = if style.position == Position::Static {
@@ -4041,6 +4118,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         content_width,
         content_x: 0.0,
         align: style.text_align,
+        raise: 0.0,
     };
     let box_opacity = style.opacity * parent_opacity;
     let item_block = if style.position == Position::Static {
@@ -4988,7 +5066,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             let shift = match cell.style.vertical_align {
                 VerticalAlign::Middle => free / 2.0,
                 VerticalAlign::Bottom => free,
-                VerticalAlign::Top | VerticalAlign::Baseline => 0.0,
+                _ => 0.0,
             };
             for child in &mut laid_out.children {
                 translate_layout_box(child, 0.0, shift);
@@ -6608,6 +6686,16 @@ fn append_inline_element(
         .resolve(font_size, font_size)
         .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
         .max(1.0);
+    let (above, _) = line_extent(line_height, style.font_family, font_size);
+    let raise = match vertical_shift(
+        style.vertical_align,
+        &context,
+        (line_height, above),
+        (font_size, line_height),
+    ) {
+        LineShift::Raise(raise) => raise,
+        LineShift::Top | LineShift::Bottom => context.raise,
+    };
     let child_context = InlineContext {
         font_size,
         line_height,
@@ -6618,6 +6706,7 @@ fn append_inline_element(
         content_width: context.content_width,
         content_x: context.content_x,
         align: context.align,
+        raise,
     };
     let child_parent = ParentStyle {
         font_size,
@@ -6635,7 +6724,7 @@ fn append_inline_element(
         tag: node.name().to_string(),
         style,
         font_size,
-        line_height,
+        raise,
         padding,
         border,
         margin,
@@ -6979,11 +7068,7 @@ impl TextPlacer {
                 .fragments
                 .last()
                 .is_some_and(|fragment| matches!(fragment.edge, Some((_, true))))
-            && let Some(previous) = line
-                .fragments
-                .iter_mut()
-                .rev()
-                .find(|fragment| fragment.edge.is_none() && fragment.atomic.is_none())
+            && let Some(previous) = line.text_before_edges()
         {
             previous.text.push(' ');
             previous.width += space_width;
@@ -7076,6 +7161,13 @@ impl TextPlacer {
             edge: None,
             level,
             leading: self.leading,
+            baseline: line_extent(
+                self.context.line_height,
+                self.context.text.family,
+                self.context.font_size,
+            )
+            .0,
+            shift: LineShift::Raise(self.context.raise),
         });
     }
 }
@@ -7142,6 +7234,61 @@ fn append_atomic(
         line.fit_to_floats(context.content_x, context.content_width);
         line.make_room(outer_width, context.content_x, context.content_width);
     }
+    // a collapsed space before the box is drawn unless the line breaks there
+    if line.trailing_space && line.has_content() {
+        let font = FontStyle {
+            weight: context.weight.0,
+            italic: context.text.italic,
+        };
+        let space = match line.text_before_edges() {
+            Some(previous) => measure_text(
+                " ",
+                previous.font_stack,
+                previous.font_size,
+                previous.font,
+                previous.letter_spacing,
+            ),
+            None => measure_text(" ", context.text.family, context.font_size, font, 0.0),
+        };
+        if !line.overflows(line.used + space + outer_width, context.content_width) {
+            if let Some(previous) = line.text_before_edges() {
+                previous.text.push(' ');
+                previous.width += space;
+            } else {
+                line.fragments.push(InlineFragment {
+                    text: " ".to_string(),
+                    width: space,
+                    font_size: context.font_size,
+                    letter_spacing: 0.0,
+                    font_stack: context.text.family,
+                    color: Color::transparent(),
+                    font,
+                    node: None,
+                    node_offset: 0,
+                    source_len: 0,
+                    rtl: false,
+                    decoration: Default::default(),
+                    line_height: context.line_height,
+                    atomic: None,
+                    edge: None,
+                    level: line.base_level(),
+                    leading: half_leading(
+                        context.line_height,
+                        context.text.family,
+                        context.font_size,
+                    ),
+                    baseline: line_extent(
+                        context.line_height,
+                        context.text.family,
+                        context.font_size,
+                    )
+                    .0,
+                    shift: LineShift::Raise(context.raise),
+                });
+            }
+            line.used += space;
+        }
+    }
     if line.has_content() && line.overflows(line.used + outer_width, context.content_width) {
         flush_line(
             line,
@@ -7151,6 +7298,30 @@ fn append_atomic(
             context.align,
         );
     }
+    // a replaced box, a box that clips or one with no line of text sits on its bottom margin
+    // edge; inline-block takes its last line, the other inline boxes their first
+    let baseline = (!style.overflow.clips() && node.name() != "img")
+        .then(|| {
+            if style.display == Display::InlineBlock {
+                last_baseline(&laid_out)
+            } else {
+                first_baseline(&laid_out)
+            }
+        })
+        .flatten()
+        .map_or(outer_height, |baseline| {
+            laid_out.margin.top + baseline - laid_out.rect.y
+        });
+    let line_height = style
+        .line_height
+        .resolve(font_size, font_size)
+        .unwrap_or_else(|| normal_line_height(style.font_family, font_size));
+    let shift = vertical_shift(
+        style.vertical_align,
+        &context,
+        (outer_height, baseline),
+        (font_size, line_height),
+    );
     line.used += outer_width;
     line.height = line.height.max(outer_height);
     line.trailing_space = false;
@@ -7172,6 +7343,8 @@ fn append_atomic(
         edge: None,
         level: line.base_level(),
         leading: 0.0,
+        baseline,
+        shift,
     });
 }
 
@@ -7197,11 +7370,23 @@ fn flush_line(
     };
     let mut x = content_x + line.left + offset;
     let line_start = x;
-    // text shares the bottom of a line that a taller inline box stretched
-    let stretched = line
+    let (mut above, mut below) = line.strut;
+    let mut pinned = 0.0_f32;
+    for fragment in line
         .fragments
         .iter()
-        .any(|fragment| fragment.atomic.is_some());
+        .filter(|fragment| fragment.edge.is_none())
+    {
+        match fragment.shift {
+            LineShift::Raise(raise) => {
+                above = above.max(fragment.baseline + raise);
+                below = below.max(fragment.line_height - fragment.baseline - raise);
+            }
+            LineShift::Top | LineShift::Bottom => pinned = pinned.max(fragment.line_height),
+        }
+    }
+    let height = (above + below).max(pinned);
+    let baseline_y = line.y + above;
     let mut active = line.open_inlines.clone();
     let mut starts = HashMap::new();
     let mut ends = HashMap::new();
@@ -7221,10 +7406,10 @@ fn flush_line(
             x += fragment.width;
             continue;
         }
-        let top = if stretched {
-            line.y + (line.height - fragment.line_height).max(0.0)
-        } else {
-            line.y
+        let top = match fragment.shift {
+            LineShift::Raise(raise) => baseline_y - raise - fragment.baseline,
+            LineShift::Top => line.y,
+            LineShift::Bottom => line.y + height - fragment.line_height,
         };
         if let Some(mut atomic) = fragment.atomic {
             let outer_x = atomic.rect.x - atomic.margin.left;
@@ -7264,17 +7449,10 @@ fn flush_line(
             ),
             {
                 let decoration = &line.decorations[decoration];
-                let line_top = if stretched {
-                    line.y + (line.height - decoration.line_height).max(0.0)
-                } else {
-                    line.y
-                };
-                line_top
-                    + half_leading(
-                        decoration.line_height,
-                        decoration.style.font_family,
-                        decoration.font_size,
-                    )
+                baseline_y
+                    - decoration.raise
+                    - crate::font::active_fonts()
+                        .ascent(decoration.style.font_family, decoration.font_size)
             },
         );
         line.placed.push(fragment);
@@ -7283,7 +7461,7 @@ fn flush_line(
         .into_iter()
         .filter(|decoration| !ends.contains_key(decoration))
         .collect();
-    line.y += line.height.max(1.0);
+    line.y += height.max(1.0);
     line.used = 0.0;
     line.height = 0.0;
     line.fit_to_floats(content_x, content_width);
@@ -7581,6 +7759,8 @@ fn clone_text_fragment(fragment: &InlineFragment) -> InlineFragment {
         edge: None,
         level: fragment.level,
         leading: fragment.leading,
+        baseline: fragment.baseline,
+        shift: fragment.shift,
     }
 }
 
@@ -8398,6 +8578,43 @@ mod tests {
     }
 
     #[test]
+    fn inline_boxes_share_the_line_baseline_and_keep_the_space_before_them() {
+        let document = Document::parse_markup(concat!(
+            "<style>* { margin: 0 } p { font-size: 16px } kbd { display: inline-block; ",
+            "font-size: 12px; padding: 0 4px } i { display: inline-block; vertical-align: 10px }",
+            "</style><p>press <kbd>Alt</kbd> x<sup>2</sup> <i>up</i></p>",
+        ))
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 200.0,
+            },
+        );
+        let fonts = crate::font::active_fonts();
+        let baseline = |run: &TextRun| run.y + fonts.ascent(run.font_stack, run.font_size);
+        let runs = collect_text_runs(&result.root);
+        let run = |text: &str| {
+            runs.iter()
+                .find(|run| run.text.trim() == text)
+                .unwrap_or_else(|| panic!("a run for {text}"))
+        };
+        let press = run("press");
+        assert!(
+            press.text.ends_with(' '),
+            "the space before the box is drawn"
+        );
+        let kbd = find_box(&result.root, "kbd").expect("kbd box");
+        assert!(kbd.rect.x >= press.x + press.width - 0.01);
+        assert!((baseline(run("Alt")) - baseline(press)).abs() < 0.01);
+        assert!((baseline(press) - baseline(run("2")) - (16.0 / 3.0 + 1.0)).abs() < 0.01);
+        assert!((baseline(press) - baseline(run("up")) - 10.0).abs() < 0.01);
+    }
+
+    #[test]
     fn wraps_text_when_the_line_is_full() {
         let document = Document::parse_markup("<main>one two three four five six</main>")
             .expect("document should parse");
@@ -9129,6 +9346,7 @@ mod tests {
             left: 0.0,
             right: 0.0,
             band: 1.0,
+            strut: (0.0, 0.0),
             floats: None,
             decorations: Vec::new(),
             open_inlines: Vec::new(),

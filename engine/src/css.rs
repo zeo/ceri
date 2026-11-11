@@ -228,12 +228,18 @@ pub(crate) enum OverflowWrap {
     BreakWord,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum VerticalAlign {
     Baseline,
     Top,
     Middle,
     Bottom,
+    TextTop,
+    TextBottom,
+    Sub,
+    Super,
+    // a raise above the parent's baseline, percentages of the box's own line height
+    Raise(Length),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4918,6 +4924,8 @@ b, strong { font-weight: bolder }
 th, optgroup { font-weight: bold }
 em, i, cite, var, dfn, address { font-style: italic }
 small, sub, sup { font-size: 0.83em }
+sub { vertical-align: sub }
+sup { vertical-align: super }
 code, kbd, pre, samp, tt, listing, xmp, plaintext { font-family: monospace }
 pre, listing, xmp, plaintext { white-space: pre }
 [dir="rtl" i] { direction: rtl }
@@ -5215,12 +5223,20 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "caption-side" => style.caption_bottom = value.trim().eq_ignore_ascii_case("bottom"),
         "table-layout" => style.table_fixed = value.trim().eq_ignore_ascii_case("fixed"),
         "vertical-align" => {
-            style.vertical_align = match value.trim().to_ascii_lowercase().as_str() {
-                "top" | "text-top" => VerticalAlign::Top,
-                "middle" => VerticalAlign::Middle,
-                "bottom" | "text-bottom" => VerticalAlign::Bottom,
-                _ => VerticalAlign::Baseline,
-            };
+            let value = value.trim().to_ascii_lowercase();
+            if let Some(align) = match value.as_str() {
+                "baseline" => Some(VerticalAlign::Baseline),
+                "top" => Some(VerticalAlign::Top),
+                "text-top" => Some(VerticalAlign::TextTop),
+                "middle" => Some(VerticalAlign::Middle),
+                "bottom" => Some(VerticalAlign::Bottom),
+                "text-bottom" => Some(VerticalAlign::TextBottom),
+                "sub" => Some(VerticalAlign::Sub),
+                "super" => Some(VerticalAlign::Super),
+                _ => parse_length(&value).map(VerticalAlign::Raise),
+            } {
+                style.vertical_align = align;
+            }
         }
         "list-style" => {
             // images are not loaded, so the type stands in for them

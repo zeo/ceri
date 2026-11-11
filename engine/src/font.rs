@@ -27,6 +27,8 @@ pub struct FontFace {
     characters: BTreeMap<u32, u16>,
     // usWeightClass and the italic flag, from OS/2 and head
     weight: u16,
+    // sxHeight from OS/2 version 2 on, or half an em
+    x_height: f32,
     italic: bool,
     // where each table starts, for the layout tables shaping reads
     tables: BTreeMap<[u8; 4], (usize, usize)>,
@@ -99,6 +101,11 @@ impl FontFace {
             .and_then(|os2| read_u16(&data, os2 + 4).ok())
             .filter(|weight| (1..=1000).contains(weight))
             .unwrap_or(400);
+        let x_height = os2
+            .filter(|&os2| read_u16(&data, os2).is_ok_and(|version| version >= 2))
+            .and_then(|os2| read_i16(&data, os2 + 86).ok())
+            .filter(|&height| height > 0)
+            .map_or(units_per_em / 2.0, f32::from);
         let italic = os2
             .and_then(|os2| read_u16(&data, os2 + 62).ok())
             .map(|selection| selection & 1 != 0)
@@ -124,6 +131,7 @@ impl FontFace {
             horizontal_metrics,
             characters,
             weight,
+            x_height,
             italic,
             tables,
         })
@@ -139,6 +147,10 @@ impl FontFace {
 
     pub fn descent(&self, size: f32) -> f32 {
         self.descent / self.units_per_em * size
+    }
+
+    pub fn x_height(&self, size: f32) -> f32 {
+        self.x_height / self.units_per_em * size
     }
 
     pub fn line_height(&self, size: f32) -> f32 {
@@ -1098,6 +1110,13 @@ impl FontSet {
         match self.primary(stack, FontStyle::NORMAL) {
             Some(face) => face.ascent(size),
             None => size,
+        }
+    }
+
+    pub fn x_height(&self, stack: FontStack, size: f32) -> f32 {
+        match self.primary(stack, FontStyle::NORMAL) {
+            Some(face) => face.x_height(size),
+            None => size / 2.0,
         }
     }
 
