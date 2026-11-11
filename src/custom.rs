@@ -178,6 +178,10 @@ fn capture(
     let status = host
         .navigate(&config.start_url)
         .map_err(|error| error.to_string())?;
+    // a second of page time lets timers and animation frames settle the first view
+    host.browser_mut()
+        .advance_time(1000)
+        .map_err(|error| error.to_string())?;
     let frame = host
         .render()
         .map_err(|error| error.to_string())?
