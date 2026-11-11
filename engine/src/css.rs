@@ -6256,7 +6256,8 @@ fn parse_length_arguments(arguments: &str, expected: usize) -> Option<Vec<Length
                 .and_then(|rest| rest.strip_suffix(')'))
             {
                 Some(expression) => parse_length_sum(expression),
-                None => parse_length_unit(argument),
+                // a math function's arguments are sums already, which minifiers leave bare
+                None => parse_length_sum(argument),
             }
         })
         .collect::<Option<Vec<_>>>()?;
@@ -8150,6 +8151,9 @@ mod tests {
         assert_eq!(resolve("clamp(10px, 1vw, 40px)"), Some(10.0));
         assert_eq!(resolve("min(30px, 2rem)"), Some(30.0));
         assert_eq!(resolve("max(30px, 2rem)"), Some(40.0));
+        // minifiers drop the calc() around sums inside math functions
+        assert_eq!(resolve("min(560px,100vw - 48px)"), Some(560.0));
+        assert_eq!(resolve("max(10px,50% - 2rem * 2)"), Some(120.0));
         assert_eq!(resolve("calc(2rem + 5%)"), Some(60.0));
         assert_eq!(parse_length("3quirks"), None);
     }
