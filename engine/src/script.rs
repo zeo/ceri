@@ -2,6 +2,7 @@ mod arrays;
 mod ast;
 mod bigint;
 mod bridge;
+mod canvas;
 mod collections;
 mod compiler;
 mod console;
@@ -39,6 +40,7 @@ use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol
 use realm::{Intrinsics, Native, create_intrinsics};
 
 pub use bridge::HostBridge;
+pub(crate) use canvas::canvas_size;
 pub use dates::TimeZone;
 pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
@@ -53,7 +55,6 @@ use crate::navigation::{
     ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
     is_http_redirect, is_javascript, is_json, normalize_headers,
 };
-use crate::paint::CanvasCommand;
 use crate::text::{next_word_boundary, previous_word_boundary};
 use crate::wasm;
 use std::cell::RefCell;
@@ -102,7 +103,7 @@ type IndexedDbTransactionHandle = Rc<RefCell<IndexedDbTransactionData>>;
 type IndexedDbObjectStoreHandle = Rc<RefCell<IndexedDbObjectStoreData>>;
 type IndexedDbNameListHandle = Rc<Vec<String>>;
 type TypedArrayHandle = Rc<RefCell<TypedArrayData>>;
-type CanvasContextHandle = Rc<RefCell<CanvasContextData>>;
+type CanvasContextHandle = Rc<RefCell<canvas::CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
 type BytesHandle = Rc<RefCell<Vec<u8>>>;
@@ -271,8 +272,7 @@ enum Builtin {
     ElementReportValidity(ElementHandle),
     ElementSetCustomValidity(ElementHandle),
     CanvasGetContext(ElementHandle),
-    CanvasFillRect(CanvasContextHandle),
-    CanvasClearRect(CanvasContextHandle),
+    CanvasMethod(CanvasContextHandle, &'static str),
     UrlSearchParamsAppend(UrlSearchParamsHandle),
     UrlSearchParamsDelete(UrlSearchParamsHandle),
     UrlSearchParamsGet(UrlSearchParamsHandle),
@@ -550,7 +550,6 @@ pub struct ScriptRuntime {
     scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     viewport: ViewportMetrics,
     canvas_contexts: HashMap<NodeId, CanvasContextHandle>,
-    canvas_commands: Vec<CanvasCommand>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -1099,11 +1098,6 @@ struct ErrorData {
     class_name: String,
 }
 
-struct CanvasContextData {
-    node: NodeId,
-    fill_style: Color,
-}
-
 struct AbortSignalData {
     aborted: bool,
     reason: Option<Value>,
@@ -1566,7 +1560,6 @@ impl ScriptRuntime {
             bridge: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
-            canvas_commands: Vec::new(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,
@@ -1817,6 +1810,7 @@ impl ScriptRuntime {
         self.file_lists.borrow_mut().retain(|node, _| !gone(*node));
         self.scroll_offsets.retain(|node, _| !gone(*node));
         self.canvas_contexts.retain(|node, _| !gone(*node));
+        self.image_loads.retain(|node, _| !gone(*node));
     }
 
     fn remove_event_listeners_for_signal(&mut self, signal: &AbortSignalHandle) {
@@ -2708,10 +2702,6 @@ impl ScriptRuntime {
 
     pub(crate) fn report(&mut self, message: impl Into<String>) {
         self.logs.push(message.into());
-    }
-
-    pub(crate) fn canvas_commands(&self) -> &[CanvasCommand] {
-        &self.canvas_commands
     }
 
     // document prose ranges as (text node, start, end) for paint highlighting
@@ -4099,14 +4089,7 @@ impl ScriptRuntime {
             Value::FileConstructor => {
                 Err(runtime_error(format!("File has no property {property}")))
             }
-            Value::CanvasContext(context) => match property {
-                "fillStyle" => Ok(Value::String(color_css(context.borrow().fill_style).into())),
-                "fillRect" => Ok(Value::Builtin(Builtin::CanvasFillRect(context))),
-                "clearRect" => Ok(Value::Builtin(Builtin::CanvasClearRect(context))),
-                _ => Err(runtime_error(format!(
-                    "CanvasRenderingContext2D has no property {property}"
-                ))),
-            },
+            Value::CanvasContext(context) => self.canvas_context_property(&context, property),
             Value::AbortController(controller) => match property {
                 "signal" => Ok(Value::AbortSignal(controller.borrow().signal.clone())),
                 "abort" => Ok(Value::Builtin(Builtin::AbortControllerAbort(controller))),
@@ -6132,9 +6115,13 @@ impl ScriptRuntime {
         {
             self.normalize_select_selection(node, false);
         }
-        // setting src to the value it already has still loads it again
+        // setting src to the value it already has still loads it again, and setting a canvas
+        // size to the one it has still clears it
         if name.eq_ignore_ascii_case("src") {
             self.update_image(node);
+        }
+        if name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height") {
+            self.reset_canvas(node);
         }
         changed
     }
@@ -6245,14 +6232,6 @@ impl ScriptRuntime {
         }
     }
 
-    fn set_canvas_fill_style(&mut self, context: &CanvasContextHandle, value: &str) -> bool {
-        let Some(color) = Color::parse(value) else {
-            return false;
-        };
-        context.borrow_mut().fill_style = color;
-        true
-    }
-
     fn set_element_checked(&mut self, handle: &ElementHandle, checked: bool) -> bool {
         let node = handle.id;
         let is_radio = self.document.borrow().element(node).is_some_and(|element| {
@@ -6316,6 +6295,9 @@ impl ScriptRuntime {
         }
         if changed && name.eq_ignore_ascii_case("src") {
             self.update_image(node);
+        }
+        if changed && (name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height")) {
+            self.reset_canvas(node);
         }
         changed
     }
@@ -7417,49 +7399,13 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                if !kind.eq_ignore_ascii_case("2d") {
+                if kind != "2d" {
                     return Ok(Value::Null);
                 }
-                let context = self
-                    .canvas_contexts
-                    .entry(node)
-                    .or_insert_with(|| {
-                        Rc::new(RefCell::new(CanvasContextData {
-                            node,
-                            fill_style: Color::BLACK,
-                        }))
-                    })
-                    .clone();
-                Ok(Value::CanvasContext(context))
+                Ok(Value::CanvasContext(self.canvas_context(node)))
             }
-            Builtin::CanvasFillRect(context) => {
-                let x = canvas_number(&arguments, 0)?;
-                let y = canvas_number(&arguments, 1)?;
-                let width = canvas_number(&arguments, 2)?;
-                let height = canvas_number(&arguments, 3)?;
-                self.canvas_commands.push(CanvasCommand::FillRect {
-                    node: context.borrow().node,
-                    x,
-                    y,
-                    width,
-                    height,
-                    color: context.borrow().fill_style,
-                });
-                Ok(Value::Undefined)
-            }
-            Builtin::CanvasClearRect(context) => {
-                let x = canvas_number(&arguments, 0)?;
-                let y = canvas_number(&arguments, 1)?;
-                let width = canvas_number(&arguments, 2)?;
-                let height = canvas_number(&arguments, 3)?;
-                self.canvas_commands.push(CanvasCommand::ClearRect {
-                    node: context.borrow().node,
-                    x,
-                    y,
-                    width,
-                    height,
-                });
-                Ok(Value::Undefined)
+            Builtin::CanvasMethod(context, name) => {
+                self.call_canvas_method(&context, name, &arguments)
             }
             Builtin::UrlToString(url) => Ok(Value::String(url.borrow().url.to_string().into())),
             Builtin::UrlSearchParamsAppend(params) => {
@@ -12211,18 +12157,6 @@ fn read_result(value: Value, done: bool) -> Value {
     result.insert("value".to_string(), value);
     result.insert("done".to_string(), Value::Bool(done));
     plain_object(result)
-}
-
-fn canvas_number(arguments: &[Value], index: usize) -> Result<f32, ScriptError> {
-    let value = arguments
-        .get(index)
-        .map(Value::number)
-        .transpose()?
-        .unwrap_or(0.0);
-    if !value.is_finite() {
-        return Err(runtime_error("canvas coordinates must be finite"));
-    }
-    Ok(value as f32)
 }
 
 fn color_css(color: Color) -> String {
@@ -19092,7 +19026,7 @@ mod tests {
     }
 
     #[test]
-    fn canvas_2d_context_records_fill_and_clear_commands() {
+    fn canvas_2d_context_draws_into_a_bitmap_scripts_can_read() {
         let document = document(
             r#"<canvas id="art" style="display: block; width: 80px; height: 60px"></canvas><p id="status">idle</p>"#,
         );
@@ -19102,21 +19036,42 @@ mod tests {
                 r##"
                 const canvas = document.getElementById("art");
                 const ctx = canvas.getContext("2d");
+                const pixel = (context, x, y) => Array.from(context.getImageData(x, y, 1, 1).data).join(" ");
+                const seen = [canvas.width, canvas.height, ctx.canvas === canvas, String(canvas.getContext("2D"))];
                 ctx.fillStyle = "#ff0000";
                 ctx.fillRect(4, 5, 10, 8);
                 ctx.clearRect(6, 7, 2, 2);
-                document.getElementById("status").textContent = ctx.fillStyle;
+                ctx.fillRect(Infinity, 0, 1, 1);
+                seen.push(pixel(ctx, 4, 5), pixel(ctx, 6, 7), ctx.fillStyle);
+                const copy = document.createElement("canvas");
+                copy.width = 4;
+                copy.height = 2;
+                const copied = copy.getContext("2d");
+                copied.drawImage(canvas, 4, 5, 2, 1, 0, 0, 4, 2);
+                seen.push(pixel(copied, 3, 1));
+                const data = ctx.getImageData(0, 0, 2, 1);
+                data.data[0] = 9;
+                data.data[3] = 255;
+                ctx.putImageData(data, 20, 0);
+                seen.push(pixel(ctx, 20, 0));
+                canvas.width = canvas.width;
+                seen.push(pixel(ctx, 4, 5), ctx.fillStyle, copy.width);
+                for (const attempt of [() => ctx.getImageData(0, 0, 0, 1), () => ctx.drawImage({}, 0, 0), () => ctx.drawImage(copy, 0, 0, 1)]) {
+                    try { attempt(); } catch (error) { seen.push(error.name); }
+                }
+                document.getElementById("status").textContent = seen.join(",");
                 "##,
             )
             .expect("canvas APIs should execute");
-        assert_eq!(runtime.canvas_commands().len(), 2);
         let status = document
             .borrow()
             .find_element_by_id("status")
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
-            Some("#ff0000")
+            Some(
+                "300,150,true,null,255 0 0 255,0 0 0 0,#ff0000,255 0 0 255,9 0 0 255,0 0 0 0,#000000,4,IndexSizeError,TypeError,TypeError"
+            )
         );
     }
 

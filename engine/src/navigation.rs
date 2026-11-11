@@ -2449,6 +2449,13 @@ impl Browser {
                 }
             }
         }
+        for node in document
+            .find_elements_by_selector("canvas")
+            .unwrap_or_default()
+        {
+            let size = crate::script::canvas_size(&document, node);
+            style_state.image_sizes.insert(node, size);
+        }
         style_state.container_sizes = self.container_sizes.borrow().clone();
         let mut keyed_state = style_state.clone();
         // a page with nothing in motion lays out the same at any clock time
@@ -2514,15 +2521,15 @@ impl Browser {
         device_pixel_ratio: f32,
     ) -> Result<Canvas, NavigationError> {
         let layout = self.layout(viewport)?;
-        let commands = self
+        let canvases = self
             .page
             .as_ref()
-            .map(|page| page.runtime.canvas_commands())
-            .unwrap_or(&[]);
+            .map(|page| page.runtime.canvas_layers())
+            .unwrap_or_default();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
-        Ok(crate::paint::paint_with_commands(
+        Ok(crate::paint::paint_with_canvases(
             &layout,
-            commands,
+            &canvases,
             device_pixel_ratio,
         ))
     }
@@ -5479,6 +5486,58 @@ mod tests {
     }
 
     #[test]
+    fn canvases_draw_loaded_images_and_refuse_broken_ones() {
+        let mut resources = bundle(
+            r#"<p id="status">idle</p><script>
+                const canvas = document.createElement("canvas");
+                canvas.width = 13;
+                canvas.height = 7;
+                const ctx = canvas.getContext("2d");
+                const img = new Image();
+                img.src = "/shot.png";
+                ctx.drawImage(img, 0, 0);
+                const before = ctx.getImageData(2, 3, 1, 1).data[3];
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, 13, 7);
+                    const missing = new Image();
+                    missing.onerror = () => {
+                        let refused = "drawn";
+                        try { ctx.drawImage(missing, 0, 0); } catch (error) { refused = error.name; }
+                        const pixel = Array.from(ctx.getImageData(2, 3, 1, 1).data).join(" ");
+                        document.getElementById("status").textContent = [before, pixel, refused].join(",");
+                    };
+                    missing.src = "/missing.png";
+                };
+            </script>"#,
+        );
+        let (mime_type, png) = crate::image::decode_data_url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHCAIAAABcElBNAAAAJHRFWHRDb21tZW50AGFuY2lsbGFyeSBjaHVua3MgYXJlIHNraXBwZWQXJBj8AAAAQElEQVR42mNgYNAQZjVW47Kz5Pf0EQmJl4wvkstqVS6dodGwWrd7n9G0i+YLn9isYWSXNxVm5SaImNjleYlBzHx2erxCwNKhtwAAAEFJREFUPAQRC0g5KzdBxKA8O9NsQYnn0vqYVV3566c2bVkwdefqFfu27T588NyJMw/PXv9y6RH79beMWrvKiPEHAPIZMLzOFGjtAAAAAElFTkSuQmCC").expect("fixture");
+        let expected = crate::image::decode_image(&png, &mime_type)
+            .expect("fixture should decode")
+            .pixel(2, 3);
+        resources
+            .insert("/shot.png", &mime_type, png)
+            .expect("image should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("canvas page should load");
+        for _ in 0..4 {
+            browser.advance_time(0).expect("image tasks should run");
+        }
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(expected.alpha, 255);
+        assert_eq!(
+            document.element_text_content(status),
+            Some(format!(
+                "0,{} {} {} 255,InvalidStateError",
+                expected.red, expected.green, expected.blue
+            ))
+        );
+    }
+
+    #[test]
     fn shadow_roots_render_slots_scope_styles_and_retarget_events() {
         let mut browser = Browser::new(bundle(
             r#"<style>body { margin: 0 } .label { color: rgb(255, 0, 0) } x-card { display: block }</style><x-card id="card"><span class="label" id="title" slot="title">Title</span><span class="label" id="text">body text</span></x-card><p id="status">idle</p><script>
@@ -7893,13 +7952,13 @@ A</div>
     }
 
     #[test]
-    fn canvas_commands_reach_the_custom_paint_path() {
+    fn canvas_bitmaps_paint_at_their_natural_size() {
         let mut browser = Browser::new(bundle(
-            r##"<canvas id="art" style="display: block; width: 80px; height: 60px"></canvas><script>
+            r##"<body style="margin: 0"><canvas id="art" width="40" height="30">fallback text</canvas><script>
                 const ctx = document.getElementById("art").getContext("2d");
                 ctx.fillStyle = "#ff0000";
-                ctx.fillRect(4, 5, 10, 8);
-            </script>"##,
+                ctx.fillRect(0, 0, 40, 30);
+            </script></body>"##,
         ));
         browser
             .navigate("https://app.ceri.invalid/")
@@ -7910,12 +7969,11 @@ A</div>
                 height: 120.0,
             })
             .expect("canvas page should paint");
-        assert!(
-            canvas
-                .rgba_pixels()
-                .chunks_exact(4)
-                .any(|pixel| pixel == [255, 0, 0, 255])
-        );
+        let pixel = |x: usize, y: usize| canvas.rgba_pixels()[(y * 160 + x) * 4..][..4].to_vec();
+        assert_eq!(pixel(0, 0), [255, 0, 0, 255]);
+        assert_eq!(pixel(39, 29), [255, 0, 0, 255]);
+        assert_ne!(pixel(40, 10), [255, 0, 0, 255]);
+        assert_ne!(pixel(10, 30), [255, 0, 0, 255]);
     }
 
     #[test]

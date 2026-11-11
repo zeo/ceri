@@ -2450,11 +2450,13 @@ impl Stylesheet {
         // an image with no declared size takes its natural size; with one side
         // declared, the other follows the natural ratio
         if let Some(&(width, height)) = own.and_then(|node| state.image_sizes.get(&node))
-            && name == "img"
+            && matches!(name, "img" | "canvas")
         {
-            style
-                .aspect_ratio
-                .get_or_insert(width as f32 / height as f32);
+            if width > 0 && height > 0 {
+                style
+                    .aspect_ratio
+                    .get_or_insert(width as f32 / height as f32);
+            }
             if style.width == Length::Auto && style.height == Length::Auto {
                 style.width = Length::px(width as f32);
                 style.height = Length::px(height as f32);

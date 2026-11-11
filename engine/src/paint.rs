@@ -3,7 +3,6 @@ use crate::css::{
     BackgroundLayer, BackgroundSize, Color, Gradient, GradientKind, GradientStop, LayerImage,
     ObjectFit, Overflow, PseudoElement, Radial, RadialSize, Style,
 };
-use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
     BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
@@ -14,25 +13,6 @@ use crate::layout::{
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CanvasCommand {
-    FillRect {
-        node: NodeId,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: Color,
-    },
-    ClearRect {
-        node: NodeId,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-    },
-}
 
 #[derive(Clone, Debug)]
 pub struct Canvas {
@@ -1925,14 +1905,28 @@ fn overflow_mask(layout_box: &LayoutBox, rect: Rect) -> Option<Shape> {
 }
 
 pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
-    paint_with_commands(document, &[], 1.0)
+    paint_with_canvases(document, &[], 1.0)
 }
 
-pub(crate) fn paint_with_commands(
+// canvas elements reach paint as image layers of their own, so drawing on one repaints it
+// without a new layout
+pub(crate) fn paint_with_canvases(
     document: &LayoutDocument,
-    commands: &[CanvasCommand],
+    canvases: &[ImageLayer],
     scale: f32,
 ) -> Canvas {
+    let layers;
+    let images = if canvases.is_empty() {
+        &document.images
+    } else {
+        layers = document
+            .images
+            .iter()
+            .chain(canvases)
+            .cloned()
+            .collect::<Vec<_>>();
+        &layers
+    };
     let mut canvas = Canvas::scaled(
         document.viewport.width,
         document.viewport.height,
@@ -1961,8 +1955,7 @@ pub(crate) fn paint_with_commands(
     paint_box(
         &mut canvas,
         &document.root,
-        commands,
-        &document.images,
+        images,
         &document.prose_selections,
         None,
         (0.0, 0.0),
@@ -2029,53 +2022,9 @@ fn fill_rect_optional(
     }
 }
 
-fn paint_canvas_command(
-    canvas: &mut Canvas,
-    canvas_box: &LayoutBox,
-    command: &CanvasCommand,
-    clip: Option<Rect>,
-    rect: Rect,
-) {
-    let (node, x, y, width, height) = match command {
-        CanvasCommand::FillRect {
-            node,
-            x,
-            y,
-            width,
-            height,
-            ..
-        }
-        | CanvasCommand::ClearRect {
-            node,
-            x,
-            y,
-            width,
-            height,
-        } => (node, *x, *y, *width, *height),
-    };
-    if *node != canvas_box.node {
-        return;
-    }
-    let color = match command {
-        CanvasCommand::FillRect { color, .. } => *color,
-        CanvasCommand::ClearRect { .. } => {
-            if canvas_box.background.alpha == 0 {
-                canvas.background
-            } else {
-                canvas_box.background
-            }
-        }
-    };
-    let Some(command_clip) = intersect_clip(clip, rect) else {
-        return;
-    };
-    canvas.fill_rect_clipped(rect.x + x, rect.y + y, width, height, color, command_clip);
-}
-
 fn paint_box(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
-    commands: &[CanvasCommand],
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
@@ -2084,7 +2033,6 @@ fn paint_box(
     paint_context(
         canvas,
         layout_box,
-        commands,
         images,
         prose_selections,
         clip,
@@ -2095,7 +2043,6 @@ fn paint_box(
 fn paint_context(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
-    commands: &[CanvasCommand],
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
@@ -2124,7 +2071,6 @@ fn paint_context(
             &mut layer,
             layout_box,
             ContextPaint {
-                commands,
                 images,
                 prose_selections,
                 clip: None,
@@ -2148,7 +2094,6 @@ fn paint_context(
             &mut layer,
             layout_box,
             ContextPaint {
-                commands,
                 images,
                 prose_selections,
                 clip,
@@ -2163,7 +2108,6 @@ fn paint_context(
         canvas,
         layout_box,
         ContextPaint {
-            commands,
             images,
             prose_selections,
             clip,
@@ -2174,7 +2118,6 @@ fn paint_context(
 }
 
 struct ContextPaint<'a> {
-    commands: &'a [CanvasCommand],
     images: &'a [ImageLayer],
     prose_selections: &'a [ProseSpan],
     clip: Option<Rect>,
@@ -2185,7 +2128,6 @@ struct ContextPaint<'a> {
 
 fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: ContextPaint<'_>) {
     let ContextPaint {
-        commands,
         images,
         prose_selections,
         clip,
@@ -2212,7 +2154,7 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
-        paint_context_entry(canvas, entry, commands, images, prose_selections);
+        paint_context_entry(canvas, entry, images, prose_selections);
     }
     paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
     paint_box_text(
@@ -2225,15 +2167,13 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     paint_non_context_children(
         canvas,
         layout_box,
-        commands,
         images,
         prose_selections,
         content_clip,
         offset,
     );
-    paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
     for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
-        paint_context_entry(canvas, entry, commands, images, prose_selections);
+        paint_context_entry(canvas, entry, images, prose_selections);
     }
     if mask.is_some() {
         canvas.pop_mask();
@@ -2251,7 +2191,6 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
 fn paint_context_entry(
     canvas: &mut Canvas,
     entry: &StackingContextEntry<'_>,
-    commands: &[CanvasCommand],
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
 ) {
@@ -2266,7 +2205,6 @@ fn paint_context_entry(
     paint_context(
         canvas,
         entry.layout,
-        commands,
         images,
         prose_selections,
         entry.clip,
@@ -2280,7 +2218,6 @@ fn paint_context_entry(
 fn paint_non_context_children(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
-    commands: &[CanvasCommand],
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
@@ -2294,7 +2231,6 @@ fn paint_non_context_children(
         paint_non_context_subtree(
             canvas,
             child,
-            commands,
             images,
             prose_selections,
             clip,
@@ -2306,7 +2242,6 @@ fn paint_non_context_children(
 fn paint_non_context_subtree(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
-    commands: &[CanvasCommand],
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
@@ -2338,13 +2273,11 @@ fn paint_non_context_subtree(
     paint_non_context_children(
         canvas,
         layout_box,
-        commands,
         images,
         prose_selections,
         content_clip,
         offset,
     );
-    paint_canvas_commands(canvas, layout_box, commands, content_clip, rect);
     if mask.is_some() {
         canvas.pop_mask();
     }
@@ -2405,7 +2338,7 @@ fn paint_box_surface(
     {
         paint_shadow(canvas, shadow, outer, surface, opacity, clip);
     }
-    if layout_box.tag == "img"
+    if matches!(layout_box.tag.as_str(), "img" | "canvas")
         && let Some(layer) = images
             .iter()
             .find(|layer| layer.background.is_none() && layer.node == layout_box.node)
@@ -2863,21 +2796,6 @@ fn utf16_char_offset(value: &str, offset: usize) -> usize {
         characters += 1;
     }
     characters
-}
-
-fn paint_canvas_commands(
-    canvas: &mut Canvas,
-    layout_box: &LayoutBox,
-    commands: &[CanvasCommand],
-    clip: Option<Rect>,
-    rect: Rect,
-) {
-    if layout_box.tag != "canvas" || !layout_box.visible {
-        return;
-    }
-    for command in commands {
-        paint_canvas_command(canvas, layout_box, command, clip, rect);
-    }
 }
 
 fn paint_scrollbars(
@@ -3839,7 +3757,7 @@ mod tests {
             .node_at(path)
     }
     use crate::css::Stylesheet;
-    use crate::dom::Document;
+    use crate::dom::{Document, NodeId};
     use crate::layout::{LayoutBox, LayoutDocument, Rect, Size};
 
     #[test]
@@ -4561,191 +4479,5 @@ mod tests {
         );
         document.root.control_selection = Some((0, 0, false));
         assert_ne!(paint(&document).rgba_pixels(), canvas.rgba_pixels());
-    }
-
-    #[test]
-    fn canvas_commands_stay_in_document_paint_order() {
-        let document = LayoutDocument {
-            viewport: Size {
-                width: 20.0,
-                height: 20.0,
-            },
-            root: LayoutBox {
-                node: node(&[]),
-                tag: "#document".to_string(),
-                rect: Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 20.0,
-                    height: 20.0,
-                },
-                background: Color::opaque(245, 248, 250),
-                backgrounds: Vec::new(),
-                masks: Vec::new(),
-                object_fit: crate::css::ObjectFit::Fill,
-                transform: None,
-                backface_hidden: false,
-                clip_path: None,
-                radii: SQUARE_CORNERS,
-                opacity: 1.0,
-                shadows: Vec::new(),
-                border: BoxBorder::NONE,
-                outline: None,
-                text: Vec::new(),
-                control_value: None,
-                control_selection: None,
-                control_focused: false,
-                control_text_origin: None,
-                children: vec![
-                    LayoutBox {
-                        node: node(&[0]),
-                        tag: "canvas".to_string(),
-                        rect: Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            width: 10.0,
-                            height: 10.0,
-                        },
-                        background: Color::transparent(),
-                        backgrounds: Vec::new(),
-                        masks: Vec::new(),
-                        object_fit: crate::css::ObjectFit::Fill,
-                        transform: None,
-                        backface_hidden: false,
-                        clip_path: None,
-                        radii: SQUARE_CORNERS,
-                        opacity: 1.0,
-                        shadows: Vec::new(),
-                        border: BoxBorder::NONE,
-                        outline: None,
-                        text: Vec::new(),
-                        control_value: None,
-                        control_selection: None,
-                        control_focused: false,
-                        control_text_origin: None,
-                        children: Vec::new(),
-                        position: crate::css::Position::Static,
-                        visual_offset: (0.0, 0.0),
-                        z_index: 0,
-                        creates_stacking_context: false,
-                        sticky_inset: crate::css::Edges::auto(),
-                        font_size: 16.0,
-                        overflow: Overflow::Visible,
-                        overflow_axes: [Overflow::Visible; 2],
-                        visible: true,
-                        pointer_events: true,
-                        selectable: true,
-                        cursor: crate::css::Cursor::Auto,
-                        floated: false,
-                        inline: false,
-                        control: None,
-                        selection: None,
-                        selection_color: None,
-                        scroll_content: Size {
-                            width: 10.0,
-                            height: 10.0,
-                        },
-                        scroll_offset: (0.0, 0.0),
-                        svg: None,
-                        scrollbar: Default::default(),
-                        margin: Default::default(),
-                    },
-                    LayoutBox {
-                        node: node(&[1]),
-                        tag: "div".to_string(),
-                        rect: Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            width: 10.0,
-                            height: 10.0,
-                        },
-                        background: Color::opaque(0, 0, 255),
-                        backgrounds: Vec::new(),
-                        masks: Vec::new(),
-                        object_fit: crate::css::ObjectFit::Fill,
-                        transform: None,
-                        backface_hidden: false,
-                        clip_path: None,
-                        radii: SQUARE_CORNERS,
-                        opacity: 1.0,
-                        shadows: Vec::new(),
-                        border: BoxBorder::NONE,
-                        outline: None,
-                        text: Vec::new(),
-                        control_value: None,
-                        control_selection: None,
-                        control_focused: false,
-                        control_text_origin: None,
-                        children: Vec::new(),
-                        position: crate::css::Position::Static,
-                        visual_offset: (0.0, 0.0),
-                        z_index: 0,
-                        creates_stacking_context: false,
-                        sticky_inset: crate::css::Edges::auto(),
-                        font_size: 16.0,
-                        overflow: Overflow::Visible,
-                        overflow_axes: [Overflow::Visible; 2],
-                        visible: true,
-                        pointer_events: true,
-                        selectable: true,
-                        cursor: crate::css::Cursor::Auto,
-                        floated: false,
-                        inline: false,
-                        control: None,
-                        selection: None,
-                        selection_color: None,
-                        scroll_content: Size {
-                            width: 10.0,
-                            height: 10.0,
-                        },
-                        scroll_offset: (0.0, 0.0),
-                        svg: None,
-                        scrollbar: Default::default(),
-                        margin: Default::default(),
-                    },
-                ],
-                position: crate::css::Position::Static,
-                visual_offset: (0.0, 0.0),
-                z_index: 0,
-                creates_stacking_context: true,
-                sticky_inset: crate::css::Edges::auto(),
-                font_size: 16.0,
-                overflow: Overflow::Visible,
-                overflow_axes: [Overflow::Visible; 2],
-                visible: true,
-                pointer_events: true,
-                selectable: true,
-                cursor: crate::css::Cursor::Auto,
-                floated: false,
-                inline: false,
-                control: None,
-                selection: None,
-                selection_color: None,
-                scroll_content: Size {
-                    width: 20.0,
-                    height: 20.0,
-                },
-                scroll_offset: (0.0, 0.0),
-                svg: None,
-                scrollbar: Default::default(),
-                margin: Default::default(),
-            },
-            images: Vec::new(),
-            prose_selections: Vec::new(),
-        };
-        let commands = [CanvasCommand::FillRect {
-            node: node(&[0]),
-            x: 0.0,
-            y: 0.0,
-            width: 10.0,
-            height: 10.0,
-            color: Color::opaque(255, 0, 0),
-        }];
-
-        let canvas = paint_with_commands(&document, &commands, 1.0);
-        assert_eq!(
-            &canvas.rgba_pixels()[((5 * 20 + 5) * 4) as usize..][..4],
-            [0, 0, 255, 255]
-        );
     }
 }

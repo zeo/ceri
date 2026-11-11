@@ -457,7 +457,11 @@ static INTERFACES: &[Interface] = &[
     Interface {
         name: "HTMLCanvasElement",
         parent: "HTMLElement",
-        members: &[("getContext", Method(1))],
+        members: &[
+            ("width", ReadWrite),
+            ("height", ReadWrite),
+            ("getContext", Method(1)),
+        ],
     },
     Interface {
         name: "HTMLTemplateElement",
@@ -1240,6 +1244,12 @@ impl ScriptRuntime {
             }
             ("defaultView", Access::Get) => Value::Window,
             ("readyState", Access::Get) => Value::String("complete".into()),
+            ("width" | "height", Access::Get) => {
+                self.canvas_element_member(handle, member.name(), None)?
+            }
+            ("width" | "height", Access::Set) => {
+                self.canvas_element_member(handle, member.name(), Some(first))?
+            }
             ("naturalWidth" | "naturalHeight" | "complete" | "currentSrc", Access::Get)
             | ("decode", Access::Call) => self.image_member(node, member.name()),
             ("crossOrigin", Access::Get) => {

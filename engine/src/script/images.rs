@@ -151,6 +151,21 @@ impl ScriptRuntime {
         decoded
     }
 
+    // the decoded picture drawImage reads; Err when the load it made failed, which leaves
+    // the element broken rather than merely empty
+    pub(super) fn image_content(&self, node: NodeId) -> Result<Option<Rc<Image>>, ()> {
+        let Some(load) = self.image_loads.get(&node).filter(|load| !load.pending) else {
+            return Ok(None);
+        };
+        let Some(url) = &load.url else {
+            return Ok(None);
+        };
+        match self.images.borrow().get(url).cloned().flatten() {
+            Some(image) if load.natural.is_some() => Ok(Some(image)),
+            _ => Err(()),
+        }
+    }
+
     pub(super) fn image_member(&mut self, node: NodeId, name: &str) -> Value {
         let load = self.image_loads.get(&node);
         let natural = load.and_then(|load| load.natural).unwrap_or_default();

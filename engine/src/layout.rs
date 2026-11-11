@@ -627,7 +627,7 @@ impl<'a> Subject<'a> {
     }
 
     fn replaced(self) -> bool {
-        self.name() == "img" || self.svg_root().is_some()
+        matches!(self.name(), "img" | "canvas") || self.svg_root().is_some()
     }
 
     // the node whose own state, such as a control value or focus, belongs to the box
@@ -676,7 +676,8 @@ impl<'a> Subject<'a> {
             }
             return items;
         }
-        if self.svg_root().is_some() {
+        // canvas children are fallback content for agents that cannot draw it
+        if self.svg_root().is_some() || self.name() == "canvas" {
             return items;
         }
         let generated_box = |pseudo: PseudoElement, content: &'a Option<String>| {
