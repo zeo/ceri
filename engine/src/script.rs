@@ -1,5 +1,6 @@
 mod arrays;
 mod ast;
+mod audio;
 mod bigint;
 mod bridge;
 mod canvas;
@@ -533,6 +534,7 @@ pub struct ScriptRuntime {
     observers: HashMap<u32, observers::ObserverRecord>,
     next_observer: u32,
     xhr: HashMap<u32, xhr::XhrState>,
+    audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
     image_loads: HashMap<NodeId, images::ImageLoad>,
@@ -1551,6 +1553,7 @@ impl ScriptRuntime {
             observers: HashMap::new(),
             next_observer: 0,
             xhr: HashMap::new(),
+            audio: audio::AudioState::default(),
             images: RefCell::default(),
             image_loads: HashMap::new(),
             dialogs: HashMap::new(),
@@ -3476,6 +3479,7 @@ impl ScriptRuntime {
             executed += 1;
         }
         self.clock = target;
+        self.pump_audio()?;
         self.drain_microtasks()?;
         self.run_layout_observers()?;
         self.pump_workers()?;
@@ -4808,7 +4812,8 @@ impl ScriptRuntime {
     }
 
     pub fn pump(&mut self) -> Result<usize, ScriptError> {
-        let processed = self.pump_workers()? + self.settle_command_replies()?;
+        let processed =
+            self.pump_workers()? + self.settle_command_replies()? + self.pump_audio()?;
         self.drain_microtasks()?;
         Ok(processed)
     }

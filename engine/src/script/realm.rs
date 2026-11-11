@@ -140,6 +140,10 @@ pub(super) enum Native {
     // a dialog reporting that it closed
     DialogClose(crate::dom::NodeId),
     CustomElements(super::custom::RegistryMethod),
+    Audio(super::audio::AudioMember),
+    AudioConstructor(super::audio::AudioClass),
+    // an audio context announcing that it resumed, suspended or closed
+    AudioStateChange(u32),
 }
 
 impl Native {
@@ -168,6 +172,7 @@ impl Native {
                 | Native::RangeConstructor(_)
                 | Native::ObserverConstructor(_)
                 | Native::XhrConstructor
+                | Native::AudioConstructor(_)
         ) || matches!(self, Native::Intl(method) if matches!(**method,
             super::intl::IntlMethod::NumberFormatConstructor
                 | super::intl::IntlMethod::DateTimeFormatConstructor
@@ -229,6 +234,7 @@ pub(super) struct Intrinsics {
     pub(super) ranges: super::ranges::RangeInterfaces,
     pub(super) observers: super::observers::ObserverInterfaces,
     pub(super) xhr: super::xhr::XhrInterfaces,
+    pub(super) audio: super::audio::AudioInterfaces,
 }
 
 fn plain(prototype: &ObjectHandle) -> ObjectHandle {
@@ -1200,6 +1206,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let ranges = super::ranges::create(&build, &object_prototype, &mut globals);
     let observers = super::observers::create(&build, &object_prototype, &mut globals);
     let xhr = super::xhr::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let audio = super::audio::create(
+        &build,
+        &dom.prototype("EventTarget"),
+        &object_prototype,
+        &mut globals,
+    );
     let intrinsics = Intrinsics {
         object_prototype,
         function_prototype,
@@ -1245,6 +1257,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         ranges,
         observers,
         xhr,
+        audio,
     };
     (intrinsics, globals)
 }
@@ -2337,6 +2350,12 @@ impl ScriptRuntime {
             Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
             Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
             Native::DialogClose(node) => self.deliver_dialog_close(node),
+            Native::Audio(member) => self.call_audio(member, this, arguments),
+            Native::AudioStateChange(id) => self.deliver_audio_state(id),
+            Native::AudioConstructor(class) => Err(self.type_error(format!(
+                "Failed to construct '{}': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+                super::audio::class_name(class)
+            ))),
             Native::XhrConstructor => Err(self
                 .type_error("Failed to construct 'XMLHttpRequest': Please use the 'new' operator")),
             Native::ObserverConstructor(kind) => Err(self.type_error(format!(
@@ -2621,6 +2640,7 @@ impl ScriptRuntime {
                 self.construct_observer(kind, arguments, new_target)
             }
             Native::XhrConstructor => self.construct_xhr(new_target),
+            Native::AudioConstructor(class) => self.construct_audio(class, arguments, new_target),
             Native::Codec(method) => {
                 self.call_codec(method, Value::Undefined, arguments, Some(new_target))
             }

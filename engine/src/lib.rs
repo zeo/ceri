@@ -1,3 +1,4 @@
+mod audio;
 mod bidi;
 mod border;
 mod bridge;
@@ -45,6 +46,7 @@ mod wasm;
 mod window;
 mod woff;
 
+pub use audio::{AudioDevice, AudioOutput, AudioRender};
 pub use bridge::{
     Capabilities, CommandCall, CommandError, CommandReply, CommandResult, CommandRouter, Grant,
 };

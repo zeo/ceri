@@ -903,6 +903,7 @@ pub struct Browser {
     resource_provider: Option<Rc<dyn ResourceProvider>>,
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
+    audio_device: Option<Rc<dyn crate::AudioDevice>>,
     time_zone: Option<Rc<dyn crate::TimeZone>>,
     locale: Option<String>,
     last_navigation_failure: Option<NavigationFailure>,
@@ -1023,6 +1024,7 @@ impl Browser {
             resource_provider: None,
             file_picker: None,
             clipboard_provider: None,
+            audio_device: None,
             time_zone: None,
             locale: None,
             last_navigation_failure: None,
@@ -1079,6 +1081,12 @@ impl Browser {
         clipboard_provider: Rc<dyn ClipboardProvider>,
     ) -> Self {
         self.clipboard_provider = Some(clipboard_provider);
+        self
+    }
+
+    // the speakers a page's audio contexts play through; without one they keep time silently
+    pub fn with_audio_device(mut self, device: Rc<dyn crate::AudioDevice>) -> Self {
+        self.audio_device = Some(device);
         self
     }
 
@@ -1392,6 +1400,7 @@ impl Browser {
         );
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
+        runtime.set_audio(self.audio_device.clone(), self.waker.clone());
         if let Some(bridge) = &self.host_bridge {
             runtime.set_host_bridge(bridge.clone(), APP_ORIGIN.to_string(), self.waker.clone());
         }
@@ -2996,6 +3005,7 @@ impl Browser {
                 );
                 runtime.set_file_picker(self.file_picker.clone());
                 runtime.set_clipboard_provider(self.clipboard_provider.clone());
+                runtime.set_audio(self.audio_device.clone(), self.waker.clone());
                 if let Some(time_zone) = &self.time_zone {
                     runtime.set_time_zone(time_zone.clone());
                 }

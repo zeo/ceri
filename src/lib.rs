@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod launch;
 
+mod audio;
 mod commands;
 mod custom;
 #[cfg(not(target_os = "windows"))]

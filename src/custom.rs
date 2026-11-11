@@ -1,4 +1,5 @@
 use crate::assets::{AssetOrigin, AssetRoute, EmbeddedAssets, RequestTarget};
+use crate::audio::DesktopAudio;
 use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
 use crate::files::FileScope;
@@ -536,6 +537,7 @@ fn build_browser(
     .with_host_bridge(bridge)
     .with_fonts(Rc::new(system_font_set()))
     .with_clipboard_provider(Rc::new(DesktopClipboard::default()))
+    .with_audio_device(Rc::new(DesktopAudio))
     .with_time_zone(Rc::new(DesktopTimeZone))
     .with_file_picker(Rc::new(DesktopFilePicker));
     Ok(match user_locale() {
