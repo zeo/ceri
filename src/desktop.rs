@@ -56,8 +56,13 @@ impl FilePicker for DesktopFilePicker {
         &self,
         request: &FilePickerRequest,
     ) -> Result<Option<Vec<FileSelection>>, NavigationError> {
-        let chosen = platform::pick_files(request.multiple(), request.accept())
-            .map_err(NavigationError::FilePicker)?;
+        let chosen = crate::dialog::FileDialog {
+            filters: crate::dialog::accept_filters(request.accept()),
+            multiple: request.multiple(),
+            ..Default::default()
+        }
+        .open_files()
+        .map_err(NavigationError::FilePicker)?;
         let Some(chosen) = chosen else {
             return Ok(None);
         };
@@ -100,7 +105,6 @@ fn read_selection(path: &Path) -> Result<FileSelection, NavigationError> {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::path::PathBuf;
     use windows::Win32::Foundation::{FILETIME, GlobalFree, HANDLE, HGLOBAL, SYSTEMTIME};
     use windows::Win32::Globalization::GetUserDefaultLocaleName;
     use windows::Win32::System::DataExchange::{
@@ -113,12 +117,6 @@ mod platform {
         FileTimeToSystemTime, GetTimeZoneInformation, SystemTimeToFileTime,
         SystemTimeToTzSpecificLocalTime, TIME_ZONE_INFORMATION,
     };
-    use windows::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OPENFILENAMEW,
-    };
-    use windows::core::{PCWSTR, PWSTR};
-
-    const PATH_BUFFER: usize = 32 * 1024;
     // 100-nanosecond intervals between 1601-01-01 and the Unix epoch
     const EPOCH_IN_FILE_TIME: i64 = 116_444_736_000_000_000;
 
@@ -280,89 +278,10 @@ mod platform {
         }
         Ok(())
     }
-
-    pub(super) fn pick_files(
-        multiple: bool,
-        accept: Option<&str>,
-    ) -> Result<Option<Vec<PathBuf>>, String> {
-        let filter = file_filter(accept);
-        let mut buffer = vec![0_u16; PATH_BUFFER];
-        let mut arguments = OPENFILENAMEW {
-            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-            lpstrFilter: PCWSTR(filter.as_ptr()),
-            nFilterIndex: 1,
-            lpstrFile: PWSTR(buffer.as_mut_ptr()),
-            nMaxFile: buffer.len() as u32,
-            Flags: OFN_EXPLORER
-                | OFN_FILEMUSTEXIST
-                | if multiple {
-                    OFN_ALLOWMULTISELECT
-                } else {
-                    Default::default()
-                },
-            ..Default::default()
-        };
-        // SAFETY: every pointer field references a live buffer for the duration of the call
-        if !unsafe { GetOpenFileNameW(&mut arguments) }.as_bool() {
-            // a cancelled dialog is a normal outcome, not a failure
-            return Ok(None);
-        }
-        Ok(Some(parse_selection(&buffer)))
-    }
-
-    // a multi selection arrives as a directory followed by null separated names
-    fn parse_selection(buffer: &[u16]) -> Vec<PathBuf> {
-        let mut entries = Vec::new();
-        let mut current = Vec::new();
-        for unit in buffer {
-            if *unit == 0 {
-                if current.is_empty() {
-                    break;
-                }
-                entries.push(String::from_utf16_lossy(&current));
-                current.clear();
-                continue;
-            }
-            current.push(*unit);
-        }
-        match entries.split_first() {
-            Some((directory, names)) if !names.is_empty() => names
-                .iter()
-                .map(|name| PathBuf::from(directory).join(name))
-                .collect(),
-            Some((single, _)) => vec![PathBuf::from(single)],
-            None => Vec::new(),
-        }
-    }
-
-    fn file_filter(accept: Option<&str>) -> Vec<u16> {
-        let patterns = accept
-            .map(|accept| {
-                accept
-                    .split(',')
-                    .filter_map(|entry| {
-                        let entry = entry.trim();
-                        entry
-                            .strip_prefix('.')
-                            .map(|extension| format!("*.{extension}"))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut filter = String::new();
-        if !patterns.is_empty() {
-            filter.push_str(&format!("Accepted files\0{}\0", patterns.join(";")));
-        }
-        filter.push_str("All files\0*.*\0");
-        filter.push('\0');
-        filter.encode_utf16().collect()
-    }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use std::path::PathBuf;
-
     #[cfg(unix)]
     mod clock {
         use std::ffi::{CStr, c_char, c_int, c_long};
@@ -496,13 +415,6 @@ mod platform {
         _text: &str,
     ) -> Result<(), String> {
         Err("the desktop clipboard adapter covers Windows and Linux only".to_string())
-    }
-
-    pub(super) fn pick_files(
-        _multiple: bool,
-        _accept: Option<&str>,
-    ) -> Result<Option<Vec<PathBuf>>, String> {
-        Err("the desktop file dialog adapter currently covers Windows only".to_string())
     }
 }
 

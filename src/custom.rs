@@ -232,7 +232,11 @@ impl App {
         let capabilities = self.capabilities.grant(Grant {
             windows: vec!["*".to_string()],
             origins: vec![APP_ORIGIN.to_string()],
-            commands: vec!["window:*".to_string(), "app:*".to_string()],
+            commands: vec![
+                "window:*".to_string(),
+                "app:*".to_string(),
+                "dialog:*".to_string(),
+            ],
         });
         run_app(
             Bridge {

@@ -1,12 +1,15 @@
 // the commands an app registers for its pages to invoke, by name; payloads and results are
 // JSON text
 
+use crate::dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 use ceri_engine::{
-    CommandCall, CommandError, CommandReply, CommandRouter, WindowAction, WindowControl,
+    CommandCall, CommandError, CommandReply, CommandRouter, NativeHandle, WindowAction,
+    WindowControl,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -130,6 +133,69 @@ struct Title {
     title: String,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PickRequest {
+    title: Option<String>,
+    default_path: Option<PathBuf>,
+    directory: bool,
+    multiple: bool,
+    filters: Vec<FileFilter>,
+}
+
+#[derive(Deserialize)]
+struct MessageRequest {
+    message: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    kind: MessageLevel,
+}
+
+// a dialog waits on the user, so it answers from a thread of its own; paths go back as strings,
+// one or none, or a list when several were asked for
+fn dialog(call: &CommandCall, owner: Option<NativeHandle>) -> Result<String, CommandError> {
+    let command = call.command.as_str();
+    let buttons = match command {
+        "dialog:open" | "dialog:save" => {
+            let request = arguments::<Option<PickRequest>>(call)?.unwrap_or_default();
+            let multiple = request.multiple && command == "dialog:open";
+            let dialog = FileDialog {
+                title: request.title,
+                default_path: request.default_path,
+                filters: request.filters,
+                multiple,
+                owner,
+            };
+            let chosen = match (command, request.directory) {
+                ("dialog:save", _) => dialog.save_file().map(|path| path.map(|path| vec![path])),
+                (_, true) => dialog.open_folders(),
+                (_, false) => dialog.open_files(),
+            }
+            .map_err(CommandError::failed)?;
+            return match chosen {
+                Some(paths) if !multiple => json(&paths.first()),
+                chosen => json(&chosen),
+            };
+        }
+        "dialog:message" => MessageButtons::Ok,
+        "dialog:ask" => MessageButtons::YesNo,
+        "dialog:confirm" => MessageButtons::OkCancel,
+        _ => return Err(CommandError::unknown(command)),
+    };
+    let request = arguments::<MessageRequest>(call)?;
+    let answer = MessageDialog {
+        title: request.title.unwrap_or_default(),
+        text: request.message,
+        level: request.kind,
+        buttons,
+        owner,
+    }
+    .show()
+    .map_err(CommandError::failed)?;
+    json(&answer)
+}
+
 fn arguments<T: DeserializeOwned>(call: &CommandCall) -> Result<T, CommandError> {
     serde_json::from_str(&call.payload)
         .map_err(|error| CommandError::new("invalid-payload", error.to_string()))
@@ -143,6 +209,20 @@ impl CommandRouter for CommandRoutes {
     fn invoke(&self, call: CommandCall, reply: CommandReply) {
         if let Some(answer) = self.builtin(&call) {
             reply.send(answer);
+            return;
+        }
+        if call.command.starts_with("dialog:") {
+            let owner = self
+                .control
+                .as_ref()
+                .and_then(|control| control.state(&call.window))
+                .and_then(|state| state.handle);
+            let spawned = thread::Builder::new()
+                .name(format!("ceri {}", call.command))
+                .spawn(move || reply.send(dialog(&call, owner)));
+            if let Err(error) = spawned {
+                eprintln!("ceri: could not start a dialog thread: {error}");
+            }
             return;
         }
         let Some(registered) = self.commands.registered.get(&call.command).cloned() else {
@@ -214,5 +294,19 @@ mod tests {
             (5, Err(CommandError::unknown("window:minimize"))),
             "without a window loop the window commands are not there"
         );
+        assert_eq!(
+            ask("dialog:nothing", 6),
+            (6, Err(CommandError::unknown("dialog:nothing")))
+        );
+        let (id, answer) = {
+            let mut bad = call("dialog:open");
+            bad.payload = "{\"multiple\":3}".to_string();
+            routes.invoke(bad, CommandReply::new(7, sender.clone()));
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("answers")
+        };
+        assert_eq!(id, 7);
+        assert_eq!(answer.expect_err("a bad payload").code, "invalid-payload");
     }
 }

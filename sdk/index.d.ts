@@ -84,6 +84,45 @@ export interface AppWindow {
 
 export const appWindow: AppWindow;
 
+export interface DialogFilter {
+  readonly name: string;
+  // without the dot; "*" takes any file
+  readonly extensions: readonly string[];
+}
+
+export interface OpenDialogOptions {
+  readonly title?: string;
+  // a folder to start in, or a file whose folder to start in and whose name to suggest
+  readonly defaultPath?: string;
+  readonly directory?: boolean;
+  readonly multiple?: boolean;
+  readonly filters?: readonly DialogFilter[];
+}
+
+export interface SaveDialogOptions {
+  readonly title?: string;
+  readonly defaultPath?: string;
+  readonly filters?: readonly DialogFilter[];
+}
+
+export interface MessageDialogOptions {
+  readonly title?: string;
+  readonly kind?: "info" | "warning" | "error";
+}
+
+export interface Dialog {
+  open(options: OpenDialogOptions & { readonly multiple: true }): Promise<string[] | null>;
+  open(options?: OpenDialogOptions): Promise<string | null>;
+  save(options?: SaveDialogOptions): Promise<string | null>;
+  message(message: string, options?: string | MessageDialogOptions): Promise<boolean>;
+  // yes or no
+  ask(message: string, options?: string | MessageDialogOptions): Promise<boolean>;
+  // OK or cancel
+  confirm(message: string, options?: string | MessageDialogOptions): Promise<boolean>;
+}
+
+export const dialog: Dialog;
+
 export function appVersion(): Promise<string>;
 
 export function fileSrc(path: string): string;

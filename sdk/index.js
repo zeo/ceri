@@ -142,6 +142,20 @@ export const appWindow = Object.freeze({
   onResized: (handler) => listen("window:resized", (event) => handler(event.payload)),
 });
 
+function asking(name) {
+  return (message, options = {}) =>
+    invoke(name, { message, ...(typeof options === "string" ? { title: options } : options) });
+}
+
+// the system's own dialogs, owned by the page's window; a cancelled pick resolves to null
+export const dialog = Object.freeze({
+  open: (options) => invoke("dialog:open", options ?? {}),
+  save: (options) => invoke("dialog:save", options ?? {}),
+  message: asking("dialog:message"),
+  ask: asking("dialog:ask"),
+  confirm: asking("dialog:confirm"),
+});
+
 export function appVersion() {
   return invoke("app:version");
 }

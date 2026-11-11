@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -121,7 +122,6 @@ impl Value {
     }
 
     // the value under a key of an a{sv} dictionary, with its variant unwrapped
-    #[cfg(test)]
     pub(crate) fn get(&self, key: &str) -> Option<&Value> {
         self.items().iter().find_map(|entry| match entry {
             Self::Entry(name, value) if name.as_str() == Some(key) => match value.as_ref() {
@@ -577,7 +577,8 @@ fn read_message(stream: &mut impl Read) -> Result<Message, String> {
     Message::decode(&fixed, &rest)
 }
 
-fn unescape(value: &str) -> String {
+// percent escapes undone, as bus addresses and file uris carry them
+pub(crate) fn unescape(value: &str) -> Vec<u8> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -599,7 +600,7 @@ fn unescape(value: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 fn connect(address: &str) -> Result<UnixStream, String> {
@@ -613,7 +614,7 @@ fn connect(address: &str) -> Result<UnixStream, String> {
             .filter_map(|pair| pair.split_once('='))
             .collect();
         let attempt = if let Some(path) = keys.get("path") {
-            UnixStream::connect(unescape(path))
+            UnixStream::connect(std::ffi::OsStr::from_bytes(&unescape(path)))
         } else if let Some(name) = keys.get("abstract") {
             abstract_socket(&unescape(name))
         } else {
@@ -628,13 +629,13 @@ fn connect(address: &str) -> Result<UnixStream, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn abstract_socket(name: &str) -> std::io::Result<UnixStream> {
+fn abstract_socket(name: &[u8]) -> std::io::Result<UnixStream> {
     use std::os::linux::net::SocketAddrExt;
     UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name)?)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn abstract_socket(_name: &str) -> std::io::Result<UnixStream> {
+fn abstract_socket(_name: &[u8]) -> std::io::Result<UnixStream> {
     Err(std::io::Error::other("abstract sockets are Linux only"))
 }
 
@@ -878,6 +879,6 @@ mod tests {
         assert!(read_message(&mut &message[..20]).is_err());
         assert_eq!(split_type("a{sv}i"), Ok(("a{sv}", "i")));
         assert!(split_type("(ii").is_err());
-        assert_eq!(unescape("/tmp/dbus%2dx"), "/tmp/dbus-x");
+        assert_eq!(unescape("/tmp/dbus%2dx"), b"/tmp/dbus-x");
     }
 }

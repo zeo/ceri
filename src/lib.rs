@@ -6,6 +6,7 @@ mod custom;
 #[cfg(not(target_os = "windows"))]
 mod dbus;
 mod desktop;
+mod dialog;
 pub mod dirs;
 mod files;
 mod fonts;
@@ -18,5 +19,6 @@ pub use ceri_engine::{
     WindowAction, WindowConfig, WindowControl, WindowState,
 };
 pub use custom::{App, AppHandle, run};
+pub use dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 pub use files::FileScope;
 pub use tray::{MenuItem, Tray, TrayConfig, TrayEvent};
