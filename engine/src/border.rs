@@ -124,7 +124,7 @@ fn parse_side(value: &str, color: &dyn Fn(&str) -> Option<Color>) -> Option<Bord
 }
 
 // one to four values for top, right, bottom and left, or for the corners from top-left
-fn expand<T: Copy>(values: &[T]) -> Option<[T; 4]> {
+pub(crate) fn expand<T: Copy>(values: &[T]) -> Option<[T; 4]> {
     Some(match *values {
         [all] => [all; 4],
         [vertical, horizontal] => [vertical, horizontal, vertical, horizontal],
@@ -138,7 +138,7 @@ fn parse_each<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<Vec<T
     split_words(value).into_iter().map(parse).collect()
 }
 
-fn parse_radii(value: &str) -> Option<CornerLengths> {
+pub(crate) fn parse_radii(value: &str) -> Option<CornerLengths> {
     let (horizontal, vertical) = match value.split_once('/') {
         Some((horizontal, vertical)) => (horizontal, Some(vertical)),
         None => (value, None),

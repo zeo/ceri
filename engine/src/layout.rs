@@ -121,6 +121,8 @@ pub struct LayoutBox {
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<crate::transform::Matrix>,
     pub(crate) backface_hidden: bool,
+    // relative to the border box corner
+    pub(crate) clip_path: Option<crate::clip_path::ClipRegion>,
     pub(crate) radii: CornerRadii,
     pub opacity: f32,
     pub shadow: Option<ResolvedShadow>,
@@ -277,7 +279,7 @@ pub(crate) fn used_border(style: &Style) -> ResolvedEdges {
 }
 
 // percentages resolve against the border box, and radii that would overlap shrink together
-fn resolve_corner_radii(
+pub(crate) fn resolve_corner_radii(
     radii: CornerLengths,
     width: f32,
     height: f32,
@@ -891,6 +893,7 @@ pub fn layout_with_state(
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
+        clip_path: None,
         radii: SQUARE_CORNERS,
         opacity: 1.0,
         shadow: None,
@@ -1680,6 +1683,9 @@ fn hit_test_context(
     };
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
+    if !inside_clip_path(layout, rect, x, y) {
+        return None;
+    }
     let inside_layout = contains_point(rect, x, y);
     let mut contexts = stacking_context_entries(layout, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
@@ -1703,6 +1709,21 @@ fn hit_test_context(
         offset: visual_offset,
         point: (x, y),
     })
+}
+
+// a clip-path hides its box and everything in it from the pointer outside the shape
+fn inside_clip_path(layout: &LayoutBox, rect: Rect, x: f32, y: f32) -> bool {
+    use crate::clip_path::{ClipRegion, polygon_contains};
+    match &layout.clip_path {
+        None => true,
+        Some(ClipRegion::Rounded(clip, radii)) => {
+            let clip = translate_rect(*clip, (rect.x, rect.y));
+            contains_point(clip, x, y) && inside_corners(clip, *radii, x, y)
+        }
+        Some(ClipRegion::Polygon { even_odd, points }) => {
+            polygon_contains(points, *even_odd, (x - rect.x, y - rect.y))
+        }
+    }
 }
 
 fn hit_target(layout: &LayoutBox, rect: Rect, x: f32, y: f32) -> bool {
@@ -1912,6 +1933,9 @@ fn scroll_target_box(
     };
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
+    if !inside_clip_path(layout, rect, x, y) {
+        return None;
+    }
     let inside_layout = contains_point(rect, x, y);
     let child_clip = if layout.overflow.clips() || layout.is_document() {
         intersect_rect(
@@ -2766,6 +2790,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
+        clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: style.opacity * parent.opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
@@ -2943,6 +2968,7 @@ fn anonymous_box(
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
+        clip_path: None,
         radii: SQUARE_CORNERS,
         opacity,
         shadow: None,
@@ -3851,6 +3877,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
+        clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
@@ -4327,6 +4354,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
+        clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
@@ -5042,6 +5070,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
+        clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadow: resolve_shadow(style.shadow, content_width, font_size),
@@ -6209,15 +6238,19 @@ fn positioned_z_index(style: Style) -> i32 {
 fn creates_stacking_context(style: Style) -> bool {
     style.has_transform()
         || style.perspective.is_some()
+        || style.clip_path.is_some()
         || matches!(style.position, Position::Fixed | Position::Sticky)
         || (style.position != Position::Static && style.z_index.is_some())
 }
 
-// resolves the transform properties against the border box, then lets the box's
-// perspective act on the transformed children laid out inside it
+// resolves the transform properties and clip-path against the border box, then lets the
+// box's perspective act on the transformed children laid out inside it
 fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
     use crate::transform::Matrix;
     let (width, height) = (layout.rect.width, layout.rect.height);
+    layout.clip_path = style
+        .clip_path
+        .and_then(|path| path.resolve(width, height, font_size));
     if style.has_transform() {
         let matrix = [
             style.translate_property,
@@ -8762,6 +8795,36 @@ mod tests {
             &canvas.rgba_pixels()[outside..outside + 4],
             [255, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn clip_paths_cut_paint_and_hit_testing_for_the_whole_subtree() {
+        let document = Document::parse_markup(
+            "<style>#cut { width: 40px; height: 40px; margin: 0; background: #ff0000; clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%); } #child { width: 40px; height: 10px; margin: 0; background: #0000ff; } #hidden { position: absolute; left: 50px; top: 0; width: 20px; height: 20px; background: #00ff00; clip-path: inset(50%); }</style><div id='cut'><div id='child'></div></div><div id='hidden'></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        assert_eq!(result.hit_test(5.0, 2.0), Some(document.node_at(&[1, 0])));
+        assert_eq!(result.hit_test(5.0, 20.0), Some(document.node_at(&[1])));
+        assert_eq!(result.hit_test(38.0, 2.0), None);
+        assert_eq!(result.hit_test(60.0, 10.0), None);
+        let canvas = result.paint();
+        let pixel = |x: u32, y: u32| {
+            let index = ((y * canvas.width() + x) * 4) as usize;
+            canvas.rgba_pixels()[index..index + 4].to_vec()
+        };
+        assert_eq!(pixel(5, 2), [0, 0, 255, 255]);
+        assert_eq!(pixel(5, 20), [255, 0, 0, 255]);
+        assert_eq!(pixel(38, 2), pixel(78, 78));
+        assert_eq!(pixel(60, 10), pixel(78, 78));
     }
 
     #[test]

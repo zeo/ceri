@@ -1277,6 +1277,7 @@ pub(crate) struct Style {
     pub perspective: Option<f32>,
     pub perspective_origin: (Length, Length),
     pub backface_hidden: bool,
+    pub(crate) clip_path: Option<crate::clip_path::ClipPath>,
 }
 
 impl Style {
@@ -1454,6 +1455,7 @@ impl Style {
             perspective: None,
             perspective_origin: (Length::percent(50.0), Length::percent(50.0)),
             backface_hidden: false,
+            clip_path: None,
         };
         match name {
             // the canvas behind a page is white unless the page says otherwise
@@ -4530,6 +4532,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "box-sizing",
     "caption-side",
     "clear",
+    "clip-path",
     "color",
     "column-gap",
     "container",
@@ -5225,6 +5228,13 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "scale-down" => ObjectFit::ScaleDown,
                 _ => ObjectFit::Fill,
             };
+        }
+        "clip-path" => {
+            if value.trim().eq_ignore_ascii_case("none") {
+                style.clip_path = None;
+            } else if let Some(path) = crate::clip_path::ClipPath::parse(value) {
+                style.clip_path = Some(path);
+            }
         }
         "transform" => {
             if value.trim().eq_ignore_ascii_case("none") {
@@ -5973,7 +5983,7 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
 }
 
 // splits on commas that are not inside a function call
-fn split_top_level(source: &str) -> Vec<&str> {
+pub(crate) fn split_top_level(source: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0_usize;
     let mut start = 0;
@@ -6376,7 +6386,7 @@ fn parse_background_size(value: &str) -> Option<BackgroundSize> {
 }
 
 // keywords become percentages; one value centers the other axis
-fn parse_background_position(value: &str) -> Option<(Length, Length)> {
+pub(crate) fn parse_background_position(value: &str) -> Option<(Length, Length)> {
     let percent = |amount: f32| {
         Length::Terms(LengthTerms {
             percent: amount,

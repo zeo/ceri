@@ -2,6 +2,7 @@ mod bidi;
 mod border;
 mod bridge;
 mod cff;
+mod clip_path;
 mod color_glyph;
 mod colors;
 mod css;

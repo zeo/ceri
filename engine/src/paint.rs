@@ -39,8 +39,33 @@ pub struct Canvas {
     pixels: Vec<u8>,
     // the layout point drawn at the surface's top-left corner, nonzero for transform layers
     shift: (f32, f32),
-    // rounded overflow clips in device space; every write is scaled by their coverage
-    masks: Vec<Shape>,
+    // rounded overflow clips and clip-paths in device space; every write is scaled by their
+    // coverage
+    masks: Vec<Mask>,
+}
+
+#[derive(Clone, Debug)]
+enum Mask {
+    Rounded(Shape),
+    Polygon {
+        even_odd: bool,
+        points: Vec<(f32, f32)>,
+    },
+}
+
+fn mask_coverage(masks: &[Mask], point: (f32, f32)) -> f32 {
+    masks.iter().map(|mask| mask.coverage(point)).product()
+}
+
+impl Mask {
+    fn coverage(&self, point: (f32, f32)) -> f32 {
+        match self {
+            Self::Rounded(shape) => shape.coverage(point),
+            Self::Polygon { even_odd, points } => {
+                crate::clip_path::polygon_coverage(points, *even_odd, point)
+            }
+        }
+    }
 }
 
 impl Canvas {
@@ -641,7 +666,30 @@ impl Canvas {
 
     fn push_mask(&mut self, shape: Shape) {
         let device = self.device_shape(shape);
-        self.masks.push(device);
+        self.masks.push(Mask::Rounded(device));
+    }
+
+    // a clip-path region relative to the border box corner at `origin`
+    fn push_clip_path(&mut self, region: &crate::clip_path::ClipRegion, origin: (f32, f32)) {
+        use crate::clip_path::ClipRegion;
+        match region {
+            ClipRegion::Rounded(rect, radii) => {
+                self.push_mask(Shape::from_rect(translate_rect(*rect, origin), *radii));
+            }
+            ClipRegion::Polygon { even_odd, points } => {
+                let device = |(x, y): (f32, f32)| {
+                    (
+                        (x + origin.0 - self.shift.0) * self.scale,
+                        (y + origin.1 - self.shift.1) * self.scale,
+                    )
+                };
+                let points = points.iter().copied().map(device).collect();
+                self.masks.push(Mask::Polygon {
+                    even_odd: *even_odd,
+                    points,
+                });
+            }
+        }
     }
 
     fn pop_mask(&mut self) {
@@ -649,11 +697,7 @@ impl Canvas {
     }
 
     fn mask_at(&self, x: u32, y: u32) -> f32 {
-        let center = (x as f32 + 0.5, y as f32 + 0.5);
-        self.masks
-            .iter()
-            .map(|mask| mask.coverage(center))
-            .product()
+        mask_coverage(&self.masks, (x as f32 + 0.5, y as f32 + 0.5))
     }
 
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
@@ -736,12 +780,7 @@ impl Canvas {
                         (bounds.left as usize + column) as f32 + 0.5,
                         row as f32 + 0.5,
                     );
-                    let coverage = self
-                        .masks
-                        .iter()
-                        .map(|mask| mask.coverage(center))
-                        .product::<f32>();
-                    (factor as f32 * coverage).round() as u32
+                    (factor as f32 * mask_coverage(&self.masks, center)).round() as u32
                 } else {
                     factor
                 };
@@ -1691,6 +1730,13 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     } = paint;
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
+    // a clip-path cuts everything the box paints, its shadow and outline included
+    if let Some(region) = &layout_box.clip_path {
+        if region.is_empty() {
+            return;
+        }
+        canvas.push_clip_path(region, (rect.x, rect.y));
+    }
     let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
     let mask = overflow_mask(layout_box, rect);
     if let Some(mask) = mask {
@@ -1743,6 +1789,9 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     }
     paint_scrollbars(canvas, layout_box, offset, clip);
     paint_outline(canvas, layout_box, rect, opacity, clip);
+    if layout_box.clip_path.is_some() {
+        canvas.pop_mask();
+    }
 }
 
 fn paint_non_context_children(
@@ -3091,6 +3140,7 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
+                clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
@@ -3412,6 +3462,7 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
+                clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
@@ -3525,6 +3576,7 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
+                clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
@@ -3631,6 +3683,7 @@ mod tests {
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
+                clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadow: None,
@@ -3657,6 +3710,7 @@ mod tests {
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,
+                        clip_path: None,
                         radii: SQUARE_CORNERS,
                         opacity: 1.0,
                         shadow: None,
@@ -3705,6 +3759,7 @@ mod tests {
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,
+                        clip_path: None,
                         radii: SQUARE_CORNERS,
                         opacity: 1.0,
                         shadow: None,
