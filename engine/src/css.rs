@@ -1308,6 +1308,47 @@ impl ShadowList {
     }
 }
 
+// a filter function list kept outside the copyable computed style
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FilterList(u32);
+
+thread_local! {
+    static FILTER_LISTS: RefCell<crate::intern::Table<[crate::filter::Filter<Length>]>> =
+        RefCell::new(crate::intern::Table::new());
+}
+
+impl FilterList {
+    pub(crate) fn filters(self) -> Rc<[crate::filter::Filter<Length>]> {
+        FILTER_LISTS
+            .with(|lists| lists.borrow().get(self.0))
+            .unwrap_or_else(|| Rc::from(Vec::new()))
+    }
+}
+
+// none, or the list; None when the value is invalid
+fn parse_filter_list(value: &str) -> Option<Option<FilterList>> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    // a drop-shadow without a color takes currentcolor, so the key carries it
+    let current = CURRENT_COLOR.with(std::cell::Cell::get);
+    let key = format!(
+        "{}|{:02x}{:02x}{:02x}{:02x}",
+        value.trim(),
+        current.red,
+        current.green,
+        current.blue,
+        current.alpha
+    );
+    if let Some(id) = FILTER_LISTS.with(|lists| lists.borrow().find(&key)) {
+        return Some(Some(FilterList(id)));
+    }
+    let filters = crate::filter::parse(value)?;
+    Some(Some(FilterList(FILTER_LISTS.with(|lists| {
+        lists.borrow_mut().insert(&key, Rc::from(filters))
+    }))))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Style {
     pub display: Display,
@@ -1342,8 +1383,8 @@ pub(crate) struct Style {
     // the thumb and track colors, none for the platform's
     pub scrollbar_color: Option<(Color, Color)>,
     pub scrollbar_width: ScrollbarWidth,
-    // the product of the filter's brightness() functions; other filter functions are not drawn
-    pub brightness: f32,
+    pub(crate) filter: Option<FilterList>,
+    pub(crate) backdrop_filter: Option<FilterList>,
     // horizontal and vertical
     pub border_spacing: (f32, f32),
     pub caption_bottom: bool,
@@ -1524,7 +1565,8 @@ impl Style {
             appearance_none: false,
             scrollbar_color: parent_text.scrollbar_color,
             scrollbar_width: ScrollbarWidth::Auto,
-            brightness: 1.0,
+            filter: None,
+            backdrop_filter: None,
             border_spacing: parent_text.border_spacing,
             caption_bottom: parent_text.caption_bottom,
             table_fixed: false,
@@ -4731,30 +4773,6 @@ fn drop_or_fail(dropped: Option<&mut Vec<String>>, error: String) -> Result<(), 
     }
 }
 
-// none, or a list of filter functions whose brightness() factors multiply
-fn parse_brightness(value: &str) -> Option<f32> {
-    if value.trim().eq_ignore_ascii_case("none") {
-        return Some(1.0);
-    }
-    let mut brightness = 1.0;
-    for word in split_words(value) {
-        let Some(argument) = word
-            .strip_prefix("brightness(")
-            .and_then(|rest| rest.strip_suffix(')'))
-        else {
-            continue;
-        };
-        let argument = argument.trim();
-        let factor = match argument.strip_suffix('%') {
-            Some(percent) => parse_number(percent)? / 100.0,
-            None if argument.is_empty() => 1.0,
-            None => parse_number(argument)?,
-        };
-        brightness *= factor.max(0.0);
-    }
-    Some(brightness)
-}
-
 fn parse_container_type(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "size" => Some(true),
@@ -4892,6 +4910,8 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
         "border-radius" => style.border_radius = from.border_radius,
         "outline" => style.outline = from.outline,
         "box-shadow" => style.shadows = from.shadows,
+        "filter" => style.filter = from.filter,
+        "backdrop-filter" => style.backdrop_filter = from.backdrop_filter,
         "opacity" => style.opacity = from.opacity,
         "gap" => {
             style.gap = from.gap;
@@ -5012,6 +5032,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "animation-play-state",
     "animation-timing-function",
     "aspect-ratio",
+    "backdrop-filter",
     "backface-visibility",
     "background",
     "background-color",
@@ -5060,6 +5081,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "content",
     "cursor",
     "display",
+    "filter",
     "flex",
     "flex-basis",
     "flex-direction",
@@ -5194,6 +5216,7 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
             "auto" | "normal" | "none"
         ),
         "font-feature-settings" => crate::font::parse_feature_settings(value).is_some(),
+        "filter" | "backdrop-filter" => parse_filter_list(value).is_some(),
         _ => true,
     }
 }
@@ -5454,7 +5477,7 @@ thread_local! {
     static CURRENT_COLOR: std::cell::Cell<Color> = const { std::cell::Cell::new(Color::BLACK) };
 }
 
-fn parse_color(value: &str) -> Option<Color> {
+pub(crate) fn parse_color(value: &str) -> Option<Color> {
     crate::colors::parse(value, CURRENT_COLOR.with(std::cell::Cell::get))
 }
 
@@ -5671,7 +5694,10 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 _ => style.scrollbar_width,
             };
         }
-        "filter" => style.brightness = parse_brightness(value).unwrap_or(style.brightness),
+        "filter" => style.filter = parse_filter_list(value).unwrap_or(style.filter),
+        "backdrop-filter" => {
+            style.backdrop_filter = parse_filter_list(value).unwrap_or(style.backdrop_filter);
+        }
         "container-type" => style.container_type = parse_container_type(value),
         "container-name" => style.container_name = parse_container_name(value),
         "container" => {
@@ -7606,12 +7632,25 @@ mod tests {
         };
         let resting = thumb(&StyleState::default());
         assert_eq!(resting.width, Length::px(14.0));
-        assert!((resting.brightness - 1.5).abs() < 1e-6);
+        let filters = |style: &Style| {
+            style
+                .filter
+                .expect("the thumb should be filtered")
+                .filters()
+                .to_vec()
+        };
+        assert_eq!(
+            filters(&resting),
+            crate::filter::parse("drop-shadow(0 0 1px red) brightness(150%)").unwrap()
+        );
         let hovered = thumb(&StyleState {
             hovered: Some(slider.1),
             ..StyleState::default()
         });
-        assert!((hovered.brightness - 1.15).abs() < 1e-6);
+        assert_eq!(
+            filters(&hovered),
+            crate::filter::parse("brightness(1.15)").unwrap()
+        );
 
         let scroller = placed(&Element::new("div"), &[]);
         let part = |pseudo: PseudoElement, hovered_part: Option<PseudoElement>| {
@@ -7647,7 +7686,7 @@ mod tests {
             Some((Color::opaque(204, 51, 51), Color::opaque(51, 51, 51)))
         );
         assert_eq!(style.scrollbar_width, ScrollbarWidth::Thin);
-        assert_eq!(style.brightness, 1.0);
+        assert_eq!(style.filter, None);
         assert!(!stylesheet.styles_pseudo(PseudoElement::ScrollbarCorner));
         // the inherited thumb and track colors reach the children of a scroller
         let child = placed(&Element::new("p"), &[&Element::new("div")]);

@@ -869,14 +869,72 @@ impl Canvas {
         }
     }
 
-    // draws a premultiplied layer over this surface at the given group opacity
+    // a transparent surface over the device pixels `rect` touches, aligned to this one but
+    // free to reach past its edges, as a filter that spreads needs
+    fn aligned_layer(&self, rect: Rect) -> Canvas {
+        let left = ((rect.x - self.shift.0) * self.scale).floor();
+        let top = ((rect.y - self.shift.1) * self.scale).floor();
+        let right = ((rect.x + rect.width - self.shift.0) * self.scale).ceil();
+        let bottom = ((rect.y + rect.height - self.shift.1) * self.scale).ceil();
+        let width = (right - left).max(1.0) as u32;
+        let height = (bottom - top).max(1.0) as u32;
+        let mut pixels = LAYER_BUFFERS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_default();
+        pixels.clear();
+        pixels.resize(width as usize * height as usize * 4, 0);
+        Canvas {
+            width,
+            height,
+            scale: self.scale,
+            background: Color::transparent(),
+            pixels,
+            shift: (
+                self.shift.0 + left / self.scale,
+                self.shift.1 + top / self.scale,
+            ),
+            masks: Vec::new(),
+        }
+    }
+
+    fn extent(&self) -> Rect {
+        Rect {
+            x: self.shift.0,
+            y: self.shift.1,
+            width: self.width as f32 / self.scale,
+            height: self.height as f32 / self.scale,
+        }
+    }
+
+    // draws a premultiplied layer aligned to this surface over it, inside the bounds, at the
+    // given group opacity
     fn composite(&mut self, layer: Canvas, bounds: DeviceBounds, opacity: f32) {
         let factor = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
         let stride = self.width as usize * 4;
         let layer_stride = layer.width as usize * 4;
         let masked = !self.masks.is_empty();
+        let origin = |from: f32, to: f32| ((from - to) * self.scale).round() as i64;
+        let origin = (
+            origin(layer.shift.0, self.shift.0),
+            origin(layer.shift.1, self.shift.1),
+        );
+        let left = i64::from(bounds.left).max(origin.0);
+        let right = i64::from(bounds.right).min(origin.0 + i64::from(layer.width));
+        let top = i64::from(bounds.top).max(origin.1);
+        let bottom = i64::from(bounds.bottom).min(origin.1 + i64::from(layer.height));
+        if right <= left || bottom <= top {
+            recycle_layer(layer.pixels);
+            return;
+        }
+        let bounds = DeviceBounds {
+            left: left as u32,
+            top: top as u32,
+            right: right as u32,
+            bottom: bottom as u32,
+        };
+        let first = (top - origin.1) as usize * layer_stride + (left - origin.0) as usize * 4;
         for (row, source_row) in
-            (bounds.top..bounds.bottom).zip(layer.pixels.chunks_exact(layer_stride))
+            (bounds.top..bounds.bottom).zip(layer.pixels[first..].chunks(layer_stride))
         {
             let start = row as usize * stride + bounds.left as usize * 4;
             let end = row as usize * stride + bounds.right as usize * 4;
@@ -1000,7 +1058,16 @@ fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
     for child in &layout_box.children {
         bounds = union_rect(bounds, subtree_bounds(child, offset));
     }
-    bounds
+    outset_rect(bounds, crate::filter::reach(&layout_box.filters.own))
+}
+
+fn outset_rect(rect: Rect, amount: f32) -> Rect {
+    Rect {
+        x: rect.x - amount,
+        y: rect.y - amount,
+        width: rect.width + amount * 2.0,
+        height: rect.height + amount * 2.0,
+    }
 }
 
 fn union_rect(first: Rect, second: Rect) -> Rect {
@@ -2034,7 +2101,38 @@ fn paint_context(
                 opacity: 1.0,
             },
         );
+        // the filter acts in the box's own space, before the transform
+        filter_layer(&mut layer, &layout_box.filters.own);
         canvas.composite_transformed(layer, &full, clip, opacity);
+        return;
+    }
+    paint_backdrop(
+        canvas,
+        layout_box,
+        visual_rect_for(layout_box, ancestor_offset),
+        clip,
+        opacity,
+    );
+    if !layout_box.filters.own.is_empty() {
+        paint_filtered(
+            canvas,
+            &layout_box.filters.own,
+            (subtree_bounds(layout_box, ancestor_offset), clip),
+            opacity,
+            |layer| {
+                paint_context_contents(
+                    layer,
+                    layout_box,
+                    ContextPaint {
+                        images,
+                        prose_selections,
+                        clip: None,
+                        ancestor_offset,
+                        opacity: 1.0,
+                    },
+                );
+            },
+        );
         return;
     }
     // opacity fades the painted subtree as one image, so overlapping descendants do not
@@ -2071,6 +2169,86 @@ fn paint_context(
             opacity,
         },
     );
+}
+
+fn filter_layer(layer: &mut Canvas, filters: &[crate::filter::Filter]) {
+    let size = (layer.width as usize, layer.height as usize);
+    crate::filter::apply(filters, &mut layer.pixels, size, layer.scale, false);
+}
+
+// paints into a layer that leaves the filter room to spread, filters it, and draws it inside
+// the clip; `bounds` is everything the paint and its filter can cover
+fn paint_filtered(
+    canvas: &mut Canvas,
+    filters: &[crate::filter::Filter],
+    (bounds, clip): (Rect, Option<Rect>),
+    opacity: f32,
+    paint: impl FnOnce(&mut Canvas),
+) {
+    // what lies past the visible area only matters as far as the filter reaches into it
+    let Some(visible) = intersect_clip(clip, canvas.extent()) else {
+        return;
+    };
+    let Some(area) = intersect_clip(
+        Some(outset_rect(visible, crate::filter::reach(filters))),
+        bounds,
+    ) else {
+        return;
+    };
+    let mut layer = canvas.aligned_layer(area);
+    paint(&mut layer);
+    filter_layer(&mut layer, filters);
+    match DeviceBounds::of(canvas, layer.extent(), clip) {
+        Some(shown) => canvas.composite(layer, shown, opacity),
+        None => recycle_layer(layer.pixels),
+    }
+}
+
+// backdrop-filter redraws what the surface already holds behind the border box, filtered and
+// cut to the rounded box, before the box paints; chromium reads the backdrop past the edges
+// of the box as if mirrored there
+fn paint_backdrop(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    rect: Rect,
+    clip: Option<Rect>,
+    opacity: f32,
+) {
+    let filters = &layout_box.filters.backdrop;
+    if filters.is_empty() {
+        return;
+    }
+    let (Some(input), Some(shown)) = (
+        DeviceBounds::of(canvas, rect, None),
+        DeviceBounds::of(canvas, rect, clip),
+    ) else {
+        return;
+    };
+    let mut layer = canvas.layer(input);
+    let row_bytes = layer.width as usize * 4;
+    let stride = canvas.width as usize * 4;
+    for (row, target) in layer.pixels.chunks_exact_mut(row_bytes).enumerate() {
+        let start = (input.top as usize + row) * stride + input.left as usize * 4;
+        target.copy_from_slice(&canvas.pixels[start..start + row_bytes]);
+    }
+    let size = (layer.width as usize, layer.height as usize);
+    crate::filter::apply(filters, &mut layer.pixels, size, canvas.scale, true);
+    let shape = canvas.device_shape(Shape::from_rect(canvas.snap_rect(rect), layout_box.radii));
+    for (row, line) in layer.pixels.chunks_exact_mut(row_bytes).enumerate() {
+        for (column, pixel) in line.chunks_exact_mut(4).enumerate() {
+            let center = (
+                (input.left as usize + column) as f32 + 0.5,
+                (input.top as usize + row) as f32 + 0.5,
+            );
+            let coverage = shape.coverage(center);
+            if coverage < 1.0 {
+                for value in pixel {
+                    *value = (f32::from(*value) * coverage).round() as u8;
+                }
+            }
+        }
+    }
+    canvas.composite(layer, shown, opacity);
 }
 
 struct ContextPaint<'a> {
@@ -2799,6 +2977,7 @@ fn paint_scrollbars(
                     rect,
                     (layout_box.font_size, layout_box.cursor),
                 );
+                // chromium draws scrollbar parts without their filter
                 paint_box_surface(
                     canvas,
                     &part,
@@ -3742,6 +3921,7 @@ mod tests {
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadows: Vec::new(),
+                filters: Default::default(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: vec![TextRun {
@@ -3917,6 +4097,81 @@ mod tests {
             "an unrepeated tile masks the rest"
         );
         assert_eq!(pixel(5, 55), [255, 255, 255]);
+    }
+
+    #[test]
+    fn filters_and_backdrop_filters_land_on_the_pixels_chromium_draws() {
+        let document = Document::parse_markup(concat!(
+            "<html><body><div id='blurred'></div><div id='shadowed'></div>",
+            "<div id='stripes'></div><div id='frosted'></div><div id='clip'><div></div></div>",
+            "</body></html>",
+        ))
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #fff } body > div { position: absolute }",
+            "#blurred, #shadowed { width: 60px; height: 40px; background: #e01020; left: 20px }",
+            "#blurred { top: 20px; filter: blur(4px) }",
+            "#shadowed { top: 100px; filter: drop-shadow(4px 6px 6px #000) }",
+            "#stripes { left: 200px; top: 20px; width: 200px; height: 120px;",
+            " background: repeating-linear-gradient(90deg, #000 0 10px, #fff 10px 20px) }",
+            "#frosted { left: 240px; top: 50px; width: 120px; height: 80px; border-radius: 12px;",
+            " backdrop-filter: blur(6px) }",
+            "#clip { left: 300px; top: 150px; width: 80px; height: 40px; overflow: hidden }",
+            "#clip div { position: absolute; inset: 0; background: #000; filter: blur(18px) }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 420.0,
+                height: 220.0,
+            },
+        ));
+        let pixel = |x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            <[u8; 3]>::try_from(&canvas.rgba_pixels()[index..index + 3]).expect("a pixel")
+        };
+        // every expected value was read from edge rendering the same page in software
+        let blurred = (8..24).step_by(2).map(|x| pixel(x, 40)).collect::<Vec<_>>();
+        assert_eq!(
+            blurred,
+            [
+                [255, 255, 255],
+                [255, 253, 253],
+                [254, 247, 247],
+                [252, 232, 233],
+                [249, 205, 209],
+                [244, 168, 174],
+                [238, 125, 133],
+                [233, 83, 95],
+            ]
+        );
+        let shadow = (140..156)
+            .step_by(2)
+            .map(|y| pixel(50, y)[0])
+            .collect::<Vec<_>>();
+        assert_eq!(shadow, [42, 69, 102, 136, 170, 200, 223, 239]);
+        assert_eq!(pixel(50, 138), [224, 16, 32], "the box stays on its shadow");
+        let frosted = (240..260).map(|x| pixel(x, 90)[0]).collect::<Vec<_>>();
+        assert_eq!(
+            frosted,
+            [
+                17, 20, 25, 32, 42, 55, 68, 83, 98, 112, 125, 137, 147, 154, 158, 158, 155, 149,
+                141, 132
+            ]
+        );
+        assert_eq!(
+            pixel(240, 50),
+            [0, 0, 0],
+            "the rounded corner leaves the stripe behind it unfiltered"
+        );
+        assert_eq!(
+            pixel(385, 170),
+            [255, 255, 255],
+            "the blur stays inside the overflow clip"
+        );
+        assert!(pixel(378, 170)[0] < 200);
     }
 
     #[test]
@@ -4234,6 +4489,7 @@ mod tests {
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadows: Vec::new(),
+                filters: Default::default(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: vec![TextRun {
@@ -4352,6 +4608,7 @@ mod tests {
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
                 shadows: Vec::new(),
+                filters: Default::default(),
                 border: BoxBorder::NONE,
                 outline: None,
                 text: vec![

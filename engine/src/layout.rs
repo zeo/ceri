@@ -132,6 +132,7 @@ pub struct LayoutBox {
     pub opacity: f32,
     // first on top, as declared
     pub shadows: Vec<ResolvedShadow>,
+    pub(crate) filters: crate::filter::Filters,
     pub(crate) border: BoxBorder,
     pub(crate) outline: Option<BoxOutline>,
     pub text: Vec<TextRun>,
@@ -962,6 +963,7 @@ pub fn layout_with_state(
         radii: SQUARE_CORNERS,
         opacity: 1.0,
         shadows: Vec::new(),
+        filters: crate::filter::Filters::default(),
         border: BoxBorder::NONE,
         outline: None,
         text: Vec::new(),
@@ -3252,6 +3254,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: style.opacity * parent.opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
+        filters: crate::filter::Filters::of(&style, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text,
@@ -3435,6 +3438,7 @@ fn anonymous_box(
         radii: SQUARE_CORNERS,
         opacity,
         shadows: Vec::new(),
+        filters: crate::filter::Filters::default(),
         border: BoxBorder::NONE,
         outline: None,
         text,
@@ -3476,45 +3480,18 @@ pub(crate) fn part_box(
     rect: Rect,
     (font_size, cursor): (f32, Cursor),
 ) -> LayoutBox {
-    let mut part = LayoutBox {
+    LayoutBox {
         tag: pseudo.tag().to_string(),
         background: style.background,
         backgrounds: style.layers(),
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         shadows: resolve_shadows(style.shadows, rect.width, font_size),
+        filters: crate::filter::Filters::of(style, font_size),
         border: BoxBorder::of(style),
+        // a filtered part paints through a layer of its own
+        creates_stacking_context: style.filter.is_some(),
         visible: style.visibility == Visibility::Visible,
         ..anonymous_box(node, rect, Vec::new(), (font_size, cursor), style.opacity)
-    };
-    brighten(&mut part, style.brightness);
-    part
-}
-
-// filter: brightness() scales every color a part paints, which matches filtering its pixels
-fn brighten(part: &mut LayoutBox, factor: f32) {
-    if factor == 1.0 {
-        return;
-    }
-    let scale = |color: Color| {
-        let channel = |value: u8| (f32::from(value) * factor).round().clamp(0.0, 255.0) as u8;
-        Color::rgba(
-            channel(color.red),
-            channel(color.green),
-            channel(color.blue),
-            color.alpha,
-        )
-    };
-    part.background = scale(part.background);
-    for layer in &mut part.backgrounds {
-        if let crate::css::LayerImage::Gradient(gradient) = &mut layer.image {
-            for stop in &mut gradient.stops {
-                stop.color = scale(stop.color);
-            }
-        }
-    }
-    part.border.colors = part.border.colors.map(scale);
-    for shadow in &mut part.shadows {
-        shadow.color = scale(shadow.color);
     }
 }
 
@@ -4532,6 +4509,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
+        filters: crate::filter::Filters::of(&style, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -5015,6 +4993,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
+        filters: crate::filter::Filters::of(&style, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -5739,6 +5718,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
+        filters: crate::filter::Filters::of(&style, font_size),
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -6954,6 +6934,8 @@ fn creates_stacking_context(style: Style) -> bool {
         || style.perspective.is_some()
         || style.clip_path.is_some()
         || style.masks.is_some_and(|masks| !masks.layers().is_empty())
+        || style.filter.is_some()
+        || style.backdrop_filter.is_some()
         || matches!(style.position, Position::Fixed | Position::Sticky)
         || (style.position != Position::Static && style.z_index.is_some())
 }
@@ -8938,10 +8920,13 @@ mod tests {
                 height: 14.0
             }
         );
-        // brightness(2) doubles every color the thumb paints and keeps their alpha
-        assert_eq!(thumb.background, Color::opaque(128, 128, 128));
-        assert_eq!(thumb.border.colors[0], Color::opaque(34, 34, 34));
-        assert_eq!(thumb.shadows[0].color, Color::rgba(64, 64, 64, 128));
+        // the thumb keeps its own colors and paints through its filter as a layer of its own
+        assert_eq!(thumb.background, Color::opaque(64, 64, 64));
+        assert!(matches!(
+            thumb.filters.own[..],
+            [crate::filter::Filter::Matrix(_)]
+        ));
+        assert!(thumb.creates_stacking_context && !track.creates_stacking_context);
 
         // appearance: auto keeps the platform slider, whose thumb starts at the content edge
         assert!(native.children.is_empty());

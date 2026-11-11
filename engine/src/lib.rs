@@ -8,6 +8,7 @@ mod colors;
 mod css;
 mod deflate;
 mod dom;
+mod filter;
 mod font;
 mod gif;
 mod grid;
