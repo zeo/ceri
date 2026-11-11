@@ -6,15 +6,21 @@ use std::path::Path;
 
 const MAX_PICKED_BYTES: u64 = 64 * 1024 * 1024;
 
-pub struct DesktopClipboard;
+#[derive(Default)]
+pub struct DesktopClipboard {
+    // x11 and wayland serve pasted text from the copying process, so the connection lives as
+    // long as the app and hands its text to a clipboard manager when dropped
+    #[cfg(all(unix, not(target_os = "macos")))]
+    connection: std::cell::RefCell<Option<arboard::Clipboard>>,
+}
 
 impl ClipboardProvider for DesktopClipboard {
     fn read_text(&self) -> Result<String, NavigationError> {
-        platform::read_clipboard_text().map_err(NavigationError::Clipboard)
+        platform::read_clipboard_text(self).map_err(NavigationError::Clipboard)
     }
 
     fn write_text(&self, text: &str) -> Result<(), NavigationError> {
-        platform::write_clipboard_text(text).map_err(NavigationError::Clipboard)
+        platform::write_clipboard_text(self, text).map_err(NavigationError::Clipboard)
     }
 }
 
@@ -202,7 +208,9 @@ mod platform {
         }
     }
 
-    pub(super) fn read_clipboard_text() -> Result<String, String> {
+    pub(super) fn read_clipboard_text(
+        _clipboard: &super::DesktopClipboard,
+    ) -> Result<String, String> {
         // SAFETY: the format constant is valid and the call only reports availability
         if unsafe { IsClipboardFormatAvailable(unicode_text()) }.is_err() {
             return Ok(String::new());
@@ -232,7 +240,10 @@ mod platform {
         Ok(String::from_utf16_lossy(&units))
     }
 
-    pub(super) fn write_clipboard_text(text: &str) -> Result<(), String> {
+    pub(super) fn write_clipboard_text(
+        _clipboard: &super::DesktopClipboard,
+        text: &str,
+    ) -> Result<(), String> {
         let mut units: Vec<u16> = text.encode_utf16().collect();
         units.push(0);
         // SAFETY: the size is the exact byte length of the buffer copied below
@@ -438,12 +449,53 @@ mod platform {
             .and_then(|value| super::posix_locale_tag(&value))
     }
 
-    pub(super) fn read_clipboard_text() -> Result<String, String> {
-        Err("the desktop clipboard adapter currently covers Windows only".to_string())
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn with_connection<T>(
+        clipboard: &super::DesktopClipboard,
+        action: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+    ) -> Result<T, String> {
+        let mut connection = clipboard.connection.borrow_mut();
+        let connection = match &mut *connection {
+            Some(connection) => connection,
+            None => {
+                connection.insert(arboard::Clipboard::new().map_err(|error| error.to_string())?)
+            }
+        };
+        action(connection).map_err(|error| error.to_string())
     }
 
-    pub(super) fn write_clipboard_text(_text: &str) -> Result<(), String> {
-        Err("the desktop clipboard adapter currently covers Windows only".to_string())
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(super) fn read_clipboard_text(
+        clipboard: &super::DesktopClipboard,
+    ) -> Result<String, String> {
+        with_connection(clipboard, |connection| match connection.get_text() {
+            // an empty or non-text clipboard reads as empty text, as on windows
+            Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+            result => result,
+        })
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(super) fn write_clipboard_text(
+        clipboard: &super::DesktopClipboard,
+        text: &str,
+    ) -> Result<(), String> {
+        with_connection(clipboard, |connection| connection.set_text(text))
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    pub(super) fn read_clipboard_text(
+        _clipboard: &super::DesktopClipboard,
+    ) -> Result<String, String> {
+        Err("the desktop clipboard adapter covers Windows and Linux only".to_string())
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    pub(super) fn write_clipboard_text(
+        _clipboard: &super::DesktopClipboard,
+        _text: &str,
+    ) -> Result<(), String> {
+        Err("the desktop clipboard adapter covers Windows and Linux only".to_string())
     }
 
     pub(super) fn pick_files(
@@ -470,7 +522,7 @@ mod tests {
 
     #[test]
     fn clipboard_round_trips_text_on_the_host() {
-        let clipboard = DesktopClipboard;
+        let clipboard = DesktopClipboard::default();
         let sample = "ceri clipboard check";
         match clipboard.write_text(sample) {
             Ok(()) => {

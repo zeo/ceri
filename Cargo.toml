@@ -35,6 +35,9 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_Controls_Dialogs",
 ] }
 
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+arboard = { version = "=3.7.0", default-features = false, features = ["wayland-data-control"] }
+
 # windows reaches the network through the platform stack, other targets use the engine client
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 ceri-engine = { path = "engine", features = ["windowed", "native-http"] }

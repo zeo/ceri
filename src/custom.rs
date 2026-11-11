@@ -228,7 +228,7 @@ fn build_browser(
     .with_host_runtime_info(runtime_info())
     .with_host_bridge(bridge)
     .with_fonts(Rc::new(system_font_set()))
-    .with_clipboard_provider(Rc::new(DesktopClipboard))
+    .with_clipboard_provider(Rc::new(DesktopClipboard::default()))
     .with_time_zone(Rc::new(DesktopTimeZone))
     .with_file_picker(Rc::new(DesktopFilePicker));
     Ok(match user_locale() {
