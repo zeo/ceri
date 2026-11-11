@@ -1,5 +1,5 @@
 use crate::border::{BorderSide, CornerLengths, OutlineStyle, SQUARE_CORNERS};
-use crate::dom::{Document, Element, NodeId};
+use crate::dom::{Document, Element, Namespace, NodeId};
 use crate::grid::{Areas, GridLine, GridPlacement, Tracks, parse_line, parse_placement};
 use crate::media::{ContainerQuery, MediaQueryList};
 use std::borrow::Cow;
@@ -872,6 +872,7 @@ pub(crate) struct InheritedText {
     pub(crate) font_variations: crate::font::FontVariations,
     pub(crate) optical_sizing: bool,
     pub(crate) decoration: TextDecoration,
+    pub(crate) svg: crate::svg::Presentation,
 }
 
 impl Default for InheritedText {
@@ -901,7 +902,38 @@ impl Default for InheritedText {
             font_variations: crate::font::FontVariations::default(),
             optical_sizing: true,
             decoration: TextDecoration::default(),
+            svg: crate::svg::Presentation::default(),
         }
+    }
+}
+
+pub(crate) fn inherited_text(style: &Style) -> InheritedText {
+    InheritedText {
+        transform: style.text_transform,
+        letter_spacing: style.letter_spacing,
+        family: style.font_family,
+        visibility: style.visibility,
+        cursor: style.cursor,
+        pointer_events: style.pointer_events,
+        selectable: style.selectable,
+        list_style_type: style.list_style_type,
+        list_inside: style.list_inside,
+        border_collapse: style.border_collapse,
+        border_spacing: style.border_spacing,
+        caption_bottom: style.caption_bottom,
+        accent_color: style.accent_color,
+        text_align: style.text_align,
+        line_height: style.line_height,
+        space_collapse: style.space_collapse,
+        wrap: style.wrap,
+        word_break: style.word_break,
+        overflow_wrap: style.overflow_wrap,
+        rtl: style.rtl,
+        italic: style.italic,
+        font_variations: style.font_variations,
+        optical_sizing: style.optical_sizing,
+        decoration: style.text_decoration,
+        svg: style.svg,
     }
 }
 
@@ -1270,6 +1302,7 @@ pub(crate) struct Style {
     pub overflow_y: Overflow,
     pub visibility: Visibility,
     pub cursor: Cursor,
+    pub(crate) svg: crate::svg::Presentation,
     // pointer-events other than none, and user-select other than none
     pub(crate) pointer_events: bool,
     pub(crate) selectable: bool,
@@ -1449,6 +1482,7 @@ impl Style {
             overflow_y: Overflow::Visible,
             visibility: parent_text.visibility,
             cursor: parent_text.cursor,
+            svg: parent_text.svg,
             pointer_events: parent_text.pointer_events,
             selectable: parent_text.selectable,
             float: Float::None,
@@ -2394,6 +2428,26 @@ impl Stylesheet {
                 style.height = Length::px(height as f32);
             }
         }
+        // an outer svg takes its natural ratio from the viewBox, and without one an auto side
+        // takes the default 300 by 150
+        if let Some(element) = own.and_then(|node| document.element(node))
+            && name == "svg"
+            && element.namespace == Namespace::Svg
+        {
+            let ratio = crate::svg::view_box(element)
+                .map(|view| view.2 / view.3)
+                .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+            if let Some(ratio) = ratio {
+                style.aspect_ratio.get_or_insert(ratio);
+            } else {
+                if style.width == Length::Auto {
+                    style.width = Length::px(300.0);
+                }
+                if style.height == Length::Auto {
+                    style.height = Length::px(150.0);
+                }
+            }
+        }
         // a line height with units is computed here, so descendants inherit the pixels
         if style.line_height_absolute {
             let font_size = style
@@ -2472,35 +2526,37 @@ impl Stylesheet {
                 .max(1.0);
             color = style.color;
             weight = style.font_weight;
-            text = InheritedText {
-                transform: style.text_transform,
-                letter_spacing: style.letter_spacing,
-                family: style.font_family,
-                visibility: style.visibility,
-                cursor: style.cursor,
-                pointer_events: style.pointer_events,
-                selectable: style.selectable,
-                list_style_type: style.list_style_type,
-                list_inside: style.list_inside,
-                border_collapse: style.border_collapse,
-                border_spacing: style.border_spacing,
-                caption_bottom: style.caption_bottom,
-                accent_color: style.accent_color,
-                text_align: style.text_align,
-                line_height: style.line_height,
-                space_collapse: style.space_collapse,
-                wrap: style.wrap,
-                word_break: style.word_break,
-                overflow_wrap: style.overflow_wrap,
-                rtl: style.rtl,
-                italic: style.italic,
-                font_variations: style.font_variations,
-                optical_sizing: style.optical_sizing,
-                decoration: style.text_decoration,
-            };
+            text = inherited_text(&style);
             computed = Some((style, font_size));
         }
         computed
+    }
+
+    // a child's style under a parent style already computed, and its font size in pixels
+    pub(crate) fn child_style(
+        &self,
+        document: &Document,
+        node: NodeId,
+        parent: &Style,
+        parent_font_size: f32,
+        state: &StyleState,
+    ) -> (Style, f32) {
+        let style = self.style_for(StyleContext {
+            document,
+            node,
+            pseudo: None,
+            parent_font_size,
+            parent_color: parent.color,
+            parent_weight: parent.font_weight,
+            parent_text: inherited_text(parent),
+            state,
+        });
+        let font_size = style
+            .font_size
+            .resolve(parent_font_size, parent_font_size)
+            .unwrap_or(parent_font_size)
+            .max(1.0);
+        (style, font_size)
     }
 
     // declared values after custom property substitution, from one cascade
@@ -2767,6 +2823,18 @@ impl Stylesheet {
                 values.entry(property).or_insert(value);
             }
         }
+        // svg presentation attributes beat the user agent's rules and lose to every author rule
+        if element.namespace == Namespace::Svg && pseudo.is_none() {
+            let author = Specificity(1 << LAYER_SHIFT, 0, 0);
+            for (property, value) in presentation_hints(element) {
+                if values
+                    .get(property)
+                    .is_none_or(|current| current.0 < author)
+                {
+                    values.insert(Cow::Borrowed(property), (Specificity(0, 0, 0), 0, value));
+                }
+            }
+        }
         let mut inline_dropped = Vec::new();
         if let Some(inline) = element.attr("style").filter(|_| pseudo.is_none())
             && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
@@ -2794,6 +2862,31 @@ impl Stylesheet {
         }
         values
     }
+}
+
+// the attributes of an svg element that style it, with bare numbers on the outer svg's
+// width and height read as pixels
+fn presentation_hints(element: &Element) -> impl Iterator<Item = (&'static str, Cow<'_, str>)> {
+    let sizes = (element.name == "svg")
+        .then_some(["width", "height"])
+        .into_iter()
+        .flatten();
+    crate::svg::PRESENTATION_ATTRIBUTES
+        .iter()
+        .copied()
+        .chain(sizes)
+        .filter_map(move |name| {
+            let value = element.attr(name)?.trim();
+            let pixels = matches!(name, "width" | "height") && value.parse::<f32>().is_ok();
+            Some((
+                name,
+                if pixels {
+                    Cow::Owned(format!("{value}px"))
+                } else {
+                    Cow::Borrowed(value)
+                },
+            ))
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -4642,6 +4735,9 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "word-break" => style.word_break = from.word_break,
         "overflow-wrap" | "word-wrap" => style.overflow_wrap = from.overflow_wrap,
         "direction" => style.rtl = from.rtl,
+        _ if crate::svg::PROPERTIES.contains(&property) => {
+            crate::svg::reset_property(&mut style.svg, &from.svg, property)
+        }
         _ => return false,
     }
     true
@@ -4747,6 +4843,15 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
 // the properties this engine applies, for @supports
 const SUPPORTED_PROPERTIES: &[&str] = &[
     "accent-color",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-opacity",
+    "stroke-width",
     "text-decoration",
     "text-decoration-line",
     "text-decoration-style",
@@ -5833,6 +5938,10 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             } else if let Some(length) = parse_length(value) {
                 style.letter_spacing = length;
             }
+        }
+        property if crate::svg::PROPERTIES.contains(&property) => {
+            let current = CURRENT_COLOR.with(std::cell::Cell::get);
+            crate::svg::apply_property(&mut style.svg, property, value, current);
         }
         _ => {
             crate::border::apply(style, property, value, &parse_color);

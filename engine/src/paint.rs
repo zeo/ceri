@@ -1021,7 +1021,7 @@ fn fades_without_layer(layout_box: &LayoutBox) -> bool {
             + usize::from(layout_box.background.alpha > 0)
             + layout_box.backgrounds.len()
             <= 1
-        && !matches!(layout_box.tag.as_str(), "img" | "canvas")
+        && !matches!(layout_box.tag.as_str(), "img" | "canvas" | "svg")
         && layout_box.overflow == Overflow::Visible
 }
 
@@ -2384,7 +2384,73 @@ fn paint_box_surface(
             },
         );
     }
+    if let Some(scene) = &layout_box.svg {
+        paint_svg(canvas, scene, rect, surface, content_clip, opacity);
+    }
     content_clip
+}
+
+// rasterizes the scene at device resolution over the part of its viewport that shows, then
+// draws that pixel for pixel
+fn paint_svg(
+    canvas: &mut Canvas,
+    scene: &crate::svg::Scene,
+    rect: Rect,
+    area: Shape,
+    clip: Option<Rect>,
+    opacity: f32,
+) {
+    let (x, y, width, height) = scene.viewport;
+    let viewport = Rect {
+        x: rect.x + x,
+        y: rect.y + y,
+        width,
+        height,
+    };
+    let Some(bounds) = intersect_clip(clip, viewport) else {
+        return;
+    };
+    let (scale, shift) = (canvas.scale, canvas.shift);
+    let left = ((bounds.x - shift.0) * scale).floor().max(0.0);
+    let top = ((bounds.y - shift.1) * scale).floor().max(0.0);
+    let right = ((bounds.x + bounds.width - shift.0) * scale)
+        .ceil()
+        .min(canvas.width as f32);
+    let bottom = ((bounds.y + bounds.height - shift.1) * scale)
+        .ceil()
+        .min(canvas.height as f32);
+    if right <= left || bottom <= top {
+        return;
+    }
+    let mut image = Image::new((right - left) as u32, (bottom - top) as u32);
+    crate::svg::rasterize(
+        scene,
+        &mut image,
+        [
+            scale,
+            0.0,
+            0.0,
+            scale,
+            (rect.x - shift.0) * scale - left,
+            (rect.y - shift.1) * scale - top,
+        ],
+    );
+    paint_image(
+        canvas,
+        ImageDraw {
+            image: &image,
+            placement: Rect {
+                x: left / scale + shift.0,
+                y: top / scale + shift.1,
+                width: (right - left) / scale,
+                height: (bottom - top) / scale,
+            },
+            area,
+            clip,
+            opacity,
+            repeat: (false, false),
+        },
+    );
 }
 
 // the color lies under every image layer, the last layer lowest and the first on top; images
@@ -3761,6 +3827,7 @@ mod tests {
                     height: 24.0,
                 },
                 scroll_offset: (0.0, 0.0),
+                svg: None,
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -4216,6 +4283,7 @@ mod tests {
                     height: 10.0,
                 },
                 scroll_offset: (0.0, 0.0),
+                svg: None,
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -4350,6 +4418,7 @@ mod tests {
                     height: 28.0,
                 },
                 scroll_offset: (0.0, 0.0),
+                svg: None,
                 margin: Default::default(),
             },
             images: Vec::new(),
@@ -4453,6 +4522,7 @@ mod tests {
                             height: 10.0,
                         },
                         scroll_offset: (0.0, 0.0),
+                        svg: None,
                         margin: Default::default(),
                     },
                     LayoutBox {
@@ -4504,6 +4574,7 @@ mod tests {
                             height: 10.0,
                         },
                         scroll_offset: (0.0, 0.0),
+                        svg: None,
                         margin: Default::default(),
                     },
                 ],
@@ -4529,6 +4600,7 @@ mod tests {
                     height: 20.0,
                 },
                 scroll_offset: (0.0, 0.0),
+                svg: None,
                 margin: Default::default(),
             },
             images: Vec::new(),

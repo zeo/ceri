@@ -7618,6 +7618,34 @@ A</div>
         );
     }
 
+    #[test]
+    fn inline_svgs_size_from_attributes_and_view_boxes_and_take_css_paint() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>.styled path { fill: #0000ff }</style><div style="width: 200px"><svg width="24" height="24" viewBox="0 0 12 12" style="display: block; color: #ff0000"><path d="M0 0H12V12H0Z" fill="currentColor"/></svg><svg class="styled" width="24" height="24" style="display: block"><path d="M0 0h24v24h-24z" fill="#00ff00"/></svg><svg viewBox="0 0 4 2" style="display: block"></svg><svg style="display: block"></svg></div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("svg page should load");
+        let viewport = Size {
+            width: 320.0,
+            height: 360.0,
+        };
+        let layout = browser.layout(viewport).expect("svg layout should build");
+        let block = find_box(&layout.root, "div").expect("div");
+        let sizes: Vec<_> = block
+            .children
+            .iter()
+            .map(|child| (child.rect.width, child.rect.height))
+            .collect();
+        assert_eq!(
+            sizes,
+            [(24.0, 24.0), (24.0, 24.0), (200.0, 100.0), (300.0, 150.0)]
+        );
+        let canvas = browser.paint(viewport).expect("svg page should paint");
+        assert_eq!(pixel_at(&canvas, 12, 12), [255, 0, 0, 255]);
+        assert_eq!(pixel_at(&canvas, 12, 36), [0, 0, 255, 255]);
+    }
+
     fn image_bundle(source: &str) -> ResourceBundle {
         let mut resources = bundle(source);
         for name in ["rgb8.png", "rgba8.png", "baseline-420.jpg", "frame.gif"] {

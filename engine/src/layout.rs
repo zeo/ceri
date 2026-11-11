@@ -3,12 +3,12 @@ use crate::border::{BorderSide, BorderStyle, CornerLengths};
 use crate::css::{
     AlignContent, AlignItems, Color, Display, Edges, FontWeight, InheritedText, JustifyContent,
     Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState, Stylesheet,
-    TextAlign,
+    TextAlign, inherited_text,
 };
 use crate::css::{
     Clear, Cursor, Float, ListStyleType, OverflowWrap, SpaceCollapse, VerticalAlign, Visibility,
 };
-use crate::dom::{Document, Element, NodeId, NodeKind};
+use crate::dom::{Document, Element, Namespace, NodeId, NodeKind};
 use crate::font::{FontStack, FontStyle};
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
 use crate::image::Image;
@@ -163,6 +163,8 @@ pub struct LayoutBox {
     pub(crate) selection_color: Option<Color>,
     pub(crate) scroll_content: Size,
     pub(crate) scroll_offset: (f32, f32),
+    // the shapes an outer svg element draws in its content box
+    pub(crate) svg: Option<Rc<crate::svg::Scene>>,
     pub(crate) margin: ResolvedEdges,
 }
 
@@ -609,6 +611,16 @@ impl<'a> Subject<'a> {
         }
     }
 
+    // an outer svg element is replaced content, drawn from its subtree instead of laid out
+    fn svg_root(self) -> Option<&'a Element> {
+        self.element()
+            .filter(|element| element.namespace == Namespace::Svg && element.name == "svg")
+    }
+
+    fn replaced(self) -> bool {
+        self.name() == "img" || self.svg_root().is_some()
+    }
+
     // the node whose own state, such as a control value or focus, belongs to the box
     fn own(self) -> Option<NodeId> {
         self.generated.is_none().then_some(self.node)
@@ -653,6 +665,9 @@ impl<'a> Subject<'a> {
             if !content.is_empty() {
                 items.push(Child::Text(None, content));
             }
+            return items;
+        }
+        if self.svg_root().is_some() {
             return items;
         }
         let generated_box = |pseudo: PseudoElement, content: &'a Option<String>| {
@@ -708,35 +723,6 @@ fn resolve_shadows(
             inset: shadow.inset,
         })
         .collect()
-}
-
-fn inherited_text(style: &Style) -> InheritedText {
-    InheritedText {
-        transform: style.text_transform,
-        letter_spacing: style.letter_spacing,
-        family: style.font_family,
-        visibility: style.visibility,
-        cursor: style.cursor,
-        pointer_events: style.pointer_events,
-        selectable: style.selectable,
-        list_style_type: style.list_style_type,
-        list_inside: style.list_inside,
-        border_collapse: style.border_collapse,
-        border_spacing: style.border_spacing,
-        caption_bottom: style.caption_bottom,
-        accent_color: style.accent_color,
-        text_align: style.text_align,
-        line_height: style.line_height,
-        space_collapse: style.space_collapse,
-        wrap: style.wrap,
-        word_break: style.word_break,
-        overflow_wrap: style.overflow_wrap,
-        rtl: style.rtl,
-        italic: style.italic,
-        font_variations: style.font_variations,
-        optical_sizing: style.optical_sizing,
-        decoration: style.text_decoration,
-    }
 }
 
 // a hidden box's own text paints nothing, while its visible descendants still show
@@ -984,6 +970,7 @@ pub fn layout_with_state(
             height: viewport.height,
         },
         scroll_offset: (0.0, 0.0),
+        svg: None,
         margin: ResolvedEdges::default(),
     };
     root.children = layout_document_children(document, stylesheet, viewport, style_state);
@@ -2868,6 +2855,24 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             (font_size, line_height),
         ));
     }
+    let svg = node.svg_root().map(|_| {
+        let style_of = |child, parent: &Style, parent_font_size| {
+            stylesheet.child_style(node.document, child, parent, parent_font_size, style_state)
+        };
+        let viewport = (
+            border.left + padding.left,
+            border.top + padding.top,
+            content_width,
+            content_height,
+        );
+        Rc::new(crate::svg::build(
+            node.document,
+            node.node,
+            (&style, font_size),
+            viewport,
+            &style_of,
+        ))
+    });
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -2916,6 +2921,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         inline: false,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
+        svg,
         margin,
     };
     // a checked box fills with the accent color, and a checked radio rings with it, unless
@@ -3089,6 +3095,7 @@ fn anonymous_box(
         selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
+        svg: None,
         margin: ResolvedEdges::default(),
     }
 }
@@ -4041,6 +4048,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
+        svg: None,
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -4521,6 +4529,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
+        svg: None,
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -5242,6 +5251,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         selection_color: None,
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
+        svg: None,
         margin,
     };
     if mode != LayoutMode::Flow {
@@ -6725,7 +6735,7 @@ fn append_inline_element(
     if matches!(
         style.display,
         Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable
-    ) || node.name() == "img"
+    ) || node.replaced()
     {
         append_atomic(input, &style, text, line);
         return;
@@ -7357,7 +7367,7 @@ fn append_atomic(
     }
     // a replaced box, a box that clips or one with no line of text sits on its bottom margin
     // edge; inline-block takes its last line, the other inline boxes their first
-    let baseline = (!style.overflow.clips() && node.name() != "img")
+    let baseline = (!style.overflow.clips() && !node.replaced())
         .then(|| {
             if style.display == Display::InlineBlock {
                 last_baseline(&laid_out)

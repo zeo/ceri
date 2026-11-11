@@ -29,6 +29,7 @@ mod presenter;
 mod script;
 mod selection;
 mod shaping;
+mod svg;
 mod text;
 mod text_tables;
 mod transform;
