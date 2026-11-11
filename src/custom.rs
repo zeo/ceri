@@ -329,7 +329,7 @@ fn run_app(
     bridge: Bridge,
     identifier: &str,
     windows: Vec<WindowConfig>,
-    lifecycle: Lifecycle,
+    mut lifecycle: Lifecycle,
     handle: AppHandle,
     tray: Option<TrayRequest>,
     single_instance: Option<LaunchRequest>,
@@ -357,19 +357,16 @@ fn run_app(
         }],
         false => windows,
     };
-    let windows: Vec<_> = windows
-        .into_iter()
-        .map(|config| WindowConfig {
-            start_url: app_url(&config.start_url),
-            icon: config.icon.clone().or_else(|| icon.clone()),
-            ..config
-        })
-        .collect();
+    let prepare = move |config: WindowConfig| WindowConfig {
+        start_url: app_url(&config.start_url),
+        icon: config.icon.or_else(|| icon.clone()),
+        ..config
+    };
     if let Some(path) = launch::switch_value(arguments.clone(), SCREENSHOT_SWITCH) {
-        let config = windows.first().cloned().unwrap_or_else(|| WindowConfig {
+        let config = prepare(windows.first().cloned().unwrap_or_else(|| WindowConfig {
             start_url: launch.initial_url.clone(),
             ..WindowConfig::default()
-        });
+        }));
         // the engine needs a worker's stack, more than the main thread has on windows
         return std::thread::Builder::new()
             .name("ceri-engine".to_string())
@@ -412,6 +409,7 @@ fn run_app(
         );
         let _ = handle.tray.set(tray);
     }
+    lifecycle.prepare = Some(Box::new(prepare));
     let tray = handle.tray.clone();
     let result = run_window_with(
         windows,

@@ -415,6 +415,8 @@ pub struct Lifecycle {
     pub closed: Option<ClosedHook>,
     // after the last window has gone, before run returns
     pub exiting: Option<Box<dyn FnOnce()>>,
+    // fills in what a window's config leaves to the app, for launch windows and later ones alike
+    pub prepare: Option<Box<dyn Fn(WindowConfig) -> WindowConfig>>,
 }
 
 // runs windows until the last one closes; the factory builds each window's browser on that
@@ -504,6 +506,10 @@ where
     F: Fn(&WindowContext) -> Result<Browser, String> + Send + Clone + 'static,
 {
     fn open(&mut self, event_loop: &ActiveEventLoop, config: WindowConfig) {
+        let config = match &self.lifecycle.prepare {
+            Some(prepare) => prepare(config),
+            None => config,
+        };
         if let Some(open) = self
             .windows
             .values_mut()
