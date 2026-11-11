@@ -2379,7 +2379,7 @@ impl Browser {
             layout.images.push(ImageLayer {
                 node,
                 image,
-                background: background.is_some(),
+                background,
             });
         }
     }
@@ -2893,8 +2893,10 @@ fn collect_image_sources(
     layout: &crate::layout::LayoutBox,
     sources: &mut Vec<(NodeId, Option<crate::image::ImageSource>)>,
 ) {
-    if let Some(background) = layout.background_image {
-        sources.push((layout.node, Some(background.source)));
+    for layer in &layout.backgrounds {
+        if let crate::css::LayerImage::Url(source) = layer.image {
+            sources.push((layout.node, Some(source)));
+        }
     }
     if layout.tag == "img" {
         sources.push((layout.node, None));

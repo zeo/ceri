@@ -1,9 +1,9 @@
 use crate::bidi::{BidiClass, bidi_class, mirrored, resolve_levels, visual_order};
 use crate::border::{BorderSide, BorderStyle, CornerLengths};
 use crate::css::{
-    AlignContent, AlignItems, Color, Display, Edges, FontWeight, Gradient, InheritedText,
-    JustifyContent, Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
-    Stylesheet, TextAlign,
+    AlignContent, AlignItems, Color, Display, Edges, FontWeight, InheritedText, JustifyContent,
+    Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState, Stylesheet,
+    TextAlign,
 };
 use crate::css::{
     Clear, Cursor, Float, ListStyleType, OverflowWrap, SpaceCollapse, VerticalAlign, Visibility,
@@ -116,8 +116,8 @@ pub struct LayoutBox {
     pub tag: String,
     pub rect: Rect,
     pub background: Color,
-    pub gradient: Option<Gradient>,
-    pub(crate) background_image: Option<crate::css::BackgroundImage>,
+    // first layer on top
+    pub(crate) backgrounds: Vec<crate::css::BackgroundLayer>,
     pub(crate) object_fit: crate::css::ObjectFit,
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<crate::transform::Matrix>,
@@ -177,8 +177,8 @@ pub struct LayoutDocument {
 pub(crate) struct ImageLayer {
     pub(crate) node: NodeId,
     pub(crate) image: std::rc::Rc<Image>,
-    // a CSS background rather than the element's own content
-    pub(crate) background: bool,
+    // the CSS background url this decodes, rather than the element's own content
+    pub(crate) background: Option<crate::image::ImageSource>,
 }
 
 // corner radii as horizontal and vertical extents, from the top-left corner clockwise
@@ -903,8 +903,7 @@ pub fn layout_with_state(
             height: viewport.height,
         },
         background: Color::transparent(),
-        gradient: None,
-        background_image: None,
+        backgrounds: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
@@ -2805,8 +2804,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         tag: name.to_string(),
         rect,
         background: style.background,
-        gradient: style.gradient,
-        background_image: style.background_layer(),
+        backgrounds: style.layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -2985,8 +2983,7 @@ fn anonymous_box(
         tag: "::text".to_string(),
         rect,
         background: Color::transparent(),
-        gradient: None,
-        background_image: None,
+        backgrounds: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
         transform: None,
         backface_hidden: false,
@@ -3896,8 +3893,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         tag: node.name().to_string(),
         rect,
         background: style.background,
-        gradient: style.gradient,
-        background_image: style.background_layer(),
+        backgrounds: style.layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -4375,8 +4371,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         tag: node.name().to_string(),
         rect,
         background: style.background,
-        gradient: style.gradient,
-        background_image: style.background_layer(),
+        backgrounds: style.layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -5000,7 +4995,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         );
         section.tag = subject.name().to_string();
         section.background = section_style.background;
-        section.gradient = section_style.gradient;
+        section.backgrounds = section_style.layers();
         section.visible = section_style.visibility == Visibility::Visible;
         section.pointer_events = section_style.pointer_events;
         section.selectable = section_style.selectable;
@@ -5095,8 +5090,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         tag: node.name().to_string(),
         rect,
         background: style.background,
-        gradient: style.gradient,
-        background_image: style.background_layer(),
+        backgrounds: style.layers(),
         object_fit: style.object_fit,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -7307,7 +7301,7 @@ fn inline_fragment_box(
     fragment.pointer_events = style.pointer_events;
     fragment.selectable = style.selectable;
     fragment.background = style.background;
-    fragment.gradient = style.gradient;
+    fragment.backgrounds = style.layers();
     fragment.border = BoxBorder {
         widths: border,
         ..BoxBorder::of(style)

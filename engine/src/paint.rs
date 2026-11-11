@@ -1,5 +1,8 @@
 use crate::border::BorderStyle;
-use crate::css::{BackgroundImage, BackgroundSize, Color, Gradient, ObjectFit, Overflow};
+use crate::css::{
+    BackgroundLayer, BackgroundSize, Color, Gradient, GradientKind, GradientStop, LayerImage,
+    ObjectFit, Overflow, Radial, RadialSize,
+};
 use crate::dom::NodeId;
 use crate::image::Image;
 use crate::layout::{
@@ -384,7 +387,7 @@ impl Canvas {
                 if coverage <= 0.0 {
                     continue;
                 }
-                let color = paint.color_at(center, device);
+                let color = paint.color_at(center);
                 if color.alpha == 0 {
                     continue;
                 }
@@ -955,9 +958,10 @@ fn fades_without_layer(layout_box: &LayoutBox) -> bool {
     layout_box.children.is_empty()
         && layout_box.text.is_empty()
         && layout_box.shadows.is_empty()
-        && (layout_box.border.is_none()
-            || (layout_box.background.alpha == 0 && layout_box.gradient.is_none()))
-        && layout_box.background_image.is_none()
+        && usize::from(!layout_box.border.is_none())
+            + usize::from(layout_box.background.alpha > 0)
+            + layout_box.backgrounds.len()
+            <= 1
         && !matches!(layout_box.tag.as_str(), "img" | "canvas")
         && layout_box.overflow == Overflow::Visible
 }
@@ -1141,28 +1145,262 @@ impl Shape {
 
 enum Paint {
     Solid(Color),
-    Gradient(Gradient),
+    Ramp(Ramp),
 }
 
 impl Paint {
-    fn color_at(&self, point: (f32, f32), shape: Shape) -> Color {
+    fn color_at(&self, point: (f32, f32)) -> Color {
         match self {
             Self::Solid(color) => *color,
-            Self::Gradient(gradient) => {
-                let angle = gradient.angle.to_radians();
-                let axis = (angle.sin(), -angle.cos());
-                let center = (shape.x + shape.width / 2.0, shape.y + shape.height / 2.0);
-                let extent = (shape.width * axis.0).abs() + (shape.height * axis.1).abs();
-                let along = (point.0 - center.0) * axis.0 + (point.1 - center.1) * axis.1;
-                let progress = if extent > 0.0 {
-                    along / extent + 0.5
-                } else {
-                    0.0
-                };
-                gradient.color_at(progress)
-            }
+            Self::Ramp(ramp) => ramp.color_at(point),
         }
     }
+}
+
+// a gradient laid out over its tile, in layout pixels from the tile's corner; stops are
+// offsets along the gradient line or ray with premultiplied colors, as gradients blend
+struct Ramp {
+    corner: (f32, f32),
+    scale: f32,
+    size: (f32, f32),
+    repeat: (bool, bool),
+    shape: RampShape,
+    repeating: bool,
+    stops: Vec<(f32, [f32; 4])>,
+}
+
+enum RampShape {
+    // the start of the line, and its direction over its length
+    Linear((f32, f32), (f32, f32)),
+    // the center and the radii of the ending shape
+    Radial((f32, f32), (f32, f32)),
+}
+
+impl Ramp {
+    fn new(
+        canvas: &Canvas,
+        gradient: &Gradient,
+        tile: Rect,
+        repeat: (bool, bool),
+        font_size: f32,
+        opacity: f32,
+    ) -> Option<Self> {
+        let (width, height) = (tile.width, tile.height);
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let (shape, length) = match gradient.kind {
+            GradientKind::Linear(degrees) => linear_ramp(degrees.to_radians(), width, height),
+            GradientKind::Corner(x, y) => {
+                linear_ramp((x * height).atan2(-y * width), width, height)
+            }
+            GradientKind::Radial(ref radial) => {
+                let Radial {
+                    circle,
+                    size,
+                    center,
+                } = **radial;
+                let center = (
+                    center.0.resolve(width, font_size).unwrap_or(width / 2.0),
+                    center.1.resolve(height, font_size).unwrap_or(height / 2.0),
+                );
+                let radii = radial_radii(circle, size, center, (width, height), font_size);
+                let radii = (radii.0.max(0.001), radii.1.max(0.001));
+                (RampShape::Radial(center, radii), radii.0)
+            }
+        };
+        let mut stops = ramp_stops(&gradient.stops, length, font_size, opacity);
+        let (first, last) = (stops[0].0, stops[stops.len() - 1].0);
+        let mut repeating = gradient.repeating;
+        // a repeat too short to draw paints the average of its stops spread evenly
+        if repeating && last - first < 1.0 / (length * canvas.scale).max(1.0) {
+            let segments = (stops.len() - 1) as f32;
+            let mut average = [0.0; 4];
+            for pair in stops.windows(2) {
+                for (channel, sum) in average.iter_mut().enumerate() {
+                    *sum += (pair[0].1[channel] + pair[1].1[channel]) / 2.0 / segments;
+                }
+            }
+            stops = vec![(0.0, average)];
+            repeating = false;
+        }
+        let device = canvas.device_shape(Shape::square(tile));
+        Some(Self {
+            corner: (device.x, device.y),
+            scale: canvas.scale,
+            size: (width, height),
+            repeat,
+            shape,
+            repeating,
+            stops,
+        })
+    }
+
+    fn color_at(&self, point: (f32, f32)) -> Color {
+        let mut x = (point.0 - self.corner.0) / self.scale;
+        let mut y = (point.1 - self.corner.1) / self.scale;
+        if self.repeat.0 {
+            x = x.rem_euclid(self.size.0);
+        } else if !(0.0..self.size.0).contains(&x) {
+            return Color::transparent();
+        }
+        if self.repeat.1 {
+            y = y.rem_euclid(self.size.1);
+        } else if !(0.0..self.size.1).contains(&y) {
+            return Color::transparent();
+        }
+        let offset = match self.shape {
+            RampShape::Linear(start, axis) => (x - start.0) * axis.0 + (y - start.1) * axis.1,
+            RampShape::Radial(center, radii) => {
+                ((x - center.0) / radii.0).hypot((y - center.1) / radii.1)
+            }
+        };
+        self.sample(offset)
+    }
+
+    fn sample(&self, offset: f32) -> Color {
+        let stops = &self.stops;
+        let (first, last) = (stops[0].0, stops[stops.len() - 1].0);
+        let offset = if self.repeating {
+            first + (offset - first).rem_euclid(last - first)
+        } else {
+            offset
+        };
+        let next = stops.partition_point(|stop| stop.0 <= offset);
+        let color = match (
+            next.checked_sub(1).map(|index| stops[index]),
+            stops.get(next).copied(),
+        ) {
+            (Some(before), Some(after)) => {
+                let ratio = (offset - before.0) / (after.0 - before.0);
+                std::array::from_fn(|channel| {
+                    before.1[channel] + (after.1[channel] - before.1[channel]) * ratio
+                })
+            }
+            (Some(stop), None) | (None, Some(stop)) => stop.1,
+            (None, None) => return Color::transparent(),
+        };
+        let alpha = color[3];
+        if alpha <= 0.0 {
+            return Color::transparent();
+        }
+        let channel = |value: f32| (value / alpha).round().clamp(0.0, 255.0) as u8;
+        Color {
+            red: channel(color[0]),
+            green: channel(color[1]),
+            blue: channel(color[2]),
+            alpha: (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+        }
+    }
+}
+
+// the line through the tile's center whose ends meet the corners, and its length
+fn linear_ramp(angle: f32, width: f32, height: f32) -> (RampShape, f32) {
+    let direction = (angle.sin(), -angle.cos());
+    let length = (width * direction.0).abs() + (height * direction.1).abs();
+    let start = (
+        width / 2.0 - direction.0 * length / 2.0,
+        height / 2.0 - direction.1 * length / 2.0,
+    );
+    let axis = if length > 0.0 {
+        (direction.0 / length, direction.1 / length)
+    } else {
+        (0.0, 0.0)
+    };
+    (RampShape::Linear(start, axis), length)
+}
+
+// an ellipse sized to corners keeps the shape it has at the matching sides, scaled by root two
+fn radial_radii(
+    circle: bool,
+    size: RadialSize,
+    center: (f32, f32),
+    (width, height): (f32, f32),
+    font_size: f32,
+) -> (f32, f32) {
+    let horizontal = (center.0.abs(), (width - center.0).abs());
+    let vertical = (center.1.abs(), (height - center.1).abs());
+    let closest = (horizontal.0.min(horizontal.1), vertical.0.min(vertical.1));
+    let farthest = (horizontal.0.max(horizontal.1), vertical.0.max(vertical.1));
+    let both = |radius: f32| (radius, radius);
+    match (size, circle) {
+        (RadialSize::Explicit(horizontal, vertical), _) => (
+            horizontal.resolve(width, font_size).unwrap_or(0.0),
+            vertical.resolve(height, font_size).unwrap_or(0.0),
+        ),
+        (RadialSize::ClosestSide, true) => both(closest.0.min(closest.1)),
+        (RadialSize::FarthestSide, true) => both(farthest.0.max(farthest.1)),
+        (RadialSize::ClosestCorner, true) => both(closest.0.hypot(closest.1)),
+        (RadialSize::FarthestCorner, true) => both(farthest.0.hypot(farthest.1)),
+        (RadialSize::ClosestSide, false) => closest,
+        (RadialSize::FarthestSide, false) => farthest,
+        (RadialSize::ClosestCorner, false) => (
+            closest.0 * std::f32::consts::SQRT_2,
+            closest.1 * std::f32::consts::SQRT_2,
+        ),
+        (RadialSize::FarthestCorner, false) => (
+            farthest.0 * std::f32::consts::SQRT_2,
+            farthest.1 * std::f32::consts::SQRT_2,
+        ),
+    }
+}
+
+// stop offsets as fractions of the line: the ends default to its ends, a stop never sits
+// before an earlier one, and stops without a position spread evenly between their neighbors
+fn ramp_stops(
+    stops: &[GradientStop],
+    length: f32,
+    font_size: f32,
+    opacity: f32,
+) -> Vec<(f32, [f32; 4])> {
+    let mut offsets: Vec<Option<f32>> = stops
+        .iter()
+        .map(|stop| {
+            let position = stop.position?.resolve(length, font_size)?;
+            Some(if length > 0.0 { position / length } else { 0.0 })
+        })
+        .collect();
+    let last = offsets.len() - 1;
+    offsets[0].get_or_insert(0.0);
+    offsets[last].get_or_insert(1.0);
+    let mut floor = f32::MIN;
+    for offset in offsets.iter_mut().flatten() {
+        *offset = offset.max(floor);
+        floor = *offset;
+    }
+    let mut index = 1;
+    while index < last {
+        if offsets[index].is_none() {
+            let end = (index..=last)
+                .find(|&next| offsets[next].is_some())
+                .unwrap_or(last);
+            let from = offsets[index - 1].unwrap_or(0.0);
+            let to = offsets[end].unwrap_or(1.0);
+            let gaps = (end - index + 1) as f32;
+            for (step, offset) in offsets[index..end].iter_mut().enumerate() {
+                *offset = Some(from + (to - from) * (step + 1) as f32 / gaps);
+            }
+            index = end;
+        }
+        index += 1;
+    }
+    stops
+        .iter()
+        .zip(offsets)
+        .map(|(stop, offset)| {
+            let color = stop.color;
+            let alpha = f32::from(color.alpha) / 255.0 * opacity.clamp(0.0, 1.0);
+            (
+                offset.unwrap_or(0.0),
+                [
+                    f32::from(color.red) * alpha,
+                    f32::from(color.green) * alpha,
+                    f32::from(color.blue) * alpha,
+                    alpha,
+                ],
+            )
+        })
+        .collect()
 }
 
 struct ShadowFill {
@@ -1604,7 +1842,8 @@ pub(crate) fn paint_with_commands(
         scale,
         Color::opaque(245, 248, 250),
     );
-    // the root background paints the whole canvas, as CSS backgrounds require
+    // the root background paints the whole canvas, as CSS backgrounds require; its images
+    // stay with the root box
     if let Some(root) = canvas_background(&document.root) {
         let viewport = Shape::square(Rect {
             x: 0.0,
@@ -1612,7 +1851,15 @@ pub(crate) fn paint_with_commands(
             width: document.viewport.width,
             height: document.viewport.height,
         });
-        canvas.fill_shape(viewport, &root, None);
+        paint_backgrounds(
+            &mut canvas,
+            root,
+            &[],
+            viewport,
+            viewport,
+            root.opacity,
+            None,
+        );
     }
     paint_box(
         &mut canvas,
@@ -1626,16 +1873,12 @@ pub(crate) fn paint_with_commands(
     canvas
 }
 
-fn canvas_background(root: &LayoutBox) -> Option<Paint> {
+fn canvas_background(root: &LayoutBox) -> Option<&LayoutBox> {
     let mut candidates = Vec::new();
     collect_root_boxes(root, 0, &mut candidates);
-    candidates.into_iter().find_map(|layout_box| {
-        if let Some(gradient) = layout_box.gradient {
-            return Some(Paint::Gradient(gradient.scale_alpha(layout_box.opacity)));
-        }
-        (layout_box.background.alpha > 0)
-            .then(|| Paint::Solid(layout_box.background.scale_alpha(layout_box.opacity)))
-    })
+    candidates
+        .into_iter()
+        .find(|layout_box| layout_box.background.alpha > 0 || !layout_box.backgrounds.is_empty())
 }
 
 fn collect_root_boxes<'a>(
@@ -2021,15 +2264,7 @@ fn paint_box_surface(
     {
         paint_shadow(canvas, shadow, outer, surface, opacity, clip);
     }
-    if let Some(gradient) = layout_box.gradient {
-        canvas.fill_shape(outer, &Paint::Gradient(gradient.scale_alpha(opacity)), clip);
-    } else if layout_box.background.alpha > 0 {
-        canvas.fill_shape(
-            outer,
-            &Paint::Solid(layout_box.background.scale_alpha(opacity)),
-            clip,
-        );
-    }
+    paint_backgrounds(canvas, layout_box, images, outer, surface, opacity, clip);
     paint_border(canvas, outer, surface, &layout_box.border, opacity, clip);
     if let Some(control) = layout_box.control {
         let inner = Rect {
@@ -2039,34 +2274,6 @@ fn paint_box_surface(
             height: surface.height,
         };
         paint_control(canvas, control, inner, opacity, clip);
-    }
-    if let Some(background) = layout_box.background_image.as_ref()
-        && let Some(layer) = images
-            .iter()
-            .find(|layer| layer.background && layer.node == layout_box.node)
-    {
-        let area = Rect {
-            x: surface.x,
-            y: surface.y,
-            width: surface.width,
-            height: surface.height,
-        };
-        paint_image(
-            canvas,
-            ImageDraw {
-                image: &layer.image,
-                placement: background_placement(
-                    area,
-                    &layer.image,
-                    background,
-                    layout_box.font_size,
-                ),
-                area: surface,
-                clip,
-                opacity,
-                repeat: (background.repeat.x, background.repeat.y),
-            },
-        );
     }
     for shadow in layout_box
         .shadows
@@ -2079,7 +2286,7 @@ fn paint_box_surface(
     if layout_box.tag == "img"
         && let Some(layer) = images
             .iter()
-            .find(|layer| !layer.background && layer.node == layout_box.node)
+            .find(|layer| layer.background.is_none() && layer.node == layout_box.node)
     {
         let content = Rect {
             x: surface.x,
@@ -2100,6 +2307,60 @@ fn paint_box_surface(
         );
     }
     content_clip
+}
+
+// the color lies under every image layer, the last layer lowest and the first on top; images
+// take their place from the padding box and paint across the border box
+fn paint_backgrounds(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    outer: Shape,
+    surface: Shape,
+    opacity: f32,
+    clip: Option<Rect>,
+) {
+    if layout_box.background.alpha > 0 {
+        let color = layout_box.background.scale_alpha(opacity);
+        canvas.fill_shape(outer, &Paint::Solid(color), clip);
+    }
+    let area = Rect {
+        x: surface.x,
+        y: surface.y,
+        width: surface.width,
+        height: surface.height,
+    };
+    let font_size = layout_box.font_size;
+    for layer in layout_box.backgrounds.iter().rev() {
+        let repeat = (layer.repeat.x, layer.repeat.y);
+        match &layer.image {
+            LayerImage::Gradient(gradient) => {
+                let tile = background_placement(area, None, layer, font_size);
+                if let Some(ramp) = Ramp::new(canvas, gradient, tile, repeat, font_size, opacity) {
+                    canvas.fill_shape(outer, &Paint::Ramp(ramp), clip);
+                }
+            }
+            LayerImage::Url(source) => {
+                let Some(found) = images.iter().find(|image| {
+                    image.background == Some(*source) && image.node == layout_box.node
+                }) else {
+                    continue;
+                };
+                let natural = (found.image.width as f32, found.image.height as f32);
+                paint_image(
+                    canvas,
+                    ImageDraw {
+                        image: &found.image,
+                        placement: background_placement(area, Some(natural), layer, font_size),
+                        area: surface,
+                        clip,
+                        opacity,
+                        repeat,
+                    },
+                );
+            }
+        }
+    }
 }
 
 // inline element backgrounds and borders sit under the text of their block
@@ -2737,13 +2998,14 @@ fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
 }
 
 // the first tile of a background image inside its positioning area
+// an image without a natural size, as a gradient, fills the area along any auto side
 fn background_placement(
     area: Rect,
-    image: &Image,
-    background: &BackgroundImage,
+    natural: Option<(f32, f32)>,
+    background: &BackgroundLayer,
     font_size: f32,
 ) -> Rect {
-    let (natural_width, natural_height) = (image.width as f32, image.height as f32);
+    let (natural_width, natural_height) = natural.unwrap_or((area.width, area.height));
     let (width, height) = match background.size {
         BackgroundSize::Auto => (natural_width, natural_height),
         BackgroundSize::Cover | BackgroundSize::Contain => {
@@ -2759,11 +3021,13 @@ fn background_placement(
         BackgroundSize::Explicit(width, height) => {
             let width = width.resolve(area.width, font_size);
             let height = height.resolve(area.height, font_size);
-            match (width, height) {
-                (Some(width), Some(height)) => (width, height),
-                (Some(width), None) => (width, width * natural_height / natural_width),
-                (None, Some(height)) => (height * natural_width / natural_height, height),
-                (None, None) => (natural_width, natural_height),
+            match (width, height, natural) {
+                (Some(width), Some(height), _) => (width, height),
+                (Some(width), None, Some(_)) => (width, width * natural_height / natural_width),
+                (None, Some(height), Some(_)) => (height * natural_width / natural_height, height),
+                (Some(width), None, None) => (width, area.height),
+                (None, Some(height), None) => (area.width, height),
+                (None, None, _) => (natural_width, natural_height),
             }
         }
     };
@@ -3271,8 +3535,7 @@ mod tests {
                     height: 24.0,
                 },
                 background: Color::opaque(245, 248, 250),
-                gradient: None,
-                background_image: None,
+                backgrounds: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -3354,6 +3617,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gradient_layers_tile_repeat_and_blend_premultiplied() {
+        let document = Document::parse_markup(
+            "<html><body><div id='a'></div><div id='b'></div><div id='c'></div></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #ffffff } div { width: 40px; height: 40px }",
+            "#a { background: linear-gradient(#ff0000, #ff0000) 10px 0 / 10px 100% no-repeat, linear-gradient(to right, #0000ff, #0000ff) }",
+            "#b { background: repeating-linear-gradient(to right, #000000 0 2px, transparent 2px 4px) }",
+            "#c { background: radial-gradient(circle closest-side, #ff0000, transparent) }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 120.0,
+            },
+        ));
+        let pixel = |x: usize, y: usize| {
+            let index = (y * canvas.width() as usize + x) * 4;
+            <[u8; 3]>::try_from(&canvas.rgba_pixels()[index..index + 3]).expect("a pixel")
+        };
+        assert_eq!(pixel(15, 20), [255, 0, 0], "the first layer lies on top");
+        assert_eq!(
+            pixel(5, 20),
+            [0, 0, 255],
+            "outside its tile the lower layer shows"
+        );
+        assert_eq!(pixel(25, 20), [0, 0, 255]);
+        assert_eq!(pixel(1, 60), [0, 0, 0]);
+        assert_eq!(pixel(3, 60), [255, 255, 255], "a hard stop starts the gap");
+        assert_eq!(pixel(33, 60), [0, 0, 0], "the stripes repeat every 4px");
+        let center = pixel(20, 100);
+        assert!(
+            center[0] == 255 && center[1] < 16,
+            "the center holds the first stop, got {center:?}"
+        );
+        let halfway = pixel(30, 100);
+        assert!(
+            halfway[0] >= 250 && (110..150).contains(&halfway[1]),
+            "a fade to transparent keeps its hue, got {halfway:?}"
+        );
+        assert_eq!(
+            pixel(0, 81),
+            [255, 255, 255],
+            "past the closest side is clear"
+        );
     }
 
     #[test]
@@ -3595,8 +3910,7 @@ mod tests {
                     height: 10.0,
                 },
                 background: Color::opaque(10, 20, 30),
-                gradient: None,
-                background_image: None,
+                backgrounds: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -3711,8 +4025,7 @@ mod tests {
                     height: 28.0,
                 },
                 background: Color::opaque(10, 20, 30),
-                gradient: None,
-                background_image: None,
+                backgrounds: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -3820,8 +4133,7 @@ mod tests {
                     height: 20.0,
                 },
                 background: Color::opaque(245, 248, 250),
-                gradient: None,
-                background_image: None,
+                backgrounds: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
                 transform: None,
                 backface_hidden: false,
@@ -3847,8 +4159,7 @@ mod tests {
                             height: 10.0,
                         },
                         background: Color::transparent(),
-                        gradient: None,
-                        background_image: None,
+                        backgrounds: Vec::new(),
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,
@@ -3898,8 +4209,7 @@ mod tests {
                             height: 10.0,
                         },
                         background: Color::opaque(0, 0, 255),
-                        gradient: None,
-                        background_image: None,
+                        backgrounds: Vec::new(),
                         object_fit: crate::css::ObjectFit::Fill,
                         transform: None,
                         backface_hidden: false,

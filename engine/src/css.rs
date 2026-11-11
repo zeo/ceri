@@ -1116,47 +1116,107 @@ pub(crate) struct StyleContext<'a> {
     pub(crate) state: &'a StyleState,
 }
 
+// a stop without a position is placed between its neighbors once the gradient has a size
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GradientStop {
-    pub color: Color,
-    pub position: f32,
+pub(crate) struct GradientStop {
+    pub(crate) color: Color,
+    pub(crate) position: Option<Length>,
 }
 
-// a bounded linear gradient: an axis angle in degrees plus up to four stops
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Gradient {
-    pub angle: f32,
-    pub stops: [GradientStop; 4],
-    pub count: usize,
+pub(crate) enum RadialSize {
+    ClosestSide,
+    ClosestCorner,
+    FarthestSide,
+    FarthestCorner,
+    // a circle repeats its radius
+    Explicit(Length, Length),
 }
 
-impl Gradient {
-    pub fn scale_alpha(self, factor: f32) -> Self {
-        let mut scaled = self;
-        for stop in scaled.stops.iter_mut() {
-            stop.color = stop.color.scale_alpha(factor);
-        }
-        scaled
-    }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Radial {
+    pub(crate) circle: bool,
+    pub(crate) size: RadialSize,
+    pub(crate) center: (Length, Length),
+}
 
-    pub(crate) fn color_at(&self, progress: f32) -> Color {
-        if self.count == 0 {
-            return Color::transparent();
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GradientKind {
+    // degrees clockwise from up
+    Linear(f32),
+    // toward a corner, as the signs of x and y; the angle follows the box's shape
+    Corner(f32, f32),
+    Radial(Box<Radial>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Gradient {
+    pub(crate) kind: GradientKind,
+    pub(crate) repeating: bool,
+    pub(crate) stops: Vec<GradientStop>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LayerImage {
+    Url(crate::image::ImageSource),
+    Gradient(Gradient),
+}
+
+// the background or mask longhand lists; the others cycle to the length of the image list
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Layers {
+    images: Vec<Option<LayerImage>>,
+    sizes: Vec<BackgroundSize>,
+    positions: Vec<(Length, Length)>,
+    repeats: Vec<BackgroundRepeat>,
+}
+
+// one image layer as paint draws it
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BackgroundLayer {
+    pub(crate) image: LayerImage,
+    pub(crate) size: BackgroundSize,
+    pub(crate) position: (Length, Length),
+    pub(crate) repeat: BackgroundRepeat,
+}
+
+// layer lists kept outside the copyable computed style
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LayerList(u32);
+
+thread_local! {
+    static LAYER_LISTS: RefCell<crate::intern::Table<Layers>> =
+        RefCell::new(crate::intern::Table::new());
+}
+
+impl LayerList {
+    // first layer on top; a layer whose image is none paints nothing
+    pub(crate) fn layers(self) -> Vec<BackgroundLayer> {
+        let Some(layers) = LAYER_LISTS.with(|lists| lists.borrow().get(self.0)) else {
+            return Vec::new();
+        };
+        fn cycled<T: Copy>(list: &[T], index: usize, initial: T) -> T {
+            list.get(index % list.len().max(1))
+                .copied()
+                .unwrap_or(initial)
         }
-        let stops = &self.stops[..self.count];
-        let progress = progress.clamp(0.0, 1.0);
-        if progress <= stops[0].position {
-            return stops[0].color;
-        }
-        for pair in stops.windows(2) {
-            let (start, end) = (pair[0], pair[1]);
-            if progress <= end.position {
-                let span = (end.position - start.position).max(f32::EPSILON);
-                let ratio = ((progress - start.position) / span).clamp(0.0, 1.0);
-                return start.color.mix(end.color, ratio);
-            }
-        }
-        stops[stops.len() - 1].color
+        layers
+            .images
+            .iter()
+            .enumerate()
+            .filter_map(|(index, image)| {
+                Some(BackgroundLayer {
+                    image: image.clone()?,
+                    size: cycled(&layers.sizes, index, BackgroundSize::Auto),
+                    position: cycled(&layers.positions, index, (Length::px(0.0), Length::px(0.0))),
+                    repeat: cycled(
+                        &layers.repeats,
+                        index,
+                        BackgroundRepeat { x: true, y: true },
+                    ),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1284,15 +1344,11 @@ pub(crate) struct Style {
     pub translate: (Length, Length),
     pub border_radius: CornerLengths,
     pub opacity: f32,
-    pub gradient: Option<Gradient>,
+    pub(crate) backgrounds: Option<LayerList>,
     pub shadows: Option<ShadowList>,
     // width over height, from aspect-ratio or a replaced element's natural size
     pub aspect_ratio: Option<f32>,
     pub object_fit: ObjectFit,
-    pub background_image: Option<crate::image::ImageSource>,
-    pub background_size: BackgroundSize,
-    pub background_position: (Length, Length),
-    pub background_repeat: BackgroundRepeat,
     // anything beyond a pure translation, which keeps using the visual offset path
     pub transform: Option<crate::transform::TransformList>,
     pub translate_property: Option<crate::transform::TransformList>,
@@ -1306,6 +1362,10 @@ pub(crate) struct Style {
 }
 
 impl Style {
+    pub(crate) fn layers(&self) -> Vec<BackgroundLayer> {
+        self.backgrounds.map(LayerList::layers).unwrap_or_default()
+    }
+
     pub(crate) fn has_transform(&self) -> bool {
         self.transform.is_some()
             || self.translate_property.is_some()
@@ -1327,26 +1387,6 @@ pub(crate) enum BackgroundSize {
 pub(crate) struct BackgroundRepeat {
     pub(crate) x: bool,
     pub(crate) y: bool,
-}
-
-// a resolved background image layer, carried on the layout box for paint
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct BackgroundImage {
-    pub(crate) source: crate::image::ImageSource,
-    pub(crate) size: BackgroundSize,
-    pub(crate) position: (Length, Length),
-    pub(crate) repeat: BackgroundRepeat,
-}
-
-impl Style {
-    pub(crate) fn background_layer(&self) -> Option<BackgroundImage> {
-        Some(BackgroundImage {
-            source: self.background_image?,
-            size: self.background_size,
-            position: self.background_position,
-            repeat: self.background_repeat,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1466,14 +1506,10 @@ impl Style {
             translate: (Length::px(0.0), Length::px(0.0)),
             border_radius: SQUARE_CORNERS,
             opacity: 1.0,
-            gradient: None,
+            backgrounds: None,
             shadows: None,
             aspect_ratio: None,
             object_fit: ObjectFit::Fill,
-            background_image: None,
-            background_size: BackgroundSize::Auto,
-            background_position: (Length::px(0.0), Length::px(0.0)),
-            background_repeat: BackgroundRepeat { x: true, y: true },
             transform: None,
             translate_property: None,
             rotate_property: None,
@@ -5210,44 +5246,20 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             style.padding.bottom = parse_length(value).unwrap_or(style.padding.bottom)
         }
         "padding-left" => style.padding.left = parse_length(value).unwrap_or(style.padding.left),
-        "background" | "background-color" | "background-image" => {
-            if let Some(gradient) = parse_linear_gradient(value) {
-                style.gradient = Some(gradient);
-                style.background_image = None;
-                return;
-            }
-            if value.trim().eq_ignore_ascii_case("none") {
-                style.gradient = None;
-                if property != "background-color" {
-                    style.background_image = None;
-                }
-                return;
-            }
+        "background-color" => {
             if let Some(color) = parse_color(value) {
-                style.gradient = None;
                 style.background = color;
-                if property == "background" {
-                    style.background_image = None;
-                }
-                return;
-            }
-            if property != "background-color" {
-                apply_background_layer(style, value, property == "background");
             }
         }
-        "background-size" => {
-            if let Some(size) = parse_background_size(value) {
-                style.background_size = size;
+        "background" => {
+            if let Some((layers, color)) = parse_background_shorthand(value) {
+                style.backgrounds = Some(intern_layers(None, property, value, layers));
+                style.background = color;
             }
         }
-        "background-position" => {
-            if let Some(position) = parse_background_position(value) {
-                style.background_position = position;
-            }
-        }
-        "background-repeat" => {
-            if let Some(repeat) = parse_background_repeat(value) {
-                style.background_repeat = repeat;
+        "background-image" | "background-size" | "background-position" | "background-repeat" => {
+            if let Some(list) = edit_layers(style.backgrounds, property, value) {
+                style.backgrounds = Some(list);
             }
         }
         "aspect-ratio" => {
@@ -5924,71 +5936,190 @@ fn calc_terms(value: CalcValue) -> LengthTerms {
     }
 }
 
-fn parse_linear_gradient(value: &str) -> Option<Gradient> {
-    let arguments = value
-        .trim()
-        .strip_prefix("linear-gradient(")
-        .or_else(|| value.trim().strip_prefix("linear-gradient ("))?
-        .strip_suffix(')')?;
-    let parts = split_top_level(arguments);
-    let mut parts = parts.iter().map(|part| part.trim()).peekable();
-    let first = *parts.peek()?;
-    let angle = if let Some(degrees) = first.strip_suffix("deg") {
-        let angle = degrees.trim().parse::<f32>().ok()?;
-        parts.next();
-        angle
-    } else if let Some(side) = first.strip_prefix("to ") {
-        let angle = match side.trim().to_ascii_lowercase().as_str() {
-            "top" => 0.0,
-            "right" => 90.0,
-            "bottom" => 180.0,
-            "left" => 270.0,
-            "bottom right" | "right bottom" => 135.0,
-            "bottom left" | "left bottom" => 225.0,
-            "top right" | "right top" => 45.0,
-            "top left" | "left top" => 315.0,
-            _ => return None,
-        };
-        parts.next();
-        angle
-    } else {
-        180.0
+// linear and radial gradients and their repeating forms
+fn parse_gradient(value: &str) -> Option<Gradient> {
+    let value = value.trim();
+    let open = value.find('(')?;
+    let name = value[..open].trim().to_ascii_lowercase();
+    let arguments = value[open + 1..].strip_suffix(')')?;
+    let (repeating, name) = match name.strip_prefix("repeating-") {
+        Some(name) => (true, name),
+        None => (false, name.as_str()),
     };
+    let parts = split_top_level(arguments);
+    let first = parts.first()?.trim();
+    let (kind, stops) = match name {
+        "linear-gradient" => match parse_linear_direction(first) {
+            Some(kind) => (kind, &parts[1..]),
+            None => (GradientKind::Linear(180.0), &parts[..]),
+        },
+        "radial-gradient" => match parse_radial_shape(first) {
+            Some(kind) => (kind, &parts[1..]),
+            None => (
+                GradientKind::Radial(Box::new(Radial {
+                    circle: false,
+                    size: RadialSize::FarthestCorner,
+                    center: (Length::percent(50.0), Length::percent(50.0)),
+                })),
+                &parts[..],
+            ),
+        },
+        _ => return None,
+    };
+    let mut parsed = Vec::new();
+    for part in stops {
+        let words = split_words(part.trim());
+        let (color, positions) = words.split_first()?;
+        let Some(color) = parse_color(color) else {
+            // a lone position is a transition hint, which blends as a plain midpoint here
+            if words.len() == 1 && parse_length(words[0]).is_some() {
+                continue;
+            }
+            return None;
+        };
+        if positions.len() > 2 {
+            return None;
+        }
+        if positions.is_empty() {
+            parsed.push(GradientStop {
+                color,
+                position: None,
+            });
+        }
+        for position in positions {
+            parsed.push(GradientStop {
+                color,
+                position: Some(parse_length(position)?),
+            });
+        }
+    }
+    (parsed.len() >= 2).then_some(Gradient {
+        kind,
+        repeating,
+        stops: parsed,
+    })
+}
 
-    let mut stops = [GradientStop {
-        color: Color::transparent(),
-        position: 0.0,
-    }; 4];
-    let mut count = 0;
-    let entries: Vec<&str> = parts.collect();
-    if entries.len() < 2 || entries.len() > stops.len() {
+fn parse_linear_direction(value: &str) -> Option<GradientKind> {
+    let value = value.to_ascii_lowercase();
+    let Some(side) = value.strip_prefix("to ") else {
+        return crate::transform::parse_angle(&value)
+            .map(|angle| GradientKind::Linear(angle.to_degrees()));
+    };
+    let (mut x, mut y) = (0.0_f32, 0.0_f32);
+    for word in side.split_whitespace() {
+        match word {
+            "left" if x == 0.0 => x = -1.0,
+            "right" if x == 0.0 => x = 1.0,
+            "top" if y == 0.0 => y = -1.0,
+            "bottom" if y == 0.0 => y = 1.0,
+            _ => return None,
+        }
+    }
+    Some(match (x, y) {
+        (0.0, 0.0) => return None,
+        (0.0, y) => GradientKind::Linear(if y < 0.0 { 0.0 } else { 180.0 }),
+        (x, 0.0) => GradientKind::Linear(if x > 0.0 { 90.0 } else { 270.0 }),
+        (x, y) => GradientKind::Corner(x, y),
+    })
+}
+
+// the shape, size and center ahead of a radial gradient's stops
+fn parse_radial_shape(value: &str) -> Option<GradientKind> {
+    let words = split_words(value);
+    let at = words
+        .iter()
+        .position(|word| word.eq_ignore_ascii_case("at"));
+    let (shape, center) = match at {
+        Some(index) => (
+            &words[..index],
+            parse_background_position(&words[index + 1..].join(" "))?,
+        ),
+        None => (&words[..], (Length::percent(50.0), Length::percent(50.0))),
+    };
+    if shape.is_empty() && at.is_none() {
         return None;
     }
-    for (index, entry) in entries.iter().enumerate() {
-        let mut pieces = entry.rsplitn(2, ' ');
-        let last = pieces.next()?.trim();
-        let head = pieces.next().map(str::trim);
-        let (color, position) = match (head, last.strip_suffix('%')) {
-            (Some(head), Some(percent)) => (
-                parse_color(head)?,
-                percent.trim().parse::<f32>().ok()? / 100.0,
-            ),
-            _ => (
-                parse_color(entry)?,
-                index as f32 / (entries.len() - 1) as f32,
-            ),
-        };
-        stops[count] = GradientStop {
-            color,
-            position: position.clamp(0.0, 1.0),
-        };
-        count += 1;
+    let mut circle = None;
+    let mut keyword = None;
+    let mut lengths = Vec::new();
+    for word in shape {
+        match word.to_ascii_lowercase().as_str() {
+            "circle" if circle.is_none() => circle = Some(true),
+            "ellipse" if circle.is_none() => circle = Some(false),
+            "closest-side" if keyword.is_none() => keyword = Some(RadialSize::ClosestSide),
+            "closest-corner" if keyword.is_none() => keyword = Some(RadialSize::ClosestCorner),
+            "farthest-side" if keyword.is_none() => keyword = Some(RadialSize::FarthestSide),
+            "farthest-corner" if keyword.is_none() => keyword = Some(RadialSize::FarthestCorner),
+            other => lengths.push(parse_length(other)?),
+        }
     }
-    Some(Gradient {
-        angle,
-        stops,
-        count,
-    })
+    let circle = circle.unwrap_or(lengths.len() == 1);
+    let size = match (keyword, lengths.as_slice(), circle) {
+        (Some(size), [], _) => size,
+        (None, [], _) => RadialSize::FarthestCorner,
+        (None, [radius], true) => RadialSize::Explicit(*radius, *radius),
+        (None, [horizontal, vertical], false) => RadialSize::Explicit(*horizontal, *vertical),
+        _ => return None,
+    };
+    Some(GradientKind::Radial(Box::new(Radial {
+        circle,
+        size,
+        center,
+    })))
+}
+
+fn parse_layer_image(value: &str) -> Option<Option<LayerImage>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    if let Some(url) = parse_url(value) {
+        return crate::image::intern_image_source(url).map(|source| Some(LayerImage::Url(source)));
+    }
+    parse_gradient(value).map(|gradient| Some(LayerImage::Gradient(gradient)))
+}
+
+// a longhand edits one list of the layers already declared
+fn edit_layers(list: Option<LayerList>, property: &str, value: &str) -> Option<LayerList> {
+    let mut layers = list
+        .and_then(|list| LAYER_LISTS.with(|lists| lists.borrow().get(list.0)))
+        .map(|layers| (*layers).clone())
+        .unwrap_or_default();
+    let parts = split_top_level(value);
+    let parts = parts.iter().map(|part| part.trim());
+    match property.rsplit('-').next()? {
+        "image" => layers.images = parts.map(parse_layer_image).collect::<Option<_>>()?,
+        "size" => layers.sizes = parts.map(parse_background_size).collect::<Option<_>>()?,
+        "position" => {
+            layers.positions = parts
+                .map(parse_background_position)
+                .collect::<Option<_>>()?
+        }
+        "repeat" => layers.repeats = parts.map(parse_background_repeat).collect::<Option<_>>()?,
+        _ => return None,
+    }
+    Some(intern_layers(list, property, value, layers))
+}
+
+// keyed by the list edited and the current color, which a gradient stop may take
+fn intern_layers(
+    list: Option<LayerList>,
+    property: &str,
+    value: &str,
+    layers: Layers,
+) -> LayerList {
+    let current = CURRENT_COLOR.with(std::cell::Cell::get);
+    let key = format!(
+        "{:?}|{property}|{}|{:02x}{:02x}{:02x}{:02x}",
+        list.map(|list| list.0),
+        value.trim(),
+        current.red,
+        current.green,
+        current.blue,
+        current.alpha
+    );
+    LayerList(LAYER_LISTS.with(|lists| lists.borrow_mut().insert(&key, Rc::new(layers))))
 }
 
 // keyed by the current color too, which a shadow without its own color takes
@@ -6363,66 +6494,84 @@ fn parse_url(word: &str) -> Option<&str> {
     Some(inner.trim_matches(['"', '\'']))
 }
 
-// the image, color, position, size and repeat parts of a background declaration
-fn apply_background_layer(style: &mut Style, value: &str, shorthand: bool) {
-    let layer = split_top_level(value).into_iter().next().unwrap_or(value);
-    // the size follows a slash outside parentheses, so a slash inside url() stays put
-    let mut depth = 0_usize;
-    let slash = layer.char_indices().find_map(|(index, character)| {
-        match character {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            '/' if depth == 0 => return Some(index),
-            _ => {}
-        }
-        None
-    });
-    let (place, size) = match slash {
-        Some(index) => (&layer[..index], Some(&layer[index + 1..])),
-        None => (layer, None),
-    };
-    // after the slash, only the leading one or two words are the size
-    let mut size_words = Vec::new();
-    let mut trailing = Vec::new();
-    for word in size.map(split_words).unwrap_or_default() {
-        let is_size = matches!(
-            word.to_ascii_lowercase().as_str(),
-            "auto" | "cover" | "contain"
-        ) || parse_length(word).is_some();
-        if is_size && size_words.len() < 2 && trailing.is_empty() {
-            size_words.push(word);
-        } else {
-            trailing.push(word);
-        }
-    }
-    let mut image = None;
-    let mut positions = Vec::new();
-    let mut repeat = None;
-    for word in split_words(place).into_iter().chain(trailing) {
-        if let Some(url) = parse_url(word) {
-            image = crate::image::intern_image_source(url);
-        } else if let Some(parsed) = parse_background_repeat(word) {
-            repeat = Some(parsed);
-        } else if let Some(color) = parse_color(word) {
-            if shorthand {
-                style.background = color;
+// every layer of the shorthand resets all four lists; only the last may carry the color
+fn parse_background_shorthand(value: &str) -> Option<(Layers, Color)> {
+    let mut layers = Layers::default();
+    let mut background = Color::transparent();
+    let parts = split_top_level(value);
+    for (index, layer) in parts.iter().enumerate() {
+        // the size follows a slash outside parentheses, so a slash inside url() stays put
+        let mut depth = 0_usize;
+        let slash = layer.char_indices().find_map(|(index, character)| {
+            match character {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                '/' if depth == 0 => return Some(index),
+                _ => {}
             }
-        } else {
-            positions.push(word);
+            None
+        });
+        let (place, size) = match slash {
+            Some(index) => (&layer[..index], Some(&layer[index + 1..])),
+            None => (&layer[..], None),
+        };
+        // after the slash, only the leading one or two words are the size
+        let mut size_words = Vec::new();
+        let mut trailing = Vec::new();
+        for word in size.map(split_words).unwrap_or_default() {
+            let is_size = matches!(
+                word.to_ascii_lowercase().as_str(),
+                "auto" | "cover" | "contain"
+            ) || parse_length(word).is_some();
+            if is_size && size_words.len() < 2 && trailing.is_empty() {
+                size_words.push(word);
+            } else {
+                trailing.push(word);
+            }
         }
+        let mut image = None;
+        let mut positions = Vec::new();
+        let mut repeat = Vec::new();
+        for word in split_words(place).into_iter().chain(trailing) {
+            let lower = word.to_ascii_lowercase();
+            if image.is_none()
+                && let Some(parsed) = parse_layer_image(word)
+            {
+                image = Some(parsed);
+            } else if matches!(
+                lower.as_str(),
+                "repeat" | "no-repeat" | "repeat-x" | "repeat-y"
+            ) {
+                repeat.push(word);
+            } else if index + 1 == parts.len()
+                && let Some(color) = parse_color(word)
+            {
+                background = color;
+            } else if !matches!(
+                lower.as_str(),
+                "scroll" | "fixed" | "local" | "border-box" | "padding-box" | "content-box"
+            ) {
+                positions.push(word);
+            }
+        }
+        layers.images.push(image.flatten());
+        layers.positions.push(if positions.is_empty() {
+            (Length::px(0.0), Length::px(0.0))
+        } else {
+            parse_background_position(&positions.join(" "))?
+        });
+        layers.sizes.push(if size_words.is_empty() {
+            BackgroundSize::Auto
+        } else {
+            parse_background_size(&size_words.join(" "))?
+        });
+        layers.repeats.push(if repeat.is_empty() {
+            BackgroundRepeat { x: true, y: true }
+        } else {
+            parse_background_repeat(&repeat.join(" "))?
+        });
     }
-    if image.is_none() && !shorthand {
-        return;
-    }
-    style.gradient = None;
-    style.background_image = image;
-    if shorthand {
-        style.background_position = parse_background_position(&positions.join(" "))
-            .unwrap_or((Length::px(0.0), Length::px(0.0)));
-        style.background_repeat = repeat.unwrap_or(BackgroundRepeat { x: true, y: true });
-        style.background_size =
-            parse_background_size(&size_words.join(" ")).unwrap_or(BackgroundSize::Auto);
-    }
+    Some((layers, background))
 }
 
 fn parse_background_size(value: &str) -> Option<BackgroundSize> {
@@ -6433,7 +6582,7 @@ fn parse_background_size(value: &str) -> Option<BackgroundSize> {
         "auto" | "auto auto" => return Some(BackgroundSize::Auto),
         _ => {}
     }
-    let mut words = value.split_whitespace();
+    let mut words = split_words(&value).into_iter();
     let parse = |word: &str| {
         if word == "auto" {
             Some(Length::Auto)
@@ -6967,18 +7116,117 @@ mod tests {
         assert_eq!(shadow.offset_y.resolve(0.0, 16.0), Some(10.0));
         assert_eq!(shadow.blur.resolve(0.0, 16.0), Some(30.0));
         assert_eq!(shadow.color.alpha, 128);
-        let gradient = style.gradient.expect("gradient should parse");
-        assert_eq!((gradient.angle, gradient.count), (90.0, 2));
-        assert_eq!(gradient.color_at(0.0), Color::opaque(255, 0, 0));
-        assert_eq!(gradient.color_at(1.0), Color::opaque(0, 0, 255));
-        assert_eq!(gradient.color_at(0.5), Color::opaque(128, 0, 128));
+        let layers = style.layers();
+        let [
+            BackgroundLayer {
+                image: LayerImage::Gradient(gradient),
+                ..
+            },
+        ] = layers.as_slice()
+        else {
+            panic!("one gradient layer, got {layers:?}");
+        };
+        assert_eq!(gradient.kind, GradientKind::Linear(90.0));
+        assert_eq!(
+            gradient.stops,
+            [
+                GradientStop {
+                    color: Color::opaque(255, 0, 0),
+                    position: Some(Length::percent(0.0)),
+                },
+                GradientStop {
+                    color: Color::opaque(0, 0, 255),
+                    position: Some(Length::percent(100.0)),
+                },
+            ]
+        );
 
         let none = Stylesheet::parse(".card { box-shadow: none; background: #101010; }")
             .expect("stylesheet should parse")
             .style_for(context(&placed(&card, &[]), &StyleState::default()));
         assert!(none.shadows.is_none());
-        assert!(none.gradient.is_none());
+        assert!(none.layers().is_empty());
         assert_eq!(none.background, Color::opaque(16, 16, 16));
+    }
+
+    #[test]
+    fn background_layers_cycle_their_longhands_and_parse_every_gradient_form() {
+        let stylesheet = Stylesheet::parse(concat!(
+            ".arrow { background-image: linear-gradient(45deg, transparent 50%, #aaa 50%), linear-gradient(135deg, #aaa 50%, transparent 50%); background-position: calc(100% - 12px) 9px, calc(100% - 8px) 9px; background-size: 4px 4px; background-repeat: no-repeat; }",
+            ".track { background: repeating-linear-gradient(to right, red 0 1px, transparent 1px 25%) 7px 0 / calc(100% - 13px) 100% no-repeat, linear-gradient(blue, blue) 0 0 / 50% 100% no-repeat, #101010; }",
+            ".dot { background: radial-gradient(circle at 50% 30%, #ff8a80, #d42d20 60%, #8c140b); }",
+            ".nav { background: linear-gradient(to bottom, #828282 0%, #535353 4%, #3d3d3d 50%, #222222 51%, #1b1b1b 92%, #101010 100%); }",
+            ".gloss { background: radial-gradient(ellipse 95% 100% at 50% 0%, #000 50%, transparent 82%), url(x.png) center; }",
+            ".cleared { background-color: red; background: none; }",
+            ".single { background: linear-gradient(red); }",
+        ))
+        .expect("stylesheet should parse");
+        let style = |class: &str| {
+            let mut element = Element::new("div");
+            element.attrs.insert("class".to_string(), class.to_string());
+            stylesheet.style_for(context(&placed(&element, &[]), &StyleState::default()))
+        };
+        let gradient = |layer: &BackgroundLayer| match &layer.image {
+            LayerImage::Gradient(gradient) => gradient.clone(),
+            other => panic!("expected a gradient, got {other:?}"),
+        };
+        let px = |length: Length| length.resolve(100.0, 16.0);
+
+        let arrow = style("arrow").layers();
+        assert_eq!(arrow.len(), 2);
+        assert_eq!(gradient(&arrow[0]).kind, GradientKind::Linear(45.0));
+        assert_eq!(gradient(&arrow[1]).kind, GradientKind::Linear(135.0));
+        assert_eq!(px(arrow[1].position.0), Some(92.0));
+        assert_eq!(
+            arrow[1].size,
+            BackgroundSize::Explicit(Length::px(4.0), Length::px(4.0)),
+            "a shorter longhand list cycles"
+        );
+        assert_eq!(arrow[1].repeat, BackgroundRepeat { x: false, y: false });
+
+        let track = style("track");
+        assert_eq!(track.background, Color::opaque(16, 16, 16));
+        let track = track.layers();
+        let stripes = gradient(&track[0]);
+        assert!(stripes.repeating);
+        assert_eq!(stripes.stops.len(), 4, "two positions make two stops");
+        assert_eq!(px(track[0].position.0), Some(7.0));
+        assert_eq!(
+            track[1].size,
+            BackgroundSize::Explicit(Length::percent(50.0), Length::percent(100.0))
+        );
+
+        let dot = gradient(&style("dot").layers()[0]);
+        assert_eq!(
+            dot.kind,
+            GradientKind::Radial(Box::new(Radial {
+                circle: true,
+                size: RadialSize::FarthestCorner,
+                center: (Length::percent(50.0), Length::percent(30.0)),
+            }))
+        );
+        assert_eq!(dot.stops[0].position, None);
+        assert_eq!(gradient(&style("nav").layers()[0]).stops.len(), 6);
+
+        let gloss = style("gloss").layers();
+        assert_eq!(
+            gradient(&gloss[0]).kind,
+            GradientKind::Radial(Box::new(Radial {
+                circle: false,
+                size: RadialSize::Explicit(Length::percent(95.0), Length::percent(100.0)),
+                center: (Length::percent(50.0), Length::percent(0.0)),
+            }))
+        );
+        assert!(matches!(gloss[1].image, LayerImage::Url(_)));
+        assert_eq!(px(gloss[1].position.0), Some(50.0));
+
+        let cleared = style("cleared");
+        assert_eq!(cleared.background, Color::transparent());
+        assert!(cleared.layers().is_empty());
+        assert!(
+            style("single").layers().is_empty(),
+            "a gradient with one stop is invalid"
+        );
     }
 
     #[test]
