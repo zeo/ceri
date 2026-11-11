@@ -2265,6 +2265,34 @@ impl Stylesheet {
             .into_iter()
             .filter(|(property, _)| !property.starts_with("--"))
             .collect::<Vec<_>>();
+        let inherited = style;
+        let initial = || {
+            Style::default_for(
+                "",
+                16.0,
+                Color::BLACK,
+                FontWeight::NORMAL,
+                Default::default(),
+            )
+        };
+        // all resets every declaration beneath it, so only those that outrank it remain
+        if let Some(index) = values.iter().position(|(property, _)| property == "all") {
+            let (_, (rank, order, value)) = values.swap_remove(index);
+            style = match css_wide_keyword(&value) {
+                Some("initial") => initial(),
+                Some(_) => Style::default_for(
+                    "",
+                    parent_font_size,
+                    parent_color,
+                    parent_weight,
+                    parent_text,
+                ),
+                None => style,
+            };
+            values.retain(|(_, (other_rank, other_order, _))| {
+                (*other_rank, *other_order) > (rank, order)
+            });
+        }
         values.sort_unstable_by_key(|(property, (rank, order, _))| {
             (property.as_ref() != "color", *rank, *order)
         });
@@ -2272,6 +2300,15 @@ impl Stylesheet {
             let Some(value) = resolve_custom_value(&value, custom_properties) else {
                 continue;
             };
+            if let Some(keyword) = css_wide_keyword(&value) {
+                let from = if keyword == "initial" {
+                    initial()
+                } else {
+                    inherited
+                };
+                reset_inherited_property(&mut style, &from, &property);
+                continue;
+            }
             if property == "animation" || property == "animation-name" {
                 animation = parse_animation(&value);
                 continue;
@@ -4495,6 +4532,72 @@ fn parse_container_name(value: &str) -> Option<u32> {
 }
 
 // font: style and weight words, then a size with an optional line height, then the families
+fn css_wide_keyword(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    ["inherit", "initial", "unset", "revert", "revert-layer"]
+        .into_iter()
+        .find(|keyword| value.eq_ignore_ascii_case(keyword))
+}
+
+// copies an inherited property from the style holding its parent or initial value; other
+// properties need the parent's full style, which the cascade does not see, so they keep theirs
+fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) {
+    match property {
+        "font" => {
+            style.font_family = from.font_family;
+            style.font_size = from.font_size;
+            style.font_weight = from.font_weight;
+            style.italic = from.italic;
+            style.line_height = from.line_height;
+            style.line_height_absolute = from.line_height_absolute;
+        }
+        "font-family" => style.font_family = from.font_family,
+        "font-size" => style.font_size = from.font_size,
+        "font-weight" => style.font_weight = from.font_weight,
+        "font-style" => style.italic = from.italic,
+        "line-height" => {
+            style.line_height = from.line_height;
+            style.line_height_absolute = from.line_height_absolute;
+        }
+        "color" => style.color = from.color,
+        "letter-spacing" => style.letter_spacing = from.letter_spacing,
+        "text-align" => style.text_align = from.text_align,
+        "text-transform" => style.text_transform = from.text_transform,
+        "text-decoration" | "-webkit-text-decoration" | "text-decoration-line" => {
+            style.text_decoration = TextDecoration {
+                shadow: style.text_decoration.shadow,
+                stroke: style.text_decoration.stroke,
+                ..from.text_decoration
+            };
+        }
+        "text-shadow" => style.text_decoration.shadow = from.text_decoration.shadow,
+        "visibility" => style.visibility = from.visibility,
+        "cursor" => style.cursor = from.cursor,
+        "pointer-events" => style.pointer_events = from.pointer_events,
+        "user-select" | "-webkit-user-select" => style.selectable = from.selectable,
+        "list-style" => {
+            style.list_style_type = from.list_style_type;
+            style.list_inside = from.list_inside;
+        }
+        "list-style-type" => style.list_style_type = from.list_style_type,
+        "list-style-position" => style.list_inside = from.list_inside,
+        "border-collapse" => style.border_collapse = from.border_collapse,
+        "border-spacing" => style.border_spacing = from.border_spacing,
+        "caption-side" => style.caption_bottom = from.caption_bottom,
+        "accent-color" => style.accent_color = from.accent_color,
+        "white-space" => {
+            style.space_collapse = from.space_collapse;
+            style.wrap = from.wrap;
+        }
+        "white-space-collapse" => style.space_collapse = from.space_collapse,
+        "text-wrap" | "text-wrap-mode" => style.wrap = from.wrap,
+        "word-break" => style.word_break = from.word_break,
+        "overflow-wrap" | "word-wrap" => style.overflow_wrap = from.overflow_wrap,
+        "direction" => style.rtl = from.rtl,
+        _ => {}
+    }
+}
+
 fn apply_font_shorthand(style: &mut Style, value: &str) {
     let words = split_words(value);
     let Some(size_index) = words.iter().position(|word| {
@@ -6886,6 +6989,59 @@ mod tests {
             parent_text: InheritedText::default(),
             state,
         }
+    }
+
+    #[test]
+    fn css_wide_keywords_take_the_parent_or_initial_value() {
+        let stylesheet = Stylesheet::parse(
+            "button { font: inherit; color: inherit; letter-spacing: 3px }
+             button { letter-spacing: initial; text-align: unset }
+             .reset { all: unset; cursor: pointer }",
+        )
+        .expect("stylesheet should parse");
+        let parent_color = Color::opaque(1, 2, 3);
+        let mut button = Element::new("button");
+        let style = style_within(
+            &stylesheet,
+            &button,
+            &[],
+            12.0,
+            parent_color,
+            FontWeight::BOLD,
+        );
+        assert_eq!(style.font_size, Length::px(12.0));
+        assert_eq!(style.font_family, InheritedText::default().family);
+        assert_eq!(style.font_weight, FontWeight::BOLD);
+        assert_eq!(style.color, parent_color);
+        assert_eq!(
+            style.letter_spacing,
+            Style::default_for(
+                "",
+                16.0,
+                Color::BLACK,
+                FontWeight::NORMAL,
+                InheritedText::default()
+            )
+            .letter_spacing
+        );
+        assert_eq!(style.display, Display::InlineBlock);
+
+        button
+            .attrs
+            .insert("class".to_string(), "reset".to_string());
+        let style = style_within(
+            &stylesheet,
+            &button,
+            &[],
+            12.0,
+            parent_color,
+            FontWeight::BOLD,
+        );
+        assert_eq!(style.display, Display::Inline);
+        assert_eq!(style.font_size, Length::px(12.0));
+        assert_eq!(style.color, parent_color);
+        assert_eq!(style.cursor, Cursor::Pointer);
+        assert_eq!(style.border, [BorderSide::INITIAL; 4]);
     }
 
     fn style_within(
