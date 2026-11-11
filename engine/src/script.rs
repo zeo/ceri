@@ -388,6 +388,9 @@ enum Builtin {
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
     ElementClassListToggle(ElementHandle),
+    StyleGetPropertyValue(ElementHandle),
+    StyleSetProperty(ElementHandle),
+    StyleRemoveProperty(ElementHandle),
     Fetch,
     SubtleDigest,
     PromiseThen(PromiseHandle),
@@ -3666,10 +3669,21 @@ impl ScriptRuntime {
                     ))),
                 }
             }
-            Value::Style(handle) => Ok(self
-                .element_style_property(&handle, property)
-                .map(|text| Value::String(text.into()))
-                .unwrap_or_else(|| Value::String(String::new().into()))),
+            Value::Style(handle) => Ok(match property {
+                "getPropertyValue" => Value::Builtin(Builtin::StyleGetPropertyValue(handle)),
+                "setProperty" => Value::Builtin(Builtin::StyleSetProperty(handle)),
+                "removeProperty" => Value::Builtin(Builtin::StyleRemoveProperty(handle)),
+                "cssText" => Value::String(
+                    self.element_attribute(&handle, "style")
+                        .unwrap_or_default()
+                        .into(),
+                ),
+                _ => Value::String(
+                    self.element_style_property(&handle, property)
+                        .unwrap_or_default()
+                        .into(),
+                ),
+            }),
             Value::ClassList(handle) => match property {
                 "add" => Ok(Value::Builtin(Builtin::ElementClassListAdd(handle))),
                 "remove" => Ok(Value::Builtin(Builtin::ElementClassListRemove(handle))),
@@ -4334,6 +4348,13 @@ impl ScriptRuntime {
             },
             Value::Dataset(handle) => {
                 self.set_element_attribute(&handle, &dataset_attribute_name(property), value_string)
+            }
+            Value::Style(handle) if property == "cssText" => {
+                if value_string.trim().is_empty() {
+                    self.remove_element_attribute(&handle, "style")
+                } else {
+                    self.set_element_attribute(&handle, "style", value_string)
+                }
             }
             Value::Style(handle) => {
                 self.set_element_style_property(&handle, property, value_string)
@@ -8672,6 +8693,41 @@ impl ScriptRuntime {
                 let class = first_class_name(&arguments)?;
                 let force = arguments.get(1).map(Value::truthy);
                 Ok(Value::Bool(self.toggle_class(&handle, &class, force)?))
+            }
+            Builtin::StyleGetPropertyValue(handle) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                Ok(Value::String(
+                    self.element_style_property(&handle, &name)
+                        .unwrap_or_default()
+                        .into(),
+                ))
+            }
+            Builtin::StyleSetProperty(handle) => {
+                let mut arguments = arguments.into_iter().map(|value| match value {
+                    Value::Undefined | Value::Null => String::new(),
+                    value => value.string_value(),
+                });
+                let name = arguments.next().unwrap_or_default();
+                let mut value = arguments.next().unwrap_or_default();
+                if !value.is_empty() && arguments.next().is_some_and(|p| p == "important") {
+                    value.push_str(" !important");
+                }
+                self.set_element_style_property(&handle, &name, value);
+                Ok(Value::Undefined)
+            }
+            Builtin::StyleRemoveProperty(handle) => {
+                let name = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let previous = self
+                    .element_style_property(&handle, &name)
+                    .unwrap_or_default();
+                self.set_element_style_property(&handle, &name, String::new());
+                Ok(Value::String(previous.into()))
             }
         }
     }
@@ -19124,6 +19180,38 @@ mod tests {
                 .style_property(created, "color")
                 .as_deref(),
             Some("#42d3b4")
+        );
+    }
+
+    #[test]
+    fn style_css_text_and_property_methods_edit_the_style_attribute() {
+        let document = document("<main><p id='status'>idle</p></main>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const status = document.getElementById("status");
+                status.style.cssText = "left: 40%; width: 0.5%";
+                const seen = [status.getAttribute("style"), status.style.left];
+                status.style.setProperty("--tint", "red");
+                status.style.setProperty("top", "2px", "important");
+                seen.push(status.style.removeProperty("width"), status.style.getPropertyValue("top"));
+                seen.push(status.style.cssText);
+                status.style.cssText = "";
+                seen.push(String(status.getAttribute("style")));
+                status.textContent = seen.join("|");
+                "##,
+            )
+            .expect("style edits should execute");
+        let status = document
+            .borrow()
+            .find_element_by_selector("#status")
+            .expect("status");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "left: 40%; width: 0.5%|40%|0.5%|2px !important|left: 40%; --tint: red; top: 2px !important|null"
+            )
         );
     }
 
