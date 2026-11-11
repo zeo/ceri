@@ -13,6 +13,7 @@ mod grid;
 mod host;
 mod image;
 mod inflate;
+mod intern;
 mod interpolate;
 mod jpeg;
 mod layout;

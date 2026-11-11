@@ -222,35 +222,20 @@ impl TransformOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TransformList(u32);
 
-const MAX_TRANSFORM_LISTS: usize = 4096;
-
 thread_local! {
-    static TRANSFORM_LISTS: RefCell<Vec<(String, Rc<[TransformOp]>)>> = const { RefCell::new(Vec::new()) };
+    static TRANSFORM_LISTS: RefCell<crate::intern::Table<[TransformOp]>> =
+        RefCell::new(crate::intern::Table::new());
 }
 
 impl TransformList {
-    pub(crate) fn intern(source: &str, ops: Vec<TransformOp>) -> Option<Self> {
-        TRANSFORM_LISTS.with(|lists| {
-            let mut lists = lists.borrow_mut();
-            if let Some(index) = lists.iter().position(|(key, _)| key == source) {
-                return Some(Self(index as u32));
-            }
-            if lists.len() >= MAX_TRANSFORM_LISTS {
-                return None;
-            }
-            lists.push((source.to_string(), ops.into()));
-            Some(Self(lists.len() as u32 - 1))
-        })
+    pub(crate) fn intern(source: &str, ops: Vec<TransformOp>) -> Self {
+        TRANSFORM_LISTS.with(|lists| Self(lists.borrow_mut().insert(source, ops.into())))
     }
 
     pub(crate) fn ops(self) -> Rc<[TransformOp]> {
-        TRANSFORM_LISTS.with(|lists| {
-            lists
-                .borrow()
-                .get(self.0 as usize)
-                .map(|(_, ops)| ops.clone())
-                .unwrap_or_else(|| Rc::from(Vec::new()))
-        })
+        TRANSFORM_LISTS
+            .with(|lists| lists.borrow().get(self.0))
+            .unwrap_or_else(|| Rc::from(Vec::new()))
     }
 
     pub(crate) fn matrix(self, width: f32, height: f32, font_size: f32) -> Matrix {

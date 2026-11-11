@@ -5261,7 +5261,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.translate = translate;
                 style.transform = None;
             } else if let Some(list) = crate::transform::parse_transform_list(value)
-                .and_then(|ops| crate::transform::TransformList::intern(value.trim(), ops))
+                .map(|ops| crate::transform::TransformList::intern(value.trim(), ops))
             {
                 style.translate = (Length::px(0.0), Length::px(0.0));
                 style.transform = Some(list);
@@ -5272,7 +5272,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 Some(None)
             } else {
                 parse_individual_transform(property, value)
-                    .and_then(|op| {
+                    .map(|op| {
                         crate::transform::TransformList::intern(
                             &format!("{property}:{}", value.trim()),
                             vec![op],

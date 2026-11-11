@@ -50,22 +50,20 @@ impl ClipRegion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ClipPath(u32);
 
-const MAX_CLIP_PATHS: usize = 4096;
 // coverage walks every edge per pixel, so a polygon stays small enough to paint
 const MAX_POLYGON_POINTS: usize = 256;
 
 thread_local! {
-    static CLIP_PATHS: RefCell<Vec<(String, Rc<Shape>)>> = const { RefCell::new(Vec::new()) };
+    static CLIP_PATHS: RefCell<crate::intern::Table<Shape>> =
+        RefCell::new(crate::intern::Table::new());
 }
 
 impl ClipPath {
     // a basic shape with an optional border-box; other reference boxes and url() are invalid
     pub(crate) fn parse(value: &str) -> Option<Self> {
         let source = value.trim();
-        if let Some(index) =
-            CLIP_PATHS.with(|paths| paths.borrow().iter().position(|(key, _)| key == source))
-        {
-            return Some(Self(index as u32));
+        if let Some(id) = CLIP_PATHS.with(|paths| paths.borrow().find(source)) {
+            return Some(Self(id));
         }
         let mut shape = None;
         for word in split_words(source) {
@@ -100,25 +98,15 @@ impl ClipPath {
             });
         }
         let shape = Rc::new(shape?);
-        CLIP_PATHS.with(|paths| {
-            let mut paths = paths.borrow_mut();
-            if paths.len() >= MAX_CLIP_PATHS {
-                return None;
-            }
-            paths.push((source.to_string(), shape));
-            Some(Self(paths.len() as u32 - 1))
-        })
+        Some(Self(
+            CLIP_PATHS.with(|paths| paths.borrow_mut().insert(source, shape)),
+        ))
     }
 
     // percentages of x run along the width and of y down the height; a circle's radius
     // resolves against the box diagonal over the square root of two
     pub(crate) fn resolve(self, width: f32, height: f32, font_size: f32) -> Option<ClipRegion> {
-        let shape = CLIP_PATHS.with(|paths| {
-            paths
-                .borrow()
-                .get(self.0 as usize)
-                .map(|(_, shape)| shape.clone())
-        })?;
+        let shape = CLIP_PATHS.with(|paths| paths.borrow().get(self.0))?;
         let x = |length: Length| length.resolve(width, font_size).unwrap_or(0.0);
         let y = |length: Length| length.resolve(height, font_size).unwrap_or(0.0);
         let ellipse = |(center_x, center_y): (f32, f32), radius_x: f32, radius_y: f32| {
