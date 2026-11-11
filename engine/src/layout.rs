@@ -144,6 +144,9 @@ pub struct LayoutBox {
     // the x and y axes, after a scrolling axis has settled the other
     pub(crate) overflow_axes: [Overflow; 2],
     pub(crate) visible: bool,
+    // pointer-events and user-select, both inherited, so a descendant can opt back in
+    pub(crate) pointer_events: bool,
+    pub(crate) selectable: bool,
     pub(crate) cursor: Cursor,
     // floats paint after their in-flow siblings
     pub(crate) floated: bool,
@@ -677,6 +680,8 @@ fn inherited_text(style: &Style) -> InheritedText {
         family: style.font_family,
         visibility: style.visibility,
         cursor: style.cursor,
+        pointer_events: style.pointer_events,
+        selectable: style.selectable,
         list_style_type: style.list_style_type,
         list_inside: style.list_inside,
         border_collapse: style.border_collapse,
@@ -914,6 +919,8 @@ pub fn layout_with_state(
         overflow: Overflow::Visible,
         overflow_axes: [Overflow::Visible; 2],
         visible: true,
+        pointer_events: true,
+        selectable: true,
         cursor: Cursor::Auto,
         floated: false,
         inline: false,
@@ -1257,7 +1264,7 @@ fn collect_prose_runs(
     if let Some(transform) = layout_box.transform {
         transforms.push(transform.about(box_rect.x, box_rect.y));
     }
-    for run in &layout_box.text {
+    for run in layout_box.text.iter().filter(|_| layout_box.selectable) {
         let Some(node) = run.node else {
             continue;
         };
@@ -1727,7 +1734,10 @@ fn inside_clip_path(layout: &LayoutBox, rect: Rect, x: f32, y: f32) -> bool {
 }
 
 fn hit_target(layout: &LayoutBox, rect: Rect, x: f32, y: f32) -> bool {
-    !layout.is_document() && layout.visible && inside_corners(rect, layout.radii, x, y)
+    !layout.is_document()
+        && layout.visible
+        && layout.pointer_events
+        && inside_corners(rect, layout.radii, x, y)
 }
 
 // whether a point inside a box's rectangle is also inside its rounded corners
@@ -2821,6 +2831,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
+        pointer_events: style.pointer_events,
+        selectable: style.selectable,
         cursor: style.cursor,
         floated: false,
         inline: false,
@@ -2989,6 +3001,8 @@ fn anonymous_box(
         overflow: Overflow::Visible,
         overflow_axes: [Overflow::Visible; 2],
         visible: true,
+        pointer_events: true,
+        selectable: true,
         cursor,
         floated: false,
         inline: false,
@@ -3898,6 +3912,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
+        pointer_events: style.pointer_events,
+        selectable: style.selectable,
         cursor: style.cursor,
         floated: false,
         inline: false,
@@ -4375,6 +4391,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
+        pointer_events: style.pointer_events,
+        selectable: style.selectable,
         cursor: style.cursor,
         floated: false,
         inline: false,
@@ -4974,6 +4992,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         section.background = section_style.background;
         section.gradient = section_style.gradient;
         section.visible = section_style.visibility == Visibility::Visible;
+        section.pointer_events = section_style.pointer_events;
+        section.selectable = section_style.selectable;
         section
     };
     let mut row_boxes: Vec<(usize, LayoutBox)> = Vec::new();
@@ -5091,6 +5111,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
         visible: style.visibility == Visibility::Visible,
+        pointer_events: style.pointer_events,
+        selectable: style.selectable,
         cursor: style.cursor,
         floated: false,
         inline: false,
@@ -7272,6 +7294,8 @@ fn inline_fragment_box(
     fragment.tag = tag.clone();
     fragment.inline = true;
     fragment.visible = style.visibility == Visibility::Visible;
+    fragment.pointer_events = style.pointer_events;
+    fragment.selectable = style.selectable;
     fragment.background = style.background;
     fragment.gradient = style.gradient;
     fragment.border = BoxBorder {
@@ -8825,6 +8849,31 @@ mod tests {
         assert_eq!(pixel(5, 20), [255, 0, 0, 255]);
         assert_eq!(pixel(38, 2), pixel(78, 78));
         assert_eq!(pixel(60, 10), pixel(78, 78));
+    }
+
+    #[test]
+    fn pointer_events_and_user_select_none_pass_through_until_a_descendant_opts_back_in() {
+        let document = Document::parse_markup(
+            "<style>#app { user-select: none; } #base { width: 60px; height: 40px; margin: 0; } #veil { position: absolute; left: 0; top: 0; width: 60px; height: 40px; pointer-events: none; } #back { position: absolute; left: 40px; top: 20px; width: 10px; height: 10px; pointer-events: auto; } p { margin: 0; } .field { user-select: text; }</style><div id='base'></div><div id='veil'><div id='back'></div></div><div id='app'><p>locked</p><p class='field'>free</p></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 200.0,
+            },
+        );
+        assert_eq!(result.hit_test(10.0, 10.0), Some(document.node_at(&[1])));
+        assert_eq!(result.hit_test(45.0, 25.0), Some(document.node_at(&[2, 0])));
+        let selectable = result
+            .prose_runs()
+            .into_iter()
+            .map(|prose| prose.run.text.trim().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(selectable, ["free"]);
     }
 
     #[test]

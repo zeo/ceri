@@ -845,6 +845,8 @@ pub(crate) struct InheritedText {
     pub(crate) family: crate::font::FontStack,
     pub(crate) visibility: Visibility,
     pub(crate) cursor: Cursor,
+    pub(crate) pointer_events: bool,
+    pub(crate) selectable: bool,
     pub(crate) list_style_type: ListStyleType,
     pub(crate) list_inside: bool,
     pub(crate) border_collapse: bool,
@@ -872,6 +874,8 @@ impl Default for InheritedText {
             family: crate::font::FontStack::default(),
             visibility: Visibility::Visible,
             cursor: Cursor::Auto,
+            pointer_events: true,
+            selectable: true,
             list_style_type: ListStyleType::Disc,
             list_inside: false,
             border_collapse: false,
@@ -1177,6 +1181,9 @@ pub(crate) struct Style {
     pub overflow_y: Overflow,
     pub visibility: Visibility,
     pub cursor: Cursor,
+    // pointer-events other than none, and user-select other than none
+    pub(crate) pointer_events: bool,
+    pub(crate) selectable: bool,
     pub float: Float,
     pub clear: Clear,
     pub list_style_type: ListStyleType,
@@ -1365,6 +1372,8 @@ impl Style {
             overflow_y: Overflow::Visible,
             visibility: parent_text.visibility,
             cursor: parent_text.cursor,
+            pointer_events: parent_text.pointer_events,
+            selectable: parent_text.selectable,
             float: Float::None,
             clear: Clear::None,
             list_style_type: parent_text.list_style_type,
@@ -2329,6 +2338,8 @@ impl Stylesheet {
                 family: style.font_family,
                 visibility: style.visibility,
                 cursor: style.cursor,
+                pointer_events: style.pointer_events,
+                selectable: style.selectable,
                 list_style_type: style.list_style_type,
                 list_inside: style.list_inside,
                 border_collapse: style.border_collapse,
@@ -4608,6 +4619,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "perspective-origin",
     "place-items",
     "place-self",
+    "pointer-events",
     "position",
     "right",
     "rotate",
@@ -4625,6 +4637,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "transition-property",
     "transition-timing-function",
     "translate",
+    "user-select",
     "vertical-align",
     "visibility",
     "width",
@@ -5005,6 +5018,10 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "cursor" => style.cursor = Cursor::parse(value).unwrap_or(style.cursor),
+        "pointer-events" => style.pointer_events = !value.trim().eq_ignore_ascii_case("none"),
+        "user-select" | "-webkit-user-select" => {
+            style.selectable = !value.trim().eq_ignore_ascii_case("none");
+        }
         "list-style-type" => {
             style.list_style_type =
                 ListStyleType::parse(value.trim()).unwrap_or(style.list_style_type);
