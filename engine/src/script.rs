@@ -847,6 +847,8 @@ pub(crate) struct StorageData {
     databases: BTreeMap<String, IndexedDbDatabaseHandle>,
     database_order: Vec<String>,
     persistence_path: Option<PathBuf>,
+    // the bytes last read from or written to the file, so an unchanged store is not rewritten
+    persisted: RefCell<Vec<u8>>,
 }
 
 impl StorageData {
@@ -858,6 +860,7 @@ impl StorageData {
             databases: BTreeMap::new(),
             database_order: Vec::new(),
             persistence_path: None,
+            persisted: RefCell::new(Vec::new()),
         }
     }
 
@@ -880,7 +883,9 @@ impl StorageData {
                 ));
             }
             let bytes = fs::read(&path)?;
-            decode_storage(&bytes)?
+            let storage = decode_storage(&bytes)?;
+            *storage.persisted.borrow_mut() = bytes;
+            storage
         } else {
             Self::new()
         };
@@ -893,7 +898,12 @@ impl StorageData {
             return Ok(());
         };
         let bytes = encode_storage(self)?;
-        atomic_write(path, &bytes)
+        if *self.persisted.borrow() == bytes {
+            return Ok(());
+        }
+        atomic_write(path, &bytes)?;
+        *self.persisted.borrow_mut() = bytes;
+        Ok(())
     }
 }
 

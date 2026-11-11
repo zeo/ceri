@@ -878,6 +878,18 @@ pub struct Browser {
     fonts: Rc<FontSet>,
     // the word or block a multi-click selected, which a following drag extends by
     selection_unit: Option<SelectionUnit>,
+    // hit testing, cursor lookup and paint after one input all read the same layout
+    layout_cache: RefCell<Option<(LayoutKey, Rc<LayoutDocument>)>>,
+}
+
+// everything a layout is a pure function of
+#[derive(PartialEq)]
+struct LayoutKey {
+    document: (Option<u64>, *const RefCell<Document>, u64),
+    stylesheet: *const crate::css::Stylesheet,
+    viewport: Size,
+    state: StyleState,
+    selections: Vec<crate::layout::ProseSpan>,
 }
 
 #[derive(Clone, Copy)]
@@ -978,6 +990,7 @@ impl Browser {
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
             selection_unit: None,
+            layout_cache: RefCell::new(None),
         }
     }
 
@@ -2229,7 +2242,7 @@ impl Browser {
             .unwrap_or(&[])
     }
 
-    pub fn layout(&self, viewport: Size) -> Result<LayoutDocument, NavigationError> {
+    pub fn layout(&self, viewport: Size) -> Result<Rc<LayoutDocument>, NavigationError> {
         let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
         let document = page.document.clone();
         let document = document.borrow();
@@ -2263,6 +2276,27 @@ impl Browser {
             }
         }
         style_state.container_sizes = self.container_sizes.borrow().clone();
+        let mut keyed_state = style_state.clone();
+        // a page with nothing in motion lays out the same at any clock time
+        if page.animation_wake.get().is_none() && keyed_state.transitions.is_empty() {
+            keyed_state.clock = 0;
+        }
+        let key = LayoutKey {
+            document: (
+                self.current_document_id,
+                Rc::as_ptr(&page.document),
+                document.version(),
+            ),
+            stylesheet: Rc::as_ptr(stylesheet),
+            viewport,
+            state: keyed_state,
+            selections: page.runtime.prose_selections(),
+        };
+        if let Some((cached, layout)) = self.layout_cache.borrow().as_ref()
+            && *cached == key
+        {
+            return Ok(layout.clone());
+        }
         crate::css::take_animation_wake();
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         // container queries read sizes from a layout, so a change in them lays out once more
@@ -2287,10 +2321,12 @@ impl Browser {
             container_sizes: style_state.container_sizes.clone(),
             ..StyleState::default()
         };
-        layout.prose_selections = page.runtime.prose_selections();
+        layout.prose_selections = key.selections.clone();
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(page, base, &document, &mut layout);
         }
+        let layout = Rc::new(layout);
+        *self.layout_cache.borrow_mut() = Some((key, layout.clone()));
         Ok(layout)
     }
 
@@ -5867,6 +5903,94 @@ mod tests {
     }
 
     #[test]
+    fn layouts_are_reused_until_the_document_or_its_state_changes() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>#box { width: 50px; height: 20px } #box:hover { width: 90px }</style>
+            <div id="box"></div><p id="text">one</p>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 320.0,
+            height: 180.0,
+        };
+        fn width_of(layout: &crate::layout::LayoutBox, node: NodeId) -> Option<f32> {
+            if layout.node == node {
+                return Some(layout.rect.width);
+            }
+            layout
+                .children
+                .iter()
+                .find_map(|child| width_of(child, node))
+        }
+        let target = browser
+            .document()
+            .unwrap()
+            .borrow()
+            .find_element_by_id("box")
+            .unwrap();
+        let width = |layout: &LayoutDocument| width_of(&layout.root, target).unwrap();
+        let first = browser.layout(viewport).expect("layout should build");
+        assert!(Rc::ptr_eq(&first, &browser.layout(viewport).unwrap()));
+        assert_eq!(width(&first), 50.0);
+        browser
+            .dispatch_at(viewport, 10.0, 10.0, "pointermove")
+            .expect("pointer move should dispatch");
+        let hovered = browser.layout(viewport).unwrap();
+        assert_eq!(width(&hovered), 90.0);
+        let document = browser.document().unwrap();
+        let text = document.borrow().find_element_by_id("text").unwrap();
+        document
+            .borrow_mut()
+            .set_attribute(text, "hidden", String::new());
+        assert!(!Rc::ptr_eq(&hovered, &browser.layout(viewport).unwrap()));
+    }
+
+    #[test]
+    fn persistent_storage_rewrites_its_file_only_when_the_store_changed() {
+        let storage_root = std::env::temp_dir().join(format!(
+            "ceri-engine-storage-unchanged-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the epoch")
+                .as_nanos()
+        ));
+        let file = storage_root.join("storage.bin");
+        let mut browser = Browser::new(bundle(
+            r##"<button id="go" style="display: block; width: 120px; height: 40px">save</button><script>
+                document.getElementById("go").addEventListener("click", () => {
+                    localStorage.setItem("token", "saved");
+                });
+            </script>"##,
+        ))
+        .with_storage_directory(&storage_root)
+        .expect("persistent storage should initialize");
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(file.is_file());
+        std::fs::remove_file(&file).expect("snapshot should be removable");
+        browser.pump().expect("idle pump should succeed");
+        assert!(!file.exists(), "an unchanged store should not be rewritten");
+        let viewport = Size {
+            width: 320.0,
+            height: 180.0,
+        };
+        assert!(
+            browser
+                .click_at(viewport, 10.0, 10.0)
+                .expect("click should dispatch")
+        );
+        assert!(file.is_file(), "a changed store should be written");
+        let saved = std::fs::read(&file).expect("snapshot should be readable");
+        assert!(saved.windows(5).any(|bytes| bytes == b"saved"));
+        drop(browser);
+        std::fs::remove_dir_all(&storage_root).expect("test storage should be cleaned up");
+    }
+
+    #[test]
     fn browser_dispatches_coordinate_clicks_to_positioned_overlays() {
         let mut browser = Browser::new(bundle(
             r##"<style>
@@ -7492,7 +7616,7 @@ A</div>
         resources
     }
 
-    fn image_page(source: &str, width: f32, height: f32) -> (Browser, LayoutDocument, Canvas) {
+    fn image_page(source: &str, width: f32, height: f32) -> (Browser, Rc<LayoutDocument>, Canvas) {
         let mut browser = Browser::new(image_bundle(source));
         assert_eq!(
             browser
