@@ -4344,9 +4344,9 @@ impl ScriptRuntime {
                 }
                 "checked" => self.set_element_checked(&handle, truthy),
                 "defaultChecked" => self.set_element_default_checked(&handle, truthy),
-                "disabled" => self.set_element_disabled(&handle, truthy),
-                "readOnly" => self.set_element_readonly(&handle, truthy),
-                "required" => self.set_element_required(&handle, truthy),
+                "disabled" => self.set_boolean_attribute(&handle, "disabled", truthy),
+                "readOnly" => self.set_boolean_attribute(&handle, "readonly", truthy),
+                "required" => self.set_boolean_attribute(&handle, "required", truthy),
                 "maxLength" => {
                     self.set_element_length_attribute(&handle, "maxlength", value.number()?)?
                 }
@@ -6120,29 +6120,14 @@ impl ScriptRuntime {
         true
     }
 
-    fn set_element_disabled(&mut self, handle: &ElementHandle, disabled: bool) -> bool {
-        let node = handle.id;
-        if disabled {
-            self.document
-                .borrow_mut()
-                .set_attribute(node, "disabled", String::new())
+    // a reflected boolean attribute, where clearing one that is absent still succeeds
+    fn set_boolean_attribute(&mut self, handle: &ElementHandle, name: &str, on: bool) -> bool {
+        let mut document = self.document.borrow_mut();
+        if on {
+            document.set_attribute(handle.id, name, String::new())
         } else {
-            self.document
-                .borrow_mut()
-                .remove_attribute(node, "disabled")
-        }
-    }
-
-    fn set_element_readonly(&mut self, handle: &ElementHandle, readonly: bool) -> bool {
-        let node = handle.id;
-        if readonly {
-            self.document
-                .borrow_mut()
-                .set_attribute(node, "readonly", String::new())
-        } else {
-            self.document
-                .borrow_mut()
-                .remove_attribute(node, "readonly")
+            document.remove_attribute(handle.id, name);
+            document.element(handle.id).is_some()
         }
     }
 
@@ -6173,19 +6158,6 @@ impl ScriptRuntime {
             self.normalize_select_selection(node, false);
         }
         changed
-    }
-
-    fn set_element_required(&mut self, handle: &ElementHandle, required: bool) -> bool {
-        let node = handle.id;
-        if required {
-            self.document
-                .borrow_mut()
-                .set_attribute(node, "required", String::new())
-        } else {
-            self.document
-                .borrow_mut()
-                .remove_attribute(node, "required")
-        }
     }
 
     fn set_element_length_attribute(
@@ -19227,6 +19199,33 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("1/2/2026, 3:04:05 PM|02/01/2026, 15:04:05|15:04|en-GB|en-GB|en-GB")
+        );
+    }
+
+    #[test]
+    fn clearing_an_absent_boolean_attribute_is_an_ordinary_write() {
+        let document = document("<main><button id='status'>idle</button></main>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const status = document.getElementById("status");
+                status.disabled = false;
+                status.required = false;
+                status.readOnly = false;
+                status.disabled = true;
+                status.disabled = true;
+                status.textContent = [status.disabled, status.hasAttribute("required")].join("|");
+                "#,
+            )
+            .expect("boolean property writes should not throw");
+        let status = document
+            .borrow()
+            .find_element_by_selector("#status")
+            .expect("status");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("true|false")
         );
     }
 
