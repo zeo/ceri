@@ -2598,6 +2598,15 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f
         paint_text_shadow(canvas, run, shadow, clip, offset);
     }
     paint_glyphs(canvas, run, clip, offset, false);
+    let stroke = run.decoration.stroke;
+    let fonts = crate::font::active_fonts();
+    if stroke.width > 0.0 && !fonts.is_builtin() {
+        let stroked = TextRun {
+            color: stroke.color.unwrap_or(run.color),
+            ..run.clone()
+        };
+        paint_outline_text(canvas, &stroked, clip, offset, &fonts, false, stroke.width);
+    }
     if run.decoration.has_lines() {
         paint_decoration_lines(canvas, run, clip, offset);
     }
@@ -2792,7 +2801,7 @@ fn paint_glyphs(
 ) {
     let fonts = crate::font::active_fonts();
     if !fonts.is_builtin() {
-        paint_outline_text(canvas, run, clip, offset, &fonts, silhouette);
+        paint_outline_text(canvas, run, clip, offset, &fonts, silhouette, 0.0);
         return;
     }
     let cell = text_advance(run.font_size) + run.letter_spacing;
@@ -2831,6 +2840,7 @@ fn paint_outline_text(
     offset: (f32, f32),
     fonts: &crate::font::FontSet,
     silhouette: bool,
+    stroke: f32,
 ) {
     let scale = canvas.scale();
     let device_size = run.font_size * scale;
@@ -2873,7 +2883,12 @@ fn paint_outline_text(
         } else {
             pen + offset
         };
-        if let Some(colored) = fonts.color_glyph(face, glyph.glyph, device_size, x, run.color) {
+        let colored = if stroke > 0.0 {
+            None
+        } else {
+            fonts.color_glyph(face, glyph.glyph, device_size, x, run.color)
+        };
+        if let Some(colored) = colored {
             canvas.blend_color_glyph(
                 x.floor() as i32 + colored.left,
                 baseline.round() as i32 + colored.top,
@@ -2882,7 +2897,9 @@ fn paint_outline_text(
                 silhouette,
                 device_clip,
             );
-        } else if let Some(bitmap) = fonts.glyph_bitmap(face, glyph.glyph, device_size, x) {
+        } else if let Some(bitmap) =
+            fonts.glyph_bitmap(face, glyph.glyph, device_size, x, stroke * scale)
+        {
             canvas.blend_coverage(
                 x.floor() as i32 + bitmap.left,
                 baseline.round() as i32 + bitmap.top,

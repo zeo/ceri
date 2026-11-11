@@ -412,15 +412,74 @@ impl FontFace {
 // signed-area accumulation, the same approach font-rs uses for antialiased coverage
 pub fn rasterize(outline: &Outline, scale: f32, subpixel_x: f32) -> Option<GlyphBitmap> {
     let mut segments = Vec::new();
-    let mut minimum = (f32::MAX, f32::MAX);
-    let mut maximum = (f32::MIN, f32::MIN);
     for contour in &outline.contours {
         flatten_contour(contour, scale, subpixel_x, &mut segments);
     }
+    coverage_bitmap(&segments)
+}
+
+// the outline stroked at a device width, as the union of a quad along every flattened edge
+// and a disc at every joint
+pub fn rasterize_stroke(
+    outline: &Outline,
+    scale: f32,
+    subpixel_x: f32,
+    width: f32,
+) -> Option<GlyphBitmap> {
+    let mut path = Vec::new();
+    for contour in &outline.contours {
+        flatten_contour(contour, scale, subpixel_x, &mut path);
+    }
+    let half = width / 2.0;
+    let mut segments = Vec::new();
+    for &(from, to) in &path {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = dx.hypot(dy);
+        if length > f32::EPSILON {
+            let normal = (-dy / length * half, dx / length * half);
+            push_polygon(
+                &mut segments,
+                &[
+                    (from.0 + normal.0, from.1 + normal.1),
+                    (to.0 + normal.0, to.1 + normal.1),
+                    (to.0 - normal.0, to.1 - normal.1),
+                    (from.0 - normal.0, from.1 - normal.1),
+                ],
+            );
+        }
+        let disc = (0..8)
+            .map(|step| {
+                let angle = step as f32 * std::f32::consts::FRAC_PI_4;
+                (to.0 + half * angle.cos(), to.1 + half * angle.sin())
+            })
+            .collect::<Vec<_>>();
+        push_polygon(&mut segments, &disc);
+    }
+    coverage_bitmap(&segments)
+}
+
+// winds every polygon the same way, so where they overlap their coverage adds up instead of
+// cancelling
+fn push_polygon(segments: &mut Vec<Segment>, points: &[(f32, f32)]) {
+    let edges = || {
+        points
+            .iter()
+            .copied()
+            .zip(points.iter().copied().cycle().skip(1))
+    };
+    let area: f32 = edges()
+        .map(|(from, to)| from.0 * to.1 - to.0 * from.1)
+        .sum();
+    segments.extend(edges().map(|edge| if area < 0.0 { (edge.1, edge.0) } else { edge }));
+}
+
+fn coverage_bitmap(segments: &[Segment]) -> Option<GlyphBitmap> {
+    let mut minimum = (f32::MAX, f32::MAX);
+    let mut maximum = (f32::MIN, f32::MIN);
     if segments.is_empty() {
         return None;
     }
-    for segment in &segments {
+    for segment in segments {
         for point in [segment.0, segment.1] {
             minimum.0 = minimum.0.min(point.0);
             minimum.1 = minimum.1.min(point.1);
@@ -437,7 +496,7 @@ pub fn rasterize(outline: &Outline, scale: f32, subpixel_x: f32) -> Option<Glyph
     }
 
     let mut area = vec![0.0_f32; width * height + 4];
-    for segment in &segments {
+    for segment in segments {
         accumulate_segment(
             &mut area,
             width,
@@ -636,6 +695,8 @@ struct GlyphKey {
     synthetic_italic: bool,
     // the pen's fraction of a pixel, in quarters
     quarter: u8,
+    // the device width of the outline's stroke, or zero for the filled glyph
+    stroke: u32,
 }
 
 // shaped runs kept before the cache is emptied
@@ -1063,16 +1124,18 @@ impl FontSet {
         style: FontStyle,
     ) -> Option<Rc<GlyphBitmap>> {
         let chosen = self.face_for(character, stack, style)?;
-        self.glyph_bitmap(&chosen, chosen.face.glyph_for(character), size, 0.0)
+        self.glyph_bitmap(&chosen, chosen.face.glyph_for(character), size, 0.0, 0.0)
     }
 
-    // a glyph rasterized at a size, at a pen position's fraction of a pixel (to a quarter)
+    // a glyph rasterized at a size, at a pen position's fraction of a pixel (to a quarter),
+    // filled, or stroked along its outline when the stroke width is above zero
     pub(crate) fn glyph_bitmap(
         &self,
         chosen: &ChosenFace,
         glyph: u16,
         size: f32,
         subpixel: f32,
+        stroke: f32,
     ) -> Option<Rc<GlyphBitmap>> {
         let quarter = ((subpixel.fract() * 4.0).round() as u8) % 4;
         let key = GlyphKey {
@@ -1082,6 +1145,7 @@ impl FontSet {
             synthetic_bold: chosen.synthetic_bold,
             synthetic_italic: chosen.synthetic_italic,
             quarter,
+            stroke: stroke.to_bits(),
         };
         if let Some(cached) = self.glyphs.borrow().get(&key) {
             return cached.clone();
@@ -1097,14 +1161,16 @@ impl FontSet {
                 }
             })
             .and_then(|outline| {
-                rasterize(
-                    &outline,
-                    size / chosen.face.units_per_em(),
-                    f32::from(quarter) / 4.0,
-                )
+                let scale = size / chosen.face.units_per_em();
+                let subpixel = f32::from(quarter) / 4.0;
+                if stroke > 0.0 {
+                    rasterize_stroke(&outline, scale, subpixel, stroke)
+                } else {
+                    rasterize(&outline, scale, subpixel)
+                }
             })
             .map(|bitmap| {
-                if chosen.synthetic_bold {
+                if chosen.synthetic_bold && stroke <= 0.0 {
                     embolden(bitmap, (size / 24.0).round().max(1.0) as usize)
                 } else {
                     bitmap
@@ -1135,6 +1201,7 @@ impl FontSet {
             synthetic_bold: false,
             synthetic_italic: false,
             quarter,
+            stroke: 0,
         };
         let color = [
             foreground.red,
@@ -1634,6 +1701,29 @@ mod tests {
         assert!(interior > 240, "glyph interior should be solid: {interior}");
         let outside = bitmap.coverage[bitmap.width - 1];
         assert_eq!(outside, 0, "pixels past the outline should stay empty");
+    }
+
+    #[test]
+    fn strokes_a_glyph_along_its_outline_and_leaves_the_inside_empty() {
+        let face = FontFace::parse(synthetic_font()).expect("synthetic font should parse");
+        let outline = face
+            .outline(face.glyph_for('A'))
+            .expect("glyph should have an outline");
+        let filled = rasterize(&outline, 20.0 / 1000.0, 0.0).expect("glyph should rasterize");
+        let stroked =
+            rasterize_stroke(&outline, 20.0 / 1000.0, 0.0, 2.0).expect("glyph should stroke");
+        // a two pixel stroke reaches one pixel past the outline on every side
+        assert_eq!(
+            (stroked.left, stroked.top),
+            (filled.left - 1, filled.top - 1)
+        );
+        let at = |x: i32, y: i32| {
+            stroked.coverage
+                [(y - stroked.top) as usize * stroked.width + (x - stroked.left) as usize]
+        };
+        let middle = filled.top + filled.height as i32 / 2;
+        assert_eq!(at(filled.left + 5, middle), 0, "the inside stays empty");
+        assert!(at(filled.left, middle) > 240, "the left edge is solid");
     }
 
     fn fixture(name: &str) -> FontFace {

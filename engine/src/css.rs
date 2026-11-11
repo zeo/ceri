@@ -85,6 +85,7 @@ pub struct TextDecoration {
     pub(crate) color: Option<Color>,
     pub(crate) thickness: Option<f32>,
     pub(crate) shadow: Option<TextShadow>,
+    pub(crate) stroke: TextStroke,
 }
 
 impl TextDecoration {
@@ -109,6 +110,46 @@ pub struct TextShadow {
     pub(crate) y: f32,
     pub(crate) blur: f32,
     pub(crate) color: Color,
+}
+
+// -webkit-text-stroke, drawn along each glyph's outline over its fill
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextStroke {
+    pub(crate) width: f32,
+    // none follows the text's color
+    pub(crate) color: Option<Color>,
+}
+
+fn parse_stroke_width(value: &str) -> Option<f32> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        other => parse_length(other)?
+            .resolve(0.0, 16.0)
+            .map(|width| width.max(0.0)),
+    }
+}
+
+fn parse_stroke_color(value: &str) -> Option<Option<Color>> {
+    if value.trim().eq_ignore_ascii_case("currentcolor") {
+        return Some(None);
+    }
+    parse_color(value).map(Some)
+}
+
+fn apply_text_stroke(stroke: &mut TextStroke, value: &str) {
+    let mut parsed = TextStroke::default();
+    for word in split_words(value) {
+        if let Some(width) = parse_stroke_width(word) {
+            parsed.width = width;
+        } else if let Some(color) = parse_stroke_color(word) {
+            parsed.color = color;
+        } else {
+            return;
+        }
+    }
+    *stroke = parsed;
 }
 
 // the decoration keywords of text-decoration and its longhands, added to what the element
@@ -822,15 +863,7 @@ impl Default for InheritedText {
             overflow_wrap: OverflowWrap::Normal,
             rtl: false,
             italic: false,
-            decoration: TextDecoration {
-                underline: false,
-                overline: false,
-                line_through: false,
-                style: DecorationStyle::Solid,
-                color: None,
-                thickness: None,
-                shadow: None,
-            },
+            decoration: TextDecoration::default(),
         }
     }
 }
@@ -4408,6 +4441,9 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "text-decoration-color",
     "text-decoration-thickness",
     "text-shadow",
+    "-webkit-text-stroke",
+    "-webkit-text-stroke-width",
+    "-webkit-text-stroke-color",
     "text-overflow",
     "font",
     "font-style",
@@ -4957,6 +4993,17 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             apply_decoration(&mut style.text_decoration, value, &parse_color)
         }
         "text-shadow" => style.text_decoration.shadow = parse_text_shadow(value),
+        "-webkit-text-stroke" => apply_text_stroke(&mut style.text_decoration.stroke, value),
+        "-webkit-text-stroke-width" => {
+            if let Some(width) = parse_stroke_width(value) {
+                style.text_decoration.stroke.width = width;
+            }
+        }
+        "-webkit-text-stroke-color" => {
+            if let Some(color) = parse_stroke_color(value) {
+                style.text_decoration.stroke.color = color;
+            }
+        }
         "text-overflow" => {
             style.text_overflow_ellipsis = value.trim().eq_ignore_ascii_case("ellipsis");
         }
