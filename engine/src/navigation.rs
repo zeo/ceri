@@ -2073,6 +2073,7 @@ impl Browser {
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         let handled = {
             let focused = if event == "pointerdown" {
+                page.runtime.note_pointer_press();
                 page.runtime
                     .focus_node(node)
                     .map_err(|error| NavigationError::Script(error.to_string()))?

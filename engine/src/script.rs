@@ -491,6 +491,8 @@ pub struct ScriptRuntime {
     // compiled inline on* attributes, keyed by their source so an edit recompiles
     attribute_handlers: HashMap<(NodeId, String), (String, Value)>,
     focused_element: Option<NodeId>,
+    // the last user input was a pointer press, so only text controls show focus
+    pointer_modality: bool,
     control_values: HashMap<NodeId, String>,
     control_checked: HashMap<NodeId, bool>,
     dirty_checked_controls: BTreeSet<NodeId>,
@@ -1512,6 +1514,7 @@ impl ScriptRuntime {
             event_handlers: HashMap::new(),
             attribute_handlers: HashMap::new(),
             focused_element: None,
+            pointer_modality: false,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
             dirty_checked_controls: BTreeSet::new(),
@@ -2083,17 +2086,22 @@ impl ScriptRuntime {
     }
 
     pub fn click_node(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        self.click(node, true)
+    }
+
+    // element.click() runs activation without moving focus, as browsers do
+    fn click(&mut self, node: NodeId, focus: bool) -> Result<bool, ScriptError> {
         if self.is_disabled(node) {
             return Ok(false);
         }
-        let focused = self.focus_node(node)?;
+        let focused = focus && self.focus_node(node)?;
         let dispatch = self.dispatch_event(node, "click")?;
         self.drain_microtasks()?;
         if !dispatch.default_prevented
             && self.pending_navigation.is_none()
             && let Some(control) = self.label_activation_control(node)
         {
-            let activated = self.click_node(control)?;
+            let activated = self.click(control, focus)?;
             return Ok(dispatch.handled || focused || activated);
         }
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
@@ -2514,6 +2522,7 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
+        self.note_key_press(key);
         let Some(focused) = self.focused_element else {
             return Ok(false);
         };
@@ -2794,6 +2803,16 @@ impl ScriptRuntime {
         self.set_text_selection(node, start, end, direction)
     }
 
+    pub(crate) fn note_pointer_press(&mut self) {
+        self.pointer_modality = true;
+    }
+
+    fn note_key_press(&mut self, key: &str) {
+        if !matches!(key, "Shift" | "Control" | "Alt" | "Meta") {
+            self.pointer_modality = false;
+        }
+    }
+
     pub(crate) fn focused_text_control(&self) -> bool {
         self.focused_element
             .as_ref()
@@ -2806,6 +2825,7 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<EventDispatch, ScriptError> {
+        self.note_key_press(key);
         let target = self.focused_element.unwrap_or_else(|| {
             let document = self.document.borrow();
             document.document_element().unwrap_or(document.root())
@@ -2819,6 +2839,9 @@ impl ScriptRuntime {
         let mut state = StyleState {
             hovered: hovered_path,
             focused: self.focused_element,
+            focus_visible: self
+                .focused_element
+                .is_some_and(|node| !self.pointer_modality || self.is_text_control(node)),
             active: self.active_node,
             scroll_offsets: self.scroll_offsets.clone(),
             control_values: self.control_values.clone().into_iter().collect(),
@@ -8385,7 +8408,7 @@ impl ScriptRuntime {
                 ))
             }
             Builtin::ElementClick(handle) => {
-                self.click_node(handle.id)?;
+                self.click(handle.id, false)?;
                 Ok(Value::Undefined)
             }
             Builtin::ElementAppendChild(parent) => {
@@ -19200,6 +19223,46 @@ mod tests {
             document.borrow().element_text_content(status).as_deref(),
             Some("1/2/2026, 3:04:05 PM|02/01/2026, 15:04:05|15:04|en-GB|en-GB|en-GB")
         );
+    }
+
+    #[test]
+    fn focus_shows_after_keys_and_script_but_not_after_a_pointer_press_on_a_button() {
+        let document = document(
+            r#"<html><body><button id="a">A</button><button id="b">B</button><input id="name"></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let [a, b, name] =
+            ["a", "b", "name"].map(|id| document.borrow().find_element_by_id(id).expect("element"));
+        let visible = |runtime: &ScriptRuntime| {
+            let state = runtime.style_state(None);
+            state.focus_visible.then_some(state.focused).flatten()
+        };
+        runtime
+            .execute(r#"document.getElementById("a").click();"#)
+            .expect("click");
+        assert_eq!(runtime.style_state(None).focused, None);
+        runtime.focus_node(a).expect("script focus");
+        assert_eq!(visible(&runtime), Some(a));
+        runtime.note_pointer_press();
+        runtime.focus_node(b).expect("pointer focus");
+        assert_eq!(
+            (runtime.style_state(None).focused, visible(&runtime)),
+            (Some(b), None)
+        );
+        runtime
+            .focus_node(name)
+            .expect("pointer focus on a text field");
+        assert_eq!(visible(&runtime), Some(name));
+        runtime.note_pointer_press();
+        runtime.focus_node(a).expect("pointer focus");
+        runtime
+            .key_down_with_modifiers("Shift", KeyModifiers::default())
+            .expect("shift");
+        assert_eq!(visible(&runtime), None);
+        runtime
+            .key_down_with_modifiers("Tab", KeyModifiers::default())
+            .expect("tab");
+        assert_eq!(visible(&runtime), Some(b));
     }
 
     #[test]

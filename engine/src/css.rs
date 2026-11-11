@@ -1061,6 +1061,7 @@ pub(crate) struct TransitionState {
 pub(crate) struct StyleState {
     pub(crate) hovered: Option<NodeId>,
     pub(crate) focused: Option<NodeId>,
+    pub(crate) focus_visible: bool,
     // the element the primary pointer button is pressed on
     pub(crate) active: Option<NodeId>,
     pub(crate) checked: BTreeSet<NodeId>,
@@ -2940,6 +2941,7 @@ enum PseudoClass {
     Root,
     Hover,
     Focus,
+    FocusVisible,
     FocusWithin,
     Active,
     Checked,
@@ -3272,6 +3274,7 @@ impl PseudoClass {
             ),
             Self::Hover => state.is_hovered(document, node),
             Self::Focus => state.focused == Some(node),
+            Self::FocusVisible => state.focus_visible && state.focused == Some(node),
             Self::Checked => {
                 element.name == "input"
                     && element.attr("type").is_some_and(|kind| {
@@ -3578,7 +3581,8 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                         "hover" => PseudoClass::Hover,
                         // focus moved by the keyboard or by script shows a ring, so every
                         // focus is visible focus here
-                        "focus" | "focus-visible" => PseudoClass::Focus,
+                        "focus" => PseudoClass::Focus,
+                        "focus-visible" => PseudoClass::FocusVisible,
                         "focus-within" => PseudoClass::FocusWithin,
                         "active" => PseudoClass::Active,
                         "checked" => PseudoClass::Checked,
