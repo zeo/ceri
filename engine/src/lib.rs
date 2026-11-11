@@ -70,4 +70,7 @@ pub use navigation::{
 pub use paint::Canvas;
 pub use script::{HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
 #[cfg(feature = "windowed")]
-pub use window::{WindowConfig, WindowContext, WindowControl, run as run_window};
+pub use window::{
+    Lifecycle, Monitor, NativeHandle, WindowAction, WindowConfig, WindowContext, WindowControl,
+    WindowState, run as run_window, run_with as run_window_with,
+};
