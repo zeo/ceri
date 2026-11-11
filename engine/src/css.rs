@@ -1032,7 +1032,7 @@ pub(crate) enum AlignItems {
     FlexStart,
     Center,
     FlexEnd,
-    // first-baseline alignment, which lines items up by their tops for now
+    // first-baseline alignment
     Baseline,
 }
 

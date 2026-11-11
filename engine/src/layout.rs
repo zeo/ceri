@@ -3112,6 +3112,26 @@ fn align_offset(align: AlignItems, available: f32, item: f32) -> f32 {
     }
 }
 
+// how far below its border-box top a box's first baseline sits; a box with no line of text
+// takes its bottom edge
+fn baseline_offset(layout: &LayoutBox) -> f32 {
+    first_baseline(layout).map_or(layout.rect.height, |baseline| baseline - layout.rect.y)
+}
+
+fn first_baseline(layout: &LayoutBox) -> Option<f32> {
+    let fonts = crate::font::active_fonts();
+    let own = layout
+        .text
+        .iter()
+        .map(|run| run.y + fonts.ascent(run.font_stack, run.font_size));
+    let nested = layout
+        .children
+        .iter()
+        .filter(|child| !child.position.is_out_of_flow())
+        .filter_map(first_baseline);
+    own.chain(nested).reduce(f32::min)
+}
+
 // resolves flexible lengths for one line, as CSS Flexbox section 9.7 describes
 fn resolve_flexible_lengths(items: &mut [&mut FlexItem<'_>], available: f32, gaps: f32, row: bool) {
     let used: f32 = items
@@ -3708,6 +3728,13 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             0.0
         };
         let (start, between) = justify_offsets(style.justify_content, free, line.len());
+        // in a row, baseline-aligned items share the lowest of their baselines
+        let line_baseline = line
+            .iter()
+            .map(|&index| &items[index])
+            .filter(|item| row && item.align(style.align_items) == AlignItems::Baseline)
+            .filter_map(|item| Some(item.margin.top + baseline_offset(item.layout.as_ref()?)))
+            .fold(0.0_f32, f32::max);
         let mut cursor = start;
         for &index in line {
             let item = &mut items[index];
@@ -3749,6 +3776,9 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 (true, true) => ((cross_size - outer_cross) / 2.0).max(0.0),
                 (true, false) => (cross_size - outer_cross).max(0.0),
                 (false, true) => 0.0,
+                (false, false) if row && item.align(style.align_items) == AlignItems::Baseline => {
+                    line_baseline - cross_start_margin - baseline_offset(&child)
+                }
                 (false, false) => {
                     align_offset(item.align(style.align_items), cross_size, outer_cross)
                 }
@@ -4215,6 +4245,16 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         justify_for_content(style.align_content),
     );
 
+    // baseline-aligned items in a row share the lowest of their baselines
+    let mut row_baselines = vec![0.0_f32; row_sizes.len()];
+    for item in &items {
+        if let Some(child) = &item.layout
+            && align(item) == AlignItems::Baseline
+        {
+            let row = &mut row_baselines[item.area[1].0];
+            *row = row.max(item.margin.top + baseline_offset(child));
+        }
+    }
     let mut children = Vec::with_capacity(items.len());
     for item in &mut items {
         let Some(mut child) = item.layout.take() else {
@@ -4237,8 +4277,11 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let free_y = cell_height - child.rect.height - item.margin.top - item.margin.bottom;
         let desired_x =
             content_x + cell_x + item.margin.left + align_offset(justify(item), free_x, 0.0);
-        let desired_y =
-            content_y + cell_y + item.margin.top + align_offset(item_align, free_y, 0.0);
+        let desired_y = if item_align == AlignItems::Baseline {
+            content_y + cell_y + row_baselines[item.area[1].0] - baseline_offset(&child)
+        } else {
+            content_y + cell_y + item.margin.top + align_offset(item_align, free_y, 0.0)
+        };
         let offset = (desired_x - child.rect.x, desired_y - child.rect.y);
         translate_layout_box(&mut child, offset.0, offset.1);
         children.push(child);
@@ -8848,6 +8891,39 @@ mod tests {
             assert_eq!(
                 widths(display),
                 (60.0, 50.0 - SCROLLBAR_THICKNESS, true, false),
+                "{display}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_alignment_lines_up_first_baselines_in_grid_and_flex_rows() {
+        for display in ["grid; grid-template-columns: auto auto", "flex"] {
+            let markup = format!(
+                "<style>#row {{ display: {display}; align-items: baseline; margin: 0; }} p {{ margin: 0; }} #big {{ font-size: 40px; }} #small {{ font-size: 10px; margin-top: 3px; }}</style><div id='row'><p id='big'>Big</p><p id='small'>small</p></div>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 300.0,
+                    height: 200.0,
+                },
+            );
+            let row = &result.root.children[0];
+            let baselines: Vec<f32> = row
+                .children
+                .iter()
+                .map(|child| first_baseline(child).expect("items should hold text"))
+                .collect();
+            assert!(
+                (baselines[0] - baselines[1]).abs() < 0.01,
+                "{display}: {baselines:?}"
+            );
+            assert!(
+                row.children[1].rect.y > row.children[0].rect.y + 3.0,
                 "{display}"
             );
         }
