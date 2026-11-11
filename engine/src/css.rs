@@ -1138,6 +1138,8 @@ pub(crate) struct StyleState {
     pub(crate) animation_starts: BTreeMap<NodeId, u64>,
     // query containers and their content sizes from the last layout
     pub(crate) container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
+    // modal dialogs above the page, bottom first
+    pub(crate) top_layer: Vec<NodeId>,
 }
 
 impl StyleState {
@@ -1392,6 +1394,8 @@ pub(crate) struct Style {
     pub vertical_align: VerticalAlign,
     pub width: Length,
     pub height: Length,
+    // width and height: fit-content, which leave the lengths auto for everything else
+    pub(crate) fit_content: [bool; 2],
     pub min_width: Length,
     pub max_width: Length,
     pub min_height: Length,
@@ -1578,6 +1582,7 @@ impl Style {
             },
             width: Length::Auto,
             height: Length::Auto,
+            fit_content: [false; 2],
             min_width: Length::Auto,
             max_width: Length::Auto,
             min_height: Length::Auto,
@@ -3036,6 +3041,8 @@ pub(crate) enum PseudoElement {
     ScrollbarTrack,
     ScrollbarThumb,
     ScrollbarCorner,
+    // the box a modal dialog lays over the page beneath it
+    Backdrop,
     // a pseudo-element the engine does not draw, such as ::placeholder; its rules parse and
     // never apply
     Unrendered,
@@ -3055,6 +3062,7 @@ impl PseudoElement {
             Self::ScrollbarTrack => "::-webkit-scrollbar-track",
             Self::ScrollbarThumb => "::-webkit-scrollbar-thumb",
             Self::ScrollbarCorner => "::-webkit-scrollbar-corner",
+            Self::Backdrop => "::backdrop",
             Self::Unrendered => "::unrendered",
         }
     }
@@ -3174,6 +3182,7 @@ enum PseudoClass {
     Required,
     Optional,
     Defined,
+    Modal,
     Not(Vec<Selector>),
     Is(Vec<Selector>),
     // as :is() but with no specificity
@@ -3590,6 +3599,7 @@ impl PseudoClass {
                     && (element.attr("required").is_some() == matches!(self, Self::Required))
             }
             Self::Defined => true,
+            Self::Modal => state.top_layer.contains(&node),
             Self::Is(selectors) | Self::Where(selectors) => selectors
                 .iter()
                 .any(|selector| selector.matches(document, node, None, state)),
@@ -3726,8 +3736,8 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                     "-webkit-scrollbar-track" => Some(PseudoElement::ScrollbarTrack),
                     "-webkit-scrollbar-thumb" => Some(PseudoElement::ScrollbarThumb),
                     "-webkit-scrollbar-corner" => Some(PseudoElement::ScrollbarCorner),
-                    "backdrop"
-                    | "first-line"
+                    "backdrop" => Some(PseudoElement::Backdrop),
+                    "first-line"
                     | "first-letter"
                     | "file-selector-button"
                     | "cue"
@@ -3829,6 +3839,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                         "required" => PseudoClass::Required,
                         "optional" => PseudoClass::Optional,
                         "defined" => PseudoClass::Defined,
+                        "modal" => PseudoClass::Modal,
                         _ => return Err(format!("unsupported pseudo-class: :{name}")),
                     }
                 };
@@ -4888,8 +4899,14 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
             style.overflow_x = from.overflow_x;
             style.overflow_y = from.overflow_y;
         }
-        "width" => style.width = from.width,
-        "height" => style.height = from.height,
+        "width" => {
+            style.width = from.width;
+            style.fit_content[0] = from.fit_content[0];
+        }
+        "height" => {
+            style.height = from.height;
+            style.fit_content[1] = from.fit_content[1];
+        }
         "min-width" => style.min_width = from.min_width,
         "max-width" => style.max_width = from.max_width,
         "min-height" => style.min_height = from.min_height,
@@ -5419,7 +5436,9 @@ fieldset { margin-left: 2px; margin-right: 2px; padding: 0.35em 0.75em 0.625em; 
 legend { padding-left: 2px; padding-right: 2px }
 iframe { border: 2px inset }
 dialog:not([open]), input[type="hidden" i], datalist, template { display: none }
-dialog { position: absolute; left: 0; right: 0; margin: auto; border: solid; padding: 1em; background-color: white; color: black }
+dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 1em; background-color: white; color: black }
+dialog:modal { position: fixed; overflow: auto; top: 0; bottom: 0; max-width: calc(100% - 6px - 2em); max-height: calc(100% - 6px - 2em); user-select: text; visibility: visible }
+dialog:modal::backdrop { display: block; position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.1) }
 input, button, select, textarea { font-size: 13.333px; font-family: sans-serif; color: black; letter-spacing: normal; text-transform: none; text-align: start; margin: 0 }
 input, textarea, select, button, meter, progress { display: inline-block; cursor: default }
 input:not([type]), input[type="text" i], input[type="search" i], input[type="email" i], input[type="url" i], input[type="tel" i], input[type="password" i], input[type="number" i], input[type="date" i], input[type="datetime-local" i], input[type="month" i], input[type="week" i], input[type="time" i], textarea {
@@ -5750,8 +5769,16 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             style.list_style_type = list_type.unwrap_or(ListStyleType::Disc);
             style.list_inside = inside;
         }
-        "width" => style.width = parse_length(value).unwrap_or(Length::Auto),
-        "height" => style.height = parse_length(value).unwrap_or(Length::Auto),
+        "width" | "height" => {
+            let axis = usize::from(property == "height");
+            style.fit_content[axis] = value.trim().eq_ignore_ascii_case("fit-content");
+            let length = parse_length(value).unwrap_or(Length::Auto);
+            if axis == 0 {
+                style.width = length;
+            } else {
+                style.height = length;
+            }
+        }
         // none and auto both read as no limit
         "min-width" => style.min_width = parse_length(value).unwrap_or(Length::Auto),
         "max-width" => style.max_width = parse_length(value).unwrap_or(Length::Auto),

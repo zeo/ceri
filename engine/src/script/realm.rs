@@ -137,6 +137,8 @@ pub(super) enum Native {
     XhrDeliver(u32, u64),
     // an img reporting the outcome of the request it started in this generation
     ImageDeliver(crate::dom::NodeId, u64),
+    // a dialog reporting that it closed
+    DialogClose(crate::dom::NodeId),
     CustomElements(super::custom::RegistryMethod),
 }
 
@@ -2334,6 +2336,7 @@ impl ScriptRuntime {
             Native::CustomElements(method) => self.call_registry(method, arguments),
             Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
             Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
+            Native::DialogClose(node) => self.deliver_dialog_close(node),
             Native::XhrConstructor => Err(self
                 .type_error("Failed to construct 'XMLHttpRequest': Please use the 'new' operator")),
             Native::ObserverConstructor(kind) => Err(self.type_error(format!(

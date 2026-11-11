@@ -1724,17 +1724,14 @@ impl ScriptRuntime {
         handled
     }
 
-    // a keyup at the focused element, or the document element when nothing has focus
+    // a keyup at the focused element, or the body when nothing has focus
     pub(crate) fn key_up(
         &mut self,
         key: &str,
         code: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
-        let target = self
-            .focused_element
-            .or_else(|| self.document.borrow().document_element());
-        let Some(target) = target else {
+        let Some(target) = self.key_target() else {
             return Ok(false);
         };
         let fields = HostEventFields {

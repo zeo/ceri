@@ -466,6 +466,18 @@ static INTERFACES: &[Interface] = &[
         ],
     },
     Interface {
+        name: "HTMLDialogElement",
+        parent: "HTMLElement",
+        members: &[
+            ("open", Flag("open")),
+            ("returnValue", ReadWrite),
+            ("show", Method(0)),
+            ("showModal", Method(0)),
+            ("close", Method(0)),
+            ("requestClose", Method(0)),
+        ],
+    },
+    Interface {
         name: "HTMLTemplateElement",
         parent: "HTMLElement",
         members: &[("content", ReadOnly)],
@@ -785,6 +797,7 @@ pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
                 "button" => "HTMLButtonElement",
                 "form" => "HTMLFormElement",
                 "canvas" => "HTMLCanvasElement",
+                "dialog" => "HTMLDialogElement",
                 "template" => "HTMLTemplateElement",
                 "a" => "HTMLAnchorElement",
                 "img" => "HTMLImageElement",
@@ -1251,6 +1264,10 @@ impl ScriptRuntime {
             }
             ("width" | "height", Access::Set) => {
                 self.canvas_element_member(handle, member.name(), Some(first))?
+            }
+            ("returnValue", _)
+            | ("show" | "showModal" | "close" | "requestClose", Access::Call) => {
+                self.dialog_member(handle, member.name(), member.access, first)?
             }
             ("toDataURL" | "toBlob", Access::Call) => {
                 self.export_canvas(node, member.name(), arguments)?

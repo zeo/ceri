@@ -694,7 +694,9 @@ impl<'a> Subject<'a> {
         for &child in self.document.flat_children(self.node).iter() {
             match self.document.kind(child) {
                 Some(NodeKind::Text(text)) => items.push(Child::Text(Some(child), text)),
-                Some(NodeKind::Element(_)) => {
+                Some(NodeKind::Element(_))
+                    if !TOP_LAYER.with(|layer| layer.borrow().contains(&child)) =>
+                {
                     items.push(Child::Element(Subject::new(self.document, child)))
                 }
                 _ => {}
@@ -919,6 +921,8 @@ thread_local! {
     // query containers sized by the most recent layout on this thread
     static CONTAINERS: std::cell::RefCell<std::collections::BTreeMap<NodeId, ContainerSize>> =
         std::cell::RefCell::default();
+    // the top layer of the layout in progress, whose elements leave their place in the tree
+    static TOP_LAYER: std::cell::RefCell<Vec<NodeId>> = std::cell::RefCell::default();
 }
 
 // the query containers the last layout sized, for container queries in the next style pass
@@ -933,6 +937,7 @@ pub fn layout_with_state(
     style_state: &StyleState,
 ) -> LayoutDocument {
     CONTAINERS.with(|containers| containers.borrow_mut().clear());
+    TOP_LAYER.with(|layer| layer.borrow_mut().clone_from(&style_state.top_layer));
     let _viewport_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
         viewport,
         root_font_size: 16.0,
@@ -1136,18 +1141,53 @@ fn layout_document_children(
             children.push(child_box);
         }
     }
-    append_positioned_nodes(
-        &mut children,
-        positioned,
-        PositionedLayoutContext {
-            containing_block: viewport_block,
-            viewport: viewport_block,
-            viewport_size: viewport,
-            parent: root_parent,
-            stylesheet,
-            style_state,
-        },
-    );
+    let positioned_context = PositionedLayoutContext {
+        containing_block: viewport_block,
+        viewport: viewport_block,
+        viewport_size: viewport,
+        parent: root_parent,
+        stylesheet,
+        style_state,
+    };
+    append_positioned_nodes(&mut children, positioned, positioned_context);
+    // the top layer paints over everything, each element over its backdrop, inheriting from
+    // where it sits in the tree but not its ancestors' opacity
+    let inherited = |node: Option<NodeId>| {
+        node.and_then(|node| stylesheet.computed_style(document, node, style_state))
+            .map_or(root_parent, |(style, font_size)| ParentStyle {
+                font_size,
+                color: style.color,
+                weight: style.font_weight,
+                text: inherited_text(&style),
+                opacity: 1.0,
+            })
+    };
+    for &node in &style_state.top_layer {
+        let backdrop = Subject {
+            document,
+            node,
+            generated: Some((PseudoElement::Backdrop, "")),
+        };
+        let mut layer = Vec::new();
+        for (subject, parent) in [
+            (backdrop, inherited(Some(node))),
+            (
+                Subject::new(document, node),
+                inherited(document.parent(node)),
+            ),
+        ] {
+            let context = PositionedLayoutContext {
+                parent,
+                ..positioned_context
+            };
+            append_positioned_nodes(&mut layer, vec![subject], context);
+        }
+        for layout in &mut layer {
+            layout.z_index = i32::MAX;
+            layout.creates_stacking_context = true;
+        }
+        children.append(&mut layer);
+    }
     children
 }
 
@@ -1917,6 +1957,46 @@ fn position_layout_box(
     font_size: f32,
 ) {
     let inset = resolve_insets(style.inset, containing, font_size);
+    // with both insets set, auto margins share what the box leaves between them, the start
+    // margin taking none of a shortfall inline
+    if mode == LayoutMode::Fixed || mode == LayoutMode::Absolute {
+        let auto = |length: Length| length == Length::Auto;
+        if let (Some(left), Some(right)) = (inset.left, inset.right) {
+            let free = containing.width
+                - left
+                - right
+                - layout.rect.width
+                - layout.margin.left
+                - layout.margin.right;
+            match (auto(style.margin.left), auto(style.margin.right)) {
+                (true, true) if free < 0.0 => layout.margin.right += free,
+                (true, true) => {
+                    layout.margin.left += free / 2.0;
+                    layout.margin.right += free / 2.0;
+                }
+                (true, false) => layout.margin.left += free,
+                (false, true) => layout.margin.right += free,
+                (false, false) => {}
+            }
+        }
+        if let (Some(top), Some(bottom)) = (inset.top, inset.bottom) {
+            let free = containing.height
+                - top
+                - bottom
+                - layout.rect.height
+                - layout.margin.top
+                - layout.margin.bottom;
+            match (auto(style.margin.top), auto(style.margin.bottom)) {
+                (true, true) => {
+                    layout.margin.top += free / 2.0;
+                    layout.margin.bottom += free / 2.0;
+                }
+                (true, false) => layout.margin.top += free,
+                (false, true) => layout.margin.bottom += free,
+                (false, false) => {}
+            }
+        }
+    }
     let x = if let Some(left) = inset.left {
         containing.x + left + layout.margin.left
     } else if let Some(right) = inset.right {
@@ -2586,10 +2666,13 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let explicit_height = resolve_height(style.height, containing_height, font_size)
         .map(inner_height)
         .or_else(|| {
-            (mode != LayoutMode::Flow && inset.top.is_some() && inset.bottom.is_some()).then(|| {
+            let stretch = mode != LayoutMode::Flow && !style.fit_content[1];
+            (stretch && inset.top.is_some() && inset.bottom.is_some()).then(|| {
                 (position_block.height
                     - inset.top.unwrap_or(0.0)
                     - inset.bottom.unwrap_or(0.0)
+                    - margin.top
+                    - margin.bottom
                     - vertical_inner)
                     .max(0.0)
             })
@@ -2600,7 +2683,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .resolve(containing_width, font_size)
         .map(inner_width)
         .or_else(|| {
-            (mode != LayoutMode::Flow && inset.left.is_some() && inset.right.is_some()).then(|| {
+            let stretch = mode != LayoutMode::Flow && !style.fit_content[0];
+            (stretch && inset.left.is_some() && inset.right.is_some()).then(|| {
                 (position_block.width
                     - inset.left.unwrap_or(0.0)
                     - inset.right.unwrap_or(0.0)
@@ -2616,8 +2700,9 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         })
         .or(control_size.0)
         .or_else(|| {
-            // an out-of-flow box with an auto width shrinks to fit the room its insets leave
-            (mode != LayoutMode::Flow).then(|| {
+            // an out-of-flow box with an auto width shrinks to fit the room its insets leave,
+            // as fit-content does in flow
+            (mode != LayoutMode::Flow || style.fit_content[0]).then(|| {
                 let measure = |minimum: bool| {
                     intrinsic_width(
                         MaxContentInput {
@@ -2631,8 +2716,11 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                         minimum,
                     )
                 };
-                let room =
-                    position_block.width - inset.left.unwrap_or(0.0) - inset.right.unwrap_or(0.0);
+                let room = if mode == LayoutMode::Flow {
+                    containing_width
+                } else {
+                    position_block.width - inset.left.unwrap_or(0.0) - inset.right.unwrap_or(0.0)
+                };
                 measure(false).min(room.max(measure(true))) - horizontal_extras
             })
         })
@@ -10526,5 +10614,40 @@ mod tests {
         let canvas = result.paint();
         let pixel = &canvas.rgba_pixels()[(10 * canvas.width() as usize + 10) * 4..];
         assert_eq!(&pixel[..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn modal_dialogs_center_over_a_backdrop_and_fit_their_content() {
+        let document = Document::parse_markup(
+            r#"<html><body><p>page</p><dialog id="box" open><div style="width: 200px; height: 50px"></div></dialog></body></html>"#,
+        )
+        .expect("document should parse");
+        let dialog = document.find_element_by_id("box").expect("dialog");
+        let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
+        let state = StyleState {
+            top_layer: vec![dialog],
+            ..StyleState::default()
+        };
+        let viewport = Size {
+            width: 800.0,
+            height: 600.0,
+        };
+        let layout = layout_with_state(&document, &stylesheet, viewport, &state);
+        // 200 by 50 of content, 1em of padding and a medium border on each side
+        let card = find_box(&layout.root, "dialog").expect("dialog box");
+        assert_eq!(
+            (card.rect.x, card.rect.y, card.rect.width, card.rect.height),
+            (281.0, 256.0, 238.0, 88.0)
+        );
+        let backdrop = find_box(&layout.root, "::backdrop").expect("backdrop box");
+        assert_eq!(
+            (
+                backdrop.rect.x,
+                backdrop.rect.y,
+                backdrop.rect.width,
+                backdrop.rect.height
+            ),
+            (0.0, 0.0, 800.0, 600.0)
+        );
     }
 }

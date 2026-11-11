@@ -8,6 +8,7 @@ mod compiler;
 mod console;
 mod custom;
 mod dates;
+mod dialogs;
 mod encoding;
 mod events;
 mod geometry;
@@ -535,6 +536,11 @@ pub struct ScriptRuntime {
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
     image_loads: HashMap<NodeId, images::ImageLoad>,
+    dialogs: HashMap<NodeId, dialogs::DialogState>,
+    // modal dialogs in the order they were shown, closed or removed ones included
+    top_layer: Vec<NodeId>,
+    // a press since the last cancel script was allowed to refuse
+    history_activation: bool,
     custom_definitions: Vec<custom::Definition>,
     // custom elements by the index of their definition
     custom_states: HashMap<NodeId, usize>,
@@ -1547,6 +1553,9 @@ impl ScriptRuntime {
             xhr: HashMap::new(),
             images: RefCell::default(),
             image_loads: HashMap::new(),
+            dialogs: HashMap::new(),
+            top_layer: Vec::new(),
+            history_activation: false,
             custom_definitions: Vec::new(),
             custom_states: HashMap::new(),
             construction_stack: Vec::new(),
@@ -1811,6 +1820,8 @@ impl ScriptRuntime {
         self.scroll_offsets.retain(|node, _| !gone(*node));
         self.canvas_contexts.retain(|node, _| !gone(*node));
         self.image_loads.retain(|node, _| !gone(*node));
+        self.dialogs.retain(|node, _| !gone(*node));
+        self.top_layer.retain(|node| !gone(*node));
     }
 
     fn remove_event_listeners_for_signal(&mut self, signal: &AbortSignalHandle) {
@@ -2161,7 +2172,15 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn focus_node(&mut self, node: NodeId) -> Result<bool, ScriptError> {
-        if !self.is_focusable(node) || self.focused_element.as_ref() == Some(&node) {
+        if !self.is_focusable(node) {
+            return Ok(false);
+        }
+        self.move_focus(node)
+    }
+
+    // focus without the focusable check, for a dialog that takes focus itself
+    fn move_focus(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        if self.focused_element == Some(node) {
             return Ok(false);
         }
         if self.composition.is_some() {
@@ -2214,6 +2233,11 @@ impl ScriptRuntime {
         let mut order = 0usize;
         let tree = self.document.borrow().accessibility_tree();
         collect_sequential_focus_nodes(&tree, &mut order, &mut entries, &self.document);
+        // a modal dialog keeps tab inside itself
+        if let Some(&dialog) = self.modal_dialogs().last() {
+            let document = self.document.borrow();
+            entries.retain(|&(_, _, node)| document.is_inclusive_ancestor(dialog, node));
+        }
         entries.sort_by_key(|(tabindex, order, _)| {
             if *tabindex > 0 {
                 (0, *tabindex, *order)
@@ -2524,7 +2548,7 @@ impl ScriptRuntime {
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
         self.note_key_press(key);
-        let Some(focused) = self.focused_element else {
+        let Some(focused) = self.key_target() else {
             return Ok(false);
         };
         let dispatch =
@@ -2532,6 +2556,14 @@ impl ScriptRuntime {
         self.drain_microtasks()?;
         if self.composition.is_some() {
             return Ok(dispatch.handled);
+        }
+        if key == "Escape"
+            && !dispatch.default_prevented
+            && let Some(&dialog) = self.modal_dialogs().last()
+        {
+            self.request_dialog_close(dialog, None)?;
+            self.drain_microtasks()?;
+            return Ok(true);
         }
         if key == "Tab" && !modifiers.control && !modifiers.alt && !modifiers.meta {
             if dispatch.default_prevented {
@@ -2805,12 +2837,25 @@ impl ScriptRuntime {
 
     pub(crate) fn note_pointer_press(&mut self) {
         self.pointer_modality = true;
+        self.history_activation = true;
     }
 
     fn note_key_press(&mut self, key: &str) {
         if !matches!(key, "Shift" | "Control" | "Alt" | "Meta") {
             self.pointer_modality = false;
         }
+        // escape is the one key that doesn't count as an activation
+        if key != "Escape" {
+            self.history_activation = true;
+        }
+    }
+
+    // keys go to the focused element, or the body when nothing has focus
+    pub(crate) fn key_target(&self) -> Option<NodeId> {
+        let document = self.document.borrow();
+        self.focused_element
+            .or_else(|| document.body())
+            .or_else(|| document.document_element())
     }
 
     pub(crate) fn focused_text_control(&self) -> bool {
@@ -2826,10 +2871,9 @@ impl ScriptRuntime {
         modifiers: KeyModifiers,
     ) -> Result<EventDispatch, ScriptError> {
         self.note_key_press(key);
-        let target = self.focused_element.unwrap_or_else(|| {
-            let document = self.document.borrow();
-            document.document_element().unwrap_or(document.root())
-        });
+        let target = self
+            .key_target()
+            .unwrap_or_else(|| self.document.borrow().root());
         let dispatch = self.dispatch_event_with_modifiers(target, "keydown", key, "", modifiers)?;
         self.drain_microtasks()?;
         Ok(dispatch)
@@ -2839,6 +2883,7 @@ impl ScriptRuntime {
         let mut state = StyleState {
             hovered: hovered_path,
             focused: self.focused_element,
+            top_layer: self.modal_dialogs(),
             focus_visible: self
                 .focused_element
                 .is_some_and(|node| !self.pointer_modality || self.is_text_control(node)),
@@ -17095,6 +17140,84 @@ mod tests {
             "an unreachable subtree is freed"
         );
         assert!(!document.contains(dropped_text));
+    }
+
+    #[test]
+    fn modal_dialogs_take_focus_keep_tab_inside_and_close_on_escape_unless_canceled() {
+        let document = document(
+            r#"<html><body><button id="page">page</button><dialog id="box"><p>text</p><button id="one">one</button><button id="two">two</button></dialog><p id="status"></p></body></html>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                globalThis.box = document.getElementById("box");
+                globalThis.seen = [];
+                box.addEventListener("cancel", (event) => {
+                    seen.push("cancel:" + event.cancelable);
+                    event.preventDefault();
+                });
+                box.addEventListener("close", () => seen.push("close:" + box.returnValue));
+                window.addEventListener("keydown", (event) => {
+                    seen.push(event.key + ":" + event.target.id);
+                });
+                globalThis.report = () => {
+                    document.getElementById("status").textContent = seen.join("|");
+                };
+                "#,
+            )
+            .expect("listeners should register");
+        let id = |name: &str| document.borrow().find_element_by_id(name);
+        runtime
+            .key_down_with_modifiers("a", KeyModifiers::default())
+            .expect("a key with nothing focused should reach the body");
+        runtime
+            .execute("box.showModal(); seen.push(String(box.open));")
+            .expect("showModal should run");
+        assert_eq!(runtime.active_element(), id("one"));
+        assert_eq!(
+            runtime.style_state(None).top_layer,
+            id("box").into_iter().collect::<Vec<_>>()
+        );
+        for expected in ["two", "one"] {
+            runtime
+                .key_down_with_modifiers("Tab", KeyModifiers::default())
+                .expect("tab should move focus");
+            assert_eq!(
+                runtime.active_element(),
+                id(expected),
+                "tab stays in the dialog"
+            );
+        }
+        // the first escape follows a press, so the page may refuse it, the second may not
+        for _ in 0..2 {
+            runtime
+                .key_down_with_modifiers("Escape", KeyModifiers::default())
+                .expect("escape should run");
+        }
+        runtime.advance_time(0).expect("the close task should run");
+        assert_eq!(runtime.active_element(), None);
+        assert_eq!(runtime.style_state(None).top_layer, Vec::new());
+        runtime
+            .execute(
+                r#"
+                box.showModal();
+                box.close("done");
+                box.show();
+                try { box.showModal(); } catch (error) { seen.push(error.name); }
+                box.close();
+                try { document.createElement("dialog").showModal(); } catch (error) { seen.push(error.name); }
+                "#,
+            )
+            .expect("dialog calls should run");
+        runtime.advance_time(0).expect("the close tasks should run");
+        runtime.execute("report();").expect("report should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "a:|true|Tab:one|Tab:two|Escape:one|cancel:true|Escape:one|cancel:false|close:|InvalidStateError|InvalidStateError|close:done|close:done"
+            )
+        );
     }
 
     #[test]
