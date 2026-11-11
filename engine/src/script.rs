@@ -16837,6 +16837,9 @@ mod tests {
                     document.getElementsByTagName("b").length,
                     document.getElementsByClassName("card wide")[0] === box,
                     box.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_PRECEDING,
+                    document.createElement("video") instanceof HTMLMediaElement,
+                    document.createElement("audio") instanceof HTMLMediaElement,
+                    box instanceof HTMLMediaElement,
                 ];
                 const svg = document.createElementNS("http://www.w3.org/2000/svg", "linearGradient");
                 results.push(svg.tagName, svg instanceof SVGElement, svg.namespaceURI);
@@ -16857,7 +16860,7 @@ mod tests {
         assert_eq!(
             status_text(&document).as_deref(),
             Some(
-                "object|true|true|true|true|true|true|false|1|__vnode|DIV!|true|[object HTMLDivElement]|true|true|true|BODY|head|root|true|true|true|true|true|class,data-x,hidden,id|1|true|2|linearGradient|true|http://www.w3.org/2000/svg|2|0|<span></span>|HR|New|TypeError"
+                "object|true|true|true|true|true|true|false|1|__vnode|DIV!|true|[object HTMLDivElement]|true|true|true|BODY|head|root|true|true|true|true|true|class,data-x,hidden,id|1|true|2|true|true|false|linearGradient|true|http://www.w3.org/2000/svg|2|0|<span></span>|HR|New|TypeError"
             )
         );
     }

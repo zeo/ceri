@@ -479,6 +479,27 @@ static INTERFACES: &[Interface] = &[
         members: &[("src", Attr("src")), ("alt", Attr("alt"))],
     },
     Interface {
+        name: "HTMLMediaElement",
+        parent: "HTMLElement",
+        members: &[
+            ("src", Attr("src")),
+            ("autoplay", Flag("autoplay")),
+            ("controls", Flag("controls")),
+            ("loop", Flag("loop")),
+            ("preload", Attr("preload")),
+        ],
+    },
+    Interface {
+        name: "HTMLVideoElement",
+        parent: "HTMLMediaElement",
+        members: &[("poster", Attr("poster"))],
+    },
+    Interface {
+        name: "HTMLAudioElement",
+        parent: "HTMLMediaElement",
+        members: &[],
+    },
+    Interface {
         name: "HTMLLabelElement",
         parent: "HTMLElement",
         members: &[("htmlFor", Attr("for"))],
@@ -735,6 +756,8 @@ pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
                 "template" => "HTMLTemplateElement",
                 "a" => "HTMLAnchorElement",
                 "img" => "HTMLImageElement",
+                "video" => "HTMLVideoElement",
+                "audio" => "HTMLAudioElement",
                 "label" => "HTMLLabelElement",
                 "script" => "HTMLScriptElement",
                 "link" => "HTMLLinkElement",
