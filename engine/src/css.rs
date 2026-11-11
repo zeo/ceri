@@ -3586,7 +3586,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 selector.attributes.push(attribute);
             }
             b'*' => *cursor += 1,
-            byte if byte.is_ascii_whitespace() || byte == b'>' => break,
+            byte if byte.is_ascii_whitespace() || matches!(byte, b'>' | b'+' | b'~') => break,
             _ => {
                 if selector.tag.is_some() {
                     return Err(format!("invalid compound selector: {source}"));
@@ -7659,7 +7659,7 @@ mod tests {
     #[test]
     fn matches_sibling_combinators_and_structural_pseudo_classes() {
         let stylesheet = Stylesheet::parse(
-            "p + p { color: red; } h1 ~ p { background-color: green; } li:first-child { color: blue; } li:last-child { color: yellow; } li:nth-child(2n) { border-width: 3px; }",
+            "p + p { color: red; } h1~p { background-color: green; } li+li:last-child { outline-width: 2px; } li:first-child { color: blue; } li:last-child { color: yellow; } li:nth-child(2n) { border-width: 3px; }",
         )
         .expect("stylesheet should parse");
         let document = Document::parse_markup(
@@ -7688,6 +7688,8 @@ mod tests {
         assert_eq!(style(items[1]).border[0].width, 3.0);
         assert_eq!(style(items[0]).border[0].width, 3.0);
         assert_eq!(style(items[0]).border[0].used_width(), 0.0);
+        assert_eq!(style(items[2]).outline.side.width, 2.0);
+        assert_eq!(style(items[0]).outline.side.width, 3.0);
     }
 
     #[test]
