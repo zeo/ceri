@@ -5,7 +5,7 @@ use crate::dom::{AccessibilityNode, Document, NodeId, ScriptSource, StylesheetSo
 use crate::font::FontSet;
 use crate::image::Image;
 use crate::layout::{
-    ImageLayer, LayoutDocument, Size, ThumbDrag, layout_with_state as build_layout,
+    ImageLayer, LayoutDocument, RangeDrag, Size, ThumbDrag, layout_with_state as build_layout,
 };
 use crate::paint::Canvas;
 use crate::script::{
@@ -1814,6 +1814,46 @@ impl Browser {
         } else {
             Ok(changed)
         }
+    }
+
+    // a press on a range input starts dragging its thumb, which centers under a press on the
+    // track at once and fires input
+    pub(crate) fn press_range(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<RangeDrag>, NavigationError> {
+        let drag = {
+            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            self.layout(viewport)?.range_drag_at(x, y)
+        };
+        let Some(mut drag) = drag else {
+            return Ok(None);
+        };
+        let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+        drag.pressed = page.runtime.control_value(drag.node).unwrap_or_default();
+        self.drag_range(&drag, x)?;
+        Ok(Some(drag))
+    }
+
+    pub(crate) fn drag_range(&mut self, drag: &RangeDrag, x: f32) -> Result<bool, NavigationError> {
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let changed = page
+            .runtime
+            .drag_range(drag.node, drag.fraction(x))
+            .map_err(|error| NavigationError::Script(error.to_string()))?;
+        Ok(self.process_pending_navigation()?.is_some() || changed)
+    }
+
+    // the drag ended; change fires if the value moved since the press
+    pub(crate) fn release_range(&mut self, drag: &RangeDrag) -> Result<(), NavigationError> {
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        page.runtime
+            .release_range(drag.node, &drag.pressed)
+            .map_err(|error| NavigationError::Script(error.to_string()))?;
+        self.process_pending_navigation()?;
+        Ok(())
     }
 
     // a pointer press or drag over a text control or prose moves or extends its selection;

@@ -14,6 +14,7 @@ use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks
 use crate::image::Image;
 use crate::linebreak::{WordBreak, break_opportunities};
 use crate::media::ContainerSize;
+use crate::range::RangeBounds;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -208,6 +209,12 @@ pub(crate) enum ControlPaint {
     Range {
         fraction: f32,
         accent: Color,
+        disabled: bool,
+        // the page draws the track and thumb as boxes, under appearance: none
+        styled: bool,
+        // where the thumb's left edge starts from the box's left edge, and how far it travels
+        travel: (f32, f32),
+        thumb: f32,
     },
     // none is indeterminate
     Progress {
@@ -1404,6 +1411,72 @@ impl LayoutDocument {
     pub(crate) fn thumb_drag_at(&self, x: f32, y: f32) -> Option<ThumbDrag> {
         thumb_drag_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
+
+    // an enabled range input under a pointer press, and where its thumb travels
+    pub(crate) fn range_drag_at(&self, x: f32, y: f32) -> Option<RangeDrag> {
+        let hit = hit_test_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))?;
+        range_drag_box(&self.root, hit.layout.node, x, (0.0, 0.0))
+    }
+}
+
+// a range input being dragged, in viewport coordinates; ancestor transforms are not mapped
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RangeDrag {
+    pub(crate) node: NodeId,
+    // where the thumb's center sits at the minimum, and how far it travels to the maximum
+    pub(crate) start: f32,
+    pub(crate) length: f32,
+    // the pointer's offset from the thumb's center when the press landed on the thumb, so it
+    // does not jump; a press on the track centers the thumb under the pointer
+    pub(crate) grab: f32,
+    // the value at the press, which change compares against on release
+    pub(crate) pressed: String,
+}
+
+impl RangeDrag {
+    pub(crate) fn fraction(&self, x: f32) -> f64 {
+        if self.length > 0.0 {
+            f64::from(((x - self.grab - self.start) / self.length).clamp(0.0, 1.0))
+        } else {
+            0.0
+        }
+    }
+}
+
+fn range_drag_box(
+    layout_box: &LayoutBox,
+    node: NodeId,
+    x: f32,
+    ancestor_offset: (f32, f32),
+) -> Option<RangeDrag> {
+    if layout_box.node == node
+        && let Some(ControlPaint::Range {
+            fraction,
+            disabled: false,
+            travel: (start, length),
+            thumb,
+            ..
+        }) = layout_box.control
+    {
+        let start = visual_rect_for(layout_box, ancestor_offset).x + start + thumb / 2.0;
+        let center = start + fraction * length;
+        return Some(RangeDrag {
+            node,
+            start,
+            length,
+            grab: if (x - center).abs() <= thumb / 2.0 {
+                x - center
+            } else {
+                0.0
+            },
+            pressed: String::new(),
+        });
+    }
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    layout_box
+        .children
+        .iter()
+        .find_map(|child| range_drag_box(child, node, x, offset))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2488,20 +2561,20 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let mut text = Vec::new();
     // ::marker, ::placeholder and ::selection style parts of this box; they are cascaded only
     // when some rule names them
-    let pseudo_style = |pseudo: PseudoElement| {
-        stylesheet.styles_pseudo(pseudo).then(|| {
-            stylesheet.style_for(StyleContext {
-                document: node.document,
-                node: node.node,
-                pseudo: Some(pseudo),
-                parent_font_size: font_size,
-                parent_color: style.color,
-                parent_weight: style.font_weight,
-                parent_text: inherited_text(&style),
-                state: style_state,
-            })
+    let part_style = |pseudo: PseudoElement| {
+        stylesheet.style_for(StyleContext {
+            document: node.document,
+            node: node.node,
+            pseudo: Some(pseudo),
+            parent_font_size: font_size,
+            parent_color: style.color,
+            parent_weight: style.font_weight,
+            parent_text: inherited_text(&style),
+            state: style_state,
         })
     };
+    let pseudo_style =
+        |pseudo: PseudoElement| stylesheet.styles_pseudo(pseudo).then(|| part_style(pseudo));
     let control_value = text_control_value(node, style_state);
     let control_placeholder = control_value
         .as_deref()
@@ -2874,6 +2947,37 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             &style_of,
         ))
     });
+    let mut control = control_paint(node, &style, style_state, font_size);
+    if let Some(ControlPaint::Range {
+        fraction,
+        accent,
+        styled,
+        travel,
+        thumb,
+        ..
+    }) = &mut control
+    {
+        if *styled {
+            let (track, start, (length, width)) = slider_parts(
+                node.node,
+                [PseudoElement::SliderTrack, PseudoElement::SliderThumb].map(part_style),
+                Rect {
+                    x: content_x,
+                    y: content_y,
+                    width: content_width,
+                    height: content_height,
+                },
+                (*fraction, *accent),
+                (font_size, style.cursor),
+            );
+            children.push(track);
+            *travel = (start - rect.x, length);
+            *thumb = width;
+        } else {
+            *travel = (content_x - rect.x, (content_width - 16.0).max(0.0));
+            *thumb = 16.0;
+        }
+    }
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -2891,7 +2995,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text,
-        control: control_paint(node, &style, style_state, font_size),
+        control,
         selection: selection_style
             .map(|selection| selection.background)
             .filter(|background| background.alpha > 0),
@@ -3099,6 +3203,149 @@ fn anonymous_box(
         svg: None,
         margin: ResolvedEdges::default(),
     }
+}
+
+// a slider or scrollbar part, drawn as a box of its own style that belongs to the element
+fn part_box(
+    node: NodeId,
+    pseudo: PseudoElement,
+    style: &Style,
+    rect: Rect,
+    (font_size, cursor): (f32, Cursor),
+) -> LayoutBox {
+    let mut part = LayoutBox {
+        tag: pseudo.tag().to_string(),
+        background: style.background,
+        backgrounds: style.layers(),
+        radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
+        shadows: resolve_shadows(style.shadows, rect.width, font_size),
+        border: BoxBorder::of(style),
+        visible: style.visibility == Visibility::Visible,
+        ..anonymous_box(node, rect, Vec::new(), (font_size, cursor), style.opacity)
+    };
+    brighten(&mut part, style.brightness);
+    part
+}
+
+// filter: brightness() scales every color a part paints, which matches filtering its pixels
+fn brighten(part: &mut LayoutBox, factor: f32) {
+    if factor == 1.0 {
+        return;
+    }
+    let scale = |color: Color| {
+        let channel = |value: u8| (f32::from(value) * factor).round().clamp(0.0, 255.0) as u8;
+        Color::rgba(
+            channel(color.red),
+            channel(color.green),
+            channel(color.blue),
+            color.alpha,
+        )
+    };
+    part.background = scale(part.background);
+    for layer in &mut part.backgrounds {
+        if let crate::css::LayerImage::Gradient(gradient) = &mut layer.image {
+            for stop in &mut gradient.stops {
+                stop.color = scale(stop.color);
+            }
+        }
+    }
+    part.border.colors = part.border.colors.map(scale);
+    for shadow in &mut part.shadows {
+        shadow.color = scale(shadow.color);
+    }
+}
+
+// the track and thumb of a range input under appearance: none, placed as chromium does: the
+// track centered in the content box, the thumb a child of it that travels its content width;
+// returns the track, where the thumb's travel starts, and the travel and thumb widths
+fn slider_parts(
+    node: NodeId,
+    [track_style, thumb_style]: [Style; 2],
+    content: Rect,
+    (fraction, accent): (f32, Color),
+    (font_size, cursor): (f32, Cursor),
+) -> (LayoutBox, f32, (f32, f32)) {
+    let inset = |style: &Style| {
+        let padding = resolve_edges(style.padding, content.width, font_size);
+        let border = used_border(style);
+        ResolvedEdges {
+            top: padding.top + border.top,
+            right: padding.right + border.right,
+            bottom: padding.bottom + border.bottom,
+            left: padding.left + border.left,
+        }
+    };
+    let border_box = |style: &Style, length: Length, containing: f32, inner: f32| {
+        length
+            .resolve(containing, font_size)
+            .map(|size| match style.box_sizing {
+                crate::css::BoxSizing::BorderBox => size.max(inner),
+                crate::css::BoxSizing::ContentBox => size.max(0.0) + inner,
+            })
+    };
+    let track_inset = inset(&track_style);
+    let track_inner = (content.width - track_inset.left - track_inset.right).max(0.0);
+    let thumb_inset = inset(&thumb_style);
+    // a thumb left at appearance: auto keeps the platform's circle
+    let native_thumb = !thumb_style.appearance_none;
+    let thumb_size = |length: Length, containing: f32, inner: f32| {
+        if native_thumb {
+            16.0
+        } else {
+            border_box(&thumb_style, length, containing, inner).unwrap_or(inner)
+        }
+    };
+    let thumb_width = thumb_size(
+        thumb_style.width,
+        track_inner,
+        thumb_inset.left + thumb_inset.right,
+    );
+    let thumb_height = thumb_size(
+        thumb_style.height,
+        0.0,
+        thumb_inset.top + thumb_inset.bottom,
+    );
+    let track_vertical = track_inset.top + track_inset.bottom;
+    let track_height = border_box(
+        &track_style,
+        track_style.height,
+        content.height,
+        track_vertical,
+    )
+    .unwrap_or(thumb_height + track_vertical);
+    let track = Rect {
+        y: content.y + (content.height - track_height) / 2.0,
+        height: track_height,
+        ..content
+    };
+    let margin = resolve_margins(thumb_style.margin, track_inner, font_size);
+    let start = track.x + track_inset.left + margin.left;
+    let travel = (track_inner - margin.left - margin.right - thumb_width).max(0.0);
+    let mut thumb = part_box(
+        node,
+        PseudoElement::SliderThumb,
+        &thumb_style,
+        Rect {
+            x: start + fraction * travel,
+            y: track.y + track_inset.top + margin.top,
+            width: thumb_width,
+            height: thumb_height,
+        },
+        (font_size, cursor),
+    );
+    if native_thumb {
+        thumb.background = accent;
+        thumb.radii = [(8.0, 8.0); 4];
+    }
+    let mut track = part_box(
+        node,
+        PseudoElement::SliderTrack,
+        &track_style,
+        track,
+        (font_size, cursor),
+    );
+    track.children.push(thumb);
+    (track, start, (travel, thumb_width))
 }
 
 // lays out a run of text at a width, as an anonymous block
@@ -5474,10 +5721,10 @@ fn control_paint(
     style_state: &StyleState,
     font_size: f32,
 ) -> Option<ControlPaint> {
-    if style.appearance_none {
+    let control = control_type(node, style_state)?;
+    if style.appearance_none && !matches!(control, ControlType::Range) {
         return None;
     }
-    let control = control_type(node, style_state)?;
     let element = node.element()?;
     let accent = style.accent_color.unwrap_or(Color::opaque(0, 117, 255));
     let mark = text_color(style);
@@ -5492,22 +5739,22 @@ fn control_paint(
         },
         ControlType::Select(_) => ControlPaint::Select { color: mark },
         ControlType::Range => {
-            let minimum = number_attribute(element, "min").unwrap_or(0.0);
-            let maximum = number_attribute(element, "max")
-                .unwrap_or(100.0)
-                .max(minimum);
-            let value = style_state
-                .control_values
-                .get(&node.node)
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .or_else(|| number_attribute(element, "value"))
-                .unwrap_or((minimum + maximum) / 2.0);
-            let fraction = if maximum > minimum {
-                ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            ControlPaint::Range { fraction, accent }
+            let bounds = RangeBounds::of(element);
+            let value = bounds.sanitize(
+                style_state
+                    .control_values
+                    .get(&node.node)
+                    .map(String::as_str)
+                    .or_else(|| element.attr("value")),
+            );
+            ControlPaint::Range {
+                fraction: bounds.fraction(value) as f32,
+                accent,
+                disabled: style_state.is_disabled(element, node.node),
+                styled: style.appearance_none,
+                travel: (0.0, 0.0),
+                thumb: 0.0,
+            }
         }
         ControlType::Progress => {
             let maximum = number_attribute(element, "max")
@@ -8337,6 +8584,97 @@ mod tests {
             "an absolute generated box stretches between its insets"
         );
         assert_eq!(generated.background, Color::opaque(0, 255, 0));
+    }
+
+    #[test]
+    fn a_styled_slider_lays_out_its_track_and_thumb_from_their_rules() {
+        let document = Document::parse_markup(
+            r#"<html><body><input type="range" value="25"><input type="range" style="appearance: auto" value="0"></body></html>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "body { margin: 0 } input { margin: 0; vertical-align: top }
+             input[type=range] { appearance: none; width: 180px; height: 16px }
+             input::-webkit-slider-runnable-track { height: 4px; border-radius: 2px }
+             input::-webkit-slider-thumb { appearance: none; width: 14px; height: 14px;
+                 margin-top: -5px; border: 1px solid #111; background: #404040;
+                 box-shadow: 0 1px 2px #20202080; filter: brightness(2) }",
+        )
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 100.0,
+            },
+        );
+        let mut inputs = Vec::new();
+        fn collect<'a>(layout_box: &'a LayoutBox, found: &mut Vec<&'a LayoutBox>) {
+            if layout_box.tag == "input" {
+                found.push(layout_box);
+            }
+            for child in &layout_box.children {
+                collect(child, found);
+            }
+        }
+        collect(&layout.root, &mut inputs);
+        let [styled, native] = inputs[..] else {
+            panic!("two sliders should lay out, found {}", inputs.len());
+        };
+        assert_eq!(
+            styled.control,
+            Some(ControlPaint::Range {
+                fraction: 0.25,
+                accent: Color::opaque(0, 117, 255),
+                disabled: false,
+                styled: true,
+                travel: (0.0, 166.0),
+                thumb: 14.0,
+            })
+        );
+        let [track] = &styled.children[..] else {
+            panic!("the slider should hold its track");
+        };
+        assert_eq!(track.tag, "::-webkit-slider-runnable-track");
+        assert_eq!(
+            track.rect,
+            Rect {
+                x: 0.0,
+                y: 6.0,
+                width: 180.0,
+                height: 4.0
+            }
+        );
+        let [thumb] = &track.children[..] else {
+            panic!("the track should hold its thumb");
+        };
+        // the thumb travels the track less its own width, and its margin lifts it over the track
+        assert_eq!(
+            thumb.rect,
+            Rect {
+                x: 41.5,
+                y: 1.0,
+                width: 14.0,
+                height: 14.0
+            }
+        );
+        // brightness(2) doubles every color the thumb paints and keeps their alpha
+        assert_eq!(thumb.background, Color::opaque(128, 128, 128));
+        assert_eq!(thumb.border.colors[0], Color::opaque(34, 34, 34));
+        assert_eq!(thumb.shadows[0].color, Color::rgba(64, 64, 64, 128));
+
+        // appearance: auto keeps the platform slider, whose thumb starts at the content edge
+        assert!(native.children.is_empty());
+        assert!(matches!(
+            native.control,
+            Some(ControlPaint::Range {
+                styled: false,
+                travel: (0.0, 164.0),
+                thumb: 16.0,
+                ..
+            })
+        ));
     }
 
     #[test]

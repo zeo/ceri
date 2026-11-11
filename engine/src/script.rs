@@ -2539,6 +2539,9 @@ impl ScriptRuntime {
             let moved = self.move_focus_sequential(modifiers.shift)?;
             return Ok(dispatch.handled || moved);
         }
+        if !dispatch.default_prevented && self.step_range_by_key(focused, key)? {
+            return Ok(true);
+        }
         if dispatch.default_prevented || !self.is_text_control(focused) {
             return Ok(dispatch.handled);
         }
@@ -3018,6 +3021,69 @@ impl ScriptRuntime {
 
     pub fn now(&self) -> u64 {
         self.clock
+    }
+
+    // the bounds of an enabled input type=range
+    fn enabled_range(&self, node: NodeId) -> Option<crate::range::RangeBounds> {
+        let bounds = self
+            .with_element(node, |element| {
+                crate::range::is_range(element).then(|| crate::range::RangeBounds::of(element))
+            })
+            .flatten()?;
+        (!self.is_disabled(node)).then_some(bounds)
+    }
+
+    fn range_number(&self, node: NodeId) -> f64 {
+        self.control_value(node)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    // a key that moves a focused slider sets its value and fires input then change
+    fn step_range_by_key(&mut self, node: NodeId, key: &str) -> Result<bool, ScriptError> {
+        let Some(bounds) = self.enabled_range(node) else {
+            return Ok(false);
+        };
+        let Some(next) = bounds.after_key(self.range_number(node), key) else {
+            return Ok(false);
+        };
+        if self.set_range_number(node, next)? {
+            self.dispatch_event(node, "change")?;
+            self.drain_microtasks()?;
+        }
+        Ok(true)
+    }
+
+    // the pointer moved a slider's thumb to a fraction of its travel; a change fires on release
+    pub(crate) fn drag_range(&mut self, node: NodeId, fraction: f64) -> Result<bool, ScriptError> {
+        let Some(bounds) = self.enabled_range(node) else {
+            return Ok(false);
+        };
+        self.set_range_number(node, bounds.at_fraction(fraction))
+    }
+
+    pub(crate) fn release_range(&mut self, node: NodeId, pressed: &str) -> Result<(), ScriptError> {
+        if self
+            .control_value(node)
+            .is_some_and(|value| value != pressed)
+        {
+            self.dispatch_event(node, "change")?;
+            self.drain_microtasks()?;
+        }
+        Ok(())
+    }
+
+    // stores a new slider value as the user set it, firing input when it changed
+    fn set_range_number(&mut self, node: NodeId, value: f64) -> Result<bool, ScriptError> {
+        let value = crate::range::serialize(value);
+        if self.control_value(node).as_deref() == Some(value.as_str()) {
+            return Ok(false);
+        }
+        self.control_values.insert(node, value);
+        self.dirty_controls.insert(node);
+        self.dispatch_event(node, "input")?;
+        self.drain_microtasks()?;
+        Ok(true)
     }
 
     fn apply_click_default(&mut self, node: NodeId) -> Result<(), ScriptError> {
@@ -3603,6 +3669,7 @@ impl ScriptRuntime {
                     "value" => {
                         Value::String(self.element_value(&handle).unwrap_or_default().into())
                     }
+                    "valueAsNumber" => Value::Number(self.element_value_as_number(node)),
                     "form" => self.element_form(&handle),
                     "elements" => self.element_form_elements(&handle),
                     "defaultValue" => self.element_default_value(&handle),
@@ -4354,6 +4421,7 @@ impl ScriptRuntime {
                 "innerHTML" => self.set_element_inner_html(&handle, value_string)?,
                 "outerHTML" => self.set_element_outer_html(&handle, value_string)?,
                 "value" => self.set_element_value(&handle, value_string),
+                "valueAsNumber" => self.set_element_value_as_number(&handle, value.number()?),
                 "defaultValue" => self.set_element_default_value(&handle, value_string)?,
                 "selected" => self.set_element_selected(&handle, truthy),
                 "defaultSelected" => self.set_element_default_selected(&handle, truthy),
@@ -5117,10 +5185,21 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn control_value(&self, node: NodeId) -> Option<String> {
+        let document = self.document.borrow();
+        if let Some(element) = document.element(node)
+            && crate::range::is_range(element)
+        {
+            let bounds = crate::range::RangeBounds::of(element);
+            let raw = self
+                .control_values
+                .get(&node)
+                .map(String::as_str)
+                .or_else(|| element.attr("value"));
+            return Some(crate::range::serialize(bounds.sanitize(raw)));
+        }
         if let Some(value) = self.control_values.get(&node) {
             return Some(value.clone());
         }
-        let document = self.document.borrow();
         let element = document.element(node)?;
         if element.name == "select" {
             return Some(self.select_value(node));
@@ -5491,6 +5570,40 @@ impl ScriptRuntime {
 
     fn element_value(&self, handle: &ElementHandle) -> Option<String> {
         self.control_value(handle.id)
+    }
+
+    fn is_numeric_input(&self, node: NodeId) -> bool {
+        self.with_element(node, |element| {
+            crate::range::is_range(element)
+                || element.name == "input"
+                    && element
+                        .attr("type")
+                        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("number"))
+        })
+        .unwrap_or(false)
+    }
+
+    // a range or number input's value as a number, NaN for other inputs and empty values
+    fn element_value_as_number(&self, node: NodeId) -> f64 {
+        if !self.is_numeric_input(node) {
+            return f64::NAN;
+        }
+        self.control_value(node)
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(f64::NAN)
+    }
+
+    fn set_element_value_as_number(&mut self, handle: &ElementHandle, number: f64) -> bool {
+        if !self.is_numeric_input(handle.id) {
+            return false;
+        }
+        let value = if number.is_finite() {
+            crate::range::serialize(number)
+        } else {
+            String::new()
+        };
+        self.set_element_value(handle, value)
     }
 
     fn element_default_value(&self, handle: &ElementHandle) -> Value {

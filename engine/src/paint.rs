@@ -1756,31 +1756,56 @@ fn paint_control(
                 clip,
             );
         }
-        ControlPaint::Range { fraction, accent } => {
-            let thumb = rect.height.min(16.0);
-            let track_height = 4.0_f32.min(rect.height);
+        ControlPaint::Range {
+            fraction,
+            accent,
+            disabled,
+            styled: false,
+            travel: (start, length),
+            thumb,
+        } => {
+            // chromium's slider: an 8px bordered track inset a pixel from each end, filled with
+            // the accent up to a 16px thumb whose position snaps to whole pixels
+            let thumb_x = rect.x + start + (length * fraction).round();
             let track = Rect {
-                x: rect.x + thumb / 2.0 - 2.0,
-                y: rect.y + (rect.height - track_height) / 2.0,
-                width: (rect.width - thumb + 4.0).max(0.0),
-                height: track_height,
+                x: rect.x + start + 1.0,
+                y: rect.y + (rect.height - 8.0) / 2.0,
+                width: (length + thumb - 2.0).max(0.0),
+                height: 8.0,
             };
-            let thumb_x = rect.x + (rect.width - thumb) * fraction;
-            canvas.fill_shape(
-                Shape::from_rect(track, round(track_height / 2.0)),
-                &Paint::Solid(Color::opaque(239, 239, 239).scale_alpha(opacity)),
-                clip,
-            );
-            canvas.fill_shape(
-                Shape::from_rect(
-                    Rect {
-                        width: (thumb_x + thumb / 2.0 - track.x).max(0.0),
-                        ..track
-                    },
-                    round(track_height / 2.0),
-                ),
-                &Paint::Solid(accent.scale_alpha(opacity)),
-                clip,
+            let (filled, filled_border, empty, empty_border, knob) = if disabled {
+                let gray = Color::opaque(203, 203, 203);
+                let border = Color::opaque(177, 177, 177);
+                let empty = Color::opaque(250, 250, 250);
+                (gray, border, empty, Color::opaque(210, 210, 210), gray)
+            } else {
+                let border = accent.mix(Color::opaque(117, 117, 117), 0.5);
+                let empty = Color::opaque(239, 239, 239);
+                (accent, border, empty, Color::opaque(178, 178, 178), accent)
+            };
+            let mut bar = |width: f32, (fill, border): (Color, Color)| {
+                let outer = Rect { width, ..track };
+                let inner = Rect {
+                    x: outer.x + 1.0,
+                    y: outer.y + 1.0,
+                    width: (width - 2.0).max(0.0),
+                    height: 6.0,
+                };
+                canvas.fill_shape(
+                    Shape::from_rect(outer, round(4.0)),
+                    &Paint::Solid(border.scale_alpha(opacity)),
+                    clip,
+                );
+                canvas.fill_shape(
+                    Shape::from_rect(inner, round(3.0)),
+                    &Paint::Solid(fill.scale_alpha(opacity)),
+                    clip,
+                );
+            };
+            bar(track.width, (empty, empty_border));
+            bar(
+                (thumb_x + thumb / 2.0 - track.x).max(0.0),
+                (filled, filled_border),
             );
             canvas.fill_shape(
                 Shape::from_rect(
@@ -1792,7 +1817,7 @@ fn paint_control(
                     },
                     round(thumb / 2.0),
                 ),
-                &Paint::Solid(accent.scale_alpha(opacity)),
+                &Paint::Solid(knob.scale_alpha(opacity)),
                 clip,
             );
         }
