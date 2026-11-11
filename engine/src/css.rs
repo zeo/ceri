@@ -869,6 +869,8 @@ pub(crate) struct InheritedText {
     pub(crate) overflow_wrap: OverflowWrap,
     pub(crate) rtl: bool,
     pub(crate) italic: bool,
+    pub(crate) font_variations: crate::font::FontVariations,
+    pub(crate) optical_sizing: bool,
     pub(crate) decoration: TextDecoration,
 }
 
@@ -896,6 +898,8 @@ impl Default for InheritedText {
             overflow_wrap: OverflowWrap::Normal,
             rtl: false,
             italic: false,
+            font_variations: crate::font::FontVariations::default(),
+            optical_sizing: true,
             decoration: TextDecoration::default(),
         }
     }
@@ -1309,6 +1313,9 @@ pub(crate) struct Style {
     pub rtl: bool,
     // font-style italic or oblique
     pub italic: bool,
+    pub font_variations: crate::font::FontVariations,
+    // font-optical-sizing auto
+    pub optical_sizing: bool,
     // the lines this element and its ancestors draw through its text, and its text shadow
     pub text_decoration: TextDecoration,
     pub text_overflow_ellipsis: bool,
@@ -1482,6 +1489,8 @@ impl Style {
             overflow_wrap: parent_text.overflow_wrap,
             rtl: parent_text.rtl,
             italic: parent_text.italic,
+            font_variations: parent_text.font_variations,
+            optical_sizing: parent_text.optical_sizing,
             text_decoration: parent_text.decoration,
             text_overflow_ellipsis: false,
             border: [BorderSide::INITIAL; 4],
@@ -2485,6 +2494,8 @@ impl Stylesheet {
                 overflow_wrap: style.overflow_wrap,
                 rtl: style.rtl,
                 italic: style.italic,
+                font_variations: style.font_variations,
+                optical_sizing: style.optical_sizing,
                 decoration: style.text_decoration,
             };
             computed = Some((style, font_size));
@@ -4147,7 +4158,7 @@ pub(crate) struct FontFaceRule {
     pub(crate) family: String,
     // urls in order of preference, with formats this engine cannot read left out
     pub(crate) sources: Vec<String>,
-    pub(crate) weights: (u16, u16),
+    pub(crate) weights: Option<(u16, u16)>,
     pub(crate) italic: bool,
     pub(crate) ranges: Vec<(u32, u32)>,
 }
@@ -4183,14 +4194,15 @@ fn parse_font_face(body: &str) -> Option<FontFaceRule> {
     if family.is_empty() || sources.is_empty() {
         return None;
     }
-    let weights = value("font-weight").map_or((400, 400), |weight| {
+    // a missing, auto or unreadable font-weight leaves the range to the face itself
+    let weights = value("font-weight").and_then(|weight| {
         let mut parts = weight
             .split_ascii_whitespace()
             .filter_map(|part| FontWeight::parse(part, FontWeight::NORMAL));
         match (parts.next(), parts.next()) {
-            (Some(low), Some(high)) => (low.0.min(high.0), low.0.max(high.0)),
-            (Some(single), None) => (single.0, single.0),
-            _ => (400, 400),
+            (Some(low), Some(high)) => Some((low.0.min(high.0), low.0.max(high.0))),
+            (Some(single), None) => Some((single.0, single.0)),
+            _ => None,
         }
     });
     let italic = value("font-style").is_some_and(|style| {
@@ -4580,6 +4592,8 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
             style.font_size = from.font_size;
             style.font_weight = from.font_weight;
             style.italic = from.italic;
+            style.font_variations = from.font_variations;
+            style.optical_sizing = from.optical_sizing;
             style.line_height = from.line_height;
             style.line_height_absolute = from.line_height_absolute;
         }
@@ -4587,6 +4601,8 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "font-size" => style.font_size = from.font_size,
         "font-weight" => style.font_weight = from.font_weight,
         "font-style" => style.italic = from.italic,
+        "font-variation-settings" => style.font_variations = from.font_variations,
+        "font-optical-sizing" => style.optical_sizing = from.optical_sizing,
         "line-height" => {
             style.line_height = from.line_height;
             style.line_height_absolute = from.line_height_absolute;
@@ -4702,6 +4718,8 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
     // the shorthand resets what it leaves out
     style.italic = false;
     style.font_weight = FontWeight::NORMAL;
+    style.font_variations = crate::font::FontVariations::default();
+    style.optical_sizing = true;
     style.line_height = Length::Auto;
     style.line_height_absolute = false;
     for word in &words[..size_index] {
@@ -4746,6 +4764,8 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "text-overflow",
     "font",
     "font-style",
+    "font-variation-settings",
+    "font-optical-sizing",
     "direction",
     "word-wrap",
     "overflow-wrap",
@@ -5620,6 +5640,16 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         {
             "italic" | "oblique" => style.italic = true,
             "normal" => style.italic = false,
+            _ => {}
+        },
+        "font-variation-settings" => {
+            if let Some(variations) = crate::font::parse_font_variations(value) {
+                style.font_variations = variations;
+            }
+        }
+        "font-optical-sizing" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => style.optical_sizing = true,
+            "none" => style.optical_sizing = false,
             _ => {}
         },
         "font" => apply_font_shorthand(style, value),
@@ -7182,6 +7212,47 @@ mod tests {
             parent_weight,
             ..context(&placed, &StyleState::default())
         })
+    }
+
+    #[test]
+    fn font_variation_settings_and_font_face_weight_ranges() {
+        let stylesheet = Stylesheet::parse(
+            "@font-face { font-family: Ranged; src: url(a.woff2); font-weight: 700 200 }
+             @font-face { font-family: Open; src: url(a.woff2) }
+             @font-face { font-family: Auto; src: url(a.woff2); font-weight: auto }
+             p { font-variation-settings: 'wght' 650; font-optical-sizing: none }
+             em { font-variation-settings: 'wght' 650; font-optical-sizing: none; font: 12px mono }",
+        )
+        .expect("stylesheet should parse");
+        let weights = stylesheet
+            .font_faces()
+            .iter()
+            .map(|face| face.weights)
+            .collect::<Vec<_>>();
+        assert_eq!(weights, vec![Some((200, 700)), None, None]);
+        let style = |tag: &str| {
+            style_within(
+                &stylesheet,
+                &Element::new(tag),
+                &[],
+                16.0,
+                Color::BLACK,
+                FontWeight::NORMAL,
+            )
+        };
+        let paragraph = style("p");
+        assert_eq!(
+            paragraph.font_variations,
+            crate::font::parse_font_variations("\"wght\" 650").expect("settings")
+        );
+        assert!(!paragraph.optical_sizing);
+        // the font shorthand resets both
+        let emphasis = style("em");
+        assert_eq!(
+            emphasis.font_variations,
+            crate::font::FontVariations::default()
+        );
+        assert!(emphasis.optical_sizing);
     }
 
     #[test]

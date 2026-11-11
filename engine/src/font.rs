@@ -11,7 +11,7 @@ const MAX_GLYPH_PIXELS: usize = 4_000_000;
 
 // glyph outlines and metrics read straight from an sfnt file, no shaping engine
 pub struct FontFace {
-    data: Vec<u8>,
+    data: Rc<[u8]>,
     units_per_em: f32,
     ascent: f32,
     descent: f32,
@@ -24,7 +24,7 @@ pub struct FontFace {
     cff: Option<crate::cff::CffFont>,
     hmtx: (usize, usize),
     horizontal_metrics: u16,
-    characters: BTreeMap<u32, u16>,
+    characters: Rc<BTreeMap<u32, u16>>,
     // usWeightClass and the italic flag, from OS/2 and head
     weight: u16,
     // sxHeight from OS/2 version 2 on, or half an em
@@ -32,6 +32,15 @@ pub struct FontFace {
     italic: bool,
     // where each table starts, for the layout tables shaping reads
     tables: BTreeMap<[u8; 4], (usize, usize)>,
+    // the axes of a variable truetype face
+    variations: Option<Rc<crate::variation::Variations>>,
+    // the normalized coordinates an instance draws at, empty for the default instance
+    coordinates: Vec<f32>,
+    // an instance's outlines and advances, varied once per glyph
+    outlines: RefCell<HashMap<u16, Option<Outline>>>,
+    advances: RefCell<HashMap<u16, f32>>,
+    // the instances of a variable face, by their coordinates in F2DOT14 units
+    instances: RefCell<HashMap<Vec<i16>, Rc<FontFace>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -115,9 +124,14 @@ impl FontFace {
                     .map(|style| style & 2 != 0)
             })
             .unwrap_or(false);
+        let variations = cff
+            .is_none()
+            .then(|| crate::variation::Variations::parse(&data, &tables))
+            .flatten()
+            .map(Rc::new);
 
         Ok(Self {
-            data,
+            data: data.into(),
             units_per_em,
             ascent,
             descent: -descent,
@@ -129,12 +143,96 @@ impl FontFace {
             cff,
             hmtx,
             horizontal_metrics,
-            characters,
+            characters: Rc::new(characters),
             weight,
             x_height,
             italic,
             tables,
+            variations,
+            coordinates: Vec::new(),
+            outlines: RefCell::default(),
+            advances: RefCell::default(),
+            instances: RefCell::default(),
         })
+    }
+
+    // the instance of a variable face that draws a style: font-weight on the wght axis within
+    // the weights the face is used for, italic on ital or else slnt, opsz at the optical size,
+    // and font-variation-settings over all of them
+    pub(crate) fn instance(self: &Rc<Self>, style: FontStyle, weights: (u16, u16)) -> Rc<Self> {
+        let Some(variations) = &self.variations else {
+            return self.clone();
+        };
+        let settings = font_variation_values(style.variations);
+        let has_ital = variations.axis(b"ital").is_some();
+        let values = variations
+            .axes
+            .iter()
+            .map(|axis| {
+                let requested = match &axis.tag {
+                    b"wght" => Some(f32::from(style.weight.clamp(weights.0, weights.1))),
+                    b"ital" if style.italic => Some(1.0),
+                    // css oblique's default angle, counter-clockwise as slnt measures it
+                    b"slnt" if style.italic && !has_ital => Some(-14.0),
+                    b"opsz" if style.optical_size != 0 => Some(f32::from_bits(style.optical_size)),
+                    _ => None,
+                };
+                settings
+                    .iter()
+                    .rev()
+                    .find(|(tag, _)| tag == &axis.tag)
+                    .map(|&(_, value)| value)
+                    .or(requested)
+                    .unwrap_or(axis.default)
+                    .clamp(axis.minimum, axis.maximum)
+            })
+            .collect::<Vec<_>>();
+        let key = variations.normalize(&values);
+        if key.iter().all(|&coordinate| coordinate == 0) {
+            return self.clone();
+        }
+        if let Some(instance) = self.instances.borrow().get(&key) {
+            return instance.clone();
+        }
+        let value = |tag: &[u8; 4]| {
+            variations
+                .axes
+                .iter()
+                .position(|axis| &axis.tag == tag)
+                .map(|index| values[index])
+        };
+        let base: &Self = self;
+        let instance = Rc::new(Self {
+            data: base.data.clone(),
+            cff: None,
+            characters: base.characters.clone(),
+            weight: value(b"wght").map_or(base.weight, |weight| weight.round() as u16),
+            italic: base.italic
+                || value(b"ital").is_some_and(|ital| ital > 0.0)
+                || value(b"slnt").is_some_and(|slnt| slnt < 0.0),
+            tables: base.tables.clone(),
+            variations: base.variations.clone(),
+            coordinates: key
+                .iter()
+                .map(|&coordinate| f32::from(coordinate) / 16384.0)
+                .collect(),
+            outlines: RefCell::default(),
+            advances: RefCell::default(),
+            instances: RefCell::default(),
+            ..*base
+        });
+        self.instances.borrow_mut().insert(key, instance.clone());
+        instance
+    }
+
+    // the weights a face can draw: its wght axis, or its one weight
+    pub(crate) fn weight_range(&self) -> (u16, u16) {
+        self.variations
+            .as_ref()
+            .and_then(|variations| variations.axis(b"wght"))
+            .map_or((self.weight, self.weight), |axis| {
+                (axis.minimum.round() as u16, axis.maximum.round() as u16)
+            })
     }
 
     pub fn units_per_em(&self) -> f32 {
@@ -165,11 +263,73 @@ impl FontFace {
         self.tables.get(tag).map(|(start, _)| *start)
     }
 
-    // a glyph's advance in font units
+    // a glyph's advance in font units, as HVAR or else the phantom points move it
     pub(crate) fn advance_units(&self, glyph: u16) -> f32 {
         let metrics = self.horizontal_metrics.max(1);
         let index = glyph.min(metrics - 1);
-        f32::from(read_u16(&self.data, self.hmtx.0 + usize::from(index) * 4).unwrap_or(0))
+        let advance =
+            f32::from(read_u16(&self.data, self.hmtx.0 + usize::from(index) * 4).unwrap_or(0));
+        let Some(variations) = self
+            .variations
+            .as_ref()
+            .filter(|_| !self.coordinates.is_empty())
+        else {
+            return advance;
+        };
+        if let Some(&varied) = self.advances.borrow().get(&glyph) {
+            return varied;
+        }
+        let delta = variations
+            .advance_delta(&self.data, glyph, &self.coordinates)
+            .or_else(|| {
+                let points = self.point_count(glyph);
+                let deltas = self.point_deltas(glyph, &vec![(0.0, 0.0); points], &[])?;
+                Some(deltas[points + 1].0 - deltas[points].0)
+            })
+            .unwrap_or(0.0);
+        let varied = (advance + delta).max(0.0);
+        self.advances.borrow_mut().insert(glyph, varied);
+        varied
+    }
+
+    // the points gvar moves in a glyph before its four phantom points: a simple glyph's
+    // outline points, or one per component of a composite
+    fn point_count(&self, glyph: u16) -> usize {
+        let Some((start, end)) = self.glyph_range(glyph) else {
+            return 0;
+        };
+        match read_i16(&self.data, start) {
+            Ok(contours) if contours > 0 => {
+                read_u16(&self.data, start + 10 + (contours as usize - 1) * 2)
+                    .map_or(0, |last| usize::from(last) + 1)
+            }
+            Ok(contours) if contours < 0 => self
+                .components(start, end)
+                .map_or(0, |components| components.len()),
+            _ => 0,
+        }
+    }
+
+    // how gvar moves a glyph's points, then its phantom points, at this instance's
+    // coordinates; none at the default instance
+    fn point_deltas(
+        &self,
+        glyph: u16,
+        points: &[(f32, f32)],
+        contour_ends: &[usize],
+    ) -> Option<Vec<(f32, f32)>> {
+        if self.coordinates.is_empty() {
+            return None;
+        }
+        let mut points = points.to_vec();
+        points.extend([(0.0, 0.0); 4]);
+        self.variations.as_ref()?.glyph_deltas(
+            &self.data,
+            glyph,
+            &self.coordinates,
+            &points,
+            contour_ends,
+        )
     }
 
     pub fn weight(&self) -> u16 {
@@ -192,20 +352,24 @@ impl FontFace {
     }
 
     pub fn advance(&self, glyph: u16, size: f32) -> f32 {
-        let metrics = self.horizontal_metrics.max(1);
-        let index = glyph.min(metrics - 1);
-        let offset = self.hmtx.0 + usize::from(index) * 4;
-        let advance = read_u16(&self.data, offset).unwrap_or(0);
-        f32::from(advance) / self.units_per_em * size
+        self.advance_units(glyph) / self.units_per_em * size
     }
 
     pub fn outline(&self, glyph: u16) -> Option<Outline> {
         if let Some(cff) = &self.cff {
             return cff.outline(&self.data, glyph);
         }
+        if let Some(cached) = self.outlines.borrow().get(&glyph) {
+            return cached.clone();
+        }
         let mut outline = Outline::default();
-        self.append_outline(glyph, (1.0, 0.0, 0.0, 1.0), (0.0, 0.0), 0, &mut outline)?;
-        Some(outline)
+        let outline = self
+            .append_outline(glyph, (1.0, 0.0, 0.0, 1.0), (0.0, 0.0), 0, &mut outline)
+            .map(|()| outline);
+        if !self.coordinates.is_empty() {
+            self.outlines.borrow_mut().insert(glyph, outline.clone());
+        }
+        outline
     }
 
     fn glyph_range(&self, glyph: u16) -> Option<(usize, usize)> {
@@ -247,22 +411,22 @@ impl FontFace {
         let contour_count = read_i16(&self.data, start).ok()?;
         if contour_count >= 0 {
             self.append_simple_glyph(
-                start,
-                end,
+                glyph,
+                (start, end),
                 contour_count as usize,
                 transform,
                 offset,
                 outline,
             )
         } else {
-            self.append_composite_glyph(start, end, transform, offset, depth, outline)
+            self.append_composite_glyph(glyph, (start, end), transform, offset, depth, outline)
         }
     }
 
     fn append_simple_glyph(
         &self,
-        start: usize,
-        end: usize,
+        glyph: u16,
+        (start, end): (usize, usize),
         contour_count: usize,
         transform: (f32, f32, f32, f32),
         offset: (f32, f32),
@@ -328,16 +492,26 @@ impl FontFace {
         if cursor > end {
             return None;
         }
+        let mut points = x_coordinates
+            .iter()
+            .zip(&y_coordinates)
+            .map(|(&x, &y)| (x as f32, y as f32))
+            .collect::<Vec<_>>();
+        if let Some(deltas) = self.point_deltas(glyph, &points, &contour_ends) {
+            for (point, delta) in points.iter_mut().zip(deltas) {
+                point.0 += delta.0;
+                point.1 += delta.1;
+            }
+        }
 
         let mut first = 0;
         for &last in &contour_ends {
-            if last >= point_count {
+            if last >= point_count || last < first {
                 break;
             }
             let mut contour = Vec::with_capacity(last + 1 - first);
             for index in first..=last {
-                let point_x = x_coordinates[index] as f32;
-                let point_y = y_coordinates[index] as f32;
+                let (point_x, point_y) = points[index];
                 contour.push(OutlinePoint {
                     x: transform.0 * point_x + transform.2 * point_y + offset.0,
                     y: transform.1 * point_x + transform.3 * point_y + offset.1,
@@ -352,17 +526,62 @@ impl FontFace {
 
     fn append_composite_glyph(
         &self,
-        start: usize,
-        end: usize,
+        glyph: u16,
+        (start, end): (usize, usize),
         transform: (f32, f32, f32, f32),
         offset: (f32, f32),
         depth: u8,
         outline: &mut Outline,
     ) -> Option<()> {
+        let mut components = self.components(start, end)?;
+        let offsets = components
+            .iter()
+            .map(|component| component.offset)
+            .collect::<Vec<_>>();
+        if let Some(deltas) = self.point_deltas(glyph, &offsets, &[]) {
+            for (component, delta) in components.iter_mut().zip(deltas) {
+                if component.offset_is_xy {
+                    component.offset.0 += delta.0;
+                    component.offset.1 += delta.1;
+                }
+            }
+        }
+        for component in components {
+            let component_transform = component.transform;
+            // only offsets in component space are supported, matching ARGS_ARE_XY_VALUES
+            let (component_offset_x, component_offset_y) = if component.offset_is_xy {
+                component.offset
+            } else {
+                (0.0, 0.0)
+            };
+            let combined = (
+                transform.0 * component_transform.0 + transform.2 * component_transform.1,
+                transform.1 * component_transform.0 + transform.3 * component_transform.1,
+                transform.0 * component_transform.2 + transform.2 * component_transform.3,
+                transform.1 * component_transform.2 + transform.3 * component_transform.3,
+            );
+            let component_origin = (
+                offset.0 + transform.0 * component_offset_x + transform.2 * component_offset_y,
+                offset.1 + transform.1 * component_offset_x + transform.3 * component_offset_y,
+            );
+            self.append_outline(
+                component.glyph,
+                combined,
+                component_origin,
+                depth + 1,
+                outline,
+            )?;
+        }
+        Some(())
+    }
+
+    // a composite glyph's component records, in order
+    fn components(&self, start: usize, end: usize) -> Option<Vec<Component>> {
+        let mut components = Vec::new();
         let mut cursor = start + 10;
         loop {
             if cursor + 4 > end {
-                return Some(());
+                return Some(components);
             }
             let flags = read_u16(&self.data, cursor).ok()?;
             let component = read_u16(&self.data, cursor + 2).ok()?;
@@ -397,28 +616,26 @@ impl FontFace {
                 );
                 cursor += 8;
             }
-            // only offsets in component space are supported, matching ARGS_ARE_XY_VALUES
-            let (component_offset_x, component_offset_y) = if flags & 0x0002 != 0 {
-                (argument_x, argument_y)
-            } else {
-                (0.0, 0.0)
-            };
-            let combined = (
-                transform.0 * component_transform.0 + transform.2 * component_transform.1,
-                transform.1 * component_transform.0 + transform.3 * component_transform.1,
-                transform.0 * component_transform.2 + transform.2 * component_transform.3,
-                transform.1 * component_transform.2 + transform.3 * component_transform.3,
-            );
-            let component_origin = (
-                offset.0 + transform.0 * component_offset_x + transform.2 * component_offset_y,
-                offset.1 + transform.1 * component_offset_x + transform.3 * component_offset_y,
-            );
-            self.append_outline(component, combined, component_origin, depth + 1, outline)?;
+            components.push(Component {
+                glyph: component,
+                offset: (argument_x, argument_y),
+                offset_is_xy: flags & 0x0002 != 0,
+                transform: component_transform,
+            });
             if flags & 0x0020 == 0 {
-                return Some(());
+                return Some(components);
             }
         }
     }
+}
+
+// one glyph a composite places, with its offset (or the point numbers it matches up) and
+// its 2x2 transform
+struct Component {
+    glyph: u16,
+    offset: (f32, f32),
+    offset_is_xy: bool,
+    transform: (f32, f32, f32, f32),
 }
 
 // signed-area accumulation, the same approach font-rs uses for antialiased coverage
@@ -731,17 +948,23 @@ pub(crate) struct ShapedRun {
 
 type ShapeKey = (String, FontStack, u32, FontStyle, bool);
 
-// the weight and slant text asks for
+// the weight and slant text asks for, and how it tunes a variable face's axes
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FontStyle {
     pub weight: u16,
     pub italic: bool,
+    pub variations: FontVariations,
+    // the opsz font-optical-sizing auto asks for, the font size in css pixels as f32 bits, or
+    // zero when optical sizing is off
+    pub optical_size: u32,
 }
 
 impl FontStyle {
     pub const NORMAL: Self = Self {
         weight: 400,
         italic: false,
+        variations: FontVariations(0),
+        optical_size: 0,
     };
 
     pub fn is_bold(self) -> bool {
@@ -809,6 +1032,75 @@ pub fn font_stack_families(stack: FontStack) -> Option<Rc<[String]>> {
     FONT_STACKS.with(|table| table.borrow().families.get(stack.0 as usize - 1).cloned())
 }
 
+// a font-variation-settings list, interned like font stacks; the default is normal
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FontVariations(u32);
+
+type AxisSettings = Rc<[([u8; 4], f32)]>;
+
+thread_local! {
+    static FONT_VARIATIONS: RefCell<(Vec<AxisSettings>, HashMap<String, FontVariations>)> =
+        RefCell::default();
+}
+
+// font-variation-settings: normal, or a list of quoted four letter axis tags and values
+pub(crate) fn parse_font_variations(value: &str) -> Option<FontVariations> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("normal") {
+        return Some(FontVariations::default());
+    }
+    let settings = value
+        .split(',')
+        .map(|setting| {
+            let setting = setting.trim();
+            let quote = setting
+                .chars()
+                .next()
+                .filter(|&quote| quote == '"' || quote == '\'')?;
+            let (tag, number) = setting[1..].split_once(quote)?;
+            let tag: [u8; 4] = tag.as_bytes().try_into().ok()?;
+            let number = number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|number| number.is_finite())?;
+            (tag.iter().all(|byte| (0x20..=0x7E).contains(byte))).then_some((tag, number))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let key = settings
+        .iter()
+        .map(|(tag, number)| format!("{}={number}", String::from_utf8_lossy(tag)))
+        .collect::<Vec<_>>()
+        .join(",");
+    FONT_VARIATIONS.with(|table| {
+        let (lists, ids) = &mut *table.borrow_mut();
+        if let Some(variations) = ids.get(&key) {
+            return Some(*variations);
+        }
+        if lists.len() >= MAX_FONT_STACKS {
+            return None;
+        }
+        lists.push(settings.into());
+        let variations = FontVariations(lists.len() as u32);
+        ids.insert(key, variations);
+        Some(variations)
+    })
+}
+
+fn font_variation_values(variations: FontVariations) -> AxisSettings {
+    if variations.0 == 0 {
+        return Rc::from([]);
+    }
+    FONT_VARIATIONS.with(|table| {
+        table
+            .borrow()
+            .0
+            .get(variations.0 as usize - 1)
+            .cloned()
+            .unwrap_or_else(|| Rc::from([]))
+    })
+}
+
 // the host owns font discovery, the engine only asks for a family by name and style
 pub trait FontSource {
     fn face(&self, family: &str, style: FontStyle) -> Option<Rc<FontFace>>;
@@ -848,11 +1140,13 @@ struct WebFace {
     face: Rc<FontFace>,
 }
 
-// a face in a stack, limited to an @font-face unicode-range when it has one
+// a face in a stack, limited to an @font-face unicode-range when it has one, and the weights
+// it is used for
 #[derive(Clone)]
 struct StackFace {
     face: Rc<FontFace>,
     ranges: Rc<[(u32, u32)]>,
+    weights: (u16, u16),
 }
 
 impl StackFace {
@@ -876,7 +1170,9 @@ pub(crate) struct ChosenFace {
 }
 
 impl ChosenFace {
-    fn new(face: Rc<FontFace>, style: FontStyle) -> Self {
+    // a variable face draws at the instance the style picks within the weights it is used for
+    fn new(face: &Rc<FontFace>, style: FontStyle, weights: (u16, u16)) -> Self {
+        let face = face.instance(style, weights);
         Self {
             synthetic_bold: style.weight >= 600 && face.weight() <= 500,
             synthetic_italic: style.italic && !face.is_italic(),
@@ -949,18 +1245,19 @@ impl FontSet {
         self.source.is_none() && self.web_faces.borrow().is_empty()
     }
 
-    // registers a face from an @font-face rule; it is chosen before installed faces
+    // registers a face from an @font-face rule; it is chosen before installed faces, and a
+    // rule without font-weight covers the weights the face itself can draw
     pub(crate) fn add_web_face(
         &self,
         family: &str,
-        weights: (u16, u16),
+        weights: Option<(u16, u16)>,
         italic: bool,
         ranges: Vec<(u32, u32)>,
         face: Rc<FontFace>,
     ) {
         self.web_faces.borrow_mut().push(WebFace {
             family: family.to_ascii_lowercase(),
-            weights,
+            weights: weights.unwrap_or_else(|| face.weight_range()),
             italic,
             ranges: ranges.into(),
             face,
@@ -1255,23 +1552,23 @@ impl FontSet {
     ) -> Option<ChosenFace> {
         let faces = self.stack_faces(stack, style);
         if let Some(entry) = faces.iter().find(|entry| entry.covers(character)) {
-            return Some(ChosenFace::new(entry.face.clone(), style));
+            return Some(ChosenFace::new(&entry.face, style, entry.weights));
         }
         if !character.is_whitespace()
             && !character.is_control()
             && let Some(face) = self.fallback(character, style)
         {
-            return Some(ChosenFace::new(face, style));
+            return Some(ChosenFace::new(&face, style, face.weight_range()));
         }
         faces
             .first()
-            .map(|entry| ChosenFace::new(entry.face.clone(), style))
+            .map(|entry| ChosenFace::new(&entry.face, style, entry.weights))
     }
 
     fn emoji_face(&self, character: char, style: FontStyle) -> Option<ChosenFace> {
         let face = self.source.as_ref()?.emoji(style)?;
         face.has_glyph(character)
-            .then(|| ChosenFace::new(face, FontStyle::NORMAL))
+            .then(|| ChosenFace::new(&face, FontStyle::NORMAL, face.weight_range()))
     }
 
     fn primary(&self, stack: FontStack, style: FontStyle) -> Option<Rc<FontFace>> {
@@ -1298,6 +1595,11 @@ impl FontSet {
     }
 
     fn stack_faces(&self, stack: FontStack, style: FontStyle) -> FaceList {
+        let style = FontStyle {
+            variations: FontVariations::default(),
+            optical_size: 0,
+            ..style
+        };
         if let Some(cached) = self.stacks.borrow().get(&(stack, style)) {
             return cached.clone();
         }
@@ -1327,6 +1629,7 @@ impl FontSet {
                 .and_then(|source| source.face(family, style))
             {
                 push(StackFace {
+                    weights: face.weight_range(),
                     face,
                     ranges: Rc::from([]),
                 });
@@ -1362,6 +1665,7 @@ impl FontSet {
             .map(|web| StackFace {
                 face: web.face.clone(),
                 ranges: web.ranges.clone(),
+                weights: web.weights,
             })
             .collect()
     }
@@ -1585,6 +1889,10 @@ mod tests {
 
     // a one-glyph font built in memory, so the parser is tested without a font file
     fn synthetic_font() -> Vec<u8> {
+        synthetic_font_with(Vec::new())
+    }
+
+    fn synthetic_font_with(extra: Vec<(&[u8; 4], Vec<u8>)>) -> Vec<u8> {
         let head = {
             let mut table = vec![0_u8; 54];
             table[18..20].copy_from_slice(&1000_u16.to_be_bytes());
@@ -1658,7 +1966,7 @@ mod tests {
             table
         };
 
-        let tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
+        let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
             (b"cmap", cmap),
             (b"glyf", glyf),
             (b"head", head),
@@ -1667,6 +1975,7 @@ mod tests {
             (b"loca", loca),
             (b"maxp", maxp),
         ];
+        tables.extend(extra);
         let mut file = Vec::new();
         file.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
         file.extend_from_slice(&(tables.len() as u16).to_be_bytes());
@@ -1743,6 +2052,156 @@ mod tests {
         let middle = filled.top + filled.height as i32 / 2;
         assert_eq!(at(filled.left + 5, middle), 0, "the inside stays empty");
         assert!(at(filled.left, middle) > 240, "the left edge is solid");
+    }
+
+    // the synthetic font with a wght axis from 100 to 900, default 400, whose heaviest end
+    // moves the square's lower right corner 100 units right, its upper left corner 50 units
+    // up, and the advance phantom point 100 units right; with an HVAR table the advance grows
+    // by 50 instead
+    fn synthetic_variable_font(hvar: bool) -> Vec<u8> {
+        let mut fvar = Vec::new();
+        for value in [1_u16, 0, 16, 2, 1, 20, 0, 8] {
+            fvar.extend_from_slice(&value.to_be_bytes());
+        }
+        fvar.extend_from_slice(b"wght");
+        for value in [100_i32, 400, 900] {
+            fvar.extend_from_slice(&(value << 16).to_be_bytes());
+        }
+        fvar.extend_from_slice(&[0, 0, 1, 0]);
+        // points 1, 3 and phantom 5; point 3 is touched with no x delta, so IUP moves point 2
+        // with point 1 and leaves point 0
+        let serialized = [3, 0x02, 1, 2, 2, 0x02, 100, 0, 100, 0x02, 0, 50, 0];
+        let mut glyph = Vec::new();
+        for value in [1_u16, 10, serialized.len() as u16, 0xA000, 0x4000] {
+            glyph.extend_from_slice(&value.to_be_bytes());
+        }
+        glyph.extend_from_slice(&serialized);
+        glyph.push(0);
+        let mut gvar = Vec::new();
+        gvar.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        for value in [1_u16, 0] {
+            gvar.extend_from_slice(&value.to_be_bytes());
+        }
+        gvar.extend_from_slice(&26_u32.to_be_bytes());
+        for value in [2_u16, 0] {
+            gvar.extend_from_slice(&value.to_be_bytes());
+        }
+        gvar.extend_from_slice(&26_u32.to_be_bytes());
+        for value in [0_u16, 0, glyph.len() as u16 / 2] {
+            gvar.extend_from_slice(&value.to_be_bytes());
+        }
+        gvar.extend_from_slice(&glyph);
+        let mut extra: Vec<(&[u8; 4], Vec<u8>)> = vec![(b"fvar", fvar), (b"gvar", gvar)];
+        if hvar {
+            let mut table = Vec::new();
+            table.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+            for value in [20_u32, 0, 0, 0] {
+                table.extend_from_slice(&value.to_be_bytes());
+            }
+            table.extend_from_slice(&1_u16.to_be_bytes());
+            table.extend_from_slice(&12_u32.to_be_bytes());
+            table.extend_from_slice(&1_u16.to_be_bytes());
+            table.extend_from_slice(&22_u32.to_be_bytes());
+            for value in [1_u16, 1, 0, 0x4000, 0x4000, 2, 0, 1, 0] {
+                table.extend_from_slice(&value.to_be_bytes());
+            }
+            table.extend_from_slice(&[0, 50]);
+            extra.push((b"HVAR", table));
+        }
+        synthetic_font_with(extra)
+    }
+
+    fn weight(weight: u16) -> FontStyle {
+        FontStyle {
+            weight,
+            ..FontStyle::NORMAL
+        }
+    }
+
+    #[test]
+    fn variable_instances_move_points_and_advances_with_gvar() {
+        let face = Rc::new(FontFace::parse(synthetic_variable_font(false)).expect("font"));
+        assert_eq!(face.weight_range(), (100, 900));
+        let heaviest = face.instance(weight(900), (100, 900));
+        assert!(!Rc::ptr_eq(&heaviest, &face));
+        assert!(Rc::ptr_eq(
+            &heaviest,
+            &face.instance(weight(900), (100, 900))
+        ));
+        assert!(Rc::ptr_eq(&face.instance(weight(400), (100, 900)), &face));
+        assert_eq!(heaviest.weight(), 900);
+        let corners = |face: &FontFace| {
+            face.outline(1).expect("outline").contours[0]
+                .iter()
+                .map(|point| (point.x, point.y))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            corners(&face),
+            vec![(100.0, 0.0), (600.0, 0.0), (600.0, 700.0), (100.0, 700.0)]
+        );
+        assert_eq!(
+            corners(&heaviest),
+            vec![(100.0, 0.0), (700.0, 0.0), (700.0, 750.0), (100.0, 750.0)]
+        );
+        assert_eq!(heaviest.advance(1, 1000.0), 700.0);
+        let middle = face.instance(weight(650), (100, 900));
+        assert_eq!(middle.advance(1, 1000.0), 650.0);
+        assert_eq!(corners(&middle)[2], (650.0, 725.0));
+
+        let hvar = Rc::new(FontFace::parse(synthetic_variable_font(true)).expect("font"));
+        assert_eq!(
+            hvar.instance(weight(900), (100, 900)).advance(1, 1000.0),
+            650.0
+        );
+    }
+
+    #[test]
+    fn font_weight_picks_the_wght_axis_within_the_font_face_range() {
+        let fonts = FontSet::new(
+            Rc::new(FontFace::parse(synthetic_font()).expect("font")),
+            None,
+        );
+        let variable = || Rc::new(FontFace::parse(synthetic_variable_font(false)).expect("font"));
+        fonts.add_web_face("Ranged", Some((400, 650)), false, Vec::new(), variable());
+        fonts.add_web_face("Open", None, false, Vec::new(), variable());
+        let ranged = intern_font_stack("Ranged");
+        let open = intern_font_stack("Open");
+        // 900 clamps to 650, halfway up the axis, and draws without synthetic bold
+        assert_eq!(fonts.measure("A", ranged, 1000.0, weight(900)), 650.0);
+        assert_eq!(fonts.measure("A", ranged, 1000.0, weight(300)), 600.0);
+        // without a font-weight descriptor the rule covers the whole axis
+        assert_eq!(fonts.measure("A", open, 1000.0, weight(900)), 700.0);
+        let settings = FontStyle {
+            variations: parse_font_variations("\"wght\" 650").expect("settings"),
+            ..FontStyle::NORMAL
+        };
+        assert_eq!(fonts.measure("A", open, 1000.0, settings), 650.0);
+
+        let chosen = ChosenFace::new(&variable(), weight(900), (100, 900));
+        assert!(!chosen.synthetic_bold);
+        let ranged_light = ChosenFace::new(&variable(), weight(900), (100, 500));
+        assert!(ranged_light.synthetic_bold);
+    }
+
+    #[test]
+    fn font_variation_settings_parse_quoted_tags_and_numbers() {
+        assert_eq!(
+            parse_font_variations("normal"),
+            Some(FontVariations::default())
+        );
+        let settings = parse_font_variations("'wght' 450, \"opsz\" 12.5").expect("settings");
+        assert_eq!(
+            parse_font_variations("\"wght\" 450,'opsz' 12.5"),
+            Some(settings)
+        );
+        assert_eq!(
+            font_variation_values(settings).to_vec(),
+            vec![(*b"wght", 450.0), (*b"opsz", 12.5)]
+        );
+        assert_eq!(parse_font_variations("\"wg\" 1"), None);
+        assert_eq!(parse_font_variations("\"wght\""), None);
+        assert_eq!(parse_font_variations("wght 400"), None);
     }
 
     fn fixture(name: &str) -> FontFace {

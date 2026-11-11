@@ -35,6 +35,7 @@ mod transform;
 mod unicode;
 #[rustfmt::skip]
 mod unicode_tables;
+mod variation;
 mod wasm;
 #[cfg(feature = "windowed")]
 mod window;

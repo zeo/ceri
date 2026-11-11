@@ -733,6 +733,8 @@ fn inherited_text(style: &Style) -> InheritedText {
         overflow_wrap: style.overflow_wrap,
         rtl: style.rtl,
         italic: style.italic,
+        font_variations: style.font_variations,
+        optical_sizing: style.optical_sizing,
         decoration: style.text_decoration,
     }
 }
@@ -759,6 +761,17 @@ struct InlineContext {
     align: TextAlign,
     // how far this text's baseline sits above the line's
     raise: f32,
+}
+
+impl InlineContext {
+    fn font(&self) -> FontStyle {
+        FontStyle {
+            weight: self.weight.0,
+            italic: self.text.italic,
+            variations: self.text.font_variations,
+            optical_size: optical_size(self.text.optical_sizing, self.font_size),
+        }
+    }
 }
 
 // which DOM text node the next appended words belong to, for prose selection
@@ -2211,7 +2224,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(1.0);
-    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style));
+    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style, font_size));
     let mut margin = resolve_margins(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
     let border = used_border(&style);
@@ -2541,14 +2554,14 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                     value_line,
                     style.font_family,
                     font_size,
-                    font_style(&style),
+                    font_style(&style, font_size),
                     letter_spacing,
                 ),
                 font_size,
                 letter_spacing,
                 font_stack: style.font_family,
                 color,
-                font: font_style(&style),
+                font: font_style(&style, font_size),
                 node: None,
                 node_offset: 0,
                 source_len: 0,
@@ -3146,10 +3159,7 @@ fn text_intrinsic_widths(pieces: &[(Option<NodeId>, &str)], context: InlineConte
         .letter_spacing
         .resolve(context.font_size, context.font_size)
         .unwrap_or(0.0);
-    let font = FontStyle {
-        weight: context.weight.0,
-        italic: context.text.italic,
-    };
+    let font = context.font();
     let joined = pieces
         .iter()
         .map(|(_, value)| *value)
@@ -5379,8 +5389,15 @@ fn control_content_size(
         return (None, None);
     };
     let element = node.element();
-    let measure =
-        |text: &str| measure_text(text, style.font_family, font_size, font_style(style), 0.0);
+    let measure = |text: &str| {
+        measure_text(
+            text,
+            style.font_family,
+            font_size,
+            font_style(style, font_size),
+            0.0,
+        )
+    };
     let attribute = |name: &str, default: f32| {
         element
             .and_then(|element| element.attr(name))
@@ -5554,7 +5571,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(1.0);
-    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style));
+    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style, font_size));
     let margin = resolve_edges(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
     let extras = margin.left
@@ -5616,7 +5633,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         .letter_spacing
         .resolve(font_size, font_size)
         .unwrap_or(0.0);
-    let font = font_style(&style);
+    let font = font_style(&style, font_size);
     let child_parent = ParentStyle {
         font_size,
         color: style.color,
@@ -6815,10 +6832,7 @@ fn append_inline_text(
             .letter_spacing
             .resolve(context.font_size, context.font_size)
             .unwrap_or(0.0),
-        font: FontStyle {
-            weight: context.weight.0,
-            italic: context.text.italic,
-        },
+        font: context.font(),
         levels: None,
         space: 0.0,
         leading: half_leading(context.line_height, context.text.family, context.font_size),
@@ -7282,10 +7296,7 @@ fn append_atomic(
     }
     // a collapsed space before the box is drawn unless the line breaks there
     if line.trailing_space && line.has_content() {
-        let font = FontStyle {
-            weight: context.weight.0,
-            italic: context.text.italic,
-        };
+        let font = context.font();
         let space = match line.text_before_edges() {
             Some(previous) => measure_text(
                 " ",
@@ -7583,7 +7594,7 @@ fn outside_marker(
     let color = text_color(style);
     let gap = font_size * 0.5;
     if let Some(label) = style.list_style_type.marker_text(ordinal) {
-        let font = font_style(style);
+        let font = font_style(style, font_size);
         let letter_spacing = style
             .letter_spacing
             .resolve(font_size, font_size)
@@ -8012,12 +8023,19 @@ fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
     (line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0
 }
 
-// the weight and slant a style asks its font for
-fn font_style(style: &Style) -> FontStyle {
+// the weight, slant, axis settings and optical size a style asks its font for
+fn font_style(style: &Style, font_size: f32) -> FontStyle {
     FontStyle {
         weight: style.font_weight.0,
         italic: style.italic,
+        variations: style.font_variations,
+        optical_size: optical_size(style.optical_sizing, font_size),
     }
+}
+
+// font-optical-sizing auto sets opsz to the used font size in pixels
+fn optical_size(auto: bool, font_size: f32) -> u32 {
+    if auto { font_size.to_bits() } else { 0 }
 }
 
 fn measure_text(
