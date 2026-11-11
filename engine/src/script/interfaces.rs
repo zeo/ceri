@@ -216,6 +216,9 @@ static INTERFACES: &[Interface] = &[
             ("slot", Attr("slot")),
             ("getBoundingClientRect", Method(0)),
             ("getClientRects", Method(0)),
+            ("setPointerCapture", Method(1)),
+            ("releasePointerCapture", Method(1)),
+            ("hasPointerCapture", Method(1)),
             ("clientWidth", ReadOnly),
             ("clientHeight", ReadOnly),
             ("clientTop", ReadOnly),
@@ -1264,6 +1267,9 @@ impl ScriptRuntime {
             }
             ("width" | "height", Access::Set) => {
                 self.canvas_element_member(handle, member.name(), Some(first))?
+            }
+            ("setPointerCapture" | "releasePointerCapture" | "hasPointerCapture", Access::Call) => {
+                self.pointer_capture_member(node, member.name(), first)?
             }
             ("returnValue", _)
             | ("show" | "showModal" | "close" | "requestClose", Access::Call) => {

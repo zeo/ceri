@@ -1749,11 +1749,11 @@ impl Browser {
         y: f32,
         count: u32,
     ) -> Result<bool, NavigationError> {
-        let node = self.layout(viewport)?.hit_test(x, y);
-        let Some(node) = node else {
+        let hit = self.layout(viewport)?.hit_test(x, y);
+        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+        let Some(node) = page.runtime.click_target(hit) else {
             return Ok(false);
         };
-        let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime.set_pointer_position(x, y);
         page.runtime.set_click_detail(count);
         let clicked = self.activate_node(node);
@@ -2245,6 +2245,7 @@ impl Browser {
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime.set_pointer_position(x, y);
+        let node = page.runtime.pointer_target(node).map_err(script_error)?;
         let hover_changed = if event == "pointermove" && self.hovered_node != node {
             let previous = std::mem::replace(&mut self.hovered_node, node);
             page.runtime

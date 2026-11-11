@@ -444,10 +444,10 @@ fn event_defaults(event_type: &str) -> (&'static str, bool, bool) {
         "pointerdown" | "pointerup" | "pointermove" | "pointerover" | "pointerout" => {
             ("PointerEvent", true, true)
         }
-        "pointercancel" => ("PointerEvent", true, false),
-        "pointerenter" | "pointerleave" | "gotpointercapture" | "lostpointercapture" => {
-            ("PointerEvent", false, false)
+        "pointercancel" | "gotpointercapture" | "lostpointercapture" => {
+            ("PointerEvent", true, false)
         }
+        "pointerenter" | "pointerleave" => ("PointerEvent", false, false),
         "wheel" => ("WheelEvent", true, true),
         "dragstart" => ("DragEvent", true, true),
         "keydown" | "keyup" | "keypress" => ("KeyboardEvent", true, true),
@@ -521,6 +521,12 @@ pub(super) struct PointerState {
     buttons: u16,
     // a canceled pointerdown suppresses compatibility mouse events until the pointerup
     suppress_mouse: bool,
+    // the element pointer events go to instead of the one under the pointer
+    capture: Option<NodeId>,
+    // what script asked for, which takes over at the next pointer event
+    pending_capture: Option<NodeId>,
+    // the capture the last release had, which its click goes to
+    released_capture: Option<NodeId>,
 }
 
 // the legacy keyCode of a key, which older code still compares against
@@ -1621,6 +1627,12 @@ impl ScriptRuntime {
             _ => {}
         }
         let pointer = self.fire(target, event_type, HostEventFields::default())?;
+        // a release ends any capture once its pointerup has gone out
+        if event_type == "pointerup" {
+            self.pointer.released_capture = self.pointer.capture;
+            self.pointer.pending_capture = None;
+            self.process_pointer_capture()?;
+        }
         let mouse = match event_type {
             "pointerdown" => {
                 self.pointer.suppress_mouse = pointer.default_prevented;
@@ -1644,6 +1656,93 @@ impl ScriptRuntime {
         }
         self.drain_microtasks()?;
         Ok(handled)
+    }
+
+    // where a pointer event goes: the capturing element, else the one under the pointer
+    pub(crate) fn pointer_target(
+        &mut self,
+        hit: Option<NodeId>,
+    ) -> Result<Option<NodeId>, ScriptError> {
+        self.process_pointer_capture()?;
+        Ok(self.pointer.capture.or(hit))
+    }
+
+    // a click after a captured release goes to the element that had the capture
+    pub(crate) fn click_target(&self, hit: Option<NodeId>) -> Option<NodeId> {
+        let document = self.document.borrow();
+        self.pointer
+            .released_capture
+            .filter(|&node| document.is_connected(node))
+            .or(hit)
+    }
+
+    // hands capture over to what script last asked for, with lost and got events
+    fn process_pointer_capture(&mut self) -> Result<(), ScriptError> {
+        let connected = |runtime: &Self, node: NodeId| runtime.document.borrow().is_connected(node);
+        if self
+            .pointer
+            .pending_capture
+            .is_some_and(|node| !connected(self, node))
+        {
+            self.pointer.pending_capture = None;
+        }
+        if self.pointer.capture == self.pointer.pending_capture {
+            return Ok(());
+        }
+        let lost = std::mem::replace(&mut self.pointer.capture, self.pointer.pending_capture);
+        if let Some(lost) = lost {
+            // an element that left the document hands its lost event to the document
+            let node = if connected(self, lost) {
+                lost
+            } else {
+                self.document_node()
+            };
+            self.fire(
+                ListenerTarget::Node(node),
+                "lostpointercapture",
+                HostEventFields::default(),
+            )?;
+        }
+        if let Some(got) = self.pointer.capture {
+            self.fire(
+                ListenerTarget::Node(got),
+                "gotpointercapture",
+                HostEventFields::default(),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn pointer_capture_member(
+        &mut self,
+        node: NodeId,
+        name: &str,
+        pointer: Value,
+    ) -> Result<Value, ScriptError> {
+        // the mouse is the only pointer, and its id is 1 as in browsers
+        if self.coerce_number(pointer)? != 1.0 {
+            return Err(self.throw_value(dom_exception(
+                "NotFoundError",
+                "No active pointer with the given id is found.",
+            )));
+        }
+        let held = self.pointer.pending_capture == Some(node);
+        match name {
+            "hasPointerCapture" => return Ok(Value::Bool(held)),
+            "releasePointerCapture" if held => self.pointer.pending_capture = None,
+            "setPointerCapture" if !self.document.borrow().is_connected(node) => {
+                return Err(self.throw_value(dom_exception(
+                    "InvalidStateError",
+                    "The element is not in a document.",
+                )));
+            }
+            // capture only holds while a button is down
+            "setPointerCapture" if self.pointer.buttons != 0 => {
+                self.pointer.pending_capture = Some(node);
+            }
+            _ => {}
+        }
+        Ok(Value::Undefined)
     }
 
     // the dragstart of a press that moved far enough on a draggable element

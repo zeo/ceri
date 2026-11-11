@@ -2240,6 +2240,55 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_press_keeps_its_moves_release_and_click_on_the_capturing_element() {
+        let browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } p { display: block; width: 100px; height: 40px; margin: 0 }</style><p id="handle">drag</p><p id="other">other</p><p id="status"></p><script>
+                const seen = [];
+                const note = (entry) => { seen.push(entry); document.getElementById("status").textContent = seen.join(","); };
+                const handle = document.getElementById("handle");
+                document.getElementById("other").addEventListener("pointermove", () => note("other"));
+                document.addEventListener("gotpointercapture", (event) => note("got:" + event.target.id + ":" + event.bubbles));
+                document.addEventListener("lostpointercapture", (event) => note("lost:" + event.target.id));
+                handle.addEventListener("pointerdown", (event) => {
+                    let threw = "";
+                    try { handle.setPointerCapture(7); } catch (error) { threw = error.name; }
+                    handle.setPointerCapture(event.pointerId);
+                    note("down:" + threw + ":" + handle.hasPointerCapture(1));
+                    handle.onpointermove = (move) => note("move:" + move.clientY);
+                    handle.onpointerup = () => note("up");
+                });
+                handle.addEventListener("mouseup", () => note("mouseup"));
+                document.addEventListener("click", (event) => note("click:" + event.target.id));
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        press(&mut host, (10.0, 10.0));
+        drag(&mut host, (10.0, 50.0));
+        drag(&mut host, (10.0, 400.0));
+        release(&mut host, (10.0, 50.0));
+        drag(&mut host, (12.0, 50.0));
+        let document = host.browser().document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "down:NotFoundError:true,got:handle:true,move:50,move:400,up,lost:handle,mouseup,click:handle,other"
+            )
+        );
+    }
+
+    #[test]
     fn a_press_that_moves_four_pixels_on_a_draggable_element_starts_a_drag() {
         let browser = Browser::new(bundle(
             r#"<style>body { margin: 0 } li, p { display: block; width: 100px; height: 40px; margin: 0 }</style><ul style="margin: 0; padding: 0"><li id="card" draggable="true"><span>one</span></li></ul><p id="plain">two</p><p id="status"></p><script>
