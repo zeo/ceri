@@ -625,13 +625,7 @@ impl LengthTerms {
             + self.percent * containing / 100.0
             + self.viewport_width * environment.viewport.width / 100.0
             + self.viewport_height * environment.viewport.height / 100.0
-            + self.zero_width
-                * crate::font::active_fonts().advance(
-                    '0',
-                    crate::font::FontStack::default(),
-                    font_size,
-                    crate::font::FontStyle::NORMAL,
-                )
+            + self.zero_width * zero_advance(font_size)
     }
 
     fn is_finite(self) -> bool {
@@ -775,6 +769,35 @@ impl Drop for ActiveEnvironment {
     fn drop(&mut self) {
         LAYOUT_ENVIRONMENT.with(|current| current.set(self.previous));
     }
+}
+
+thread_local! {
+    static ZERO_FONT: std::cell::Cell<(crate::font::FontStack, crate::font::FontStyle)> =
+        std::cell::Cell::new((crate::font::FontStack::default(), crate::font::FontStyle::NORMAL));
+}
+
+pub(crate) struct ActiveZeroFont {
+    previous: (crate::font::FontStack, crate::font::FontStyle),
+}
+
+impl Drop for ActiveZeroFont {
+    fn drop(&mut self) {
+        ZERO_FONT.with(|current| current.set(self.previous));
+    }
+}
+
+// ch measures the zero of the font the element being laid out asks for
+pub(crate) fn use_zero_font(
+    stack: crate::font::FontStack,
+    style: crate::font::FontStyle,
+) -> ActiveZeroFont {
+    let previous = ZERO_FONT.with(|current| current.replace((stack, style)));
+    ActiveZeroFont { previous }
+}
+
+fn zero_advance(font_size: f32) -> f32 {
+    let (stack, style) = ZERO_FONT.with(|current| current.get());
+    crate::font::active_fonts().advance('0', stack, font_size, style)
 }
 
 // viewport and root-relative units resolve against the pass the layout runs in

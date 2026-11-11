@@ -2110,6 +2110,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(1.0);
+    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style));
     let mut margin = resolve_margins(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
     let border = used_border(&style);
@@ -5321,6 +5322,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(1.0);
+    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style));
     let margin = resolve_edges(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
     let extras = margin.left
