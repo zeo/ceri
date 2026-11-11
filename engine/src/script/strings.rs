@@ -698,9 +698,95 @@ pub(super) fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
     })
 }
 
+// the characters encodeURI leaves as they are beyond the ones encodeURIComponent does
+pub(super) const URI_RESERVED: &str = ";/?:@&=+$,#";
+
+// encodeURIComponent, or encodeURI with the reserved characters kept
+pub(super) fn encode_uri(text: &str, keep: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric()
+            || "-_.!~*'()".contains(character)
+            || keep.contains(character)
+        {
+            encoded.push(character);
+            continue;
+        }
+        for byte in character.encode_utf8(&mut [0; 4]).bytes() {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+// decodeURIComponent, or decodeURI with escapes of the reserved characters left escaped; None
+// when an escape is malformed or the bytes are not UTF-8
+pub(super) fn decode_uri(text: &str, keep: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let byte_at = |index: usize| -> Option<u8> {
+        if bytes.get(index) != Some(&b'%') {
+            return None;
+        }
+        u8::from_str_radix(text.get(index + 1..index + 3)?, 16).ok()
+    };
+    let mut decoded = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(offset) = text[index..].find('%') {
+        decoded.push_str(&text[index..index + offset]);
+        index += offset;
+        let lead = byte_at(index)?;
+        let length = match lead.leading_ones() {
+            0 => 1,
+            count @ 2..=4 => count as usize,
+            _ => return None,
+        };
+        let mut sequence = vec![lead];
+        for part in 1..length {
+            sequence.push(byte_at(index + part * 3)?);
+        }
+        let character = std::str::from_utf8(&sequence).ok()?;
+        match keep.contains(character) && length == 1 {
+            true => decoded.push_str(&text[index..index + 3]),
+            false => decoded.push_str(character),
+        }
+        index += length * 3;
+    }
+    decoded.push_str(&text[index..]);
+    Some(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uri_functions_escape_and_unescape_like_the_spec() {
+        assert_eq!(
+            encode_uri("a b/é#?😀", ""),
+            "a%20b%2F%C3%A9%23%3F%F0%9F%98%80"
+        );
+        assert_eq!(encode_uri("a b/é#?", URI_RESERVED), "a%20b/%C3%A9#?");
+        assert_eq!(
+            decode_uri("a%20b%2F%C3%A9%F0%9F%98%80", "").as_deref(),
+            Some("a b/é😀")
+        );
+        assert_eq!(
+            decode_uri("%2F%20%23", URI_RESERVED).as_deref(),
+            Some("%2F %23")
+        );
+        for malformed in [
+            "%",
+            "%2",
+            "%zz",
+            "%C3",
+            "%C3%28",
+            "%80",
+            "%ED%A0%80",
+            "%C0%AF",
+        ] {
+            assert_eq!(decode_uri(malformed, ""), None, "{malformed}");
+        }
+    }
 
     #[test]
     fn replacement_templates_expand_like_the_spec() {

@@ -100,6 +100,9 @@ pub(super) enum Native {
     Promise(Rc<super::promises::PromiseFunction>),
     ParseInt,
     ParseFloat,
+    // true for the component forms
+    EncodeUri(bool),
+    DecodeUri(bool),
     GlobalIsNaN,
     GlobalIsFinite,
     StringRaw,
@@ -558,6 +561,14 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(&number, "parseFloat", parse_float.clone());
     globals.push(("parseInt", parse_int));
     globals.push(("parseFloat", parse_float));
+    for (name, native) in [
+        ("encodeURI", Native::EncodeUri(false)),
+        ("encodeURIComponent", Native::EncodeUri(true)),
+        ("decodeURI", Native::DecodeUri(false)),
+        ("decodeURIComponent", Native::DecodeUri(true)),
+    ] {
+        globals.push((name, Value::Object(build.function(native, name, 1))));
+    }
     globals.push((
         "isNaN",
         Value::Object(build.function(Native::GlobalIsNaN, "isNaN", 1)),
@@ -2334,6 +2345,29 @@ impl ScriptRuntime {
             Native::ParseFloat => {
                 let text = self.coerce_string(first)?;
                 Ok(Value::Number(super::numbers::parse_float(&text)))
+            }
+            Native::EncodeUri(component) => {
+                let text = self.coerce_string(first)?;
+                let keep = if component {
+                    ""
+                } else {
+                    super::strings::URI_RESERVED
+                };
+                Ok(Value::String(
+                    super::strings::encode_uri(&text, keep).into(),
+                ))
+            }
+            Native::DecodeUri(component) => {
+                let text = self.coerce_string(first)?;
+                let keep = if component {
+                    ""
+                } else {
+                    super::strings::URI_RESERVED
+                };
+                match super::strings::decode_uri(&text, keep) {
+                    Some(decoded) => Ok(Value::String(decoded.into())),
+                    None => Err(self.throw_error("URIError", "URI malformed")),
+                }
             }
             Native::GlobalIsNaN => Ok(Value::Bool(self.coerce_number(first)?.is_nan())),
             Native::GlobalIsFinite => Ok(Value::Bool(self.coerce_number(first)?.is_finite())),
