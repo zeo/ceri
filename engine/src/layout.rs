@@ -1017,7 +1017,7 @@ pub fn layout_with_state(
             scrollbar_for(stylesheet, (document, html), &style, font_size, style_state);
     }
     root.children = layout_document_children(document, stylesheet, viewport, style_state);
-    finalize_scroll(&mut root, style_state);
+    finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     // a classic vertical scrollbar takes its width from the initial and fixed containing
     // blocks, while vw, resolved from the layout environment, keeps the whole viewport
     if let Some(bar) = scrollbar_metrics(&root).vertical_track {
@@ -1027,7 +1027,7 @@ pub fn layout_with_state(
         };
         CONTAINERS.with(|containers| containers.borrow_mut().clear());
         root.children = layout_document_children(document, stylesheet, scrollport, style_state);
-        finalize_scroll(&mut root, style_state);
+        finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     }
     LayoutDocument {
         viewport,
@@ -1994,20 +1994,12 @@ fn index_boxes(
 ) {
     let offset = visual_offset_for(layout, ancestor_offset);
     if !layout.tag.starts_with("::") {
-        let content = if layout.is_document() || layout.overflow != Overflow::Visible {
-            layout.scroll_content
-        } else {
-            Size {
-                width: layout.rect.width,
-                height: layout.rect.height,
-            }
-        };
         index.entry(layout.node).or_default().push(BoxGeometry {
             rect: translate_rect(layout.rect, offset),
             border: layout.border.widths,
             position: layout.position,
             scrollport: translate_rect(scrollbar_metrics(layout).scrollport, offset),
-            scroll_size: content,
+            scroll_size: layout.scroll_content,
         });
     }
     // text nodes are measured by the runs they produced
@@ -3342,7 +3334,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     Some(layout)
 }
 
@@ -4608,7 +4600,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     layout
 }
 
@@ -5091,7 +5083,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     layout
 }
 
@@ -5815,7 +5807,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         },
     );
-    finalize_scroll(&mut layout, style_state);
+    finalize_scroll(&mut layout, padding, style_state);
     layout
 }
 
@@ -7064,12 +7056,12 @@ fn apply_relative_offset(
     );
 }
 
-fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
+fn finalize_scroll(layout: &mut LayoutBox, padding: ResolvedEdges, style_state: &StyleState) {
     let size = Size {
         width: layout.rect.width,
         height: layout.rect.height,
     };
-    layout.scroll_content = measure_scroll_content(layout, size);
+    layout.scroll_content = measure_scroll_content(layout, padding, size);
     let is_document = layout.is_document();
     // clip never scrolls; hidden scrolls only when script asks
     if !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden) && !is_document {
@@ -7082,7 +7074,7 @@ fn finalize_scroll(layout: &mut LayoutBox, style_state: &StyleState) {
         width: gutter.width,
         height: gutter.height,
     };
-    layout.scroll_content = measure_scroll_content(layout, floor);
+    layout.scroll_content = measure_scroll_content(layout, padding, floor);
     let scrollport = scrollbar_metrics(layout).scrollport;
     layout.scroll_content.width = layout.scroll_content.width.max(scrollport.width);
     layout.scroll_content.height = layout.scroll_content.height.max(scrollport.height);
@@ -7155,19 +7147,29 @@ fn apply_sticky_descendants(
     }
 }
 
-fn measure_scroll_content(layout: &LayoutBox, floor: Size) -> Size {
+// in border box coordinates, so the extent counts both borders as the scrollport does
+fn measure_scroll_content(layout: &LayoutBox, padding: ResolvedEdges, floor: Size) -> Size {
     let mut right = layout.rect.x + floor.width;
     let mut bottom = layout.rect.y + floor.height;
+    let border = layout.border.widths;
     // rounding in the sums below must not read as overflow
     const SLACK: f32 = 0.01;
     for child in &layout.children {
         if child.position == Position::Fixed {
             continue;
         }
-        right =
-            right.max(child.rect.x + child.visual_offset.0 + child.rect.width + child.margin.right);
-        bottom = bottom
-            .max(child.rect.y + child.visual_offset.1 + child.rect.height + child.margin.bottom);
+        // as in chromium, in-flow margin boxes carry the end padding and border with them,
+        // while an absolutely positioned box reaches only as far as its border box
+        let (end_x, end_y) = if child.position == Position::Absolute {
+            (border.right, border.bottom)
+        } else {
+            (
+                child.margin.right + padding.right + border.right,
+                child.margin.bottom + padding.bottom + border.bottom,
+            )
+        };
+        right = right.max(child.rect.x + child.visual_offset.0 + child.rect.width + end_x);
+        bottom = bottom.max(child.rect.y + child.visual_offset.1 + child.rect.height + end_y);
     }
     let extent = |far: f32, start: f32, size: f32| {
         let measured = far - start;
@@ -9933,6 +9935,38 @@ mod tests {
             .map(|prose| prose.run.text.trim().to_string())
             .collect::<Vec<_>>();
         assert_eq!(selectable, ["free"]);
+    }
+
+    #[test]
+    fn scroll_extent_ends_with_the_padding_after_the_children_margin_boxes() {
+        let document = Document::parse_markup(
+            "<style>body { margin: 0 } #scroller { width: 100px; height: 100px; padding: 10px; border: 4px solid red; overflow: auto } #content { width: 300px; height: 300px; margin: 0 7px 5px 0 }</style><div id='scroller'><div id='content'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let mut state = StyleState::default();
+        state
+            .scroll_offsets
+            .insert(document.node_at(&[1]), (1000.0, 1000.0));
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 400.0,
+            },
+            &state,
+        );
+        let scroller = &result.root.children[0];
+        // chromium: scrollWidth 327 and scrollHeight 325 inside the 4px borders, 105px client
+        assert_eq!(
+            scroller.scroll_content,
+            Size {
+                width: 335.0,
+                height: 333.0
+            }
+        );
+        assert_eq!(scroller.scroll_offset, (222.0, 220.0));
     }
 
     #[test]

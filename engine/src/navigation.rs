@@ -5159,6 +5159,38 @@ mod tests {
     }
 
     #[test]
+    fn scroll_sizes_count_end_padding_and_leave_out_borders() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } .scroller { overflow: auto; width: 100px; height: 100px; padding: 10px; border: 4px solid red } .block { width: 300px; height: 300px; margin: 0 7px 5px 0; flex: none } .line { display: inline-block; width: 300px; height: 20px } #plain { width: 50px; height: 20px; border: 3px solid red } #visible { position: relative; width: 50px; height: 20px; padding: 6px; border: 4px solid red } #visible > div { position: absolute; left: 0; top: 0; width: 80px; height: 30px; margin: 0 5px 5px 0 }</style><div class="scroller" id="block"><div class="block"></div></div><div class="scroller" id="flex" style="display: flex"><div class="block"></div></div><div class="scroller" id="line"><span class="line"></span></div><div id="plain"></div><div id="visible"><div></div></div><p id="status">idle</p><script>
+                document.getElementById("status").textContent = ["block", "flex", "line", "plain", "visible"]
+                    .map((id) => {
+                        const box = document.getElementById(id);
+                        return [box.scrollWidth, box.scrollHeight, box.clientWidth, box.clientHeight].join("x");
+                    })
+                    .join(",");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("scroll size page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        // what chromium reports for the same markup
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("327x325x105x105,327x325x105x105,320x105x120x105,50x20x50x20,80x32x62x32")
+        );
+    }
+
+    #[test]
     fn performance_timeline_idle_callbacks_and_event_target_objects() {
         let mut browser = Browser::new(bundle(
             r#"<p id="status">idle</p><script>
