@@ -22025,11 +22025,19 @@ mod tests {
                 ws.onerror = () => log.push("error");
                 ws.addEventListener("close", (event) => {
                     log.push(`close:${event.wasClean}:${event.code}:${event.reason}:${ws.readyState}:${event instanceof CloseEvent}`);
-                    document.getElementById("status").textContent = log.join("|");
+                    settle();
                 });
+                // the refused socket fails on its own clock, so its events are kept apart
+                const failed = [];
+                const settle = () => {
+                    if (failed.length === 2 && log.at(-1).startsWith("close:")) document.getElementById("status").textContent = [...log, ...failed].join("|");
+                };
                 const refused = new WebSocket("ws://nowhere.example/");
-                refused.onerror = () => log.push("refused error");
-                refused.onclose = (event) => log.push(`refused close:${event.wasClean}:${event.code}`);
+                refused.onerror = () => failed.push("refused error");
+                refused.onclose = (event) => {
+                    failed.push(`refused close:${event.wasClean}:${event.code}`);
+                    settle();
+                };
                 "#,
             )
             .expect("sockets should construct");
@@ -22047,7 +22055,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "SyntaxError|SyntaxError|SyntaxError|SyntaxError|wss://app.ceri.invalid/live?room=1|0|blob|InvalidStateError|InvalidAccessError|refused error|refused close:false:1006|open:json|buffered:8|text:hello:wss://app.ceri.invalid|bytes:1-2-3|close:true:4000:bye:3:true"
+                "SyntaxError|SyntaxError|SyntaxError|SyntaxError|wss://app.ceri.invalid/live?room=1|0|blob|InvalidStateError|InvalidAccessError|open:json|buffered:8|text:hello:wss://app.ceri.invalid|bytes:1-2-3|close:true:4000:bye:3:true|refused error|refused close:false:1006"
             )
         );
         let (request, frames, close) = server.join().expect("server");

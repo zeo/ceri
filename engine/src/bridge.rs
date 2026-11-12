@@ -109,7 +109,8 @@ pub trait CommandRouter {
 }
 
 // which commands one set of windows may invoke from one set of origins; a pattern is `*`, an
-// exact name, or a prefix ending in `*`
+// exact name, or a prefix ending in `*`, and only a pattern with a colon reaches a built-in
+// `namespace:command`, so `*` grants the app's own commands and none of the desktop's
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub windows: Vec<String>,
@@ -137,13 +138,19 @@ impl Capabilities {
         self.grants.iter().any(|grant| {
             matches_any(&grant.windows, window)
                 && matches_any(&grant.origins, origin)
-                && matches_any(&grant.commands, command)
+                && matches_any(
+                    grant
+                        .commands
+                        .iter()
+                        .filter(|pattern| pattern.contains(':') || !command.contains(':')),
+                    command,
+                )
         })
     }
 }
 
-fn matches_any(patterns: &[String], value: &str) -> bool {
-    patterns.iter().any(|pattern| {
+fn matches_any<'a>(patterns: impl IntoIterator<Item = &'a String>, value: &str) -> bool {
+    patterns.into_iter().any(|pattern| {
         pattern == "*"
             || pattern == value
             || pattern
@@ -171,6 +178,7 @@ mod tests {
         let capabilities = Capabilities::new(vec![
             grant(&["main"], &[origin], &["greet", "window:*"]),
             grant(&["*"], &[origin], &["ping"]),
+            grant(&["tools"], &[origin], &["*", "d*", "notification:*"]),
         ]);
         assert!(capabilities.permits("main", origin, "greet"));
         assert!(capabilities.permits("main", origin, "window:minimize"));
@@ -179,5 +187,9 @@ mod tests {
         assert!(!capabilities.permits("main", "https://example.com", "greet"));
         assert!(!capabilities.permits("main", origin, "windows"));
         assert!(!Capabilities::default().permits("main", origin, "ping"));
+        assert!(capabilities.permits("tools", origin, "greet"));
+        assert!(capabilities.permits("tools", origin, "notification:show"));
+        assert!(!capabilities.permits("tools", origin, "dialog:open"));
+        assert!(!capabilities.permits("tools", origin, "window:close"));
     }
 }

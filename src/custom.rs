@@ -345,7 +345,8 @@ impl App {
         self
     }
 
-    // the app origin may always drive its own window and read the app version
+    // the app origin may always drive its own window and read the app version; dialogs, the
+    // opener, notifications, autostart and deep links need a grant naming them
     pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
         self
@@ -373,16 +374,7 @@ impl App {
         let capabilities = self.capabilities.grant(Grant {
             windows: vec!["*".to_string()],
             origins: vec![APP_ORIGIN.to_string()],
-            commands: vec![
-                "window:*".to_string(),
-                "app:*".to_string(),
-                "dialog:*".to_string(),
-                "opener:open-url".to_string(),
-                "opener:reveal".to_string(),
-                "notification:*".to_string(),
-                "autostart:*".to_string(),
-                "deep-link:get-current".to_string(),
-            ],
+            commands: vec!["window:*".to_string(), "app:*".to_string()],
         });
         let name = self
             .name
