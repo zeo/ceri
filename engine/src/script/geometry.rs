@@ -33,6 +33,7 @@ pub(super) struct MeasuredLayout {
     version: u64,
     state: StyleState,
     boxes: HashMap<NodeId, Vec<BoxGeometry>>,
+    layout: LayoutDocument,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,8 +189,24 @@ const COMPUTED: &[&str] = &[
     "letter-spacing",
 ];
 
+// blink prints css numbers to six significant digits
+fn css_number(value: f64) -> String {
+    number_to_string(format!("{value:.5e}").parse().unwrap_or(value))
+}
+
 fn px(value: f32) -> String {
-    format!("{}px", number_to_string(f64::from(value)))
+    format!("{}px", css_number(f64::from(value)))
+}
+
+// a family stays bare when it is one css identifier and is quoted otherwise, as chrome serializes it
+fn family_text(name: &str) -> String {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii();
+    let body = name.strip_prefix('-').unwrap_or(name);
+    if body.starts_with(|c: char| ident(c) && !c.is_ascii_digit()) && name.chars().all(ident) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 fn color_text(color: crate::Color) -> String {
@@ -309,6 +326,7 @@ impl ScriptRuntime {
                 version,
                 state,
                 boxes: layout.box_index(),
+                layout,
             });
         }
         std::cell::Ref::filter_map(self.measured.borrow(), Option::as_ref).ok()
@@ -373,6 +391,24 @@ impl ScriptRuntime {
             }
         }
         lines
+    }
+
+    // the element on top at a viewport point, as cssom view's elementFromPoint finds it: text
+    // answers with its element and a point over nothing with the root element
+    pub(super) fn element_from_point(&self, x: f64, y: f64) -> Option<NodeId> {
+        let (width, height) = (
+            f64::from(self.viewport.width),
+            f64::from(self.viewport.height),
+        );
+        if !(0.0..=width).contains(&x) || !(0.0..=height).contains(&y) {
+            return None;
+        }
+        let hit = self.measure()?.layout.hit_test(x as f32, y as f32);
+        let document = self.document.borrow();
+        hit.into_iter()
+            .flat_map(|node| std::iter::once(node).chain(document.ancestors(node)))
+            .find(|&node| document.element(node).is_some())
+            .or_else(|| document.document_element())
     }
 
     pub(super) fn bounding_box(&self, node: NodeId) -> Option<Rect> {
@@ -1034,7 +1070,16 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         "font-size" => px(font_size),
         "font-weight" => style.font_weight.0.to_string(),
         "font-style" => if style.italic { "italic" } else { "normal" }.to_string(),
-        "font-family" => inherited("font-family").unwrap_or_else(|| "sans-serif".to_string()),
+        "font-family" => crate::font::font_stack_names(style.font_family).map_or_else(
+            || "sans-serif".to_string(),
+            |names| {
+                names
+                    .iter()
+                    .map(|name| family_text(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
         "line-height" => style
             .line_height
             .resolve(font_size, font_size)

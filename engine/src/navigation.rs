@@ -6465,6 +6465,41 @@ mod tests {
     }
 
     #[test]
+    fn computed_fonts_serialize_and_element_from_point_hits_as_chrome_does() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0; font: 13px/1.4 "Lucida Grande", Lucida Sans Unicode, sans-serif } #head { height: 20px; font-size: 10px; letter-spacing: .06em } button { font: inherit } .same { font-family: inherit }</style><div id="head">A</div><button id="press">B</button><span class="same" id="note">C</span><p id="status">idle</p><script>
+                const style = (id) => getComputedStyle(document.getElementById(id));
+                document.getElementById("status").textContent = [
+                    style("head").fontFamily, style("head").letterSpacing, style("press").fontFamily,
+                    style("note").fontFamily, style("note").lineHeight,
+                    document.elementFromPoint(2, 2).id, document.elementFromPoint(-1, 2),
+                    document.elementFromPoint(390, 290).tagName,
+                ].join("|");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("font page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        let family = r#""Lucida Grande", "Lucida Sans Unicode", sans-serif"#;
+        assert_eq!(
+            document.element_text_content(status),
+            Some(format!(
+                "{family}|0.6px|{family}|{family}|18.2px|head||HTML"
+            ))
+        );
+    }
+
+    #[test]
     fn styles_script_adds_rewrites_and_removes_apply_as_they_change() {
         let mut resources = bundle(
             r##"<div id="box" style="height: 10px"></div><p id="status">idle</p><script>

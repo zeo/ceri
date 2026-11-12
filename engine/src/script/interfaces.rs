@@ -346,6 +346,7 @@ static INTERFACES: &[Interface] = &[
             ("createEvent", Method(1)),
             ("createRange", Method(0)),
             ("getSelection", Method(0)),
+            ("elementFromPoint", Method(2)),
             ("append", Method(0)),
             ("prepend", Method(0)),
             ("replaceChildren", Method(0)),
@@ -1586,6 +1587,12 @@ impl ScriptRuntime {
                 let data = self.coerce_string(first)?;
                 let created = self.document.borrow_mut().create_comment(data);
                 self.node_value(created)
+            }
+            ("elementFromPoint", Access::Call) if on_document => {
+                let x = self.coerce_number(first)?;
+                let y = self.coerce_number(second)?;
+                self.element_from_point(x, y)
+                    .map_or(Value::Null, |node| self.node_value(node))
             }
             ("createDocumentFragment", Access::Call) => {
                 let created = self.document.borrow_mut().create_fragment();

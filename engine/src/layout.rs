@@ -2947,6 +2947,11 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .letter_spacing
         .resolve(font_size, font_size)
         .unwrap_or(0.0);
+    let line_height = if name == "input" && control_value.is_some() {
+        editor_line_height(&style, font_size, line_height)
+    } else {
+        line_height
+    };
     if let Some(value) = control_placeholder
         .as_ref()
         .or(control_display_value.as_ref())
@@ -3270,13 +3275,29 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                 .max(min_height)
         })
         .max(0.0);
-    // chromium centres a single-line field's editor in its content box, overflowing both ways,
-    // halving the layout-unit difference toward zero
-    if name == "input" && control_value.is_some() {
+    // blink's align-content-block centres a control's content in its content box, halving the
+    // layout-unit difference toward zero: buttons and a select's label never rise above the top,
+    // a single-line field's editor overflows both ways
+    let centring = match name {
+        "button" | "select" => Some(true),
+        "input" if control_value.is_some() || control.is_some() => Some(false),
+        _ => None,
+    };
+    if let Some(safe) = centring
+        && !matches!(
+            control,
+            Some(ControlType::Checkbox | ControlType::Radio | ControlType::File)
+        )
+    {
         let scale = crate::font::device_scale();
-        let offset = ((content_height - line_height) * scale * 32.0).trunc() / 64.0 / scale;
+        let free = content_height - (line.y - content_y);
+        let free = if safe { free.max(0.0) } else { free };
+        let offset = (free * scale * 32.0).trunc() / 64.0 / scale;
         for run in &mut text {
             run.y += offset;
+        }
+        for child in &mut children {
+            translate_layout_box(child, 0.0, offset);
         }
         if let Some(origin) = &mut control_text_origin {
             origin.1 += offset;
@@ -8738,6 +8759,22 @@ fn used_line_height(style: &Style, font_size: f32) -> f32 {
     (units / 64.0 / scale).max(1.0)
 }
 
+// chromium's inner editor drops a single-line field's line-height for normal when the font is
+// at least the whole-pixel line height, or the field's height is a percentage or a fixed length
+// taller than it
+fn editor_line_height(style: &Style, font_size: f32, line_height: f32) -> f32 {
+    let scale = crate::font::device_scale();
+    let line_pixels = (line_height * scale).floor();
+    let resets = font_size * scale >= line_pixels
+        || matches!(style.height, Length::Terms(terms) if terms.percent != 0.0
+            || style.height.resolve(0.0, font_size).is_some_and(|height| height * scale > line_pixels));
+    if resets {
+        normal_line_height(style.font_family, font_size)
+    } else {
+        line_height
+    }
+}
+
 // line-height normal takes the primary face's ascent, descent and line gap
 pub(crate) fn normal_line_height(stack: FontStack, font_size: f32) -> f32 {
     crate::font::active_fonts().line_height(stack, font_size)
@@ -8748,7 +8785,8 @@ pub(crate) fn normal_line_height(stack: FontStack, font_size: f32) -> f32 {
 fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
     let scale = crate::font::device_scale();
     let content_height = crate::font::active_fonts().content_height(stack, font_size);
-    ((line_height - content_height) * scale / 2.0).floor() / scale
+    let leading_units = ((line_height - content_height) * scale * 64.0).round();
+    ((leading_units / 2.0).trunc() / 64.0).floor() / scale
 }
 
 // the weight, slant, axis settings, optical size and features a style asks its font for
@@ -9777,6 +9815,33 @@ mod tests {
             &state,
         );
         assert_eq!(live.root.children[0].text[0].text, "live");
+    }
+
+    #[test]
+    fn controls_centre_their_text_as_blink_aligns_block_content() {
+        let document = Document::parse_markup(
+            r#"<style>* { margin: 0; padding: 0; border: 0; font-size: 10px; line-height: 12px } input, select, button { display: block; height: 30px } .short { height: 4px }</style><input placeholder="p"><select><option>s</option></select><button>b</button><button class="short">t</button>"#,
+        )
+        .expect("control document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 200.0,
+            },
+            &StyleState::default(),
+        );
+        let text_offsets = result
+            .root
+            .children
+            .iter()
+            .map(|control| control.text[0].y - control.rect.y)
+            .collect::<Vec<_>>();
+        // the field's editor drops its 12px line for normal, 12.5px, under a taller fixed height,
+        // and a short button keeps its text at the top instead of overflowing upward
+        assert_eq!(text_offsets, [9.75, 10.0, 10.0, 1.0]);
     }
 
     #[test]

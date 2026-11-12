@@ -1054,21 +1054,17 @@ thread_local! {
 #[derive(Default)]
 struct FontStackTable {
     families: Vec<Rc<[String]>>,
+    names: Vec<Rc<[String]>>,
     ids: HashMap<String, FontStack>,
 }
 
 pub fn intern_font_stack(source: &str) -> FontStack {
-    let families: Vec<String> = source
+    let names: Vec<String> = source
         .split(',')
-        .map(|family| {
-            family
-                .trim()
-                .trim_matches(['"', '\''])
-                .trim()
-                .to_ascii_lowercase()
-        })
+        .map(|family| family.trim().trim_matches(['"', '\'']).trim().to_string())
         .filter(|family| !family.is_empty())
         .collect();
+    let families: Vec<String> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
     if families.is_empty() {
         return FontStack::default();
     }
@@ -1083,6 +1079,7 @@ pub fn intern_font_stack(source: &str) -> FontStack {
         }
         let stack = FontStack(table.families.len() as u32 + 1);
         table.families.push(families.into());
+        table.names.push(names.into());
         table.ids.insert(key, stack);
         stack
     })
@@ -1093,6 +1090,14 @@ pub fn font_stack_families(stack: FontStack) -> Option<Rc<[String]>> {
         return None;
     }
     FONT_STACKS.with(|table| table.borrow().families.get(stack.0 as usize - 1).cloned())
+}
+
+// the family names as first authored, for getComputedStyle, which keeps their case
+pub fn font_stack_names(stack: FontStack) -> Option<Rc<[String]>> {
+    if stack.0 == 0 {
+        return None;
+    }
+    FONT_STACKS.with(|table| table.borrow().names.get(stack.0 as usize - 1).cloned())
 }
 
 // a font-variation-settings list, interned like font stacks; the default is normal

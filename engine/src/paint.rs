@@ -635,7 +635,9 @@ impl Canvas {
     // chromium snaps a box's border box to device pixels before rounding its corners, so a
     // rounded box at a fractional offset lands on the same pixels a square one would
     fn snap_rect(&self, rect: Rect) -> Rect {
-        let edge = |at: f32, shift: f32| ((at - shift) * self.scale).round() / self.scale + shift;
+        let edge = |at: f32, shift: f32| {
+            layout_units((at - shift) * self.scale).round() / self.scale + shift
+        };
         let (left, top) = (edge(rect.x, self.shift.0), edge(rect.y, self.shift.1));
         Rect {
             x: left,
@@ -1621,7 +1623,7 @@ struct ShadowFill {
 
 // how much of a pixel a shape covers once blurred by a gaussian of deviation `sigma`, in
 // device pixels; a blurred edge is the error function of the distance to it, exact axis by
-// axis for a square shape; unblurred square edges snap to whole pixels as filled boxes do
+// axis for a square shape, and an unblurred square covers each pixel by its overlap
 fn shadow_coverage(shape: Shape, sigma: f32, point: (f32, f32)) -> f32 {
     let sharp = sigma < 0.5;
     let scale = sigma * std::f32::consts::SQRT_2;
@@ -1630,13 +1632,7 @@ fn shadow_coverage(shape: Shape, sigma: f32, point: (f32, f32)) -> f32 {
             if length <= 0.0 {
                 0.0
             } else if sharp {
-                let first = start.round();
-                let last = (start + length).round().max(first + 1.0);
-                if (first..last).contains(&at) {
-                    1.0
-                } else {
-                    0.0
-                }
+                ((start + length).min(at + 0.5) - start.max(at - 0.5)).clamp(0.0, 1.0)
             } else {
                 0.5 * (erf((at - start) / scale) - erf((at - start - length) / scale))
             }
@@ -2874,7 +2870,15 @@ fn paint_box_surface(
         );
     }
     if let Some(scene) = &layout_box.svg {
-        paint_svg(canvas, scene, rect, surface, content_clip, opacity);
+        // blink translates an svg root to its pixel-snapped border box before it paints
+        paint_svg(
+            canvas,
+            scene,
+            canvas.snap_rect(rect),
+            surface,
+            content_clip,
+            opacity,
+        );
     }
     content_clip
 }
@@ -3996,6 +4000,12 @@ fn paint_glyphs(
     }
 }
 
+// blink holds positions in 1/64 device pixel layout units, so a half pixel is exact and rounds
+// up where float error would land just under it
+fn layout_units(device: f32) -> f32 {
+    (device * 64.0).round() / 64.0
+}
+
 fn paint_outline_text(
     canvas: &mut Canvas,
     run: &TextRun,
@@ -4008,8 +4018,9 @@ fn paint_outline_text(
     let scale = canvas.scale();
     let device_size = run.font_size * scale;
     let shift = canvas.shift;
-    let baseline =
-        (run.y + offset.1 - shift.1 + fonts.ascent(run.font_stack, run.font_size)) * scale;
+    let baseline = layout_units(
+        (run.y + offset.1 - shift.1 + fonts.ascent(run.font_stack, run.font_size)) * scale,
+    );
     let pen = (run.x + offset.0 - shift.0) * scale;
     let device_clip = clip.map(|clip| Rect {
         x: (clip.x - shift.0) * scale,
