@@ -462,6 +462,11 @@ pub(super) fn format_date(options: &DateOptions, local: f64) -> String {
             let hour = hours as i64 % 12;
             let hour = if hour == 0 { 12 } else { hour };
             let meridiem = if hours < 12.0 { "AM" } else { "PM" };
+            let hour = if options.hour.as_deref() == Some("2-digit") {
+                two(hour as f64)
+            } else {
+                hour.to_string()
+            };
             format!("{hour}:{}{seconds_text} {meridiem}", two(minutes))
         } else {
             format!("{}:{}{seconds_text}", two(hours), two(minutes))
@@ -1179,6 +1184,13 @@ mod tests {
             format_date(&date, local),
             "Monday, January 15, 2024 at 3:04 PM"
         );
+        let padded = DateOptions {
+            locale: "en-US".to_string(),
+            hour: Some("2-digit".into()),
+            minute: Some("2-digit".into()),
+            ..DateOptions::default()
+        };
+        assert_eq!(format_date(&padded, local - 28_800_000.0), "07:04 AM");
         let german = DateOptions {
             locale: "de-DE".to_string(),
             month: Some("long".into()),

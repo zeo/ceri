@@ -4088,8 +4088,15 @@ fn paint_outline_text(
     }
 }
 
-// the coverage correction chromium's skia applies to windows text (srgb gamma, contrast 1),
-// one table per eighth of the text colour's luminance, so light text on dark keeps its weight
+// skia/BUILD.gn blends text in srgb with contrast 1 on windows and with gamma 1.2 and contrast
+// 0.2 on linux
+const TEXT_GAMMA: (f32, f32) = if cfg!(windows) {
+    (0.0, 1.0)
+} else {
+    (1.2, 0.2)
+};
+
+// the coverage correction chromium's skia applies to text, one table per eighth of the text colour's luminance, so light text on dark keeps its weight
 fn text_gamma_table(color: Color) -> &'static [u8; 256] {
     // skia's integer luminance of the gamma-encoded channels
     let luminance =
@@ -4106,16 +4113,31 @@ fn text_gamma(luminance: u8) -> &'static [u8; 256] {
             let level = level as u32;
             correcting_table(
                 ((level << 5) | (level << 2) | (level >> 1)) as f32 / 255.0,
-                1.0,
+                TEXT_GAMMA,
             )
         })
     });
     &tables[usize::from(luminance >> 5)]
 }
 
-fn correcting_table(src: f32, contrast: f32) -> [u8; 256] {
+fn correcting_table(src: f32, (gamma, contrast): (f32, f32)) -> [u8; 256] {
+    // a gamma of zero stands for the srgb curve, as in skia
+    let to_luma = |value: f32| {
+        if gamma == 0.0 {
+            srgb_to_linear(value)
+        } else {
+            value.powf(gamma)
+        }
+    };
+    let from_luma = |value: f32| {
+        if gamma == 0.0 {
+            linear_to_srgb(value)
+        } else {
+            value.powf(1.0 / gamma)
+        }
+    };
     let dst = 1.0 - src;
-    let (linear_src, linear_dst) = (srgb_to_linear(src), srgb_to_linear(dst));
+    let (linear_src, linear_dst) = (to_luma(src), to_luma(dst));
     // contrast fades out as the text approaches white
     let contrast = contrast * linear_dst;
     std::array::from_fn(|index| {
@@ -4124,7 +4146,7 @@ fn correcting_table(src: f32, contrast: f32) -> [u8; 256] {
         let result = if (src - dst).abs() < 1.0 / 256.0 {
             alpha
         } else {
-            let out = linear_to_srgb(linear_src * alpha + (1.0 - alpha) * linear_dst);
+            let out = from_luma(linear_src * alpha + (1.0 - alpha) * linear_dst);
             // undo the linear blend the blit does next
             (out - dst) / (src - dst)
         };
@@ -4286,9 +4308,13 @@ mod tests {
             assert_eq!((table[0], table[255]), (0, 255));
             assert!(table.windows(2).all(|pair| pair[0] <= pair[1]));
         }
-        // white on black follows the srgb curve, half coverage reads as about 74 percent,
-        // while contrast keeps black on white near linear
-        assert_eq!((white[128], black[128]), (188, 119));
+        // white on black follows the gamma curve while contrast keeps black on white near linear
+        let expected = if cfg!(windows) {
+            (188, 119)
+        } else {
+            (144, 124)
+        };
+        assert_eq!((white[128], black[128]), expected);
     }
 
     const DAMAGE_PAGE: &str = concat!(
