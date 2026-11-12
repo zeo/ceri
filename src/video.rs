@@ -37,20 +37,52 @@ mod platform {
         AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
         edit_shift,
     };
+    use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
     use std::sync::OnceLock;
+    use windows::Win32::Foundation::{HMODULE, RECT};
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+        D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE,
+        D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+        D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+        ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext1, ID3D11VideoDevice,
+        ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
+        DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
+        DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_SAMPLE_DESC,
+    };
     use windows::Win32::Media::MediaFoundation::{
-        IMF2DBuffer, IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader,
-        MF_BYTESTREAM_CONTENT_TYPE, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
-        MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-        MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_PD_DURATION,
-        MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+        IMF2DBuffer, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
+        IMFMediaType, IMFSample, IMFSourceReader, MF_BYTESTREAM_CONTENT_TYPE,
+        MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
+        MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+        MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
+        MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
+        MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
         MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
         MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
         MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_VERSION, MFAudioFormat_Float,
-        MFCreateAttributes, MFCreateMFByteStreamOnStream, MFCreateMediaType,
-        MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL, MFMediaType_Audio,
-        MFMediaType_Video, MFSTARTUP_LITE, MFStartup, MFVideoArea, MFVideoFormat_RGB32,
+        MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMFByteStreamOnStream,
+        MFCreateMediaType, MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL,
+        MFMediaType_Audio, MFMediaType_Video, MFNominalRange_0_255, MFSTARTUP_LITE, MFStartup,
+        MFVideoArea, MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32,
+        MFVideoTransFunc_2084, MFVideoTransFunc_HLG, MFVideoTransferFunction,
+        MFVideoTransferMatrix, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
+        MFVideoTransferMatrix_BT2020_10, MFVideoTransferMatrix_BT2020_12,
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -79,6 +111,11 @@ mod platform {
         coded: (u32, u32),
         stride: i32,
         picture: Area,
+        // set when the decoder hands frames over as gpu surfaces
+        gpu: Option<&'static Gpu>,
+        converter: Option<Converter>,
+        // the first frame, decoded while open checked that the gpu path works
+        pending: Option<VideoFrame>,
         // seconds the mp4 edit list moves pictures by
         shift: f64,
         // declared last so the reader is released before the apartment closes
@@ -88,6 +125,303 @@ mod platform {
     // SAFETY: the engine opens, reads and drops a reader on one decode thread, the apartment
     // open joined
     unsafe impl Send for Reader {}
+
+    // one d3d11 device that every hardware decoder in the process shares through the device
+    // manager, as browsers do, so each video costs no device of its own
+    pub(super) struct Gpu {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        video: ID3D11VideoDevice,
+        playback: ID3D11VideoContext1,
+        manager: IMFDXGIDeviceManager,
+    }
+
+    // SAFETY: d3d11 devices are free threaded, the immediate context is multithread protected
+    // before it is shared, and the device manager serializes its own callers
+    unsafe impl Send for Gpu {}
+    unsafe impl Sync for Gpu {}
+
+    pub(super) fn gpu() -> Option<&'static Gpu> {
+        static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+        // SAFETY: the out pointers refer to live locals for each call
+        GPU.get_or_init(|| unsafe { Gpu::new() }).as_ref()
+    }
+
+    impl Gpu {
+        unsafe fn new() -> Option<Self> {
+            unsafe {
+                let mut device = None;
+                let mut context = None;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+                .ok()?;
+                let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device?, context?);
+                let _ = context
+                    .cast::<ID3D11Multithread>()
+                    .ok()?
+                    .SetMultithreadProtected(true);
+                let mut token = 0;
+                let mut manager = None;
+                MFCreateDXGIDeviceManager(&mut token, &mut manager).ok()?;
+                let manager = manager?;
+                manager.ResetDevice(&device, token).ok()?;
+                Some(Self {
+                    video: device.cast().ok()?,
+                    playback: context.cast().ok()?,
+                    device,
+                    context,
+                    manager,
+                })
+            }
+        }
+
+        unsafe fn texture(
+            &self,
+            (width, height): (u32, u32),
+            usage: D3D11_USAGE,
+            bind: u32,
+            access: u32,
+        ) -> Result<ID3D11Texture2D, String> {
+            let description = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: usage,
+                BindFlags: bind,
+                CPUAccessFlags: access,
+                MiscFlags: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                self.device
+                    .CreateTexture2D(&description, None, Some(&mut texture))
+                    .map_err(text)?;
+            }
+            texture.ok_or_else(|| "Direct3D returned no texture".to_string())
+        }
+    }
+
+    // turns the decoder's nv12 or p010 surfaces into bgra on the gpu, then reads the rows back
+    struct Converter {
+        enumerator: ID3D11VideoProcessorEnumerator,
+        processor: ID3D11VideoProcessor,
+        target: ID3D11Texture2D,
+        view: ID3D11VideoProcessorOutputView,
+        staging: ID3D11Texture2D,
+        size: (u32, u32),
+    }
+
+    impl Converter {
+        unsafe fn new(
+            gpu: &Gpu,
+            kind: &IMFMediaType,
+            picture: Area,
+            coded: (u32, u32),
+        ) -> Result<Self, String> {
+            let size = (picture.width, picture.height);
+            unsafe {
+                let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                    InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                    InputWidth: coded.0,
+                    InputHeight: coded.1,
+                    OutputWidth: size.0,
+                    OutputHeight: size.1,
+                    Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+                    ..Default::default()
+                };
+                let enumerator = gpu
+                    .video
+                    .CreateVideoProcessorEnumerator(&content)
+                    .map_err(text)?;
+                let processor = gpu
+                    .video
+                    .CreateVideoProcessor(&enumerator, 0)
+                    .map_err(text)?;
+                let target = gpu.texture(
+                    size,
+                    D3D11_USAGE_DEFAULT,
+                    D3D11_BIND_RENDER_TARGET.0 as u32,
+                    0,
+                )?;
+                let staging =
+                    gpu.texture(size, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?;
+                let described = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                    ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                    },
+                };
+                let mut view = None;
+                gpu.video
+                    .CreateVideoProcessorOutputView(
+                        &target,
+                        &enumerator,
+                        &described,
+                        Some(&mut view),
+                    )
+                    .map_err(text)?;
+                let shown = RECT {
+                    left: picture.left as i32,
+                    top: picture.top as i32,
+                    right: (picture.left + picture.width) as i32,
+                    bottom: (picture.top + picture.height) as i32,
+                };
+                let whole = RECT {
+                    left: 0,
+                    top: 0,
+                    right: size.0 as i32,
+                    bottom: size.1 as i32,
+                };
+                let playback = &gpu.playback;
+                playback.VideoProcessorSetStreamFrameFormat(
+                    &processor,
+                    0,
+                    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                );
+                playback.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&shown));
+                playback.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&whole));
+                playback.VideoProcessorSetOutputTargetRect(&processor, true, Some(&whole));
+                // drivers would otherwise sharpen or denoise, which the software path never does
+                playback.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+                playback.VideoProcessorSetStreamColorSpace1(
+                    &processor,
+                    0,
+                    color_space(kind, picture.height),
+                );
+                playback.VideoProcessorSetOutputColorSpace1(
+                    &processor,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                );
+                Ok(Self {
+                    enumerator,
+                    processor,
+                    target,
+                    view: view.ok_or("Direct3D returned no output view")?,
+                    staging,
+                    size,
+                })
+            }
+        }
+
+        // the sample's surface as bgra rows; a frame in system memory means no gpu decoder
+        unsafe fn convert(&self, gpu: &Gpu, sample: &IMFSample) -> Result<Vec<u8>, String> {
+            unsafe {
+                let surface: IMFDXGIBuffer = sample
+                    .GetBufferByIndex(0)
+                    .and_then(|buffer| buffer.cast())
+                    .map_err(|_| "the decoder gave a frame outside the gpu".to_string())?;
+                let mut texture: Option<ID3D11Texture2D> = None;
+                surface
+                    .GetResource(&ID3D11Texture2D::IID, (&raw mut texture).cast())
+                    .map_err(text)?;
+                let texture = texture.ok_or("the decoder gave no texture")?;
+                let described = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                    FourCC: 0,
+                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_VPIV {
+                            MipSlice: 0,
+                            ArraySlice: surface.GetSubresourceIndex().map_err(text)?,
+                        },
+                    },
+                };
+                let mut input = None;
+                gpu.video
+                    .CreateVideoProcessorInputView(
+                        &texture,
+                        &self.enumerator,
+                        &described,
+                        Some(&mut input),
+                    )
+                    .map_err(text)?;
+                let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                    Enable: true.into(),
+                    pInputSurface: ManuallyDrop::new(input),
+                    ..Default::default()
+                };
+                let blitted = gpu.playback.VideoProcessorBlt(
+                    &self.processor,
+                    &self.view,
+                    0,
+                    std::slice::from_ref(&stream),
+                );
+                drop(ManuallyDrop::into_inner(stream.pInputSurface));
+                blitted.map_err(text)?;
+                gpu.context.CopyResource(&self.staging, &self.target);
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                gpu.context
+                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .map_err(text)?;
+                let row = self.size.0 as usize * 4;
+                let mut bgra = Vec::with_capacity(row * self.size.1 as usize);
+                for y in 0..self.size.1 as usize {
+                    let start = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize);
+                    bgra.extend_from_slice(std::slice::from_raw_parts(start, row));
+                }
+                gpu.context.Unmap(&self.staging, 0);
+                Ok(bgra)
+            }
+        }
+    }
+
+    // the decoder's matrix, range and transfer as a dxgi colour space; with no matrix named,
+    // hd pictures count as bt.709 and smaller ones as bt.601, as players commonly guess
+    unsafe fn color_space(kind: &IMFMediaType, height: u32) -> DXGI_COLOR_SPACE_TYPE {
+        let value = |key| {
+            unsafe { kind.GetUINT32(key) }
+                .ok()
+                .map(|value| value as i32)
+        };
+        let full = value(&MF_MT_VIDEO_NOMINAL_RANGE) == Some(MFNominalRange_0_255.0);
+        let matrix = value(&MF_MT_YUV_MATRIX).map(MFVideoTransferMatrix);
+        let transfer = value(&MF_MT_TRANSFER_FUNCTION).map(MFVideoTransferFunction);
+        let wide = [
+            MFVideoTransferMatrix_BT2020_10,
+            MFVideoTransferMatrix_BT2020_12,
+        ]
+        .map(Some)
+        .contains(&matrix);
+        if wide && transfer == Some(MFVideoTransFunc_2084) {
+            return DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+        }
+        if wide && transfer == Some(MFVideoTransFunc_HLG) {
+            return DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+        }
+        let [studio, whole] = if wide {
+            [
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
+                DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020,
+            ]
+        } else if matrix == Some(MFVideoTransferMatrix_BT709)
+            || matrix != Some(MFVideoTransferMatrix_BT601) && height >= 720
+        {
+            [
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+                DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
+            ]
+        } else {
+            [
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
+                DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+            ]
+        };
+        if full { whole } else { studio }
+    }
 
     struct Apartment;
 
@@ -293,20 +627,41 @@ mod platform {
     }
 
     impl Reader {
+        // a hardware decoder that fails anywhere up to its first frame leaves the media to
+        // the software one
         pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
+            gpu()
+                .and_then(|gpu| Self::open_on(source, Some(gpu)).ok())
+                .map_or_else(|| Self::open_on(source, None), Ok)
+        }
+
+        pub(super) fn open_on(
+            source: &MediaSource,
+            gpu: Option<&'static Gpu>,
+        ) -> Result<Self, String> {
             let apartment = apartment()?;
             // SAFETY: every call below follows the source reader's documented contract, on
             // interfaces this function created and still holds
             unsafe {
                 let mut attributes = None;
-                MFCreateAttributes(&mut attributes, 1).map_err(text)?;
+                MFCreateAttributes(&mut attributes, 2).map_err(text)?;
                 let attributes: IMFAttributes =
                     attributes.ok_or("media foundation gave no attribute store")?;
-                attributes
-                    // the advanced processor would also resample to the frame rate the
-                    // container claims, which webm files often get wrong
-                    .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-                    .map_err(text)?;
+                match gpu {
+                    Some(gpu) => {
+                        attributes
+                            .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &gpu.manager)
+                            .map_err(text)?;
+                        attributes
+                            .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
+                            .map_err(text)?;
+                    }
+                    None => attributes
+                        // the advanced processor would also resample to the frame rate the
+                        // container claims, which webm files often get wrong
+                        .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                        .map_err(text)?,
+                }
                 let reader = source_reader(
                     source,
                     Some(&attributes),
@@ -326,12 +681,18 @@ mod platform {
                 output
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
                     .map_err(text)?;
-                output
-                    .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-                    .map_err(text)?;
-                reader
-                    .SetCurrentMediaType(VIDEO, None, &output)
-                    .map_err(text)?;
+                let deliver = |subtype| {
+                    output.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+                    reader.SetCurrentMediaType(VIDEO, None, &output)
+                };
+                match gpu {
+                    // ten bit decoders give p010 only
+                    Some(_) => {
+                        deliver(&MFVideoFormat_NV12).or_else(|_| deliver(&MFVideoFormat_P010))
+                    }
+                    None => deliver(&MFVideoFormat_RGB32),
+                }
+                .map_err(text)?;
                 let mut opened = Self {
                     reader,
                     info: MediaInfo {
@@ -342,10 +703,16 @@ mod platform {
                     coded: (0, 0),
                     stride: 0,
                     picture: shown,
+                    gpu,
+                    converter: None,
+                    pending: None,
                     shift: edit_shift(source, b"vide").unwrap_or(0.0),
                     _apartment: apartment,
                 };
                 opened.take_format()?;
+                if gpu.is_some() {
+                    opened.pending = opened.next()?;
+                }
                 Ok(opened)
             }
         }
@@ -358,8 +725,31 @@ mod platform {
                 self.stride = current
                     .GetUINT32(&MF_MT_DEFAULT_STRIDE)
                     .map_or(self.coded.0 as i32 * 4, |stride| stride as i32);
+                if let Some(gpu) = self.gpu {
+                    self.converter = Some(Converter::new(gpu, &current, self.picture, self.coded)?);
+                }
             }
             Ok(())
+        }
+
+        fn next(&mut self) -> Result<Option<VideoFrame>, String> {
+            let reader = self.reader.clone();
+            let Some((sample, time)) = read_sample(&reader, VIDEO, || self.take_format())? else {
+                return Ok(None);
+            };
+            // SAFETY: the sample came from the read above and is still held
+            let bgra = unsafe {
+                match (self.gpu, &self.converter) {
+                    (Some(gpu), Some(converter)) => converter.convert(gpu, &sample)?,
+                    _ => self.copy(&sample.ConvertToContiguousBuffer().map_err(text)?)?,
+                }
+            };
+            Ok(Some(VideoFrame {
+                time: time + self.shift,
+                width: self.picture.width,
+                height: self.picture.height,
+                bgra,
+            }))
         }
 
         fn copy(&self, buffer: &IMFMediaBuffer) -> Result<Vec<u8>, String> {
@@ -418,22 +808,15 @@ mod platform {
         }
 
         fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.pending = None;
             seek(&self.reader, seconds - self.shift)
         }
 
         fn read(&mut self) -> Result<Option<VideoFrame>, String> {
-            let reader = self.reader.clone();
-            let Some((sample, time)) = read_sample(&reader, VIDEO, || self.take_format())? else {
-                return Ok(None);
-            };
-            // SAFETY: the sample came from the read above and is still held
-            let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(text)?;
-            Ok(Some(VideoFrame {
-                time: time + self.shift,
-                width: self.picture.width,
-                height: self.picture.height,
-                bgra: self.copy(&buffer)?,
-            }))
+            match self.pending.take() {
+                Some(frame) => Ok(Some(frame)),
+                None => self.next(),
+            }
         }
     }
 
@@ -1393,6 +1776,39 @@ mod tests {
         assert_eq!(natural_size(720, 480, (32, 27)), (853, 480));
         assert_eq!(natural_size(720, 480, (8, 9)), (720, 540));
         assert_eq!(natural_size(64, 32, (0, 0)), (64, 32));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn gpu_frames_match_the_software_decoders() {
+        use super::platform::{Reader, gpu};
+        use ceri_engine::VideoReader;
+
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let frames = |gpu| {
+            let mut reader =
+                Reader::open_on(&MediaSource::File(reel()), gpu).expect("the fixture should open");
+            std::iter::from_fn(|| reader.read().expect("frames should decode"))
+                .map(|frame| (frame.time, frame.bgra))
+                .collect::<Vec<_>>()
+        };
+        let (hardware, software) = (frames(Some(gpu)), frames(None));
+        assert_eq!(hardware.len(), software.len());
+        for ((time, gpu), (expected, cpu)) in hardware.iter().zip(&software) {
+            assert!((time - expected).abs() < 1e-6, "{time} {expected}");
+            // rgb32 leaves alpha undefined, the engine reads only the colour
+            let apart = gpu
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(cpu.as_chunks::<4>().0)
+                .flat_map(|(a, b)| (0..3).map(|channel| a[channel].abs_diff(b[channel])))
+                .max()
+                .unwrap_or(u8::MAX);
+            assert!(apart <= 2, "{time}: {apart}");
+        }
     }
 
     #[test]
