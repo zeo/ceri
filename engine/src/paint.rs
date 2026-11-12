@@ -27,6 +27,21 @@ pub struct Canvas {
     // rounded overflow clips and clip-paths in device space; every write is scaled by their
     // coverage
     masks: Vec<Mask>,
+    revision: Revision,
+}
+
+// numbers what a canvas shows, so a presenter that holds the pixels numbered before can upload
+// only the device box that changed since
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Revision {
+    pub(crate) id: u64,
+    // the revision this one was painted over, and the left, top, right and bottom it repainted
+    pub(crate) changed: Option<(u64, [u32; 4])>,
+}
+
+fn next_revision() -> u64 {
+    static REVISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    REVISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +119,15 @@ impl Canvas {
             pixels,
             shift: (0.0, 0.0),
             masks: Vec::new(),
+            revision: Revision {
+                id: next_revision(),
+                changed: None,
+            },
         }
+    }
+
+    pub(crate) fn revision(&self) -> Revision {
+        self.revision
     }
 
     pub fn scale(&self) -> f32 {
@@ -564,6 +587,7 @@ impl Canvas {
             pixels,
             shift: (bounds.x, bounds.y),
             masks: Vec::new(),
+            revision: Revision::default(),
         }
     }
 
@@ -870,6 +894,7 @@ impl Canvas {
                 self.shift.1 + bounds.top as f32 / self.scale,
             ),
             masks: Vec::new(),
+            revision: Revision::default(),
         }
     }
 
@@ -898,6 +923,7 @@ impl Canvas {
                 self.shift.1 + top / self.scale,
             ),
             masks: Vec::new(),
+            revision: Revision::default(),
         }
     }
 
@@ -2176,6 +2202,13 @@ pub(crate) fn repaint(
             after.copy_from_slice(before);
         }
     }
+    canvas.revision = Revision {
+        id: next_revision(),
+        changed: Some((
+            canvas.revision.id,
+            [kept.left, kept.top, kept.right, kept.bottom],
+        )),
+    };
 }
 
 fn paint_document(

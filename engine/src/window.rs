@@ -24,11 +24,11 @@ use winit::window::{
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
 // where a window's frames go: a composition swapchain, or a software surface where one cannot
-// be made
+// be made, with the canvas revision and surface size it shows
 enum Output {
     #[cfg(target_os = "windows")]
     Composition(crate::presenter::Presenter),
-    Software(WindowSurface),
+    Software(WindowSurface, Option<(u64, (u32, u32))>),
 }
 
 impl Output {
@@ -52,7 +52,7 @@ impl Output {
             }
         }
         Surface::new(context, window.clone())
-            .map(Self::Software)
+            .map(|surface| Self::Software(surface, None))
             .map_err(|error| format!("window surface creation failed: {error}"))
     }
 
@@ -66,26 +66,49 @@ impl Output {
             #[cfg(target_os = "windows")]
             Self::Composition(presenter) => presenter.present(
                 frame.canvas.rgba_pixels(),
-                frame.canvas.width(),
-                frame.canvas.height(),
+                (frame.canvas.width(), frame.canvas.height()),
                 (width.get(), height.get()),
+                Some(frame.canvas.revision()),
             ),
-            Self::Software(surface) => {
+            Self::Software(surface, shown) => {
+                let revision = frame.canvas.revision();
+                let size = (width.get(), height.get());
+                if *shown == Some((revision.id, size)) {
+                    return Ok(());
+                }
                 surface
                     .resize(width, height)
                     .map_err(|error| format!("window surface resize failed: {error}"))?;
                 let mut buffer = surface
                     .buffer_mut()
                     .map_err(|error| format!("window surface buffer failed: {error}"))?;
-                present_frame(
-                    frame,
-                    width.get() as usize,
-                    height.get() as usize,
-                    &mut buffer,
-                );
-                buffer
-                    .present()
-                    .map_err(|error| format!("window surface present failed: {error}"))
+                let changed = match revision.changed {
+                    // a buffer presented last holds the shown revision outside the box
+                    Some((base, [left, top, right, bottom]))
+                        if buffer.age() == 1 && *shown == Some((base, size)) =>
+                    {
+                        [left, top, right.min(size.0), bottom.min(size.1)]
+                    }
+                    _ => [0, 0, size.0, size.1],
+                };
+                *shown = None;
+                present_frame(frame, size, changed, &mut buffer);
+                let [left, top, right, bottom] = changed;
+                if let (Some(columns), Some(rows)) = (
+                    NonZeroU32::new(right.saturating_sub(left)),
+                    NonZeroU32::new(bottom.saturating_sub(top)),
+                ) {
+                    buffer
+                        .present_with_damage(&[softbuffer::Rect {
+                            x: left,
+                            y: top,
+                            width: columns,
+                            height: rows,
+                        }])
+                        .map_err(|error| format!("window surface present failed: {error}"))?;
+                }
+                *shown = Some((revision.id, size));
+                Ok(())
             }
         }
     }
@@ -97,11 +120,12 @@ impl Output {
             #[cfg(target_os = "windows")]
             Self::Composition(presenter) => presenter.present(
                 &[rgb[0], rgb[1], rgb[2], 255],
-                1,
-                1,
+                (1, 1),
                 (width.get(), height.get()),
+                None,
             ),
-            Self::Software(surface) => {
+            Self::Software(surface, shown) => {
+                *shown = None;
                 surface
                     .resize(width, height)
                     .map_err(|error| format!("window surface resize failed: {error}"))?;
@@ -1564,16 +1588,20 @@ fn layout_viewport(width: u32, height: u32, scale: f32) -> Size {
     }
 }
 
-fn present_frame(frame: &Frame, width: usize, height: usize, buffer: &mut [u32]) {
-    let canvas_width = frame.canvas.width() as usize;
-    let canvas_height = frame.canvas.height() as usize;
+// copies the left, top, right and bottom box of the canvas into a surface buffer
+fn present_frame(
+    frame: &Frame,
+    (width, _): (u32, u32),
+    [left, top, right, bottom]: [u32; 4],
+    buffer: &mut [u32],
+) {
     let pixels = frame.canvas.rgba_pixels();
     let stride = frame.canvas.bytes_per_row();
-    let copy_width = width.min(canvas_width);
-    let copy_height = height.min(canvas_height);
-    for row in 0..copy_height {
-        let source = &pixels[row * stride..row * stride + canvas_width * 4];
-        let target = &mut buffer[row * width..row * width + copy_width];
+    let (left, width) = (left as usize, width as usize);
+    let right = (right.min(frame.canvas.width()) as usize).max(left);
+    for row in top as usize..bottom.min(frame.canvas.height()) as usize {
+        let source = &pixels[row * stride + left * 4..row * stride + right * 4];
+        let target = &mut buffer[row * width + left..row * width + right];
         for (pixel, rgba) in target.iter_mut().zip(source.as_chunks::<4>().0.iter()) {
             *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
         }
@@ -1582,7 +1610,41 @@ fn present_frame(frame: &Frame, width: usize, height: usize, buffer: &mut [u32])
 
 #[cfg(test)]
 mod tests {
-    use super::{Monitor, ResizeDirection, centred, layout_viewport, resize_direction};
+    use super::{
+        Monitor, ResizeDirection, centred, layout_viewport, present_frame, resize_direction,
+    };
+
+    #[test]
+    fn a_software_present_copies_only_the_box_it_is_given() {
+        let frame = crate::host::Frame {
+            sequence: 0,
+            viewport: crate::layout::Size {
+                width: 4.0,
+                height: 3.0,
+            },
+            scale: 1.0,
+            title: None,
+            canvas: std::sync::Arc::new(crate::paint::Canvas::new(
+                4,
+                3,
+                crate::css::Color::opaque(1, 2, 3),
+            )),
+        };
+        let mut buffer = vec![7; 5 * 3];
+        present_frame(&frame, (5, 3), [1, 1, 3, 2], &mut buffer);
+        let painted = 0x01_02_03;
+        assert_eq!(
+            buffer,
+            [7, 7, 7, 7, 7, 7, painted, painted, 7, 7, 7, 7, 7, 7, 7]
+        );
+        present_frame(&frame, (5, 3), [0, 0, 5, 3], &mut buffer);
+        assert!(
+            buffer
+                .chunks(5)
+                .all(|row| row[..4] == [painted; 4] && row[4] == 7),
+            "the surface past the canvas is left alone"
+        );
+    }
 
     #[test]
     fn frameless_windows_resize_from_a_band_inside_their_edges() {
