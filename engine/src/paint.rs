@@ -2271,9 +2271,10 @@ pub(crate) fn repaint(
     let line = |row: usize| {
         row * stride + reach.left as usize * 4..row * stride + reach.right as usize * 4
     };
-    let saved = (reach.top as usize..reach.bottom as usize)
-        .flat_map(|row| canvas.pixels[line(row)].to_vec())
-        .collect::<Vec<_>>();
+    let mut saved = Vec::with_capacity(line(0).len() * (reach.bottom - reach.top) as usize);
+    for row in reach.top as usize..reach.bottom as usize {
+        saved.extend_from_slice(&canvas.pixels[line(row)]);
+    }
     canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, BASE);
     let layers = document
         .images
@@ -3612,33 +3613,62 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         && (step.1 - 1.0).abs() < 1e-4
         && origin.0.fract() == 0.0
         && origin.1.fract() == 0.0;
+    // the taps along each axis are worked out once, so a frame costs its blends alone
+    let taps = |pixel: u32, origin: f32, step: f32, size: u32, repeat: bool| {
+        if aligned {
+            wrap_or_none(pixel as f32 - origin, size, repeat).map(|at| Tap {
+                near: at,
+                far: at,
+                fraction: 0.0,
+            })
+        } else {
+            Some(Tap::at(
+                (pixel as f32 + 0.5 - origin) * step - 0.5,
+                size,
+                repeat,
+            ))
+        }
+    };
+    let columns = (left..right)
+        .map(|pixel_x| taps(pixel_x, origin.0, step.0, image.width, repeat.0))
+        .collect::<Vec<_>>();
+    // with nothing to scale a pixel by, an opaque one is stored as it is
+    let plain = !rounded && opacity >= 1.0 && canvas.masks.is_empty();
+    let stride = canvas.bytes_per_row();
     for pixel_y in top..bottom {
-        for pixel_x in left..right {
-            let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+        let Some(row) = taps(pixel_y, origin.1, step.1, image.height, repeat.1) else {
+            continue;
+        };
+        for (pixel_x, column) in (left..right).zip(&columns) {
+            let Some(column) = *column else {
+                continue;
+            };
+            let color = blend_taps(image, column, row);
+            if plain && color.alpha == 255 {
+                let at = pixel_y as usize * stride + pixel_x as usize * 4;
+                canvas.pixels[at..at + 4].copy_from_slice(&[
+                    color.red,
+                    color.green,
+                    color.blue,
+                    255,
+                ]);
+                continue;
+            }
             let coverage = if rounded {
-                area_device.coverage(center)
+                area_device.coverage((pixel_x as f32 + 0.5, pixel_y as f32 + 0.5))
             } else {
                 1.0
             };
-            if coverage <= 0.0 {
+            if coverage <= 0.0 || color.alpha == 0 {
                 continue;
             }
-            let color = if aligned {
-                let column = wrap_or_none(pixel_x as f32 - origin.0, image.width, repeat.0);
-                let row = wrap_or_none(pixel_y as f32 - origin.1, image.height, repeat.1);
-                let (Some(column), Some(row)) = (column, row) else {
-                    continue;
-                };
-                image.pixel(column, row)
+            let factor = opacity * coverage;
+            let color = if factor >= 1.0 {
+                color
             } else {
-                let u = (center.0 - origin.0) * step.0 - 0.5;
-                let v = (center.1 - origin.1) * step.1 - 0.5;
-                sample_bilinear(image, u, v, repeat)
+                color.scale_alpha(factor)
             };
-            if color.alpha == 0 {
-                continue;
-            }
-            canvas.blend_pixel(pixel_x, pixel_y, color.scale_alpha(opacity * coverage));
+            canvas.blend_pixel(pixel_x, pixel_y, color);
         }
     }
 }
@@ -3654,46 +3684,100 @@ fn wrap_or_none(position: f32, size: u32, repeat: bool) -> Option<u32> {
     }
 }
 
-// interpolates in premultiplied alpha so transparent neighbours do not darken edges
-fn sample_bilinear(image: &Image, u: f32, v: f32, repeat: (bool, bool)) -> Color {
-    let (x0, y0) = (u.floor(), v.floor());
-    let (fraction_x, fraction_y) = (u - x0, v - y0);
-    let index = |position: f32, size: u32, repeats: bool| -> u32 {
-        let position = position as i64;
-        if repeats {
-            position.rem_euclid(i64::from(size)) as u32
-        } else {
-            position.clamp(0, i64::from(size) - 1) as u32
-        }
-    };
-    let mut sum = [0.0_f32; 4];
-    for (dy, weight_y) in [(0.0, 1.0 - fraction_y), (1.0, fraction_y)] {
-        for (dx, weight_x) in [(0.0, 1.0 - fraction_x), (1.0, fraction_x)] {
-            let weight = weight_x * weight_y;
-            if weight == 0.0 {
-                continue;
+// the two texels either side of a sample position along one axis, and how far past the near
+// one it lies
+#[derive(Clone, Copy)]
+struct Tap {
+    near: u32,
+    far: u32,
+    fraction: f32,
+}
+
+impl Tap {
+    fn at(position: f32, size: u32, repeat: bool) -> Self {
+        let floor = position.floor();
+        let index = |position: f32| -> u32 {
+            let position = position as i64;
+            if repeat {
+                position.rem_euclid(i64::from(size)) as u32
+            } else {
+                position.clamp(0, i64::from(size) - 1) as u32
             }
-            let color = image.pixel(
-                index(x0 + dx, image.width, repeat.0),
-                index(y0 + dy, image.height, repeat.1),
-            );
-            let alpha = f32::from(color.alpha) * weight;
-            sum[0] += f32::from(color.red) * alpha;
-            sum[1] += f32::from(color.green) * alpha;
-            sum[2] += f32::from(color.blue) * alpha;
-            sum[3] += alpha;
+        };
+        Self {
+            near: index(floor),
+            far: index(floor + 1.0),
+            fraction: position - floor,
         }
+    }
+
+    // the far texel's weight in 256ths, the subtexel precision of GPU texture filtering
+    fn weight(self) -> u32 {
+        (self.fraction * 256.0 + 0.5) as u32
+    }
+}
+
+// interpolates in premultiplied alpha so transparent neighbours do not darken edges
+fn blend_taps(image: &Image, x: Tap, y: Tap) -> Color {
+    let texels = [
+        (x.near, y.near),
+        (x.far, y.near),
+        (x.near, y.far),
+        (x.far, y.far),
+    ]
+    .map(|(column, row)| image.pixel(column, row));
+    // opaque texels need no premultiplying, which is every texel of a video frame or a photo
+    if texels.iter().all(|texel| texel.alpha == 255) {
+        let (along, down) = (x.weight(), y.weight());
+        let weights = [
+            (256 - along) * (256 - down),
+            along * (256 - down),
+            (256 - along) * down,
+            along * down,
+        ];
+        let mut sum = [1_u32 << 15; 3];
+        for (texel, weight) in texels.iter().zip(weights) {
+            sum[0] += u32::from(texel.red) * weight;
+            sum[1] += u32::from(texel.green) * weight;
+            sum[2] += u32::from(texel.blue) * weight;
+        }
+        let [red, green, blue] = sum.map(|sum| (sum >> 16) as u8);
+        return Color::opaque(red, green, blue);
+    }
+    let weights = [
+        (1.0 - x.fraction) * (1.0 - y.fraction),
+        x.fraction * (1.0 - y.fraction),
+        (1.0 - x.fraction) * y.fraction,
+        x.fraction * y.fraction,
+    ];
+    let mut sum = [0.0_f32; 4];
+    for (color, weight) in texels.into_iter().zip(weights) {
+        if weight == 0.0 {
+            continue;
+        }
+        let alpha = f32::from(color.alpha) * weight;
+        sum[0] += f32::from(color.red) * alpha;
+        sum[1] += f32::from(color.green) * alpha;
+        sum[2] += f32::from(color.blue) * alpha;
+        sum[3] += alpha;
     }
     if sum[3] <= 0.0 {
         return Color::transparent();
     }
-    let channel = |value: f32| (value / sum[3]).round().clamp(0.0, 255.0) as u8;
+    let channel = |value: f32| round_byte(value / sum[3]);
     Color::rgba(
         channel(sum[0]),
         channel(sum[1]),
         channel(sum[2]),
-        sum[3].round().clamp(0.0, 255.0) as u8,
+        round_byte(sum[3]),
     )
+}
+
+// f32::round is a library call on baseline x86-64, and this runs per pixel per channel
+fn round_byte(value: f32) -> u8 {
+    let value = value.clamp(0.0, 255.0);
+    let whole = value as u8;
+    whole + u8::from(value - f32::from(whole) >= 0.5)
 }
 
 fn intersect_rect(first: Rect, second: Rect) -> Rect {
