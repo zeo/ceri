@@ -4,6 +4,7 @@
 use crate::autostart::Autostart;
 use crate::dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 use crate::notification::Notifier;
+use crate::shortcut::GlobalShortcuts;
 use ceri_engine::{
     CommandCall, CommandError, CommandReply, CommandRouter, NativeHandle, WindowAction,
     WindowControl,
@@ -59,6 +60,7 @@ pub struct CommandRoutes {
     pub version: Option<String>,
     pub notifier: Arc<OnceLock<Notifier>>,
     pub autostart: Autostart,
+    pub shortcuts: GlobalShortcuts,
 }
 
 impl CommandRoutes {
@@ -72,6 +74,9 @@ impl CommandRoutes {
         }
         if call.command.starts_with("autostart:") {
             return Some(autostart(call, &self.autostart));
+        }
+        if call.command.starts_with("global-shortcut:") {
+            return Some(global_shortcut(call, &self.shortcuts));
         }
         let control = self.control.as_ref()?;
         let label = call.window.as_str();
@@ -245,6 +250,41 @@ fn autostart(call: &CommandCall, autostart: &Autostart) -> Result<String, Comman
 }
 
 #[derive(Deserialize)]
+struct Accelerator {
+    shortcut: String,
+}
+
+fn global_shortcut(
+    call: &CommandCall,
+    shortcuts: &GlobalShortcuts,
+) -> Result<String, CommandError> {
+    let shortcut = || arguments::<Accelerator>(call).map(|accelerator| accelerator.shortcut);
+    match call.command.as_str() {
+        "global-shortcut:register" => json(
+            &shortcuts
+                .register(&shortcut()?)
+                .map_err(CommandError::failed)?,
+        ),
+        "global-shortcut:unregister" => {
+            shortcuts
+                .unregister(&shortcut()?)
+                .map_err(CommandError::failed)?;
+            Ok("null".to_string())
+        }
+        "global-shortcut:unregister-all" => {
+            shortcuts.unregister_all();
+            Ok("null".to_string())
+        }
+        "global-shortcut:is-registered" => json(
+            &shortcuts
+                .is_registered(&shortcut()?)
+                .map_err(CommandError::failed)?,
+        ),
+        command => Err(CommandError::unknown(command)),
+    }
+}
+
+#[derive(Deserialize)]
 struct Notice {
     title: String,
     #[serde(default)]
@@ -412,6 +452,7 @@ mod tests {
             version: Some("1.2.3".to_string()),
             notifier: Arc::default(),
             autostart: Autostart::new("dev.ceri.router-test", "Router Test"),
+            shortcuts: GlobalShortcuts::default(),
         };
         let (sender, receiver) = channel();
         let ask = |command: &str, id| {

@@ -162,6 +162,21 @@ export interface Autostart {
 
 export const autostart: Autostart;
 
+export interface ShortcutEvent {
+  readonly shortcut: string;
+  readonly state: "Pressed" | "Released";
+}
+
+export interface GlobalShortcut {
+  // electron's or tauri's accelerator grammar, such as "CmdOrCtrl+Shift+K" or "Alt+F9"
+  register(shortcuts: string | readonly string[], handler: (event: ShortcutEvent) => void): Promise<void>;
+  unregister(shortcuts: string | readonly string[]): Promise<void>;
+  unregisterAll(): Promise<void>;
+  isRegistered(shortcut: string): Promise<boolean>;
+}
+
+export const globalShortcut: GlobalShortcut;
+
 export function appVersion(): Promise<string>;
 
 export function fileSrc(path: string): string;

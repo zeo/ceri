@@ -18,6 +18,7 @@ mod http;
 mod instance;
 mod notification;
 pub mod opener;
+mod shortcut;
 mod tray;
 mod video;
 
@@ -28,6 +29,7 @@ pub use ceri_engine::{
 pub use custom::{App, AppHandle, run};
 pub use dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 pub use files::FileScope;
+pub use shortcut::{GlobalShortcuts, ShortcutState};
 pub use tray::{MenuItem, Tray, TrayConfig, TrayEvent};
 
 #[doc(hidden)]

@@ -180,6 +180,38 @@ export const autostart = Object.freeze({
   isEnabled: () => invoke("autostart:is-enabled"),
 });
 
+// shortcuts that reach the app while another app has the keyboard, once the app grants
+// global-shortcut:*; a handler hears each press and release under the name it registered
+const shortcutHandlers = new Map();
+let shortcutEvents;
+
+export const globalShortcut = Object.freeze({
+  async register(shortcuts, handler) {
+    shortcutEvents ??= listen("global-shortcut", ({ payload }) => {
+      const registered = shortcutHandlers.get(payload.shortcut);
+      registered?.handler({ shortcut: registered.name, state: payload.state });
+    });
+    await shortcutEvents;
+    for (const name of [shortcuts].flat()) {
+      const canonical = await invoke("global-shortcut:register", { shortcut: name });
+      shortcutHandlers.set(canonical, { name, handler });
+    }
+  },
+  async unregister(shortcuts) {
+    for (const name of [shortcuts].flat()) {
+      await invoke("global-shortcut:unregister", { shortcut: name });
+      for (const [canonical, registered] of shortcutHandlers) {
+        if (registered.name === name) shortcutHandlers.delete(canonical);
+      }
+    }
+  },
+  async unregisterAll() {
+    await invoke("global-shortcut:unregister-all");
+    shortcutHandlers.clear();
+  },
+  isRegistered: (shortcut) => invoke("global-shortcut:is-registered", { shortcut }),
+});
+
 export function appVersion() {
   return invoke("app:version");
 }

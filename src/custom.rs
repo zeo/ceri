@@ -9,6 +9,7 @@ use crate::fonts::SystemFonts;
 use crate::instance;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use crate::notification::Notifier;
+use crate::shortcut::{GlobalShortcuts, ShortcutState};
 use crate::tray::{Tray, TrayConfig, TrayEvent};
 use crate::video::DesktopVideo;
 use ceri_engine::{
@@ -37,6 +38,7 @@ pub struct AppHandle {
     files: FileScope,
     tray: Arc<OnceLock<Tray>>,
     notifier: Arc<OnceLock<Notifier>>,
+    shortcuts: GlobalShortcuts,
 }
 
 impl AppHandle {
@@ -57,6 +59,12 @@ impl AppHandle {
     // the notification area icon the app asked for, there from before the loop runs
     pub fn tray(&self) -> Option<&Tray> {
         self.tray.get()
+    }
+
+    // shortcuts that reach the app from anywhere on the desktop, reported to
+    // App::on_global_shortcut and as the global-shortcut event
+    pub fn global_shortcuts(&self) -> &GlobalShortcuts {
+        &self.shortcuts
     }
 
     // an event for every window's listeners
@@ -108,6 +116,7 @@ pub struct App {
     handle: AppHandle,
     tray: Option<TrayRequest>,
     single_instance: Option<LaunchRequest>,
+    global_shortcut: Option<ShortcutHook>,
     assets: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
     content_security_policy: Option<String>,
@@ -116,6 +125,8 @@ pub struct App {
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
+
+type ShortcutHook = Box<dyn Fn(&AppHandle, &str, ShortcutState) + Send + Sync>;
 
 type TrayRequest = (TrayConfig, Box<dyn Fn(&AppHandle, TrayEvent) + Send + Sync>);
 
@@ -215,6 +226,15 @@ impl App {
     }
 
     // stays running with every window closed, until the app exits
+    // each press and release of a registered global shortcut, by its canonical name
+    pub fn on_global_shortcut(
+        mut self,
+        hook: impl Fn(&AppHandle, &str, ShortcutState) + Send + Sync + 'static,
+    ) -> Self {
+        self.global_shortcut = Some(Box::new(hook));
+        self
+    }
+
     pub fn keep_running(mut self) -> Self {
         self.lifecycle.keep_running = true;
         self
@@ -319,6 +339,19 @@ impl App {
             Some(url) => Some(DevServer::parse(&url)?),
             None => None,
         };
+        let events = self.handle.clone();
+        let hook = self.global_shortcut.take();
+        self.handle
+            .shortcuts
+            .listen(Box::new(move |shortcut, state| {
+                if let Some(hook) = &hook {
+                    hook(&events, shortcut, state);
+                }
+                events.emit(
+                    "global-shortcut",
+                    serde_json::json!({ "shortcut": shortcut, "state": state }),
+                );
+            }));
         let handle = self.handle.clone();
         let started = self.lifecycle.started.take();
         self.lifecycle.started = Some(Box::new(move |control| {
@@ -351,6 +384,7 @@ impl App {
                 commands: Arc::new(self.commands),
                 capabilities,
                 autostart,
+                shortcuts: self.handle.shortcuts.clone(),
                 name,
                 version: self.version,
                 files: self.handle.files.clone(),
@@ -412,6 +446,7 @@ struct Bridge {
     files: FileScope,
     notifier: Arc<OnceLock<Notifier>>,
     autostart: Autostart,
+    shortcuts: GlobalShortcuts,
     // the pages compiled into the app, served unless a folder is named at launch
     embedded: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
@@ -428,6 +463,7 @@ impl Bridge {
                 version: self.version.clone(),
                 notifier: self.notifier.clone(),
                 autostart: self.autostart.clone(),
+                shortcuts: self.shortcuts.clone(),
             }),
             self.capabilities.clone(),
             window,
