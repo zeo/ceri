@@ -306,6 +306,8 @@ impl App {
                 "window:*".to_string(),
                 "app:*".to_string(),
                 "dialog:*".to_string(),
+                "opener:open-url".to_string(),
+                "opener:reveal".to_string(),
             ],
         });
         run_app(

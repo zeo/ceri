@@ -156,6 +156,14 @@ export const dialog = Object.freeze({
   confirm: asking("dialog:confirm"),
 });
 
+// links open in the system's browser, mail or phone app; a page may open http, https, mailto and
+// tel links and reveal an item, and the app grants opener:open-path for anything else
+export const opener = Object.freeze({
+  openUrl: (url) => invoke("opener:open-url", { url }),
+  openPath: (path) => invoke("opener:open-path", { path }),
+  revealItemInDir: (path) => invoke("opener:reveal", { path }),
+});
+
 export function appVersion() {
   return invoke("app:version");
 }

@@ -128,6 +128,16 @@ export interface Dialog {
 
 export const dialog: Dialog;
 
+export interface Opener {
+  openUrl(url: string): Promise<void>;
+  // needs the app to grant opener:open-path
+  openPath(path: string): Promise<void>;
+  // the file manager on the item's folder, with the item selected
+  revealItemInDir(path: string): Promise<void>;
+}
+
+export const opener: Opener;
+
 export function appVersion(): Promise<string>;
 
 export function fileSrc(path: string): string;

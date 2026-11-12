@@ -196,6 +196,37 @@ fn dialog(call: &CommandCall, owner: Option<NativeHandle>) -> Result<String, Com
     json(&answer)
 }
 
+#[derive(Deserialize)]
+struct OpenUrl {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct OpenPath {
+    path: PathBuf,
+}
+
+// a page opens web, mail and phone links only; a path needs the app to grant the command
+fn opener(call: &CommandCall) -> Result<String, CommandError> {
+    match call.command.as_str() {
+        "opener:open-url" => {
+            let url = arguments::<OpenUrl>(call)?.url;
+            if !crate::opener::page_may_open(&url) {
+                return Err(CommandError::new(
+                    "denied",
+                    format!("a page may only open http, https, mailto and tel links, not {url}"),
+                ));
+            }
+            crate::opener::open_url(&url)
+        }
+        "opener:open-path" => crate::opener::open_path(arguments::<OpenPath>(call)?.path),
+        "opener:reveal" => crate::opener::reveal(arguments::<OpenPath>(call)?.path),
+        command => return Err(CommandError::unknown(command)),
+    }
+    .map_err(CommandError::failed)?;
+    Ok("null".to_string())
+}
+
 fn arguments<T: DeserializeOwned>(call: &CommandCall) -> Result<T, CommandError> {
     serde_json::from_str(&call.payload)
         .map_err(|error| CommandError::new("invalid-payload", error.to_string()))
@@ -267,7 +298,8 @@ impl CommandRouter for CommandRoutes {
             reply.send(answer);
             return;
         }
-        if call.command.starts_with("dialog:") {
+        if call.command.starts_with("dialog:") || call.command.starts_with("opener:") {
+            let command = call.command.clone();
             let owner = self
                 .control
                 .as_ref()
@@ -275,9 +307,14 @@ impl CommandRouter for CommandRoutes {
                 .and_then(|state| state.handle);
             let spawned = thread::Builder::new()
                 .name(format!("ceri {}", call.command))
-                .spawn(move || reply.send(dialog(&call, owner)));
+                .spawn(move || {
+                    reply.send(match call.command.starts_with("opener:") {
+                        true => opener(&call),
+                        false => dialog(&call, owner),
+                    })
+                });
             if let Err(error) = spawned {
-                eprintln!("ceri: could not start a dialog thread: {error}");
+                eprintln!("ceri: could not start a thread for {command}: {error}");
             }
             return;
         }
@@ -365,6 +402,18 @@ mod tests {
         };
         assert_eq!(id, 7);
         assert_eq!(answer.expect_err("a bad payload").code, "invalid-payload");
+        let mut program = call("opener:open-url");
+        program.payload = r#"{"url":"file:///C:/Windows/System32/calc.exe"}"#.to_string();
+        routes.invoke(program, CommandReply::new(8, sender.clone()));
+        let (id, answer) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("answers");
+        assert_eq!(id, 8);
+        assert_eq!(answer.expect_err("a file url").code, "denied");
+        assert_eq!(
+            ask("opener:nothing", 9),
+            (9, Err(CommandError::unknown("opener:nothing")))
+        );
     }
 
     #[test]
