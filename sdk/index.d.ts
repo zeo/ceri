@@ -177,6 +177,14 @@ export interface GlobalShortcut {
 
 export const globalShortcut: GlobalShortcut;
 
+export interface DeepLink {
+  // null until a link opens the app
+  getCurrent(): Promise<string[] | null>;
+  onOpenUrl(handler: (urls: string[]) => void): Promise<Unlisten>;
+}
+
+export const deepLink: DeepLink;
+
 export function appVersion(): Promise<string>;
 
 export function fileSrc(path: string): string;

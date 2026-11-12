@@ -44,7 +44,7 @@ impl Autostart {
 }
 
 // an AppImage runs from a mount that is gone after it exits, so the image itself is started
-fn program() -> Result<PathBuf, String> {
+pub(crate) fn program() -> Result<PathBuf, String> {
     std::env::var_os("APPIMAGE")
         .filter(|_| cfg!(target_os = "linux"))
         .map(PathBuf::from)
@@ -204,10 +204,10 @@ mod platform {
     }
 
     pub(super) fn desktop_entry(autostart: &Autostart, program: &Path) -> String {
-        let mut exec = exec_argument(&program.to_string_lossy());
+        let mut exec = super::exec_argument(&program.to_string_lossy());
         for argument in &autostart.arguments {
             exec.push(' ');
-            exec.push_str(&exec_argument(&argument.to_string_lossy()));
+            exec.push_str(&super::exec_argument(&argument.to_string_lossy()));
         }
         let name: String = autostart
             .name
@@ -218,34 +218,35 @@ mod platform {
             "[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\nX-GNOME-Autostart-enabled=true\n"
         )
     }
+}
 
-    // the desktop entry spec's Exec quoting, then its string escape, which doubles every
-    // backslash again; % starts a field code, so a literal one is doubled
-    fn exec_argument(argument: &str) -> String {
-        let reserved = argument.is_empty()
-            || argument
-                .chars()
-                .any(|c| c.is_whitespace() || "\"'\\><~|&;$*?#()`".contains(c) || c.is_control());
-        let mut quoted = String::new();
-        if reserved {
-            quoted.push('"');
-            for c in argument.chars() {
-                if matches!(c, '"' | '`' | '$' | '\\') {
-                    quoted.push('\\');
-                }
-                quoted.push(c);
+// the desktop entry spec's Exec quoting, then its string escape, which doubles every
+// backslash again; % starts a field code, so a literal one is doubled
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn exec_argument(argument: &str) -> String {
+    let reserved = argument.is_empty()
+        || argument
+            .chars()
+            .any(|c| c.is_whitespace() || "\"'\\><~|&;$*?#()`".contains(c) || c.is_control());
+    let mut quoted = String::new();
+    if reserved {
+        quoted.push('"');
+        for c in argument.chars() {
+            if matches!(c, '"' | '`' | '$' | '\\') {
+                quoted.push('\\');
             }
-            quoted.push('"');
-        } else {
-            quoted.push_str(argument);
+            quoted.push(c);
         }
-        quoted
-            .replace('\\', "\\\\")
-            .replace('%', "%%")
-            .replace('\n', "\\n")
-            .replace('\t', "\\t")
-            .replace('\r', "\\r")
+        quoted.push('"');
+    } else {
+        quoted.push_str(argument);
     }
+    quoted
+        .replace('\\', "\\\\")
+        .replace('%', "%%")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
 }
 
 #[cfg(test)]

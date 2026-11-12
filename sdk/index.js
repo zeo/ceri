@@ -212,6 +212,12 @@ export const globalShortcut = Object.freeze({
   isRegistered: (shortcut) => invoke("global-shortcut:is-registered", { shortcut }),
 });
 
+// links in the app's own schemes: the latest it was opened with, and each that reaches it after
+export const deepLink = Object.freeze({
+  getCurrent: () => invoke("deep-link:get-current"),
+  onOpenUrl: (handler) => listen("deep-link", ({ payload }) => handler(payload.urls)),
+});
+
 export function appVersion() {
   return invoke("app:version");
 }

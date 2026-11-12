@@ -2,6 +2,7 @@ use crate::assets::{AssetOrigin, AssetRoute, EmbeddedAssets, RequestTarget};
 use crate::audio::DesktopAudio;
 use crate::autostart::Autostart;
 use crate::commands::{CommandRoutes, Commands};
+use crate::deep_link;
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
 use crate::dev::DevServer;
 use crate::files::FileScope;
@@ -24,7 +25,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
@@ -39,6 +40,7 @@ pub struct AppHandle {
     tray: Arc<OnceLock<Tray>>,
     notifier: Arc<OnceLock<Notifier>>,
     shortcuts: GlobalShortcuts,
+    opened_urls: Arc<Mutex<Vec<String>>>,
 }
 
 impl AppHandle {
@@ -65,6 +67,14 @@ impl AppHandle {
     // App::on_global_shortcut and as the global-shortcut event
     pub fn global_shortcuts(&self) -> &GlobalShortcuts {
         &self.shortcuts
+    }
+
+    // the links in the app's schemes it was last opened with, at launch or by a later launch
+    pub fn opened_urls(&self) -> Vec<String> {
+        self.opened_urls
+            .lock()
+            .expect("opened urls poisoned")
+            .clone()
     }
 
     // an event for every window's listeners
@@ -117,6 +127,8 @@ pub struct App {
     tray: Option<TrayRequest>,
     single_instance: Option<LaunchRequest>,
     global_shortcut: Option<ShortcutHook>,
+    deep_link_schemes: Vec<String>,
+    open_url: Option<OpenUrlHook>,
     assets: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
     content_security_policy: Option<String>,
@@ -127,6 +139,8 @@ pub struct App {
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
 
 type ShortcutHook = Box<dyn Fn(&AppHandle, &str, ShortcutState) + Send + Sync>;
+
+type OpenUrlHook = Arc<dyn Fn(&AppHandle, &[String]) + Send + Sync>;
 
 type TrayRequest = (TrayConfig, Box<dyn Fn(&AppHandle, TrayEvent) + Send + Sync>);
 
@@ -225,7 +239,6 @@ impl App {
         self
     }
 
-    // stays running with every window closed, until the app exits
     // each press and release of a registered global shortcut, by its canonical name
     pub fn on_global_shortcut(
         mut self,
@@ -235,6 +248,24 @@ impl App {
         self
     }
 
+    // a url scheme such as clip that starts the app, pointed at this executable when the app
+    // runs; with single_instance a link reaches the running copy instead of a new one
+    pub fn deep_link_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.deep_link_schemes.push(scheme.into());
+        self
+    }
+
+    // the links the app was started with, once the loop runs, and each a later launch hands over
+    // under single_instance; pages hear the later ones as the deep-link event
+    pub fn on_open_url(
+        mut self,
+        hook: impl Fn(&AppHandle, &[String]) + Send + Sync + 'static,
+    ) -> Self {
+        self.open_url = Some(Arc::new(hook));
+        self
+    }
+
+    // stays running with every window closed, until the app exits
     pub fn keep_running(mut self) -> Self {
         self.lifecycle.keep_running = true;
         self
@@ -352,14 +383,6 @@ impl App {
                     serde_json::json!({ "shortcut": shortcut, "state": state }),
                 );
             }));
-        let handle = self.handle.clone();
-        let started = self.lifecycle.started.take();
-        self.lifecycle.started = Some(Box::new(move |control| {
-            handle.attach(control);
-            if let Some(started) = started {
-                started(control);
-            }
-        }));
         let capabilities = self.capabilities.grant(Grant {
             windows: vec!["*".to_string()],
             origins: vec![APP_ORIGIN.to_string()],
@@ -371,6 +394,7 @@ impl App {
                 "opener:reveal".to_string(),
                 "notification:*".to_string(),
                 "autostart:*".to_string(),
+                "deep-link:get-current".to_string(),
             ],
         });
         let name = self
@@ -378,6 +402,59 @@ impl App {
             .or_else(|| self.windows.first().map(|window| window.title.clone()))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| identifier.clone());
+        let schemes = self
+            .deep_link_schemes
+            .iter()
+            .map(|scheme| deep_link::check_scheme(scheme))
+            .collect::<Result<Vec<_>, _>>()?;
+        let launched = deep_link::urls(&schemes, &std::env::args_os().skip(1).collect::<Vec<_>>());
+        self.handle
+            .opened_urls
+            .lock()
+            .expect("opened urls poisoned")
+            .clone_from(&launched);
+        let on_open_url = self.open_url.take();
+        self.single_instance = self.single_instance.take().map(|on_launch| {
+            let schemes = schemes.clone();
+            let on_open_url = on_open_url.clone();
+            Box::new(
+                move |handle: &AppHandle, arguments: Vec<OsString>, directory| {
+                    let urls = deep_link::urls(&schemes, &arguments);
+                    if !urls.is_empty() {
+                        handle
+                            .opened_urls
+                            .lock()
+                            .expect("opened urls poisoned")
+                            .clone_from(&urls);
+                        if let Some(hook) = &on_open_url {
+                            hook(handle, &urls);
+                        }
+                        handle.emit("deep-link", serde_json::json!({ "urls": urls }));
+                    }
+                    on_launch(handle, arguments, directory);
+                },
+            ) as LaunchRequest
+        });
+        let handle = self.handle.clone();
+        let started = self.lifecycle.started.take();
+        let (registrant, display_name) = (identifier.clone(), name.clone());
+        self.lifecycle.started = Some(Box::new(move |control| {
+            handle.attach(control);
+            if !schemes.is_empty() {
+                // the shell and the desktop's files take a moment, not the first frame's
+                std::thread::spawn(move || {
+                    if let Err(error) = deep_link::register(&registrant, &display_name, &schemes) {
+                        eprintln!("ceri: links will not open the app: {error}");
+                    }
+                });
+            }
+            if let Some(started) = started {
+                started(control);
+            }
+            if let (Some(hook), false) = (&on_open_url, launched.is_empty()) {
+                hook(&handle, &launched);
+            }
+        }));
         let autostart = Autostart::new(&identifier, &name).arguments(self.autostart_arguments);
         run_app(
             Bridge {
@@ -385,6 +462,7 @@ impl App {
                 capabilities,
                 autostart,
                 shortcuts: self.handle.shortcuts.clone(),
+                opened_urls: self.handle.opened_urls.clone(),
                 name,
                 version: self.version,
                 files: self.handle.files.clone(),
@@ -447,6 +525,7 @@ struct Bridge {
     notifier: Arc<OnceLock<Notifier>>,
     autostart: Autostart,
     shortcuts: GlobalShortcuts,
+    opened_urls: Arc<Mutex<Vec<String>>>,
     // the pages compiled into the app, served unless a folder is named at launch
     embedded: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
@@ -464,6 +543,7 @@ impl Bridge {
                 notifier: self.notifier.clone(),
                 autostart: self.autostart.clone(),
                 shortcuts: self.shortcuts.clone(),
+                opened_urls: self.opened_urls.clone(),
             }),
             self.capabilities.clone(),
             window,

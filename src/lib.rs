@@ -8,6 +8,7 @@ mod commands;
 mod custom;
 #[cfg(not(target_os = "windows"))]
 mod dbus;
+mod deep_link;
 mod desktop;
 mod dev;
 mod dialog;

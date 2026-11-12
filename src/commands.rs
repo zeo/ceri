@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 type Handler = dyn Fn(&CommandCall) -> Result<String, CommandError> + Send + Sync;
@@ -61,6 +61,7 @@ pub struct CommandRoutes {
     pub notifier: Arc<OnceLock<Notifier>>,
     pub autostart: Autostart,
     pub shortcuts: GlobalShortcuts,
+    pub opened_urls: Arc<Mutex<Vec<String>>>,
 }
 
 impl CommandRoutes {
@@ -77,6 +78,14 @@ impl CommandRoutes {
         }
         if call.command.starts_with("global-shortcut:") {
             return Some(global_shortcut(call, &self.shortcuts));
+        }
+        if call.command == "deep-link:get-current" {
+            let urls = self
+                .opened_urls
+                .lock()
+                .expect("opened urls poisoned")
+                .clone();
+            return Some(json(&Some(urls).filter(|urls| !urls.is_empty())));
         }
         let control = self.control.as_ref()?;
         let label = call.window.as_str();
@@ -453,6 +462,7 @@ mod tests {
             notifier: Arc::default(),
             autostart: Autostart::new("dev.ceri.router-test", "Router Test"),
             shortcuts: GlobalShortcuts::default(),
+            opened_urls: Arc::new(Mutex::new(vec!["clip://open".to_string()])),
         };
         let (sender, receiver) = channel();
         let ask = |command: &str, id| {
@@ -471,6 +481,10 @@ mod tests {
             (3, Err(CommandError::unknown("nothing")))
         );
         assert_eq!(ask("app:version", 4), (4, Ok("\"1.2.3\"".to_string())));
+        assert_eq!(
+            ask("deep-link:get-current", 40),
+            (40, Ok("[\"clip://open\"]".to_string()))
+        );
         assert_eq!(
             ask("window:minimize", 5),
             (5, Err(CommandError::unknown("window:minimize"))),
