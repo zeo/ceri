@@ -1566,13 +1566,21 @@ mod tests {
             .expect("audio script should run");
         for _ in 0..5000 {
             runtime.pump().expect("audio pump should run");
-            if runtime.logs().len() >= 7 {
+            if runtime.logs().len() >= 8 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        // the two decodes settle in whichever order their threads finish
+        let failed = runtime
+            .logs()
+            .iter()
+            .position(|line| line == "failed EncodingError")
+            .expect("the bad buffer should fail to decode");
+        let mut logs = runtime.logs()[..8].to_vec();
+        logs.remove(failed);
         assert_eq!(
-            runtime.logs()[..7],
+            logs,
             [
                 "true",
                 "running,48000,1,1,true,[object AudioContext],true,true",
@@ -1583,15 +1591,6 @@ mod tests {
                 "InvalidStateError",
             ]
         );
-        assert!(runtime.logs()[7..].is_empty() || runtime.logs()[7] == "failed EncodingError");
-        for _ in 0..5000 {
-            runtime.pump().expect("audio pump should run");
-            if runtime.logs().len() >= 8 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert_eq!(runtime.logs()[7], "failed EncodingError");
         let render = device
             .0
             .borrow()
