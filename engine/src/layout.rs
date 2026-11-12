@@ -2936,7 +2936,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             |element| text_control_display_value(element, value),
         )
     });
-    let control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
+    let mut control_text_origin = control_value.as_ref().map(|_| (content_x, content_y));
     let letter_spacing = style
         .letter_spacing
         .resolve(font_size, font_size)
@@ -3264,6 +3264,17 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                 .max(min_height)
         })
         .max(0.0);
+    // chromium centres a single-line field's editor in its content box, overflowing both ways,
+    // halving the layout-unit difference toward zero
+    if name == "input" && control_value.is_some() {
+        let offset = ((content_height - line_height) * 32.0).trunc() / 64.0;
+        for run in &mut text {
+            run.y += offset;
+        }
+        if let Some(origin) = &mut control_text_origin {
+            origin.1 += offset;
+        }
+    }
     let border_box_height = content_height + vertical_inner;
     let rect = Rect {
         height: border_box_height,
@@ -8722,9 +8733,10 @@ pub(crate) fn normal_line_height(stack: FontStack, font_size: f32) -> f32 {
     crate::font::active_fonts().line_height(stack, font_size)
 }
 
-// the space above a glyph box that centres it in its line, half the leading
+// the space above a glyph box that centres it in its line: half the leading floored to a
+// whole pixel, the rest going below, as blink's CalculateLeadingSpace splits it
 fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
-    (line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0
+    ((line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0).floor()
 }
 
 // the weight, slant, axis settings, optical size and features a style asks its font for

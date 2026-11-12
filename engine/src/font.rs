@@ -273,8 +273,12 @@ impl FontFace {
         self.x_height / self.units_per_em * size
     }
 
+    // normal line height, each part rounded to whole pixels as blink's line spacing is
     pub fn line_height(&self, size: f32) -> f32 {
-        (self.ascent + self.descent + self.line_gap) / self.units_per_em * size
+        [self.ascent, self.descent, self.line_gap]
+            .map(|metric| (metric / self.units_per_em * size).round())
+            .iter()
+            .sum()
     }
 
     pub(crate) fn data(&self) -> &[u8] {
@@ -1595,9 +1599,10 @@ impl FontSet {
         }
     }
 
+    // the primary face's ascent in whole pixels, as blink rounds it for html text
     pub fn ascent(&self, stack: FontStack, size: f32) -> f32 {
         match self.primary(stack, FontStyle::NORMAL) {
-            Some(face) => face.ascent(size),
+            Some(face) => face.ascent(size).round(),
             None => size,
         }
     }
@@ -1612,7 +1617,7 @@ impl FontSet {
     // the height of a glyph box, ascent plus descent, which half-leading centres in a line
     pub fn content_height(&self, stack: FontStack, size: f32) -> f32 {
         match self.primary(stack, FontStyle::NORMAL) {
-            Some(face) => face.ascent(size) + face.descent(size),
+            Some(face) => face.ascent(size).round() + face.descent(size).round(),
             None => size,
         }
     }

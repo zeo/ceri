@@ -2053,9 +2053,11 @@ fn paint_outline(
 }
 
 // an overflow clip with rounded corners clips to the padding box's curves as well
-fn overflow_mask(layout_box: &LayoutBox, rect: Rect) -> Option<Shape> {
+// the rounded padding box a clipping box masks its content to, snapped as its background is
+fn overflow_mask(canvas: &Canvas, layout_box: &LayoutBox, rect: Rect) -> Option<Shape> {
     let clips = layout_box.overflow.clips();
-    let padding_box = Shape::from_rect(rect, layout_box.radii).inset(layout_box.border.widths);
+    let padding_box =
+        Shape::from_rect(canvas.snap_rect(rect), layout_box.radii).inset(layout_box.border.widths);
     (clips && !padding_box.is_square()).then_some(padding_box)
 }
 
@@ -2622,7 +2624,7 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
         canvas.push_image_mask(layout_box, images, rect);
     }
     let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
-    let mask = overflow_mask(layout_box, rect);
+    let mask = overflow_mask(canvas, layout_box, rect);
     if let Some(mask) = mask {
         canvas.push_mask(mask);
     }
@@ -2672,7 +2674,9 @@ fn paint_context_entry(
     let masks = entry
         .clippers
         .iter()
-        .filter_map(|&(clipper, offset)| overflow_mask(clipper, visual_rect_for(clipper, offset)))
+        .filter_map(|&(clipper, offset)| {
+            overflow_mask(canvas, clipper, visual_rect_for(clipper, offset))
+        })
         .collect::<Vec<_>>();
     for &mask in &masks {
         canvas.push_mask(mask);
@@ -2733,7 +2737,7 @@ fn paint_non_context_subtree(
         rect,
         layout_box.opacity,
     );
-    let mask = overflow_mask(layout_box, rect);
+    let mask = overflow_mask(canvas, layout_box, rect);
     if let Some(mask) = mask {
         canvas.push_mask(mask);
     }
@@ -2822,17 +2826,24 @@ fn paint_box_surface(
             .iter()
             .find(|layer| layer.background.is_none() && layer.node == layout_box.node)
     {
+        // the object fits the unsnapped box, as layout places it, before its rect snaps
+        let padding_box = Shape::from_rect(rect, layout_box.radii).inset(layout_box.border.widths);
         let content = Rect {
-            x: surface.x,
-            y: surface.y,
-            width: surface.width,
-            height: surface.height,
+            x: padding_box.x,
+            y: padding_box.y,
+            width: padding_box.width,
+            height: padding_box.height,
         };
         paint_image(
             canvas,
             ImageDraw {
                 image: &layer.image,
-                placement: fitted_placement(content, &layer.image, layout_box.object_fit),
+                // chromium draws replaced images into their pixel-snapped rect
+                placement: canvas.snap_rect(fitted_placement(
+                    content,
+                    &layer.image,
+                    layout_box.object_fit,
+                )),
                 area: surface,
                 clip: content_clip,
                 opacity,
@@ -3630,22 +3641,36 @@ fn intersect_rect(first: Rect, second: Rect) -> Rect {
 }
 
 // where object-fit puts the image inside the content box, centered as object-position defaults
+// blink's object-fit in 1/64 px layout units: the constrained side by integer muldiv and the
+// centring offset truncated, so the rect snaps to the pixels chromium paints
 fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
-    let (width, height) = (image.width as f32, image.height as f32);
-    let contain = (content.width / width).min(content.height / height);
-    let scale = match fit {
-        ObjectFit::Fill => return content,
-        ObjectFit::Contain => contain,
-        ObjectFit::Cover => (content.width / width).max(content.height / height),
-        ObjectFit::None => 1.0,
-        ObjectFit::ScaleDown => contain.min(1.0),
+    let unit = |value: f32| (value * 64.0) as i64;
+    let natural = (i64::from(image.width) * 64, i64::from(image.height) * 64);
+    let size = (unit(content.width), unit(content.height));
+    let fitted = |grow: bool| {
+        let height = size.0 * natural.1 / natural.0;
+        if (grow && height < size.1) || (!grow && height > size.1) {
+            (size.1 * natural.0 / natural.1, size.1)
+        } else {
+            (size.0, height)
+        }
     };
-    let (placed_width, placed_height) = (width * scale, height * scale);
+    let (width, height) = match fit {
+        _ if natural.0 == 0 || natural.1 == 0 => return content,
+        ObjectFit::Fill => return content,
+        ObjectFit::Contain => fitted(false),
+        ObjectFit::Cover => fitted(true),
+        ObjectFit::None => natural,
+        ObjectFit::ScaleDown if fitted(false).0 > natural.0 => natural,
+        ObjectFit::ScaleDown => fitted(false),
+    };
+    let centre = |space: i64, object: i64| ((space - object) as f32 / 64.0 * 0.5 * 64.0) as i64;
+    let pixels = |raw: i64| raw as f32 / 64.0;
     Rect {
-        x: content.x + (content.width - placed_width) / 2.0,
-        y: content.y + (content.height - placed_height) / 2.0,
-        width: placed_width,
-        height: placed_height,
+        x: content.x + pixels(centre(size.0, width)),
+        y: content.y + pixels(centre(size.1, height)),
+        width: pixels(width),
+        height: pixels(height),
     }
 }
 
