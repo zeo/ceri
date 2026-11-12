@@ -523,6 +523,8 @@ struct AppWindow {
     output: Option<Output>,
     handle: Option<NativeHandle>,
     cursor: (f32, f32),
+    // buttons the page saw go down and not yet up
+    pressed: Vec<PointerButton>,
     // the resize edge under the pointer of a window without decorations
     edge: Option<ResizeDirection>,
     normal: Option<WindowGeometry>,
@@ -602,6 +604,7 @@ where
             output: None,
             handle: None,
             cursor: (0.0, 0.0),
+            pressed: Vec::new(),
             edge: None,
             normal: None,
             modifiers: ModifiersState::empty(),
@@ -1043,6 +1046,10 @@ impl AppWindow {
                 if !self.submit(event) {
                     return;
                 }
+                self.pressed.retain(|&held| held != button);
+                if state == ElementState::Pressed {
+                    self.pressed.push(button);
+                }
                 if state == ElementState::Released && button == PointerButton::Primary {
                     self.submit(InputEvent::Click { x, y });
                 }
@@ -1146,6 +1153,22 @@ impl AppWindow {
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    // a modal loop a task ran, such as an OLE drag, reads the release itself, so the page gets
+    // it here without a click
+    fn release_lost_buttons(&mut self) {
+        let (x, y) = self.cursor;
+        let released: Vec<_> = self
+            .pressed
+            .iter()
+            .copied()
+            .filter(|&button| !button_held(button))
+            .collect();
+        for button in released {
+            self.pressed.retain(|&held| held != button);
+            self.submit(InputEvent::PointerUp { x, y, button });
         }
     }
 
@@ -1387,6 +1410,26 @@ impl AppWindow {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn button_held(button: PointerButton) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    };
+    let key = match button {
+        PointerButton::Primary => VK_LBUTTON,
+        PointerButton::Secondary => VK_RBUTTON,
+        PointerButton::Auxiliary => VK_MBUTTON,
+    };
+    // this thread's view of the button, which moves as its queue is read
+    unsafe { GetKeyState(i32::from(key.0)) < 0 }
+}
+
+// winit tracks no button state to ask, so a release a task's own loop read stays unseen here
+#[cfg(not(target_os = "windows"))]
+fn button_held(_: PointerButton) -> bool {
+    true
+}
+
 impl<F> ApplicationHandler<Request> for App<F>
 where
     F: Fn(&WindowContext) -> Result<Browser, String> + Send + Clone + 'static,
@@ -1477,7 +1520,12 @@ where
                     }
                 }
             }
-            Request::Run(task) => task(),
+            Request::Run(task) => {
+                task();
+                for window in self.windows.values_mut() {
+                    window.release_lost_buttons();
+                }
+            }
             Request::Exit => {
                 for window in self.windows.values_mut() {
                     window.remember_geometry();
