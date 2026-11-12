@@ -20,6 +20,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 // the milliseconds between frames while something animates
 const FRAME_INTERVAL: u64 = 16;
@@ -468,6 +469,11 @@ pub trait ResourceProvider {
         self.provide_request(request)
             .map(|resource| resource.map(ResourceResponse::from_resource))
     }
+
+    // the file an audio or video URL names, which a decoder reads in place; none fetches it
+    fn media_file(&self, _url: &AppUrl) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -904,6 +910,7 @@ pub struct Browser {
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     audio_device: Option<Rc<dyn crate::AudioDevice>>,
+    media_decoder: Option<Arc<dyn crate::MediaDecoder>>,
     time_zone: Option<Rc<dyn crate::TimeZone>>,
     locale: Option<String>,
     last_navigation_failure: Option<NavigationFailure>,
@@ -1025,6 +1032,7 @@ impl Browser {
             file_picker: None,
             clipboard_provider: None,
             audio_device: None,
+            media_decoder: None,
             time_zone: None,
             locale: None,
             last_navigation_failure: None,
@@ -1085,6 +1093,11 @@ impl Browser {
     }
 
     // the speakers a page's audio contexts play through; without one they keep time silently
+    pub fn with_media_decoder(mut self, decoder: Arc<dyn crate::MediaDecoder>) -> Self {
+        self.media_decoder = Some(decoder);
+        self
+    }
+
     pub fn with_audio_device(mut self, device: Rc<dyn crate::AudioDevice>) -> Self {
         self.audio_device = Some(device);
         self
@@ -1123,8 +1136,10 @@ impl Browser {
     // frame, or messages from its workers
     pub fn next_wake(&self) -> Option<u64> {
         let page = self.page.as_ref()?;
-        let motion = (!self.transitions.is_empty() || page.runtime.has_live_workers())
-            .then_some(FRAME_INTERVAL);
+        let motion = (!self.transitions.is_empty()
+            || page.runtime.has_live_workers()
+            || page.runtime.media_playing())
+        .then_some(FRAME_INTERVAL);
         // a stepped animation sleeps until its next step; a continuous one needs every frame
         let animation = page
             .animation_wake
@@ -1401,6 +1416,7 @@ impl Browser {
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
         runtime.set_audio(self.audio_device.clone(), self.waker.clone());
+        runtime.set_media_decoder(self.media_decoder.clone(), self.waker.clone());
         if let Some(bridge) = &self.host_bridge {
             runtime.set_host_bridge(bridge.clone(), APP_ORIGIN.to_string(), self.waker.clone());
         }
@@ -2502,6 +2518,14 @@ impl Browser {
             let size = crate::script::canvas_size(&document, node);
             style_state.image_sizes.insert(node, size);
         }
+        for node in document
+            .find_elements_by_selector("video")
+            .unwrap_or_default()
+        {
+            style_state
+                .image_sizes
+                .insert(node, page.runtime.video_size(node));
+        }
         style_state.container_sizes = self.container_sizes.borrow().clone();
         let mut keyed_state = style_state.clone();
         // a page with nothing in motion lays out the same at any clock time
@@ -2570,7 +2594,11 @@ impl Browser {
         let canvases = self
             .page
             .as_ref()
-            .map(|page| page.runtime.canvas_layers())
+            .map(|page| {
+                let mut layers = page.runtime.canvas_layers();
+                layers.extend(page.runtime.video_layers());
+                layers
+            })
             .unwrap_or_default();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
         Ok(crate::paint::paint_with_canvases(
@@ -3006,6 +3034,7 @@ impl Browser {
                 runtime.set_file_picker(self.file_picker.clone());
                 runtime.set_clipboard_provider(self.clipboard_provider.clone());
                 runtime.set_audio(self.audio_device.clone(), self.waker.clone());
+                runtime.set_media_decoder(self.media_decoder.clone(), self.waker.clone());
                 if let Some(time_zone) = &self.time_zone {
                     runtime.set_time_zone(time_zone.clone());
                 }
@@ -5470,6 +5499,163 @@ mod tests {
             Some(
                 "state:1,sent:1,sync:200:13,missing:404,InvalidStateError,state:2,state:3,state:4,load:200:42:13:application/json,end:true:4"
             )
+        );
+    }
+
+    // ten frames a second for a second, each four by two and as red as ten times its number
+    struct Reel;
+
+    struct ReelReader(usize);
+
+    impl crate::MediaDecoder for Reel {
+        fn open(&self, source: &crate::MediaSource) -> Result<Box<dyn crate::VideoReader>, String> {
+            match source {
+                crate::MediaSource::Bytes { body, .. } if &body[..] == b"reel" => {
+                    Ok(Box::new(ReelReader(0)))
+                }
+                _ => Err("not a reel".into()),
+            }
+        }
+
+        fn can_play(&self, mime_type: &str) -> &'static str {
+            if mime_type == "video/mp4" {
+                "maybe"
+            } else {
+                ""
+            }
+        }
+    }
+
+    impl crate::VideoReader for ReelReader {
+        fn info(&self) -> crate::MediaInfo {
+            crate::MediaInfo {
+                duration: 1.0,
+                width: 4,
+                height: 2,
+            }
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.0 = (seconds * 10.0).floor() as usize;
+            Ok(())
+        }
+
+        fn read(&mut self) -> Result<Option<crate::VideoFrame>, String> {
+            if self.0 == 10 {
+                return Ok(None);
+            }
+            let red = (self.0 * 20) as u8;
+            let frame = crate::VideoFrame {
+                time: self.0 as f64 / 10.0,
+                width: 4,
+                height: 2,
+                bgra: [0, 0, red, 0].repeat(8),
+            };
+            self.0 += 1;
+            Ok(Some(frame))
+        }
+    }
+
+    // runs a page whose video frames come from another thread until its status is set
+    fn play_until_status(browser: &mut Browser) -> String {
+        for _ in 0..2000 {
+            browser.pump().expect("media should pump");
+            browser.advance_time(16).expect("tasks should run");
+            let document = browser.document().expect("document");
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            let text = document.element_text_content(status).unwrap_or_default();
+            if !text.is_empty() {
+                return text;
+            }
+            drop(document);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the page never reported");
+    }
+
+    #[test]
+    fn a_video_plays_its_frames_to_the_end_by_the_page_clock() {
+        let mut resources = bundle(
+            r#"<video id="v" src="/reel.mp4" muted style="display: block; width: 40px; height: 20px"></video><p id="status"></p><script>
+                const log = [];
+                const v = document.getElementById("v");
+                log.push(v instanceof HTMLVideoElement, v.paused, v.readyState, isNaN(v.duration), v.canPlayType("video/mp4"), v.muted);
+                for (const name of ["loadstart", "durationchange", "loadedmetadata", "loadeddata", "canplay", "ratechange", "play", "playing", "pause", "ended", "emptied"]) {
+                    v.addEventListener(name, () => log.push(name + "@" + v.currentTime.toFixed(1)));
+                }
+                v.addEventListener("loadeddata", () => {
+                    log.push(v.videoWidth + "x" + v.videoHeight, v.duration, v.readyState, v.networkState);
+                    v.playbackRate = 2;
+                    v.play().then(() => log.push("played"));
+                }, { once: true });
+                v.onended = () => {
+                    log.push(v.paused + ":" + v.ended);
+                    document.getElementById("status").textContent = log.join(",");
+                };
+            </script>"#,
+        );
+        resources
+            .insert("/reel.mp4", "video/mp4", b"reel".to_vec())
+            .expect("video should be accepted");
+        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(Reel));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("video page should load");
+        assert_eq!(
+            play_until_status(&mut browser),
+            "true,true,0,true,maybe,true,loadstart@0.0,durationchange@0.0,loadedmetadata@0.0,loadeddata@0.0,4x2,1,4,1,canplay@0.0,ratechange@0.0,play@0.0,playing@0.0,played,pause@1.0,ended@1.0,true:true"
+        );
+        let canvas = browser
+            .paint(Size {
+                width: 100.0,
+                height: 60.0,
+            })
+            .expect("page should paint");
+        assert_eq!(pixel_at(&canvas, 20, 10), [180, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_detached_video_seeks_to_the_frame_drawn_into_a_canvas() {
+        let mut resources = bundle(
+            r#"<p id="status"></p><script>
+                const log = [];
+                const v = document.createElement("video");
+                v.preload = "auto";
+                v.addEventListener("loadeddata", () => {
+                    v.addEventListener("seeking", () => log.push("seeking:" + v.seeking + ":" + v.currentTime));
+                    v.addEventListener("seeked", () => {
+                        const canvas = document.createElement("canvas");
+                        canvas.width = 4;
+                        canvas.height = 2;
+                        const ctx = canvas.getContext("2d");
+                        ctx.drawImage(v, 0, 0);
+                        log.push("seeked:" + v.seeking + ":" + v.currentTime, Array.from(ctx.getImageData(1, 1, 1, 1).data).join(" "));
+                        v.removeAttribute("src");
+                        v.load();
+                        log.push("emptied:" + v.networkState + ":" + v.readyState + ":" + isNaN(v.duration));
+                        const broken = document.createElement("video");
+                        broken.onerror = () => broken.play().catch((error) => {
+                            log.push("error:" + broken.error.code + ":" + broken.networkState + ":" + error.name);
+                            document.getElementById("status").textContent = log.join(",");
+                        });
+                        broken.src = "/missing.mp4";
+                    }, { once: true });
+                    v.currentTime = 0.55;
+                }, { once: true });
+                v.src = "/reel.mp4";
+            </script>"#,
+        );
+        resources
+            .insert("/reel.mp4", "video/mp4", b"reel".to_vec())
+            .expect("video should be accepted");
+        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(Reel));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("video page should load");
+        assert_eq!(
+            play_until_status(&mut browser),
+            "seeking:true:0.55,seeked:false:0.55,100 0 0 255,emptied:0:0:true,error:4:3:NotSupportedError"
         );
     }
 

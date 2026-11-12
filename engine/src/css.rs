@@ -2496,7 +2496,7 @@ impl Stylesheet {
         // an image with no declared size takes its natural size; with one side
         // declared, the other follows the natural ratio
         if let Some(&(width, height)) = own.and_then(|node| state.image_sizes.get(&node))
-            && matches!(name, "img" | "canvas")
+            && matches!(name, "img" | "canvas" | "video")
         {
             if width > 0 && height > 0 {
                 style
@@ -5435,6 +5435,8 @@ hr { margin: 0.5em auto; border-style: inset; border-width: 1px; color: gray; ov
 fieldset { margin-left: 2px; margin-right: 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0 }
 legend { padding-left: 2px; padding-right: 2px }
 iframe { border: 2px inset }
+video { object-fit: contain }
+audio:not([controls]) { display: none }
 dialog:not([open]), input[type="hidden" i], datalist, template { display: none }
 dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 1em; background-color: white; color: black }
 dialog:modal { position: fixed; overflow: auto; top: 0; bottom: 0; max-width: calc(100% - 6px - 2em); max-height: calc(100% - 6px - 2em); user-select: text; visibility: visible }

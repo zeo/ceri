@@ -1090,7 +1090,7 @@ fn fades_without_layer(layout_box: &LayoutBox) -> bool {
             + usize::from(layout_box.background.alpha > 0)
             + layout_box.backgrounds.len()
             <= 1
-        && !matches!(layout_box.tag.as_str(), "img" | "canvas" | "svg")
+        && !matches!(layout_box.tag.as_str(), "img" | "canvas" | "video" | "svg")
         && layout_box.overflow == Overflow::Visible
 }
 
@@ -2472,7 +2472,7 @@ fn paint_box_surface(
     {
         paint_shadow(canvas, shadow, outer, surface, opacity, clip);
     }
-    if matches!(layout_box.tag.as_str(), "img" | "canvas")
+    if matches!(layout_box.tag.as_str(), "img" | "canvas" | "video")
         && let Some(layer) = images
             .iter()
             .find(|layer| layer.background.is_none() && layer.node == layout_box.node)

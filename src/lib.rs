@@ -14,6 +14,7 @@ mod fonts;
 mod http;
 mod instance;
 mod tray;
+mod video;
 
 pub use ceri_engine::{
     APP_ORIGIN, Capabilities, CommandCall, CommandError, Grant, Monitor, NativeHandle,

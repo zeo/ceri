@@ -44,7 +44,8 @@ impl ScriptRuntime {
         self.load_images_in(root);
     }
 
-    // starts a load for every img with a src in a tree that just came into being
+    // starts a load for every img, audio and video with a source in a tree that just came
+    // into being
     pub(super) fn load_images_in(&mut self, root: NodeId) {
         let nodes = {
             let document = self.document.borrow();
@@ -58,6 +59,7 @@ impl ScriptRuntime {
         for node in nodes {
             self.update_image(node);
         }
+        self.start_media_loads_in(root);
     }
 
     // runs when src is set, even to the value it had, or removed

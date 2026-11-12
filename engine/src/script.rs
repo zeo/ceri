@@ -19,6 +19,7 @@ mod interfaces;
 mod intl;
 mod json;
 mod lexer;
+mod media;
 mod modules;
 mod numbers;
 mod object;
@@ -538,6 +539,7 @@ pub struct ScriptRuntime {
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
     image_loads: HashMap<NodeId, images::ImageLoad>,
+    media: media::MediaState,
     dialogs: HashMap<NodeId, dialogs::DialogState>,
     // modal dialogs in the order they were shown, closed or removed ones included
     top_layer: Vec<NodeId>,
@@ -1556,6 +1558,7 @@ impl ScriptRuntime {
             audio: audio::AudioState::default(),
             images: RefCell::default(),
             image_loads: HashMap::new(),
+            media: media::MediaState::default(),
             dialogs: HashMap::new(),
             top_layer: Vec::new(),
             history_activation: false,
@@ -1823,6 +1826,7 @@ impl ScriptRuntime {
         self.scroll_offsets.retain(|node, _| !gone(*node));
         self.canvas_contexts.retain(|node, _| !gone(*node));
         self.image_loads.retain(|node, _| !gone(*node));
+        self.forget_media(gone);
         self.dialogs.retain(|node, _| !gone(*node));
         self.top_layer.retain(|node| !gone(*node));
     }
@@ -4812,8 +4816,10 @@ impl ScriptRuntime {
     }
 
     pub fn pump(&mut self) -> Result<usize, ScriptError> {
-        let processed =
-            self.pump_workers()? + self.settle_command_replies()? + self.pump_audio()?;
+        let processed = self.pump_workers()?
+            + self.settle_command_replies()?
+            + self.pump_audio()?
+            + self.pump_media();
         self.drain_microtasks()?;
         Ok(processed)
     }
@@ -6169,6 +6175,7 @@ impl ScriptRuntime {
         // size to the one it has still clears it
         if name.eq_ignore_ascii_case("src") {
             self.update_image(node);
+            self.load_media(node);
         }
         if name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height") {
             self.reset_canvas(node);

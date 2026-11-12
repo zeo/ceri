@@ -9,6 +9,8 @@ use crate::image::Image;
 use crate::layout::ImageLayer;
 
 type Rect4 = (f32, f32, f32, f32);
+// a drawImage source's pixels and the width and height script measures it in
+type Measured = (Bitmap, (f32, f32));
 
 const METHODS: &[&str] = &[
     "fillRect",
@@ -555,8 +557,9 @@ impl ScriptRuntime {
             .then(|| numbers.iter().map(|&number| number as f32).collect()))
     }
 
-    // the picture a drawImage source shows now, None while it has nothing to draw
-    fn canvas_source(&mut self, source: &Value) -> Result<Option<Bitmap>, ScriptError> {
+    // the picture a drawImage source shows now and the size script measures it in, which for a
+    // video with anamorphic pixels differs from the picture's; None while it has nothing
+    fn canvas_source(&mut self, source: &Value) -> Result<Option<Measured>, ScriptError> {
         let node = match source {
             Value::Element(handle) => Some(handle.id),
             _ => None,
@@ -573,7 +576,7 @@ impl ScriptRuntime {
                 "Failed to execute 'drawImage' on 'CanvasRenderingContext2D': The provided value is not of type '(CSSImageValue or HTMLCanvasElement or HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or SVGImageElement or VideoFrame)'.",
             ));
         };
-        match kind {
+        let bitmap = match kind {
             "img" => match self.image_content(node) {
                 Ok(image) => Ok(image.map(|image| Bitmap::from_image(&image))),
                 Err(()) => Err(self.throw_value(dom_exception(
@@ -595,8 +598,18 @@ impl ScriptRuntime {
                     .map(|context| context.borrow().bitmap.clone()))
             }
             // a video with no frame decoded yet has nothing to draw
-            _ => Ok(None),
-        }
+            _ => {
+                let natural = self.video_size(node);
+                return Ok(self.video_content(node).map(|image| {
+                    let natural = (natural.0 as f32, natural.1 as f32);
+                    (Bitmap::from_image(&image), natural)
+                }));
+            }
+        }?;
+        Ok(bitmap.map(|bitmap| {
+            let size = (bitmap.width as f32, bitmap.height as f32);
+            (bitmap, size)
+        }))
     }
 
     fn draw_canvas_image(
@@ -615,16 +628,21 @@ impl ScriptRuntime {
         let Some(numbers) = self.canvas_numbers("drawImage", &arguments[1..], count - 1)? else {
             return Ok(());
         };
-        let Some(source) = source else {
+        let Some((source, natural)) = source else {
             return Ok(());
         };
-        let whole = (0.0, 0.0, source.width as f32, source.height as f32);
+        let whole = (0.0, 0.0, natural.0, natural.1);
         let (from, to) = match numbers[..] {
             [x, y] => (whole, (x, y, whole.2, whole.3)),
             [x, y, width, height] => (whole, (x, y, width, height)),
             [sx, sy, sw, sh, dx, dy, dw, dh] => ((sx, sy, sw, sh), (dx, dy, dw, dh)),
             _ => return Ok(()),
         };
+        let (x, y) = (
+            source.width as f32 / natural.0,
+            source.height as f32 / natural.1,
+        );
+        let from = (from.0 * x, from.1 * y, from.2 * x, from.3 * y);
         let mut context = context.borrow_mut();
         context.bitmap.draw_image(&source, from, to);
         context.snapshot = None;

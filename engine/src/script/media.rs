@@ -1,0 +1,812 @@
+// audio and video elements: a source opens on a decoder thread, and the element keeps the
+// playback clock, ready state, promises and events of HTMLMediaElement around the frames that
+// thread hands back
+
+use super::realm::Native;
+use super::*;
+use crate::dom::Namespace;
+use crate::image::Image;
+use crate::layout::ImageLayer;
+use crate::video::{MediaDecoder, MediaInfo, MediaSource, Track};
+
+const NETWORK_EMPTY: u8 = 0;
+const NETWORK_IDLE: u8 = 1;
+const NETWORK_LOADING: u8 = 2;
+const NETWORK_NO_SOURCE: u8 = 3;
+const HAVE_NOTHING: u8 = 0;
+const HAVE_METADATA: u8 = 1;
+const HAVE_FUTURE_DATA: u8 = 3;
+const HAVE_ENOUGH_DATA: u8 = 4;
+const MEDIA_ERR_SRC_NOT_SUPPORTED: u16 = 4;
+// how often a playing element reports its time, as Chromium does
+const TIME_UPDATE_INTERVAL: u64 = 250;
+
+#[derive(Default)]
+pub(super) struct MediaState {
+    decoder: Option<Arc<dyn MediaDecoder>>,
+    waker: Option<crate::bridge::Waker>,
+    elements: HashMap<NodeId, MediaElement>,
+}
+
+struct MediaElement {
+    // runs of the load algorithm; a task queued for an older one does nothing
+    generation: u64,
+    url: Option<String>,
+    track: Option<Track>,
+    info: Option<MediaInfo>,
+    network: u8,
+    ready: u8,
+    error: Option<u16>,
+    paused: bool,
+    ended: bool,
+    seeking: bool,
+    // the last seek asked of the track, which the frames on screen must answer
+    seek: u64,
+    // a position set before metadata, taken up once it arrives
+    start_at: Option<f64>,
+    // the playback position when the clock last stopped, and the clock time it started again
+    position: f64,
+    anchor: Option<u64>,
+    rate: f64,
+    default_rate: f64,
+    volume: f64,
+    muted: Option<bool>,
+    preserves_pitch: bool,
+    frame: Option<Rc<Image>>,
+    frame_time: f64,
+    // a frame came since the last load or seek
+    shown: bool,
+    // autoplay starts it unless script played or paused it first
+    can_autoplay: bool,
+    reported: u64,
+    waiters: Vec<PromiseHandle>,
+}
+
+impl MediaElement {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            url: None,
+            track: None,
+            info: None,
+            network: NETWORK_EMPTY,
+            ready: HAVE_NOTHING,
+            error: None,
+            paused: true,
+            ended: false,
+            seeking: false,
+            seek: 0,
+            start_at: None,
+            position: 0.0,
+            anchor: None,
+            rate: 1.0,
+            default_rate: 1.0,
+            volume: 1.0,
+            muted: None,
+            preserves_pitch: true,
+            frame: None,
+            frame_time: 0.0,
+            shown: false,
+            can_autoplay: true,
+            reported: 0,
+            waiters: Vec::new(),
+        }
+    }
+
+    fn duration(&self) -> f64 {
+        self.info.map_or(f64::NAN, |info| info.duration)
+    }
+
+    fn current_time(&self, now: u64) -> f64 {
+        let running = self.anchor.map_or(0.0, |anchor| {
+            now.saturating_sub(anchor) as f64 / 1000.0 * self.rate
+        });
+        let time = self.position + running;
+        match self.duration() {
+            duration if duration.is_finite() => time.min(duration),
+            _ => time,
+        }
+    }
+
+    fn should_run(&self) -> bool {
+        !self.paused && !self.seeking && !self.ended && self.ready >= HAVE_FUTURE_DATA
+    }
+
+    // starts or stops the clock to match the state; every change to that state ends here
+    fn settle_clock(&mut self, now: u64) {
+        match (self.should_run(), self.anchor) {
+            (true, None) => self.anchor = Some(now),
+            (false, Some(_)) => {
+                self.position = self.current_time(now);
+                self.anchor = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_seek(&mut self, now: u64, target: f64) -> Vec<Cue> {
+        let duration = self.duration();
+        let target = match duration.is_finite() {
+            true => target.min(duration),
+            false => target,
+        };
+        self.anchor = None;
+        self.position = target.max(0.0);
+        self.seeking = true;
+        self.ended = false;
+        self.shown = false;
+        self.seek += 1;
+        if let Some(track) = &self.track {
+            track.seek(self.seek, self.position);
+        }
+        self.settle_clock(now);
+        vec![Cue::Event("seeking")]
+    }
+
+    // what the decoder thread brought since the last look, and where the clock now stands
+    fn advance(&mut self, now: u64, connected: bool, autoplay: bool, looped: bool) -> Advance {
+        let mut step = Advance::default();
+        let Some(track) = &self.track else {
+            return step;
+        };
+        let mut state = track.lock();
+        if self.info.is_none() {
+            match state.opened.clone() {
+                None => return step,
+                Some(Err(_)) => {
+                    step.failed = true;
+                    return step;
+                }
+                Some(Ok(info)) => {
+                    self.info = Some(info);
+                    self.ready = HAVE_METADATA;
+                    self.network = NETWORK_IDLE;
+                    step.cues
+                        .extend([Cue::Event("durationchange"), Cue::Event("loadedmetadata")]);
+                }
+            }
+        }
+        let mut exhausted = false;
+        if state.reached == self.seek {
+            let time = self.current_time(now);
+            if let Some((at, image)) = state.take_frame(time, !self.shown) {
+                self.frame = Some(Rc::new(image));
+                self.frame_time = at;
+                self.shown = true;
+                step.frames += 1;
+            }
+            exhausted = state.exhausted();
+        }
+        drop(state);
+        if let Some(start) = self.start_at.take() {
+            step.cues.extend(self.begin_seek(now, start));
+            return step;
+        }
+        let landed = self.shown || exhausted;
+        if landed && self.ready < HAVE_ENOUGH_DATA {
+            self.ready = HAVE_ENOUGH_DATA;
+            step.cues
+                .extend([Cue::Event("loadeddata"), Cue::Event("canplay")]);
+            if !self.paused {
+                step.cues.push(Cue::Playing);
+            } else if autoplay && self.can_autoplay {
+                self.paused = false;
+                step.cues.extend([Cue::Event("play"), Cue::Playing]);
+            }
+            step.cues.push(Cue::Event("canplaythrough"));
+        }
+        if landed && self.seeking {
+            self.seeking = false;
+            step.cues
+                .extend([Cue::Event("timeupdate"), Cue::Event("seeked")]);
+        }
+        self.settle_clock(now);
+        if self.anchor.is_some() {
+            let time = self.current_time(now);
+            let duration = self.duration();
+            let at_end = match duration.is_finite() && duration > 0.0 {
+                true => time >= duration,
+                false => exhausted && time >= self.frame_time,
+            };
+            if at_end && looped {
+                step.cues.extend(self.begin_seek(now, 0.0));
+            } else if at_end {
+                self.position = time;
+                self.anchor = None;
+                self.paused = true;
+                self.ended = true;
+                step.cues.extend([
+                    Cue::Event("timeupdate"),
+                    Cue::Event("pause"),
+                    Cue::Event("ended"),
+                ]);
+            } else if now.saturating_sub(self.reported) >= TIME_UPDATE_INTERVAL {
+                self.reported = now;
+                step.cues.push(Cue::Event("timeupdate"));
+            }
+        }
+        // a media element taken out of the document pauses
+        if !connected && !self.paused {
+            self.paused = true;
+            self.settle_clock(now);
+            step.cues
+                .extend([Cue::Event("timeupdate"), Cue::Event("pause")]);
+            step.aborted = true;
+        }
+        step
+    }
+}
+
+#[derive(Default)]
+struct Advance {
+    cues: Vec<Cue>,
+    frames: usize,
+    failed: bool,
+    // pending play() promises are rejected
+    aborted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum Cue {
+    Event(&'static str),
+    // fires playing, then fulfills the play() promises waiting on it
+    Playing,
+    // fulfills the waiting play() promises without an event
+    Resolve,
+}
+
+fn is_media(document: &Document, node: NodeId) -> bool {
+    document.element(node).is_some_and(|element| {
+        matches!(element.name.as_str(), "video" | "audio") && element.namespace == Namespace::Html
+    })
+}
+
+// the src attribute, or the first source child with one
+fn media_reference(document: &Document, node: NodeId) -> Option<String> {
+    if let Some(source) = document.attribute(node, "src") {
+        return Some(source.to_string());
+    }
+    document
+        .children(node)
+        .iter()
+        .find(|&&child| {
+            document
+                .element(child)
+                .is_some_and(|element| element.name == "source")
+                && document.attribute(child, "src").is_some()
+        })
+        .and_then(|&child| document.attribute(child, "src").map(str::to_string))
+}
+
+fn abort_error(reason: &str) -> Value {
+    dom_exception("AbortError", reason)
+}
+
+fn unsupported() -> Value {
+    dom_exception(
+        "NotSupportedError",
+        "Failed to load because no supported source was found.",
+    )
+}
+
+impl ScriptRuntime {
+    pub(crate) fn set_media_decoder(
+        &mut self,
+        decoder: Option<Arc<dyn MediaDecoder>>,
+        waker: Option<crate::bridge::Waker>,
+    ) {
+        self.media.decoder = decoder;
+        self.media.waker = waker;
+    }
+
+    pub(super) fn forget_media(&mut self, gone: impl Fn(NodeId) -> bool) {
+        self.media.elements.retain(|node, _| !gone(*node));
+    }
+
+    pub(super) fn is_media_element(&self, node: NodeId) -> bool {
+        is_media(&self.document.borrow(), node)
+    }
+
+    // whether some element's clock runs, which wants a frame at every interval
+    pub(crate) fn media_playing(&self) -> bool {
+        self.media
+            .elements
+            .values()
+            .any(|element| element.anchor.is_some())
+    }
+
+    // the frames on screen, for paint
+    pub(crate) fn video_layers(&self) -> Vec<ImageLayer> {
+        let document = self.document.borrow();
+        self.media
+            .elements
+            .iter()
+            .filter(|(node, _)| document.is_connected(**node))
+            .filter_map(|(node, element)| {
+                Some(ImageLayer {
+                    node: *node,
+                    image: element.frame.clone()?,
+                    background: None,
+                })
+            })
+            .collect()
+    }
+
+    // the size a video lays out at when CSS gives it none
+    pub(crate) fn video_size(&self, node: NodeId) -> (u32, u32) {
+        self.media
+            .elements
+            .get(&node)
+            .and_then(|element| element.info)
+            .filter(|info| info.width > 0 && info.height > 0)
+            .map_or((300, 150), |info| (info.width, info.height))
+    }
+
+    // the frame drawImage reads, None before one arrives
+    pub(super) fn video_content(&self, node: NodeId) -> Option<Rc<Image>> {
+        self.media.elements.get(&node)?.frame.clone()
+    }
+
+    fn queue_cues(&mut self, node: NodeId, cues: Vec<Cue>) {
+        let generation = self
+            .media
+            .elements
+            .get(&node)
+            .map_or(0, |element| element.generation);
+        for cue in cues {
+            self.schedule_native_task(Native::MediaCue(Box::new((node, generation, cue))));
+        }
+    }
+
+    pub(super) fn deliver_media_cue(
+        &mut self,
+        node: NodeId,
+        generation: u64,
+        cue: Cue,
+    ) -> Result<Value, ScriptError> {
+        if self
+            .media
+            .elements
+            .get(&node)
+            .is_none_or(|element| element.generation != generation)
+        {
+            return Ok(Value::Undefined);
+        }
+        let name = match cue {
+            Cue::Event(name) => Some(name),
+            Cue::Playing => Some("playing"),
+            Cue::Resolve => None,
+        };
+        if let Some(name) = name {
+            let event = self.new_event("Event", name.to_string(), false, false, false, true);
+            self.dispatch(&event, events::ListenerTarget::Node(node))?;
+        }
+        if matches!(cue, Cue::Playing | Cue::Resolve) {
+            let waiters = self
+                .media
+                .elements
+                .get_mut(&node)
+                .map(|element| std::mem::take(&mut element.waiters))
+                .unwrap_or_default();
+            for waiter in waiters {
+                self.settle_promise(&waiter, PromiseOutcome::Fulfilled(Value::Undefined));
+            }
+        }
+        Ok(Value::Undefined)
+    }
+
+    fn reject_waiters(&mut self, node: NodeId, reason: impl Fn() -> Value) {
+        let waiters = self
+            .media
+            .elements
+            .get_mut(&node)
+            .map(|element| std::mem::take(&mut element.waiters))
+            .unwrap_or_default();
+        for waiter in waiters {
+            self.settle_promise(&waiter, PromiseOutcome::Rejected(reason()));
+        }
+    }
+
+    pub(super) fn start_media_loads_in(&mut self, root: NodeId) {
+        let nodes = {
+            let document = self.document.borrow();
+            std::iter::once(root)
+                .chain(document.descendants(root))
+                .filter(|&node| {
+                    is_media(&document, node) && media_reference(&document, node).is_some()
+                })
+                .collect::<Vec<_>>()
+        };
+        for node in nodes {
+            self.load_media(node);
+        }
+    }
+
+    // the media element load algorithm, run by load(), a new src, or a parsed element with one
+    pub(super) fn load_media(&mut self, node: NodeId) {
+        if !self.is_media_element(node) {
+            return;
+        }
+        let reference = media_reference(&self.document.borrow(), node);
+        let url = reference.as_deref().and_then(|reference| {
+            let base = self.base_url.as_ref()?;
+            images::image_key(base, reference).filter(|_| !reference.trim().is_empty())
+        });
+        let element = self
+            .media
+            .elements
+            .entry(node)
+            .or_insert_with(MediaElement::new);
+        let network = element.network;
+        let generation = element.generation + 1;
+        let waiters = std::mem::take(&mut element.waiters);
+        // what script chose survives a new source; the rest starts over
+        *element = MediaElement {
+            generation,
+            url,
+            volume: element.volume,
+            muted: element.muted,
+            preserves_pitch: element.preserves_pitch,
+            default_rate: element.default_rate,
+            rate: element.default_rate,
+            ..MediaElement::new()
+        };
+        for waiter in waiters {
+            self.settle_promise(
+                &waiter,
+                PromiseOutcome::Rejected(abort_error(
+                    "The play() request was interrupted by a new load request.",
+                )),
+            );
+        }
+        let mut cues = Vec::new();
+        if matches!(network, NETWORK_LOADING | NETWORK_IDLE) {
+            cues.push(Cue::Event("abort"));
+        }
+        if network != NETWORK_EMPTY {
+            cues.push(Cue::Event("emptied"));
+        }
+        self.queue_cues(node, cues);
+        if reference.is_none() {
+            return;
+        }
+        let element = self.media.elements.get_mut(&node).expect("inserted above");
+        element.network = NETWORK_LOADING;
+        self.schedule_native_task(Native::MediaLoad(node, generation));
+    }
+
+    pub(super) fn deliver_media_load(
+        &mut self,
+        node: NodeId,
+        generation: u64,
+    ) -> Result<Value, ScriptError> {
+        let Some(element) = self
+            .media
+            .elements
+            .get(&node)
+            .filter(|element| element.generation == generation)
+        else {
+            return Ok(Value::Undefined);
+        };
+        let url = element.url.clone();
+        let event = self.new_event("Event", "loadstart".into(), false, false, false, true);
+        self.dispatch(&event, events::ListenerTarget::Node(node))?;
+        let source = url.and_then(|url| self.media_source(&url));
+        let decoder = self.media.decoder.clone();
+        let waker = self.media.waker.clone();
+        let Some(element) = self
+            .media
+            .elements
+            .get_mut(&node)
+            .filter(|element| element.generation == generation)
+        else {
+            return Ok(Value::Undefined);
+        };
+        match (source, decoder) {
+            (Some(source), Some(decoder)) => {
+                element.track = Some(Track::open(decoder, source, waker));
+            }
+            _ => self.fail_media(node),
+        }
+        Ok(Value::Undefined)
+    }
+
+    fn fail_media(&mut self, node: NodeId) {
+        let Some(element) = self.media.elements.get_mut(&node) else {
+            return;
+        };
+        element.track = None;
+        element.error = Some(MEDIA_ERR_SRC_NOT_SUPPORTED);
+        element.network = NETWORK_NO_SOURCE;
+        self.reject_waiters(node, unsupported);
+        self.queue_cues(node, vec![Cue::Event("error")]);
+    }
+
+    // a files URL is read in place; anything else is fetched whole
+    fn media_source(&mut self, url: &str) -> Option<MediaSource> {
+        let parsed = AppUrl::parse(url).ok();
+        if let (Some(parsed), Some(provider)) = (&parsed, &self.resource_provider)
+            && let Some(path) = provider.media_file(parsed)
+        {
+            return Some(MediaSource::File(path));
+        }
+        let promise = self.fetch(&[Value::String(url.to_string().into())]);
+        let response = match &promise.borrow().outcome {
+            PromiseOutcome::Fulfilled(Value::Response(response))
+                if (200..300).contains(&response.status) =>
+            {
+                Some(response.clone())
+            }
+            _ => None,
+        }?;
+        let body = Arc::from(response.body.borrow().bytes.as_slice());
+        Some(MediaSource::Bytes {
+            body,
+            mime_type: response.mime_type.clone(),
+        })
+    }
+
+    // takes up what the decoder threads did; the count is of frames that changed what shows
+    pub(super) fn pump_media(&mut self) -> usize {
+        let now = self.clock;
+        let nodes = self
+            .media
+            .elements
+            .iter()
+            .filter(|(_, element)| element.track.is_some())
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>();
+        let mut frames = 0;
+        for node in nodes {
+            let (connected, autoplay, looped) = {
+                let document = self.document.borrow();
+                (
+                    document.is_connected(node),
+                    document.attribute(node, "autoplay").is_some(),
+                    document.attribute(node, "loop").is_some(),
+                )
+            };
+            let element = self.media.elements.get_mut(&node).expect("listed above");
+            let step = element.advance(now, connected, autoplay, looped);
+            frames += step.frames;
+            if step.failed {
+                self.fail_media(node);
+            }
+            if step.aborted {
+                self.reject_waiters(node, || {
+                    abort_error("The play() request was interrupted because the media was removed from the document.")
+                });
+            }
+            self.queue_cues(node, step.cues);
+        }
+        frames
+    }
+
+    // the HTMLMediaElement and HTMLVideoElement members, None for any other
+    pub(super) fn media_member(
+        &mut self,
+        node: NodeId,
+        name: &str,
+        access: interfaces::Access,
+        first: Value,
+    ) -> Result<Option<Value>, ScriptError> {
+        use interfaces::Access::{Call, Get, Set};
+        if !self.is_media_element(node) {
+            return Ok(None);
+        }
+        let now = self.clock;
+        let muted_attribute = self.document.borrow().attribute(node, "muted").is_some();
+        let element = self
+            .media
+            .elements
+            .entry(node)
+            .or_insert_with(MediaElement::new);
+        let value = match (name, access) {
+            ("currentSrc", Get) => Value::String(element.url.clone().unwrap_or_default().into()),
+            ("networkState", Get) => Value::Number(f64::from(element.network)),
+            ("readyState", Get) => Value::Number(f64::from(element.ready)),
+            ("paused", Get) => Value::Bool(element.paused),
+            ("ended", Get) => Value::Bool(element.ended),
+            ("seeking", Get) => Value::Bool(element.seeking),
+            ("duration", Get) => Value::Number(element.duration()),
+            ("currentTime", Get) => Value::Number(match element.ready {
+                HAVE_NOTHING => element.start_at.unwrap_or(0.0),
+                _ => element.current_time(now),
+            }),
+            ("playbackRate", Get) => Value::Number(element.rate),
+            ("defaultPlaybackRate", Get) => Value::Number(element.default_rate),
+            ("volume", Get) => Value::Number(element.volume),
+            ("muted", Get) => Value::Bool(element.muted.unwrap_or(muted_attribute)),
+            ("preservesPitch", Get) => Value::Bool(element.preserves_pitch),
+            ("videoWidth", Get) => {
+                Value::Number(f64::from(element.info.map_or(0, |info| info.width)))
+            }
+            ("videoHeight", Get) => {
+                Value::Number(f64::from(element.info.map_or(0, |info| info.height)))
+            }
+            ("error", Get) => match element.error {
+                Some(code) => self.object_from_entries(vec![
+                    ("code".into(), Value::Number(f64::from(code))),
+                    (
+                        "message".into(),
+                        Value::String("MEDIA_ELEMENT_ERROR: Format error".into()),
+                    ),
+                ]),
+                None => Value::Null,
+            },
+            ("currentTime", Set) => {
+                let time = self.media_number(first, "currentTime")?;
+                let element = self.media.elements.get_mut(&node).expect("inserted above");
+                if element.ready == HAVE_NOTHING {
+                    element.start_at = Some(time);
+                } else {
+                    let cues = element.begin_seek(now, time);
+                    self.queue_cues(node, cues);
+                }
+                Value::Undefined
+            }
+            ("fastSeek", Call) => {
+                let time = self.media_number(first, "fastSeek")?;
+                return self.media_member(node, "currentTime", Set, Value::Number(time));
+            }
+            ("playbackRate" | "defaultPlaybackRate", Set) => {
+                let rate = self.media_number(first, name)?;
+                if rate != 0.0 && !(0.0625..=16.0).contains(&rate) {
+                    return Err(self.throw_value(dom_exception(
+                        "NotSupportedError",
+                        &format!(
+                            "Failed to set the '{name}' property on 'HTMLMediaElement': The provided playback rate ({}) is not in the supported playback range.",
+                            number_to_string(rate)
+                        ),
+                    )));
+                }
+                let element = self.media.elements.get_mut(&node).expect("inserted above");
+                let current = if name == "playbackRate" {
+                    &mut element.rate
+                } else {
+                    &mut element.default_rate
+                };
+                if *current != rate {
+                    if name == "playbackRate" {
+                        element.position = element.current_time(now);
+                        element.anchor = element.anchor.map(|_| now);
+                        element.rate = rate;
+                    } else {
+                        element.default_rate = rate;
+                    }
+                    self.queue_cues(node, vec![Cue::Event("ratechange")]);
+                }
+                Value::Undefined
+            }
+            ("volume", Set) => {
+                let volume = self.media_number(first, "volume")?;
+                if !(0.0..=1.0).contains(&volume) {
+                    return Err(self.throw_value(dom_exception(
+                        "IndexSizeError",
+                        &format!(
+                            "Failed to set the 'volume' property on 'HTMLMediaElement': The volume provided ({}) is outside the range [0, 1].",
+                            number_to_string(volume)
+                        ),
+                    )));
+                }
+                let element = self.media.elements.get_mut(&node).expect("inserted above");
+                if element.volume != volume {
+                    element.volume = volume;
+                    self.queue_cues(node, vec![Cue::Event("volumechange")]);
+                }
+                Value::Undefined
+            }
+            ("muted", Set) => {
+                let muted = first.truthy();
+                let was = element.muted.replace(muted).unwrap_or(muted_attribute);
+                if was != muted {
+                    self.queue_cues(node, vec![Cue::Event("volumechange")]);
+                }
+                Value::Undefined
+            }
+            ("preservesPitch", Set) => {
+                element.preserves_pitch = first.truthy();
+                Value::Undefined
+            }
+            ("canPlayType", Call) => {
+                let mime_type = self.coerce_string(first)?;
+                let answer = self
+                    .media
+                    .decoder
+                    .as_ref()
+                    .map_or("", |decoder| decoder.can_play(mime_type.trim()));
+                Value::String(answer.into())
+            }
+            ("load", Call) => {
+                self.load_media(node);
+                Value::Undefined
+            }
+            ("play", Call) => Value::Promise(self.play_media(node)),
+            ("pause", Call) => {
+                self.pause_media(node);
+                Value::Undefined
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+
+    fn media_number(&mut self, value: Value, name: &str) -> Result<f64, ScriptError> {
+        let number = self.coerce_number(value)?;
+        if number.is_finite() {
+            Ok(number)
+        } else {
+            Err(self.type_error(format!(
+                "Failed to set the '{name}' property on 'HTMLMediaElement': The provided double value is non-finite."
+            )))
+        }
+    }
+
+    fn play_media(&mut self, node: NodeId) -> PromiseHandle {
+        let now = self.clock;
+        let errored = self
+            .media
+            .elements
+            .get(&node)
+            .is_some_and(|element| element.error == Some(MEDIA_ERR_SRC_NOT_SUPPORTED));
+        if errored {
+            return self.rejected_promise_value(dom_exception(
+                "NotSupportedError",
+                "The element has no supported sources.",
+            ));
+        }
+        if self
+            .media
+            .elements
+            .get(&node)
+            .is_none_or(|element| element.network == NETWORK_EMPTY)
+        {
+            self.load_media(node);
+        }
+        let promise = Self::pending_promise();
+        let element = self.media.elements.get_mut(&node).expect("loaded above");
+        element.can_autoplay = false;
+        element.waiters.push(promise.clone());
+        let mut cues = Vec::new();
+        if element.ended {
+            cues.extend(element.begin_seek(now, 0.0));
+        }
+        if element.paused {
+            element.paused = false;
+            cues.push(Cue::Event("play"));
+            cues.push(match element.ready >= HAVE_FUTURE_DATA {
+                true => Cue::Playing,
+                false => Cue::Event("waiting"),
+            });
+        } else if element.ready >= HAVE_FUTURE_DATA {
+            cues.push(Cue::Resolve);
+        }
+        element.reported = now;
+        element.settle_clock(now);
+        self.queue_cues(node, cues);
+        promise
+    }
+
+    fn pause_media(&mut self, node: NodeId) {
+        let now = self.clock;
+        if self
+            .media
+            .elements
+            .get(&node)
+            .is_none_or(|element| element.network == NETWORK_EMPTY)
+        {
+            self.load_media(node);
+        }
+        let element = self.media.elements.get_mut(&node).expect("loaded above");
+        element.can_autoplay = false;
+        if element.paused {
+            return;
+        }
+        element.paused = true;
+        element.settle_clock(now);
+        self.reject_waiters(node, || {
+            abort_error("The play() request was interrupted by a call to pause().")
+        });
+        self.queue_cues(node, vec![Cue::Event("timeupdate"), Cue::Event("pause")]);
+    }
+}

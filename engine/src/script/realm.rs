@@ -139,6 +139,9 @@ pub(super) enum Native {
     ImageDeliver(crate::dom::NodeId, u64),
     // a dialog reporting that it closed
     DialogClose(crate::dom::NodeId),
+    // a media element's source selection and its events, for one run of its load algorithm
+    MediaLoad(crate::dom::NodeId, u64),
+    MediaCue(Box<(crate::dom::NodeId, u64, super::media::Cue)>),
     CustomElements(super::custom::RegistryMethod),
     Audio(super::audio::AudioMember),
     AudioConstructor(super::audio::AudioClass),
@@ -2350,6 +2353,11 @@ impl ScriptRuntime {
             Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
             Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
             Native::DialogClose(node) => self.deliver_dialog_close(node),
+            Native::MediaLoad(node, generation) => self.deliver_media_load(node, generation),
+            Native::MediaCue(cue) => {
+                let (node, generation, cue) = *cue;
+                self.deliver_media_cue(node, generation, cue)
+            }
             Native::Audio(member) => self.call_audio(member, this, arguments),
             Native::AudioStateChange(id) => self.deliver_audio_state(id),
             Native::AudioConstructor(class) => Err(self.type_error(format!(

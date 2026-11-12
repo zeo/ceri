@@ -41,6 +41,7 @@ mod unicode;
 #[rustfmt::skip]
 mod unicode_tables;
 mod variation;
+mod video;
 mod wasm;
 #[cfg(feature = "windowed")]
 mod window;
@@ -74,6 +75,7 @@ pub use navigation::{
 };
 pub use paint::Canvas;
 pub use script::{HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
+pub use video::{MediaDecoder, MediaInfo, MediaSource, VideoFrame, VideoReader};
 #[cfg(feature = "windowed")]
 pub use window::{
     Lifecycle, Monitor, NativeHandle, WindowAction, WindowConfig, WindowContext, WindowControl,

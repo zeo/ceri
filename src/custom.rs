@@ -7,6 +7,7 @@ use crate::fonts::SystemFonts;
 use crate::instance;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use crate::tray::{Tray, TrayConfig, TrayEvent};
+use crate::video::DesktopVideo;
 use ceri_engine::{
     APP_ORIGIN, AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost,
     ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, NavigationError,
@@ -538,6 +539,7 @@ fn build_browser(
     .with_fonts(Rc::new(system_font_set()))
     .with_clipboard_provider(Rc::new(DesktopClipboard::default()))
     .with_audio_device(Rc::new(DesktopAudio))
+    .with_media_decoder(Arc::new(DesktopVideo))
     .with_time_zone(Rc::new(DesktopTimeZone))
     .with_file_picker(Rc::new(DesktopFilePicker));
     Ok(match user_locale() {
@@ -680,6 +682,10 @@ impl ResourceProvider for PackagedAssets {
             return Ok(None);
         }
         crate::http::request(request).map(Some)
+    }
+
+    fn media_file(&self, url: &AppUrl) -> Option<PathBuf> {
+        url.is_files().then(|| self.files.resolve(url.path()))?
     }
 }
 
