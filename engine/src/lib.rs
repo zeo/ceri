@@ -1,4 +1,5 @@
 mod audio;
+mod autohint;
 mod bidi;
 mod border;
 mod bridge;

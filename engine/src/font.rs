@@ -43,6 +43,8 @@ pub struct FontFace {
     #[cfg(windows)]
     directwrite:
         std::cell::OnceCell<Option<windows::Win32::Graphics::DirectWrite::IDWriteFontFace>>,
+    // the auto-hinter's widths and blue zones, measured on first use
+    autohint: std::cell::OnceCell<Option<crate::autohint::Metrics>>,
     // an instance's outlines and advances, varied once per glyph
     outlines: RefCell<HashMap<u16, Option<Outline>>>,
     advances: RefCell<HashMap<u16, f32>>,
@@ -163,6 +165,7 @@ impl FontFace {
             axis_values: Vec::new(),
             #[cfg(windows)]
             directwrite: Default::default(),
+            autohint: Default::default(),
             outlines: RefCell::default(),
             advances: RefCell::default(),
             instances: RefCell::default(),
@@ -238,6 +241,7 @@ impl FontFace {
                 .collect(),
             #[cfg(windows)]
             directwrite: Default::default(),
+            autohint: Default::default(),
             outlines: RefCell::default(),
             advances: RefCell::default(),
             instances: RefCell::default(),
@@ -375,6 +379,22 @@ impl FontFace {
 
     pub fn has_glyph(&self, character: char) -> bool {
         self.characters.contains_key(&u32::from(character))
+    }
+
+    pub(crate) fn characters(&self) -> &BTreeMap<u32, u16> {
+        &self.characters
+    }
+
+    // postscript outlines take freetype's own cff hinter, which this does not follow
+    pub(crate) fn autohint(&self) -> Option<&crate::autohint::Metrics> {
+        self.autohint
+            .get_or_init(|| {
+                self.cff
+                    .is_none()
+                    .then(|| crate::autohint::Metrics::new(self))
+                    .flatten()
+            })
+            .as_ref()
     }
 
     pub fn glyph_for(&self, character: char) -> u16 {
@@ -1672,15 +1692,21 @@ impl FontSet {
         let bitmap = chosen
             .face
             .outline(glyph)
-            .map(|outline| {
-                if chosen.synthetic_italic {
+            .and_then(|outline| {
+                // linux text takes freetype's light hinting as skia asks for it, so its heights
+                // sit on the pixel grid as chromium's do
+                let hinted = (cfg!(not(windows)) && stroke <= 0.0)
+                    .then(|| chosen.face.autohint()?.hint(glyph, &outline, size))
+                    .flatten();
+                let (outline, scale) = match hinted {
+                    Some(hinted) => (hinted, 1.0),
+                    None => (outline, size / chosen.face.units_per_em()),
+                };
+                let outline = if chosen.synthetic_italic {
                     oblique(outline)
                 } else {
                     outline
-                }
-            })
-            .and_then(|outline| {
-                let scale = size / chosen.face.units_per_em();
+                };
                 let subpixel = f32::from(quarter) / 4.0;
                 if stroke > 0.0 {
                     rasterize_stroke(&outline, scale, subpixel, stroke)
@@ -2505,6 +2531,31 @@ mod tests {
         let path = format!("{}/tests/fixtures/fonts/{name}", env!("CARGO_MANIFEST_DIR"));
         FontFace::parse(std::fs::read(&path).expect("fixture font should exist"))
             .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+    }
+
+    #[test]
+    fn autohinting_lifts_ascenders_onto_the_pixel_grid() {
+        let face = fixture("ceri-test.ttf");
+        let glyph = face.glyph_for('f');
+        let outline = face.outline(glyph).expect("f should have an outline");
+        let top = |outline: &Outline| {
+            outline
+                .contours
+                .iter()
+                .flatten()
+                .fold(f32::MIN, |top, point| top.max(point.y))
+        };
+        let metrics = face
+            .autohint()
+            .expect("the fixture should have a blue zone");
+        for size in [11.0, 13.0, 15.5, 27.0] {
+            let hinted = metrics.hint(glyph, &outline, size).expect("f is latin");
+            assert_eq!(top(&hinted).fract(), 0.0, "{size}px");
+            assert!(
+                (top(&hinted) - top(&outline) * size / face.units_per_em()).abs() < 1.0,
+                "{size}px"
+            );
+        }
     }
 
     #[test]
