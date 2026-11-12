@@ -389,6 +389,8 @@ enum Builtin {
     StyleRemoveProperty(ElementHandle),
     Fetch,
     SubtleDigest,
+    CryptoGetRandomValues,
+    CryptoRandomUuid,
     PromiseThen(PromiseHandle),
     PromiseCatch(PromiseHandle),
     RequestClone(RequestHandle),
@@ -3728,6 +3730,8 @@ impl ScriptRuntime {
             },
             Value::Crypto => match property {
                 "subtle" => Ok(Value::SubtleCrypto),
+                "getRandomValues" => Ok(Value::Builtin(Builtin::CryptoGetRandomValues)),
+                "randomUUID" => Ok(Value::Builtin(Builtin::CryptoRandomUuid)),
                 _ => Err(runtime_error(format!("crypto has no property {property}"))),
             },
             Value::SubtleCrypto => match property {
@@ -7918,6 +7922,47 @@ impl ScriptRuntime {
                 }
             }
             Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments, Directive::Connect))),
+            Builtin::CryptoGetRandomValues => {
+                let fail = "Failed to execute 'getRandomValues' on 'Crypto'";
+                let Some(Value::TypedArray(array)) = arguments.first().map(Value::resolve) else {
+                    return Err(self.type_error(format!(
+                        "{fail}: parameter 1 is not of type 'ArrayBufferView'."
+                    )));
+                };
+                let (buffer, start, end, kind) = {
+                    let array = array.borrow();
+                    (array.buffer.clone(), array.start, array.end, array.kind)
+                };
+                if matches!(
+                    kind,
+                    typed::ElementKind::Float32 | typed::ElementKind::Float64
+                ) {
+                    let name = kind.name().trim_end_matches("Array");
+                    return Err(self.throw_value(dom_exception(
+                        "TypeMismatchError",
+                        &format!(
+                            "{fail}: The provided ArrayBufferView is of type '{name}', which is not an integer array type."
+                        ),
+                    )));
+                }
+                if end - start > 65_536 {
+                    return Err(self.throw_value(dom_exception(
+                        "QuotaExceededError",
+                        &format!(
+                            "{fail}: The ArrayBufferView's byte length ({}) exceeds the number of bytes of entropy available via this API (65536).",
+                            end - start
+                        ),
+                    )));
+                }
+                fill_random(&mut buffer.borrow_mut()[start..end])
+                    .map_err(|error| runtime_error(format!("{fail}: {error}")))?;
+                Ok(Value::TypedArray(array))
+            }
+            Builtin::CryptoRandomUuid => {
+                let mut bytes = [0_u8; 16];
+                fill_random(&mut bytes).map_err(|error| runtime_error(error.to_string()))?;
+                Ok(Value::String(uuid_v4(bytes).into()))
+            }
             Builtin::SubtleDigest => {
                 let algorithm = match subtle_algorithm_name(arguments.first()) {
                     Ok(algorithm) => algorithm,
@@ -11754,6 +11799,38 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     } else {
         fs::rename(&temporary, path)
     }
+}
+
+#[cfg(windows)]
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    use windows::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    // SAFETY: the buffer is a live, writable slice and no algorithm handle is passed
+    unsafe { BCryptGenRandom(None, bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+        .ok()
+        .map_err(io::Error::other)
+}
+
+#[cfg(not(windows))]
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    use io::Read;
+    fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+// rfc 9562 version 4: random bits with the version and variant nibbles set
+fn uuid_v4(mut bytes: [u8; 16]) -> String {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 fn dom_exception(name: &str, message: &str) -> Value {
@@ -20156,6 +20233,39 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("SubtleCrypto.digest expects an ArrayBuffer or Uint8Array")
+        );
+    }
+
+    #[test]
+    fn crypto_fills_integer_views_and_makes_version_4_uuids() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const words = new Uint32Array(64);
+                const same = crypto.getRandomValues(words) === words;
+                const spread = new Set(words).size > 60;
+                const failure = (make) => { try { make(); return "none"; } catch (error) { return error.name; } };
+                const uuids = new Set(Array.from({ length: 50 }, () => crypto.randomUUID()));
+                const shaped = [...uuids].every((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id));
+                document.getElementById("status").textContent = [
+                    same, spread, uuids.size, shaped,
+                    failure(() => crypto.getRandomValues(new Float64Array(2))),
+                    failure(() => crypto.getRandomValues(new Uint8Array(65537))),
+                    failure(() => crypto.getRandomValues(new Uint8Array(65536))),
+                    failure(() => crypto.getRandomValues([1, 2])),
+                ].join("|");
+                "#,
+            )
+            .expect("crypto should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("true|true|50|true|TypeMismatchError|QuotaExceededError|none|TypeError")
         );
     }
 
