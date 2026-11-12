@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
+const SCALE_SWITCH: &str = "ceri-scale";
 const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 
 // reaches the running app's windows from commands, hooks and threads; quiet until the loop runs
@@ -437,12 +438,21 @@ fn run_app(
             start_url: launch.initial_url.clone(),
             ..WindowConfig::default()
         }));
+        let scale = match launch::switch_value(arguments.clone(), SCALE_SWITCH) {
+            Some(value) => value
+                .parse::<f32>()
+                .ok()
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .ok_or_else(|| format!("--{SCALE_SWITCH} needs a positive number, not {value}"))?,
+            None => 1.0,
+        };
         // the engine needs a worker's stack, more than the main thread has on windows
         return std::thread::Builder::new()
             .name("ceri-engine".to_string())
             .spawn(move || {
                 capture(
                     &config,
+                    scale,
                     PathBuf::from(path),
                     assets,
                     storage,
@@ -518,13 +528,14 @@ fn app_url(url: &str) -> String {
 // renders one frame without opening a window, for smoke checks and release shots
 fn capture(
     config: &WindowConfig,
+    scale: f32,
     output: PathBuf,
     assets: Arc<AssetOrigin>,
     storage: PathBuf,
     allowed: Vec<String>,
     bridge: Bridge,
 ) -> Result<(), String> {
-    let mut host = EngineHost::new(
+    let mut host = EngineHost::with_scale(
         build_browser(
             assets,
             storage,
@@ -538,6 +549,7 @@ fn capture(
             width: config.width as f32,
             height: config.height as f32,
         },
+        scale,
     );
     let status = host
         .navigate(&config.start_url)

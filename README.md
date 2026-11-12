@@ -34,6 +34,8 @@ Render one frame of the packaged app without opening a window, which is what CI 
 cargo run --bin ceri -- "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target\app.png"
 ```
 
+Add `--ceri-scale=1.5` to render at a device pixel ratio other than 1.
+
 ## Authoring
 
 The web surface is ordinary HTML, CSS and JavaScript. TypeScript projects can consume the declarations in `sdk/index.d.ts` and emit browser-compatible modules into the packaged asset directory.
