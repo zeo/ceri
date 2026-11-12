@@ -293,7 +293,10 @@ impl ScriptRuntime {
     pub(super) fn take_thrown(&mut self, error: ScriptError) -> Value {
         match self.pending_exception.take() {
             Some((value, message)) if message == error.message => value,
-            _ => self.make_error("TypeError", &error.message),
+            _ => {
+                let name = error.name.clone();
+                self.make_error(&name, &error.message)
+            }
         }
     }
 

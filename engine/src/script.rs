@@ -2046,6 +2046,31 @@ impl ScriptRuntime {
         self.clipboard_provider = clipboard_provider;
     }
 
+    // a page script that throws or fails to parse is reported as uncaught, as browsers do,
+    // and the scripts after it still run
+    pub(crate) fn execute_reporting(&mut self, source: &str) -> Result<(), ScriptError> {
+        let outcome = parser::parse_script(source)
+            .and_then(|script| compiler::Compiler::new(source).compile_script(&script))
+            .and_then(|code| self.run_script_code(code));
+        if let Err(error) = outcome {
+            self.report_exception(error);
+        }
+        self.drain_microtasks()?;
+        self.pump_workers().map(|_| ())
+    }
+
+    pub(crate) fn execute_module_reporting<L: ModuleSourceLoader>(
+        &mut self,
+        source: &str,
+        url: AppUrl,
+        loader: &mut L,
+    ) -> Result<(), ScriptError> {
+        if let Err(error) = self.execute_module_graph(source, url, loader) {
+            self.report_exception(error);
+        }
+        self.drain_microtasks()
+    }
+
     pub(crate) fn execute_module<L: ModuleSourceLoader>(
         &mut self,
         source: &str,

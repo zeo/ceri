@@ -1530,23 +1530,19 @@ impl Browser {
                     .collect::<Vec<_>>(),
             )
         };
+        // a stylesheet that fails to load is left out and the page renders without it
         let load = |url: &AppUrl| self.load_subresource(url);
+        let mut failed_sheets = Vec::new();
         let sheets = stylesheet_sources
             .into_iter()
             .map(|source| {
-                let text = load_sheet(&load, &url, &source, &policies)?;
-                Ok((source, text.unwrap_or_default()))
+                let text = load_sheet(&load, &url, &source, &policies).unwrap_or_else(|error| {
+                    failed_sheets.push(format!("stylesheet failed to load: {error}"));
+                    None
+                });
+                (source, text.unwrap_or_default())
             })
-            .collect::<Result<Vec<_>, NavigationError>>();
-        let sheets = match sheets {
-            Ok(sheets) => sheets,
-            Err(error) => {
-                let status = recovery_status(&error);
-                self.install_error_page(&url, status, &error.to_string());
-                self.commit_new_document(url, commit);
-                return Ok(NavigationStatus::ErrorPage { status });
-            }
-        };
+            .collect::<Vec<_>>();
         let mut runtime = ScriptRuntime::with_resources_and_storage_and_runtime_info(
             document.clone(),
             self.resources.clone(),
@@ -1571,6 +1567,9 @@ impl Browser {
             runtime.set_locale(locale.clone());
         }
         runtime.set_viewport_metrics(self.viewport);
+        for failure in failed_sheets {
+            runtime.report(failure);
+        }
         runtime.report_refusals();
         let (parsed_stylesheet, dropped_rules) =
             Stylesheet::parse_recovering(&joined_sheets(&sheets));
@@ -1587,12 +1586,7 @@ impl Browser {
                 .set_history_state_serialized(state)
                 .map_err(|error| NavigationError::Script(error.to_string()))?;
         }
-        if let Err(error) = self.execute_scripts(&url, &script_sources, &policies, &mut runtime) {
-            let status = recovery_status(&error);
-            self.install_error_page(&url, status, &error.to_string());
-            self.commit_new_document(url, commit);
-            return Ok(NavigationStatus::ErrorPage { status });
-        }
+        self.execute_scripts(&url, &script_sources, &policies, &mut runtime);
         if let Err(error) = runtime.apply_autofocus() {
             let error = NavigationError::Script(error.to_string());
             let status = recovery_status(&error);
@@ -3127,13 +3121,15 @@ impl Browser {
         }
     }
 
+    // a script that fails to load or run is reported and the rest of the page goes on, as in
+    // browsers
     fn execute_scripts(
         &self,
         base: &AppUrl,
         sources: &[(Option<String>, ScriptSource)],
         policies: &Policies,
         runtime: &mut ScriptRuntime,
-    ) -> Result<(), NavigationError> {
+    ) {
         let mut module_loader = PackagedModuleLoader {
             resources: &self.resources,
             provider: self.resource_provider.as_deref(),
@@ -3144,69 +3140,77 @@ impl Browser {
                 nonce: nonce.as_deref(),
                 parser_inserted: true,
             };
-            let check = match source {
-                ScriptSource::Inline(text)
-                | ScriptSource::InlineModule(text)
-                | ScriptSource::ImportMap(text) => {
-                    policies.inline(Directive::ScriptElem, text, element)
-                }
-                ScriptSource::External(reference) | ScriptSource::ExternalModule(reference) => {
-                    let url = base.resolve(reference)?;
-                    policies.url(Directive::ScriptElem, &url.to_string(), element)
-                }
-            };
-            if !runtime.permits(check) {
-                continue;
+            if let Err(error) =
+                self.execute_script(base, source, element, &mut module_loader, runtime)
+            {
+                runtime.report(format!("script failed to load: {error}"));
             }
-            let source = match source {
-                ScriptSource::Inline(source) => source.clone(),
-                ScriptSource::External(reference) => {
-                    let url = base.resolve(reference)?;
-                    let resource = self.load_subresource(&url)?;
-                    if !is_javascript(&resource) {
-                        return Err(NavigationError::UnsupportedMimeType {
-                            path: url.path().to_string(),
-                            mime_type: resource.mime_type,
-                        });
-                    }
-                    String::from_utf8(resource.body)
-                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?
-                }
-                ScriptSource::ImportMap(source) => {
-                    runtime.add_import_map(source, base);
-                    continue;
-                }
-                ScriptSource::InlineModule(source) => {
-                    runtime
-                        .execute_module(source, base.clone(), &mut module_loader)
-                        .map_err(|error| NavigationError::Script(error.to_string()))?;
-                    continue;
-                }
-                ScriptSource::ExternalModule(reference) => {
-                    let url = base.resolve(reference)?;
-                    let LoadedResource {
-                        url: loaded_url,
-                        resource,
-                    } = self.load_subresource_with_url(&url)?;
-                    if !is_javascript(&resource) {
-                        return Err(NavigationError::UnsupportedMimeType {
-                            path: loaded_url.path().to_string(),
-                            mime_type: resource.mime_type,
-                        });
-                    }
-                    let source = String::from_utf8(resource.body)
-                        .map_err(|_| NavigationError::InvalidUtf8(loaded_url.path().to_string()))?;
-                    runtime
-                        .execute_module(&source, loaded_url, &mut module_loader)
-                        .map_err(|error| NavigationError::Script(error.to_string()))?;
-                    continue;
-                }
-            };
-            runtime
-                .execute(&source)
-                .map_err(|error| NavigationError::Script(error.to_string()))?;
         }
-        Ok(())
+    }
+
+    fn execute_script(
+        &self,
+        base: &AppUrl,
+        source: &ScriptSource,
+        element: Initiator,
+        module_loader: &mut PackagedModuleLoader,
+        runtime: &mut ScriptRuntime,
+    ) -> Result<(), NavigationError> {
+        let policies = module_loader.policies;
+        let check = match source {
+            ScriptSource::Inline(text)
+            | ScriptSource::InlineModule(text)
+            | ScriptSource::ImportMap(text) => {
+                policies.inline(Directive::ScriptElem, text, element)
+            }
+            ScriptSource::External(reference) | ScriptSource::ExternalModule(reference) => {
+                let url = base.resolve(reference)?;
+                policies.url(Directive::ScriptElem, &url.to_string(), element)
+            }
+        };
+        if !runtime.permits(check) {
+            return Ok(());
+        }
+        let ran = match source {
+            ScriptSource::Inline(source) => runtime.execute_reporting(source),
+            ScriptSource::External(reference) => {
+                let url = base.resolve(reference)?;
+                let resource = self.load_subresource(&url)?;
+                if !is_javascript(&resource) {
+                    return Err(NavigationError::UnsupportedMimeType {
+                        path: url.path().to_string(),
+                        mime_type: resource.mime_type,
+                    });
+                }
+                let source = String::from_utf8(resource.body)
+                    .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
+                runtime.execute_reporting(&source)
+            }
+            ScriptSource::ImportMap(source) => {
+                runtime.add_import_map(source, base);
+                Ok(())
+            }
+            ScriptSource::InlineModule(source) => {
+                runtime.execute_module_reporting(source, base.clone(), module_loader)
+            }
+            ScriptSource::ExternalModule(reference) => {
+                let url = base.resolve(reference)?;
+                let LoadedResource {
+                    url: loaded_url,
+                    resource,
+                } = self.load_subresource_with_url(&url)?;
+                if !is_javascript(&resource) {
+                    return Err(NavigationError::UnsupportedMimeType {
+                        path: loaded_url.path().to_string(),
+                        mime_type: resource.mime_type,
+                    });
+                }
+                let source = String::from_utf8(resource.body)
+                    .map_err(|_| NavigationError::InvalidUtf8(loaded_url.path().to_string()))?;
+                runtime.execute_module_reporting(&source, loaded_url, module_loader)
+            }
+        };
+        ran.map_err(|error| NavigationError::Script(error.to_string()))
     }
 
     fn install_error_page(&mut self, url: &AppUrl, status: u16, detail: &str) {
@@ -7074,26 +7078,32 @@ mod tests {
     }
 
     #[test]
-    fn script_failures_are_contained_by_a_recovery_document() {
-        let mut browser = Browser::new(bundle("<script>missing?</script>"));
+    fn failing_scripts_are_reported_and_the_page_goes_on() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>missing?</script>
+            <script>throw new RangeError("late");</script>
+            <script src="/gone.js"></script>
+            <script>document.getElementById("status").textContent = "ran";</script>"#,
+        ));
         assert_eq!(
             browser
                 .navigate("https://app.ceri.invalid/")
-                .expect("script failure should become recovery page"),
-            NavigationStatus::ErrorPage { status: 500 }
+                .expect("the page should load"),
+            NavigationStatus::Loaded
         );
-        let document = browser.document().unwrap();
-        let recovery = document
+        let document = browser.document().expect("document should exist");
+        let status = document
             .borrow()
-            .find_element_by_id("recovery")
-            .expect("recovery element should exist");
+            .find_element_by_id("status")
+            .expect("status should exist");
         assert_eq!(
-            document
-                .borrow()
-                .attribute(recovery, "data-status")
-                .map(str::to_string),
-            Some("500".to_string())
+            document.borrow().element_text_content(status).as_deref(),
+            Some("ran")
         );
+        let logs = browser.console_logs().join("\n");
+        assert!(logs.contains("Uncaught SyntaxError"), "{logs}");
+        assert!(logs.contains("Uncaught RangeError: late"), "{logs}");
+        assert!(logs.contains("script failed to load"), "{logs}");
     }
 
     #[test]
@@ -8670,9 +8680,9 @@ A</div>
     }
 
     #[test]
-    fn cross_origin_module_imports_install_the_recovery_document() {
+    fn cross_origin_module_imports_are_refused_and_reported() {
         let mut resources =
-            bundle(r#"<p>before</p><script type="module" src="/entry.js"></script>"#);
+            bundle(r#"<p id="before">before</p><script type="module" src="/entry.js"></script>"#);
         resources
             .insert(
                 "/entry.js",
@@ -8684,21 +8694,13 @@ A</div>
         assert_eq!(
             browser
                 .navigate("https://app.ceri.invalid/")
-                .expect("module failure should become recovery"),
-            NavigationStatus::ErrorPage { status: 500 }
+                .expect("the page should load"),
+            NavigationStatus::Loaded
         );
-        let document = browser.document().expect("recovery document should exist");
-        let recovery = document
-            .borrow()
-            .find_element_by_id("recovery")
-            .expect("recovery element should exist");
-        assert_eq!(
-            document
-                .borrow()
-                .attribute(recovery, "data-status")
-                .map(str::to_string),
-            Some("500".to_string())
-        );
+        let document = browser.document().expect("document should exist");
+        assert!(document.borrow().find_element_by_id("before").is_some());
+        let logs = browser.console_logs().join("\n");
+        assert!(logs.contains("Uncaught"), "{logs}");
     }
 
     #[test]
@@ -8836,28 +8838,20 @@ A</div>
     }
 
     #[test]
-    fn missing_external_resources_use_the_recovery_document() {
+    fn missing_stylesheets_are_left_out() {
         let mut browser = Browser::new(bundle(
-            r#"<link rel="stylesheet" href="/assets/missing.css"><p>home</p>"#,
+            r#"<link rel="stylesheet" href="/assets/missing.css"><p id="home">home</p>"#,
         ));
         assert_eq!(
             browser
                 .navigate("https://app.ceri.invalid/")
-                .expect("missing subresource should become recovery page"),
-            NavigationStatus::ErrorPage { status: 500 }
+                .expect("the page should load"),
+            NavigationStatus::Loaded
         );
-        let document = browser.document().unwrap();
-        let recovery = document
-            .borrow()
-            .find_element_by_id("recovery")
-            .expect("recovery element should exist");
-        assert_eq!(
-            document
-                .borrow()
-                .attribute(recovery, "data-status")
-                .map(str::to_string),
-            Some("500".to_string())
-        );
+        let document = browser.document().expect("document should exist");
+        assert!(document.borrow().find_element_by_id("home").is_some());
+        let logs = browser.console_logs().join("\n");
+        assert!(logs.contains("stylesheet failed to load"), "{logs}");
     }
 
     #[test]
