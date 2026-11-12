@@ -45,6 +45,29 @@ pub(super) struct BridgeState {
     object: RefCell<Option<Value>>,
 }
 
+impl BridgeState {
+    pub(super) fn permits(&self, command: &str) -> bool {
+        self.bridge
+            .capabilities
+            .permits(&self.bridge.window, &self.origin, command)
+    }
+
+    // a call the engine makes for the page, answered through reply
+    pub(super) fn send(&self, command: &str, payload: String, reply: CommandReply) {
+        let call = CommandCall {
+            window: self.bridge.window.clone(),
+            origin: self.origin.clone(),
+            command: command.to_string(),
+            payload,
+            body: None,
+            headers: Vec::new(),
+        };
+        self.bridge
+            .router
+            .invoke(call, reply.with_waker(self.waker.clone()));
+    }
+}
+
 impl ScriptRuntime {
     pub(crate) fn set_host_bridge(
         &mut self,

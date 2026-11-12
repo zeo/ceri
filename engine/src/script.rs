@@ -21,6 +21,7 @@ mod json;
 mod lexer;
 mod media;
 mod modules;
+mod notifications;
 mod numbers;
 mod object;
 mod observers;
@@ -531,6 +532,7 @@ pub struct ScriptRuntime {
     next_observer: u32,
     xhr: HashMap<u32, xhr::XhrState>,
     sockets: sockets::Sockets,
+    notices: notifications::Notices,
     audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
@@ -1581,6 +1583,7 @@ impl ScriptRuntime {
             next_observer: 0,
             xhr: HashMap::new(),
             sockets: sockets::Sockets::default(),
+            notices: notifications::Notices::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
             image_loads: HashMap::new(),
@@ -4904,6 +4907,7 @@ impl ScriptRuntime {
             + self.settle_command_replies()?
             + self.pump_audio()?
             + self.pump_sockets()?
+            + self.pump_notices()?
             + self.pump_media();
         self.drain_microtasks()?;
         Ok(processed)

@@ -7785,6 +7785,102 @@ A</div>
     }
 
     #[test]
+    fn notifications_go_to_the_host_when_granted_and_fire_show_error_and_close() {
+        use crate::bridge::{Capabilities, CommandCall, CommandReply, CommandRouter, Grant};
+
+        #[derive(Default)]
+        struct Notifier {
+            calls: RefCell<Vec<CommandCall>>,
+        }
+
+        impl CommandRouter for Notifier {
+            fn invoke(&self, call: CommandCall, reply: CommandReply) {
+                self.calls.borrow_mut().push(call);
+                reply.send(Ok("null".to_string()));
+            }
+        }
+
+        let page = r##"<p id="status"></p>
+            <script>
+                const log = (line) => { document.getElementById("status").textContent += line + "|"; };
+                const name = (run) => { try { run(); return "none"; } catch (error) { return error.name; } };
+                log([Notification.permission, Notification.maxActions, Notification.length].join(","));
+                Notification.requestPermission((permission) => log("asked:" + permission)).then((permission) => log("granted:" + permission));
+                log([
+                    name(() => new Notification("a", { actions: [{ action: "a", title: "b" }] })),
+                    name(() => new Notification("a", { renotify: true })),
+                    name(() => new Notification("a", { dir: "up" })),
+                    name(() => Notification("a")),
+                    name(() => Notification.prototype.close.call({})),
+                ].join(","));
+                const first = new Notification("Hi", { body: "b1", tag: "t", data: { n: 1 }, icon: "/i.png", dir: "rtl", timestamp: 5.9 });
+                log([first.title, first.body, first.tag, first.dir, first.icon, first.silent, first.data.n, first.data === first.data, first.actions.length, first.timestamp, first instanceof EventTarget].join(","));
+                first.onerror = () => log("error1");
+                first.onclose = () => log("close1");
+                first.onshow = () => {
+                    log("show1");
+                    const second = new Notification("Again", { tag: "t", silent: false });
+                    second.addEventListener("show", () => { log("show2:" + second.silent); second.close(); second.close(); });
+                    second.onclose = () => log("close2");
+                };
+            </script>"##;
+        let notices = |granted: &[&str]| {
+            let router = Rc::new(Notifier::default());
+            let mut browser =
+                Browser::new(bundle(page)).with_host_bridge(crate::script::HostBridge::new(
+                    router.clone(),
+                    Capabilities::new(vec![Grant {
+                        windows: vec!["main".to_string()],
+                        origins: vec![APP_ORIGIN.to_string()],
+                        commands: granted.iter().map(|command| command.to_string()).collect(),
+                    }]),
+                    "main",
+                ));
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load");
+            for _ in 0..4 {
+                browser.pump().expect("pump");
+            }
+            let document = browser.document().expect("document");
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            let status = document.element_text_content(status).unwrap_or_default();
+            let payloads: Vec<String> = router
+                .calls
+                .borrow()
+                .iter()
+                .map(|call| format!("{}:{}", call.command, call.payload))
+                .collect();
+            (status, payloads)
+        };
+        let checks = "TypeError,TypeError,TypeError,TypeError,TypeError|Hi,b1,t,rtl,https://app.ceri.invalid/i.png,,1,false,0,5,true|";
+        let (status, payloads) = notices(&["notification:*"]);
+        assert_eq!(
+            status,
+            format!(
+                "granted,0,1|asked:granted|{checks}granted:granted|show1|show2:false|close1|close2|"
+            )
+        );
+        assert_eq!(
+            payloads,
+            [
+                "notification:show:{\"title\":\"Hi\",\"body\":\"b1\"}",
+                "notification:show:{\"title\":\"Again\",\"body\":\"\"}"
+            ]
+        );
+        let (status, payloads) = notices(&["greet"]);
+        assert_eq!(
+            status,
+            format!("denied,0,1|asked:denied|{checks}granted:denied|error1|")
+        );
+        assert!(
+            payloads.is_empty(),
+            "a denied notice never reaches the host"
+        );
+    }
+
+    #[test]
     fn the_sdk_wraps_invoke_results_and_host_errors() {
         use crate::bridge::{Capabilities, CommandCall, CommandReply, CommandRouter, Grant};
 

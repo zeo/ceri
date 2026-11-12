@@ -790,6 +790,7 @@ impl ScriptRuntime {
         self.event_handlers.retain(|(target, _), _| alive(target));
         self.xhr.retain(|id, _| live.contains_key(id));
         self.sockets.states.retain(|id, _| live.contains_key(id));
+        self.notices.retain(|id| live.contains_key(id));
         self.prune_audio();
     }
 

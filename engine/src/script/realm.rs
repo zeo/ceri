@@ -135,6 +135,8 @@ pub(super) enum Native {
     XhrConstructor,
     Socket(super::sockets::SocketMember),
     SocketConstructor,
+    Notice(super::notifications::NoticeMember),
+    NoticeConstructor,
     Url(super::urls::UrlMember),
     UrlConstructor,
     UrlSearchParams(super::urls::ParamsMember),
@@ -182,6 +184,7 @@ impl Native {
                 | Native::ObserverConstructor(_)
                 | Native::XhrConstructor
                 | Native::SocketConstructor
+                | Native::NoticeConstructor
                 | Native::UrlConstructor
                 | Native::UrlSearchParamsConstructor
                 | Native::AudioConstructor(_)
@@ -247,6 +250,7 @@ pub(super) struct Intrinsics {
     pub(super) observers: super::observers::ObserverInterfaces,
     pub(super) xhr: super::xhr::XhrInterfaces,
     pub(super) sockets: super::sockets::SocketInterfaces,
+    pub(super) notices: super::notifications::NoticeInterfaces,
     pub(super) urls: super::urls::UrlInterfaces,
     pub(super) audio: super::audio::AudioInterfaces,
 }
@@ -1221,6 +1225,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let observers = super::observers::create(&build, &object_prototype, &mut globals);
     let xhr = super::xhr::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let sockets = super::sockets::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let notices = super::notifications::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let urls = super::urls::create(&build, &object_prototype, &mut globals);
     let audio = super::audio::create(
         &build,
@@ -1274,6 +1279,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         observers,
         xhr,
         sockets,
+        notices,
         urls,
         audio,
     };
@@ -2431,6 +2437,7 @@ impl ScriptRuntime {
             Native::Observer(method) => self.call_observer_method(method, this, arguments),
             Native::Xhr(member) => self.call_xhr(member, this, arguments),
             Native::Socket(member) => self.call_socket(member, this, arguments),
+            Native::Notice(member) => self.call_notice(member, this, arguments),
             Native::Url(member) => self.call_url(member, this, arguments),
             Native::UrlSearchParams(member) => self.call_url_search_params(member, this, arguments),
             Native::UrlConstructor => {
@@ -2458,6 +2465,9 @@ impl ScriptRuntime {
                 .type_error("Failed to construct 'XMLHttpRequest': Please use the 'new' operator")),
             Native::SocketConstructor => Err(self
                 .type_error("Failed to construct 'WebSocket': Please use the 'new' operator")),
+            Native::NoticeConstructor => Err(self.type_error(
+                "Failed to construct 'Notification': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+            )),
             Native::ObserverConstructor(kind) => Err(self.type_error(format!(
                 "Failed to construct '{}': Please use the 'new' operator",
                 kind.name()
@@ -2735,6 +2745,7 @@ impl ScriptRuntime {
             }
             Native::XhrConstructor => self.construct_xhr(new_target),
             Native::SocketConstructor => self.construct_socket(arguments, new_target),
+            Native::NoticeConstructor => self.construct_notice(arguments, new_target),
             Native::UrlConstructor => self.construct_url(arguments, new_target),
             Native::UrlSearchParamsConstructor => {
                 self.construct_url_search_params(arguments, new_target)
