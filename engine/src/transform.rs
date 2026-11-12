@@ -110,6 +110,14 @@ impl Matrix {
             .all(|(value, identity)| (value - identity).abs() < 1e-6)
     }
 
+    // the x and y offset when the matrix does nothing but move the plane
+    pub(crate) fn translation(&self) -> Option<(f32, f32)> {
+        let mut rest = *self;
+        rest.0[12] = 0.0;
+        rest.0[13] = 0.0;
+        rest.is_identity().then_some((self.0[12], self.0[13]))
+    }
+
     // maps a point on the z = 0 plane; None when it lands behind the viewer
     pub(crate) fn map_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
         let w = self.at(3, 0) * x + self.at(3, 1) * y + self.at(3, 3);

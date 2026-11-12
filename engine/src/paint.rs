@@ -26,6 +26,9 @@ pub struct Canvas {
     pixels: Vec<u8>,
     // the layout point drawn at the surface's top-left corner, nonzero for transform layers
     shift: (f32, f32),
+    // device pixels vector content moves by after it snaps, the fraction of a translate that
+    // paints without a layer
+    nudge: (f32, f32),
     // rounded overflow clips and clip-paths in device space; every write is scaled by their
     // coverage
     masks: Vec<Mask>,
@@ -121,6 +124,7 @@ impl Canvas {
             opaque: true,
             pixels,
             shift: (0.0, 0.0),
+            nudge: (0.0, 0.0),
             masks: Vec::new(),
             revision: Revision {
                 id: next_revision(),
@@ -673,6 +677,7 @@ impl Canvas {
             opaque: false,
             pixels,
             shift: (bounds.x, bounds.y),
+            nudge: (0.0, 0.0),
             masks: Vec::new(),
             revision: Revision::default(),
         }
@@ -981,6 +986,7 @@ impl Canvas {
                 self.shift.0 + bounds.left as f32 / self.scale,
                 self.shift.1 + bounds.top as f32 / self.scale,
             ),
+            nudge: self.nudge,
             masks: Vec::new(),
             revision: Revision::default(),
         }
@@ -1011,6 +1017,7 @@ impl Canvas {
                 self.shift.0 + left / self.scale,
                 self.shift.1 + top / self.scale,
             ),
+            nudge: self.nudge,
             masks: Vec::new(),
             revision: Revision::default(),
         }
@@ -2419,6 +2426,40 @@ fn paint_context(
         if layout_box.backface_hidden && full.shows_back() {
             return;
         }
+        // an svg leaf that only moves draws its vectors at the fractional spot, as skia's matrix
+        // places them, instead of resampling a layer
+        if let Some(translation) = full.translation().filter(|_| {
+            layout_box.svg.is_some()
+                && layout_box.children.is_empty()
+                && layout_box.filters.own.is_empty()
+        }) {
+            let device = (translation.0 * canvas.scale, translation.1 * canvas.scale);
+            let whole = (device.0.round(), device.1.round());
+            let moved = (whole.0 / canvas.scale, whole.1 / canvas.scale);
+            let saved = (canvas.shift, canvas.nudge);
+            canvas.shift = (saved.0.0 - moved.0, saved.0.1 - moved.1);
+            canvas.nudge = (
+                saved.1.0 + device.0 - whole.0,
+                saved.1.1 + device.1 - whole.1,
+            );
+            paint_context_contents(
+                canvas,
+                layout_box,
+                ContextPaint {
+                    images,
+                    prose_selections,
+                    clip: clip.map(|clip| Rect {
+                        x: clip.x - moved.0,
+                        y: clip.y - moved.1,
+                        ..clip
+                    }),
+                    ancestor_offset,
+                    opacity,
+                },
+            );
+            (canvas.shift, canvas.nudge) = saved;
+            return;
+        }
         let bounds = subtree_bounds(layout_box, ancestor_offset);
         // scaled content renders at the scale it is shown at, up to four times, so it stays sharp
         let mut layer_scale = canvas.scale * full.max_scale().clamp(1.0, 4.0);
@@ -2903,13 +2944,13 @@ fn paint_svg(
     let Some(bounds) = intersect_clip(clip, viewport) else {
         return;
     };
-    let (scale, shift) = (canvas.scale, canvas.shift);
-    let left = ((bounds.x - shift.0) * scale).floor().max(0.0);
-    let top = ((bounds.y - shift.1) * scale).floor().max(0.0);
-    let right = ((bounds.x + bounds.width - shift.0) * scale)
+    let (scale, shift, nudge) = (canvas.scale, canvas.shift, canvas.nudge);
+    let left = ((bounds.x - shift.0) * scale + nudge.0).floor().max(0.0);
+    let top = ((bounds.y - shift.1) * scale + nudge.1).floor().max(0.0);
+    let right = ((bounds.x + bounds.width - shift.0) * scale + nudge.0)
         .ceil()
         .min(canvas.width as f32);
-    let bottom = ((bounds.y + bounds.height - shift.1) * scale)
+    let bottom = ((bounds.y + bounds.height - shift.1) * scale + nudge.1)
         .ceil()
         .min(canvas.height as f32);
     if right <= left || bottom <= top {
@@ -2924,8 +2965,8 @@ fn paint_svg(
             0.0,
             0.0,
             scale,
-            (rect.x - shift.0) * scale - left,
-            (rect.y - shift.1) * scale - top,
+            (rect.x - shift.0) * scale + nudge.0 - left,
+            (rect.y - shift.1) * scale + nudge.1 - top,
         ],
     );
     paint_image(

@@ -9055,6 +9055,25 @@ A</div>
         assert_eq!(pixel_at(&canvas, 12, 36), [0, 0, 255, 255]);
     }
 
+    #[test]
+    fn a_half_pixel_translate_draws_svg_vectors_at_the_moved_spot_without_resampling() {
+        let mut browser = Browser::new(bundle(
+            r##"<body style="margin: 0; background: #000"><svg width="4" height="4" style="display: block; translate: 0 0.5px"><rect y="0.5" width="4" height="1" fill="#fff"/></svg></body>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("svg page should load");
+        let canvas = browser
+            .paint(Size {
+                width: 8.0,
+                height: 8.0,
+            })
+            .expect("svg page should paint");
+        assert_eq!(pixel_at(&canvas, 1, 0), [0, 0, 0, 255]);
+        assert_eq!(pixel_at(&canvas, 1, 1), [255, 255, 255, 255]);
+        assert_eq!(pixel_at(&canvas, 1, 2), [0, 0, 0, 255]);
+    }
+
     fn image_bundle(source: &str) -> ResourceBundle {
         let mut resources = bundle(source);
         for name in ["rgb8.png", "rgba8.png", "baseline-420.jpg", "frame.gif"] {
