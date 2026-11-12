@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::color_glyph::ColorGlyph;
 
@@ -11,7 +12,7 @@ const MAX_GLYPH_PIXELS: usize = 4_000_000;
 
 // glyph outlines and metrics read straight from an sfnt file, no shaping engine
 pub struct FontFace {
-    data: Rc<[u8]>,
+    data: Arc<[u8]>,
     units_per_em: f32,
     ascent: f32,
     descent: f32,
@@ -36,6 +37,12 @@ pub struct FontFace {
     variations: Option<Rc<crate::variation::Variations>>,
     // the normalized coordinates an instance draws at, empty for the default instance
     coordinates: Vec<f32>,
+    // the same instance as axis tags and user values
+    #[cfg(windows)]
+    axis_values: Vec<([u8; 4], f32)>,
+    #[cfg(windows)]
+    directwrite:
+        std::cell::OnceCell<Option<windows::Win32::Graphics::DirectWrite::IDWriteFontFace>>,
     // an instance's outlines and advances, varied once per glyph
     outlines: RefCell<HashMap<u16, Option<Outline>>>,
     advances: RefCell<HashMap<u16, f32>>,
@@ -62,6 +69,8 @@ pub struct GlyphBitmap {
     pub width: usize,
     pub height: usize,
     pub coverage: Vec<u8>,
+    // coverage holds a red, green and blue subpixel value for each pixel
+    pub subpixels: bool,
 }
 
 impl FontFace {
@@ -150,6 +159,10 @@ impl FontFace {
             tables,
             variations,
             coordinates: Vec::new(),
+            #[cfg(windows)]
+            axis_values: Vec::new(),
+            #[cfg(windows)]
+            directwrite: Default::default(),
             outlines: RefCell::default(),
             advances: RefCell::default(),
             instances: RefCell::default(),
@@ -216,6 +229,15 @@ impl FontFace {
                 .iter()
                 .map(|&coordinate| f32::from(coordinate) / 16384.0)
                 .collect(),
+            #[cfg(windows)]
+            axis_values: variations
+                .axes
+                .iter()
+                .zip(&values)
+                .map(|(axis, &value)| (axis.tag, value))
+                .collect(),
+            #[cfg(windows)]
+            directwrite: Default::default(),
             outlines: RefCell::default(),
             advances: RefCell::default(),
             instances: RefCell::default(),
@@ -257,6 +279,13 @@ impl FontFace {
 
     pub(crate) fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    #[cfg(windows)]
+    fn directwrite(&self) -> Option<windows::Win32::Graphics::DirectWrite::IDWriteFontFace> {
+        self.directwrite
+            .get_or_init(|| crate::dwrite::font_face(&self.data, &self.axis_values))
+            .clone()
     }
 
     pub(crate) fn table(&self, tag: &[u8; 4]) -> Option<usize> {
@@ -729,6 +758,7 @@ fn coverage_bitmap(segments: &[Segment]) -> Option<GlyphBitmap> {
         width,
         height,
         coverage: coverage_grid(segments, (left, top), width, height, false),
+        subpixels: false,
     })
 }
 
@@ -944,6 +974,8 @@ struct GlyphKey {
     synthetic_italic: bool,
     // the pen's fraction of a pixel, in quarters
     quarter: u8,
+    // drawn by the platform's text rasterizer
+    system: bool,
     // the device width of the outline's stroke, or zero for the filled glyph
     stroke: u32,
 }
@@ -1621,6 +1653,7 @@ impl FontSet {
             synthetic_bold: chosen.synthetic_bold,
             synthetic_italic: chosen.synthetic_italic,
             quarter,
+            system: false,
             stroke: stroke.to_bits(),
         };
         if let Some(cached) = self.glyphs.borrow().get(&key) {
@@ -1657,6 +1690,50 @@ impl FontSet {
         bitmap
     }
 
+    // a glyph as the page's text draws it: on windows a filled glyph comes from directwrite
+    // with its subpixel coverage, as chromium draws it; synthetic bold is a stroked outline
+    // there, so it stays with our rasterizer like strokes do
+    pub(crate) fn text_glyph(
+        &self,
+        chosen: &ChosenFace,
+        glyph: u16,
+        size: f32,
+        subpixel: f32,
+        stroke: f32,
+    ) -> Option<Rc<GlyphBitmap>> {
+        #[cfg(windows)]
+        if stroke <= 0.0 && !chosen.synthetic_bold && size <= 256.0 {
+            let quarter = (((subpixel - subpixel.floor()) * 4.0).round() as u8) % 4;
+            let key = GlyphKey {
+                face: Rc::as_ptr(&chosen.face) as usize,
+                glyph,
+                size: size.to_bits(),
+                synthetic_bold: false,
+                synthetic_italic: chosen.synthetic_italic,
+                quarter,
+                system: true,
+                stroke: 0,
+            };
+            if let Some(cached) = self.glyphs.borrow().get(&key) {
+                return cached.clone();
+            }
+            if let Some(dwrite) = chosen.face.directwrite() {
+                let bitmap = crate::dwrite::glyph(
+                    &chosen.face,
+                    &dwrite,
+                    glyph,
+                    size,
+                    f32::from(quarter) / 4.0,
+                    chosen.synthetic_italic,
+                )
+                .map(Rc::new);
+                self.glyphs.borrow_mut().insert(key, bitmap.clone());
+                return bitmap;
+            }
+        }
+        self.glyph_bitmap(chosen, glyph, size, subpixel, stroke)
+    }
+
     // a glyph in its font's own colours, for faces with COLR layers or CBDT bitmaps
     pub(crate) fn color_glyph(
         &self,
@@ -1677,6 +1754,7 @@ impl FontSet {
             synthetic_bold: false,
             synthetic_italic: false,
             quarter,
+            system: false,
             stroke: 0,
         };
         let color = [

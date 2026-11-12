@@ -7537,7 +7537,10 @@ A</div>
         };
         let dark_columns = |top: usize| {
             (0..40)
-                .filter(|&x| (top..top + 30).any(|y| pixel(x, y) == [0, 0, 0]))
+                .filter(|&x| {
+                    (top..top + 30)
+                        .any(|y| pixel(x, y).iter().map(|&c| u32::from(c)).sum::<u32>() < 384)
+                })
                 .collect::<Vec<_>>()
         };
         // the ligature's bar runs unbroken over both letters; spaced apart the i stands alone

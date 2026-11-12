@@ -10,6 +10,8 @@ mod csp;
 mod css;
 mod deflate;
 mod dom;
+#[cfg(windows)]
+mod dwrite;
 mod filter;
 mod font;
 mod gif;

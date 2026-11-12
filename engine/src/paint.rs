@@ -21,6 +21,8 @@ pub struct Canvas {
     height: u32,
     scale: f32,
     background: Color,
+    // every pixel is opaque, so text can blend per subpixel; skia drops to grayscale in layers
+    opaque: bool,
     pixels: Vec<u8>,
     // the layout point drawn at the surface's top-left corner, nonzero for transform layers
     shift: (f32, f32),
@@ -116,6 +118,7 @@ impl Canvas {
             height,
             scale,
             background,
+            opaque: true,
             pixels,
             shift: (0.0, 0.0),
             masks: Vec::new(),
@@ -273,7 +276,9 @@ impl Canvas {
         self.fill_rect(left, top, right - left, bottom - top, color);
     }
 
-    // device-space glyph blit, the coverage bitmap is already rasterized at this scale
+    // device-space glyph blit, the coverage bitmap is already rasterized at this scale;
+    // subpixel coverage blends per channel on an opaque surface when `lcd` allows it, as skia's
+    // lcd16 blit does, and is averaged to one coverage elsewhere
     fn blend_coverage(
         &mut self,
         x: i32,
@@ -281,11 +286,25 @@ impl Canvas {
         glyph: &crate::font::GlyphBitmap,
         color: Color,
         clip: Option<crate::layout::Rect>,
+        lcd: bool,
     ) {
         if color.alpha == 0 {
             return;
         }
+        if glyph.subpixels && lcd && self.opaque {
+            self.blend_subpixels(x, y, glyph, color, clip);
+            return;
+        }
         let gamma = text_gamma_table(color);
+        let coverage_at = |index: usize| {
+            if glyph.subpixels {
+                let [red, green, blue] =
+                    [0, 1, 2].map(|at| u16::from(glyph.coverage[index * 3 + at]));
+                ((red + green + blue) / 3) as u8
+            } else {
+                glyph.coverage[index]
+            }
+        };
         for row in 0..glyph.height {
             let pixel_y = y + row as i32;
             if pixel_y < 0 || pixel_y as u32 >= self.height {
@@ -296,7 +315,7 @@ impl Canvas {
                 if pixel_x < 0 || pixel_x as u32 >= self.width {
                     continue;
                 }
-                let coverage = gamma[usize::from(glyph.coverage[row * glyph.width + column])];
+                let coverage = gamma[usize::from(coverage_at(row * glyph.width + column))];
                 if coverage == 0 {
                     continue;
                 }
@@ -318,6 +337,71 @@ impl Canvas {
                         ..color
                     },
                 );
+            }
+        }
+    }
+
+    // skia's blend of an lcd16 mask: each channel's corrected coverage kept to five bits and
+    // scaled to 32, then the source colour mixed into the destination channel by channel
+    fn blend_subpixels(
+        &mut self,
+        x: i32,
+        y: i32,
+        glyph: &crate::font::GlyphBitmap,
+        color: Color,
+        clip: Option<crate::layout::Rect>,
+    ) {
+        let tables = [color.red, color.green, color.blue].map(text_gamma);
+        let source = [color.red, color.green, color.blue].map(i32::from);
+        for row in 0..glyph.height {
+            let pixel_y = y + row as i32;
+            if pixel_y < 0 || pixel_y as u32 >= self.height {
+                continue;
+            }
+            for column in 0..glyph.width {
+                let pixel_x = x + column as i32;
+                if pixel_x < 0 || pixel_x as u32 >= self.width {
+                    continue;
+                }
+                let at = (row * glyph.width + column) * 3;
+                let mut masks = [0, 1, 2].map(|channel| {
+                    let five =
+                        i32::from(tables[channel][usize::from(glyph.coverage[at + channel])] >> 3);
+                    five + (five >> 4)
+                });
+                if masks == [0; 3] {
+                    continue;
+                }
+                if let Some(clip) = clip {
+                    let inside = (pixel_x as f32) >= clip.x.floor()
+                        && (pixel_x as f32) < (clip.x + clip.width).ceil()
+                        && (pixel_y as f32) >= clip.y.floor()
+                        && (pixel_y as f32) < (clip.y + clip.height).ceil();
+                    if !inside {
+                        continue;
+                    }
+                }
+                let alpha = if self.masks.is_empty() {
+                    color.alpha
+                } else {
+                    color
+                        .scale_alpha(self.mask_at(pixel_x as u32, pixel_y as u32))
+                        .alpha
+                };
+                if alpha == 0 {
+                    continue;
+                }
+                if alpha < 255 {
+                    let alpha = i32::from(alpha) + 1;
+                    masks = masks.map(|mask| (mask * alpha) >> 8);
+                }
+                let index = ((pixel_y as u32 * self.width + pixel_x as u32) * 4) as usize;
+                for channel in 0..3 {
+                    let destination = i32::from(self.pixels[index + channel]);
+                    self.pixels[index + channel] = (destination
+                        + (((source[channel] - destination) * masks[channel]) >> 5))
+                        as u8;
+                }
             }
         }
     }
@@ -584,6 +668,7 @@ impl Canvas {
             height,
             scale,
             background: Color::transparent(),
+            opaque: false,
             pixels,
             shift: (bounds.x, bounds.y),
             masks: Vec::new(),
@@ -888,6 +973,7 @@ impl Canvas {
             height,
             scale: self.scale,
             background: Color::transparent(),
+            opaque: false,
             pixels,
             shift: (
                 self.shift.0 + bounds.left as f32 / self.scale,
@@ -917,6 +1003,7 @@ impl Canvas {
             height,
             scale: self.scale,
             background: Color::transparent(),
+            opaque: false,
             pixels,
             shift: (
                 self.shift.0 + left / self.scale,
@@ -3928,7 +4015,7 @@ fn paint_outline_text(
                 device_clip,
             );
         } else if let Some(bitmap) =
-            fonts.glyph_bitmap(face, glyph.glyph, device_size, x, stroke * scale)
+            fonts.text_glyph(face, glyph.glyph, device_size, x, stroke * scale)
         {
             canvas.blend_coverage(
                 x.floor() as i32 + bitmap.left,
@@ -3936,6 +4023,7 @@ fn paint_outline_text(
                 &bitmap,
                 run.color,
                 device_clip,
+                device_size <= 48.0,
             );
         }
     }
@@ -3944,6 +4032,15 @@ fn paint_outline_text(
 // the coverage correction chromium's skia applies to windows text (srgb gamma, contrast 1),
 // one table per eighth of the text colour's luminance, so light text on dark keeps its weight
 fn text_gamma_table(color: Color) -> &'static [u8; 256] {
+    // skia's integer luminance of the gamma-encoded channels
+    let luminance =
+        (u32::from(color.red) * 54 + u32::from(color.green) * 183 + u32::from(color.blue) * 19)
+            >> 8;
+    text_gamma(luminance as u8)
+}
+
+// the table for one luminance, or for one channel of lcd text
+fn text_gamma(luminance: u8) -> &'static [u8; 256] {
     static TABLES: std::sync::OnceLock<[[u8; 256]; 8]> = std::sync::OnceLock::new();
     let tables = TABLES.get_or_init(|| {
         std::array::from_fn(|level| {
@@ -3954,11 +4051,7 @@ fn text_gamma_table(color: Color) -> &'static [u8; 256] {
             )
         })
     });
-    let channel = |value: u8| srgb_to_linear(f32::from(value) / 255.0);
-    let luma =
-        0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue);
-    let luminance = (linear_to_srgb(luma) * 255.0).round() as usize;
-    &tables[luminance.min(255) >> 5]
+    &tables[usize::from(luminance >> 5)]
 }
 
 fn correcting_table(src: f32, contrast: f32) -> [u8; 256] {

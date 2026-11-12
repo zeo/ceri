@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-windowed = ["dep:softbuffer", "dep:winit", "dep:windows"]
+windowed = ["dep:softbuffer", "dep:winit"]
 native-http = ["dep:ureq"]
 
 [dependencies]
@@ -26,10 +26,11 @@ ureq = { version = "=3.4.0", optional = true, default-features = false, features
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "=0.62.2", optional = true, features = [
+windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
