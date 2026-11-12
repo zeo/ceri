@@ -943,12 +943,16 @@ pub fn layout_with_state(
         root_font_size: 16.0,
     });
     let mut computed_state = style_state.clone();
-    stylesheet.populate_custom_properties(document, &mut computed_state);
+    // a caller may hand over a state whose custom properties it resolved already
+    if computed_state.root.is_none() {
+        stylesheet.populate_custom_properties(document, &mut computed_state);
+    }
     let style_state = &computed_state;
     let _root_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
         viewport,
         root_font_size: root_font_size(document, stylesheet, viewport, style_state),
     });
+    let _styles = crate::css::memoize_styles();
     let mut root = LayoutBox {
         node: document.root(),
         tag: "#document".to_string(),

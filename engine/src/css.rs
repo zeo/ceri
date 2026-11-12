@@ -761,6 +761,40 @@ pub(crate) fn take_animation_wake() -> Option<u64> {
     ANIMATION_WAKE.with(std::cell::Cell::take)
 }
 
+// everything a cascade reads besides the element, so a layout pass computes each style once
+#[derive(PartialEq)]
+struct StyleInputs {
+    stylesheet: *const Stylesheet,
+    document: *const Document,
+    state: *const StyleState,
+    parent: (f32, Color, FontWeight, InheritedText),
+    environment: LayoutEnvironment,
+    zero_font: (crate::font::FontStack, crate::font::FontStyle),
+}
+
+type StyleMemo = HashMap<(NodeId, Option<PseudoElement>), Vec<(StyleInputs, Style, Option<u64>)>>;
+
+thread_local! {
+    static STYLE_MEMO: RefCell<Option<StyleMemo>> = const { RefCell::new(None) };
+}
+
+pub(crate) struct MemoizedStyles {
+    previous: Option<StyleMemo>,
+}
+
+impl Drop for MemoizedStyles {
+    fn drop(&mut self) {
+        STYLE_MEMO.with(|memo| *memo.borrow_mut() = self.previous.take());
+    }
+}
+
+// the document, stylesheet and state must stay unchanged while the guard lives
+pub(crate) fn memoize_styles() -> MemoizedStyles {
+    MemoizedStyles {
+        previous: STYLE_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+    }
+}
+
 fn note_animation_wake(delay: u64) {
     ANIMATION_WAKE
         .with(|wake| wake.set(Some(wake.get().map_or(delay, |soonest| soonest.min(delay)))));
@@ -2341,6 +2375,52 @@ impl Stylesheet {
     }
 
     pub(crate) fn style_for(&self, context: StyleContext<'_>) -> Style {
+        if !STYLE_MEMO.with(|memo| memo.borrow().is_some()) {
+            return self.compute_style(context);
+        }
+        let key = (context.node, context.pseudo);
+        let inputs = StyleInputs {
+            stylesheet: self,
+            document: context.document,
+            state: context.state,
+            parent: (
+                context.parent_font_size,
+                context.parent_color,
+                context.parent_weight,
+                context.parent_text,
+            ),
+            environment: layout_environment(),
+            zero_font: ZERO_FONT.with(std::cell::Cell::get),
+        };
+        let known = STYLE_MEMO.with(|memo| {
+            memo.borrow()
+                .as_ref()?
+                .get(&key)?
+                .iter()
+                .find(|(seen, _, _)| *seen == inputs)
+                .map(|&(_, style, wake)| (style, wake))
+        });
+        if let Some((style, wake)) = known {
+            if let Some(delay) = wake {
+                note_animation_wake(delay);
+            }
+            return style;
+        }
+        let outer = ANIMATION_WAKE.with(std::cell::Cell::take);
+        let style = self.compute_style(context);
+        let wake = ANIMATION_WAKE.with(|current| current.replace(outer));
+        if let Some(delay) = wake {
+            note_animation_wake(delay);
+        }
+        STYLE_MEMO.with(|memo| {
+            if let Some(memo) = memo.borrow_mut().as_mut() {
+                memo.entry(key).or_default().push((inputs, style, wake));
+            }
+        });
+        style
+    }
+
+    fn compute_style(&self, context: StyleContext<'_>) -> Style {
         let StyleContext {
             document,
             node,
@@ -3024,7 +3104,7 @@ struct CompoundSelector {
     part_hover: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PseudoElement {
     Before,
     After,

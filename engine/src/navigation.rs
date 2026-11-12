@@ -895,7 +895,43 @@ struct Page {
     animated: bool,
     // the page clock time the last layout's animations next change what they show
     animation_wake: Cell<Option<u64>>,
+    // the last custom property passes, each keyed by the document version and the state it read
+    custom_properties: RefCell<Vec<(u64, StyleState, StyleState)>>,
     // decoded once per document and shared by every frame; failures are remembered too
+}
+
+impl Page {
+    // a pass over the whole document, which frames that only move the clock can skip; layout and
+    // transition sampling read different states, so the last two passes are kept
+    fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
+        let key = StyleState {
+            clock: 0,
+            transitions: BTreeMap::new(),
+            animation_starts: BTreeMap::new(),
+            custom_properties: Default::default(),
+            root: None,
+            ..state.clone()
+        };
+        let mut passes = self.custom_properties.borrow_mut();
+        if let Some((_, _, populated)) = passes
+            .iter()
+            .find(|(version, read, _)| *version == document.version() && *read == key)
+        {
+            state
+                .custom_properties
+                .clone_from(&populated.custom_properties);
+            state.root = populated.root;
+            return;
+        }
+        self.stylesheet.populate_custom_properties(document, state);
+        let populated = StyleState {
+            custom_properties: state.custom_properties.clone(),
+            root: state.root,
+            ..StyleState::default()
+        };
+        passes.insert(0, (document.version(), key, populated));
+        passes.truncate(2);
+    }
 }
 
 enum HistoryCommit {
@@ -1471,6 +1507,7 @@ impl Browser {
             layout_inputs,
             animated,
             animation_wake: Cell::new(None),
+            custom_properties: RefCell::default(),
         });
         self.last_navigation_failure = None;
         self.hovered_node = None;
@@ -1532,8 +1569,7 @@ impl Browser {
         let candidates = collect_motion_candidates(&page.stylesheet, &state, &document);
         // custom properties cost a document-wide pass, so only pages with moving elements pay it
         if !candidates.is_empty() {
-            page.stylesheet
-                .populate_custom_properties(&document, &mut state);
+            page.populate_custom_properties(&document, &mut state);
         }
         for node in candidates {
             let values = page.stylesheet.declared_values(StyleContext {
@@ -2560,12 +2596,14 @@ impl Browser {
             return Ok(layout.clone());
         }
         crate::css::take_animation_wake();
+        page.populate_custom_properties(&document, &mut style_state);
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         // container queries read sizes from a layout, so a change in them lays out once more
         if stylesheet.has_container_queries() {
             let measured = crate::layout::take_layout_containers();
             if measured != style_state.container_sizes {
                 style_state.container_sizes = measured;
+                page.populate_custom_properties(&document, &mut style_state);
                 layout = build_layout(&document, stylesheet, viewport, &style_state);
             }
             *self.container_sizes.borrow_mut() = style_state.container_sizes.clone();
@@ -3085,6 +3123,7 @@ impl Browser {
             layout_inputs,
             animated: false,
             animation_wake: Cell::new(None),
+            custom_properties: RefCell::default(),
         });
     }
 }
