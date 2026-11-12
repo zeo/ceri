@@ -1158,8 +1158,9 @@ fn fill_edges(image: &mut Image, edges: &[crate::font::Segment], even_odd: bool,
         return;
     }
     let (width, height) = ((right - left) as usize, (bottom - top) as usize);
+    let spans = span_edges(edges, (top as f32, bottom as f32), even_odd);
     let coverage =
-        crate::font::coverage_grid(edges, (left as f32, top as f32), width, height, even_odd);
+        crate::font::coverage_grid(&spans, (left as f32, top as f32), width, height, false);
     for (index, &value) in coverage.iter().enumerate() {
         if value > 0 {
             image.blend_pixel(
@@ -1168,6 +1169,86 @@ fn fill_edges(image: &mut Image, edges: &[crate::font::Segment], even_odd: bool,
                 color.scale_alpha(f32::from(value) / 255.0),
             );
         }
+    }
+}
+
+// skia's analytic rasterizer snaps edge ends to quarter rows and, per quarter row, keeps only
+// the edges where the winding enters or leaves the fill, so overlapping pieces cover once;
+// the result is the boundary of disjoint trapezoids
+fn span_edges(
+    edges: &[crate::font::Segment],
+    rows: (f32, f32),
+    even_odd: bool,
+) -> Vec<crate::font::Segment> {
+    struct Line {
+        top: f32,
+        bottom: f32,
+        x: f32,
+        slope: f32,
+        winding: i32,
+    }
+    let snap = |y: f32| (y * 4.0 + 0.5).floor() / 4.0;
+    let mut lines: Vec<Line> = edges
+        .iter()
+        .filter_map(|&(from, to)| {
+            let (upper, lower, winding) = if from.1 <= to.1 {
+                (from, to, 1)
+            } else {
+                (to, from, -1)
+            };
+            let (top, bottom) = (snap(upper.1).max(rows.0), snap(lower.1).min(rows.1));
+            let slope = (lower.0 - upper.0) / (lower.1 - upper.1);
+            (top < bottom && slope.is_finite()).then_some(Line {
+                top,
+                bottom,
+                x: upper.0 + slope * (top - upper.1),
+                slope,
+                winding,
+            })
+        })
+        .collect();
+    lines.sort_by(|a, b| a.top.total_cmp(&b.top));
+    let inside = |winding: i32| {
+        if even_odd {
+            winding % 2 != 0
+        } else {
+            winding != 0
+        }
+    };
+    let mut spans = Vec::new();
+    let mut active: Vec<&Line> = Vec::new();
+    let mut crossings: Vec<(f32, f32, i32)> = Vec::new();
+    let mut pending = lines.iter().peekable();
+    let mut y = f32::MIN;
+    loop {
+        active.retain(|line| line.bottom > y);
+        if active.is_empty() {
+            match pending.peek() {
+                Some(line) => y = y.max(line.top),
+                None => return spans,
+            }
+        }
+        while let Some(line) = pending.next_if(|line| line.top <= y) {
+            active.push(line);
+        }
+        let below = y + 0.25;
+        crossings.clear();
+        crossings.extend(active.iter().map(|line| {
+            let at = |row: f32| line.x + line.slope * (row - line.top);
+            (at(y), at(below), line.winding)
+        }));
+        crossings.sort_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1)));
+        let mut winding = 0;
+        for &(upper, lower, turn) in &crossings {
+            let was = inside(winding);
+            winding += turn;
+            match (was, inside(winding)) {
+                (false, true) => spans.push(((upper, y), (lower, below))),
+                (true, false) => spans.push(((lower, below), (upper, y))),
+                _ => {}
+            }
+        }
+        y = below;
     }
 }
 
@@ -1512,5 +1593,20 @@ mod tests {
         assert!(near(map(skew, (0.0, 2.0)), (2.0, 2.0)));
         assert!(parse_transform("translate(1 2").is_none());
         assert!(parse_transform("spin(4)").is_none());
+    }
+    #[test]
+    fn overlapping_pieces_cover_once_on_quarter_snapped_rows() {
+        let coverage = |polygons: &[&[Point]], width: usize, height: usize| {
+            let mut edges = Vec::new();
+            for polygon in polygons {
+                crate::font::push_polygon(&mut edges, polygon);
+            }
+            let spans = span_edges(&edges, (0.0, height as f32), false);
+            crate::font::coverage_grid(&spans, (0.0, 0.0), width, height, false)
+        };
+        let half: &[Point] = &[(0.5, 0.0), (1.5, 0.0), (1.5, 1.0), (0.5, 1.0)];
+        assert_eq!(coverage(&[half, half], 2, 1), vec![128, 128]);
+        let band: &[Point] = &[(0.0, 0.85), (1.0, 0.85), (1.0, 2.15), (0.0, 2.15)];
+        assert_eq!(coverage(&[band], 1, 3), vec![64, 255, 64]);
     }
 }
