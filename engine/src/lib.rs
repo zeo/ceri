@@ -75,7 +75,9 @@ pub use navigation::{
     ResourceResponse, UserPreferences, external_url, mime_type_for,
 };
 pub use paint::Canvas;
-pub use script::{HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone};
+pub use script::{
+    HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone, seed_local_storage,
+};
 pub use video::{MediaDecoder, MediaInfo, MediaSource, VideoFrame, VideoReader};
 #[cfg(feature = "windowed")]
 pub use window::{

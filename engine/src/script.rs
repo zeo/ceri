@@ -880,6 +880,29 @@ struct UrlSearchParamsData {
     url: Option<Weak<RefCell<UrlData>>>,
 }
 
+// starts the localStorage of a storage directory that has none yet with what another browser
+// kept, so the entries are read only once; entries past the limits setItem holds pages to are
+// left behind, and it says whether it seeded
+pub fn seed_local_storage(
+    directory: impl AsRef<Path>,
+    entries: impl FnOnce() -> io::Result<Vec<(String, String)>>,
+) -> io::Result<bool> {
+    if directory.as_ref().join(STORAGE_FILE_NAME).exists() {
+        return Ok(false);
+    }
+    let mut storage = StorageData::load_from_directory(directory)?;
+    storage.values.extend(
+        entries()?
+            .into_iter()
+            .filter(|(key, value)| {
+                key.len() <= MAX_STORAGE_TEXT_BYTES && value.len() <= MAX_STORAGE_VALUE_BYTES
+            })
+            .take(MAX_STORAGE_VALUES),
+    );
+    storage.persist()?;
+    Ok(true)
+}
+
 pub(crate) struct StorageData {
     values: BTreeMap<String, String>,
     caches: BTreeMap<String, CacheHandle>,

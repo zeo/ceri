@@ -5424,6 +5424,33 @@ mod tests {
     }
 
     #[test]
+    fn seeded_local_storage_reaches_pages_once() {
+        let storage_root =
+            std::env::temp_dir().join(format!("ceri-engine-storage-seed-{}", std::process::id()));
+        let seed = |value: &str| {
+            let value = value.to_string();
+            crate::script::seed_local_storage(&storage_root, move || {
+                Ok(vec![("view".to_string(), value)])
+            })
+            .expect("seeding should work")
+        };
+        assert!(seed("{\"zoom\":3}"));
+        assert!(!seed("{\"zoom\":1}"));
+        let mut browser = Browser::new(bundle(
+            r#"<p id="out"></p><script>
+                document.getElementById("out").textContent = localStorage.getItem("view");
+            </script>"#,
+        ))
+        .with_storage_directory(&storage_root)
+        .expect("seeded storage should open");
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert_eq!(element_text(&browser, "out"), "{\"zoom\":3}");
+        std::fs::remove_dir_all(&storage_root).expect("test storage should be cleaned up");
+    }
+
+    #[test]
     fn form_get_submission_navigates_packaged_origin_without_a_listener() {
         let mut resources = bundle(
             r#"<form id="search" action="/results.html" method="get"><input name="q" value="rust browser"><button id="submit" type="submit">search</button></form>"#,

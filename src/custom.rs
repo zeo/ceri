@@ -96,6 +96,7 @@ pub struct App {
     assets: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
     content_security_policy: Option<String>,
+    local_storage_import: Option<(PathBuf, String)>,
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
@@ -134,6 +135,17 @@ impl App {
     // carry it; the inline scripts and styles the app ships count as its own code
     pub fn content_security_policy(mut self, policy: impl Into<String>) -> Self {
         self.content_security_policy = Some(policy.into());
+        self
+    }
+
+    // the localStorage an Electron or WebView2 build of the app kept for origin, read from that
+    // profile's `Local Storage/leveldb` folder on the first run that has no storage of its own
+    pub fn import_local_storage(
+        mut self,
+        directory: impl Into<PathBuf>,
+        origin: impl Into<String>,
+    ) -> Self {
+        self.local_storage_import = Some((directory.into(), origin.into()));
         self
     }
 
@@ -253,6 +265,18 @@ impl App {
     pub fn run(mut self) -> Result<(), String> {
         let identifier = self.identifier.take().unwrap_or_else(|| "Ceri".to_string());
         check_identifier(&identifier)?;
+        if let Some((directory, origin)) = self.local_storage_import.take() {
+            let storage = launch::profile_path(&identifier)?.join("storage");
+            let seeded = ceri_engine::seed_local_storage(&storage, || {
+                crate::chromium::local_storage(&directory, &origin)
+            });
+            if let Err(error) = seeded {
+                eprintln!(
+                    "ceri: could not bring over the localStorage in {}: {error}",
+                    directory.display()
+                );
+            }
+        }
         let handle = self.handle.clone();
         let started = self.lifecycle.started.take();
         self.lifecycle.started = Some(Box::new(move |control| {
