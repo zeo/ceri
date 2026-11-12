@@ -17,6 +17,12 @@ use crate::layout::{
 // what the embedder adds to a layout beyond the document and the runtime's own state
 pub(crate) struct LayoutInputs {
     pub(crate) stylesheet: Rc<Stylesheet>,
+    // each style element and stylesheet link the sheet was built from with the text it gave,
+    // and the document version they were last compared at
+    pub(crate) sheets: Vec<(crate::navigation::SheetSource, String)>,
+    pub(crate) sheets_version: u64,
+    // what rebuilding the sheet dropped or failed to load, for the page's log
+    pub(crate) notes: Vec<String>,
     pub(crate) fonts: Rc<FontSet>,
     // hover, preferences, running transitions and animations, and decoded image sizes
     pub(crate) extras: StyleState,
@@ -261,8 +267,25 @@ impl ScriptRuntime {
         state
     }
 
+    // script reads styles as the document's style elements and stylesheet links now stand
+    pub(super) fn refresh_stylesheet(&self) {
+        let Some(inputs) = &self.layout_inputs else {
+            return;
+        };
+        let resources = self.resources.clone().unwrap_or_default();
+        let provider = self.resource_provider.as_deref();
+        let load = |url: &AppUrl| match resolve_runtime_resource(&resources, provider, url) {
+            Ok(Some(resource)) => Ok(resource),
+            Ok(None) => Err(NavigationError::ResourceNotFound(url.path().to_string())),
+            Err(error) => Err(NavigationError::ResourceProvider(error.message)),
+        };
+        let base = self.location.borrow().clone();
+        crate::navigation::refresh_stylesheet(&self.document.borrow(), inputs, &base, &load);
+    }
+
     // a fresh layout when the document or its state changed since the last measurement
     fn measure(&self) -> Option<std::cell::Ref<'_, MeasuredLayout>> {
+        self.refresh_stylesheet();
         let inputs = self.layout_inputs.as_ref()?.borrow();
         let state = self.layout_state(&inputs);
         let version = self.document.borrow().version();
@@ -527,6 +550,7 @@ impl ScriptRuntime {
         let Some(inputs) = self.layout_inputs.clone() else {
             return values;
         };
+        self.refresh_stylesheet();
         if inputs.borrow().stylesheet.has_container_queries() {
             drop(self.measure());
         }

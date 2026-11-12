@@ -1108,7 +1108,10 @@ impl ScriptRuntime {
             }
             Op::TypeofGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
-                let value = self.lookup_global(&name).unwrap_or(Value::Undefined);
+                let value = match self.get_global_accessor(&name) {
+                    Some(value) => value?,
+                    None => self.lookup_global(&name).unwrap_or(Value::Undefined),
+                };
                 let kind = self.type_of(&value);
                 frames
                     .last_mut()
@@ -1133,7 +1136,9 @@ impl ScriptRuntime {
             }
             Op::DeclareGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
-                if self.lookup_global(&name).is_none() {
+                if self.lookup_global(&name).is_none()
+                    && !self.global.borrow().accessors.contains_key(&*name)
+                {
                     self.global
                         .borrow_mut()
                         .values
@@ -1142,7 +1147,9 @@ impl ScriptRuntime {
             }
             Op::DeleteGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
-                self.global.borrow_mut().values.remove(&*name);
+                let mut global = self.global.borrow_mut();
+                global.values.remove(&*name);
+                global.accessors.remove(&*name);
                 frames
                     .last_mut()
                     .expect("frame")
@@ -1191,11 +1198,22 @@ impl ScriptRuntime {
                     .closure
                     .as_ref()
                     .and_then(|closure| closure.url.clone());
-                let meta = self.new_plain_object();
-                if let Some(url) = url {
-                    meta.borrow_mut()
-                        .insert("url".to_string(), Value::String(url.to_string().into()));
-                }
+                let meta = match url {
+                    Some(url) => {
+                        let key = url.to_string();
+                        match self.import_metas.get(&key) {
+                            Some(meta) => meta.clone(),
+                            None => {
+                                let meta = self.new_plain_object();
+                                meta.borrow_mut()
+                                    .insert("url".to_string(), Value::String(key.as_str().into()));
+                                self.import_metas.insert(key, meta.clone());
+                                meta
+                            }
+                        }
+                    }
+                    None => self.new_plain_object(),
+                };
                 frames
                     .last_mut()
                     .expect("frame")

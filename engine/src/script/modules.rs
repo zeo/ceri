@@ -72,8 +72,29 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         let key = url.to_string();
         let module = parser::parse_module(source)?;
-        let module = compiler::Compiler::new(source).compile_module(&module)?;
+        let mut module = compiler::Compiler::new(source).compile_module(&module)?;
         let scope = vm::Scope::new(module.code.scope_size as usize, None);
+        // an import exported again is resolved through the module it came from, since this
+        // module's slot only receives that binding once it links
+        let mut exports = Vec::new();
+        for (exported, slot) in std::mem::take(&mut module.exports) {
+            let imported = module.imports.iter().find_map(|(specifier, bindings)| {
+                bindings
+                    .iter()
+                    .find(|(_, imported_slot)| *imported_slot == slot)
+                    .map(|(binding, _)| (specifier.clone(), binding.clone()))
+            });
+            match imported {
+                Some((from, ast::ImportBinding::Named { imported, .. })) => {
+                    module.reexports.push((from, imported, exported))
+                }
+                Some((from, ast::ImportBinding::Namespace(_))) => {
+                    module.namespace_exports.push((from, exported))
+                }
+                None => exports.push((exported, slot)),
+            }
+        }
+        module.exports = exports;
         let mut locals = BTreeMap::new();
         for (exported, slot) in &module.exports {
             let cell = Rc::new(RefCell::new(Value::Undefined));
@@ -250,15 +271,8 @@ impl ScriptRuntime {
                     }
                 }
             }
-            let record = graph.records.get_mut(&key).expect("record exists");
-            let mut scope = record.scope.borrow_mut();
+            let mut scope = graph.records[&key].scope.borrow_mut();
             for (slot, value) in slots {
-                // an import that is exported again keeps the binding it was linked to
-                for (exported, export_slot) in &record.module.exports {
-                    if *export_slot == slot {
-                        record.locals.insert(exported.to_string(), value.clone());
-                    }
-                }
                 scope.slots[slot as usize] = value;
             }
         }

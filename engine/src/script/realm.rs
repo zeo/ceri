@@ -133,6 +133,10 @@ pub(super) enum Native {
     ObserverConstructor(super::observers::ObserverKind),
     Xhr(super::xhr::XhrMember),
     XhrConstructor,
+    Url(super::urls::UrlMember),
+    UrlConstructor,
+    UrlSearchParams(super::urls::ParamsMember),
+    UrlSearchParamsConstructor,
     // an asynchronous XMLHttpRequest reporting its answer
     XhrDeliver(u32, u64),
     // an img reporting the outcome of the request it started in this generation
@@ -175,6 +179,8 @@ impl Native {
                 | Native::RangeConstructor(_)
                 | Native::ObserverConstructor(_)
                 | Native::XhrConstructor
+                | Native::UrlConstructor
+                | Native::UrlSearchParamsConstructor
                 | Native::AudioConstructor(_)
         ) || matches!(self, Native::Intl(method) if matches!(**method,
             super::intl::IntlMethod::NumberFormatConstructor
@@ -237,6 +243,7 @@ pub(super) struct Intrinsics {
     pub(super) ranges: super::ranges::RangeInterfaces,
     pub(super) observers: super::observers::ObserverInterfaces,
     pub(super) xhr: super::xhr::XhrInterfaces,
+    pub(super) urls: super::urls::UrlInterfaces,
     pub(super) audio: super::audio::AudioInterfaces,
 }
 
@@ -1209,6 +1216,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let ranges = super::ranges::create(&build, &object_prototype, &mut globals);
     let observers = super::observers::create(&build, &object_prototype, &mut globals);
     let xhr = super::xhr::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let urls = super::urls::create(&build, &object_prototype, &mut globals);
     let audio = super::audio::create(
         &build,
         &dom.prototype("EventTarget"),
@@ -1260,6 +1268,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         ranges,
         observers,
         xhr,
+        urls,
         audio,
     };
     (intrinsics, globals)
@@ -1383,12 +1392,15 @@ impl ScriptRuntime {
                     self.array_expando(array, key).map(Property::data)
                 }
             }
-            Value::Window => self
-                .global
-                .borrow()
-                .values
-                .get(key)
-                .map(|value| Property::data(value.resolve())),
+            Value::Window => {
+                let global = self.global.borrow();
+                global.accessors.get(key).cloned().or_else(|| {
+                    global
+                        .values
+                        .get(key)
+                        .map(|value| Property::data(value.resolve()))
+                })
+            }
             _ => None,
         })
     }
@@ -1445,7 +1457,15 @@ impl ScriptRuntime {
                 keys.push("length".to_string());
                 keys
             }
-            Value::Window if !symbols => self.global.borrow().values.keys().cloned().collect(),
+            Value::Window if !symbols => {
+                let global = self.global.borrow();
+                global
+                    .values
+                    .keys()
+                    .chain(global.accessors.keys())
+                    .cloned()
+                    .collect()
+            }
             other if !symbols => enumerable_object_properties(other.clone())
                 .map(|entries| entries.into_iter().map(|(key, _)| key).collect())
                 .unwrap_or_default(),
@@ -1547,13 +1567,45 @@ impl ScriptRuntime {
                 return Err(self.type_error("accessor properties on arrays are not supported"));
             }
             Value::Window => {
-                if let Slot::Data(value) = property.slot {
-                    self.global.borrow_mut().values.insert(key, value);
-                    return Ok(());
+                let existing = self.global.borrow().accessors.get(&key).cloned();
+                if let Some(current) = existing {
+                    if !current.configurable {
+                        return Err(self.type_error(format!("Cannot redefine property: {key}")));
+                    }
+                    if let (
+                        Slot::Accessor { get, set },
+                        Slot::Accessor {
+                            get: new_get,
+                            set: new_set,
+                        },
+                    ) = (current.slot, &mut property.slot)
+                    {
+                        if !present[4] {
+                            *new_get = get;
+                        }
+                        if !present[5] {
+                            *new_set = set;
+                        }
+                        if !present[0] {
+                            property.enumerable = current.enumerable;
+                        }
+                        if !present[1] {
+                            property.configurable = current.configurable;
+                        }
+                    }
                 }
-                return Err(
-                    self.type_error("accessor properties on the global object are not supported")
-                );
+                let mut global = self.global.borrow_mut();
+                match property.slot {
+                    Slot::Data(value) => {
+                        global.accessors.remove(&key);
+                        global.values.insert(key, value);
+                    }
+                    Slot::Accessor { .. } => {
+                        global.values.remove(&key);
+                        global.accessors.insert(key, property);
+                    }
+                }
+                return Ok(());
             }
             _ => return Err(self.type_error("Object.defineProperty called on non-object")),
         };
@@ -1829,7 +1881,16 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Object(result))
             }
-            Native::ObjectKeys | Native::ObjectValues | Native::ObjectEntries => {
+            Native::ObjectKeys => {
+                let target = self.coerce_object(first)?;
+                let keys = self.own_enumerable_keys(&target)?;
+                Ok(Self::new_array(
+                    keys.into_iter()
+                        .map(|key| Value::String(key.into()))
+                        .collect(),
+                ))
+            }
+            Native::ObjectValues | Native::ObjectEntries => {
                 let target = self.coerce_object(first)?;
                 let entries: Vec<(String, Value)> = self
                     .own_enumerable_entries(&target)?
@@ -1839,7 +1900,6 @@ impl ScriptRuntime {
                 let values = entries
                     .into_iter()
                     .map(|(key, value)| match native {
-                        Native::ObjectKeys => Value::String(key.into()),
                         Native::ObjectValues => value,
                         _ => Self::new_array(vec![Value::String(key.into()), value]),
                     })
@@ -2364,6 +2424,14 @@ impl ScriptRuntime {
             Native::Window(method) => self.call_window_method(method, this, arguments),
             Native::Observer(method) => self.call_observer_method(method, this, arguments),
             Native::Xhr(member) => self.call_xhr(member, this, arguments),
+            Native::Url(member) => self.call_url(member, this, arguments),
+            Native::UrlSearchParams(member) => self.call_url_search_params(member, this, arguments),
+            Native::UrlConstructor => {
+                Err(self.type_error("Failed to construct 'URL': Please use the 'new' operator"))
+            }
+            Native::UrlSearchParamsConstructor => Err(self.type_error(
+                "Failed to construct 'URLSearchParams': Please use the 'new' operator",
+            )),
             Native::CustomElements(method) => self.call_registry(method, arguments),
             Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
             Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
@@ -2657,6 +2725,10 @@ impl ScriptRuntime {
                 self.construct_observer(kind, arguments, new_target)
             }
             Native::XhrConstructor => self.construct_xhr(new_target),
+            Native::UrlConstructor => self.construct_url(arguments, new_target),
+            Native::UrlSearchParamsConstructor => {
+                self.construct_url_search_params(arguments, new_target)
+            }
             Native::AudioConstructor(class) => self.construct_audio(class, arguments, new_target),
             Native::Codec(method) => {
                 self.call_codec(method, Value::Undefined, arguments, Some(new_target))

@@ -44,6 +44,7 @@ mod unicode_tables;
 mod variation;
 mod video;
 mod wasm;
+mod weburl;
 #[cfg(feature = "windowed")]
 mod window;
 mod woff;

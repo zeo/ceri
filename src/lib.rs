@@ -8,6 +8,7 @@ mod custom;
 #[cfg(not(target_os = "windows"))]
 mod dbus;
 mod desktop;
+mod dev;
 mod dialog;
 pub mod dirs;
 mod files;

@@ -110,6 +110,8 @@ pub(super) enum ObjectClass {
     },
     TextDecoder(Rc<RefCell<super::encoding::DecoderState>>),
     Intl(Rc<super::intl::IntlState>),
+    Url(Rc<RefCell<super::urls::UrlState>>),
+    UrlSearchParams(Rc<RefCell<super::urls::ParamsState>>),
 }
 
 #[derive(Clone)]

@@ -67,8 +67,6 @@ pub(super) fn is_callable(value: &Value) -> bool {
         | Value::ResponseConstructor
         | Value::RequestConstructor
         | Value::HeadersConstructor
-        | Value::UrlConstructor
-        | Value::UrlSearchParamsConstructor
         | Value::FormDataConstructor
         | Value::BlobConstructor
         | Value::FileConstructor
@@ -1001,6 +999,9 @@ impl ScriptRuntime {
     }
 
     fn window_get(&mut self, key: &str) -> Result<Value, ScriptError> {
+        if let Some(value) = self.get_global_accessor(key) {
+            return value;
+        }
         if let Some(value) = self.global.borrow().values.get(key) {
             return Ok(value.resolve());
         }
@@ -1363,7 +1364,16 @@ impl ScriptRuntime {
                 Ok(true)
             }
             Value::Window => {
-                self.global.borrow_mut().values.remove(key);
+                let mut global = self.global.borrow_mut();
+                if global
+                    .accessors
+                    .get(key)
+                    .is_some_and(|property| !property.configurable)
+                {
+                    return Ok(false);
+                }
+                global.accessors.remove(key);
+                global.values.remove(key);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1399,7 +1409,11 @@ impl ScriptRuntime {
                 self.host_has(target, key)
             }
             Value::Window => {
-                if self.global.borrow().values.contains_key(key) {
+                let own = {
+                    let global = self.global.borrow();
+                    global.values.contains_key(key) || global.accessors.contains_key(key)
+                };
+                if own {
                     return Ok(true);
                 }
                 self.host_has(target, key)
@@ -1557,8 +1571,17 @@ impl ScriptRuntime {
         &mut self,
         source: &Value,
     ) -> Result<Vec<(String, Value)>, ScriptError> {
+        self.enumerable_own_properties(source, true)
+    }
+
+    // keys alone are read without calling getters, as Object.keys does
+    fn enumerable_own_properties(
+        &mut self,
+        source: &Value,
+        with_values: bool,
+    ) -> Result<Vec<(String, Value)>, ScriptError> {
         if let Some(object) = self.wrapper_object(source) {
-            return self.own_enumerable_entries(&Value::Object(object));
+            return self.enumerable_own_properties(&Value::Object(object), with_values);
         }
         match source {
             Value::Object(object) if super::reflect::proxy_of(object).is_some() => {
@@ -1570,7 +1593,11 @@ impl ScriptRuntime {
                         .proxy_own_property(&proxy, &key)?
                         .is_some_and(|property| property.enumerable);
                     if enumerable {
-                        let value = self.proxy_get(&proxy, &key, source)?;
+                        let value = if with_values {
+                            self.proxy_get(&proxy, &key, source)?
+                        } else {
+                            Value::Undefined
+                        };
                         entries.push((key, value));
                     }
                 }
@@ -1603,7 +1630,11 @@ impl ScriptRuntime {
                 }
                 let mut entries = Vec::with_capacity(keys.len());
                 for key in keys {
-                    let value = self.ordinary_get(object.clone(), &key, source)?;
+                    let value = if with_values {
+                        self.ordinary_get(object.clone(), &key, source)?
+                    } else {
+                        Value::Undefined
+                    };
                     entries.push((key, value));
                 }
                 Ok(entries)
@@ -1618,7 +1649,7 @@ impl ScriptRuntime {
         value: &Value,
     ) -> Result<Vec<String>, ScriptError> {
         Ok(self
-            .own_enumerable_entries(value)?
+            .enumerable_own_properties(value, false)?
             .into_iter()
             .map(|(key, _)| key)
             .filter(|key| !super::object::is_symbol_key(key))
@@ -1812,7 +1843,21 @@ impl ScriptRuntime {
         self.member(Value::Window, name).ok()
     }
 
+    // the getter a global accessor runs, or undefined when it has none
+    pub(super) fn get_global_accessor(&mut self, name: &str) -> Option<Result<Value, ScriptError>> {
+        let property = self.global.borrow().accessors.get(name).cloned()?;
+        Some(match property.slot {
+            Slot::Accessor {
+                get: Some(getter), ..
+            } => self.call_function(getter, Value::Window, Vec::new()),
+            _ => Ok(Value::Undefined),
+        })
+    }
+
     pub(super) fn get_global(&mut self, name: &str) -> Result<Value, ScriptError> {
+        if let Some(value) = self.get_global_accessor(name) {
+            return value;
+        }
         match self.lookup_global(name) {
             Some(Value::Uninitialized) => {
                 Err(self.reference_error(format!("Cannot access '{name}' before initialization")))
@@ -1834,6 +1879,20 @@ impl ScriptRuntime {
         }
         if self.worker_sender.is_some() && matches!(name, "onmessage" | "onerror") {
             return self.assign_member(Value::Window, name, value);
+        }
+        let accessor = self.global.borrow().accessors.get(name).cloned();
+        if let Some(property) = accessor {
+            return match property.slot {
+                Slot::Accessor {
+                    set: Some(setter), ..
+                } => self
+                    .call_function(setter, Value::Window, vec![value])
+                    .map(drop),
+                _ if strict => Err(self.type_error(format!(
+                    "Cannot set property {name} of #<Window> which has only a getter"
+                ))),
+                _ => Ok(()),
+            };
         }
         let existing = self.global.borrow().values.get(name).cloned();
         match existing {
@@ -2277,8 +2336,6 @@ fn host_instance_of(value: &Value, constructor: &Value) -> bool {
             | (Value::Response(_), Value::ResponseConstructor)
             | (Value::Request(_), Value::RequestConstructor)
             | (Value::Headers(_), Value::HeadersConstructor)
-            | (Value::Url(_), Value::UrlConstructor)
-            | (Value::UrlSearchParams(_), Value::UrlSearchParamsConstructor)
             | (Value::FormData(_), Value::FormDataConstructor)
             | (Value::AbortController(_), Value::AbortControllerConstructor)
     )
@@ -2302,17 +2359,6 @@ fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
             iterator.index = iterator.values.len();
             values
         }
-        Value::UrlSearchParams(params) => params
-            .borrow()
-            .pairs
-            .iter()
-            .map(|(name, value)| {
-                pair(
-                    Value::String(name.clone().into()),
-                    Value::String(value.clone().into()),
-                )
-            })
-            .collect(),
         Value::FormData(form_data) => form_data
             .borrow()
             .pairs

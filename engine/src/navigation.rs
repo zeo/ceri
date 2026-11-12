@@ -138,7 +138,7 @@ impl AppUrl {
             .split_once('?')
             .map_or((target, "", false), |(path, query)| (path, query, true));
         // the reference is still escaped, so the base joins it escaped too
-        let base = encode_path(&self.path);
+        let base = encode_path(&self.path, self.files);
         let path = if raw_path.is_empty() {
             base.to_string()
         } else if raw_path.starts_with('/') {
@@ -174,7 +174,12 @@ impl AppUrl {
 
 impl fmt::Display for AppUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}{}", self.origin(), encode_path(&self.path))?;
+        write!(
+            formatter,
+            "{}{}",
+            self.origin(),
+            encode_path(&self.path, self.files)
+        )?;
         if !self.query.is_empty() {
             write!(formatter, "?{}", self.query)?;
         }
@@ -186,14 +191,19 @@ impl fmt::Display for AppUrl {
 }
 
 // the characters a decoded path may hold that would end it or start an escape in a URL
-fn encode_path(path: &str) -> std::borrow::Cow<'_, str> {
-    match path.contains(['%', '?', '#', ':']) {
-        true => path
-            .replace('%', "%25")
-            .replace('?', "%3F")
-            .replace('#', "%23")
-            .replace(':', "%3A")
-            .into(),
+fn encode_path(path: &str, files: bool) -> std::borrow::Cow<'_, str> {
+    let colon = files && path.contains(':');
+    match colon || path.contains(['%', '?', '#']) {
+        true => {
+            let path = path
+                .replace('%', "%25")
+                .replace('?', "%3F")
+                .replace('#', "%23");
+            match colon {
+                true => path.replace(':', "%3A").into(),
+                false => path.into(),
+            }
+        }
         false => path.into(),
     }
 }
@@ -736,7 +746,7 @@ impl fmt::Display for NavigationError {
             }
             Self::Backslash => formatter.write_str("backslashes are not allowed in app paths"),
             Self::NulByte => formatter.write_str("NUL bytes are not allowed in app paths"),
-            Self::Colon => formatter.write_str("colons are not allowed in app paths"),
+            Self::Colon => formatter.write_str("a files path must escape its colons"),
             Self::UnsafeCharacter => {
                 formatter.write_str("unsafe characters are not allowed in app paths")
             }
@@ -889,11 +899,9 @@ struct LoadedResource {
 struct Page {
     document: Rc<RefCell<Document>>,
     runtime: ScriptRuntime,
-    // parsed once per document, because layout and paint run on every frame
-    stylesheet: Rc<Stylesheet>,
-    // shared with the runtime, so script can lay out the document to measure it
+    // the parsed stylesheet, shared with the runtime so script can lay out the document to
+    // measure it
     layout_inputs: Rc<RefCell<LayoutInputs>>,
-    animated: bool,
     // the page clock time the last layout's animations next change what they show
     animation_wake: Cell<Option<u64>>,
     // the last custom property passes, each keyed by the document version and the state it read
@@ -924,7 +932,11 @@ impl Page {
             state.root = populated.root;
             return;
         }
-        self.stylesheet.populate_custom_properties(document, state);
+        self.layout_inputs
+            .borrow()
+            .stylesheet
+            .clone()
+            .populate_custom_properties(document, state);
         let populated = StyleState {
             custom_properties: state.custom_properties.clone(),
             root: state.root,
@@ -1275,9 +1287,30 @@ impl Browser {
         }
     }
 
-    fn layout_inputs(&self, stylesheet: Rc<Stylesheet>) -> Rc<RefCell<LayoutInputs>> {
+    // the page's stylesheet as its style elements and stylesheet links now stand
+    fn stylesheet(&self, page: &Page) -> Rc<Stylesheet> {
+        if let Some(base) = &self.current_url {
+            refresh_stylesheet(
+                &page.document.borrow(),
+                &page.layout_inputs,
+                base,
+                &|url: &AppUrl| self.load_subresource(url),
+            );
+        }
+        page.layout_inputs.borrow().stylesheet.clone()
+    }
+
+    fn layout_inputs(
+        &self,
+        stylesheet: Stylesheet,
+        sheets: Vec<(SheetSource, String)>,
+        document: &Document,
+    ) -> Rc<RefCell<LayoutInputs>> {
         Rc::new(RefCell::new(LayoutInputs {
-            stylesheet,
+            stylesheet: Rc::new(stylesheet),
+            sheets,
+            sheets_version: document.version(),
+            notes: Vec::new(),
             fonts: self.fonts.clone(),
             extras: StyleState {
                 color_scheme: self.preferences.color_scheme,
@@ -1466,11 +1499,7 @@ impl Browser {
             let document = document.borrow();
             let nonce = |node| document.attribute(node, "nonce").map(str::to_string);
             (
-                document
-                    .stylesheet_elements()
-                    .into_iter()
-                    .map(|(node, source)| (nonce(node), source))
-                    .collect::<Vec<_>>(),
+                sheet_sources(&document),
                 document
                     .script_elements()
                     .into_iter()
@@ -1478,8 +1507,16 @@ impl Browser {
                     .collect::<Vec<_>>(),
             )
         };
-        let stylesheet = match self.load_stylesheets(&url, &stylesheet_sources, &policies) {
-            Ok(stylesheet) => stylesheet,
+        let load = |url: &AppUrl| self.load_subresource(url);
+        let sheets = stylesheet_sources
+            .into_iter()
+            .map(|source| {
+                let text = load_sheet(&load, &url, &source, &policies)?;
+                Ok((source, text.unwrap_or_default()))
+            })
+            .collect::<Result<Vec<_>, NavigationError>>();
+        let sheets = match sheets {
+            Ok(sheets) => sheets,
             Err(error) => {
                 let status = recovery_status(&error);
                 self.install_error_page(&url, status, &error.to_string());
@@ -1511,14 +1548,14 @@ impl Browser {
         }
         runtime.set_viewport_metrics(self.viewport);
         runtime.report_refusals();
-        let (parsed_stylesheet, dropped_rules) = Stylesheet::parse_recovering(&stylesheet);
+        let (parsed_stylesheet, dropped_rules) =
+            Stylesheet::parse_recovering(&joined_sheets(&sheets));
         for dropped in dropped_rules {
             runtime.report(format!("dropped CSS rule: {dropped}"));
         }
-        let parsed_stylesheet = Rc::new(parsed_stylesheet);
-        self.load_web_fonts(&url, &parsed_stylesheet, &policies);
+        load_web_fonts(&load, &self.fonts, &url, &parsed_stylesheet, &policies);
         runtime.report_refusals();
-        let layout_inputs = self.layout_inputs(parsed_stylesheet.clone());
+        let layout_inputs = self.layout_inputs(parsed_stylesheet, sheets, &document.borrow());
         runtime.set_layout_inputs(layout_inputs.clone());
         runtime.load_document_images();
         if let Err(error) = self.execute_scripts(&url, &script_sources, &policies, &mut runtime) {
@@ -1537,13 +1574,10 @@ impl Browser {
         self.persist_storage()?;
 
         let pending_navigation = runtime.take_navigation_request();
-        let animated = parsed_stylesheet.has_animations();
         self.page = Some(Page {
             document,
             runtime,
-            stylesheet: parsed_stylesheet,
             layout_inputs,
-            animated,
             animation_wake: Cell::new(None),
             custom_properties: RefCell::default(),
         });
@@ -1582,7 +1616,8 @@ impl Browser {
         let Some(page) = self.page.as_ref() else {
             return Ok(false);
         };
-        let has_motion = page.stylesheet.has_transitions() || page.animated;
+        let stylesheet = self.stylesheet(page);
+        let has_motion = stylesheet.has_transitions() || stylesheet.has_animations();
         if !has_motion || self.preferences.reduced_motion {
             self.transitions.clear();
             self.declared.clear();
@@ -1604,13 +1639,13 @@ impl Browser {
         let mut seen_animations = BTreeSet::new();
         let mut events = Vec::new();
         let mut changed = false;
-        let candidates = collect_motion_candidates(&page.stylesheet, &state, &document);
+        let candidates = collect_motion_candidates(&stylesheet, &state, &document);
         // custom properties cost a document-wide pass, so only pages with moving elements pay it
         if !candidates.is_empty() {
             page.populate_custom_properties(&document, &mut state);
         }
         for node in candidates {
-            let values = page.stylesheet.declared_values(StyleContext {
+            let values = stylesheet.declared_values(StyleContext {
                 document: &document,
                 node,
                 pseudo: None,
@@ -1674,7 +1709,7 @@ impl Browser {
                 }
             }
             if let Some(animation) = crate::css::animation_from(&values)
-                .filter(|animation| page.stylesheet.has_keyframes(&animation.name))
+                .filter(|animation| stylesheet.has_keyframes(&animation.name))
             {
                 seen_animations.insert(node);
                 if self
@@ -1958,7 +1993,7 @@ impl Browser {
         state.viewport_height = viewport.height;
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
-        page.stylesheet
+        self.stylesheet(page)
             .computed_style(&document, element, &state)
             .is_some_and(|(style, _)| style.drag_region)
     }
@@ -2597,9 +2632,9 @@ impl Browser {
 
     pub fn layout(&self, viewport: Size) -> Result<Rc<LayoutDocument>, NavigationError> {
         let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
+        let stylesheet = &self.stylesheet(page);
         let document = page.document.clone();
         let document = document.borrow();
-        let stylesheet = &page.stylesheet;
         let mut style_state = page.runtime.style_state(self.hovered_node);
         style_state.hovered_part = self
             .hovered_thumb
@@ -3053,133 +3088,6 @@ impl Browser {
         }
     }
 
-    fn load_stylesheets(
-        &self,
-        base: &AppUrl,
-        sources: &[(Option<String>, StylesheetSource)],
-        policies: &Policies,
-    ) -> Result<String, NavigationError> {
-        let mut stylesheet = String::new();
-        for (nonce, source) in sources {
-            let element = Initiator {
-                nonce: nonce.as_deref(),
-                parser_inserted: true,
-            };
-            let source = match source {
-                StylesheetSource::Inline(source) => {
-                    if !policies.permits(policies.inline(Directive::StyleElem, source, element)) {
-                        continue;
-                    }
-                    self.expand_imports(source.clone(), base, 0, policies)
-                }
-                StylesheetSource::External(reference) => {
-                    let url = base.resolve(reference)?;
-                    if !policies.permits(policies.url(
-                        Directive::StyleElem,
-                        &url.to_string(),
-                        element,
-                    )) {
-                        continue;
-                    }
-                    let resource = self.load_subresource(&url)?;
-                    if !is_css(&resource) {
-                        return Err(NavigationError::UnsupportedMimeType {
-                            path: url.path().to_string(),
-                            mime_type: resource.mime_type,
-                        });
-                    }
-                    let text = String::from_utf8(resource.body)
-                        .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
-                    // urls in an external sheet are relative to it, not to the page
-                    let text = crate::css::absolutize_urls(&text, &|reference| {
-                        url.resolve(reference)
-                            .ok()
-                            .map(|absolute| absolute.to_string())
-                    });
-                    self.expand_imports(text, &url, 0, policies)
-                }
-            };
-            if !stylesheet.is_empty() {
-                stylesheet.push('\n');
-            }
-            stylesheet.push_str(&source);
-        }
-        Ok(stylesheet)
-    }
-
-    // splices each @import's stylesheet in place of the rule, inside the layer, supports and
-    // media conditions it names; one that fails to load is skipped, as a browser does
-    fn expand_imports(
-        &self,
-        text: String,
-        base: &AppUrl,
-        depth: usize,
-        policies: &Policies,
-    ) -> String {
-        const MAX_IMPORT_DEPTH: usize = 8;
-        let (imports, statements, rest) = crate::css::leading_imports(&text);
-        if imports.is_empty() {
-            return text;
-        }
-        let mut expanded = statements;
-        for import in imports {
-            if depth >= MAX_IMPORT_DEPTH {
-                continue;
-            }
-            let Ok(url) = base.resolve(&import.url) else {
-                continue;
-            };
-            if !policies.permits(policies.url(
-                Directive::StyleElem,
-                &url.to_string(),
-                Initiator::default(),
-            )) {
-                continue;
-            }
-            let Ok(resource) = self.load_subresource(&url) else {
-                continue;
-            };
-            if !is_css(&resource) {
-                continue;
-            }
-            let Ok(body) = String::from_utf8(resource.body) else {
-                continue;
-            };
-            expanded.push_str(&import.open);
-            expanded.push_str(&self.expand_imports(body, &url, depth + 1, policies));
-            expanded.push_str(&import.close);
-            expanded.push('\n');
-        }
-        expanded.push_str(&rest);
-        expanded
-    }
-
-    // fetches each @font-face rule's first source that loads and parses; a rule with none is
-    // skipped, and its family falls back to installed faces
-    fn load_web_fonts(&self, base: &AppUrl, stylesheet: &Stylesheet, policies: &Policies) {
-        self.fonts.clear_web_faces();
-        for rule in stylesheet.font_faces() {
-            let face = rule.sources.iter().find_map(|source| {
-                let url = base.resolve(source).ok()?;
-                let check = policies.url(Directive::Font, &url.to_string(), Initiator::default());
-                if !policies.permits(check) {
-                    return None;
-                }
-                let resource = self.load_subresource(&url).ok()?;
-                crate::font::FontFace::parse(resource.body).ok()
-            });
-            if let Some(face) = face {
-                self.fonts.add_web_face(
-                    &rule.family,
-                    rule.weights,
-                    rule.italic,
-                    rule.ranges.clone(),
-                    Rc::new(face),
-                );
-            }
-        }
-    }
-
     fn execute_scripts(
         &self,
         base: &AppUrl,
@@ -3272,8 +3180,18 @@ impl Browser {
         let document = Rc::new(RefCell::new(
             Document::parse(&source).expect("built-in recovery document should parse"),
         ));
-        let stylesheet = Rc::new(Stylesheet::parse_recovering(&document.borrow().style_text()).0);
-        let layout_inputs = self.layout_inputs(stylesheet.clone());
+        let sheets = sheet_sources(&document.borrow())
+            .into_iter()
+            .map(|source| {
+                let text = match &source.1 {
+                    StylesheetSource::Inline(text) => text.clone(),
+                    StylesheetSource::External(_) => String::new(),
+                };
+                (source, text)
+            })
+            .collect::<Vec<_>>();
+        let stylesheet = Stylesheet::parse_recovering(&joined_sheets(&sheets)).0;
+        let layout_inputs = self.layout_inputs(stylesheet, sheets, &document.borrow());
         self.page = Some(Page {
             runtime: {
                 let mut runtime = ScriptRuntime::with_storage_and_runtime_info(
@@ -3297,9 +3215,7 @@ impl Browser {
                 runtime
             },
             document,
-            stylesheet,
             layout_inputs,
-            animated: false,
             animation_wake: Cell::new(None),
             custom_properties: RefCell::default(),
         });
@@ -3356,6 +3272,213 @@ fn is_html(resource: &Resource) -> bool {
         .split(';')
         .next()
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+}
+
+pub(crate) type LoadResource<'a> = &'a dyn Fn(&AppUrl) -> Result<Resource, NavigationError>;
+pub(crate) type SheetSource = (Option<String>, StylesheetSource);
+
+// the stylesheet elements a document has, with their nonces, in tree order
+pub(crate) fn sheet_sources(document: &Document) -> Vec<SheetSource> {
+    document
+        .stylesheet_elements()
+        .into_iter()
+        .map(|(node, source)| {
+            (
+                document.attribute(node, "nonce").map(str::to_string),
+                source,
+            )
+        })
+        .collect()
+}
+
+// one style element's or stylesheet link's text with its imports spliced in, or none when the
+// policy refuses it
+fn load_sheet(
+    load: LoadResource,
+    base: &AppUrl,
+    (nonce, source): &SheetSource,
+    policies: &Policies,
+) -> Result<Option<String>, NavigationError> {
+    let element = Initiator {
+        nonce: nonce.as_deref(),
+        parser_inserted: true,
+    };
+    match source {
+        StylesheetSource::Inline(source) => {
+            if !policies.permits(policies.inline(Directive::StyleElem, source, element)) {
+                return Ok(None);
+            }
+            Ok(Some(expand_imports(
+                load,
+                source.clone(),
+                base,
+                0,
+                policies,
+            )))
+        }
+        StylesheetSource::External(reference) => {
+            let url = base.resolve(reference)?;
+            if !policies.permits(policies.url(Directive::StyleElem, &url.to_string(), element)) {
+                return Ok(None);
+            }
+            let resource = load(&url)?;
+            if !is_css(&resource) {
+                return Err(NavigationError::UnsupportedMimeType {
+                    path: url.path().to_string(),
+                    mime_type: resource.mime_type,
+                });
+            }
+            let text = String::from_utf8(resource.body)
+                .map_err(|_| NavigationError::InvalidUtf8(url.path().to_string()))?;
+            // urls in an external sheet are relative to it, not to the page
+            let text = crate::css::absolutize_urls(&text, &|reference| {
+                url.resolve(reference)
+                    .ok()
+                    .map(|absolute| absolute.to_string())
+            });
+            Ok(Some(expand_imports(load, text, &url, 0, policies)))
+        }
+    }
+}
+
+fn joined_sheets(sheets: &[(SheetSource, String)]) -> String {
+    sheets
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// splices each @import's stylesheet in place of the rule, inside the layer, supports and
+// media conditions it names; one that fails to load is skipped, as a browser does
+fn expand_imports(
+    load: LoadResource,
+    text: String,
+    base: &AppUrl,
+    depth: usize,
+    policies: &Policies,
+) -> String {
+    const MAX_IMPORT_DEPTH: usize = 8;
+    let (imports, statements, rest) = crate::css::leading_imports(&text);
+    if imports.is_empty() {
+        return text;
+    }
+    let mut expanded = statements;
+    for import in imports {
+        if depth >= MAX_IMPORT_DEPTH {
+            continue;
+        }
+        let Ok(url) = base.resolve(&import.url) else {
+            continue;
+        };
+        if !policies.permits(policies.url(
+            Directive::StyleElem,
+            &url.to_string(),
+            Initiator::default(),
+        )) {
+            continue;
+        }
+        let Ok(resource) = load(&url) else {
+            continue;
+        };
+        if !is_css(&resource) {
+            continue;
+        }
+        let Ok(body) = String::from_utf8(resource.body) else {
+            continue;
+        };
+        expanded.push_str(&import.open);
+        expanded.push_str(&expand_imports(load, body, &url, depth + 1, policies));
+        expanded.push_str(&import.close);
+        expanded.push('\n');
+    }
+    expanded.push_str(&rest);
+    expanded
+}
+
+// fetches each @font-face rule's first source that loads and parses; a rule with none is
+// skipped, and its family falls back to installed faces
+fn load_web_fonts(
+    load: LoadResource,
+    fonts: &FontSet,
+    base: &AppUrl,
+    stylesheet: &Stylesheet,
+    policies: &Policies,
+) {
+    fonts.clear_web_faces();
+    for rule in stylesheet.font_faces() {
+        let face = rule.sources.iter().find_map(|source| {
+            let url = base.resolve(source).ok()?;
+            let check = policies.url(Directive::Font, &url.to_string(), Initiator::default());
+            if !policies.permits(check) {
+                return None;
+            }
+            let resource = load(&url).ok()?;
+            crate::font::FontFace::parse(resource.body).ok()
+        });
+        if let Some(face) = face {
+            fonts.add_web_face(
+                &rule.family,
+                rule.weights,
+                rule.italic,
+                rule.ranges.clone(),
+                Rc::new(face),
+            );
+        }
+    }
+}
+
+// rebuilds the sheet once script added, removed or rewrote a style element or stylesheet link;
+// a sheet still in place keeps the text it loaded with, and one that fails to load stays empty
+pub(crate) fn refresh_stylesheet(
+    document: &Document,
+    inputs: &RefCell<LayoutInputs>,
+    base: &AppUrl,
+    load: LoadResource,
+) {
+    if inputs.borrow().sheets_version == document.version() {
+        return;
+    }
+    let sources = sheet_sources(document);
+    let mut inputs = inputs.borrow_mut();
+    inputs.sheets_version = document.version();
+    if inputs.sheets.len() == sources.len()
+        && inputs
+            .sheets
+            .iter()
+            .zip(&sources)
+            .all(|((old, _), source)| old == source)
+    {
+        return;
+    }
+    let policies = document.content_security_policy().clone();
+    let mut sheets = Vec::with_capacity(sources.len());
+    for source in sources {
+        let text = match inputs.sheets.iter().find(|(old, _)| *old == source) {
+            Some((_, text)) => text.clone(),
+            None => load_sheet(load, base, &source, &policies)
+                .unwrap_or_else(|error| {
+                    inputs
+                        .notes
+                        .push(format!("stylesheet failed to load: {error}"));
+                    None
+                })
+                .unwrap_or_default(),
+        };
+        sheets.push((source, text));
+    }
+    let (stylesheet, dropped) = Stylesheet::parse_recovering(&joined_sheets(&sheets));
+    inputs.notes.extend(
+        dropped
+            .into_iter()
+            .map(|rule| format!("dropped CSS rule: {rule}")),
+    );
+    if stylesheet.font_faces() != inputs.stylesheet.font_faces() {
+        load_web_fonts(load, &inputs.fonts, base, &stylesheet, &policies);
+    }
+    inputs.stylesheet = Rc::new(stylesheet);
+    inputs.sheets = sheets;
 }
 
 fn is_css(resource: &Resource) -> bool {
@@ -3504,14 +3627,18 @@ fn decode_path_bytes(raw_path: &str, files: bool) -> Result<String, NavigationEr
                 .and_then(|value| hex_value(*value))
                 .ok_or(NavigationError::InvalidPercentEncoding)?;
             let value = (high << 4) | low;
-            if !(files && value == b':') {
+            if value != b':' {
                 reject_path_byte(value, true)?;
             }
             decoded.push(value);
             cursor += 3;
             continue;
         }
-        reject_path_byte(byte, false)?;
+        // an app path may hold a colon, as vite's /@fs/D:/ paths do; the packaged files
+        // refuse one on their own, and a files path names a colon escaped
+        if files || byte != b':' {
+            reject_path_byte(byte, false)?;
+        }
         decoded.push(byte);
         cursor += 1;
     }
@@ -6256,6 +6383,72 @@ mod tests {
     }
 
     #[test]
+    fn styles_script_adds_rewrites_and_removes_apply_as_they_change() {
+        let mut resources = bundle(
+            r##"<div id="box" style="height: 10px"></div><p id="status">idle</p><script>
+                const box = document.getElementById("box");
+                const read = () => getComputedStyle(box).color + "/" + getComputedStyle(box).marginLeft;
+                const log = [read()];
+                const style = document.createElement("style");
+                style.textContent = "#box { color: rgb(1, 2, 3) }";
+                document.head.appendChild(style);
+                log.push(read());
+                const link = document.createElement("link");
+                link.rel = "stylesheet";
+                link.href = "/late.css";
+                document.head.appendChild(link);
+                log.push(read());
+                style.textContent = "#box { color: rgb(4, 5, 6) }";
+                log.push(read());
+                link.remove();
+                log.push(read());
+                document.getElementById("status").textContent = log.join(",");
+                setTimeout(() => {
+                    const wide = document.createElement("style");
+                    wide.textContent = "#box { width: 37px }";
+                    document.head.append(wide);
+                }, 5);
+            </script>"##,
+        );
+        resources
+            .insert(
+                "/late.css",
+                "text/css",
+                b"#box { margin-left: 3px }".to_vec(),
+            )
+            .expect("stylesheet should be accepted");
+        let mut browser = Browser::new(resources);
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        browser.set_viewport(viewport, 1.0);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let (status, target) = {
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            (
+                document.element_text_content(status),
+                document.find_element_by_id("box").expect("box"),
+            )
+        };
+        assert_eq!(
+            status.as_deref(),
+            Some(
+                "rgb(0, 0, 0)/0px,rgb(1, 2, 3)/0px,rgb(1, 2, 3)/3px,rgb(4, 5, 6)/3px,rgb(4, 5, 6)/0px"
+            )
+        );
+        let hit = |browser: &Browser, x| browser.layout(viewport).expect("layout").hit_test(x, 5.0);
+        assert_eq!(hit(&browser, 300.0), Some(target));
+        browser.advance_time(10).expect("timer should run");
+        assert_eq!(hit(&browser, 30.0), Some(target));
+        assert_ne!(hit(&browser, 300.0), Some(target));
+    }
+
+    #[test]
     fn cascade_honours_importance_source_order_colors_and_level_four_selectors() {
         let mut browser = Browser::new(bundle(
             r##"<style>
@@ -8485,9 +8678,24 @@ A</div>
         assert_eq!(sibling.path(), "/home/ana/cover#1.png");
         assert_eq!(sibling.query(), "v=2");
         assert!(matches!(
-            AppUrl::parse("https://app.ceri.invalid/a%3Ab"),
+            AppUrl::parse("https://files.ceri.invalid/home/a:b"),
             Err(NavigationError::Colon)
         ));
+        let module = AppUrl::parse("https://app.ceri.invalid/@fs/D%3A/web/deps.js?v=1")
+            .expect("an app path may hold a colon");
+        assert_eq!(module.path(), "/@fs/D:/web/deps.js");
+        assert_eq!(
+            module.to_string(),
+            "https://app.ceri.invalid/@fs/D:/web/deps.js?v=1"
+        );
+        assert_eq!(
+            AppUrl::parse(&module.to_string()).expect("reparses"),
+            module
+        );
+        assert_eq!(
+            module.resolve("./chunk.js").expect("sibling").path(),
+            "/@fs/D:/web/chunk.js"
+        );
         let page = AppUrl::parse("https://app.ceri.invalid/notes/100%25%23.html").expect("url");
         assert_eq!(page.path(), "/notes/100%#.html");
         assert_eq!(AppUrl::parse(&page.to_string()).expect("reparses"), page);

@@ -70,8 +70,6 @@ pub(super) fn value_address(value: &Value) -> usize {
         Value::Blob(handle) => address!(handle),
         Value::File(handle) => address!(handle),
         Value::FormData(handle) => address!(handle),
-        Value::Url(handle) => address!(handle),
-        Value::UrlSearchParams(handle) => address!(handle),
         Value::Bytes(handle) => address!(handle),
         Value::TypedArray(handle) => address!(handle),
         Value::Worker(handle) => address!(handle),

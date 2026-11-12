@@ -2,6 +2,7 @@ use crate::assets::{AssetOrigin, AssetRoute, EmbeddedAssets, RequestTarget};
 use crate::audio::DesktopAudio;
 use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
+use crate::dev::DevServer;
 use crate::files::FileScope;
 use crate::fonts::SystemFonts;
 use crate::instance;
@@ -97,6 +98,7 @@ pub struct App {
     icon: Option<Vec<u8>>,
     content_security_policy: Option<String>,
     local_storage_import: Option<(PathBuf, String)>,
+    dev_url: Option<String>,
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
@@ -146,6 +148,13 @@ impl App {
         origin: impl Into<String>,
     ) -> Self {
         self.local_storage_import = Some((directory.into(), origin.into()));
+        self
+    }
+
+    // a debug build serves the app origin from this dev server, such as vite's
+    // http://localhost:5173, instead of the packaged pages; a release build ignores it
+    pub fn dev_url(mut self, url: impl Into<String>) -> Self {
+        self.dev_url = Some(url.into());
         self
     }
 
@@ -277,6 +286,10 @@ impl App {
                 );
             }
         }
+        let dev = match self.dev_url.take().filter(|_| cfg!(debug_assertions)) {
+            Some(url) => Some(DevServer::parse(&url)?),
+            None => None,
+        };
         let handle = self.handle.clone();
         let started = self.lifecycle.started.take();
         self.lifecycle.started = Some(Box::new(move |control| {
@@ -303,6 +316,7 @@ impl App {
                 embedded: self.assets,
                 icon: self.icon,
                 content_security_policy: self.content_security_policy,
+                dev,
             },
             &identifier,
             self.windows,
@@ -357,6 +371,7 @@ struct Bridge {
     embedded: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
     content_security_policy: Option<String>,
+    dev: Option<DevServer>,
 }
 
 impl Bridge {
@@ -481,6 +496,7 @@ fn run_app(
                 bridge.files.clone(),
                 bridge.host_bridge(&window.label, Some(&window.control)),
                 bridge.content_security_policy.clone(),
+                bridge.dev.clone(),
             )
         },
         lifecycle,
@@ -516,6 +532,7 @@ fn capture(
             bridge.files.clone(),
             bridge.host_bridge(&config.label, None),
             bridge.content_security_policy.clone(),
+            bridge.dev.clone(),
         )?,
         Size {
             width: config.width as f32,
@@ -557,6 +574,7 @@ fn build_browser(
     files: FileScope,
     bridge: HostBridge,
     content_security_policy: Option<String>,
+    dev: Option<DevServer>,
 ) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
         .map_err(|error| format!("could not create {}: {error}", storage.display()))?;
@@ -566,6 +584,7 @@ fn build_browser(
             assets,
             allowed_origins,
             files,
+            dev,
         }),
     )
     .with_storage_directory(&storage)
@@ -679,6 +698,7 @@ struct PackagedAssets {
     assets: Arc<AssetOrigin>,
     allowed_origins: Vec<String>,
     files: FileScope,
+    dev: Option<DevServer>,
 }
 
 impl ResourceProvider for PackagedAssets {
@@ -688,6 +708,9 @@ impl ResourceProvider for PackagedAssets {
                 return Ok(None);
             };
             return read_resource(&path).map(Some);
+        }
+        if let Some(dev) = &self.dev {
+            return dev.get(url);
         }
         let request = url.to_string();
         let target = if is_document_path(url.path()) {
@@ -785,6 +808,7 @@ mod tests {
             assets: Arc::new(AssetOrigin::new(&root).expect("web root should exist")),
             allowed_origins: Vec::new(),
             files: Default::default(),
+            dev: None,
         };
 
         let index = provider
@@ -829,6 +853,7 @@ mod tests {
             assets: Arc::new(AssetOrigin::new(&root).expect("web root should exist")),
             allowed_origins: vec!["https://api.example.test".to_string()],
             files: Default::default(),
+            dev: None,
         };
         let refused = ExternalRequest::new(
             "https://other.example.test/data",
