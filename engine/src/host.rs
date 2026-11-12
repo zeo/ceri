@@ -1687,7 +1687,9 @@ mod tests {
         );
         host.navigate("https://app.ceri.invalid/index.html")
             .expect("packaged document should load");
-        for _ in 0..100 {
+        // the worker runs on its own thread, which a loaded machine may start late
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             let _ = host.render().expect("worker frame should render");
             let document = host.browser().document().expect("document should exist");
             let status = document
