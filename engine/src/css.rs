@@ -800,6 +800,54 @@ fn note_animation_wake(delay: u64) {
         .with(|wake| wake.set(Some(wake.get().map_or(delay, |soonest| soonest.min(delay)))));
 }
 
+// the elements a layout pass sampled motion for, and whether any of it can move a box
+#[derive(Default)]
+struct Motion {
+    nodes: BTreeSet<NodeId>,
+    relayout: bool,
+}
+
+thread_local! {
+    static MOTION: RefCell<Option<Motion>> = const { RefCell::new(None) };
+}
+
+// properties whose motion repaints a box without moving, resizing or restacking anything
+const REPAINT_ONLY: [&str; 8] = [
+    "box-shadow",
+    "background-color",
+    "border-color",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "outline-color",
+];
+
+pub(crate) fn record_motion() {
+    MOTION.with(|motion| *motion.borrow_mut() = Some(Motion::default()));
+}
+
+// the elements whose motion only repaints them, or none when some motion needs a layout
+pub(crate) fn take_motion() -> Option<BTreeSet<NodeId>> {
+    MOTION
+        .with(|motion| motion.borrow_mut().take())
+        .filter(|motion| !motion.relayout)
+        .map(|motion| motion.nodes)
+}
+
+fn note_motion<'a>(node: Option<NodeId>, mut properties: impl Iterator<Item = &'a str>) {
+    MOTION.with(|motion| {
+        if let Some(motion) = motion.borrow_mut().as_mut() {
+            match node {
+                Some(node) if properties.all(|property| REPAINT_ONLY.contains(&property)) => {
+                    motion.nodes.insert(node);
+                }
+                _ => motion.relayout = true,
+            }
+        }
+    });
+}
+
 thread_local! {
     static LAYOUT_ENVIRONMENT: std::cell::Cell<LayoutEnvironment> =
         const { std::cell::Cell::new(LayoutEnvironment {
@@ -2534,6 +2582,7 @@ impl Stylesheet {
         {
             let range = (node, AnimatableProperty::All)..=(node, AnimatableProperty::Perspective);
             for ((_, property), active) in state.transitions.range(range) {
+                note_motion(own, std::iter::once(property.name()));
                 let elapsed = state.clock.saturating_sub(active.started);
                 if elapsed < active.delay {
                     apply_declaration(&mut style, property.name(), &active.from);
@@ -2563,6 +2612,18 @@ impl Stylesheet {
                 .and_then(|node| state.animation_starts.get(&node).copied())
                 .unwrap_or(0);
             let now = state.clock.saturating_sub(started);
+            let keyframes = self
+                .keyframes
+                .iter()
+                .find(|frames| frames.name == animation.name);
+            note_motion(
+                own,
+                keyframes
+                    .into_iter()
+                    .flat_map(|frames| &frames.stops)
+                    .flat_map(|stop| &stop.declarations)
+                    .map(|declaration| declaration.property.as_str()),
+            );
             if let Some(delay) = animation.next_change(now) {
                 note_animation_wake(delay);
             }

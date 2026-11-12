@@ -8600,6 +8600,98 @@ pub(crate) fn resolve_edges(edges: Edges, containing_width: f32, font_size: f32)
     }
 }
 
+// a frame that only moves the clock keeps the boxes of the last layout when every element in
+// motion animates paint-only properties; it gives up when a box did not take those values from
+// its own style, which leaves a full layout to get it right
+pub(crate) fn repaint_motion(
+    document: &Document,
+    stylesheet: &Stylesheet,
+    viewport: Size,
+    [last_state, next_state]: [&StyleState; 2],
+    (nodes, last): (&std::collections::BTreeSet<NodeId>, &LayoutDocument),
+) -> Option<LayoutDocument> {
+    let _viewport_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+        viewport,
+        root_font_size: 16.0,
+    });
+    let _root_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+        viewport,
+        root_font_size: root_font_size(document, stylesheet, viewport, next_state),
+    });
+    let mut styles = HashMap::new();
+    for &node in nodes {
+        // their backgrounds reach the canvas, which a box patch does not
+        if document
+            .element(node)
+            .is_none_or(|element| matches!(element.name.as_str(), "html" | "body"))
+        {
+            return None;
+        }
+        let (last_style, _) = stylesheet.computed_style(document, node, last_state)?;
+        styles.insert(node, last_style);
+    }
+    // the wake belongs to the frame drawn now, not the last one
+    crate::css::take_animation_wake();
+    let mut moved = HashMap::new();
+    for (node, last_style) in styles {
+        let (next_style, font_size) = stylesheet.computed_style(document, node, next_state)?;
+        moved.insert(node, (last_style, next_style, font_size));
+    }
+    let mut next = last.clone();
+    patch_motion(&mut next.root, document, &moved).then_some(next)
+}
+
+fn patch_motion(
+    layout: &mut LayoutBox,
+    document: &Document,
+    moved: &HashMap<NodeId, (Style, Style, f32)>,
+) -> bool {
+    // a field moves only when it holds what the last style gives it
+    fn swap<T: PartialEq>(field: &mut T, [last, next]: [T; 2]) -> bool {
+        if *field == last {
+            *field = next;
+            true
+        } else {
+            last == next
+        }
+    }
+    if let Some((last, next, font_size)) = moved.get(&layout.node)
+        && document
+            .element(layout.node)
+            .is_some_and(|element| element.name == layout.tag)
+    {
+        let styles = [last, next];
+        let width = layout.rect.width;
+        let widths = layout.border.widths;
+        let shadows = styles.map(|style| resolve_shadows(style.shadows, width, *font_size));
+        // inline fragments draw no shadows
+        let shadows_moved = if layout.inline {
+            shadows[0] == shadows[1]
+        } else {
+            swap(&mut layout.shadows, shadows)
+        };
+        let moved = layout.control.is_none()
+            && shadows_moved
+            && swap(&mut layout.background, styles.map(|style| style.background))
+            && swap(&mut layout.backgrounds, styles.map(Style::layers))
+            && swap(
+                &mut layout.border,
+                styles.map(|style| BoxBorder {
+                    widths,
+                    ..BoxBorder::of(style)
+                }),
+            )
+            && swap(&mut layout.outline, styles.map(box_outline));
+        if !moved {
+            return false;
+        }
+    }
+    layout
+        .children
+        .iter_mut()
+        .all(|child| patch_motion(child, document, moved))
+}
+
 // rem resolves against the root element font size, which itself may only use absolute units
 fn root_font_size(
     document: &Document,

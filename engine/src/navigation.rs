@@ -982,7 +982,7 @@ pub struct Browser {
     // the word or block a multi-click selected, which a following drag extends by
     selection_unit: Option<SelectionUnit>,
     // hit testing, cursor lookup and paint after one input all read the same layout
-    layout_cache: RefCell<Option<(LayoutKey, Rc<LayoutDocument>)>>,
+    layout_cache: RefCell<Option<CachedLayout>>,
     // the last frame and what it was painted from, so the next paints only what changed
     painted: RefCell<Option<Painted>>,
 }
@@ -1003,6 +1003,13 @@ struct LayoutKey {
     viewport: Size,
     state: StyleState,
     selections: Vec<crate::layout::ProseSpan>,
+}
+
+struct CachedLayout {
+    key: LayoutKey,
+    layout: Rc<LayoutDocument>,
+    // the elements in motion, when all of it only repaints them
+    motion: Option<BTreeSet<NodeId>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2590,13 +2597,53 @@ impl Browser {
             state: keyed_state,
             selections: page.runtime.prose_selections(),
         };
-        if let Some((cached, layout)) = self.layout_cache.borrow().as_ref()
-            && *cached == key
+        if let Some(cached) = self.layout_cache.borrow().as_ref()
+            && cached.key == key
         {
-            return Ok(layout.clone());
+            return Ok(cached.layout.clone());
+        }
+        page.populate_custom_properties(&document, &mut style_state);
+        let repainted = self.layout_cache.borrow().as_ref().and_then(|cached| {
+            let last = &cached.key;
+            let clock = last.state.clock;
+            let clock_only = last.document == key.document
+                && last.stylesheet == key.stylesheet
+                && last.viewport == key.viewport
+                && last.selections == key.selections
+                && last.state
+                    == StyleState {
+                        clock,
+                        ..key.state.clone()
+                    };
+            let nodes = cached.motion.as_ref().filter(|_| clock_only)?;
+            let last_state = StyleState {
+                clock,
+                ..style_state.clone()
+            };
+            crate::layout::repaint_motion(
+                &document,
+                stylesheet,
+                viewport,
+                [&last_state, &style_state],
+                (nodes, &cached.layout),
+            )
+            .map(|layout| (layout, cached.motion.clone()))
+        });
+        if let Some((layout, motion)) = repainted {
+            page.animation_wake.set(
+                crate::css::take_animation_wake()
+                    .map(|delay| style_state.clock.saturating_add(delay)),
+            );
+            let layout = Rc::new(layout);
+            *self.layout_cache.borrow_mut() = Some(CachedLayout {
+                key,
+                layout: layout.clone(),
+                motion,
+            });
+            return Ok(layout);
         }
         crate::css::take_animation_wake();
-        page.populate_custom_properties(&document, &mut style_state);
+        crate::css::record_motion();
         let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
         // container queries read sizes from a layout, so a change in them lays out once more
         if stylesheet.has_container_queries() {
@@ -2608,6 +2655,7 @@ impl Browser {
             }
             *self.container_sizes.borrow_mut() = style_state.container_sizes.clone();
         }
+        let motion = crate::css::take_motion();
         page.animation_wake.set(
             crate::css::take_animation_wake().map(|delay| style_state.clock.saturating_add(delay)),
         );
@@ -2626,7 +2674,11 @@ impl Browser {
             self.attach_image_layers(page, base, &document, &mut layout);
         }
         let layout = Rc::new(layout);
-        *self.layout_cache.borrow_mut() = Some((key, layout.clone()));
+        *self.layout_cache.borrow_mut() = Some(CachedLayout {
+            key,
+            layout: layout.clone(),
+            motion,
+        });
         Ok(layout)
     }
 
@@ -5440,6 +5492,49 @@ mod tests {
             document.element_text_content(status).as_deref(),
             Some("327x325x105x105,327x325x105x105,320x105x120x105,50x20x50x20,80x32x62x32")
         );
+    }
+
+    #[test]
+    fn paint_only_motion_keeps_the_last_layout_and_matches_a_full_one() {
+        let viewport = Size {
+            width: 200.0,
+            height: 120.0,
+        };
+        let page = |rules: &str| {
+            let mut browser = Browser::new(bundle(&format!(
+                "<style>@keyframes glow {{ 50% {{ box-shadow: 0 0 0 4px #0000ff; border-color: #00ff00; background-color: #ffff00 }} }} #dot {{ width: 20px; height: 20px; border: 2px solid #000000; box-shadow: 0 0 0 4px #ff0000 }} {rules}</style><div id=\"dot\"></div><p>text</p>"
+            )));
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("motion page should load");
+            browser.layout(viewport).expect("first layout");
+            browser
+        };
+        let mut browser = page("#dot { animation: glow 1000ms linear infinite }");
+        for _ in 0..3 {
+            // a mark a full layout would not keep
+            let marked = {
+                let mut cache = browser.layout_cache.borrow_mut();
+                let cached = cache.as_mut().expect("a cached layout");
+                assert!(cached.motion.is_some());
+                let mut layout = (*cached.layout).clone();
+                layout.root.tag = "#marked".to_string();
+                cached.layout = Rc::new(layout);
+                cached.layout.root.clone()
+            };
+            browser.advance_time(120).expect("animation frame");
+            let mut fast = (*browser.layout(viewport).expect("fast layout")).clone();
+            assert_eq!(fast.root.tag, "#marked");
+            assert_ne!(fast.root, marked);
+            *browser.layout_cache.borrow_mut() = None;
+            let full = browser.layout(viewport).expect("full layout");
+            fast.root.tag = full.root.tag.clone();
+            assert_eq!(fast, *full);
+        }
+        let browser =
+            page("@keyframes grow { to { width: 40px } } #dot { animation: grow 1000ms infinite }");
+        let cache = browser.layout_cache.borrow();
+        assert!(cache.as_ref().expect("a cached layout").motion.is_none());
     }
 
     #[test]
