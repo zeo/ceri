@@ -2,8 +2,8 @@ use crate::bidi::{BidiClass, bidi_class, mirrored, resolve_levels, visual_order}
 use crate::border::{BorderSide, BorderStyle, CornerLengths};
 use crate::css::{
     AlignContent, AlignItems, Color, Display, Edges, FontWeight, InheritedText, JustifyContent,
-    Length, Overflow, Position, PseudoElement, Style, StyleContext, StyleState, Stylesheet,
-    TextAlign, inherited_text,
+    Length, LengthTerms, Overflow, Position, PseudoElement, Style, StyleContext, StyleState,
+    Stylesheet, TextAlign, inherited_text,
 };
 use crate::css::{
     Clear, Cursor, Float, ListStyleType, OverflowWrap, ScrollbarWidth, SpaceCollapse,
@@ -2663,11 +2663,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         node,
         &style,
         font_size,
-        style
-            .line_height
-            .resolve(font_size, font_size)
-            .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
-            .max(1.0),
+        used_line_height(&style, font_size),
         style_state,
     );
     // an out-of-flow box with both block insets set stretches between them
@@ -2887,11 +2883,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             mode,
         }));
     }
-    let line_height = style
-        .line_height
-        .resolve(font_size, font_size)
-        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
-        .max(1.0);
+    let line_height = used_line_height(&style, font_size);
     // a box that starts a formatting context keeps a float area of its own
     let float_area = match floats {
         Some(area) if !establishes_formatting_context(&style) => area,
@@ -4052,11 +4044,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         text: inherited_text(&style),
         opacity: 1.0,
     };
-    let line_height = style
-        .line_height
-        .resolve(font_size, font_size)
-        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
-        .max(1.0);
+    let line_height = used_line_height(&style, font_size);
     let text_context = InlineContext {
         font_size,
         line_height,
@@ -4708,11 +4696,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         text: inherited_text(&style),
         opacity: 1.0,
     };
-    let line_height = style
-        .line_height
-        .resolve(font_size, font_size)
-        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
-        .max(1.0);
+    let line_height = used_line_height(&style, font_size);
     let text_context = InlineContext {
         font_size,
         line_height,
@@ -6027,7 +6011,8 @@ fn control_content_size(
                 })
                 .map(|option| measure(document.text_content(option).trim()))
                 .fold(0.0, f32::max);
-            (Some(widest), Some(line_height))
+            // chromium rounds the widest option up to a whole pixel
+            (Some(widest.ceil()), Some(line_height))
         }
         ControlType::File => (
             Some(file_button_width(&measure) + font_size * 0.4 + measure(FILE_EMPTY_LABEL)),
@@ -6217,11 +6202,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         node,
         &style,
         font_size,
-        style
-            .line_height
-            .resolve(font_size, font_size)
-            .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
-            .max(1.0),
+        used_line_height(&style, font_size),
         style_state,
     ) {
         return extras + width;
@@ -7350,11 +7331,7 @@ fn append_inline_element(
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(1.0);
-    let line_height = style
-        .line_height
-        .resolve(font_size, font_size)
-        .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
-        .max(1.0);
+    let line_height = used_line_height(&style, font_size);
     let (above, _) = line_extent(line_height, style.font_family, font_size);
     let raise = match vertical_shift(
         style.vertical_align,
@@ -7984,10 +7961,7 @@ fn append_atomic(
         .map_or(outer_height, |baseline| {
             laid_out.margin.top + baseline - laid_out.rect.y
         });
-    let line_height = style
-        .line_height
-        .resolve(font_size, font_size)
-        .unwrap_or_else(|| normal_line_height(style.font_family, font_size));
+    let line_height = used_line_height(style, font_size);
     let shift = vertical_shift(
         style.vertical_align,
         &context,
@@ -8720,6 +8694,29 @@ fn root_font_size(
         .unwrap_or(INITIAL_FONT_SIZE)
 }
 
+// chromium keeps line heights in 1/64 px units: a number scales the snapped font
+// size and truncates, a length or normal rounds
+fn used_line_height(style: &Style, font_size: f32) -> f32 {
+    let units = match style.line_height {
+        Length::Terms(terms)
+            if terms
+                == (LengthTerms {
+                    em: terms.em,
+                    ..LengthTerms::default()
+                }) =>
+        {
+            let font_size = (font_size * 64.0).round() / 64.0;
+            (font_size * (terms.em * 100.0) / 100.0 * 64.0).trunc()
+        }
+        length => (length
+            .resolve(font_size, font_size)
+            .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
+            * 64.0)
+            .round(),
+    };
+    (units / 64.0).max(1.0)
+}
+
 // line-height normal takes the primary face's ascent, descent and line gap
 pub(crate) fn normal_line_height(stack: FontStack, font_size: f32) -> f32 {
     crate::font::active_fonts().line_height(stack, font_size)
@@ -9379,6 +9376,39 @@ mod tests {
         assert_eq!(
             pixels.rect.height, 30.0,
             "a pixel line-height inherits as pixels"
+        );
+    }
+
+    #[test]
+    fn line_heights_snap_to_sixty_fourths_as_chromium_stores_them() {
+        let document = Document::parse_markup(
+            r#"<html><body><p style="font-size: 11px; line-height: 1.4">a</p><p style="font-size: 11px; line-height: 15.4px">b</p></body></html>"#,
+        )
+        .expect("document should parse");
+        let stylesheet =
+            Stylesheet::parse("body, p { margin: 0 }").expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 200.0,
+            },
+        );
+        fn collect(layout_box: &LayoutBox, found: &mut Vec<f32>) {
+            if layout_box.tag == "p" {
+                found.push(layout_box.rect.height);
+            }
+            for child in &layout_box.children {
+                collect(child, found);
+            }
+        }
+        let mut heights = Vec::new();
+        collect(&layout.root, &mut heights);
+        assert_eq!(
+            heights,
+            [985.0 / 64.0, 986.0 / 64.0],
+            "a number truncates and a length rounds"
         );
     }
 
