@@ -5505,7 +5505,8 @@ fn parse_declaration(text: &str) -> Result<Declaration, String> {
         important = true;
         value = value[..bang].trim_end();
     }
-    if property.is_empty() || value.is_empty() {
+    // a custom property may be empty, as lightningcss's light-dark() fallback relies on
+    if property.is_empty() || (value.is_empty() && !property.starts_with("--")) {
         return Err(format!("invalid declaration: {text}"));
     }
     Ok(Declaration {
@@ -8376,7 +8377,7 @@ mod tests {
     #[test]
     fn inherits_custom_properties_and_resolves_fallbacks() {
         let document = Document::parse_markup(
-            "<div id='theme' style='--Accent: #00ff00'><div id='card' style='background: var(--Accent); color: var(--missing, #0000ff); padding: var(--gap, 4px); --gap: 8px; --loop: var(--loop, #123456)'></div></div>",
+            "<div id='theme' style='--Accent: #00ff00'><div id='card' style='background: var(--Accent); color: var(--blank, #ff0000) var(--missing, #0000ff); padding: var(--gap, 4px); --gap: 8px; --blank: ; --loop: var(--loop, #123456)'></div></div>",
         )
         .expect("document should parse");
         let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
