@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 // the milliseconds between frames while something animates
-const FRAME_INTERVAL: u64 = 16;
+pub(crate) const FRAME_INTERVAL: u64 = 16;
 
 pub const APP_ORIGIN: &str = "https://app.ceri.invalid";
 

@@ -381,11 +381,25 @@ fn run_live_engine_worker(
     let mut last_tick = Instant::now();
     let mut announced = false;
     let mut held = None;
+    let frame = Duration::from_millis(crate::navigation::FRAME_INTERVAL);
+    let mut last_frame: Option<Instant> = None;
+    // a render asked for before its frame slot opens
+    let mut deferred = None;
+    let mut fine_timer = false;
     loop {
+        // timers, frame callbacks, css animations and the window asking again as each frame
+        // lands all tick apart, so a page renders at most once per frame slot
+        let slot = (deferred.is_some() || (host.is_dirty() && !announced))
+            .then(|| last_frame.map_or(Duration::ZERO, |at| frame.saturating_sub(at.elapsed())));
+        let wake = host
+            .next_wake()
+            .map(|delay| Duration::from_millis(delay.max(1)));
+        let wait = wake.into_iter().chain(slot).min();
+        hold_fine_timer(&mut fine_timer, wait.is_some_and(|wait| wait < frame * 2));
         let command = match held.take() {
             Some(command) => Some(command),
-            None => match host.next_wake() {
-                Some(delay) => match commands.recv_timeout(Duration::from_millis(delay.max(1))) {
+            None => match wait {
+                Some(delay) => match commands.recv_timeout(delay) {
                     Ok(command) => Some(command),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -420,27 +434,74 @@ fn run_live_engine_worker(
             send(EngineWorkerEvent::Failed(error));
             break;
         }
+        let slot_open = last_frame.is_none_or(|at| at.elapsed() >= frame);
+        let command = match command {
+            Some(EngineWorkerCommand::Render { request_id })
+                if !slot_open && deferred.is_none() =>
+            {
+                deferred = Some(request_id);
+                None
+            }
+            None if slot_open => deferred
+                .take()
+                .map(|request_id| EngineWorkerCommand::Render { request_id }),
+            other => {
+                if slot_open
+                    && held.is_none()
+                    && let Some(request_id) = deferred.take()
+                {
+                    held = Some(EngineWorkerCommand::Render { request_id });
+                }
+                other
+            }
+        };
+        let started = Instant::now();
         let event = match command {
             Some(EngineWorkerCommand::Shutdown) => break,
             Some(command) => answer(&mut host, command),
             None => None,
         };
         if let Some(event) = event {
-            if matches!(event, EngineWorkerEvent::Frame { .. }) {
+            if let EngineWorkerEvent::Frame { result, .. } = &event {
                 announced = false;
+                if matches!(result, Ok(Some(_))) {
+                    last_frame = Some(started);
+                }
             }
             if !send(event) {
                 break;
             }
         }
-        if host.is_dirty() && !announced {
+        if host.is_dirty() && !announced && last_frame.is_none_or(|at| at.elapsed() >= frame) {
             announced = true;
             if !send(EngineWorkerEvent::Invalidated) {
                 break;
             }
         }
     }
+    hold_fine_timer(&mut fine_timer, false);
 }
+
+// windows rounds channel timeouts up to its default 15.6 ms tick, which holds animations near
+// 40 fps, so the 1 ms tick is held only while a wait that short is pending
+#[cfg(all(target_os = "windows", feature = "windowed"))]
+fn hold_fine_timer(held: &mut bool, wanted: bool) {
+    use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+    if *held != wanted {
+        // SAFETY: `held` pairs every begin with one end
+        unsafe {
+            if wanted {
+                timeBeginPeriod(1);
+            } else {
+                timeEndPeriod(1);
+            }
+        }
+        *held = wanted;
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "windowed")))]
+fn hold_fine_timer(_: &mut bool, _: bool) {}
 
 fn is_pointer_move(command: &EngineWorkerCommand) -> bool {
     matches!(
