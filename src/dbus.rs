@@ -639,7 +639,7 @@ fn abstract_socket(_name: &[u8]) -> std::io::Result<UnixStream> {
     Err(std::io::Error::other("abstract sockets are Linux only"))
 }
 
-fn session_address() -> Result<String, String> {
+pub(crate) fn session_address() -> Result<String, String> {
     if let Ok(address) = std::env::var("DBUS_SESSION_BUS_ADDRESS")
         && !address.is_empty()
     {
@@ -700,7 +700,14 @@ impl Bus {
     pub(crate) fn session(
         handler: impl Fn(&Bus, Message) + Send + Sync + 'static,
     ) -> Result<Arc<Self>, String> {
-        let mut stream = connect(&session_address()?)?;
+        Self::at(&session_address()?, handler)
+    }
+
+    pub(crate) fn at(
+        address: &str,
+        handler: impl Fn(&Bus, Message) + Send + Sync + 'static,
+    ) -> Result<Arc<Self>, String> {
+        let mut stream = connect(address)?;
         authenticate(&mut stream)?;
         let reader = stream.try_clone().map_err(|error| error.to_string())?;
         let bus = Arc::new(Self {

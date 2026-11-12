@@ -1,10 +1,14 @@
 // shortcuts that reach the app while another app has the keyboard: RegisterHotKey on a thread
-// of its own on Windows, passive key grabs on the X11 root window elsewhere
+// of its own on Windows, the desktop portal on wayland and passive key grabs on the X11 root
+// window elsewhere
 
 use serde::Serialize;
 use std::fmt;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+#[cfg(not(target_os = "windows"))]
+mod portal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum ShortcutState {
@@ -26,6 +30,8 @@ pub struct GlobalShortcuts {
 #[derive(Default)]
 struct Shared {
     listener: OnceLock<Listener>,
+    // the app's identifier and name, which the portal knows the app by
+    app: OnceLock<(String, String)>,
     state: Mutex<State>,
 }
 
@@ -36,7 +42,11 @@ struct State {
 }
 
 impl GlobalShortcuts {
-    pub(crate) fn listen(&self, listener: Listener) {
+    pub(crate) fn listen(&self, identifier: &str, name: &str, listener: Listener) {
+        let _ = self
+            .shared
+            .app
+            .set((identifier.to_string(), name.to_string()));
         let _ = self.shared.listener.set(listener);
     }
 
@@ -48,7 +58,10 @@ impl GlobalShortcuts {
             return Err(format!("{shortcut} is already registered"));
         }
         if state.backend.is_none() {
-            state.backend = Some(platform::Backend::start(self.events()?)?);
+            state.backend = Some(platform::Backend::start(
+                self.events()?,
+                self.shared.app.get(),
+            )?);
         }
         if let Some(backend) = &state.backend {
             backend.register(shortcut)?;
@@ -417,7 +430,10 @@ mod platform {
     }
 
     impl Backend {
-        pub(super) fn start(events: Events) -> Result<Self, String> {
+        pub(super) fn start(
+            events: Events,
+            _app: Option<&(String, String)>,
+        ) -> Result<Self, String> {
             let (requests, received) = channel();
             let (started, thread) = channel();
             std::thread::Builder::new()
@@ -587,15 +603,52 @@ mod platform {
 
     type Grabs = Arc<Mutex<Vec<(u8, u16, Shortcut)>>>;
 
+    pub(super) enum Backend {
+        Portal(super::portal::Portal),
+        X11(X11),
+    }
+
+    impl Backend {
+        // a wayland compositor hands shortcuts out through the portal; an X11 grab under it
+        // only hears keys while one of xwayland's windows has the keyboard
+        pub(super) fn start(
+            events: Events,
+            app: Option<&(String, String)>,
+        ) -> Result<Self, String> {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                match super::portal::Portal::start(events.clone(), app) {
+                    Ok(portal) => return Ok(Self::Portal(portal)),
+                    Err(error) if std::env::var_os("DISPLAY").is_none() => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            X11::start(events).map(Self::X11)
+        }
+
+        pub(super) fn register(&self, shortcut: Shortcut) -> Result<(), String> {
+            match self {
+                Self::Portal(portal) => portal.register(shortcut),
+                Self::X11(x11) => x11.register(shortcut),
+            }
+        }
+
+        pub(super) fn unregister(&self, shortcut: Shortcut) {
+            match self {
+                Self::Portal(portal) => portal.unregister(shortcut),
+                Self::X11(x11) => x11.unregister(shortcut),
+            }
+        }
+    }
+
     // a connection of its own, its events read on one thread while grabs come from others
-    pub(super) struct Backend {
+    pub(super) struct X11 {
         connection: Arc<RustConnection>,
         root: u32,
         grabs: Grabs,
     }
 
-    impl Backend {
-        pub(super) fn start(events: Events) -> Result<Self, String> {
+    impl X11 {
+        fn start(events: Events) -> Result<Self, String> {
             if std::env::var_os("DISPLAY").is_none() {
                 return Err(
                     "global shortcuts need an X11 display, and this session has none".to_string(),
@@ -636,7 +689,7 @@ mod platform {
                 .ok_or_else(|| "the keyboard has no such key".to_string())
         }
 
-        pub(super) fn register(&self, shortcut: Shortcut) -> Result<(), String> {
+        fn register(&self, shortcut: Shortcut) -> Result<(), String> {
             let keycode = self
                 .keycode(shortcut.keysym())
                 .map_err(|error| format!("could not register {shortcut}: {error}"))?;
@@ -666,7 +719,7 @@ mod platform {
             Ok(())
         }
 
-        pub(super) fn unregister(&self, shortcut: Shortcut) {
+        fn unregister(&self, shortcut: Shortcut) {
             let mut grabs = self.grabs.lock().unwrap_or_else(PoisonError::into_inner);
             grabs.retain(|&(keycode, modifiers, held)| {
                 let gone = held == shortcut;

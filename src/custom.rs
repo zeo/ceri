@@ -370,19 +370,6 @@ impl App {
             Some(url) => Some(DevServer::parse(&url)?),
             None => None,
         };
-        let events = self.handle.clone();
-        let hook = self.global_shortcut.take();
-        self.handle
-            .shortcuts
-            .listen(Box::new(move |shortcut, state| {
-                if let Some(hook) = &hook {
-                    hook(&events, shortcut, state);
-                }
-                events.emit(
-                    "global-shortcut",
-                    serde_json::json!({ "shortcut": shortcut, "state": state }),
-                );
-            }));
         let capabilities = self.capabilities.grant(Grant {
             windows: vec!["*".to_string()],
             origins: vec![APP_ORIGIN.to_string()],
@@ -402,6 +389,21 @@ impl App {
             .or_else(|| self.windows.first().map(|window| window.title.clone()))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| identifier.clone());
+        let events = self.handle.clone();
+        let hook = self.global_shortcut.take();
+        self.handle.shortcuts.listen(
+            &identifier,
+            &name,
+            Box::new(move |shortcut, state| {
+                if let Some(hook) = &hook {
+                    hook(&events, shortcut, state);
+                }
+                events.emit(
+                    "global-shortcut",
+                    serde_json::json!({ "shortcut": shortcut, "state": state }),
+                );
+            }),
+        );
         let schemes = self
             .deep_link_schemes
             .iter()
