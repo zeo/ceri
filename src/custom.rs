@@ -12,8 +12,8 @@ use crate::video::DesktopVideo;
 use ceri_engine::{
     APP_ORIGIN, AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost,
     ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, NavigationError,
-    Resource, ResourceBundle, ResourceProvider, ResourceResponse, Size, WindowConfig,
-    WindowControl, mime_type_for, run_window_with,
+    Resource, ResourceBundle, ResourceProvider, ResourceResponse, Size, SocketConnector,
+    WindowConfig, WindowControl, mime_type_for, run_window_with,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -754,6 +754,18 @@ impl ResourceProvider for PackagedAssets {
 
     fn media_file(&self, url: &AppUrl) -> Option<PathBuf> {
         url.is_files().then(|| self.files.resolve(url.path()))?
+    }
+
+    fn connect_socket(&self, url: &str) -> Option<SocketConnector> {
+        let rest = url
+            .strip_prefix("wss://")
+            .or_else(|| url.strip_prefix("ws://"))?;
+        let host = rest.split(['/', '?']).next()?;
+        let app = APP_ORIGIN.strip_prefix("https://")?;
+        self.dev
+            .as_ref()
+            .filter(|_| host == app)
+            .map(DevServer::socket)
     }
 }
 

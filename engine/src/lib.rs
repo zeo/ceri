@@ -73,7 +73,7 @@ pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, ClipboardProvider, ExternalRequest, FILES_ORIGIN, FilePicker,
     FilePickerRequest, FileSelection, NavigationError, NavigationFailure, NavigationStatus,
     Resource, ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
-    ResourceResponse, UserPreferences, external_url, mime_type_for,
+    ResourceResponse, SocketConnector, SocketStream, UserPreferences, external_url, mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{

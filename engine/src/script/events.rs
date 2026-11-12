@@ -209,6 +209,11 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         ],
     },
     EventInterface {
+        name: "CloseEvent",
+        parent: "Event",
+        members: &[("wasClean", Flag), ("code", Number(0.0)), ("reason", Text)],
+    },
+    EventInterface {
         name: "ErrorEvent",
         parent: "Event",
         members: &[
@@ -784,6 +789,7 @@ impl ScriptRuntime {
         self.event_listeners.retain(|target, _| alive(target));
         self.event_handlers.retain(|(target, _), _| alive(target));
         self.xhr.retain(|id, _| live.contains_key(id));
+        self.sockets.states.retain(|id, _| live.contains_key(id));
         self.prune_audio();
     }
 

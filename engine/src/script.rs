@@ -32,10 +32,12 @@ mod ranges;
 mod realm;
 mod reflect;
 mod regexp;
+mod sockets;
 mod strings;
 mod typed;
 mod urls;
 mod vm;
+mod websocket;
 mod xhr;
 
 use events::{HostEventFields, ListenerTarget};
@@ -253,6 +255,7 @@ enum Builtin {
     DocumentGetSelection,
     LocationAssign,
     LocationReplace,
+    LocationReload,
     WindowScrollTo,
     WindowScrollBy,
     WindowGetSelection,
@@ -525,6 +528,7 @@ pub struct ScriptRuntime {
     observers: HashMap<u32, observers::ObserverRecord>,
     next_observer: u32,
     xhr: HashMap<u32, xhr::XhrState>,
+    sockets: sockets::Sockets,
     audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
@@ -556,6 +560,7 @@ pub struct ScriptRuntime {
     tasks: Vec<ScheduledTask>,
     microtasks: VecDeque<Microtask>,
     pending_navigation: Option<NavigationRequest>,
+    pending_history: Vec<NavigationRequest>,
     // the value being thrown, with the message of the Rust error that carries it
     pending_exception: Option<(Value, String)>,
     nested_runs: usize,
@@ -1571,6 +1576,7 @@ impl ScriptRuntime {
             observers: HashMap::new(),
             next_observer: 0,
             xhr: HashMap::new(),
+            sockets: sockets::Sockets::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
             image_loads: HashMap::new(),
@@ -1597,6 +1603,7 @@ impl ScriptRuntime {
             tasks: Vec::new(),
             microtasks: VecDeque::new(),
             pending_navigation: None,
+            pending_history: Vec::new(),
             pending_exception: None,
             nested_runs: 0,
             private_names: 0,
@@ -3425,8 +3432,14 @@ impl ScriptRuntime {
             .any(|worker| !worker.borrow().terminated)
     }
 
+    // history entries were already added synchronously, so they reach the browser before any
+    // navigation queued alongside them
     pub(crate) fn take_navigation_request(&mut self) -> Option<NavigationRequest> {
-        self.pending_navigation.take()
+        if self.pending_history.is_empty() {
+            self.pending_navigation.take()
+        } else {
+            Some(self.pending_history.remove(0))
+        }
     }
 
     pub(crate) fn set_location(&mut self, url: AppUrl) {
@@ -3498,8 +3511,13 @@ impl ScriptRuntime {
     }
 
     fn queue_navigation(&mut self, request: NavigationRequest) {
-        if self.pending_navigation.is_none() {
-            self.pending_navigation = Some(request);
+        match request {
+            NavigationRequest::PushState { .. } | NavigationRequest::ReplaceState { .. } => {
+                self.pending_history.push(request)
+            }
+            _ => {
+                self.pending_navigation.get_or_insert(request);
+            }
         }
     }
 
@@ -3920,6 +3938,7 @@ impl ScriptRuntime {
                     )),
                     "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
                     "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
+                    "reload" => Ok(Value::Builtin(Builtin::LocationReload)),
                     _ => Err(runtime_error(format!(
                         "location has no property {property}"
                     ))),
@@ -4848,6 +4867,7 @@ impl ScriptRuntime {
         let processed = self.pump_workers()?
             + self.settle_command_replies()?
             + self.pump_audio()?
+            + self.pump_sockets()?
             + self.pump_media();
         self.drain_microtasks()?;
         Ok(processed)
@@ -7192,6 +7212,10 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_else(|| "undefined".to_string());
                 self.request_location_navigation(reference, true);
+                Ok(Value::Undefined)
+            }
+            Builtin::LocationReload => {
+                self.queue_navigation(NavigationRequest::Traverse { delta: 0 });
                 Ok(Value::Undefined)
             }
             Builtin::HistoryPushState => {
@@ -21724,6 +21748,175 @@ mod tests {
             Some("remote!")
         );
         assert_eq!(requests.borrow().as_slice(), ["/worker.js"]);
+    }
+
+    #[test]
+    fn websocket_accept_keys_follow_the_rfc_example() {
+        assert_eq!(
+            websocket::accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+        assert_eq!(
+            websocket::frame(1, b"Hi", [1, 2, 3, 4]),
+            [0x81, 0x82, 1, 2, 3, 4, b'H' ^ 1, b'i' ^ 2]
+        );
+        assert_eq!(
+            &websocket::frame(2, &[0; 300], [0; 4])[..4],
+            [0x82, 0xfe, 1, 44]
+        );
+    }
+
+    #[test]
+    fn websockets_talk_to_a_server_and_close_cleanly_or_fail_politely() {
+        use std::io::{Read, Write};
+
+        struct LoopbackSockets {
+            port: u16,
+        }
+        impl ResourceProvider for LoopbackSockets {
+            fn provide(&self, _url: &AppUrl) -> Result<Option<Resource>, NavigationError> {
+                Ok(None)
+            }
+            fn connect_socket(&self, url: &str) -> Option<crate::navigation::SocketConnector> {
+                let port = self.port;
+                (url == "wss://app.ceri.invalid/live?room=1").then(|| {
+                    Box::new(move || {
+                        let stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+                        Ok(crate::navigation::SocketStream::new(
+                            stream,
+                            format!("localhost:{port}"),
+                        ))
+                    }) as crate::navigation::SocketConnector
+                })
+            }
+        }
+
+        fn read_client_frame(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
+            let mut head = [0; 2];
+            stream.read_exact(&mut head).expect("frame head");
+            assert_eq!(head[1] & 0x80, 0x80, "client frames are masked");
+            let mut mask = [0; 4];
+            stream.read_exact(&mut mask).expect("mask");
+            let mut payload = vec![0; usize::from(head[1] & 0x7f)];
+            stream.read_exact(&mut payload).expect("payload");
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % 4];
+            }
+            (head[0], payload)
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("request");
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).expect("ascii request");
+            let key = request
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key: "))
+                .expect("a key");
+            write!(
+                stream,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: json\r\n\r\n",
+                websocket::accept_key(key)
+            )
+            .expect("answer");
+            stream.write_all(&[0x89, 1, b'p']).expect("ping");
+            let mut frames = Vec::new();
+            while frames.len() < 3 {
+                frames.push(read_client_frame(&mut stream));
+            }
+            frames.sort();
+            // the text comes back in two fragments, the bytes in one frame
+            stream
+                .write_all(&[
+                    0x01, 3, b'h', b'e', b'l', 0x80, 2, b'l', b'o', 0x82, 3, 1, 2, 3,
+                ])
+                .expect("echo");
+            let close = read_client_frame(&mut stream);
+            stream
+                .write_all(&[0x88, 5, 0x0f, 0xa0, b'b', b'y', b'e'])
+                .expect("close answer");
+            (request, frames, close)
+        });
+
+        let document = document("<p id='status'></p>");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base URL should parse");
+        let mut runtime = ScriptRuntime::with_context(
+            document.clone(),
+            None,
+            Some(Rc::new(LoopbackSockets { port })),
+            Some(base),
+            None,
+            None,
+            None,
+        );
+        runtime
+            .execute(
+                r#"
+                const log = [];
+                const fail = (make) => { try { make(); return "made"; } catch (error) { return error.name; } };
+                log.push(fail(() => new WebSocket("ftp://x/")), fail(() => new WebSocket("wss://x/#a")),
+                    fail(() => new WebSocket("wss://x/", ["a", "a"])), fail(() => new WebSocket("wss://x/", "a b")));
+                const ws = new WebSocket("/live?room=1", ["chat", "json"]);
+                log.push(ws.url, ws.readyState, ws.binaryType, fail(() => ws.send("early")), fail(() => ws.close(1001)));
+                ws.binaryType = "arraybuffer";
+                ws.onopen = () => {
+                    log.push("open:" + ws.protocol);
+                    ws.send("hello");
+                    ws.send(new Uint8Array([1, 2, 3]));
+                    log.push("buffered:" + ws.bufferedAmount);
+                };
+                ws.onmessage = (event) => {
+                    log.push(typeof event.data === "string" ? "text:" + event.data + ":" + event.origin : "bytes:" + new Uint8Array(event.data).join("-"));
+                    if (typeof event.data !== "string") ws.close(4000, "done");
+                };
+                ws.onerror = () => log.push("error");
+                ws.addEventListener("close", (event) => {
+                    log.push(`close:${event.wasClean}:${event.code}:${event.reason}:${ws.readyState}:${event instanceof CloseEvent}`);
+                    document.getElementById("status").textContent = log.join("|");
+                });
+                const refused = new WebSocket("ws://nowhere.example/");
+                refused.onerror = () => log.push("refused error");
+                refused.onclose = (event) => log.push(`refused close:${event.wasClean}:${event.code}`);
+                "#,
+            )
+            .expect("sockets should construct");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while document.borrow().element_text_content(status).as_deref() == Some("")
+            && std::time::Instant::now() < deadline
+        {
+            runtime.pump().expect("sockets should pump");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "SyntaxError|SyntaxError|SyntaxError|SyntaxError|wss://app.ceri.invalid/live?room=1|0|blob|InvalidStateError|InvalidAccessError|refused error|refused close:false:1006|open:json|buffered:8|text:hello:wss://app.ceri.invalid|bytes:1-2-3|close:true:4000:bye:3:true"
+            )
+        );
+        let (request, frames, close) = server.join().expect("server");
+        assert!(request.starts_with("GET /live?room=1 HTTP/1.1\r\nHost: localhost:"));
+        assert!(request.contains("\r\nOrigin: https://app.ceri.invalid\r\n"));
+        assert!(request.contains("\r\nSec-WebSocket-Protocol: chat, json\r\n"));
+        assert_eq!(
+            frames,
+            [
+                (0x81, b"hello".to_vec()),
+                (0x82, vec![1, 2, 3]),
+                (0x8a, b"p".to_vec())
+            ]
+        );
+        assert_eq!(close, (0x88, [&[0x0f, 0xa0][..], b"done"].concat()));
     }
 
     #[test]

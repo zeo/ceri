@@ -1,7 +1,9 @@
 // the dev server a debug build serves its app origin from, such as vite's, reached over
 // loopback http so pages keep the app origin, its capabilities and its storage
 
-use ceri_engine::{AppUrl, NavigationError, Resource, mime_type_for};
+use ceri_engine::{
+    AppUrl, NavigationError, Resource, SocketConnector, SocketStream, mime_type_for,
+};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -41,6 +43,12 @@ impl DevServer {
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         Ok(stream)
+    }
+
+    // a websocket to the app origin, such as the hot reload channel, reaches the dev server
+    pub(crate) fn socket(&self) -> SocketConnector {
+        let dev = self.clone();
+        Box::new(move || Ok(SocketStream::new(dev.connect()?, dev.authority)))
     }
 
     // what the dev server answers for an app URL; a 404 is a missing resource

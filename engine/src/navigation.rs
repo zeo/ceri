@@ -485,7 +485,30 @@ pub trait ResourceProvider {
     fn media_file(&self, _url: &AppUrl) -> Option<PathBuf> {
         None
     }
+
+    // how a WebSocket to a ws or wss URL reaches its server; the connector runs off the page's
+    // thread, and the default refuses, so a page has no sockets the embedder did not give it
+    fn connect_socket(&self, _url: &str) -> Option<SocketConnector> {
+        None
+    }
 }
+
+// a connected stream a WebSocket handshake runs over, and the Host header it names
+pub struct SocketStream {
+    pub(crate) stream: std::net::TcpStream,
+    pub(crate) host: String,
+}
+
+impl SocketStream {
+    pub fn new(stream: std::net::TcpStream, host: impl Into<String>) -> Self {
+        Self {
+            stream,
+            host: host.into(),
+        }
+    }
+}
+
+pub type SocketConnector = Box<dyn FnOnce() -> io::Result<SocketStream> + Send>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilePickerRequest {
@@ -1537,6 +1560,7 @@ impl Browser {
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
         runtime.set_audio(self.audio_device.clone(), self.waker.clone());
         runtime.set_media_decoder(self.media_decoder.clone(), self.waker.clone());
+        runtime.set_socket_waker(self.waker.clone());
         if let Some(bridge) = &self.host_bridge {
             runtime.set_host_bridge(bridge.clone(), APP_ORIGIN.to_string(), self.waker.clone());
         }
@@ -1558,6 +1582,11 @@ impl Browser {
         let layout_inputs = self.layout_inputs(parsed_stylesheet, sheets, &document.borrow());
         runtime.set_layout_inputs(layout_inputs.clone());
         runtime.load_document_images();
+        if let HistoryCommit::Traverse { state, .. } = &commit {
+            runtime
+                .set_history_state_serialized(state)
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
+        }
         if let Err(error) = self.execute_scripts(&url, &script_sources, &policies, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
@@ -1573,7 +1602,6 @@ impl Browser {
         }
         self.persist_storage()?;
 
-        let pending_navigation = runtime.take_navigation_request();
         self.page = Some(Page {
             document,
             runtime,
@@ -1585,10 +1613,9 @@ impl Browser {
         self.hovered_node = None;
         self.hovered_thumb = None;
         self.commit_new_document(url, commit);
-        if let Some(request) = pending_navigation {
-            return self.follow_navigation(request, redirect_depth);
-        }
-        Ok(NavigationStatus::Loaded)
+        Ok(self
+            .follow_pending_navigations(redirect_depth)?
+            .unwrap_or(NavigationStatus::Loaded))
     }
 
     pub fn current_url(&self) -> Option<&AppUrl> {
@@ -2912,13 +2939,24 @@ impl Browser {
 
     fn process_pending_navigation(&mut self) -> Result<Option<NavigationStatus>, NavigationError> {
         self.persist_storage()?;
-        let request = {
-            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            page.runtime.take_navigation_request()
-        };
-        request
-            .map(|request| self.follow_navigation(request, 0))
-            .transpose()
+        self.follow_pending_navigations(0)
+    }
+
+    fn follow_pending_navigations(
+        &mut self,
+        redirect_depth: usize,
+    ) -> Result<Option<NavigationStatus>, NavigationError> {
+        let mut status = None;
+        while let Some(request) = self
+            .page
+            .as_mut()
+            .ok_or(NavigationError::NoPage)?
+            .runtime
+            .take_navigation_request()
+        {
+            status = Some(self.follow_navigation(request, redirect_depth)?);
+        }
+        Ok(status)
     }
 
     fn persist_storage(&self) -> Result<(), NavigationError> {
@@ -3008,7 +3046,8 @@ impl Browser {
         let url = self.history[target].clone();
         let state = self.history_states[target].clone();
         let document_id = self.history_document_ids[target];
-        if self.current_document_id == Some(document_id) {
+        // history.go(0) and location.reload() load the current entry again
+        if delta != 0 && self.current_document_id == Some(document_id) {
             self.history_index = Some(target);
             self.current_url = Some(url.clone());
             {
@@ -3204,6 +3243,7 @@ impl Browser {
                 runtime.set_clipboard_provider(self.clipboard_provider.clone());
                 runtime.set_audio(self.audio_device.clone(), self.waker.clone());
                 runtime.set_media_decoder(self.media_decoder.clone(), self.waker.clone());
+                runtime.set_socket_waker(self.waker.clone());
                 if let Some(time_zone) = &self.time_zone {
                     runtime.set_time_zone(time_zone.clone());
                 }
@@ -5131,6 +5171,36 @@ mod tests {
         assert_eq!(browser.current_url().unwrap().path(), "/about.html");
         assert_eq!(browser.history().len(), 1);
         assert_eq!(browser.history()[0].path(), "/about.html");
+    }
+
+    #[test]
+    fn location_reload_loads_a_fresh_document_and_keeps_the_entry_state() {
+        let mut browser = Browser::new(bundle(
+            r#"<button id="go">reload</button><p id="status"></p><script>
+                document.getElementById("status").textContent = JSON.stringify(history.state);
+                document.getElementById("go").addEventListener("click", () => {
+                    history.replaceState({ draft: 6 }, "");
+                    history.pushState({ draft: 7 }, "");
+                    location.reload();
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("home should load");
+        let first = browser.document().expect("home document should exist");
+        assert!(browser.click_id("go").expect("reload should navigate"));
+        let second = browser.document().expect("reloaded document should exist");
+        assert!(!Rc::ptr_eq(&first, &second));
+        assert_eq!(browser.history().len(), 2);
+        let status = second
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            second.borrow().element_text_content(status).as_deref(),
+            Some(r#"{"draft":7}"#)
+        );
     }
 
     #[test]
