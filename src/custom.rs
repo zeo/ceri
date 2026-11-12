@@ -408,8 +408,12 @@ fn run_app(
     let _instance = match single_instance {
         Some(on_launch) => {
             let launches = handle.clone();
-            let on_launch: instance::LaunchHandler =
-                Box::new(move |arguments, directory| on_launch(&launches, arguments, directory));
+            // a launch that lands before the loop runs waits for it, so the app can reach its
+            // windows
+            let on_launch: instance::LaunchHandler = Box::new(move |arguments, directory| {
+                launches.control.wait();
+                on_launch(&launches, arguments, directory)
+            });
             match instance::claim(&profile, identifier, &arguments, on_launch)? {
                 Some(instance) => Some(instance),
                 None => return Ok(()),
