@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod autostart;
 pub mod launch;
 
 mod audio;

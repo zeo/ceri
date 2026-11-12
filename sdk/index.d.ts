@@ -154,6 +154,14 @@ export interface Notifications {
 
 export const notification: Notifications;
 
+export interface Autostart {
+  enable(): Promise<void>;
+  disable(): Promise<void>;
+  isEnabled(): Promise<boolean>;
+}
+
+export const autostart: Autostart;
+
 export function appVersion(): Promise<string>;
 
 export function fileSrc(path: string): string;

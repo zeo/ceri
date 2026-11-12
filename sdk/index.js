@@ -173,6 +173,13 @@ export const notification = Object.freeze({
   requestPermission: () => invoke("notification:permission"),
 });
 
+// starting the app when the user logs in, with the arguments the app names for it
+export const autostart = Object.freeze({
+  enable: () => invoke("autostart:enable"),
+  disable: () => invoke("autostart:disable"),
+  isEnabled: () => invoke("autostart:is-enabled"),
+});
+
 export function appVersion() {
   return invoke("app:version");
 }

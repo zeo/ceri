@@ -1,5 +1,6 @@
 use crate::assets::{AssetOrigin, AssetRoute, EmbeddedAssets, RequestTarget};
 use crate::audio::DesktopAudio;
+use crate::autostart::Autostart;
 use crate::commands::{CommandRoutes, Commands};
 use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
 use crate::dev::DevServer;
@@ -101,6 +102,7 @@ pub struct App {
     windows: Vec<WindowConfig>,
     identifier: Option<String>,
     name: Option<String>,
+    autostart_arguments: Vec<OsString>,
     version: Option<String>,
     lifecycle: Lifecycle,
     handle: AppHandle,
@@ -142,6 +144,15 @@ impl App {
     // the name people see the app by, on notifications; the first window's title otherwise
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    // what the app starts with when a page turns on starting at login
+    pub fn autostart_arguments(
+        mut self,
+        arguments: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> Self {
+        self.autostart_arguments = arguments.into_iter().map(Into::into).collect();
         self
     }
 
@@ -326,6 +337,7 @@ impl App {
                 "opener:open-url".to_string(),
                 "opener:reveal".to_string(),
                 "notification:*".to_string(),
+                "autostart:*".to_string(),
             ],
         });
         let name = self
@@ -333,10 +345,12 @@ impl App {
             .or_else(|| self.windows.first().map(|window| window.title.clone()))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| identifier.clone());
+        let autostart = Autostart::new(&identifier, &name).arguments(self.autostart_arguments);
         run_app(
             Bridge {
                 commands: Arc::new(self.commands),
                 capabilities,
+                autostart,
                 name,
                 version: self.version,
                 files: self.handle.files.clone(),
@@ -397,6 +411,7 @@ struct Bridge {
     version: Option<String>,
     files: FileScope,
     notifier: Arc<OnceLock<Notifier>>,
+    autostart: Autostart,
     // the pages compiled into the app, served unless a folder is named at launch
     embedded: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
@@ -412,6 +427,7 @@ impl Bridge {
                 control: control.cloned(),
                 version: self.version.clone(),
                 notifier: self.notifier.clone(),
+                autostart: self.autostart.clone(),
             }),
             self.capabilities.clone(),
             window,

@@ -1,6 +1,7 @@
 // the commands an app registers for its pages to invoke, by name; payloads and results are
 // JSON text
 
+use crate::autostart::Autostart;
 use crate::dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 use crate::notification::Notifier;
 use ceri_engine::{
@@ -57,6 +58,7 @@ pub struct CommandRoutes {
     pub control: Option<WindowControl>,
     pub version: Option<String>,
     pub notifier: Arc<OnceLock<Notifier>>,
+    pub autostart: Autostart,
 }
 
 impl CommandRoutes {
@@ -67,6 +69,9 @@ impl CommandRoutes {
                 Some(version) => json(version),
                 None => Err(CommandError::failed("the app has no version")),
             });
+        }
+        if call.command.starts_with("autostart:") {
+            return Some(autostart(call, &self.autostart));
         }
         let control = self.control.as_ref()?;
         let label = call.window.as_str();
@@ -227,6 +232,16 @@ fn opener(call: &CommandCall) -> Result<String, CommandError> {
     }
     .map_err(CommandError::failed)?;
     Ok("null".to_string())
+}
+
+fn autostart(call: &CommandCall, autostart: &Autostart) -> Result<String, CommandError> {
+    match call.command.as_str() {
+        "autostart:enable" => autostart.enable().map(|()| "null".to_string()),
+        "autostart:disable" => autostart.disable().map(|()| "null".to_string()),
+        "autostart:is-enabled" => autostart.is_enabled().map(|on| on.to_string()),
+        command => return Err(CommandError::unknown(command)),
+    }
+    .map_err(CommandError::failed)
 }
 
 #[derive(Deserialize)]
@@ -396,6 +411,7 @@ mod tests {
             control: None,
             version: Some("1.2.3".to_string()),
             notifier: Arc::default(),
+            autostart: Autostart::new("dev.ceri.router-test", "Router Test"),
         };
         let (sender, receiver) = channel();
         let ask = |command: &str, id| {
