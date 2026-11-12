@@ -956,7 +956,7 @@ struct Painted {
     canvases: Vec<ImageLayer>,
     scale: f32,
     fonts: Rc<FontSet>,
-    canvas: Canvas,
+    canvas: Arc<Canvas>,
 }
 
 // everything a layout is a pure function of
@@ -2592,7 +2592,7 @@ impl Browser {
         Ok(layout)
     }
 
-    pub fn paint(&self, viewport: Size) -> Result<Canvas, NavigationError> {
+    pub fn paint(&self, viewport: Size) -> Result<Arc<Canvas>, NavigationError> {
         self.paint_scaled(viewport, 1.0)
     }
 
@@ -2600,7 +2600,7 @@ impl Browser {
         &self,
         viewport: Size,
         device_pixel_ratio: f32,
-    ) -> Result<Canvas, NavigationError> {
+    ) -> Result<Arc<Canvas>, NavigationError> {
         let layout = self.layout(viewport)?;
         let canvases = self
             .page
@@ -2624,10 +2624,14 @@ impl Browser {
         let canvas = match (damage, painted.take()) {
             (crate::paint::Damage::Nothing, Some(last)) => last.canvas,
             (crate::paint::Damage::Area(area), Some(mut last)) => {
-                crate::paint::repaint(&mut last.canvas, &layout, &canvases, area);
+                crate::paint::repaint(Arc::make_mut(&mut last.canvas), &layout, &canvases, area);
                 last.canvas
             }
-            _ => crate::paint::paint_with_canvases(&layout, &canvases, device_pixel_ratio),
+            _ => Arc::new(crate::paint::paint_with_canvases(
+                &layout,
+                &canvases,
+                device_pixel_ratio,
+            )),
         };
         *painted = Some(Painted {
             layout,
@@ -8346,7 +8350,11 @@ A</div>
         resources
     }
 
-    fn image_page(source: &str, width: f32, height: f32) -> (Browser, Rc<LayoutDocument>, Canvas) {
+    fn image_page(
+        source: &str,
+        width: f32,
+        height: f32,
+    ) -> (Browser, Rc<LayoutDocument>, Arc<Canvas>) {
         let mut browser = Browser::new(image_bundle(source));
         assert_eq!(
             browser

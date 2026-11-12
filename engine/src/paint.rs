@@ -379,6 +379,7 @@ impl Canvas {
         let bottom = (device.y + device.height)
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
+        let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
         for pixel_y in top.min(self.height)..bottom.min(self.height) {
             for pixel_x in left.min(self.width)..right.min(self.width) {
                 let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
@@ -414,6 +415,7 @@ impl Canvas {
         let bottom = (outer.y + outer.height)
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
+        let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
         for pixel_y in top..bottom {
             for pixel_x in left..right {
                 let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
@@ -495,6 +497,7 @@ impl Canvas {
         let bottom = (start.1.max(end.1) + half + 1.0)
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
+        let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
         let along = (end.0 - start.0, end.1 - start.1);
         let length = along.0 * along.0 + along.1 * along.1;
         for pixel_y in top..bottom {
@@ -713,6 +716,7 @@ impl Canvas {
         let bottom = (reach.y + reach.height)
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
+        let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
         for pixel_y in top..bottom {
             for pixel_x in left..right {
                 let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
@@ -989,6 +993,21 @@ const MAX_TRANSFORM_LAYER_PIXELS: f32 = 16_000_000.0;
 
 thread_local! {
     static LAYER_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// keeps a loop to the pixels whose centers can land in a device clip, which feathers half a
+// pixel past its edges
+fn narrow(bounds: [u32; 4], clip: Option<Shape>) -> [u32; 4] {
+    let Some(clip) = clip else { return bounds };
+    let near = |edge: f32| (edge - 1.0).floor().max(0.0) as u32;
+    let far = |edge: f32| (edge + 1.0).ceil().max(0.0) as u32;
+    let [left, top, right, bottom] = bounds;
+    [
+        left.max(near(clip.x)),
+        top.max(near(clip.y)),
+        right.min(far(clip.x + clip.width)),
+        bottom.min(far(clip.y + clip.height)),
+    ]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2104,38 +2123,58 @@ fn ink(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Option<Rect> {
 }
 
 // paints area again over the frame before, which already shows the rest; a clip rounds its
-// edges and keeps slivers a pixel wide, so the paint reaches a margin past the area and only
-// the area's own pixels are kept
+// edges and keeps slivers a pixel wide, so the paint reaches a margin past the area and the
+// margin's earlier pixels go back afterwards, one pixel wider since the margin's own edges
+// can round outward
 pub(crate) fn repaint(
     canvas: &mut Canvas,
     document: &LayoutDocument,
     canvases: &[ImageLayer],
     area: Rect,
 ) {
-    const MARGIN: f32 = 2.0;
+    const MARGIN: u32 = 2;
     let Some(kept) = DeviceBounds::of(canvas, area, None) else {
         return;
     };
     let scale = canvas.scale;
     let painted = Rect {
-        x: (kept.left as f32 - MARGIN) / scale,
-        y: (kept.top as f32 - MARGIN) / scale,
-        width: ((kept.right - kept.left) as f32 + 2.0 * MARGIN) / scale,
-        height: ((kept.bottom - kept.top) as f32 + 2.0 * MARGIN) / scale,
+        x: (kept.left as f32 - MARGIN as f32) / scale,
+        y: (kept.top as f32 - MARGIN as f32) / scale,
+        width: (kept.right - kept.left + 2 * MARGIN) as f32 / scale,
+        height: (kept.bottom - kept.top + 2 * MARGIN) as f32 / scale,
     };
-    let mut scratch = canvas.clone();
-    scratch.fill_rect(painted.x, painted.y, painted.width, painted.height, BASE);
+    let reach = DeviceBounds {
+        left: kept.left.saturating_sub(MARGIN + 1),
+        top: kept.top.saturating_sub(MARGIN + 1),
+        right: (kept.right + MARGIN + 1).min(canvas.width),
+        bottom: (kept.bottom + MARGIN + 1).min(canvas.height),
+    };
+    let stride = canvas.bytes_per_row();
+    let line = |row: usize| {
+        row * stride + reach.left as usize * 4..row * stride + reach.right as usize * 4
+    };
+    let saved = (reach.top as usize..reach.bottom as usize)
+        .flat_map(|row| canvas.pixels[line(row)].to_vec())
+        .collect::<Vec<_>>();
+    canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, BASE);
     let layers = document
         .images
         .iter()
         .chain(canvases)
         .cloned()
         .collect::<Vec<_>>();
-    paint_document(&mut scratch, document, &layers, Some(painted));
-    let stride = canvas.bytes_per_row();
-    for row in kept.top as usize..kept.bottom as usize {
-        let span = row * stride + kept.left as usize * 4..row * stride + kept.right as usize * 4;
-        canvas.pixels[span.clone()].copy_from_slice(&scratch.pixels[span]);
+    paint_document(canvas, document, &layers, Some(painted));
+    let inner = (kept.left - reach.left) as usize * 4..(kept.right - reach.left) as usize * 4;
+    for (row, before) in
+        (reach.top as usize..reach.bottom as usize).zip(saved.chunks(line(0).len()))
+    {
+        let after = &mut canvas.pixels[line(row)];
+        if (kept.top as usize..kept.bottom as usize).contains(&row) {
+            after[..inner.start].copy_from_slice(&before[..inner.start]);
+            after[inner.end..].copy_from_slice(&before[inner.end..]);
+        } else {
+            after.copy_from_slice(before);
+        }
     }
 }
 

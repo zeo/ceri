@@ -109,7 +109,7 @@ pub struct Frame {
     pub viewport: Size,
     pub scale: f32,
     pub title: Option<String>,
-    pub canvas: Canvas,
+    pub canvas: std::sync::Arc<Canvas>,
 }
 
 pub struct EngineHost {
