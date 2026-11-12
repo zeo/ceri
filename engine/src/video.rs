@@ -9,7 +9,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use crate::bridge::Waker;
 use crate::css::Color;
 use crate::image::Image;
+use crate::sound::AudioReader;
 
+#[derive(Clone)]
 pub enum MediaSource {
     // a file the decoder reads in place
     File(PathBuf),
@@ -36,6 +38,11 @@ pub struct VideoFrame {
 
 pub trait MediaDecoder: Send + Sync {
     fn open(&self, source: &MediaSource) -> Result<Box<dyn VideoReader>, String>;
+
+    // the source's sound; a WAVE file of PCM never reaches here, the engine reads it itself
+    fn open_audio(&self, _source: &MediaSource) -> Result<Box<dyn AudioReader>, String> {
+        Err("the decoder plays no sound".to_string())
+    }
 
     // "probably", "maybe" or "", as canPlayType answers for a MIME type
     fn can_play(&self, _mime_type: &str) -> &'static str {

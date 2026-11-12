@@ -6306,6 +6306,52 @@ mod tests {
     }
 
     #[test]
+    fn an_audio_element_streams_a_wave_file_through_its_clock() {
+        let mut resources = bundle(
+            r#"<p id="status"></p><script>
+                const log = [];
+                const a = new Audio();
+                log.push(a instanceof HTMLAudioElement, Audio.prototype === HTMLAudioElement.prototype, a.preload, a.videoWidth, a.canPlayType("audio/WAV; codecs=1"), a.canPlayType("audio/ogg"));
+                Object.assign(a, { preload: "auto", src: "/tone.wav" });
+                a.onloadedmetadata = () => {
+                    log.push("meta:" + a.duration);
+                    a.currentTime = 0.25;
+                };
+                a.onseeked = () => {
+                    log.push("seeked:" + a.currentTime);
+                    a.volume = 0.5;
+                    a.playbackRate = 2;
+                    a.play().then(() => log.push("played"));
+                };
+                a.onended = () => {
+                    log.push("ended:" + a.currentTime + ":" + a.paused);
+                    a.removeAttribute("src");
+                    a.load();
+                    log.push("released:" + a.networkState + ":" + isNaN(a.duration));
+                    const broken = new Audio("/missing.wav");
+                    broken.onerror = () => {
+                        log.push("error:" + broken.error.code + ":" + broken.error.message);
+                        document.getElementById("status").textContent = log.join(",");
+                    };
+                };
+            </script>"#,
+        );
+        let mut wave = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x80\x3e\0\0\x02\0\x10\0data\x40\x1f\0\0".to_vec();
+        wave.extend(std::iter::repeat_n([0x00, 0x10], 4000).flatten());
+        resources
+            .insert("/tone.wav", "audio/wav", wave)
+            .expect("sound should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("audio page should load");
+        assert_eq!(
+            play_until_status(&mut browser),
+            "true,true,auto,,maybe,,meta:0.5,seeked:0.25,played,ended:0.5:true,released:0:true,error:4:MEDIA_ELEMENT_ERROR: Format error"
+        );
+    }
+
+    #[test]
     fn images_load_from_a_task_with_natural_sizes_and_decode() {
         let mut resources = bundle(
             r#"<p id="status">idle</p><img id="parsed" src="/shot.png"><script>

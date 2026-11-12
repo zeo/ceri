@@ -1,7 +1,10 @@
-// the video decoders the desktop already has: media foundation on windows, gstreamer on linux;
-// the engine runs each reader on a media element's own decode thread
+// the media decoders the desktop already has: media foundation on windows, gstreamer on linux;
+// the engine runs each reader on a media element's own decode or sound thread
 
-use ceri_engine::{MediaDecoder, MediaInfo, MediaSource, VideoFrame, VideoReader};
+use ceri_engine::{
+    AudioChunk, AudioInfo, AudioReader, MediaDecoder, MediaInfo, MediaSource, VideoFrame,
+    VideoReader,
+};
 
 #[derive(Default)]
 pub(crate) struct DesktopVideo;
@@ -9,6 +12,10 @@ pub(crate) struct DesktopVideo;
 impl MediaDecoder for DesktopVideo {
     fn open(&self, source: &MediaSource) -> Result<Box<dyn VideoReader>, String> {
         Ok(Box::new(platform::Reader::open(source)?))
+    }
+
+    fn open_audio(&self, source: &MediaSource) -> Result<Box<dyn AudioReader>, String> {
+        Ok(Box::new(platform::Sound::open(source)?))
     }
 
     fn can_play(&self, mime_type: &str) -> &'static str {
@@ -26,18 +33,23 @@ impl MediaDecoder for DesktopVideo {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{MediaInfo, MediaSource, VideoFrame, VideoReader, edit_shift};
+    use super::{
+        AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
+        edit_shift,
+    };
     use std::os::windows::ffi::OsStrExt;
     use std::sync::OnceLock;
     use windows::Win32::Media::MediaFoundation::{
-        IMF2DBuffer, IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSourceReader,
-        MF_BYTESTREAM_CONTENT_TYPE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+        IMF2DBuffer, IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader,
+        MF_BYTESTREAM_CONTENT_TYPE, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
+        MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
         MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_PD_DURATION,
         MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
-        MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
-        MF_SOURCE_READERF_ERROR, MF_VERSION, MFCreateAttributes, MFCreateMFByteStreamOnStream,
-        MFCreateMediaType, MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL,
+        MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+        MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+        MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_VERSION, MFAudioFormat_Float,
+        MFCreateAttributes, MFCreateMFByteStreamOnStream, MFCreateMediaType,
+        MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL, MFMediaType_Audio,
         MFMediaType_Video, MFSTARTUP_LITE, MFStartup, MFVideoArea, MFVideoFormat_RGB32,
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -46,9 +58,17 @@ mod platform {
     use windows::Win32::UI::Shell::SHCreateMemStream;
     use windows::core::{GUID, Interface, PCWSTR};
 
-    pub(super) const TYPES: &[&str] = &["video/mp4", "video/webm", "video/x-matroska"];
+    pub(super) const TYPES: &[&str] = &[
+        "video/mp4",
+        "video/webm",
+        "video/x-matroska",
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/aac",
+    ];
 
     const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+    const AUDIO: u32 = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
     // media foundation keeps time in units of 100 nanoseconds
     const TICKS: f64 = 10_000_000.0;
 
@@ -92,6 +112,118 @@ mod platform {
             // SAFETY: media foundation stays started for the life of the process
             .get_or_init(|| unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.map_err(text))
             .clone()
+    }
+
+    fn apartment() -> Result<Apartment, String> {
+        // SAFETY: the decode or sound thread is new, so this is its first COM initialization
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(text)?;
+        let apartment = Apartment;
+        started()?;
+        Ok(apartment)
+    }
+
+    // a source reader with only the given stream selected, or the missing message without one
+    unsafe fn source_reader(
+        source: &MediaSource,
+        attributes: Option<&IMFAttributes>,
+        stream: u32,
+        missing: &str,
+    ) -> Result<IMFSourceReader, String> {
+        unsafe {
+            let reader = match source {
+                MediaSource::File(path) => {
+                    let path = wide(path.as_os_str());
+                    MFCreateSourceReaderFromURL(PCWSTR(path.as_ptr()), attributes)
+                }
+                MediaSource::Bytes { body, mime_type } => {
+                    let stream = SHCreateMemStream(Some(body)).ok_or("could not hold the media")?;
+                    let bytes = MFCreateMFByteStreamOnStream(&stream).map_err(text)?;
+                    let mime_type = wide(mime_type.as_ref());
+                    bytes
+                        .cast::<IMFAttributes>()
+                        .and_then(|described| {
+                            described
+                                .SetString(&MF_BYTESTREAM_CONTENT_TYPE, PCWSTR(mime_type.as_ptr()))
+                        })
+                        .map_err(text)?;
+                    MFCreateSourceReaderFromByteStream(&bytes, attributes)
+                }
+            }
+            .map_err(text)?;
+            reader
+                .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
+                .map_err(text)?;
+            reader
+                .SetStreamSelection(stream, true)
+                .map_err(|_| missing.to_string())?;
+            Ok(reader)
+        }
+    }
+
+    unsafe fn duration(reader: &IMFSourceReader) -> f64 {
+        unsafe {
+            reader
+                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
+                .ok()
+                .filter(|value| value.Anonymous.Anonymous.vt == VT_UI8)
+                .map_or(f64::NAN, |value| {
+                    value.Anonymous.Anonymous.Anonymous.uhVal as f64 / TICKS
+                })
+        }
+    }
+
+    // the next sample of a stream and its time, none at the end; a changed output type is
+    // reported first so the caller reads it before the sample's data
+    fn read_sample(
+        reader: &IMFSourceReader,
+        stream: u32,
+        mut changed: impl FnMut() -> Result<(), String>,
+    ) -> Result<Option<(IMFSample, f64)>, String> {
+        loop {
+            let mut flags = 0;
+            let mut time = 0;
+            let mut sample = None;
+            // SAFETY: a synchronous read into locals that outlive the call
+            unsafe {
+                reader.ReadSample(
+                    stream,
+                    0,
+                    None,
+                    Some(&mut flags),
+                    Some(&mut time),
+                    Some(&mut sample),
+                )
+            }
+            .map_err(text)?;
+            let flags = flags as i32;
+            if flags & MF_SOURCE_READERF_ERROR.0 != 0 {
+                return Err("the media stream failed".to_string());
+            }
+            if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 != 0 {
+                changed()?;
+            }
+            if let Some(sample) = sample {
+                return Ok(Some((sample, time as f64 / TICKS)));
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 != 0 {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn seek(reader: &IMFSourceReader, seconds: f64) -> Result<(), String> {
+        let mut position = PROPVARIANT::default();
+        // SAFETY: fills the eight byte integer member that VT_I8 names
+        unsafe {
+            let value = &mut position.Anonymous.Anonymous;
+            value.vt = VT_I8;
+            value.Anonymous.hVal = (seconds.max(0.0) * TICKS) as i64;
+            reader
+                .SetCurrentPosition(&GUID::zeroed(), &position)
+                .map_err(text)
+        }
     }
 
     fn split(packed: u64) -> (u32, u32) {
@@ -162,12 +294,7 @@ mod platform {
 
     impl Reader {
         pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
-            // SAFETY: the decode thread is new, so this is its first COM initialization
-            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-                .ok()
-                .map_err(text)?;
-            let apartment = Apartment;
-            started()?;
+            let apartment = apartment()?;
             // SAFETY: every call below follows the source reader's documented contract, on
             // interfaces this function created and still holds
             unsafe {
@@ -180,33 +307,12 @@ mod platform {
                     // container claims, which webm files often get wrong
                     .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
                     .map_err(text)?;
-                let reader = match source {
-                    MediaSource::File(path) => {
-                        let path = wide(path.as_os_str());
-                        MFCreateSourceReaderFromURL(PCWSTR(path.as_ptr()), &attributes)
-                    }
-                    MediaSource::Bytes { body, mime_type } => {
-                        let stream =
-                            SHCreateMemStream(Some(body)).ok_or("could not hold the media")?;
-                        let bytes = MFCreateMFByteStreamOnStream(&stream).map_err(text)?;
-                        let mime_type = wide(mime_type.as_ref());
-                        bytes
-                            .cast::<IMFAttributes>()
-                            .and_then(|described| {
-                                described.SetString(
-                                    &MF_BYTESTREAM_CONTENT_TYPE,
-                                    PCWSTR(mime_type.as_ptr()),
-                                )
-                            })
-                            .map_err(text)?;
-                        MFCreateSourceReaderFromByteStream(&bytes, &attributes)
-                    }
-                }
-                .map_err(text)?;
-                reader
-                    .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
-                    .map_err(text)?;
-                reader.SetStreamSelection(VIDEO, true).map_err(text)?;
+                let reader = source_reader(
+                    source,
+                    Some(&attributes),
+                    VIDEO,
+                    "the media has no video stream",
+                )?;
                 let native = reader
                     .GetNativeMediaType(VIDEO, 0)
                     .map_err(|_| "the media has no video stream".to_string())?;
@@ -215,16 +321,7 @@ mod platform {
                     .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO)
                     .map_or((1, 1), split);
                 let (width, height) = natural_size(shown.width, shown.height, aspect);
-                let duration = reader
-                    .GetPresentationAttribute(
-                        MF_SOURCE_READER_MEDIASOURCE.0 as u32,
-                        &MF_PD_DURATION,
-                    )
-                    .ok()
-                    .filter(|value| value.Anonymous.Anonymous.vt == VT_UI8)
-                    .map_or(f64::NAN, |value| {
-                        value.Anonymous.Anonymous.Anonymous.uhVal as f64 / TICKS
-                    });
+                let duration = duration(&reader);
                 let output = MFCreateMediaType().map_err(text)?;
                 output
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -245,7 +342,7 @@ mod platform {
                     coded: (0, 0),
                     stride: 0,
                     picture: shown,
-                    shift: edit_shift(source).unwrap_or(0.0),
+                    shift: edit_shift(source, b"vide").unwrap_or(0.0),
                     _apartment: apartment,
                 };
                 opened.take_format()?;
@@ -321,64 +418,141 @@ mod platform {
         }
 
         fn seek(&mut self, seconds: f64) -> Result<(), String> {
-            let mut position = PROPVARIANT::default();
-            // SAFETY: fills the eight byte integer member that VT_I8 names
-            unsafe {
-                let value = &mut position.Anonymous.Anonymous;
-                value.vt = VT_I8;
-                value.Anonymous.hVal = ((seconds - self.shift).max(0.0) * TICKS) as i64;
-                self.reader
-                    .SetCurrentPosition(&GUID::zeroed(), &position)
-                    .map_err(text)
-            }
+            seek(&self.reader, seconds - self.shift)
         }
 
         fn read(&mut self) -> Result<Option<VideoFrame>, String> {
-            loop {
-                let mut flags = 0;
-                let mut time = 0;
-                let mut sample = None;
-                // SAFETY: a synchronous read into locals that outlive the call
-                unsafe {
-                    self.reader.ReadSample(
-                        VIDEO,
-                        0,
-                        None,
-                        Some(&mut flags),
-                        Some(&mut time),
-                        Some(&mut sample),
-                    )
-                }
+            let reader = self.reader.clone();
+            let Some((sample, time)) = read_sample(&reader, VIDEO, || self.take_format())? else {
+                return Ok(None);
+            };
+            // SAFETY: the sample came from the read above and is still held
+            let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(text)?;
+            Ok(Some(VideoFrame {
+                time: time + self.shift,
+                width: self.picture.width,
+                height: self.picture.height,
+                bgra: self.copy(&buffer)?,
+            }))
+        }
+    }
+
+    pub(super) struct Sound {
+        reader: IMFSourceReader,
+        info: AudioInfo,
+        // seconds the mp4 edit list moves the sound by
+        shift: f64,
+        // declared last so the reader is released before the apartment closes
+        _apartment: Apartment,
+    }
+
+    // SAFETY: the engine opens, reads and drops a sound on one thread, the apartment open joined
+    unsafe impl Send for Sound {}
+
+    // the rate and channels the decoder gives, as 32 bit floats
+    fn layout(reader: &IMFSourceReader) -> Result<(u32, u16), String> {
+        // SAFETY: reads attributes of the type the reader now delivers
+        unsafe {
+            let current = reader.GetCurrentMediaType(AUDIO).map_err(text)?;
+            let bits = current
+                .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
                 .map_err(text)?;
-                let flags = flags as i32;
-                if flags & MF_SOURCE_READERF_ERROR.0 != 0 {
-                    return Err("the video stream failed".to_string());
-                }
-                if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 != 0 {
-                    self.take_format()?;
-                }
-                if let Some(sample) = sample {
-                    // SAFETY: the sample came from the read above and is still held
-                    let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(text)?;
-                    return Ok(Some(VideoFrame {
-                        time: time as f64 / TICKS + self.shift,
-                        width: self.picture.width,
-                        height: self.picture.height,
-                        bgra: self.copy(&buffer)?,
-                    }));
-                }
-                if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 != 0 {
-                    return Ok(None);
-                }
+            let rate = current
+                .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+                .map_err(text)?;
+            let channels = current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).map_err(text)?;
+            match (bits, u16::try_from(channels)) {
+                (32, Ok(channels)) => Ok((rate, channels)),
+                _ => Err(format!(
+                    "the decoder gave {channels} channels of {bits} bit sound"
+                )),
             }
+        }
+    }
+
+    impl Sound {
+        pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
+            let apartment = apartment()?;
+            // SAFETY: every call below follows the source reader's documented contract, on
+            // interfaces this function created and still holds
+            unsafe {
+                let reader = source_reader(source, None, AUDIO, "the media has no sound")?;
+                let output = MFCreateMediaType().map_err(text)?;
+                output
+                    .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+                    .map_err(text)?;
+                // the rate and channels stay the source's, the engine fits them to the speakers
+                output
+                    .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)
+                    .map_err(text)?;
+                reader
+                    .SetCurrentMediaType(AUDIO, None, &output)
+                    .map_err(text)?;
+                let (rate, channels) = layout(&reader)?;
+                Ok(Self {
+                    info: AudioInfo {
+                        rate,
+                        channels,
+                        duration: duration(&reader),
+                    },
+                    reader,
+                    shift: edit_shift(source, b"soun").unwrap_or(0.0),
+                    _apartment: apartment,
+                })
+            }
+        }
+    }
+
+    impl AudioReader for Sound {
+        fn info(&self) -> AudioInfo {
+            self.info
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            seek(&self.reader, seconds - self.shift)
+        }
+
+        fn read(&mut self) -> Result<Option<AudioChunk>, String> {
+            let expected = (self.info.rate, self.info.channels);
+            let changed = || match layout(&self.reader)? {
+                layout if layout == expected => Ok(()),
+                _ => Err("the media's sound changed its rate or channels".to_string()),
+            };
+            let Some((sample, time)) = read_sample(&self.reader, AUDIO, changed)? else {
+                return Ok(None);
+            };
+            let mut samples = Vec::new();
+            // SAFETY: the lock pins the buffer while its bytes are read, and is unlocked
+            unsafe {
+                let buffer = sample.ConvertToContiguousBuffer().map_err(text)?;
+                let mut start = std::ptr::null_mut();
+                let mut length = 0;
+                buffer
+                    .Lock(&mut start, None, Some(&mut length))
+                    .map_err(text)?;
+                let bytes = std::slice::from_raw_parts(start, length as usize);
+                samples.extend(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&sample| f32::from_ne_bytes(sample)),
+                );
+                buffer.Unlock().map_err(text)?;
+            }
+            Ok(Some(AudioChunk {
+                time: time + self.shift,
+                samples,
+            }))
         }
     }
 }
 
-// media foundation's mp4 source ignores the video track's edit list, which ffmpeg and chromium
-// apply; an x264 file with b-frames would otherwise start its pictures two frames late
+// media foundation's mp4 source ignores a track's edit list, which ffmpeg and chromium apply; an
+// x264 file with b-frames would otherwise start its pictures two frames late, and aac its sound
+// 1024 samples of encoder priming late
 #[cfg(any(target_os = "windows", test))]
-fn edit_shift(source: &MediaSource) -> Option<f64> {
+fn edit_shift(source: &MediaSource, handler: &[u8; 4]) -> Option<f64> {
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
     // a moov this large is no movie header worth reading whole
@@ -451,7 +625,7 @@ fn edit_shift(source: &MediaSource) -> Option<f64> {
             child(trak, b"mdia")
                 .and_then(|mdia| child(mdia, b"hdlr"))
                 .and_then(|hdlr| hdlr.get(8..12))
-                == Some(b"vide")
+                == Some(handler)
         })?
         .1;
     let media_scale = timescale(child(child(track, b"mdia")?, b"mdhd")?)?;
@@ -475,14 +649,25 @@ fn edit_shift(source: &MediaSource) -> Option<f64> {
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use super::{MediaInfo, MediaSource, VideoFrame, VideoReader};
+    use super::{
+        AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
+    };
     use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    pub(super) const TYPES: &[&str] = &["video/mp4", "video/webm", "video/ogg", "video/x-matroska"];
+    pub(super) const TYPES: &[&str] = &[
+        "video/mp4",
+        "video/webm",
+        "video/ogg",
+        "video/x-matroska",
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/webm",
+        "audio/ogg",
+    ];
 
     const RTLD_NOW: c_int = 2;
     const STATE_NULL: c_int = 1;
@@ -501,9 +686,15 @@ mod platform {
     const POLL: u64 = 100_000_000;
 
     // videoscale squares anamorphic pixels, so the sink's size is the natural one
-    const PIPELINE: &CStr = c"filesrc name=source ! decodebin ! videoconvert ! videoscale ! \
+    const PICTURES: &CStr = c"filesrc name=source ! decodebin ! videoconvert ! videoscale ! \
         video/x-raw,format=BGRx,pixel-aspect-ratio=1/1 ! \
         appsink name=sink sync=false max-buffers=3 enable-last-sample=false";
+    // the rate and channels stay the source's, the engine fits them to the speakers
+    const SOUND: &CStr = c"filesrc name=source ! decodebin ! audioconvert ! \
+        audio/x-raw,format=F32LE,layout=interleaved ! \
+        appsink name=sink sync=false max-buffers=8 enable-last-sample=false";
+    const SIZE: [&CStr; 2] = [c"width", c"height"];
+    const LAYOUT: [&CStr; 2] = [c"rate", c"channels"];
 
     #[repr(C)]
     struct MiniObject {
@@ -656,22 +847,21 @@ mod platform {
         .ok_or_else(|| "gstreamer is not installed".to_string())
     }
 
-    pub(super) struct Reader {
+    // a pipeline from the source to one appsink, prerolled so the sink's caps are settled
+    struct Pipeline {
         gst: &'static Gst,
         pipeline: Object,
         sink: Object,
         bus: Object,
-        info: MediaInfo,
-        last: f64,
-        // bytes handed over in memory, written out for filesrc and removed with the reader
+        // bytes handed over in memory, written out for filesrc and removed with the pipeline
         spilled: Option<PathBuf>,
     }
 
     // SAFETY: gstreamer objects are thread safe, and the engine uses a reader on one thread
-    unsafe impl Send for Reader {}
+    unsafe impl Send for Pipeline {}
 
-    impl Reader {
-        pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
+    impl Pipeline {
+        fn open(source: &MediaSource, description: &CStr) -> Result<Self, String> {
             let gst = gst()?;
             let (path, spilled) = match source {
                 MediaSource::File(path) => (path.clone(), None),
@@ -689,32 +879,29 @@ mod platform {
             let location = CString::new(path.as_os_str().as_encoded_bytes())
                 .map_err(|_| "the media path holds a nul byte".to_string())?;
             // SAFETY: each object is checked before use and released by Drop, which runs as
-            // soon as the reader exists
+            // soon as the pipeline exists
             unsafe {
                 let mut error = std::ptr::null_mut();
-                let pipeline = (gst.gst_parse_launch)(PIPELINE.as_ptr(), &mut error);
+                let pipeline = (gst.gst_parse_launch)(description.as_ptr(), &mut error);
                 if !error.is_null() {
                     let message = take_error(gst, error);
                     if !pipeline.is_null() {
                         (gst.gst_object_unref)(pipeline);
                     }
+                    if let Some(path) = &spilled {
+                        let _ = std::fs::remove_file(path);
+                    }
                     return Err(message);
                 }
-                let mut reader = Self {
+                let opened = Self {
                     gst,
                     pipeline,
                     sink: (gst.gst_bin_get_by_name)(pipeline, c"sink".as_ptr()),
                     bus: (gst.gst_element_get_bus)(pipeline),
-                    info: MediaInfo {
-                        duration: f64::NAN,
-                        width: 0,
-                        height: 0,
-                    },
-                    last: 0.0,
                     spilled,
                 };
                 let source = (gst.gst_bin_get_by_name)(pipeline, c"source".as_ptr());
-                if source.is_null() || reader.sink.is_null() || reader.bus.is_null() {
+                if source.is_null() || opened.sink.is_null() || opened.bus.is_null() {
                     return Err("gstreamer could not build the pipeline".to_string());
                 }
                 (gst.g_object_set)(
@@ -732,33 +919,18 @@ mod platform {
                         STALL.as_nanos() as u64,
                     ) == STATE_CHANGE_FAILURE
                 {
-                    return Err(reader
+                    return Err(opened
                         .error()
                         .unwrap_or_else(|| "gstreamer could not open the media".to_string()));
                 }
-                let (width, height) = reader
-                    .negotiated()
-                    .ok_or("the media has no video stream gstreamer can decode")?;
-                let mut duration = 0;
-                if (gst.gst_element_query_duration)(pipeline, FORMAT_TIME, &mut duration) != 0
-                    && duration >= 0
-                {
-                    reader.info.duration = duration as f64 / NANOSECONDS;
-                }
-                reader.info.width = width;
-                reader.info.height = height;
-                if (gst.gst_element_set_state)(pipeline, STATE_PLAYING) == STATE_CHANGE_FAILURE {
-                    return Err(reader
-                        .error()
-                        .unwrap_or_else(|| "gstreamer could not play the media".to_string()));
-                }
-                Ok(reader)
+                Ok(opened)
             }
         }
 
-        // the frame size the sink agreed on once the pipeline prerolled
-        unsafe fn negotiated(&self) -> Option<(u32, u32)> {
+        // two whole fields of the caps the sink agreed on
+        fn negotiated(&self, names: [&CStr; 2]) -> Option<(u32, u32)> {
             let gst = self.gst;
+            // SAFETY: the sink is alive until Drop, and the pad and caps are released
             unsafe {
                 let pad = (gst.gst_element_get_static_pad)(self.sink, c"sink".as_ptr());
                 if pad.is_null() {
@@ -769,14 +941,40 @@ mod platform {
                 if caps.is_null() {
                     return None;
                 }
-                let size = caps_size(gst, caps);
+                let fields = caps_fields(gst, caps, names);
                 (gst.gst_mini_object_unref)(caps);
-                size
+                fields
             }
         }
 
-        unsafe fn error(&self) -> Option<String> {
+        fn duration(&self) -> f64 {
+            let mut duration = 0;
+            // SAFETY: the pipeline is alive until Drop
+            let known = unsafe {
+                (self.gst.gst_element_query_duration)(self.pipeline, FORMAT_TIME, &mut duration)
+            };
+            if known != 0 && duration >= 0 {
+                duration as f64 / NANOSECONDS
+            } else {
+                f64::NAN
+            }
+        }
+
+        fn play(&self) -> Result<(), String> {
+            // SAFETY: the pipeline is alive until Drop
+            if unsafe { (self.gst.gst_element_set_state)(self.pipeline, STATE_PLAYING) }
+                == STATE_CHANGE_FAILURE
+            {
+                return Err(self
+                    .error()
+                    .unwrap_or_else(|| "gstreamer could not play the media".to_string()));
+            }
+            Ok(())
+        }
+
+        fn error(&self) -> Option<String> {
             let gst = self.gst;
+            // SAFETY: the bus is alive until Drop, and the message and its parts are released
             unsafe {
                 let message = (gst.gst_bus_pop_filtered)(self.bus, MESSAGE_ERROR);
                 if message.is_null() {
@@ -793,84 +991,7 @@ mod platform {
             }
         }
 
-        unsafe fn frame(&mut self, sample: Object) -> Result<VideoFrame, String> {
-            let gst = self.gst;
-            unsafe {
-                let (width, height) = caps_size(gst, (gst.gst_sample_get_caps)(sample))
-                    .ok_or("gstreamer gave a frame without a size")?;
-                let buffer = (gst.gst_sample_get_buffer)(sample);
-                if buffer.is_null() {
-                    return Err("gstreamer gave a frame without pixels".to_string());
-                }
-                if (*buffer).pts != CLOCK_TIME_NONE {
-                    self.last = (*buffer).pts as f64 / NANOSECONDS;
-                }
-                let mut map = std::mem::zeroed::<MapInfo>();
-                if (gst.gst_buffer_map)(buffer, &mut map, MAP_READ) == 0 {
-                    return Err("gstreamer could not map a frame".to_string());
-                }
-                let row = width as usize * 4;
-                let rows = height as usize;
-                let pitch = map.size.checked_div(rows).unwrap_or(0);
-                let mut bgra = Vec::with_capacity(row * rows);
-                if pitch >= row {
-                    let bytes = std::slice::from_raw_parts(map.data, map.size);
-                    for line in bytes.chunks(pitch).take(rows) {
-                        bgra.extend_from_slice(&line[..row]);
-                    }
-                }
-                (gst.gst_buffer_unmap)(buffer, &mut map);
-                if bgra.is_empty() {
-                    return Err("gstreamer gave a frame smaller than its picture".to_string());
-                }
-                Ok(VideoFrame {
-                    time: self.last,
-                    width,
-                    height,
-                    bgra,
-                })
-            }
-        }
-    }
-
-    unsafe fn caps_size(gst: &Gst, caps: Object) -> Option<(u32, u32)> {
-        unsafe {
-            if caps.is_null() {
-                return None;
-            }
-            let structure = (gst.gst_caps_get_structure)(caps, 0);
-            let (mut width, mut height) = (0, 0);
-            if structure.is_null()
-                || (gst.gst_structure_get_int)(structure, c"width".as_ptr(), &mut width) == 0
-                || (gst.gst_structure_get_int)(structure, c"height".as_ptr(), &mut height) == 0
-                || width <= 0
-                || height <= 0
-            {
-                return None;
-            }
-            Some((width as u32, height as u32))
-        }
-    }
-
-    unsafe fn take_error(gst: &Gst, error: *mut GError) -> String {
-        unsafe {
-            if error.is_null() {
-                return "gstreamer failed without saying why".to_string();
-            }
-            let message = CStr::from_ptr((*error).message)
-                .to_string_lossy()
-                .into_owned();
-            (gst.g_error_free)(error);
-            message
-        }
-    }
-
-    impl VideoReader for Reader {
-        fn info(&self) -> MediaInfo {
-            self.info
-        }
-
-        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        fn seek(&self, seconds: f64) -> Result<(), String> {
             let nanoseconds = (seconds.max(0.0) * NANOSECONDS) as i64;
             // SAFETY: the pipeline is alive until Drop
             let sought = unsafe {
@@ -887,32 +1008,54 @@ mod platform {
             Ok(())
         }
 
-        fn read(&mut self) -> Result<Option<VideoFrame>, String> {
+        // the next sample's caps, time and bytes, none at the end
+        fn pull<T>(
+            &self,
+            take: impl FnOnce(Object, Option<f64>, &[u8]) -> Result<T, String>,
+        ) -> Result<Option<T>, String> {
+            let gst = self.gst;
             let started = Instant::now();
-            // SAFETY: the sink and bus are alive until Drop, and each sample is released
+            // SAFETY: the sink and bus are alive until Drop, each sample is released, and the
+            // mapped bytes are read only while mapped
             unsafe {
                 loop {
-                    let sample = (self.gst.gst_app_sink_try_pull_sample)(self.sink, POLL);
+                    let sample = (gst.gst_app_sink_try_pull_sample)(self.sink, POLL);
                     if !sample.is_null() {
-                        let frame = self.frame(sample);
-                        (self.gst.gst_mini_object_unref)(sample);
-                        return frame.map(Some);
+                        let buffer = (gst.gst_sample_get_buffer)(sample);
+                        let mut map = std::mem::zeroed::<MapInfo>();
+                        let taken = if buffer.is_null()
+                            || (gst.gst_buffer_map)(buffer, &mut map, MAP_READ) == 0
+                        {
+                            Err("gstreamer gave a sample it could not map".to_string())
+                        } else {
+                            let pts = (*buffer).pts;
+                            let time = (pts != CLOCK_TIME_NONE).then(|| pts as f64 / NANOSECONDS);
+                            let bytes = match map.size {
+                                0 => &[][..],
+                                size => std::slice::from_raw_parts(map.data, size),
+                            };
+                            let taken = take((gst.gst_sample_get_caps)(sample), time, bytes);
+                            (gst.gst_buffer_unmap)(buffer, &mut map);
+                            taken
+                        };
+                        (gst.gst_mini_object_unref)(sample);
+                        return taken.map(Some);
                     }
-                    if (self.gst.gst_app_sink_is_eos)(self.sink) != 0 {
+                    if (gst.gst_app_sink_is_eos)(self.sink) != 0 {
                         return Ok(None);
                     }
                     if let Some(error) = self.error() {
                         return Err(error);
                     }
                     if started.elapsed() > STALL {
-                        return Err("gstreamer stopped giving frames".to_string());
+                        return Err("gstreamer stopped giving samples".to_string());
                     }
                 }
             }
         }
     }
 
-    impl Drop for Reader {
+    impl Drop for Pipeline {
         fn drop(&mut self) {
             // SAFETY: each object is released once, after the pipeline stops using them
             unsafe {
@@ -930,6 +1073,166 @@ mod platform {
             }
         }
     }
+
+    // two whole, positive fields of a caps' first structure
+    unsafe fn caps_fields(gst: &Gst, caps: Object, names: [&CStr; 2]) -> Option<(u32, u32)> {
+        unsafe {
+            if caps.is_null() {
+                return None;
+            }
+            let structure = (gst.gst_caps_get_structure)(caps, 0);
+            if structure.is_null() {
+                return None;
+            }
+            let mut values = [0; 2];
+            for (name, value) in names.iter().zip(&mut values) {
+                if (gst.gst_structure_get_int)(structure, name.as_ptr(), value) == 0 || *value <= 0
+                {
+                    return None;
+                }
+            }
+            Some((values[0] as u32, values[1] as u32))
+        }
+    }
+
+    unsafe fn take_error(gst: &Gst, error: *mut GError) -> String {
+        unsafe {
+            if error.is_null() {
+                return "gstreamer failed without saying why".to_string();
+            }
+            let message = CStr::from_ptr((*error).message)
+                .to_string_lossy()
+                .into_owned();
+            (gst.g_error_free)(error);
+            message
+        }
+    }
+
+    pub(super) struct Reader {
+        pipeline: Pipeline,
+        info: MediaInfo,
+        last: f64,
+    }
+
+    impl Reader {
+        pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
+            let pipeline = Pipeline::open(source, PICTURES)?;
+            let (width, height) = pipeline
+                .negotiated(SIZE)
+                .ok_or("the media has no video stream gstreamer can decode")?;
+            let info = MediaInfo {
+                duration: pipeline.duration(),
+                width,
+                height,
+            };
+            pipeline.play()?;
+            Ok(Self {
+                pipeline,
+                info,
+                last: 0.0,
+            })
+        }
+    }
+
+    impl VideoReader for Reader {
+        fn info(&self) -> MediaInfo {
+            self.info
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.pipeline.seek(seconds)
+        }
+
+        fn read(&mut self) -> Result<Option<VideoFrame>, String> {
+            let gst = self.pipeline.gst;
+            let last = &mut self.last;
+            self.pipeline.pull(|caps, time, bytes| {
+                // SAFETY: the caps belong to the sample pull still holds
+                let (width, height) = unsafe { caps_fields(gst, caps, SIZE) }
+                    .ok_or("gstreamer gave a frame without a size")?;
+                if let Some(time) = time {
+                    *last = time;
+                }
+                let row = width as usize * 4;
+                let rows = height as usize;
+                let pitch = bytes.len().checked_div(rows).unwrap_or(0);
+                if pitch < row {
+                    return Err("gstreamer gave a frame smaller than its picture".to_string());
+                }
+                let mut bgra = Vec::with_capacity(row * rows);
+                for line in bytes.chunks(pitch).take(rows) {
+                    bgra.extend_from_slice(&line[..row]);
+                }
+                Ok(VideoFrame {
+                    time: *last,
+                    width,
+                    height,
+                    bgra,
+                })
+            })
+        }
+    }
+
+    pub(super) struct Sound {
+        pipeline: Pipeline,
+        info: AudioInfo,
+        // where the next chunk starts when its buffer carries no time
+        next: f64,
+    }
+
+    impl Sound {
+        pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
+            let pipeline = Pipeline::open(source, SOUND)?;
+            let (rate, channels) = pipeline
+                .negotiated(LAYOUT)
+                .ok_or("the media has no sound gstreamer can decode")?;
+            let info = AudioInfo {
+                rate,
+                channels: u16::try_from(channels)
+                    .map_err(|_| format!("the media's sound has {channels} channels"))?,
+                duration: pipeline.duration(),
+            };
+            pipeline.play()?;
+            Ok(Self {
+                pipeline,
+                info,
+                next: 0.0,
+            })
+        }
+    }
+
+    impl AudioReader for Sound {
+        fn info(&self) -> AudioInfo {
+            self.info
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.pipeline.seek(seconds)
+        }
+
+        fn read(&mut self) -> Result<Option<AudioChunk>, String> {
+            let gst = self.pipeline.gst;
+            let info = self.info;
+            let next = &mut self.next;
+            self.pipeline.pull(|caps, time, bytes| {
+                // SAFETY: the caps belong to the sample pull still holds
+                let layout = unsafe { caps_fields(gst, caps, LAYOUT) };
+                if layout != Some((info.rate, u32::from(info.channels))) {
+                    return Err("the media's sound changed its rate or channels".to_string());
+                }
+                let time = time.unwrap_or(*next);
+                let samples: Vec<f32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&sample| f32::from_le_bytes(sample))
+                    .collect();
+                *next = time
+                    + (samples.len() / usize::from(info.channels)) as f64 / f64::from(info.rate);
+                Ok(AudioChunk { time, samples })
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -941,14 +1244,98 @@ mod tests {
     // ten 64x32 frames at ten a second, key frames at 0 and 0.5 s, frame n grey at luma
     // 16 + 10n, so its rgb level is about 11.6n
     fn reel() -> PathBuf {
-        let name = if cfg!(target_os = "windows") {
-            "reel.mp4"
+        fixture("reel")
+    }
+
+    fn fixture(stem: &str) -> PathBuf {
+        let extension = if cfg!(target_os = "windows") {
+            "mp4"
         } else {
-            "reel.webm"
+            "webm"
         };
-        [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", name]
+        [
+            env!("CARGO_MANIFEST_DIR"),
+            "tests",
+            "fixtures",
+            &format!("{stem}.{extension}"),
+        ]
+        .iter()
+        .collect()
+    }
+
+    // the reel's pictures over a mono 48 kHz sound: half a second of silence, then a 440 Hz
+    // tone at half scale, aac in the mp4 and opus in the webm
+    fn voiced() -> PathBuf {
+        fixture("voiced")
+    }
+
+    // each sample with its media time
+    fn timed(reader: &mut dyn ceri_engine::AudioReader) -> Vec<(f64, f32)> {
+        let rate = f64::from(reader.info().rate);
+        let mut timed = Vec::new();
+        while let Some(chunk) = reader.read().expect("sound should decode") {
+            timed.extend(
+                chunk
+                    .samples
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &sample)| (chunk.time + index as f64 / rate, sample)),
+            );
+        }
+        timed
+    }
+
+    fn loudness(timed: &[(f64, f32)], from: f64, to: f64) -> f32 {
+        let window: Vec<f32> = timed
             .iter()
-            .collect()
+            .filter(|(time, _)| (from..to).contains(time))
+            .map(|&(_, sample)| sample)
+            .collect();
+        assert!(!window.is_empty(), "no sound between {from} and {to}");
+        (window.iter().map(|sample| sample * sample).sum::<f32>() / window.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn a_file_decodes_to_timed_sound_from_where_it_seeks() {
+        let mut sound = DesktopVideo
+            .open_audio(&MediaSource::File(voiced()))
+            .expect("the fixture's sound should open");
+        let info = sound.info();
+        assert_eq!((info.rate, info.channels), (48_000, 1));
+        assert!((info.duration - 1.0).abs() < 0.05, "{}", info.duration);
+        let whole = timed(&mut *sound);
+        // half scale passes a quarter of it 0.19 ms into the tone
+        let onset = whole
+            .iter()
+            .find(|(_, sample)| sample.abs() > 0.25)
+            .map_or(f64::NAN, |&(time, _)| time);
+        assert!((onset - 0.5002).abs() < 0.002, "{onset}");
+        assert!(loudness(&whole, 0.0, 0.45) < 0.02);
+        let tone = loudness(&whole, 0.55, 0.95);
+        assert!((tone - 0.354).abs() < 0.06, "{tone}");
+        let end = whole.last().map_or(f64::NAN, |&(time, _)| time);
+        assert!((end - 1.0).abs() < 0.03, "{end}");
+
+        sound.seek(0.7).expect("the seek should land");
+        let after = timed(&mut *sound);
+        let start = after.first().map_or(f64::NAN, |&(time, _)| time);
+        assert!((0.5..=0.7).contains(&start), "{start}");
+        assert!((loudness(&after, 0.7, 0.9) - 0.354).abs() < 0.06);
+    }
+
+    #[test]
+    fn pictures_decode_past_a_sound_and_no_sound_fails_fast() {
+        let mut reader = DesktopVideo
+            .open(&MediaSource::File(voiced()))
+            .expect("the fixture's pictures should open");
+        let mut frames = 0;
+        while reader.read().expect("frames should decode").is_some() {
+            frames += 1;
+        }
+        assert_eq!(frames, 10);
+        let started = std::time::Instant::now();
+        assert!(DesktopVideo.open_audio(&MediaSource::File(reel())).is_err());
+        assert!(started.elapsed().as_secs_f64() < 2.0);
     }
 
     fn level(frame: &ceri_engine::VideoFrame) -> u8 {
@@ -1026,10 +1413,11 @@ mod tests {
             .collect::<PathBuf>(),
         )
         .expect("the fixture should read");
-        let shift = super::edit_shift(&source(&edited)).expect("the file has an edit list");
+        let shift =
+            super::edit_shift(&source(&edited), b"vide").expect("the file has an edit list");
         assert!((shift + 2.0 / 30.0).abs() < 1e-6, "{shift}");
         if cfg!(target_os = "windows") {
-            assert_eq!(super::edit_shift(&source(&reel)), Some(0.0));
+            assert_eq!(super::edit_shift(&source(&reel), b"vide"), Some(0.0));
             let mut reader = DesktopVideo
                 .open(&source(&edited))
                 .expect("the fixture should open");
@@ -1040,7 +1428,7 @@ mod tests {
             assert!(first.time.abs() < 1e-6, "{}", first.time);
         }
         assert_eq!(
-            super::edit_shift(&source(b"\x1a\x45\xdf\xa3 not a movie")),
+            super::edit_shift(&source(b"\x1a\x45\xdf\xa3 not a movie"), b"vide"),
             None
         );
     }
@@ -1052,6 +1440,7 @@ mod tests {
             "maybe"
         );
         assert_eq!(DesktopVideo.can_play("VIDEO/WEBM"), "maybe");
+        assert_eq!(DesktopVideo.can_play("audio/mpeg"), "maybe");
         assert_eq!(DesktopVideo.can_play("video/x-unknown"), "");
     }
 }

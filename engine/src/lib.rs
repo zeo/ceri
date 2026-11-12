@@ -37,6 +37,7 @@ mod range;
 mod script;
 mod selection;
 mod shaping;
+mod sound;
 mod svg;
 mod text;
 mod text_tables;
@@ -82,6 +83,7 @@ pub use paint::Canvas;
 pub use script::{
     HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone, seed_local_storage,
 };
+pub use sound::{AudioChunk, AudioInfo, AudioReader};
 pub use video::{MediaDecoder, MediaInfo, MediaSource, VideoFrame, VideoReader};
 #[cfg(feature = "windowed")]
 pub use window::{

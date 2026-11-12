@@ -813,18 +813,20 @@ pub(super) fn create(
         globals.push((interface.name, Value::Object(constructor)));
         prototypes.insert(interface.name, prototype);
     }
-    // the legacy factory shares HTMLImageElement's prototype rather than owning one
-    let image = build.function(Native::DomConstructor("Image"), "Image", 0);
-    image.borrow_mut().define(
-        "prototype".to_string(),
-        Property {
-            slot: Slot::Data(Value::Object(prototypes["HTMLImageElement"].clone())),
-            enumerable: false,
-            writable: false,
-            configurable: false,
-        },
-    );
-    globals.push(("Image", Value::Object(image)));
+    // the legacy factories share their element's prototype rather than owning one
+    for (name, element) in [("Image", "HTMLImageElement"), ("Audio", "HTMLAudioElement")] {
+        let factory = build.function(Native::DomConstructor(name), name, 0);
+        factory.borrow_mut().define(
+            "prototype".to_string(),
+            Property {
+                slot: Slot::Data(Value::Object(prototypes[element].clone())),
+                enumerable: false,
+                writable: false,
+                configurable: false,
+            },
+        );
+        globals.push((name, Value::Object(factory)));
+    }
     DomInterfaces { prototypes }
 }
 
@@ -1746,6 +1748,9 @@ impl ScriptRuntime {
         }
         if interface == "Image" {
             return self.construct_image(&arguments);
+        }
+        if interface == "Audio" {
+            return self.construct_audio_element(&arguments);
         }
         if interface == "EventTarget" {
             let prototype = match new_target {

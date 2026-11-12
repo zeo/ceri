@@ -33,7 +33,11 @@ struct Mix {
     voices: Vec<Voice>,
     ended: Vec<u32>,
     waker: Option<Waker>,
+    // a media element's sound, which fills the frames in place of the voices
+    feed: Option<Feed>,
 }
+
+pub(crate) type Feed = Arc<dyn Fn(&mut [f32], usize) + Send + Sync>;
 
 // a buffer source playing: where it reads, how fast, and how loud it reaches the speakers
 pub(crate) struct Voice {
@@ -66,6 +70,11 @@ impl AudioRender {
         if !mix.running {
             return;
         }
+        if let Some(feed) = mix.feed.clone() {
+            drop(mix);
+            feed(out, channels);
+            return;
+        }
         let base = mix.frames;
         let Mix { voices, ended, .. } = &mut *mix;
         let before = ended.len();
@@ -93,6 +102,10 @@ impl AudioRender {
 
     pub(crate) fn set_running(&self, running: bool) {
         self.mix().running = running;
+    }
+
+    pub(crate) fn set_feed(&self, feed: Feed) {
+        self.mix().feed = Some(feed);
     }
 
     pub(crate) fn play(&self, voice: Voice) {
@@ -216,6 +229,47 @@ impl Drop for Clock {
     }
 }
 
+// a WAVE fmt chunk's layout: frames interleave channels samples of width bytes each
+#[derive(Clone, Copy)]
+pub(crate) struct WaveFormat {
+    pub(crate) channels: usize,
+    pub(crate) rate: u32,
+    pub(crate) width: usize,
+    pub(crate) sample: fn(&[u8]) -> f32,
+}
+
+// integer or float PCM, the formats a WAVE file plays without a codec
+pub(crate) fn wave_format(format: &[u8]) -> Option<WaveFormat> {
+    let field = |at: usize| Some(u16::from_le_bytes(*format.get(at..)?.first_chunk::<2>()?));
+    let mut tag = field(0)?;
+    let channels = usize::from(field(2)?);
+    let rate = u32::from_le_bytes(*format.get(4..)?.first_chunk::<4>()?);
+    let bits = field(14)?;
+    // an extensible header carries the real format at the start of its subformat guid
+    if tag == 0xfffe {
+        tag = field(24)?;
+    }
+    let width = usize::from(bits.div_ceil(8));
+    if channels == 0 || rate == 0 || width == 0 {
+        return None;
+    }
+    let sample: fn(&[u8]) -> f32 = match (tag, bits) {
+        (1, 8) => |b| (f32::from(b[0]) - 128.0) / 128.0,
+        (1, 16) => |b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0,
+        (1, 24) => |b| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0,
+        (1, 32) => |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
+        (3, 32) => |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        (3, 64) => |b| f64::from_le_bytes(b[..8].try_into().unwrap_or_default()) as f32,
+        _ => return None,
+    };
+    Some(WaveFormat {
+        channels,
+        rate,
+        width,
+        sample,
+    })
+}
+
 // reads a RIFF WAVE file of integer or float PCM into one sample list per channel at rate
 pub(crate) fn decode(bytes: &[u8], rate: u32) -> Option<Vec<Vec<f32>>> {
     let body = bytes
@@ -237,29 +291,12 @@ pub(crate) fn decode(bytes: &[u8], rate: u32) -> Option<Vec<Vec<f32>>> {
         }
         chunks = rest.get(size + (size & 1)..).unwrap_or_default();
     }
-    let format = format?;
-    let field = |at: usize| Some(u16::from_le_bytes(*format.get(at..)?.first_chunk::<2>()?));
-    let mut tag = field(0)?;
-    let channels = usize::from(field(2)?);
-    let source_rate = u32::from_le_bytes(*format.get(4..)?.first_chunk::<4>()?);
-    let bits = field(14)?;
-    // an extensible header carries the real format at the start of its subformat guid
-    if tag == 0xfffe {
-        tag = field(24)?;
-    }
-    let width = usize::from(bits.div_ceil(8));
-    if channels == 0 || source_rate == 0 || width == 0 {
-        return None;
-    }
-    let sample: fn(&[u8]) -> f32 = match (tag, bits) {
-        (1, 8) => |b| (f32::from(b[0]) - 128.0) / 128.0,
-        (1, 16) => |b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0,
-        (1, 24) => |b| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0,
-        (1, 32) => |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
-        (3, 32) => |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-        (3, 64) => |b| f64::from_le_bytes(b[..8].try_into().unwrap_or_default()) as f32,
-        _ => return None,
-    };
+    let WaveFormat {
+        channels,
+        rate: source_rate,
+        width,
+        sample,
+    } = wave_format(format?)?;
     let mut decoded = vec![Vec::new(); channels];
     for frame in data?.chunks_exact(width * channels) {
         for (channel, bytes) in decoded.iter_mut().zip(frame.chunks_exact(width)) {

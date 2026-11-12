@@ -1,12 +1,14 @@
-// audio and video elements: a source opens on a decoder thread, and the element keeps the
-// playback clock, ready state, promises and events of HTMLMediaElement around the frames that
-// thread hands back
+// audio and video elements: a source opens on decoder threads, one for pictures and one for
+// sound, and the element keeps the playback clock, ready state, promises and events of
+// HTMLMediaElement around what those threads hand back
 
 use super::realm::Native;
 use super::*;
+use crate::audio::{AudioOutput, AudioRender};
 use crate::dom::Namespace;
 use crate::image::Image;
 use crate::layout::ImageLayer;
+use crate::sound::Sound;
 use crate::video::{MediaDecoder, MediaInfo, MediaSource, Track};
 
 const NETWORK_EMPTY: u8 = 0;
@@ -33,6 +35,7 @@ struct MediaElement {
     generation: u64,
     url: Option<String>,
     track: Option<Track>,
+    sound: Option<Sound>,
     info: Option<MediaInfo>,
     network: u8,
     ready: u8,
@@ -58,6 +61,8 @@ struct MediaElement {
     shown: bool,
     // autoplay starts it unless script played or paused it first
     can_autoplay: bool,
+    // in a document at the last look, so leaving one pauses it while new Audio() plays unplaced
+    connected: bool,
     reported: u64,
     waiters: Vec<PromiseHandle>,
 }
@@ -68,6 +73,7 @@ impl MediaElement {
             generation: 0,
             url: None,
             track: None,
+            sound: None,
             info: None,
             network: NETWORK_EMPTY,
             ready: HAVE_NOTHING,
@@ -88,6 +94,7 @@ impl MediaElement {
             frame_time: 0.0,
             shown: false,
             can_autoplay: true,
+            connected: false,
             reported: 0,
             waiters: Vec::new(),
         }
@@ -139,6 +146,9 @@ impl MediaElement {
         if let Some(track) = &self.track {
             track.seek(self.seek, self.position);
         }
+        if let Some(sound) = &self.sound {
+            sound.seek(self.seek, self.position);
+        }
         self.settle_clock(now);
         vec![Cue::Event("seeking")]
     }
@@ -146,43 +156,72 @@ impl MediaElement {
     // what the decoder thread brought since the last look, and where the clock now stands
     fn advance(&mut self, now: u64, connected: bool, autoplay: bool, looped: bool) -> Advance {
         let mut step = Advance::default();
-        let Some(track) = &self.track else {
+        if self.track.is_none() && self.sound.is_none() {
             return step;
-        };
-        let mut state = track.lock();
+        }
         if self.info.is_none() {
-            match state.opened.clone() {
-                None => return step,
-                Some(Err(_)) => {
+            let pictures = self.track.as_ref().map(|track| track.lock().opened.clone());
+            let sound = self.sound.as_ref().map(|sound| sound.lock().opened.clone());
+            if matches!(pictures, Some(None)) || matches!(sound, Some(None)) {
+                return step;
+            }
+            // either may fail alone, for a video without sound or sound without pictures
+            let pictures = pictures.flatten().and_then(Result::ok);
+            let sound = sound.flatten().and_then(Result::ok);
+            if pictures.is_none() {
+                self.track = None;
+            }
+            if sound.is_none() {
+                self.sound = None;
+            }
+            let info = match (pictures, sound) {
+                (Some(info), sound) if info.duration.is_nan() => MediaInfo {
+                    duration: sound.map_or(f64::NAN, |sound| sound.duration),
+                    ..info
+                },
+                (Some(info), _) => info,
+                (None, Some(sound)) => MediaInfo {
+                    duration: sound.duration,
+                    width: 0,
+                    height: 0,
+                },
+                (None, None) => {
                     step.failed = true;
                     return step;
                 }
-                Some(Ok(info)) => {
-                    self.info = Some(info);
-                    self.ready = HAVE_METADATA;
-                    self.network = NETWORK_IDLE;
-                    step.cues
-                        .extend([Cue::Event("durationchange"), Cue::Event("loadedmetadata")]);
+            };
+            self.info = Some(info);
+            self.ready = HAVE_METADATA;
+            self.network = NETWORK_IDLE;
+            step.cues
+                .extend([Cue::Event("durationchange"), Cue::Event("loadedmetadata")]);
+        }
+        let (mut exhausted, mut landed) = (true, true);
+        if let Some(track) = &self.track {
+            let mut state = track.lock();
+            let mut done = false;
+            if state.reached == self.seek {
+                let time = self.current_time(now);
+                if let Some((at, image)) = state.take_frame(time, !self.shown) {
+                    self.frame = Some(Rc::new(image));
+                    self.frame_time = at;
+                    self.shown = true;
+                    step.frames += 1;
                 }
+                done = state.exhausted();
             }
+            exhausted &= done;
+            landed &= self.shown || done;
         }
-        let mut exhausted = false;
-        if state.reached == self.seek {
-            let time = self.current_time(now);
-            if let Some((at, image)) = state.take_frame(time, !self.shown) {
-                self.frame = Some(Rc::new(image));
-                self.frame_time = at;
-                self.shown = true;
-                step.frames += 1;
-            }
-            exhausted = state.exhausted();
+        if let Some(sound) = &self.sound {
+            let state = sound.lock();
+            exhausted &= state.exhausted();
+            landed &= state.ready(self.seek);
         }
-        drop(state);
         if let Some(start) = self.start_at.take() {
             step.cues.extend(self.begin_seek(now, start));
             return step;
         }
-        let landed = self.shown || exhausted;
         if landed && self.ready < HAVE_ENOUGH_DATA {
             self.ready = HAVE_ENOUGH_DATA;
             step.cues
@@ -226,7 +265,8 @@ impl MediaElement {
             }
         }
         // a media element taken out of the document pauses
-        if !connected && !self.paused {
+        let removed = std::mem::replace(&mut self.connected, connected) && !connected;
+        if removed && !self.paused {
             self.paused = true;
             self.settle_clock(now);
             step.cues
@@ -234,6 +274,21 @@ impl MediaElement {
             step.aborted = true;
         }
         step
+    }
+
+    // the speakers open while it plays and follow its clock while that runs
+    fn follow_sound(
+        &mut self,
+        now: u64,
+        muted: bool,
+        open: impl FnOnce(u32, &AudioRender) -> Box<dyn AudioOutput>,
+    ) {
+        let time = self.current_time(now);
+        let clock = self.anchor.map(|anchor| (self.position, anchor, self.rate));
+        let gain = if muted { 0.0 } else { self.volume as f32 };
+        if let Some(sound) = &mut self.sound {
+            sound.follow(!self.paused, clock, time, gain, open);
+        }
     }
 }
 
@@ -297,6 +352,28 @@ impl ScriptRuntime {
     ) {
         self.media.decoder = decoder;
         self.media.waker = waker;
+    }
+
+    // new Audio(src): an audio element that preloads, loading src when one is given
+    pub(super) fn construct_audio_element(
+        &mut self,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let node = self.document.borrow_mut().create_element("audio");
+        self.document
+            .borrow_mut()
+            .set_attribute(node, "preload", "auto".to_string());
+        if let Some(source) = arguments
+            .first()
+            .filter(|value| !matches!(value, Value::Undefined))
+        {
+            let source = self.coerce_string(source.clone())?;
+            self.document
+                .borrow_mut()
+                .set_attribute(node, "src", source.to_string());
+            self.load_media(node);
+        }
+        Ok(self.node_value(node))
     }
 
     pub(super) fn forget_media(&mut self, gone: impl Fn(NodeId) -> bool) {
@@ -448,6 +525,7 @@ impl ScriptRuntime {
             muted: element.muted,
             preserves_pitch: element.preserves_pitch,
             default_rate: element.default_rate,
+            connected: element.connected,
             rate: element.default_rate,
             ..MediaElement::new()
         };
@@ -489,6 +567,11 @@ impl ScriptRuntime {
             return Ok(Value::Undefined);
         };
         let url = element.url.clone();
+        let pictures = self
+            .document
+            .borrow()
+            .element(node)
+            .is_some_and(|element| element.name == "video");
         let event = self.new_event("Event", "loadstart".into(), false, false, false, true);
         self.dispatch(&event, events::ListenerTarget::Node(node))?;
         let source = url.and_then(|url| self.media_source(&url));
@@ -502,12 +585,14 @@ impl ScriptRuntime {
         else {
             return Ok(Value::Undefined);
         };
-        match (source, decoder) {
-            (Some(source), Some(decoder)) => {
-                element.track = Some(Track::open(decoder, source, waker));
-            }
-            _ => self.fail_media(node),
+        let Some(source) = source else {
+            self.fail_media(node);
+            return Ok(Value::Undefined);
+        };
+        if let Some(decoder) = decoder.clone().filter(|_| pictures) {
+            element.track = Some(Track::open(decoder, source.clone(), waker.clone()));
         }
+        element.sound = Some(Sound::open(decoder, source, waker));
         Ok(Value::Undefined)
     }
 
@@ -516,6 +601,7 @@ impl ScriptRuntime {
             return;
         };
         element.track = None;
+        element.sound = None;
         element.error = Some(MEDIA_ERR_SRC_NOT_SUPPORTED);
         element.network = NETWORK_NO_SOURCE;
         self.reject_waiters(node, unsupported);
@@ -564,21 +650,25 @@ impl ScriptRuntime {
             .media
             .elements
             .iter()
-            .filter(|(_, element)| element.track.is_some())
+            .filter(|(_, element)| element.track.is_some() || element.sound.is_some())
             .map(|(node, _)| *node)
             .collect::<Vec<_>>();
         let mut frames = 0;
         for node in nodes {
-            let (connected, autoplay, looped) = {
+            let (connected, autoplay, looped, muted) = {
                 let document = self.document.borrow();
                 (
                     document.is_connected(node),
                     document.attribute(node, "autoplay").is_some(),
                     document.attribute(node, "loop").is_some(),
+                    document.attribute(node, "muted").is_some(),
                 )
             };
             let element = self.media.elements.get_mut(&node).expect("listed above");
             let step = element.advance(now, connected, autoplay, looped);
+            let muted = element.muted.unwrap_or(muted);
+            let audio = &self.audio;
+            element.follow_sound(now, muted, |rate, render| audio.open(Some(rate), render));
             frames += step.frames;
             if step.failed {
                 self.fail_media(node);
@@ -721,11 +811,16 @@ impl ScriptRuntime {
             }
             ("canPlayType", Call) => {
                 let mime_type = self.coerce_string(first)?;
-                let answer = self
-                    .media
-                    .decoder
-                    .as_ref()
-                    .map_or("", |decoder| decoder.can_play(mime_type.trim()));
+                let essence = mime_type.split(';').next().unwrap_or_default().trim();
+                // the engine reads pcm wave files itself
+                let wave = ["audio/wav", "audio/x-wav"]
+                    .iter()
+                    .any(|wave| wave.eq_ignore_ascii_case(essence));
+                let answer = match &self.media.decoder {
+                    _ if wave => "maybe",
+                    Some(decoder) => decoder.can_play(mime_type.trim()),
+                    None => "",
+                };
                 Value::String(answer.into())
             }
             ("load", Call) => {

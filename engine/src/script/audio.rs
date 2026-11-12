@@ -589,7 +589,7 @@ impl AudioState {
         Some((step, looped))
     }
 
-    fn open(&self, rate: Option<u32>, render: &AudioRender) -> Box<dyn AudioOutput> {
+    pub(super) fn open(&self, rate: Option<u32>, render: &AudioRender) -> Box<dyn AudioOutput> {
         self.device
             .as_ref()
             .and_then(|device| device.open(rate, render.clone()).ok())
