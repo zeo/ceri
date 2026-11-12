@@ -168,7 +168,7 @@ fn main() -> Result<(), String> {
         canvas.non_background_pixels(),
         options.output.display()
     );
-    for log in host.browser().console_logs() {
+    for log in host.browser_mut().console_logs() {
         println!("console: {log}");
     }
     Ok(())

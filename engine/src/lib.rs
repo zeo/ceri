@@ -6,6 +6,7 @@ mod cff;
 mod clip_path;
 mod color_glyph;
 mod colors;
+mod csp;
 mod css;
 mod deflate;
 mod dom;

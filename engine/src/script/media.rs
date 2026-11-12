@@ -524,13 +524,24 @@ impl ScriptRuntime {
 
     // a files URL is read in place; anything else is fetched whole
     fn media_source(&mut self, url: &str) -> Option<MediaSource> {
+        let check = self.content_security_policy().url(
+            crate::csp::Directive::Media,
+            url,
+            crate::csp::Initiator::default(),
+        );
+        if !self.permits(check) {
+            return None;
+        }
         let parsed = AppUrl::parse(url).ok();
         if let (Some(parsed), Some(provider)) = (&parsed, &self.resource_provider)
             && let Some(path) = provider.media_file(parsed)
         {
             return Some(MediaSource::File(path));
         }
-        let promise = self.fetch(&[Value::String(url.to_string().into())]);
+        let promise = self.fetch(
+            &[Value::String(url.to_string().into())],
+            crate::csp::Directive::Media,
+        );
         let response = match &promise.borrow().outcome {
             PromiseOutcome::Fulfilled(Value::Response(response))
                 if (200..300).contains(&response.status) =>

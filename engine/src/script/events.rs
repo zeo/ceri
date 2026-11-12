@@ -1059,16 +1059,20 @@ impl ScriptRuntime {
         if let Some((cached, handler)) = self.attribute_handlers.get(&key)
             && *cached == source
         {
-            return Some(handler.clone());
+            return (!matches!(handler, Value::Undefined)).then(|| handler.clone());
         }
-        let compiled = self.construct_native(
-            Native::FunctionConstructor,
-            vec![
-                Value::String("event".into()),
-                Value::String(source.clone().into()),
-            ],
-            Value::Undefined,
+        let check = self.content_security_policy().inline(
+            crate::csp::Directive::ScriptAttr,
+            &source,
+            crate::csp::Initiator::default(),
         );
+        if !self.permits(check) {
+            // refused once per source text, as it would compile once
+            self.attribute_handlers
+                .insert(key, (source, Value::Undefined));
+            return None;
+        }
+        let compiled = self.compile_function_text("event", &source);
         match compiled {
             Ok(handler) => {
                 self.attribute_handlers

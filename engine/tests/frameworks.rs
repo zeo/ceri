@@ -26,7 +26,7 @@ fn settle(browser: &mut Browser) {
     }
 }
 
-fn text(browser: &Browser, id: &str) -> String {
+fn text(browser: &mut Browser, id: &str) -> String {
     let document = browser.document().expect("document should exist");
     let document = document.borrow();
     let node = document
@@ -52,24 +52,28 @@ fn type_into(browser: &mut Browser, id: &str, value: &str) {
 fn exercise(fixture: &str) {
     let mut browser = open(fixture);
     assert_eq!(
-        text(&browser, "count"),
+        text(&mut browser, "count"),
         "count: 0",
         "{fixture} first render"
     );
     click(&mut browser, "increment");
     click(&mut browser, "increment");
-    assert_eq!(text(&browser, "count"), "count: 2", "{fixture} counter");
-    assert_eq!(text(&browser, "items"), "alphabeta", "{fixture} first list");
+    assert_eq!(text(&mut browser, "count"), "count: 2", "{fixture} counter");
+    assert_eq!(
+        text(&mut browser, "items"),
+        "alphabeta",
+        "{fixture} first list"
+    );
     type_into(&mut browser, "draft", "gamma");
     click(&mut browser, "add");
     assert_eq!(
-        text(&browser, "items"),
+        text(&mut browser, "items"),
         "alphabetagamma",
         "{fixture} added item"
     );
     click(&mut browser, "drop");
     assert_eq!(
-        text(&browser, "items"),
+        text(&mut browser, "items"),
         "betagamma",
         "{fixture} dropped item"
     );

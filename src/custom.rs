@@ -95,6 +95,7 @@ pub struct App {
     single_instance: Option<LaunchRequest>,
     assets: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
+    content_security_policy: Option<String>,
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
@@ -126,6 +127,13 @@ impl App {
     // a PNG or SVG for every window and the tray, in place of the pages' favicon
     pub fn icon(mut self, image: impl Into<Vec<u8>>) -> Self {
         self.icon = Some(image.into());
+        self
+    }
+
+    // the content security policy every page of the app enforces, as a response header would
+    // carry it; the inline scripts and styles the app ships count as its own code
+    pub fn content_security_policy(mut self, policy: impl Into<String>) -> Self {
+        self.content_security_policy = Some(policy.into());
         self
     }
 
@@ -270,6 +278,7 @@ impl App {
                 files: self.handle.files.clone(),
                 embedded: self.assets,
                 icon: self.icon,
+                content_security_policy: self.content_security_policy,
             },
             &identifier,
             self.windows,
@@ -323,6 +332,7 @@ struct Bridge {
     // the pages compiled into the app, served unless a folder is named at launch
     embedded: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
+    content_security_policy: Option<String>,
 }
 
 impl Bridge {
@@ -446,6 +456,7 @@ fn run_app(
                 allowed.clone(),
                 bridge.files.clone(),
                 bridge.host_bridge(&window.label, Some(&window.control)),
+                bridge.content_security_policy.clone(),
             )
         },
         lifecycle,
@@ -480,6 +491,7 @@ fn capture(
             allowed,
             bridge.files.clone(),
             bridge.host_bridge(&config.label, None),
+            bridge.content_security_policy.clone(),
         )?,
         Size {
             width: config.width as f32,
@@ -508,7 +520,7 @@ fn capture(
         frame.canvas.height(),
         output.display()
     );
-    for log in host.browser().console_logs() {
+    for log in host.browser_mut().console_logs() {
         println!("console: {log}");
     }
     Ok(())
@@ -520,6 +532,7 @@ fn build_browser(
     allowed_origins: Vec<String>,
     files: FileScope,
     bridge: HostBridge,
+    content_security_policy: Option<String>,
 ) -> Result<Browser, String> {
     fs::create_dir_all(&storage)
         .map_err(|error| format!("could not create {}: {error}", storage.display()))?;
@@ -546,6 +559,10 @@ fn build_browser(
     .with_media_decoder(Arc::new(DesktopVideo))
     .with_time_zone(Rc::new(DesktopTimeZone))
     .with_file_picker(Rc::new(DesktopFilePicker));
+    let browser = match content_security_policy {
+        Some(policy) => browser.with_content_security_policy(policy),
+        None => browser,
+    };
     Ok(match user_locale() {
         Some(locale) => browser.with_locale(locale),
         None => browser,

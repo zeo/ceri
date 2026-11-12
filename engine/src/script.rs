@@ -49,6 +49,7 @@ pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
 
 use crate::Color;
+use crate::csp::{Directive, Initiator, Policies};
 use crate::css::StyleState;
 use crate::dom::{
     AccessibilityNode, Boundary, Document, DomError, Element, LiveRange, NodeId, NodeKind,
@@ -614,6 +615,23 @@ pub(crate) trait ModuleSourceLoader {
 struct RuntimeModuleLoader<'a> {
     resources: &'a ResourceBundle,
     provider: Option<&'a dyn ResourceProvider>,
+    policies: &'a Policies,
+}
+
+// a module the document's policy refuses fails to load, and the refusal is logged
+pub(crate) fn permit_module(policies: &Policies, url: &AppUrl) -> Result<(), ScriptError> {
+    let check = policies.url(
+        Directive::ScriptElem,
+        &url.to_string(),
+        Initiator::default(),
+    );
+    match policies.permits(check) {
+        true => Ok(()),
+        false => Err(runtime_error(format!(
+            "module {} was refused by the content security policy",
+            url.path()
+        ))),
+    }
 }
 
 struct WorkerResourceRequest {
@@ -803,6 +821,7 @@ impl ModuleSourceLoader for RuntimeModuleLoader<'_> {
         let url = referrer
             .resolve(reference)
             .map_err(|error| runtime_error(error.to_string()))?;
+        permit_module(self.policies, &url)?;
         let resource = resolve_runtime_resource(self.resources, self.provider, &url)?
             .ok_or_else(|| runtime_error(format!("module {} was not found", url.path())))?;
         if !is_javascript(&resource) {
@@ -2045,6 +2064,10 @@ impl ScriptRuntime {
             .resolve(mapped.as_deref().unwrap_or(&reference))
             .map_err(|error| runtime_error(error.to_string()))?;
         let import_type = parse_dynamic_import_type(attributes)?;
+        let policies = self.content_security_policy();
+        let refused = permit_module(&policies, &url);
+        self.report_refusals();
+        refused?;
         if self.resources.is_none() && self.resource_provider.is_none() {
             return Err(runtime_error(
                 "dynamic import is unavailable without resources",
@@ -2068,8 +2091,11 @@ impl ScriptRuntime {
                 let mut loader = RuntimeModuleLoader {
                     resources: &resources,
                     provider: provider.as_deref(),
+                    policies: &policies,
                 };
-                self.execute_module_graph(&source, url, &mut loader)
+                let result = self.execute_module_graph(&source, url, &mut loader);
+                self.report_refusals();
+                result
             }
             Some(DynamicImportType::Json) => {
                 if !is_json(&resource) {
@@ -2741,6 +2767,27 @@ impl ScriptRuntime {
 
     pub(crate) fn report(&mut self, message: impl Into<String>) {
         self.logs.push(message.into());
+    }
+
+    pub(crate) fn content_security_policy(&self) -> Rc<Policies> {
+        self.document.borrow().content_security_policy().clone()
+    }
+
+    // logs a refusal where it happened, in the order the page sees it
+    pub(crate) fn permits(&mut self, check: Result<(), String>) -> bool {
+        check.map_err(|message| self.report(message)).is_ok()
+    }
+
+    // refusals found by layout, style and loads made outside the runtime
+    pub(crate) fn report_refusals(&mut self) {
+        let refused = self
+            .document
+            .borrow()
+            .content_security_policy()
+            .take_refused();
+        for message in refused {
+            self.report(message);
+        }
     }
 
     // document prose ranges as (text node, start, end) for paint highlighting
@@ -4640,6 +4687,17 @@ impl ScriptRuntime {
                 "SecurityError: a worker script must come from the app origin, not {url}"
             )));
         }
+        let check = self.content_security_policy().url(
+            Directive::Worker,
+            &url.to_string(),
+            Initiator::default(),
+        );
+        if !self.permits(check) {
+            return Err(runtime_error(format!(
+                "SecurityError: Failed to construct 'Worker': Access to the script at '{url}' is \
+                 denied by the document's Content Security Policy."
+            )));
+        }
         let mut name = String::new();
         let mut worker_type = WorkerScriptType::Classic;
         if let Some(options) = arguments.get(1).map(Value::resolve) {
@@ -4753,9 +4811,11 @@ impl ScriptRuntime {
                 WorkerScriptType::Module => {
                     let loader_resources = runtime.resources.clone().unwrap_or_default();
                     let loader_provider = runtime.resource_provider.clone();
+                    // a worker script arrives without a policy header, so it runs under none
                     let mut loader = RuntimeModuleLoader {
                         resources: &loader_resources,
                         provider: loader_provider.as_deref(),
+                        policies: &Policies::default(),
                     };
                     runtime
                         .execute_module(&source, worker_url.clone(), &mut loader)
@@ -7027,6 +7087,12 @@ impl ScriptRuntime {
                         "WebAssembly.instantiate imports must be an object",
                     ));
                 }
+                if let Err(message) = self.content_security_policy().wasm() {
+                    self.report(message.clone());
+                    return Err(runtime_error(format!(
+                        "CompileError: WebAssembly.instantiate(): {message}"
+                    )));
+                }
                 let module = Rc::new(wasm::Module::instantiate(&bytes).map_err(|error| {
                     runtime_error(format!("WebAssembly module error: {error}"))
                 })?);
@@ -8026,7 +8092,7 @@ impl ScriptRuntime {
                     )))),
                 }
             }
-            Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments))),
+            Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments, Directive::Connect))),
             Builtin::SubtleDigest => {
                 let algorithm = match subtle_algorithm_name(arguments.first()) {
                     Ok(algorithm) => algorithm,
@@ -9107,7 +9173,8 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn fetch(&self, arguments: &[Value]) -> PromiseHandle {
+    // a load for the page, checked against the policy directive its destination falls under
+    fn fetch(&mut self, arguments: &[Value], destination: Directive) -> PromiseHandle {
         let input = arguments
             .first()
             .cloned()
@@ -9136,6 +9203,13 @@ impl ScriptRuntime {
                 }
             }
         };
+        let target = external.clone().unwrap_or_else(|| url.to_string());
+        let check = self
+            .content_security_policy()
+            .url(destination, &target, Initiator::default());
+        if !self.permits(check) {
+            return self.rejected_promise("Failed to fetch");
+        }
         let options = match parse_fetch_options(arguments.get(1), request_input.as_ref()) {
             Ok(options) => options,
             Err(error) => return self.rejected_promise(error.message),

@@ -1,3 +1,4 @@
+use crate::csp::{Directive, Initiator, Policies};
 use crate::css::{
     AnimatableProperty, ColorScheme, StyleContext, StyleState, Stylesheet, TransitionState,
 };
@@ -949,6 +950,8 @@ pub struct Browser {
     media_decoder: Option<Arc<dyn crate::MediaDecoder>>,
     time_zone: Option<Rc<dyn crate::TimeZone>>,
     locale: Option<String>,
+    // the policy the app sets on its own documents, over whatever they declare themselves
+    content_security_policy: Option<String>,
     last_navigation_failure: Option<NavigationFailure>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
@@ -1088,6 +1091,7 @@ impl Browser {
             media_decoder: None,
             time_zone: None,
             locale: None,
+            content_security_policy: None,
             last_navigation_failure: None,
             page: None,
             current_url: None,
@@ -1166,6 +1170,13 @@ impl Browser {
     // the default locale for Intl and navigator.language; without one, en-US
     pub fn with_locale(mut self, locale: String) -> Self {
         self.locale = Some(locale);
+        self
+    }
+
+    // inline scripts and styles written into the app's own documents run under it, as the
+    // app's bundled code
+    pub fn with_content_security_policy(mut self, policy: impl Into<String>) -> Self {
+        self.content_security_policy = Some(policy.into());
         self
     }
 
@@ -1447,8 +1458,27 @@ impl Browser {
                 return Ok(NavigationStatus::ErrorPage { status: 500 });
             }
         };
-        let stylesheet_sources = document.borrow().stylesheet_sources();
-        let stylesheet = match self.load_stylesheets(&url, &stylesheet_sources) {
+        let policies = self.document_policies(&document.borrow());
+        document
+            .borrow_mut()
+            .set_content_security_policy(policies.clone());
+        let (stylesheet_sources, script_sources) = {
+            let document = document.borrow();
+            let nonce = |node| document.attribute(node, "nonce").map(str::to_string);
+            (
+                document
+                    .stylesheet_elements()
+                    .into_iter()
+                    .map(|(node, source)| (nonce(node), source))
+                    .collect::<Vec<_>>(),
+                document
+                    .script_elements()
+                    .into_iter()
+                    .map(|(node, source)| (nonce(node), source))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let stylesheet = match self.load_stylesheets(&url, &stylesheet_sources, &policies) {
             Ok(stylesheet) => stylesheet,
             Err(error) => {
                 let status = recovery_status(&error);
@@ -1457,7 +1487,6 @@ impl Browser {
                 return Ok(NavigationStatus::ErrorPage { status });
             }
         };
-        let script_sources = document.borrow().script_sources();
         let mut runtime = ScriptRuntime::with_resources_and_storage_and_runtime_info(
             document.clone(),
             self.resources.clone(),
@@ -1481,16 +1510,18 @@ impl Browser {
             runtime.set_locale(locale.clone());
         }
         runtime.set_viewport_metrics(self.viewport);
+        runtime.report_refusals();
         let (parsed_stylesheet, dropped_rules) = Stylesheet::parse_recovering(&stylesheet);
         for dropped in dropped_rules {
             runtime.report(format!("dropped CSS rule: {dropped}"));
         }
         let parsed_stylesheet = Rc::new(parsed_stylesheet);
-        self.load_web_fonts(&url, &parsed_stylesheet);
+        self.load_web_fonts(&url, &parsed_stylesheet, &policies);
+        runtime.report_refusals();
         let layout_inputs = self.layout_inputs(parsed_stylesheet.clone());
         runtime.set_layout_inputs(layout_inputs.clone());
         runtime.load_document_images();
-        if let Err(error) = self.execute_scripts(&url, &script_sources, &mut runtime) {
+        if let Err(error) = self.execute_scripts(&url, &script_sources, &policies, &mut runtime) {
             let status = recovery_status(&error);
             self.install_error_page(&url, status, &error.to_string());
             self.commit_new_document(url, commit);
@@ -2503,9 +2534,12 @@ impl Browser {
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, NavigationError> {
         let executed = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            page.runtime
+            let executed = page
+                .runtime
                 .advance_time(milliseconds)
-                .map_err(|error| NavigationError::Script(error.to_string()))?
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
+            page.runtime.report_refusals();
+            executed
         };
         self.process_pending_navigation()?;
         Ok(executed)
@@ -2514,19 +2548,51 @@ impl Browser {
     pub fn pump(&mut self) -> Result<usize, NavigationError> {
         let processed = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
-            page.runtime
+            let processed = page
+                .runtime
                 .pump()
-                .map_err(|error| NavigationError::Script(error.to_string()))?
+                .map_err(|error| NavigationError::Script(error.to_string()))?;
+            page.runtime.report_refusals();
+            processed
         };
         self.process_pending_navigation()?;
         Ok(processed)
     }
 
-    pub fn console_logs(&self) -> &[String] {
-        self.page
-            .as_ref()
-            .map(|page| page.runtime.logs())
-            .unwrap_or(&[])
+    pub fn console_logs(&mut self) -> &[String] {
+        match &mut self.page {
+            Some(page) => {
+                page.runtime.report_refusals();
+                page.runtime.logs()
+            }
+            None => &[],
+        }
+    }
+
+    // the app's policy over its own documents, then any the document declares itself
+    fn document_policies(&self, document: &Document) -> Rc<Policies> {
+        let mut policies = Policies::default();
+        if let Some(policy) = &self.content_security_policy {
+            let scripts = document.script_elements();
+            let stylesheets = document.stylesheet_elements();
+            let inline = scripts
+                .iter()
+                .filter_map(|(_, source)| match source {
+                    ScriptSource::Inline(text)
+                    | ScriptSource::InlineModule(text)
+                    | ScriptSource::ImportMap(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .chain(stylesheets.iter().filter_map(|(_, source)| match source {
+                    StylesheetSource::Inline(text) => Some(text.as_str()),
+                    StylesheetSource::External(_) => None,
+                }));
+            policies.add_bundled(policy, inline);
+        }
+        for policy in document.meta_policies() {
+            policies.add(&policy);
+        }
+        Rc::new(policies)
     }
 
     pub fn layout(&self, viewport: Size) -> Result<Rc<LayoutDocument>, NavigationError> {
@@ -2771,11 +2837,17 @@ impl Browser {
         if let Some(cached) = page.runtime.image_cache().borrow().get(&key) {
             return cached.clone();
         }
+        let policies = page.document.borrow().content_security_policy().clone();
+        let permitted =
+            |url: &str| policies.permits(policies.url(Directive::Img, url, Initiator::default()));
         let decoded = if let Some((mime_type, bytes)) = crate::image::decode_data_url(&key) {
-            crate::image::decode_image(&bytes, &mime_type).ok()
+            permitted(&key)
+                .then(|| crate::image::decode_image(&bytes, &mime_type).ok())
+                .flatten()
         } else {
             base.resolve(reference)
                 .ok()
+                .filter(|url| permitted(&url.to_string()))
                 .and_then(|url| self.load_subresource(&url).ok())
                 .and_then(|resource| {
                     crate::image::decode_image(resource.body(), &resource.mime_type).ok()
@@ -2984,14 +3056,31 @@ impl Browser {
     fn load_stylesheets(
         &self,
         base: &AppUrl,
-        sources: &[StylesheetSource],
+        sources: &[(Option<String>, StylesheetSource)],
+        policies: &Policies,
     ) -> Result<String, NavigationError> {
         let mut stylesheet = String::new();
-        for source in sources {
+        for (nonce, source) in sources {
+            let element = Initiator {
+                nonce: nonce.as_deref(),
+                parser_inserted: true,
+            };
             let source = match source {
-                StylesheetSource::Inline(source) => self.expand_imports(source.clone(), base, 0),
+                StylesheetSource::Inline(source) => {
+                    if !policies.permits(policies.inline(Directive::StyleElem, source, element)) {
+                        continue;
+                    }
+                    self.expand_imports(source.clone(), base, 0, policies)
+                }
                 StylesheetSource::External(reference) => {
                     let url = base.resolve(reference)?;
+                    if !policies.permits(policies.url(
+                        Directive::StyleElem,
+                        &url.to_string(),
+                        element,
+                    )) {
+                        continue;
+                    }
                     let resource = self.load_subresource(&url)?;
                     if !is_css(&resource) {
                         return Err(NavigationError::UnsupportedMimeType {
@@ -3007,7 +3096,7 @@ impl Browser {
                             .ok()
                             .map(|absolute| absolute.to_string())
                     });
-                    self.expand_imports(text, &url, 0)
+                    self.expand_imports(text, &url, 0, policies)
                 }
             };
             if !stylesheet.is_empty() {
@@ -3020,7 +3109,13 @@ impl Browser {
 
     // splices each @import's stylesheet in place of the rule, inside the layer, supports and
     // media conditions it names; one that fails to load is skipped, as a browser does
-    fn expand_imports(&self, text: String, base: &AppUrl, depth: usize) -> String {
+    fn expand_imports(
+        &self,
+        text: String,
+        base: &AppUrl,
+        depth: usize,
+        policies: &Policies,
+    ) -> String {
         const MAX_IMPORT_DEPTH: usize = 8;
         let (imports, statements, rest) = crate::css::leading_imports(&text);
         if imports.is_empty() {
@@ -3034,6 +3129,13 @@ impl Browser {
             let Ok(url) = base.resolve(&import.url) else {
                 continue;
             };
+            if !policies.permits(policies.url(
+                Directive::StyleElem,
+                &url.to_string(),
+                Initiator::default(),
+            )) {
+                continue;
+            }
             let Ok(resource) = self.load_subresource(&url) else {
                 continue;
             };
@@ -3044,7 +3146,7 @@ impl Browser {
                 continue;
             };
             expanded.push_str(&import.open);
-            expanded.push_str(&self.expand_imports(body, &url, depth + 1));
+            expanded.push_str(&self.expand_imports(body, &url, depth + 1, policies));
             expanded.push_str(&import.close);
             expanded.push('\n');
         }
@@ -3054,11 +3156,15 @@ impl Browser {
 
     // fetches each @font-face rule's first source that loads and parses; a rule with none is
     // skipped, and its family falls back to installed faces
-    fn load_web_fonts(&self, base: &AppUrl, stylesheet: &Stylesheet) {
+    fn load_web_fonts(&self, base: &AppUrl, stylesheet: &Stylesheet, policies: &Policies) {
         self.fonts.clear_web_faces();
         for rule in stylesheet.font_faces() {
             let face = rule.sources.iter().find_map(|source| {
                 let url = base.resolve(source).ok()?;
+                let check = policies.url(Directive::Font, &url.to_string(), Initiator::default());
+                if !policies.permits(check) {
+                    return None;
+                }
                 let resource = self.load_subresource(&url).ok()?;
                 crate::font::FontFace::parse(resource.body).ok()
             });
@@ -3077,14 +3183,34 @@ impl Browser {
     fn execute_scripts(
         &self,
         base: &AppUrl,
-        sources: &[ScriptSource],
+        sources: &[(Option<String>, ScriptSource)],
+        policies: &Policies,
         runtime: &mut ScriptRuntime,
     ) -> Result<(), NavigationError> {
         let mut module_loader = PackagedModuleLoader {
             resources: &self.resources,
             provider: self.resource_provider.as_deref(),
+            policies,
         };
-        for source in sources {
+        for (nonce, source) in sources {
+            let element = Initiator {
+                nonce: nonce.as_deref(),
+                parser_inserted: true,
+            };
+            let check = match source {
+                ScriptSource::Inline(text)
+                | ScriptSource::InlineModule(text)
+                | ScriptSource::ImportMap(text) => {
+                    policies.inline(Directive::ScriptElem, text, element)
+                }
+                ScriptSource::External(reference) | ScriptSource::ExternalModule(reference) => {
+                    let url = base.resolve(reference)?;
+                    policies.url(Directive::ScriptElem, &url.to_string(), element)
+                }
+            };
+            if !runtime.permits(check) {
+                continue;
+            }
             let source = match source {
                 ScriptSource::Inline(source) => source.clone(),
                 ScriptSource::External(reference) => {
@@ -3183,6 +3309,7 @@ impl Browser {
 struct PackagedModuleLoader<'a> {
     resources: &'a ResourceBundle,
     provider: Option<&'a dyn ResourceProvider>,
+    policies: &'a Policies,
 }
 
 impl ModuleSourceLoader for PackagedModuleLoader<'_> {
@@ -3194,6 +3321,7 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
         let url = referrer
             .resolve(reference)
             .map_err(|error| runtime_error(error.to_string()))?;
+        crate::script::permit_module(self.policies, &url)?;
         let (url, resource) = match self.resources.load_subresource(&url) {
             Ok(resource) => (url.clone(), resource),
             Err(NavigationError::ResourceNotFound(path)) => {
@@ -4529,6 +4657,119 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("about")
+        );
+    }
+
+    fn element_text(browser: &Browser, id: &str) -> String {
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let node = document
+            .find_element_by_id(id)
+            .expect("element should exist");
+        document.text_content(node)
+    }
+
+    #[test]
+    fn a_meta_policy_refuses_what_it_does_not_list_and_logs_each_refusal() {
+        let mut browser = Browser::new(bundle(
+            r#"<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'nonce-abc'">
+            <p id="out">idle</p><p id="box" style="color: red"></p>
+            <button id="press" onclick="document.getElementById('out').textContent = 'pressed'">press</button>
+            <img src="https://files.ceri.invalid/a.png" width="4" height="4">
+            <script>document.getElementById("out").textContent = "inline ran";</script>
+            <script nonce="abc">
+                const notes = [];
+                try { new Function("return 1"); notes.push("function ran"); } catch (error) { notes.push(error.name); }
+                fetch("https://example.com/feed").then(
+                    () => notes.push("fetched"),
+                    (error) => notes.push(error.name),
+                ).then(() => { document.getElementById("out").textContent = notes.join(","); });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser.pump().expect("the fetch should settle");
+        assert!(browser.click_id("press").expect("click should dispatch"));
+        assert_eq!(element_text(&browser, "out"), "EvalError,TypeError");
+        let document = browser.document().expect("document should exist");
+        let boxed = document.borrow().find_element_by_id("box").expect("box");
+        assert!(document.borrow().style_blocked(boxed));
+        browser
+            .paint(Size {
+                width: 100.0,
+                height: 60.0,
+            })
+            .expect("page should paint");
+        let logs = browser.console_logs().to_vec();
+        let script = "\"script-src 'self' 'nonce-abc'\".";
+        let has = |prefix: &str| logs.iter().any(|line| line.starts_with(prefix));
+        assert!(
+            has(&format!(
+                "Refused to execute inline script because it violates the following Content \
+                 Security Policy directive: {script} Either the 'unsafe-inline' keyword, a hash \
+                 ('sha256-"
+            )),
+            "{logs:?}"
+        );
+        assert!(
+            has(&format!(
+                "Refused to execute inline event handler because it violates the following \
+                 Content Security Policy directive: {script}"
+            )),
+            "{logs:?}"
+        );
+        assert!(
+            has(
+                "Refused to apply inline style because it violates the following Content \
+                 Security Policy directive: \"default-src 'self'\"."
+            ),
+            "{logs:?}"
+        );
+        for line in [
+            format!(
+                "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an \
+                 allowed source of script in the following Content Security Policy directive: \
+                 {script}"
+            ),
+            "Refused to connect to 'https://example.com/feed' because it violates the following \
+             Content Security Policy directive: \"default-src 'self'\". Note that 'connect-src' \
+             was not explicitly set, so 'default-src' is used as a fallback."
+                .to_string(),
+            "Refused to load the image 'https://files.ceri.invalid/a.png' because it violates the \
+             following Content Security Policy directive: \"default-src 'self'\". Note that \
+             'img-src' was not explicitly set, so 'default-src' is used as a fallback."
+                .to_string(),
+        ] {
+            assert_eq!(
+                logs.iter().filter(|logged| **logged == line).count(),
+                1,
+                "{line} in {logs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_policy_runs_bundled_inline_code_and_still_refuses_eval() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="out">idle</p><script>
+                let note;
+                try { new Function("return 1"); note = "ran"; } catch (error) { note = error.name; }
+                document.getElementById("out").textContent = note;
+            </script>"#,
+        ))
+        .with_content_security_policy("default-src 'self'");
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert_eq!(element_text(&browser, "out"), "EvalError");
+        assert_eq!(
+            browser.console_logs(),
+            [
+                "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed \
+              source of script in the following Content Security Policy directive: \
+              \"default-src 'self'\"."
+            ]
         );
     }
 

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::{Rc, Weak};
 
@@ -147,6 +147,9 @@ pub struct Document {
     mutations: Option<Vec<MutationEntry>>,
     // the same changes for custom element reactions, recorded once an element is defined
     element_changes: Option<Vec<MutationEntry>>,
+    content_security_policy: Rc<crate::csp::Policies>,
+    // elements whose markup style attribute the policy refused, until script sets one
+    blocked_styles: HashSet<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,6 +264,8 @@ impl Document {
             live_ranges: LiveRanges::default(),
             mutations: None,
             element_changes: None,
+            content_security_policy: Rc::default(),
+            blocked_styles: HashSet::new(),
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -607,7 +612,59 @@ impl Document {
                 old,
             },
         );
-        self.element_mut(id).map(edit)
+        // a refused style attribute reads as empty, so script edits start from nothing
+        let unblocked = attribute == "style" && self.blocked_styles.remove(&id);
+        self.element_mut(id).map(|element| {
+            if unblocked {
+                element.attrs.remove("style");
+            }
+            edit(element)
+        })
+    }
+
+    pub(crate) fn content_security_policy(&self) -> &Rc<crate::csp::Policies> {
+        &self.content_security_policy
+    }
+
+    // the policy for a freshly parsed document, which drops the style attributes it refuses
+    pub(crate) fn set_content_security_policy(&mut self, policies: Rc<crate::csp::Policies>) {
+        self.blocked_styles = self
+            .connected_elements()
+            .filter_map(|(node, element)| {
+                let style = element.attr("style")?;
+                let check = policies.inline(
+                    crate::csp::Directive::StyleAttr,
+                    style,
+                    crate::csp::Initiator {
+                        nonce: None,
+                        parser_inserted: true,
+                    },
+                );
+                (!policies.permits(check)).then_some(node)
+            })
+            .collect();
+        self.content_security_policy = policies;
+    }
+
+    pub(crate) fn style_blocked(&self, node: NodeId) -> bool {
+        self.blocked_styles.contains(&node)
+    }
+
+    // policies from <meta http-equiv="content-security-policy"> in the head
+    pub(crate) fn meta_policies(&self) -> Vec<String> {
+        self.connected_elements()
+            .filter(|(node, element)| {
+                element.name == "meta"
+                    && element.attr("http-equiv").is_some_and(|name| {
+                        name.trim().eq_ignore_ascii_case("content-security-policy")
+                    })
+                    && self
+                        .parent_element(*node)
+                        .and_then(|parent| self.element(parent))
+                        .is_some_and(|parent| parent.name == "head")
+            })
+            .filter_map(|(_, element)| element.attr("content").map(str::to_string))
+            .collect()
     }
 
     pub fn track_range(&mut self, range: &SharedRange) {
@@ -937,13 +994,24 @@ impl Document {
 
     // the text of the style elements directly inside a shadow root
     pub fn shadow_style_text(&self, root: NodeId) -> String {
+        let policies = &self.content_security_policy;
         self.children(root)
             .iter()
-            .filter(|&&child| {
-                self.element(child)
-                    .is_some_and(|element| element.name == "style")
+            .filter_map(|&child| {
+                let element = self
+                    .element(child)
+                    .filter(|element| element.name == "style")?;
+                let text = self.text_content(child);
+                let check = policies.inline(
+                    crate::csp::Directive::StyleElem,
+                    &text,
+                    crate::csp::Initiator {
+                        nonce: element.attr("nonce"),
+                        parser_inserted: false,
+                    },
+                );
+                policies.permits(check).then_some(text)
             })
-            .map(|&child| self.text_content(child))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1256,6 +1324,9 @@ impl Document {
     }
 
     pub fn style_property(&self, id: NodeId, property: &str) -> Option<String> {
+        if self.style_blocked(id) {
+            return None;
+        }
         self.element(id)?.style_property(property)
     }
 
@@ -1489,6 +1560,13 @@ impl Document {
     }
 
     pub fn script_sources(&self) -> Vec<ScriptSource> {
+        self.script_elements()
+            .into_iter()
+            .map(|(_, source)| source)
+            .collect()
+    }
+
+    pub(crate) fn script_elements(&self) -> Vec<(NodeId, ScriptSource)> {
         let mut scripts = Vec::new();
         for node in self.descendants(self.root) {
             let Some(element) = self
@@ -1502,7 +1580,7 @@ impl Document {
                 .map(|kind| kind.trim().to_ascii_lowercase())
                 .unwrap_or_default();
             if kind == "importmap" {
-                scripts.push(ScriptSource::ImportMap(self.text_content(node)));
+                scripts.push((node, ScriptSource::ImportMap(self.text_content(node))));
                 continue;
             }
             let is_module = kind == "module";
@@ -1518,24 +1596,34 @@ impl Document {
             if !classic {
                 continue;
             }
-            scripts.push(match (element.attr("src"), is_module) {
-                (Some(source), true) => ScriptSource::ExternalModule(source.to_string()),
-                (Some(source), false) => ScriptSource::External(source.to_string()),
-                (None, true) => ScriptSource::InlineModule(self.text_content(node)),
-                (None, false) => ScriptSource::Inline(self.text_content(node)),
-            });
+            scripts.push((
+                node,
+                match (element.attr("src"), is_module) {
+                    (Some(source), true) => ScriptSource::ExternalModule(source.to_string()),
+                    (Some(source), false) => ScriptSource::External(source.to_string()),
+                    (None, true) => ScriptSource::InlineModule(self.text_content(node)),
+                    (None, false) => ScriptSource::Inline(self.text_content(node)),
+                },
+            ));
         }
         scripts
     }
 
     pub fn stylesheet_sources(&self) -> Vec<StylesheetSource> {
+        self.stylesheet_elements()
+            .into_iter()
+            .map(|(_, source)| source)
+            .collect()
+    }
+
+    pub(crate) fn stylesheet_elements(&self) -> Vec<(NodeId, StylesheetSource)> {
         let mut stylesheets = Vec::new();
         for node in self.descendants(self.root) {
             let Some(element) = self.element(node) else {
                 continue;
             };
             if element.name == "style" {
-                stylesheets.push(StylesheetSource::Inline(self.text_content(node)));
+                stylesheets.push((node, StylesheetSource::Inline(self.text_content(node))));
             } else if element.name == "link"
                 && element.attr("rel").is_some_and(|rel| {
                     rel.split_ascii_whitespace()
@@ -1543,7 +1631,7 @@ impl Document {
                 })
                 && let Some(href) = element.attr("href")
             {
-                stylesheets.push(StylesheetSource::External(href.to_string()));
+                stylesheets.push((node, StylesheetSource::External(href.to_string())));
             }
         }
         stylesheets

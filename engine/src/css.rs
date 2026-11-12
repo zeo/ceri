@@ -2925,9 +2925,10 @@ impl Stylesheet {
         let Some(element) = document.element(node) else {
             return false;
         };
-        if element
-            .attr("style")
-            .is_some_and(|inline| inline.contains("transition") || inline.contains("animation"))
+        if !document.style_blocked(node)
+            && element
+                .attr("style")
+                .is_some_and(|inline| inline.contains("transition") || inline.contains("animation"))
         {
             return true;
         }
@@ -3057,7 +3058,9 @@ impl Stylesheet {
             }
         }
         let mut inline_dropped = Vec::new();
-        if let Some(inline) = element.attr("style").filter(|_| pseudo.is_none())
+        if let Some(inline) = element
+            .attr("style")
+            .filter(|_| pseudo.is_none() && !document.style_blocked(node))
             && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
         {
             for (position, declaration) in declarations.into_iter().enumerate() {

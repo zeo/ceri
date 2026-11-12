@@ -129,9 +129,21 @@ impl ScriptRuntime {
             return Some(image.clone());
         }
         let decoded = match crate::image::decode_data_url(url) {
-            Some((mime_type, bytes)) => crate::image::decode_image(&bytes, &mime_type).ok(),
+            Some((mime_type, bytes)) => {
+                let check = self.content_security_policy().url(
+                    crate::csp::Directive::Img,
+                    url,
+                    crate::csp::Initiator::default(),
+                );
+                self.permits(check)
+                    .then(|| crate::image::decode_image(&bytes, &mime_type).ok())
+                    .flatten()
+            }
             None => {
-                let promise = self.fetch(&[Value::String(url.to_string().into())]);
+                let promise = self.fetch(
+                    &[Value::String(url.to_string().into())],
+                    crate::csp::Directive::Img,
+                );
                 let response = match &promise.borrow().outcome {
                     PromiseOutcome::Fulfilled(Value::Response(response))
                         if (200..300).contains(&response.status) =>

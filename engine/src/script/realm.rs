@@ -1270,6 +1270,21 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 }
 
 impl ScriptRuntime {
+    // a function from source text, as the Function constructor and on* attributes build one
+    pub(super) fn compile_function_text(
+        &mut self,
+        parameters: &str,
+        body: &str,
+    ) -> Result<Value, ScriptError> {
+        let (function, source) =
+            super::parser::parse_function_source(parameters, body, false, false)
+                .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        let code = Compiler::new(&source)
+            .compile_function(&function)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        Ok(self.new_closure(code, None, None))
+    }
+
     // a native function object created at run time, such as a proxy's revoke function
     pub(super) fn native_function(&self, native: Native, name: &str, length: u32) -> Value {
         Value::Object(
@@ -2582,17 +2597,11 @@ impl ScriptRuntime {
                     Some(body) => self.coerce_string(body.clone())?,
                     None => String::new(),
                 };
-                let (function, source) = super::parser::parse_function_source(
-                    &parameters.join(","),
-                    &body,
-                    false,
-                    false,
-                )
-                .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-                let code = Compiler::new(&source)
-                    .compile_function(&function)
-                    .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-                Ok(self.new_closure(code, None, None))
+                if let Err(message) = self.content_security_policy().eval() {
+                    self.report(message.clone());
+                    return Err(self.throw_error("EvalError", message));
+                }
+                self.compile_function_text(&parameters.join(","), &body)
             }
             Native::ErrorConstructor(kind) => {
                 let target = if subclass {
