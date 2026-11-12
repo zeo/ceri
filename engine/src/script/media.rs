@@ -287,7 +287,7 @@ impl MediaElement {
         let clock = self.anchor.map(|anchor| (self.position, anchor, self.rate));
         let gain = if muted { 0.0 } else { self.volume as f32 };
         if let Some(sound) = &mut self.sound {
-            sound.follow(!self.paused, clock, time, gain, open);
+            sound.follow(!self.paused, clock, time, gain, self.preserves_pitch, open);
         }
     }
 }

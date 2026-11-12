@@ -71,6 +71,69 @@ pub(crate) struct SoundState {
     rate: f64,
     gain: f32,
     output_rate: u32,
+    preserves_pitch: bool,
+    // the queue stretched to the rate at the source's pitch, while one is wanted
+    stretch: Option<Stretch>,
+}
+
+// pitch kept at another rate by overlapping windows of the source where each lines up best
+// with the last, as chromium's wsola does
+struct Stretch {
+    window: usize,
+    search: usize,
+    hann: Vec<f32>,
+    transition: Vec<f32>,
+    // in frames past the queue's first: where the next window is looked for, and where the
+    // last one carries on, none before the first
+    position: f64,
+    target: Option<usize>,
+    // the last window's second half, waiting for the next one to overlap it
+    overlap: Vec<f32>,
+    output: VecDeque<f32>,
+    // the rate the stretched frames waiting in output were made at
+    rate: f64,
+}
+
+// chromium's: 20 ms windows looked for 15 ms either side, never within 160 frames of the
+// window before, every fifth candidate tried and then the ones beside the best
+const WINDOW: f64 = 0.02;
+const SEARCH: f64 = 0.015;
+const EXCLUDE: usize = 160;
+const DECIMATION: usize = 5;
+
+impl Stretch {
+    fn new(rate: u32, sources: usize) -> Self {
+        let window = ((WINDOW * f64::from(rate)) as usize / 2 * 2).max(2);
+        let hann = |length: usize| -> Vec<f32> {
+            (0..length)
+                .map(|n| {
+                    let phase = std::f64::consts::TAU * n as f64 / length as f64;
+                    (0.5 * (1.0 - phase.cos())) as f32
+                })
+                .collect()
+        };
+        Self {
+            window,
+            search: (SEARCH * f64::from(rate)) as usize,
+            hann: hann(window),
+            transition: hann(2 * window),
+            position: 0.0,
+            target: None,
+            overlap: vec![0.0; window / 2 * sources],
+            output: VecDeque::new(),
+            rate: 1.0,
+        }
+    }
+
+    // the frames a block needs, from the first to past the last
+    fn span(&self) -> (usize, usize) {
+        let center = self.position.round().max(0.0) as usize;
+        let target = self.target.unwrap_or(center);
+        (
+            center.saturating_sub(self.search).min(target),
+            (center + self.search).max(target) + self.window,
+        )
+    }
 }
 
 impl SoundState {
@@ -80,7 +143,13 @@ impl SoundState {
     }
 
     pub(crate) fn exhausted(&self) -> bool {
-        self.wanted.is_none() && self.ended && self.queue.is_empty()
+        self.wanted.is_none()
+            && self.ended
+            && self.queue.is_empty()
+            && self
+                .stretch
+                .as_ref()
+                .is_none_or(|stretch| stretch.output.is_empty())
     }
 
     // the speakers' next frames, read at the element's rate from where its clock stands
@@ -88,32 +157,52 @@ impl SoundState {
         let (Some(Ok(info)), Some((time, at))) = (&self.opened, self.clock) else {
             return;
         };
+        let info = *info;
         if self.wanted.is_some() || channels == 0 || self.output_rate == 0 || self.rate <= 0.0 {
             return;
         }
         let sources = usize::from(info.channels);
         let rate = f64::from(info.rate);
-        let step = self.rate * rate / f64::from(self.output_rate);
+        let stretching = self.preserves_pitch && self.rate != 1.0;
+        if stretching != self.stretch.is_some() {
+            self.settle(sources, rate);
+        }
         let due = time + now.saturating_duration_since(at).as_secs_f64() * self.rate;
-        let playing = self.head + self.fraction / rate;
+        let playing = self.playing(sources, rate);
         let mut wait = 0;
         if playing < due - SLACK {
-            let behind = ((due - playing) * rate).round() as usize;
+            self.settle(sources, rate);
+            let behind = ((due - self.playing(sources, rate)) * rate).round() as usize;
             self.advance(behind, sources, rate);
         } else if playing > due + SLACK {
             wait = ((playing - due) * f64::from(self.output_rate) / self.rate).round() as usize;
         }
+        if stretching && self.stretch.is_none() {
+            self.stretch = Some(Stretch::new(info.rate, sources));
+        }
+        // a stretch has already taken the rate out, so what is left is the speakers' own
+        let speed = if stretching { 1.0 } else { self.rate };
+        let step = speed * rate / f64::from(self.output_rate);
         for frame in out.chunks_exact_mut(channels).skip(wait) {
-            let available = self.queue.len() / sources;
-            if available == 0 || (available == 1 && !self.ended) {
+            while self
+                .stretch
+                .as_ref()
+                .is_some_and(|stretch| stretch.output.len() < 2 * sources)
+                && self.stretch_block(sources, rate)
+            {}
+            let (buffer, ended) = match &self.stretch {
+                Some(stretch) => (&stretch.output, self.ended && self.queue.is_empty()),
+                None => (&self.queue, self.ended),
+            };
+            let available = buffer.len() / sources;
+            if available == 0 || (available == 1 && !ended) {
                 break;
             }
             let fraction = self.fraction as f32;
-            let queue = &self.queue;
             let read = |channel: usize| {
-                let here = queue[channel];
+                let here = buffer[channel];
                 let next = match available > 1 {
-                    true => queue[sources + channel],
+                    true => buffer[sources + channel],
                     false => 0.0,
                 };
                 here + (next - here) * fraction
@@ -131,8 +220,143 @@ impl SoundState {
             self.fraction += step;
             let whole = self.fraction.floor();
             self.fraction -= whole;
-            self.advance(whole as usize, sources, rate);
+            match &mut self.stretch {
+                Some(stretch) => {
+                    let played = (whole as usize * sources).min(stretch.output.len());
+                    stretch.output.drain(..played);
+                }
+                None => self.advance(whole as usize, sources, rate),
+            }
         }
+    }
+
+    // the media time the speakers are at
+    fn playing(&self, sources: usize, rate: f64) -> f64 {
+        let frames = match &self.stretch {
+            Some(stretch) => {
+                let pending = (stretch.output.len() / sources) as f64 - self.fraction;
+                stretch.position - pending * stretch.rate
+            }
+            None => self.fraction,
+        };
+        self.head + frames / rate
+    }
+
+    // drops a stretch, leaving the queue to start at the frame it was playing
+    fn settle(&mut self, sources: usize, rate: f64) {
+        if self.stretch.is_some() {
+            let frames = ((self.playing(sources, rate) - self.head) * rate)
+                .round()
+                .max(0.0);
+            self.stretch = None;
+            self.fraction = 0.0;
+            self.advance(frames as usize, sources, rate);
+        }
+    }
+
+    // stretches one hop of the queue into the output; false while it waits on the reader, or
+    // once the sound is all stretched
+    fn stretch_block(&mut self, sources: usize, rate: f64) -> bool {
+        let Some(stretch) = &mut self.stretch else {
+            return false;
+        };
+        let available = self.queue.len() / sources;
+        let center = stretch.position.round().max(0.0) as usize;
+        if self.ended && center >= available {
+            self.queue.clear();
+            return false;
+        }
+        let (first, end) = stretch.span();
+        if available < end && !self.ended {
+            return false;
+        }
+        let (window, search) = (stretch.window, stretch.search);
+        let hop = window / 2;
+        // past the end of the sound reads as silence
+        let span: Vec<f32> = self
+            .queue
+            .range(first * sources..end.min(available) * sources)
+            .copied()
+            .chain(std::iter::repeat(0.0))
+            .take((end - first) * sources)
+            .collect();
+        let block = |index: usize| &span[(index - first) * sources..][..window * sources];
+        let (low, high) = (center.saturating_sub(search), center + search);
+        let (best, carried) = match stretch.target {
+            None => (center, None),
+            Some(target) if (low..=high).contains(&target) => (target, None),
+            Some(target) => {
+                // each channel apart, with running energies, so a candidate costs one product
+                let planes: Vec<Vec<f32>> = (0..sources)
+                    .map(|c| span.iter().skip(c).step_by(sources).copied().collect())
+                    .collect();
+                let squares: Vec<Vec<f64>> = planes
+                    .iter()
+                    .map(|plane| {
+                        std::iter::once(0.0)
+                            .chain(plane.iter().scan(0.0, |sum, &s| {
+                                *sum += f64::from(s * s);
+                                Some(*sum)
+                            }))
+                            .collect()
+                    })
+                    .collect();
+                // running sums can round below zero over silence
+                let energy = |c: usize, index: usize| {
+                    (squares[c][index - first + window] - squares[c][index - first]).max(0.0)
+                };
+                let plane = |c: usize, index: usize| &planes[c][index - first..][..window];
+                let last = target as isize - hop as isize;
+                let score = |index: usize| -> f64 {
+                    (0..sources)
+                        .map(|c| {
+                            let product = f64::from(dot(plane(c, index), plane(c, target)));
+                            product / (energy(c, index) * energy(c, target) + 1e-12).sqrt()
+                        })
+                        .sum()
+                };
+                let pick = |candidates: &mut dyn Iterator<Item = usize>| {
+                    candidates
+                        .filter(|&index| (index as isize - last).unsigned_abs() > EXCLUDE)
+                        .map(|index| (score(index), index))
+                        .max_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, index)| index)
+                };
+                let coarse = pick(&mut (low..=high).step_by(DECIMATION));
+                let fine = coarse.and_then(|coarse| {
+                    let mut near = coarse.saturating_sub(DECIMATION - 1).max(low)
+                        ..=(coarse + DECIMATION - 1).min(high);
+                    pick(&mut near)
+                });
+                (fine.unwrap_or(center), Some(block(target)))
+            }
+        };
+        let mut windowed = block(best).to_vec();
+        for (n, frame) in windowed.chunks_exact_mut(sources).enumerate() {
+            let carried = carried.map(|reference| &reference[n * sources..][..sources]);
+            for (c, sample) in frame.iter_mut().enumerate() {
+                // a jump fades in from where the last window would have carried on
+                if let Some(reference) = carried {
+                    *sample = *sample * stretch.transition[n]
+                        + reference[c] * stretch.transition[window + n];
+                }
+                *sample *= stretch.hann[n];
+            }
+        }
+        let (start, rest) = windowed.split_at(hop * sources);
+        stretch
+            .output
+            .extend(stretch.overlap.iter().zip(start).map(|(a, b)| a + b));
+        stretch.overlap.copy_from_slice(rest);
+        stretch.target = Some(best + hop);
+        stretch.position += hop as f64 * self.rate;
+        stretch.rate = self.rate;
+        let played = stretch.span().0.min(available);
+        stretch.position -= played as f64;
+        stretch.target = stretch.target.map(|target| target - played);
+        self.queue.drain(..played * sources);
+        self.head += played as f64 / rate;
+        true
     }
 
     fn advance(&mut self, frames: usize, sources: usize, rate: f64) {
@@ -140,6 +364,19 @@ impl SoundState {
         self.queue.drain(..frames * sources);
         self.head += frames as f64 / rate;
     }
+}
+
+// eight lanes at a time, which the compiler can keep in vector registers
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let ((whole, tail), (other, rest)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
+    for (a, b) in whole.iter().zip(other) {
+        for ((lane, a), b) in lanes.iter_mut().zip(a).zip(b) {
+            *lane += a * b;
+        }
+    }
+    let tail: f32 = tail.iter().zip(rest).map(|(a, b)| a * b).sum();
+    lanes.iter().sum::<f32>() + tail
 }
 
 impl Sound {
@@ -190,6 +427,7 @@ impl Sound {
         state.wanted = Some((id, seconds));
         state.queue.clear();
         state.fraction = 0.0;
+        state.stretch = None;
         state.ended = false;
     }
 
@@ -201,6 +439,7 @@ impl Sound {
         clock: Option<(f64, u64, f64)>,
         time: f64,
         gain: f32,
+        preserves_pitch: bool,
         open: impl FnOnce(u32, &AudioRender) -> Box<dyn AudioOutput>,
     ) {
         let Some(Ok(info)) = self.shared.lock().opened.clone() else {
@@ -222,6 +461,7 @@ impl Sound {
         let mut state = self.shared.lock();
         state.output_rate = output_rate;
         state.gain = gain;
+        state.preserves_pitch = preserves_pitch;
         if let Some((_, _, rate)) = clock {
             state.rate = rate;
         }
@@ -608,6 +848,68 @@ mod tests {
         let mut out = vec![0.0; 4];
         state.fill(&mut out, 2, start);
         assert_eq!(out, [0.0; 4]);
+    }
+
+    #[test]
+    fn a_rate_keeps_the_pitch_unless_told_not_to() {
+        let tone = |frames: usize| -> Vec<f32> {
+            (0..frames)
+                .map(|n| (std::f64::consts::TAU * 300.0 * n as f64 / 48000.0).sin() as f32)
+                .collect()
+        };
+        for (rate, preserves_pitch, pitch) in [
+            (2.0, true, 300.0),
+            (1.5, true, 300.0),
+            (0.5, true, 300.0),
+            (0.25, true, 300.0),
+            (2.0, false, 600.0),
+        ] {
+            let start = Instant::now();
+            let mut state = SoundState {
+                opened: Some(Ok(AudioInfo {
+                    rate: 48000,
+                    channels: 1,
+                    duration: 1.0,
+                })),
+                queue: tone(48000).into(),
+                ended: true,
+                clock: Some((0.0, start)),
+                rate,
+                gain: 1.0,
+                output_rate: 48000,
+                preserves_pitch,
+                ..SoundState::default()
+            };
+            let mut heard = Vec::new();
+            for callback in 0..30 {
+                let mut out = vec![0.0; 480];
+                state.fill(&mut out, 1, start + Duration::from_millis(10 * callback));
+                heard.extend(out);
+            }
+            let steady = &heard[4800..];
+            let crossings = steady
+                .windows(2)
+                .filter(|pair| pair[0] < 0.0 && pair[1] >= 0.0)
+                .count() as f64;
+            let heard_pitch = crossings / (steady.len() as f64 / 48000.0);
+            assert!(
+                (heard_pitch - pitch).abs() < 10.0,
+                "{rate}x heard at {heard_pitch} Hz"
+            );
+            let quietest = steady
+                .as_chunks::<480>()
+                .0
+                .iter()
+                .map(|chunk| (chunk.iter().map(|s| s * s).sum::<f32>() / 480.0).sqrt())
+                .fold(f32::MAX, f32::min);
+            assert!(quietest > 0.65, "{rate}x dipped to {quietest}");
+            let due = 0.3 * rate;
+            let playing = state.playing(1, 48000.0);
+            assert!(
+                (playing - due).abs() < 0.02,
+                "{rate}x at {playing}, due {due}"
+            );
+        }
     }
 
     #[test]
