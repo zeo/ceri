@@ -947,6 +947,16 @@ pub struct Browser {
     selection_unit: Option<SelectionUnit>,
     // hit testing, cursor lookup and paint after one input all read the same layout
     layout_cache: RefCell<Option<(LayoutKey, Rc<LayoutDocument>)>>,
+    // the last frame and what it was painted from, so the next paints only what changed
+    painted: RefCell<Option<Painted>>,
+}
+
+struct Painted {
+    layout: Rc<LayoutDocument>,
+    canvases: Vec<ImageLayer>,
+    scale: f32,
+    fonts: Rc<FontSet>,
+    canvas: Canvas,
 }
 
 // everything a layout is a pure function of
@@ -1062,6 +1072,7 @@ impl Browser {
             fonts: Rc::new(FontSet::builtin()),
             selection_unit: None,
             layout_cache: RefCell::new(None),
+            painted: RefCell::new(None),
         }
     }
 
@@ -2601,11 +2612,31 @@ impl Browser {
             })
             .unwrap_or_default();
         let _fonts = crate::font::use_fonts(self.fonts.clone());
-        Ok(crate::paint::paint_with_canvases(
-            &layout,
-            &canvases,
-            device_pixel_ratio,
-        ))
+        let mut painted = self.painted.borrow_mut();
+        let damage = match painted.as_ref() {
+            Some(last)
+                if last.scale == device_pixel_ratio && Rc::ptr_eq(&last.fonts, &self.fonts) =>
+            {
+                crate::paint::damage((&last.layout, &last.canvases), (&layout, &canvases))
+            }
+            _ => crate::paint::Damage::Everything,
+        };
+        let canvas = match (damage, painted.take()) {
+            (crate::paint::Damage::Nothing, Some(last)) => last.canvas,
+            (crate::paint::Damage::Area(area), Some(mut last)) => {
+                crate::paint::repaint(&mut last.canvas, &layout, &canvases, area);
+                last.canvas
+            }
+            _ => crate::paint::paint_with_canvases(&layout, &canvases, device_pixel_ratio),
+        };
+        *painted = Some(Painted {
+            layout,
+            canvases,
+            scale: device_pixel_ratio,
+            fonts: self.fonts.clone(),
+            canvas: canvas.clone(),
+        });
+        Ok(canvas)
     }
 
     pub fn describe(&self, viewport: Size) -> Result<String, NavigationError> {

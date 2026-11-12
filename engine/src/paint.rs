@@ -1954,8 +1954,197 @@ pub(crate) fn paint_with_canvases(
         document.viewport.width,
         document.viewport.height,
         scale,
-        Color::opaque(245, 248, 250),
+        BASE,
     );
+    paint_document(&mut canvas, document, images, None);
+    canvas
+}
+
+const BASE: Color = Color::opaque(245, 248, 250);
+
+// what a frame has to paint again over the one before it
+#[derive(Debug, PartialEq)]
+pub(crate) enum Damage {
+    Nothing,
+    Area(Rect),
+    Everything,
+}
+
+// compares the layout and layers a frame was painted from with the next frame's
+pub(crate) fn damage(
+    before: (&LayoutDocument, &[ImageLayer]),
+    after: (&LayoutDocument, &[ImageLayer]),
+) -> Damage {
+    let ((old, old_canvases), (new, new_canvases)) = (before, after);
+    if old.viewport != new.viewport || old.prose_selections != new.prose_selections {
+        return Damage::Everything;
+    }
+    let mut area = None;
+    if !changed_area(&old.root, &new.root, ((0.0, 0.0), (0.0, 0.0)), 0, &mut area) {
+        return Damage::Everything;
+    }
+    let old_layers = old.images.iter().chain(old_canvases);
+    let new_layers = new.images.iter().chain(new_canvases);
+    if old_layers.clone().count() != new_layers.clone().count() {
+        return Damage::Everything;
+    }
+    let mut redrawn = Vec::new();
+    for (before, after) in old_layers.zip(new_layers) {
+        if before.node != after.node || before.background != after.background {
+            return Damage::Everything;
+        }
+        if !std::rc::Rc::ptr_eq(&before.image, &after.image) {
+            redrawn.push(after.node);
+        }
+    }
+    if !redrawn.is_empty() && !node_area(&new.root, (0.0, 0.0), &redrawn, &mut area) {
+        return Damage::Everything;
+    }
+    match area {
+        None => Damage::Nothing,
+        // a backdrop filter reads what lies around it, so a change anywhere may reach it
+        Some(_) if has_backdrop(&new.root) => Damage::Everything,
+        Some(rect) => Damage::Area(rect),
+    }
+}
+
+// false when a change cannot be bounded: under a transform, or on the boxes that give the
+// canvas its background
+fn changed_area(
+    old: &LayoutBox,
+    new: &LayoutBox,
+    offsets: ((f32, f32), (f32, f32)),
+    depth: usize,
+    area: &mut Option<Rect>,
+) -> bool {
+    if old.same_own(new) && old.children.len() == new.children.len() {
+        if old.transform.is_some() || !old.filters.own.is_empty() {
+            if old.children == new.children {
+                return true;
+            }
+        } else {
+            let inner = (
+                visual_offset_for(old, offsets.0),
+                visual_offset_for(new, offsets.1),
+            );
+            return old
+                .children
+                .iter()
+                .zip(&new.children)
+                .all(|(old, new)| changed_area(old, new, inner, depth + 1, area));
+        }
+    } else if depth <= 2 && matches!(new.tag.as_str(), "html" | "body") {
+        return false;
+    }
+    let (Some(old), Some(new)) = (ink(old, offsets.0), ink(new, offsets.1)) else {
+        return false;
+    };
+    let changed = union_rect(old, new);
+    *area = Some(area.map_or(changed, |area| union_rect(area, changed)));
+    true
+}
+
+fn node_area(
+    layout_box: &LayoutBox,
+    ancestor_offset: (f32, f32),
+    nodes: &[crate::dom::NodeId],
+    area: &mut Option<Rect>,
+) -> bool {
+    if nodes.contains(&layout_box.node) {
+        let Some(ink) = ink(layout_box, ancestor_offset) else {
+            return false;
+        };
+        *area = Some(area.map_or(ink, |area| union_rect(area, ink)));
+    }
+    if layout_box.transform.is_some() {
+        // a transformed layer's ink is out of reach, so a redrawn image under it repaints all
+        return !has_node(layout_box, nodes);
+    }
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    layout_box
+        .children
+        .iter()
+        .all(|child| node_area(child, offset, nodes, area))
+}
+
+fn has_node(layout_box: &LayoutBox, nodes: &[crate::dom::NodeId]) -> bool {
+    nodes.contains(&layout_box.node)
+        || layout_box
+            .children
+            .iter()
+            .any(|child| has_node(child, nodes))
+}
+
+fn has_backdrop(layout_box: &LayoutBox) -> bool {
+    !layout_box.filters.backdrop.is_empty() || layout_box.children.iter().any(has_backdrop)
+}
+
+// everything a box and its subtree can paint, none under a transform; glyphs, outlines and
+// focus rings can reach past the boxes and runs subtree_bounds measures
+fn ink(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Option<Rect> {
+    fn reach(layout_box: &LayoutBox) -> Option<f32> {
+        if layout_box.transform.is_some() {
+            return None;
+        }
+        let outline = layout_box
+            .outline
+            .as_ref()
+            .map_or(0.0, |outline| outline.width + outline.offset.max(0.0));
+        layout_box
+            .children
+            .iter()
+            .try_fold(outline.max(layout_box.font_size), |most, child| {
+                Some(most.max(reach(child)?))
+            })
+    }
+    Some(outset_rect(
+        subtree_bounds(layout_box, ancestor_offset),
+        reach(layout_box)?,
+    ))
+}
+
+// paints area again over the frame before, which already shows the rest; a clip rounds its
+// edges and keeps slivers a pixel wide, so the paint reaches a margin past the area and only
+// the area's own pixels are kept
+pub(crate) fn repaint(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+    area: Rect,
+) {
+    const MARGIN: f32 = 2.0;
+    let Some(kept) = DeviceBounds::of(canvas, area, None) else {
+        return;
+    };
+    let scale = canvas.scale;
+    let painted = Rect {
+        x: (kept.left as f32 - MARGIN) / scale,
+        y: (kept.top as f32 - MARGIN) / scale,
+        width: ((kept.right - kept.left) as f32 + 2.0 * MARGIN) / scale,
+        height: ((kept.bottom - kept.top) as f32 + 2.0 * MARGIN) / scale,
+    };
+    let mut scratch = canvas.clone();
+    scratch.fill_rect(painted.x, painted.y, painted.width, painted.height, BASE);
+    let layers = document
+        .images
+        .iter()
+        .chain(canvases)
+        .cloned()
+        .collect::<Vec<_>>();
+    paint_document(&mut scratch, document, &layers, Some(painted));
+    let stride = canvas.bytes_per_row();
+    for row in kept.top as usize..kept.bottom as usize {
+        let span = row * stride + kept.left as usize * 4..row * stride + kept.right as usize * 4;
+        canvas.pixels[span.clone()].copy_from_slice(&scratch.pixels[span]);
+    }
+}
+
+fn paint_document(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+) {
     // the root background paints the whole canvas, as CSS backgrounds require; its images
     // stay with the root box
     if let Some(root) = canvas_background(&document.root) {
@@ -1965,25 +2154,16 @@ pub(crate) fn paint_with_canvases(
             width: document.viewport.width,
             height: document.viewport.height,
         });
-        paint_backgrounds(
-            &mut canvas,
-            root,
-            &[],
-            viewport,
-            viewport,
-            root.opacity,
-            None,
-        );
+        paint_backgrounds(canvas, root, &[], viewport, viewport, root.opacity, clip);
     }
     paint_box(
-        &mut canvas,
+        canvas,
         &document.root,
         images,
         &document.prose_selections,
-        None,
+        clip,
         (0.0, 0.0),
     );
-    canvas
 }
 
 fn canvas_background(root: &LayoutBox) -> Option<&LayoutBox> {
@@ -2138,12 +2318,16 @@ fn paint_context(
     // opacity fades the painted subtree as one image, so overlapping descendants do not
     // show through each other
     if opacity < 1.0 && !fades_without_layer(layout_box) {
-        let Some(bounds) =
-            DeviceBounds::of(canvas, subtree_bounds(layout_box, ancestor_offset), clip)
-        else {
+        // the layer spans the whole subtree whatever the clip, so where its pixels land never
+        // depends on how much of it a frame repaints
+        let subtree = subtree_bounds(layout_box, ancestor_offset);
+        let (Some(whole), Some(bounds)) = (
+            DeviceBounds::of(canvas, subtree, None),
+            DeviceBounds::of(canvas, subtree, clip),
+        ) else {
             return;
         };
-        let mut layer = canvas.layer(bounds);
+        let mut layer = canvas.layer(whole);
         paint_context_contents(
             &mut layer,
             layout_box,
@@ -2185,12 +2369,10 @@ fn paint_filtered(
     opacity: f32,
     paint: impl FnOnce(&mut Canvas),
 ) {
-    // what lies past the visible area only matters as far as the filter reaches into it
-    let Some(visible) = intersect_clip(clip, canvas.extent()) else {
-        return;
-    };
+    // what lies past the surface only matters as far as the filter reaches into it; the clip
+    // leaves the layer whole, so its pixels land the same however much a frame repaints
     let Some(area) = intersect_clip(
-        Some(outset_rect(visible, crate::filter::reach(filters))),
+        Some(outset_rect(canvas.extent(), crate::filter::reach(filters))),
         bounds,
     ) else {
         return;
@@ -2435,7 +2617,11 @@ fn paint_box_surface(
     opacity: f32,
 ) -> Option<Rect> {
     let content_clip = if layout_box.overflow.clips() || layout_box.is_document() {
-        intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
+        // a clip that leaves nothing still clips, where none would let the children paint anywhere
+        Some(
+            intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
+                .unwrap_or_default(),
+        )
     } else {
         clip
     };
@@ -3410,10 +3596,14 @@ fn paint_text_shadow(
         width: run.width + reach * 2.0,
         height: run.font_size * 1.5 + reach * 2.0,
     };
-    let Some(bounds) = DeviceBounds::of(canvas, area, clip) else {
+    // the blur reads past the clip, so the layer holds the whole shadow
+    let (Some(whole), Some(bounds)) = (
+        DeviceBounds::of(canvas, area, None),
+        DeviceBounds::of(canvas, area, clip),
+    ) else {
         return;
     };
-    let mut layer = canvas.layer(bounds);
+    let mut layer = canvas.layer(whole);
     paint_glyphs(&mut layer, &shadowed, None, at, true);
     if shadowed.decoration.has_lines() {
         paint_decoration_lines(&mut layer, &shadowed, None, at);
@@ -3875,6 +4065,156 @@ mod tests {
         // white on black follows the srgb curve, half coverage reads as about 74 percent,
         // while contrast keeps black on white near linear
         assert_eq!((white[128], black[128]), (188, 119));
+    }
+
+    const DAMAGE_PAGE: &str = concat!(
+        "<html><body><main><div id='dot'></div><p id='words'>Recording now, 02:42</p>",
+        "<section id='list'><div class='row'>alpha</div><div class='row'>beta</div>",
+        "<div class='row' id='far'>gamma</div></section><div id='turned'>turned</div>",
+        "<div id='soft'></div><input id='field' value='clip name'>",
+        "<div id='fade'>fading</div></main></body></html>",
+    );
+
+    const DAMAGE_STYLE: &str = concat!(
+        "html, body { margin: 0; background: #121315; color: #e8e8e8; font: 13px sans-serif }",
+        "main { padding: 13px }",
+        "#dot { width: 9px; height: 9px; border-radius: 50%; background: #ff4d4d; margin: 7px }",
+        "#list { height: 41px; overflow: auto; border: 1px solid #333; border-radius: 6px }",
+        ".row { height: 18px; padding: 0 5px; background: linear-gradient(#202124, #2a2b2e) }",
+        ".row { text-shadow: 0 1px 3px #000 } .row:first-child { opacity: 0.8 }",
+        "#turned { width: 60px; transform: rotate(8deg); background: #335; margin: 9px 21px }",
+        "#soft { width: 30px; height: 12px; background: #4a8; filter: blur(2px); margin: 3px }",
+        "#field { outline: 2px solid #8af; outline-offset: 1px; margin: 5px }",
+        "#fade { opacity: 0.6; box-shadow: 0 1px 3px #000 }",
+    );
+
+    fn damage_layout(extra: &str, scrolled: f32) -> LayoutDocument {
+        let document = Document::parse_markup(DAMAGE_PAGE).expect("document should parse");
+        let mut state = crate::css::StyleState::default();
+        let list = document
+            .find_element_by_id("list")
+            .expect("the list exists");
+        state.scroll_offsets.insert(list, (0.0, scrolled));
+        let stylesheet =
+            Stylesheet::parse(&format!("{DAMAGE_STYLE}{extra}")).expect("stylesheet should parse");
+        crate::layout::layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 157.0,
+                height: 233.0,
+            },
+            &state,
+        )
+    }
+
+    #[test]
+    fn repainting_the_damage_matches_a_whole_frame() {
+        let frames = [
+            (
+                "#dot { box-shadow: 0 0 0 2px rgba(255, 77, 77, 0.2) }",
+                "#dot { box-shadow: 0 0 0 6px rgba(255, 77, 77, 0.05) }",
+            ),
+            ("", "#fade { opacity: 0.35 }"),
+            ("", "#far { color: #ff0 }"),
+            ("", "#words { text-shadow: 1px 2px 3px #f00 }"),
+            (
+                "#words { text-decoration: underline }",
+                "#words { text-decoration: underline wavy #8af }",
+            ),
+            ("", "#field { outline-color: #f80 }"),
+            ("", "#soft { background: #a48 }"),
+        ];
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fonts/ceri-test.ttf"
+        );
+        let face = crate::font::FontFace::parse(std::fs::read(path).expect("the font should read"))
+            .expect("the font should parse");
+        let outlines = std::rc::Rc::new(crate::font::FontSet::new(std::rc::Rc::new(face), None));
+        for (outlined, scale, scrolled) in [false, true]
+            .into_iter()
+            .flat_map(|outlined| [1.0, 1.5, 2.0].map(|scale| (outlined, scale)))
+            .flat_map(|(outlined, scale)| [0.0, 7.5].map(|scrolled| (outlined, scale, scrolled)))
+        {
+            let _fonts = outlined.then(|| crate::font::use_fonts(outlines.clone()));
+            for (before, after) in frames {
+                let old = damage_layout(before, scrolled);
+                let new = damage_layout(after, scrolled);
+                let Damage::Area(area) = damage((&old, &[]), (&new, &[])) else {
+                    panic!("{after} should damage an area");
+                };
+                let mut canvas = paint_with_canvases(&old, &[], scale);
+                repaint(&mut canvas, &new, &[], area);
+                let whole = paint_with_canvases(&new, &[], scale);
+                let width = whole.width() as usize;
+                let differing = canvas
+                    .rgba_pixels()
+                    .chunks(4)
+                    .zip(whole.rgba_pixels().chunks(4))
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(index, _)| (index % width, index / width))
+                    .collect::<Vec<_>>();
+                assert!(
+                    differing.is_empty(),
+                    "{after} at {scale}x scrolled {scrolled} outlined {outlined}: {} pixels from {:?} to {:?} differ, damage {area:?}",
+                    differing.len(),
+                    differing.first(),
+                    differing.last(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn damage_falls_back_to_the_whole_frame_where_it_cannot_bound_a_change() {
+        let base = damage_layout("", 0.0);
+        assert_eq!(
+            damage((&base, &[]), (&damage_layout("", 0.0), &[])),
+            Damage::Nothing
+        );
+        for change in [
+            "#turned { background: #533 }",
+            "body { background: #000 }",
+            "#words { backdrop-filter: blur(1px) }",
+        ] {
+            assert_eq!(
+                damage((&base, &[]), (&damage_layout(change, 0.0), &[])),
+                Damage::Everything,
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clip_that_leaves_nothing_hides_the_children() {
+        let document = Document::parse_markup(
+            "<html><body><div id='outer'><div id='inner'><p>hidden</p></div></div></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #ffffff }",
+            "#outer { width: 40px; height: 20px; overflow: hidden }",
+            "#inner { margin-top: 30px; height: 10px; overflow: hidden }",
+            "p { position: relative; top: -30px; margin: 0; height: 20px; background: #ff0000 }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 40.0,
+                height: 40.0,
+            },
+        ));
+        assert!(
+            canvas
+                .rgba_pixels()
+                .chunks(4)
+                .all(|pixel| pixel[..3] == [255, 255, 255]),
+            "nothing of the paragraph should show outside its clips"
+        );
     }
 
     #[test]

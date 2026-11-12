@@ -2346,9 +2346,13 @@ fn stacking_child_clip(
     visual_offset: (f32, f32),
 ) -> Option<Rect> {
     if layout.overflow.clips() || layout.is_document() {
-        intersect_rect(
-            clip,
-            translate_rect(overflow_clip_rect(layout), visual_offset),
+        // a clip that leaves nothing still clips, where none would let the children paint anywhere
+        Some(
+            intersect_rect(
+                clip,
+                translate_rect(overflow_clip_rect(layout), visual_offset),
+            )
+            .unwrap_or_default(),
         )
     } else {
         clip
@@ -8764,6 +8768,100 @@ fn control_text_lines(
 }
 
 impl LayoutBox {
+    // every field but the children, which damage tracking walks one by one; the pattern names
+    // them all so a new field cannot be left out
+    pub(crate) fn same_own(&self, other: &Self) -> bool {
+        let Self {
+            children: _,
+            node,
+            tag,
+            rect,
+            background,
+            backgrounds,
+            masks,
+            object_fit,
+            transform,
+            backface_hidden,
+            clip_path,
+            radii,
+            opacity,
+            shadows,
+            filters,
+            border,
+            outline,
+            text,
+            control_value,
+            control_selection,
+            control_focused,
+            control_text_origin,
+            position,
+            visual_offset,
+            z_index,
+            creates_stacking_context,
+            sticky_inset,
+            font_size,
+            overflow,
+            overflow_axes,
+            visible,
+            pointer_events,
+            selectable,
+            cursor,
+            floated,
+            inline,
+            control,
+            selection,
+            selection_color,
+            scroll_content,
+            scroll_offset,
+            svg,
+            scrollbar,
+            margin,
+        } = self;
+        *node == other.node
+            && *tag == other.tag
+            && *rect == other.rect
+            && *background == other.background
+            && *backgrounds == other.backgrounds
+            && *masks == other.masks
+            && *object_fit == other.object_fit
+            && *transform == other.transform
+            && *backface_hidden == other.backface_hidden
+            && *clip_path == other.clip_path
+            && *radii == other.radii
+            && *opacity == other.opacity
+            && *shadows == other.shadows
+            && *filters == other.filters
+            && *border == other.border
+            && *outline == other.outline
+            && *text == other.text
+            && *control_value == other.control_value
+            && *control_selection == other.control_selection
+            && *control_focused == other.control_focused
+            && *control_text_origin == other.control_text_origin
+            && *position == other.position
+            && *visual_offset == other.visual_offset
+            && *z_index == other.z_index
+            && *creates_stacking_context == other.creates_stacking_context
+            && *sticky_inset == other.sticky_inset
+            && *font_size == other.font_size
+            && *overflow == other.overflow
+            && *overflow_axes == other.overflow_axes
+            && *visible == other.visible
+            && *pointer_events == other.pointer_events
+            && *selectable == other.selectable
+            && *cursor == other.cursor
+            && *floated == other.floated
+            && *inline == other.inline
+            && *control == other.control
+            && *selection == other.selection
+            && *selection_color == other.selection_color
+            && *scroll_content == other.scroll_content
+            && *scroll_offset == other.scroll_offset
+            && *svg == other.svg
+            && *scrollbar == other.scrollbar
+            && *margin == other.margin
+    }
+
     pub(crate) fn is_document(&self) -> bool {
         self.tag == "#document"
     }
