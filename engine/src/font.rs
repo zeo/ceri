@@ -912,9 +912,16 @@ fn flatten_quadratic(
     to: (f32, f32),
     segments: &mut Vec<Segment>,
 ) {
-    let deviation =
-        (control.0 - (from.0 + to.0) / 2.0).abs() + (control.1 - (from.1 + to.1) / 2.0).abs();
-    let steps = ((deviation * 0.5).sqrt().ceil() as usize).clamp(1, 16);
+    // freetype's smooth rasterizer splits the arc into equal steps, doubling them until each
+    // step bends by at most a quarter pixel, so curves cover the area its bitmaps do
+    let mut bend = (from.0 + to.0 - 2.0 * control.0)
+        .abs()
+        .max((from.1 + to.1 - 2.0 * control.1).abs());
+    let mut steps = 1;
+    while bend > 0.25 && steps < 1 << 16 {
+        bend /= 4.0;
+        steps *= 2;
+    }
     let mut previous = from;
     for step in 1..=steps {
         let t = step as f32 / steps as f32;
@@ -2531,6 +2538,18 @@ mod tests {
         let path = format!("{}/tests/fixtures/fonts/{name}", env!("CARGO_MANIFEST_DIR"));
         FontFace::parse(std::fs::read(&path).expect("fixture font should exist"))
             .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+    }
+
+    #[test]
+    fn curves_split_into_the_steps_freetype_draws() {
+        let steps = |control: (f32, f32)| {
+            let mut segments = Vec::new();
+            flatten_quadratic((0.0, 0.0), control, (20.0, 0.0), &mut segments);
+            segments.len()
+        };
+        assert_eq!(steps((10.0, 0.1)), 1);
+        assert_eq!(steps((10.0, 10.0)), 16);
+        assert_eq!(steps((10.0, 2.0)), 4);
     }
 
     #[test]
