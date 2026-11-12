@@ -9,6 +9,14 @@ use super::object::{
 use super::vm::{DelegateResult, ResumeMode};
 use super::*;
 
+// how the vm names a value it starts iterating, as v8's call printer finds it
+pub(super) enum Callsite {
+    // the whole not-iterable message, from the iterated source
+    Source(Rc<str>),
+    // the source of a spread call argument
+    Argument(Rc<str>),
+}
+
 // the iteration state behind for-of, spread and destructuring; host collections iterate a
 // snapshot, arrays read live by index, and other objects go through next()
 pub(super) enum VmIterator {
@@ -1944,6 +1952,8 @@ impl ScriptRuntime {
     }
 
     fn iterator_state(&mut self, value: Value) -> Result<VmIterator, ScriptError> {
+        // taken first, so an iteration the lookup itself runs reports in its own words
+        let callsite = self.iterable_callsite.take();
         match &value {
             Value::Array(array) => Ok(VmIterator::Array {
                 array: array.clone(),
@@ -1952,9 +1962,7 @@ impl ScriptRuntime {
             Value::Object(_) => {
                 let method = self.get_property(&value, "@@iterator")?;
                 if !is_callable(&method) {
-                    return Err(
-                        self.type_error(format!("{} is not iterable", receiver_label(&value)))
-                    );
+                    return Err(self.not_iterable(callsite, &value));
                 }
                 let iterator = self.call_function(method, value.clone(), Vec::new())?;
                 if is_primitive(&iterator) {
@@ -1965,14 +1973,38 @@ impl ScriptRuntime {
                 let next = self.get_property(&iterator, "next")?;
                 Ok(VmIterator::Object { iterator, next })
             }
-            Value::Undefined | Value::Null => {
-                Err(self.type_error(format!("{} is not iterable", value.string_value())))
-            }
+            Value::Undefined | Value::Null => Err(self.not_iterable(callsite, &value)),
             other => match host_iterable_values(other) {
                 Some(values) => Ok(VmIterator::List { values, index: 0 }),
-                None => Err(self.type_error(format!("{} is not iterable", receiver_label(other)))),
+                None => Err(self.not_iterable(callsite, other)),
             },
         }
+    }
+
+    // v8's wording: the source where the call printer found it, otherwise the value's type
+    fn not_iterable(&mut self, callsite: Option<Callsite>, value: &Value) -> ScriptError {
+        let nullish = matches!(value, Value::Undefined | Value::Null);
+        self.type_error(match callsite {
+            Some(Callsite::Source(message)) => message.to_string(),
+            Some(Callsite::Argument(site)) if nullish => {
+                format!("{site} is not iterable (cannot read property null)")
+            }
+            Some(Callsite::Argument(_)) => {
+                "Spread syntax requires ...iterable[Symbol.iterator] to be a function".to_string()
+            }
+            None => {
+                let shown = match value {
+                    Value::Null => " null".to_string(),
+                    Value::Bool(value) => format!(" {value}"),
+                    Value::Number(value) => format!(" {}", number_to_string(*value)),
+                    _ => String::new(),
+                };
+                format!(
+                    "{}{shown} is not iterable (cannot read property Symbol(Symbol.iterator))",
+                    self.type_of(value)
+                )
+            }
+        })
     }
 
     pub(super) fn get_async_iterator(&mut self, value: Value) -> Result<Value, ScriptError> {

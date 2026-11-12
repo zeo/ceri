@@ -81,7 +81,10 @@ pub(super) enum Op {
     NewArray,
     ArrayPush,
     ArrayHole,
-    ArraySpread,
+    // the not-iterable message naming the spread expression, from the code's names
+    ArraySpread(Option<u32>),
+    // a spread call argument, with the name its source prints as
+    ArgumentSpread(u32),
     DefineField(u32),
     DefineComputed,
     DefineAccessor {
@@ -160,7 +163,7 @@ pub(super) enum Op {
     ChainStart,
     JumpIfNullishChain(u32),
     ChainEnd,
-    GetIterator,
+    GetIterator(Option<u32>),
     GetAsyncIterator,
     IterValue,
     IterRest,
@@ -438,6 +441,8 @@ pub(super) struct Compiler {
     source: Rc<str>,
     // short-circuit jumps of the optional chain being compiled
     chain_jumps: Vec<usize>,
+    // the not-iterable message for the pattern about to be compiled, from its initializer
+    pattern_callsite: Option<u32>,
 }
 
 pub(super) struct ModuleCode {
@@ -447,6 +452,178 @@ pub(super) struct ModuleCode {
     pub(super) reexports: Vec<(Name, Name, Name)>,
     pub(super) star_exports: Vec<Name>,
     pub(super) namespace_exports: Vec<(Name, Name)>,
+}
+
+enum Folded {
+    Number(f64),
+    Bool(bool),
+    String(String),
+}
+
+// the literal v8's parser folds an operation on literals into, which its errors then print
+fn folded(expression: &Expr) -> Option<Folded> {
+    use super::operations::{to_int32_number as int32, to_uint32_number as uint32};
+    let number = |expression: &Expr| match folded(expression) {
+        Some(Folded::Number(value)) => Some(value),
+        _ => None,
+    };
+    Some(match expression {
+        Expr::Number(value) => Folded::Number(*value),
+        Expr::Bool(value) => Folded::Bool(*value),
+        Expr::String(value) => Folded::String(value.to_string()),
+        Expr::Unary {
+            operator: UnaryOperator::Not,
+            argument,
+        } => Folded::Bool(match &**argument {
+            Expr::Null => true,
+            _ => match folded(argument)? {
+                Folded::Number(value) => value == 0.0 || value.is_nan(),
+                Folded::Bool(value) => !value,
+                Folded::String(value) => value.is_empty(),
+            },
+        }),
+        Expr::Unary { operator, argument } => {
+            let value = number(argument)?;
+            Folded::Number(match operator {
+                UnaryOperator::Negative => -value,
+                UnaryOperator::Positive => value,
+                UnaryOperator::BitNot => f64::from(!int32(value)),
+                _ => return None,
+            })
+        }
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => match (operator, folded(left)?, folded(right)?) {
+            (BinaryOperator::Add, Folded::String(left), Folded::String(right)) => {
+                Folded::String(left + &right)
+            }
+            (operator, Folded::Number(left), Folded::Number(right)) => {
+                Folded::Number(match operator {
+                    BinaryOperator::Add => left + right,
+                    BinaryOperator::Subtract => left - right,
+                    BinaryOperator::Multiply => left * right,
+                    BinaryOperator::Divide => left / right,
+                    BinaryOperator::Remainder => left % right,
+                    BinaryOperator::BitAnd => f64::from(int32(left) & int32(right)),
+                    BinaryOperator::BitOr => f64::from(int32(left) | int32(right)),
+                    BinaryOperator::BitXor => f64::from(int32(left) ^ int32(right)),
+                    BinaryOperator::ShiftLeft => f64::from(int32(left) << (uint32(right) & 31)),
+                    BinaryOperator::ShiftRight => f64::from(int32(left) >> (uint32(right) & 31)),
+                    BinaryOperator::ShiftRightUnsigned => {
+                        f64::from(uint32(left) >> (uint32(right) & 31))
+                    }
+                    _ => return None,
+                })
+            }
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+// an expression as v8's call printer shows it in an error (src/ast/prettyprinter.cc)
+fn callsite(expression: &Expr) -> String {
+    const INTERMEDIATE: &str = "(intermediate value)";
+    match folded(expression) {
+        Some(Folded::Number(value)) => return super::number_to_string(value),
+        Some(Folded::Bool(value)) => return value.to_string(),
+        Some(Folded::String(value)) => return format!("\"{value}\""),
+        None => {}
+    }
+    match expression {
+        Expr::Identifier(name) => name.to_string(),
+        Expr::This => "this".to_string(),
+        Expr::Null => "null".to_string(),
+        Expr::Template {
+            quasis,
+            expressions,
+        } if expressions.is_empty() => format!("\"{}\"", quasis.concat()),
+        Expr::Member {
+            object, property, ..
+        } => format!("{}.{property}", callsite(object)),
+        Expr::Index { object, index, .. } => match &**index {
+            Expr::String(key) => format!("{}.{key}", callsite(object)),
+            key => format!("{}[{}]", callsite(object), callsite(key)),
+        },
+        Expr::Call { callee, .. } => callsite(callee),
+        Expr::Array(elements) => {
+            let elements = elements.iter().map(|element| match element {
+                ArrayElement::Hole => String::new(),
+                ArrayElement::Item(item) => callsite(item),
+                ArrayElement::Spread(item) => format!("(...{})", callsite(item)),
+            });
+            format!("[{}]", elements.collect::<Vec<_>>().join(","))
+        }
+        Expr::Object(properties) => format!("{{{}}}", INTERMEDIATE.repeat(properties.len())),
+        Expr::Unary { operator, argument } => {
+            let token = match operator {
+                UnaryOperator::Not => "!",
+                UnaryOperator::Negative => "-",
+                UnaryOperator::Positive => "+",
+                UnaryOperator::BitNot => "~",
+                UnaryOperator::TypeOf => "typeof ",
+                UnaryOperator::Void => "void ",
+                UnaryOperator::Delete => "delete ",
+            };
+            format!("({token}{})", callsite(argument))
+        }
+        Expr::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let token = match operator {
+                BinaryOperator::Add => "+",
+                BinaryOperator::Subtract => "-",
+                BinaryOperator::Multiply => "*",
+                BinaryOperator::Divide => "/",
+                BinaryOperator::Remainder => "%",
+                BinaryOperator::Exponent => "**",
+                BinaryOperator::ShiftLeft => "<<",
+                BinaryOperator::ShiftRight => ">>",
+                BinaryOperator::ShiftRightUnsigned => ">>>",
+                BinaryOperator::BitAnd => "&",
+                BinaryOperator::BitOr => "|",
+                BinaryOperator::BitXor => "^",
+                BinaryOperator::Equal => "==",
+                BinaryOperator::NotEqual => "!=",
+                BinaryOperator::StrictEqual => "===",
+                BinaryOperator::StrictNotEqual => "!==",
+                BinaryOperator::Less => "<",
+                BinaryOperator::LessEqual => "<=",
+                BinaryOperator::Greater => ">",
+                BinaryOperator::GreaterEqual => ">=",
+                BinaryOperator::InstanceOf => "instanceof",
+                BinaryOperator::In => "in",
+            };
+            format!("({} {token} {})", callsite(left), callsite(right))
+        }
+        Expr::Logical {
+            operator,
+            left,
+            right,
+        } => {
+            let token = match operator {
+                LogicalOperator::And => "&&",
+                LogicalOperator::Or => "||",
+                LogicalOperator::Nullish => "??",
+            };
+            format!("({} {token} {})", callsite(left), callsite(right))
+        }
+        Expr::Sequence(expressions) => {
+            let expressions = expressions.iter().map(callsite).collect::<Vec<_>>();
+            format!("({})", expressions.join(" , "))
+        }
+        Expr::Conditional { .. } => INTERMEDIATE.repeat(3),
+        Expr::Assign { target, .. } => match &**target {
+            Pattern::Identifier(name) => name.to_string(),
+            Pattern::Expression(target) => callsite(target),
+            _ => INTERMEDIATE.to_string(),
+        },
+        _ => INTERMEDIATE.to_string(),
+    }
 }
 
 fn error(message: impl Into<String>) -> ScriptError {
@@ -584,6 +761,7 @@ impl Compiler {
             functions: Vec::new(),
             source: source.into(),
             chain_jumps: Vec::new(),
+            pattern_callsite: None,
         }
     }
 
@@ -608,6 +786,19 @@ impl Compiler {
 
     fn name(&mut self, name: &str) -> u32 {
         self.state().name(name)
+    }
+
+    // v8's call printer names the iterated expression, and a call by its callee with both ways
+    // the call can fail
+    fn iterable_callsite(&mut self, expression: &Expr) -> u32 {
+        let message = match expression {
+            Expr::Call { callee, .. } => format!(
+                "{} is not a function or its return value is not iterable",
+                callsite(callee)
+            ),
+            other => format!("{} is not iterable", callsite(other)),
+        };
+        self.name(&message)
     }
 
     pub(super) fn compile_script(mut self, script: &Script) -> Result<Rc<Code>, ScriptError> {
@@ -1204,6 +1395,17 @@ impl Compiler {
                     match &declarator.init {
                         Some(init) => {
                             self.compile_named_expression(init, &declarator.target)?;
+                            // v8 finds the source of a destructured initializer only when the
+                            // error's position is where it starts, as with a name or a literal
+                            let starts = matches!(
+                                init,
+                                Expr::Identifier(_)
+                                    | Expr::This
+                                    | Expr::Null
+                                    | Expr::Array(_)
+                                    | Expr::Object(_)
+                            ) || folded(init).is_some();
+                            self.pattern_callsite = starts.then(|| self.iterable_callsite(init));
                             self.compile_binding(&declarator.target, *kind)?;
                         }
                         None if *kind == DeclarationKind::Let => {
@@ -1568,11 +1770,12 @@ impl Compiler {
         is_await: bool,
     ) -> Result<(), ScriptError> {
         self.compile_expression(right)?;
-        self.emit(if is_await {
+        let op = if is_await {
             Op::GetAsyncIterator
         } else {
-            Op::GetIterator
-        });
+            Op::GetIterator(Some(self.iterable_callsite(right)))
+        };
+        self.emit(op);
         self.push_target(labels, TargetKind::Loop);
         let start = self.here();
         let exit = if is_await {
@@ -1748,6 +1951,7 @@ impl Compiler {
         pattern: &Pattern,
         declaration: Option<DeclarationKind>,
     ) -> Result<(), ScriptError> {
+        let callsite = self.pattern_callsite.take();
         match pattern {
             Pattern::Identifier(name) => {
                 if declaration == Some(DeclarationKind::Const) && self.resolve(name).is_none() {
@@ -1867,7 +2071,7 @@ impl Compiler {
                 }
             }
             Pattern::Array { elements, rest } => {
-                self.emit(Op::GetIterator);
+                self.emit(Op::GetIterator(callsite));
                 for element in elements {
                     self.emit(Op::IterValue);
                     match element {
@@ -1992,7 +2196,7 @@ impl Compiler {
             for name in names {
                 self.declare(&name, BindingKind::Param);
             }
-            self.emit(Op::GetIterator);
+            self.emit(Op::GetIterator(None));
             for param in &function.params {
                 self.emit(Op::IterValue);
                 self.compile_pattern(param, Some(DeclarationKind::Let))?;
@@ -2257,7 +2461,8 @@ impl Compiler {
                         }
                         ArrayElement::Spread(item) => {
                             self.compile_expression(item)?;
-                            self.emit(Op::ArraySpread);
+                            let callsite = self.iterable_callsite(item);
+                            self.emit(Op::ArraySpread(Some(callsite)));
                         }
                     }
                 }
@@ -2476,7 +2681,7 @@ impl Compiler {
                     self.emit(Op::Jump(start));
                     self.patch_here(done);
                 } else if *delegate {
-                    self.emit(Op::GetIterator);
+                    self.emit(Op::GetIterator(None));
                     self.emit(Op::Undefined);
                     let start = self.here();
                     let done = self.emit(Op::DelegateStep(0));
@@ -2663,7 +2868,9 @@ impl Compiler {
                 }
                 Argument::Spread(value) => {
                     self.compile_expression(value)?;
-                    self.emit(Op::ArraySpread);
+                    let site = callsite(value);
+                    let site = self.name(&site);
+                    self.emit(Op::ArgumentSpread(site));
                 }
             }
         }

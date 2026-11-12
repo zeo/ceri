@@ -752,6 +752,20 @@ fn errors_surface_with_spec_types() {
             "TypeError",
         ),
         (
+            "not iterable names the source as v8 does",
+            "var o = { list: null, f() {} }, e = null, a, said = [];
+            for (const run of [() => [...e], () => { for (const x of o.f()); }, () => { const [a] = e; },
+                () => { const [a] = o.f; }, () => { [a] = e; }, () => [...[1].q], () => [...(0, !e)],
+                () => [...(o.list ?? -1)], () => [...o?.list], () => [...e ? e : e], () => Math.max(...o.list),
+                () => Math.max(...1), () => new Set(1), () => [...{}], () => [...o['list']], () => [...o[e]],
+                () => [...~1], () => [...!0], () => [...1 + 2], () => [...o['li' + 'st']], () => { const [a] = -1; },
+                () => { const [a] = 's'.length; }, () => { const [[a]] = [1]; }, () => [...(e, e, 1)], () => [...{ a: 1, b: e }]]) {
+                try { run(); } catch (error) { said.push(error.message); }
+            }
+            console.log(said.join('|'));",
+            "e is not iterable|o.f is not a function or its return value is not iterable|e is not iterable|function is not iterable (cannot read property Symbol(Symbol.iterator))|object null is not iterable (cannot read property Symbol(Symbol.iterator))|[1].q is not iterable|(0 , (!e)) is not iterable|(o.list ?? -1) is not iterable|(intermediate value) is not iterable|(intermediate value)(intermediate value)(intermediate value) is not iterable|o.list is not iterable (cannot read property null)|Spread syntax requires ...iterable[Symbol.iterator] to be a function|number 1 is not iterable (cannot read property Symbol(Symbol.iterator))|{} is not iterable|o.list is not iterable|o[e] is not iterable|-2 is not iterable|true is not iterable|3 is not iterable|o[\"list\"] is not iterable|-1 is not iterable|number 1 is not iterable (cannot read property Symbol(Symbol.iterator))|number 1 is not iterable (cannot read property Symbol(Symbol.iterator))|(e , e , 1) is not iterable|{(intermediate value)(intermediate value)} is not iterable",
+        ),
+        (
             "stack overflow",
             "function f() { return f(); } try { f(); } catch (e) { console.log(e.name); }",
             "RangeError",

@@ -7,6 +7,7 @@ use super::compiler::{self, Code, NO_TARGET, Op};
 use super::object::{
     JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, new_object,
 };
+use super::operations::Callsite;
 use super::realm::Native;
 use super::*;
 
@@ -1265,9 +1266,17 @@ impl ScriptRuntime {
                     array.borrow_mut().push(Value::Undefined);
                 }
             }
-            Op::ArraySpread => {
+            Op::ArraySpread(_) | Op::ArgumentSpread(_) => {
                 let value = Self::pop(frame);
-                let items = self.spread_list(value)?;
+                let name = |index: u32| frame.code.names[index as usize].clone();
+                self.iterable_callsite = match op {
+                    Op::ArraySpread(message) => message.map(name).map(Callsite::Source),
+                    Op::ArgumentSpread(site) => Some(Callsite::Argument(name(site))),
+                    _ => None,
+                };
+                let items = self.spread_list(value);
+                self.iterable_callsite = None;
+                let items = items?;
                 let frame = frames.last_mut().expect("frame");
                 if let Some(Value::Array(array)) = frame.stack.last() {
                     let mut array = array.borrow_mut();
@@ -1787,13 +1796,17 @@ impl ScriptRuntime {
             Op::ChainEnd => {
                 frame.chains.pop();
             }
-            Op::GetIterator | Op::GetAsyncIterator => {
+            Op::GetIterator(callsite) => {
                 let value = Self::pop(frame);
-                let iterator = if matches!(op, Op::GetAsyncIterator) {
-                    self.get_async_iterator(value)?
-                } else {
-                    self.get_iterator(value)?
-                };
+                self.iterable_callsite = callsite
+                    .map(|index| Callsite::Source(frame.code.names[index as usize].clone()));
+                let iterator = self.get_iterator(value);
+                self.iterable_callsite = None;
+                frames.last_mut().expect("frame").stack.push(iterator?);
+            }
+            Op::GetAsyncIterator => {
+                let value = Self::pop(frame);
+                let iterator = self.get_async_iterator(value)?;
                 frames.last_mut().expect("frame").stack.push(iterator);
             }
             Op::IterValue => {

@@ -563,6 +563,8 @@ pub struct ScriptRuntime {
     pending_history: Vec<NavigationRequest>,
     // the value being thrown, with the message of the Rust error that carries it
     pending_exception: Option<(Value, String)>,
+    // how an iteration the vm starts names its value when it is not iterable
+    iterable_callsite: Option<operations::Callsite>,
     nested_runs: usize,
     private_names: u64,
     symbol_counter: u64,
@@ -1605,6 +1607,7 @@ impl ScriptRuntime {
             pending_navigation: None,
             pending_history: Vec::new(),
             pending_exception: None,
+            iterable_callsite: None,
             nested_runs: 0,
             private_names: 0,
             symbol_counter: 0,
