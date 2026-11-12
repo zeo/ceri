@@ -8,7 +8,7 @@ use crate::layout::{
     BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
     ResolvedEdges, SQUARE_CORNERS, Scrollbar, StackingContextEntry, TextRun, ThumbPlacement,
     overflow_clip_rect, paint_order, part_box, scrollbar_metrics, stacking_context_entries,
-    thumb_placement, translate_rect, visual_offset_for, visual_rect_for,
+    thumb_placement, translate_rect, user_scroll_range, visual_offset_for, visual_rect_for,
 };
 use crate::png::encode_png;
 use std::fs::File;
@@ -2628,6 +2628,8 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     if let Some(mask) = mask {
         canvas.push_mask(mask);
     }
+    let opaque = canvas.opaque;
+    canvas.opaque &= !scrolls_in_own_layer(canvas, layout_box);
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
@@ -2652,6 +2654,7 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
         paint_context_entry(canvas, entry, images, prose_selections);
     }
+    canvas.opaque = opaque;
     if mask.is_some() {
         canvas.pop_mask();
     }
@@ -2663,6 +2666,16 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     if layout_box.clip_path.is_some() {
         canvas.pop_mask();
     }
+}
+
+// from a device scale of 1.5 chromium composites any scroller that can scroll, opaque
+// background or not, and text in a layer that is not opaque loses subpixel blending
+fn scrolls_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
+    let (x, y) = user_scroll_range(layout_box);
+    canvas.scale >= 1.5
+        && !layout_box.is_document()
+        && layout_box.background.alpha < 255
+        && (x > 0.0 || y > 0.0)
 }
 
 fn paint_context_entry(
@@ -2681,6 +2694,11 @@ fn paint_context_entry(
     for &mask in &masks {
         canvas.push_mask(mask);
     }
+    let opaque = canvas.opaque;
+    canvas.opaque &= !entry
+        .clippers
+        .iter()
+        .any(|&(clipper, _)| scrolls_in_own_layer(canvas, clipper));
     paint_context(
         canvas,
         entry.layout,
@@ -2689,6 +2707,7 @@ fn paint_context_entry(
         entry.clip,
         entry.ancestor_offset,
     );
+    canvas.opaque = opaque;
     for _ in &masks {
         canvas.pop_mask();
     }
@@ -2741,6 +2760,8 @@ fn paint_non_context_subtree(
     if let Some(mask) = mask {
         canvas.push_mask(mask);
     }
+    let opaque = canvas.opaque;
+    canvas.opaque &= !scrolls_in_own_layer(canvas, layout_box);
     paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
     paint_box_text(
         canvas,
@@ -2757,6 +2778,7 @@ fn paint_non_context_subtree(
         content_clip,
         offset,
     );
+    canvas.opaque = opaque;
     if mask.is_some() {
         canvas.pop_mask();
     }
@@ -3644,8 +3666,9 @@ fn intersect_rect(first: Rect, second: Rect) -> Rect {
 // blink's object-fit in 1/64 px layout units: the constrained side by integer muldiv and the
 // centring offset truncated, so the rect snaps to the pixels chromium paints
 fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
-    let unit = |value: f32| (value * 64.0) as i64;
-    let natural = (i64::from(image.width) * 64, i64::from(image.height) * 64);
+    let scale = crate::font::device_scale();
+    let unit = |value: f32| (value * scale * 64.0) as i64;
+    let natural = (unit(image.width as f32), unit(image.height as f32));
     let size = (unit(content.width), unit(content.height));
     let fitted = |grow: bool| {
         let height = size.0 * natural.1 / natural.0;
@@ -3665,7 +3688,7 @@ fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
         ObjectFit::ScaleDown => fitted(false),
     };
     let centre = |space: i64, object: i64| ((space - object) as f32 / 64.0 * 0.5 * 64.0) as i64;
-    let pixels = |raw: i64| raw as f32 / 64.0;
+    let pixels = |raw: i64| raw as f32 / 64.0 / scale;
     Rect {
         x: content.x + pixels(centre(size.0, width)),
         y: content.y + pixels(centre(size.1, height)),
@@ -4327,7 +4350,7 @@ mod tests {
             .flat_map(|outlined| [1.0, 1.5, 2.0].map(|scale| (outlined, scale)))
             .flat_map(|(outlined, scale)| [0.0, 7.5].map(|scrolled| (outlined, scale, scrolled)))
         {
-            let _fonts = outlined.then(|| crate::font::use_fonts(outlines.clone()));
+            let _fonts = outlined.then(|| crate::font::use_fonts(outlines.clone(), 1.0));
             for (before, after) in frames {
                 let old = damage_layout(before, scrolled);
                 let new = damage_layout(after, scrolled);

@@ -3092,6 +3092,10 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn set_viewport_metrics(&mut self, viewport: ViewportMetrics) {
+        // a layout rounds at the device scale, so one measured at another scale is stale
+        if viewport.device_pixel_ratio != self.viewport.device_pixel_ratio {
+            *self.measured.borrow_mut() = None;
+        }
         self.viewport = viewport;
     }
 

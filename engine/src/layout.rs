@@ -429,9 +429,9 @@ impl InlineLine {
     }
 
     // a line measured piece by piece lands a rounding error past the width the same text
-    // measured whole, so overflow starts one layout unit (1/64 px) beyond the line
+    // measured whole, so overflow starts one layout unit (1/64 device px) beyond the line
     fn overflows(&self, width: f32, content_width: f32) -> bool {
-        width > self.available(content_width) + 1.0 / 64.0
+        width > self.available(content_width) + 1.0 / 64.0 / crate::font::device_scale()
     }
 
     // a fresh line narrows to the floats beside it
@@ -1890,6 +1890,23 @@ fn user_scroll_axes(layout: &LayoutBox) -> [bool; 2] {
     layout.overflow_axes.map(|axis| axis == Overflow::Auto)
 }
 
+// how far a user can scroll a box on each axis, zero for boxes that are not scroll containers
+pub(crate) fn user_scroll_range(layout: &LayoutBox) -> (f32, f32) {
+    if layout.overflow != Overflow::Auto && !layout.is_document() {
+        return (0.0, 0.0);
+    }
+    let scrollport = scrollbar_metrics(layout).scrollport;
+    let [user_x, user_y] = user_scroll_axes(layout);
+    let range = |user: bool, content: f32, port: f32| match user {
+        true => (content - port).max(0.0),
+        false => 0.0,
+    };
+    (
+        range(user_x, layout.scroll_content.width, scrollport.width),
+        range(user_y, layout.scroll_content.height, scrollport.height),
+    )
+}
+
 // what an overflow container clips its content to: the padding box, less any scrollbar, on
 // the axes that clip
 pub(crate) fn overflow_clip_rect(layout: &LayoutBox) -> Rect {
@@ -2451,19 +2468,8 @@ fn scroll_target_box(
             return Some(target);
         }
     }
-    if inside_layout && (layout.overflow == Overflow::Auto || layout.is_document()) {
-        let scrollport = scrollbar_metrics(layout).scrollport;
-        let [user_x, user_y] = user_scroll_axes(layout);
-        let max_x = if user_x {
-            (layout.scroll_content.width - scrollport.width).max(0.0)
-        } else {
-            0.0
-        };
-        let max_y = if user_y {
-            (layout.scroll_content.height - scrollport.height).max(0.0)
-        } else {
-            0.0
-        };
+    if inside_layout {
+        let (max_x, max_y) = user_scroll_range(layout);
         if max_x > 0.0 || max_y > 0.0 {
             return Some(ScrollTarget {
                 node: layout.node,
@@ -3267,7 +3273,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     // chromium centres a single-line field's editor in its content box, overflowing both ways,
     // halving the layout-unit difference toward zero
     if name == "input" && control_value.is_some() {
-        let offset = ((content_height - line_height) * 32.0).trunc() / 64.0;
+        let scale = crate::font::device_scale();
+        let offset = ((content_height - line_height) * scale * 32.0).trunc() / 64.0 / scale;
         for run in &mut text {
             run.y += offset;
         }
@@ -6022,8 +6029,9 @@ fn control_content_size(
                 })
                 .map(|option| measure(document.text_content(option).trim()))
                 .fold(0.0, f32::max);
-            // chromium rounds the widest option up to a whole pixel
-            (Some(widest.ceil()), Some(line_height))
+            // chromium rounds the widest option up to a whole device pixel
+            let scale = crate::font::device_scale();
+            (Some((widest * scale).ceil() / scale), Some(line_height))
         }
         ControlType::File => (
             Some(file_button_width(&measure) + font_size * 0.4 + measure(FILE_EMPTY_LABEL)),
@@ -8708,6 +8716,7 @@ fn root_font_size(
 // chromium keeps line heights in 1/64 px units: a number scales the snapped font
 // size and truncates, a length or normal rounds
 fn used_line_height(style: &Style, font_size: f32) -> f32 {
+    let scale = crate::font::device_scale();
     let units = match style.line_height {
         Length::Terms(terms)
             if terms
@@ -8716,16 +8725,17 @@ fn used_line_height(style: &Style, font_size: f32) -> f32 {
                     ..LengthTerms::default()
                 }) =>
         {
-            let font_size = (font_size * 64.0).round() / 64.0;
+            let font_size = (font_size * scale * 64.0).round() / 64.0;
             (font_size * (terms.em * 100.0) / 100.0 * 64.0).trunc()
         }
         length => (length
             .resolve(font_size, font_size)
             .unwrap_or_else(|| normal_line_height(style.font_family, font_size))
+            * scale
             * 64.0)
             .round(),
     };
-    (units / 64.0).max(1.0)
+    (units / 64.0 / scale).max(1.0)
 }
 
 // line-height normal takes the primary face's ascent, descent and line gap
@@ -8736,7 +8746,9 @@ pub(crate) fn normal_line_height(stack: FontStack, font_size: f32) -> f32 {
 // the space above a glyph box that centres it in its line: half the leading floored to a
 // whole pixel, the rest going below, as blink's CalculateLeadingSpace splits it
 fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
-    ((line_height - crate::font::active_fonts().content_height(stack, font_size)) / 2.0).floor()
+    let scale = crate::font::device_scale();
+    let content_height = crate::font::active_fonts().content_height(stack, font_size);
+    ((line_height - content_height) * scale / 2.0).floor() / scale
 }
 
 // the weight, slant, axis settings, optical size and features a style asks its font for

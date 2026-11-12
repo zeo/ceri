@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -273,10 +273,10 @@ impl FontFace {
         self.x_height / self.units_per_em * size
     }
 
-    // normal line height, each part rounded to whole pixels as blink's line spacing is
+    // normal line height, each part rounded to whole device pixels as blink's line spacing is
     pub fn line_height(&self, size: f32) -> f32 {
         [self.ascent, self.descent, self.line_gap]
-            .map(|metric| (metric / self.units_per_em * size).round())
+            .map(|metric| round_to_device(metric / self.units_per_em * size))
             .iter()
             .sum()
     }
@@ -1599,10 +1599,10 @@ impl FontSet {
         }
     }
 
-    // the primary face's ascent in whole pixels, as blink rounds it for html text
+    // the primary face's ascent in whole device pixels, as blink rounds it for html text
     pub fn ascent(&self, stack: FontStack, size: f32) -> f32 {
         match self.primary(stack, FontStyle::NORMAL) {
-            Some(face) => face.ascent(size).round(),
+            Some(face) => round_to_device(face.ascent(size)),
             None => size,
         }
     }
@@ -1617,7 +1617,7 @@ impl FontSet {
     // the height of a glyph box, ascent plus descent, which half-leading centres in a line
     pub fn content_height(&self, stack: FontStack, size: f32) -> f32 {
         match self.primary(stack, FontStyle::NORMAL) {
-            Some(face) => face.ascent(size).round() + face.descent(size).round(),
+            Some(face) => round_to_device(face.ascent(size)) + round_to_device(face.descent(size)),
             None => size,
         }
     }
@@ -1951,22 +1951,40 @@ pub fn builtin_advance(size: f32) -> f32 {
 
 thread_local! {
     static ACTIVE_FONTS: RefCell<Option<Rc<FontSet>>> = const { RefCell::new(None) };
+    static DEVICE_SCALE: Cell<f32> = const { Cell::new(1.0) };
 }
 
 pub(crate) struct ActiveFonts {
     previous: Option<Rc<FontSet>>,
+    previous_scale: f32,
 }
 
 impl Drop for ActiveFonts {
     fn drop(&mut self) {
         ACTIVE_FONTS.with(|active| *active.borrow_mut() = self.previous.take());
+        DEVICE_SCALE.set(self.previous_scale);
     }
 }
 
-// layout and paint read the font set of the pass they run in, per engine thread
-pub(crate) fn use_fonts(fonts: Rc<FontSet>) -> ActiveFonts {
+// layout and paint read the font set and device scale of the pass they run in, per engine
+// thread
+pub(crate) fn use_fonts(fonts: Rc<FontSet>, scale: f32) -> ActiveFonts {
     let previous = ACTIVE_FONTS.with(|active| active.borrow_mut().replace(fonts));
-    ActiveFonts { previous }
+    ActiveFonts {
+        previous,
+        previous_scale: DEVICE_SCALE.replace(scale),
+    }
+}
+
+// blink lays out in device pixels, so what it rounds to whole pixels or layout units rounds
+// at the scale of the pass
+pub(crate) fn device_scale() -> f32 {
+    DEVICE_SCALE.get()
+}
+
+pub(crate) fn round_to_device(length: f32) -> f32 {
+    let scale = device_scale();
+    (length * scale).round() / scale
 }
 
 pub(crate) fn active_fonts() -> Rc<FontSet> {

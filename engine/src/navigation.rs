@@ -1039,6 +1039,7 @@ struct LayoutKey {
     document: (Option<u64>, *const RefCell<Document>, u64),
     stylesheet: *const crate::css::Stylesheet,
     viewport: Size,
+    scale: f32,
     state: StyleState,
     selections: Vec<crate::layout::ProseSpan>,
 }
@@ -1984,7 +1985,7 @@ impl Browser {
 
     // returns the scrollbar thumb drag state under a pointer press
     pub fn thumb_at(&self, viewport: Size, x: f32, y: f32) -> Option<ThumbDrag> {
-        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let _fonts = crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
         self.layout(viewport).ok()?.thumb_drag_at(x, y)
     }
 
@@ -1994,7 +1995,7 @@ impl Browser {
         let Some(page) = self.page.as_ref() else {
             return false;
         };
-        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let _fonts = crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
         let Some(node) = self
             .layout(viewport)
             .ok()
@@ -2023,7 +2024,7 @@ impl Browser {
     // default an image or a link is
     pub fn drag_source_at(&self, viewport: Size, x: f32, y: f32) -> Option<NodeId> {
         let page = self.page.as_ref()?;
-        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let _fonts = crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
         let node = self.layout(viewport).ok()?.hit_test(x, y)?;
         let document = page.document.borrow();
         std::iter::once(node)
@@ -2139,7 +2140,8 @@ impl Browser {
         y: f32,
     ) -> Result<Option<RangeDrag>, NavigationError> {
         let drag = {
-            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            let _fonts =
+                crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
             self.layout(viewport)?.range_drag_at(x, y)
         };
         let Some(mut drag) = drag else {
@@ -2180,7 +2182,8 @@ impl Browser {
         extend: bool,
     ) -> Result<bool, NavigationError> {
         let layout = {
-            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            let _fonts =
+                crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
             self.layout(viewport)?
         };
         if !extend {
@@ -2241,7 +2244,8 @@ impl Browser {
         clicks: u32,
     ) -> Result<bool, NavigationError> {
         let layout = {
-            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            let _fonts =
+                crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
             self.layout(viewport)?
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
@@ -2295,7 +2299,8 @@ impl Browser {
             return Ok(String::new());
         };
         let layout = {
-            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            let _fonts =
+                crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
             self.layout(viewport)?
         };
         let document = page.document.borrow();
@@ -2346,7 +2351,8 @@ impl Browser {
             return Ok(Some(true));
         }
         let layout = {
-            let _fonts = crate::font::use_fonts(self.fonts.clone());
+            let _fonts =
+                crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
             self.layout(viewport)?
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
@@ -2671,7 +2677,7 @@ impl Browser {
             .iter()
             .map(|(node, run)| (*node, run.started))
             .collect();
-        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let _fonts = crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
         if let Some(base) = self.current_url.as_ref() {
             for node in document
                 .find_elements_by_selector("img")
@@ -2716,6 +2722,7 @@ impl Browser {
             ),
             stylesheet: Rc::as_ptr(stylesheet),
             viewport,
+            scale: self.viewport.device_pixel_ratio,
             state: keyed_state,
             selections: page.runtime.prose_selections(),
         };
@@ -2731,6 +2738,7 @@ impl Browser {
             let clock_only = last.document == key.document
                 && last.stylesheet == key.stylesheet
                 && last.viewport == key.viewport
+                && last.scale == key.scale
                 && last.selections == key.selections
                 && last.state
                     == StyleState {
@@ -2823,7 +2831,7 @@ impl Browser {
                 layers
             })
             .unwrap_or_default();
-        let _fonts = crate::font::use_fonts(self.fonts.clone());
+        let _fonts = crate::font::use_fonts(self.fonts.clone(), device_pixel_ratio);
         let mut painted = self.painted.borrow_mut();
         let damage = match painted.as_ref() {
             Some(last)

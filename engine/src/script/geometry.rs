@@ -315,7 +315,7 @@ impl ScriptRuntime {
     }
 
     fn run_layout(&self, inputs: &LayoutInputs, state: &StyleState) -> LayoutDocument {
-        let _fonts = crate::font::use_fonts(inputs.fonts.clone());
+        let _fonts = crate::font::use_fonts(inputs.fonts.clone(), self.viewport.device_pixel_ratio);
         layout_with_state(
             &self.document.borrow(),
             &inputs.stylesheet,

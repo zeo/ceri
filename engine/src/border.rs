@@ -65,13 +65,14 @@ impl BorderSide {
         color: None,
     };
 
-    // a side with no style takes no space
+    // a side with no style takes no space, and a width snaps to whole device pixels, never
+    // under one, as css values 4 snaps a border width
     pub(crate) fn used_width(self) -> f32 {
-        if matches!(self.style, BorderStyle::None | BorderStyle::Hidden) {
-            0.0
-        } else {
-            self.width
+        if matches!(self.style, BorderStyle::None | BorderStyle::Hidden) || self.width <= 0.0 {
+            return 0.0;
         }
+        let scale = crate::font::device_scale();
+        (self.width * scale).floor().max(1.0) / scale
     }
 }
 
@@ -308,5 +309,21 @@ mod tests {
         assert_eq!(radii[1], (Length::px(20.0), Length::px(5.0)));
         assert_eq!(radii[2], (Length::px(10.0), Length::px(5.0)));
         assert_eq!(expand(&[1, 2, 3]), Some([1, 2, 3, 2]));
+    }
+
+    #[test]
+    fn widths_snap_to_whole_device_pixels_and_never_under_one() {
+        let side = |width| BorderSide {
+            width,
+            style: BorderStyle::Solid,
+            color: None,
+        };
+        assert_eq!(side(0.5).used_width(), 1.0);
+        assert_eq!(side(2.7).used_width(), 2.0);
+        assert_eq!(side(0.0).used_width(), 0.0);
+        let _fonts = crate::font::use_fonts(std::rc::Rc::new(crate::font::FontSet::default()), 1.5);
+        assert_eq!(side(1.0).used_width(), 1.0 / 1.5);
+        assert_eq!(side(2.0).used_width(), 3.0 / 1.5);
+        assert_eq!(side(0.4).used_width(), 1.0 / 1.5);
     }
 }
