@@ -7,6 +7,7 @@ use crate::files::FileScope;
 use crate::fonts::SystemFonts;
 use crate::instance;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
+use crate::notification::Notifier;
 use crate::tray::{Tray, TrayConfig, TrayEvent};
 use crate::video::DesktopVideo;
 use ceri_engine::{
@@ -34,6 +35,7 @@ pub struct AppHandle {
     control: Arc<OnceLock<WindowControl>>,
     files: FileScope,
     tray: Arc<OnceLock<Tray>>,
+    notifier: Arc<OnceLock<Notifier>>,
 }
 
 impl AppHandle {
@@ -65,6 +67,14 @@ impl AppHandle {
         self.send(Some(window), event, payload);
     }
 
+    // a desktop notification under the app's name and icon, once the app runs
+    pub fn notify(&self, title: &str, body: &str) -> Result<(), String> {
+        match self.notifier.get() {
+            Some(notifier) => notifier.show(title, body),
+            None => Err("notifications start with the app".to_string()),
+        }
+    }
+
     // closes every window without asking and ends the loop, once it runs
     pub fn exit(&self) {
         if let Some(control) = self.windows() {
@@ -90,6 +100,7 @@ pub struct App {
     capabilities: Capabilities,
     windows: Vec<WindowConfig>,
     identifier: Option<String>,
+    name: Option<String>,
     version: Option<String>,
     lifecycle: Lifecycle,
     handle: AppHandle,
@@ -125,6 +136,12 @@ impl App {
     // names the app's own profile folder, as a reverse domain such as com.example.notes
     pub fn identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
+        self
+    }
+
+    // the name people see the app by, on notifications; the first window's title otherwise
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -308,14 +325,22 @@ impl App {
                 "dialog:*".to_string(),
                 "opener:open-url".to_string(),
                 "opener:reveal".to_string(),
+                "notification:*".to_string(),
             ],
         });
+        let name = self
+            .name
+            .or_else(|| self.windows.first().map(|window| window.title.clone()))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| identifier.clone());
         run_app(
             Bridge {
                 commands: Arc::new(self.commands),
                 capabilities,
+                name,
                 version: self.version,
                 files: self.handle.files.clone(),
+                notifier: self.handle.notifier.clone(),
                 embedded: self.assets,
                 icon: self.icon,
                 content_security_policy: self.content_security_policy,
@@ -368,8 +393,10 @@ where
 struct Bridge {
     commands: Arc<Commands>,
     capabilities: Capabilities,
+    name: String,
     version: Option<String>,
     files: FileScope,
+    notifier: Arc<OnceLock<Notifier>>,
     // the pages compiled into the app, served unless a folder is named at launch
     embedded: Option<EmbeddedAssets>,
     icon: Option<Vec<u8>>,
@@ -384,6 +411,7 @@ impl Bridge {
                 commands: self.commands.clone(),
                 control: control.cloned(),
                 version: self.version.clone(),
+                notifier: self.notifier.clone(),
             }),
             self.capabilities.clone(),
             window,
@@ -418,6 +446,12 @@ fn run_app(
         .icon
         .clone()
         .or_else(|| app_icon_source(launch.assets.as_ref()));
+    let _ = bridge.notifier.set(Notifier::new(
+        identifier,
+        &bridge.name,
+        icon_source.clone(),
+        &profile,
+    ));
     let icon = icon_source
         .as_deref()
         .and_then(|source| ceri_engine::rasterize_icon(source, 64));

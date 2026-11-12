@@ -138,6 +138,22 @@ export interface Opener {
 
 export const opener: Opener;
 
+export interface NotificationOptions {
+  readonly title: string;
+  readonly body?: string;
+}
+
+export type NotificationPermission = "granted" | "denied" | "default";
+
+export interface Notifications {
+  send(options: string | NotificationOptions): Promise<void>;
+  permission(): Promise<NotificationPermission>;
+  isPermissionGranted(): Promise<boolean>;
+  requestPermission(): Promise<NotificationPermission>;
+}
+
+export const notification: Notifications;
+
 export function appVersion(): Promise<string>;
 
 export function fileSrc(path: string): string;

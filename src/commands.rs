@@ -2,6 +2,7 @@
 // JSON text
 
 use crate::dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
+use crate::notification::Notifier;
 use ceri_engine::{
     CommandCall, CommandError, CommandReply, CommandRouter, NativeHandle, WindowAction,
     WindowControl,
@@ -10,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 type Handler = dyn Fn(&CommandCall) -> Result<String, CommandError> + Send + Sync;
@@ -55,6 +56,7 @@ pub struct CommandRoutes {
     pub commands: Arc<Commands>,
     pub control: Option<WindowControl>,
     pub version: Option<String>,
+    pub notifier: Arc<OnceLock<Notifier>>,
 }
 
 impl CommandRoutes {
@@ -227,6 +229,29 @@ fn opener(call: &CommandCall) -> Result<String, CommandError> {
     Ok("null".to_string())
 }
 
+#[derive(Deserialize)]
+struct Notice {
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+// pages have no permission prompt to answer, so asking always grants, as tauri's does on desktop
+fn notification(call: &CommandCall, notifier: Option<&Notifier>) -> Result<String, CommandError> {
+    match call.command.as_str() {
+        "notification:show" => {
+            let notice = arguments::<Notice>(call)?;
+            notifier
+                .ok_or_else(|| CommandError::failed("notifications start with the app"))?
+                .show(&notice.title, &notice.body)
+                .map_err(CommandError::failed)?;
+            Ok("null".to_string())
+        }
+        "notification:permission" => json(&"granted"),
+        command => Err(CommandError::unknown(command)),
+    }
+}
+
 fn arguments<T: DeserializeOwned>(call: &CommandCall) -> Result<T, CommandError> {
     serde_json::from_str(&call.payload)
         .map_err(|error| CommandError::new("invalid-payload", error.to_string()))
@@ -298,8 +323,12 @@ impl CommandRouter for CommandRoutes {
             reply.send(answer);
             return;
         }
-        if call.command.starts_with("dialog:") || call.command.starts_with("opener:") {
+        if call.command.starts_with("dialog:")
+            || call.command.starts_with("opener:")
+            || call.command.starts_with("notification:")
+        {
             let command = call.command.clone();
+            let notifier = self.notifier.clone();
             let owner = self
                 .control
                 .as_ref()
@@ -308,9 +337,10 @@ impl CommandRouter for CommandRoutes {
             let spawned = thread::Builder::new()
                 .name(format!("ceri {}", call.command))
                 .spawn(move || {
-                    reply.send(match call.command.starts_with("opener:") {
-                        true => opener(&call),
-                        false => dialog(&call, owner),
+                    reply.send(match call.command.split(':').next() {
+                        Some("opener") => opener(&call),
+                        Some("notification") => notification(&call, notifier.get()),
+                        _ => dialog(&call, owner),
                     })
                 });
             if let Err(error) = spawned {
@@ -365,6 +395,7 @@ mod tests {
             commands: Arc::new(commands),
             control: None,
             version: Some("1.2.3".to_string()),
+            notifier: Arc::default(),
         };
         let (sender, receiver) = channel();
         let ask = |command: &str, id| {
@@ -413,6 +444,10 @@ mod tests {
         assert_eq!(
             ask("opener:nothing", 9),
             (9, Err(CommandError::unknown("opener:nothing")))
+        );
+        assert_eq!(
+            ask("notification:permission", 10),
+            (10, Ok("\"granted\"".to_string()))
         );
     }
 

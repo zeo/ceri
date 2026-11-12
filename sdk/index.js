@@ -164,6 +164,15 @@ export const opener = Object.freeze({
   revealItemInDir: (path) => invoke("opener:reveal", { path }),
 });
 
+// a desktop notification under the app's name; a string is the title alone
+export const notification = Object.freeze({
+  send: (options) =>
+    invoke("notification:show", typeof options === "string" ? { title: options } : options),
+  permission: () => invoke("notification:permission"),
+  isPermissionGranted: () => invoke("notification:permission").then((state) => state === "granted"),
+  requestPermission: () => invoke("notification:permission"),
+});
+
 export function appVersion() {
   return invoke("app:version");
 }

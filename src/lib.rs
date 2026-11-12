@@ -15,6 +15,7 @@ mod files;
 mod fonts;
 mod http;
 mod instance;
+mod notification;
 pub mod opener;
 mod tray;
 mod video;

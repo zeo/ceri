@@ -230,6 +230,12 @@ pub(crate) fn image_source_url(source: ImageSource) -> Option<Rc<str>> {
     IMAGE_SOURCES.with(|table| table.borrow().urls.get(source.0 as usize).cloned())
 }
 
+// the icon as a png file's bytes, for system surfaces that load icons from disk
+pub fn icon_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
+    let (rgba, size) = rasterize_icon(bytes, size)?;
+    Some(crate::png::encode_png(size, size, 4, &rgba))
+}
+
 // a square RGBA buffer for window and taskbar icons, scaled from an app owned image;
 // each icon pixel averages the source pixels it covers, so large images shrink cleanly
 pub fn rasterize_icon(bytes: &[u8], size: u32) -> Option<(Vec<u8>, u32)> {
