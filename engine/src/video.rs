@@ -40,10 +40,17 @@ pub struct VideoFrame {
 
 // a frame left in gpu memory, which a presenter shows without its pixels crossing the cpu
 pub trait VideoSurface: Send + Sync {
-    // an nt handle to the frame as a B8G8R8A8 texture behind a keyed mutex that key 0 takes
+    // an nt handle to the frame as a texture behind a keyed mutex that key 0 takes, in
+    // B8G8R8A8, or in R10G10B10A2 holding bt.2100 pq when hdr10 says so
     fn shared_handle(&self) -> isize;
     // the frame's rows as in VideoFrame::bgra, for when something paints it
     fn read(&self) -> Result<Vec<u8>, String>;
+    fn hdr10(&self) -> bool {
+        false
+    }
+    // the presenter says whether the display the video shows on is in hdr, so a decoder with
+    // an hdr source can hand its next frames over in hdr10
+    fn show_hdr(&self, _display: bool) {}
 }
 
 impl std::fmt::Debug for dyn VideoSurface {
@@ -310,7 +317,11 @@ fn to_picture(frame: VideoFrame, planed: bool) -> Option<Picture> {
             height,
             pixels: Vec::new(),
         },
-        Some(surface) if bgra.is_empty() => to_image(width, height, &surface.read().ok()?)?,
+        Some(surface) if bgra.is_empty() => {
+            // paint takes sdr, so later frames need no mapping on their way back
+            surface.show_hdr(false);
+            to_image(width, height, &surface.read().ok()?)?
+        }
         _ => to_image(width, height, &bgra)?,
     };
     Some(Picture {

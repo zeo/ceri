@@ -40,32 +40,40 @@ mod platform {
     use ceri_engine::VideoSurface;
     use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, RECT};
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+    };
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-        D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-        D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-        D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice,
-        ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext1,
-        ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+        D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+        D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+        D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
+        D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VIEWPORT, D3D11_VPIV_DIMENSION_TEXTURE2D,
+        D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Buffer, ID3D11Device,
+        ID3D11DeviceContext, ID3D11Multithread, ID3D11PixelShader, ID3D11Texture2D,
+        ID3D11VertexShader, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+        ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
         ID3D11VideoProcessorOutputView,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
-        DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
-        DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
-        DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+        DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020,
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
         DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
-        DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_SAMPLE_DESC,
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{
         DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIKeyedMutex, IDXGIResource1,
@@ -74,10 +82,10 @@ mod platform {
         IMF2DBuffer, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
         IMFMediaType, IMFSample, IMFSourceReader, MF_BYTESTREAM_CONTENT_TYPE,
         MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
-        MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
-        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
-        MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
-        MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
+        MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MAX_LUMINANCE_LEVEL,
+        MF_MT_MAX_MASTERING_LUMINANCE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO,
+        MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX,
+        MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
         MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
         MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
         MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
@@ -95,7 +103,7 @@ mod platform {
     use windows::Win32::System::Threading::INFINITE;
     use windows::Win32::System::Variant::{VT_I8, VT_UI8};
     use windows::Win32::UI::Shell::SHCreateMemStream;
-    use windows::core::{GUID, Interface, PCWSTR};
+    use windows::core::{GUID, Interface, PCSTR, PCWSTR, s};
 
     pub(super) const TYPES: &[&str] = &[
         "video/mp4",
@@ -141,6 +149,8 @@ mod platform {
         video: ID3D11VideoDevice,
         playback: ID3D11VideoContext1,
         manager: IMFDXGIDeviceManager,
+        multithread: ID3D11Multithread,
+        shaders: OnceLock<Result<(ID3D11VertexShader, ID3D11PixelShader), String>>,
     }
 
     // SAFETY: d3d11 devices are free threaded, the immediate context is multithread protected
@@ -172,10 +182,8 @@ mod platform {
                 )
                 .ok()?;
                 let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device?, context?);
-                let _ = context
-                    .cast::<ID3D11Multithread>()
-                    .ok()?
-                    .SetMultithreadProtected(true);
+                let multithread = context.cast::<ID3D11Multithread>().ok()?;
+                let _ = multithread.SetMultithreadProtected(true);
                 let mut token = 0;
                 let mut manager = None;
                 MFCreateDXGIDeviceManager(&mut token, &mut manager).ok()?;
@@ -187,6 +195,8 @@ mod platform {
                     device,
                     context,
                     manager,
+                    multithread,
+                    shaders: OnceLock::new(),
                 })
             }
         }
@@ -194,6 +204,7 @@ mod platform {
         unsafe fn texture(
             &self,
             (width, height): (u32, u32),
+            format: DXGI_FORMAT,
             usage: D3D11_USAGE,
             bind: u32,
             access: u32,
@@ -204,7 +215,7 @@ mod platform {
                 Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -222,16 +233,350 @@ mod platform {
             }
             texture.ok_or_else(|| "Direct3D returned no texture".to_string())
         }
+
+        // a processor drawing the shown part of coded sized frames in the input colour space
+        // over a whole picture in sdr
+        unsafe fn processor(
+            &self,
+            coded: (u32, u32),
+            shown: Area,
+            input: DXGI_COLOR_SPACE_TYPE,
+        ) -> Result<(ID3D11VideoProcessorEnumerator, ID3D11VideoProcessor), String> {
+            unsafe {
+                let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                    InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                    InputWidth: coded.0,
+                    InputHeight: coded.1,
+                    OutputWidth: shown.width,
+                    OutputHeight: shown.height,
+                    Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+                    ..Default::default()
+                };
+                let enumerator = self
+                    .video
+                    .CreateVideoProcessorEnumerator(&content)
+                    .map_err(text)?;
+                let processor = self
+                    .video
+                    .CreateVideoProcessor(&enumerator, 0)
+                    .map_err(text)?;
+                let source = RECT {
+                    left: shown.left as i32,
+                    top: shown.top as i32,
+                    right: (shown.left + shown.width) as i32,
+                    bottom: (shown.top + shown.height) as i32,
+                };
+                let whole = RECT {
+                    left: 0,
+                    top: 0,
+                    right: shown.width as i32,
+                    bottom: shown.height as i32,
+                };
+                let playback = &self.playback;
+                playback.VideoProcessorSetStreamFrameFormat(
+                    &processor,
+                    0,
+                    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                );
+                playback.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source));
+                playback.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&whole));
+                playback.VideoProcessorSetOutputTargetRect(&processor, true, Some(&whole));
+                // drivers would otherwise sharpen or denoise, which the software path never does
+                playback.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+                playback.VideoProcessorSetStreamColorSpace1(&processor, 0, input);
+                playback.VideoProcessorSetOutputColorSpace1(&processor, SDR);
+                Ok((enumerator, processor))
+            }
+        }
+
+        unsafe fn output_view(
+            &self,
+            texture: &ID3D11Texture2D,
+            enumerator: &ID3D11VideoProcessorEnumerator,
+        ) -> Result<ID3D11VideoProcessorOutputView, String> {
+            let described = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut view = None;
+            unsafe {
+                self.video
+                    .CreateVideoProcessorOutputView(
+                        texture,
+                        enumerator,
+                        &described,
+                        Some(&mut view),
+                    )
+                    .map_err(text)?;
+            }
+            view.ok_or_else(|| "Direct3D returned no output view".to_string())
+        }
+
+        // a slice of the input texture drawn over the output view's picture
+        unsafe fn blt(
+            &self,
+            (enumerator, processor): (&ID3D11VideoProcessorEnumerator, &ID3D11VideoProcessor),
+            input: &ID3D11Texture2D,
+            slice: u32,
+            output: &ID3D11VideoProcessorOutputView,
+        ) -> Result<(), String> {
+            let described = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: slice,
+                    },
+                },
+            };
+            let mut view = None;
+            unsafe {
+                self.video
+                    .CreateVideoProcessorInputView(input, enumerator, &described, Some(&mut view))
+                    .map_err(text)?;
+                let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                    Enable: true.into(),
+                    pInputSurface: ManuallyDrop::new(view),
+                    ..Default::default()
+                };
+                let blitted = self.playback.VideoProcessorBlt(
+                    processor,
+                    output,
+                    0,
+                    std::slice::from_ref(&stream),
+                );
+                drop(ManuallyDrop::into_inner(stream.pInputSurface));
+                blitted.map_err(text)
+            }
+        }
+
+        unsafe fn constants(&self, values: &[[f32; 4]]) -> Result<ID3D11Buffer, String> {
+            let described = D3D11_BUFFER_DESC {
+                ByteWidth: size_of_val(values) as u32,
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: values.as_ptr().cast(),
+                ..Default::default()
+            };
+            let mut buffer = None;
+            unsafe {
+                self.device
+                    .CreateBuffer(&described, Some(&data), Some(&mut buffer))
+                    .map_err(text)?;
+            }
+            buffer.ok_or_else(|| "Direct3D returned no buffer".to_string())
+        }
+
+        // an hdr10 texture drawn into an sdr one through the curve, as chromium tone maps
+        unsafe fn tone(
+            &self,
+            curve: &ID3D11Buffer,
+            source: &ID3D11Texture2D,
+            target: &ID3D11Texture2D,
+            (width, height): (u32, u32),
+        ) -> Result<(), String> {
+            let (vertices, pixels) = self
+                .shaders
+                .get_or_init(|| unsafe { shaders(&self.device) })
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let (mut read, mut drawn) = (None, None);
+            unsafe {
+                self.device
+                    .CreateShaderResourceView(source, None, Some(&mut read))
+                    .map_err(text)?;
+                self.device
+                    .CreateRenderTargetView(target, None, Some(&mut drawn))
+                    .map_err(text)?;
+                let context = &self.context;
+                // decoders on other threads share the context, so the draw's state is held whole
+                self.multithread.Enter();
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.IASetInputLayout(None);
+                context.VSSetShader(vertices, None);
+                context.PSSetShader(pixels, None);
+                context.PSSetConstantBuffers(0, Some(&[Some(curve.clone())]));
+                context.PSSetShaderResources(0, Some(&[read]));
+                context.OMSetRenderTargets(Some(&[drawn]), None);
+                context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    Width: width as f32,
+                    Height: height as f32,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]));
+                context.Draw(3, 0);
+                context.PSSetShaderResources(0, Some(&[None]));
+                context.OMSetRenderTargets(None, None);
+                self.multithread.Leave();
+            }
+            Ok(())
+        }
     }
 
-    // turns the decoder's nv12 or p010 surfaces into bgra pictures on the gpu
+    // pq in bt.2020 to linear light with 203 nits as 1, the curve's gain on the brightest
+    // channel, then bt.709 primaries and the srgb curve
+    const TONE_MAP: &str = r"
+cbuffer Curve : register(b0) {
+    float4 points[8];
+    float4 count;
+};
+Texture2D<float4> source : register(t0);
+
+float4 vertices(uint id : SV_VertexID) : SV_Position {
+    float2 at = float2((id << 1) & 2, id & 2);
+    return float4(at * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+float gain(float x) {
+    int last = (int)count.x - 1;
+    if (x <= points[0].x) return points[0].y;
+    if (x >= points[last].x) return points[last].y + log2(points[last].x / x);
+    int i = 0;
+    [unroll] for (int j = 1; j < 7; j++) if (j < last && x >= points[j].x) i = j;
+    float4 a = points[i];
+    float4 b = points[i + 1];
+    float h = b.x - a.x;
+    float ma = a.z * h;
+    float mb = b.z * h;
+    float t = (x - a.x) / h;
+    float c3 = 2 * a.y + ma - 2 * b.y + mb;
+    float c2 = -3 * a.y + 3 * b.y - 2 * ma - mb;
+    return ((c3 * t + c2) * t + ma) * t + a.y;
+}
+
+float4 pixels(float4 at : SV_Position) : SV_Target {
+    float3 e = pow(saturate(source.Load(int3(at.xy, 0)).rgb), 1 / 78.84375);
+    float3 c = pow(max(e - 0.8359375, 0) / (18.8515625 - 18.6875 * e), 1 / 0.1593017578125);
+    c *= 10000.0 / 203.0;
+    if (count.x > 0) c *= exp2(gain(max(max(c.r, c.g), c.b)));
+    c = saturate(mul(float3x3(
+        1.660491, -0.587641, -0.072850,
+        -0.124550, 1.132900, -0.008349,
+        -0.018151, -0.100579, 1.118730), c));
+    c = c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055;
+    return float4(c, 1);
+}
+";
+
+    unsafe fn shaders(
+        device: &ID3D11Device,
+    ) -> Result<(ID3D11VertexShader, ID3D11PixelShader), String> {
+        let compiled = |entry: PCSTR, target: PCSTR| {
+            let (mut code, mut errors) = (None, None);
+            let compiled = unsafe {
+                D3DCompile(
+                    TONE_MAP.as_ptr().cast(),
+                    TONE_MAP.len(),
+                    PCSTR::null(),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            let bytes = |blob: &ID3DBlob| unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+                .to_vec()
+            };
+            match (compiled, code) {
+                (Ok(()), Some(code)) => Ok(bytes(&code)),
+                (compiled, _) => Err(errors.as_ref().map_or_else(
+                    || compiled.err().map(text).unwrap_or_default(),
+                    |errors| String::from_utf8_lossy(&bytes(errors)).into_owned(),
+                )),
+            }
+        };
+        let (mut vertices, mut pixels) = (None, None);
+        unsafe {
+            device
+                .CreateVertexShader(
+                    &compiled(s!("vertices"), s!("vs_4_0"))?,
+                    None,
+                    Some(&mut vertices),
+                )
+                .map_err(text)?;
+            device
+                .CreatePixelShader(
+                    &compiled(s!("pixels"), s!("ps_4_0"))?,
+                    None,
+                    Some(&mut pixels),
+                )
+                .map_err(text)?;
+        }
+        vertices
+            .zip(pixels)
+            .ok_or_else(|| "Direct3D returned no shader".to_string())
+    }
+
+    // skia's tone map for pq and hlg that carry no agtm metadata, the reference white tone
+    // mapping operator of smpte st 2094-50, as chromium applies it for an sdr target: hermite
+    // control points of a log2 gain over maxrgb, with 203 nits as 1 and the peak from the
+    // stream's metadata or 1000 nits; none when the peak is no brighter than white
+    fn sdr_curve(peak: f32) -> [[f32; 4]; 9] {
+        let mut curve = [[0.0; 4]; 9];
+        let headroom = (peak / 203.0).log2().min(6.0);
+        if headroom.is_nan() || headroom <= 0.0 {
+            return curve;
+        }
+        let white = 1.0 - 0.5 * (headroom / (1000.0f32 / 203.0).log2()).min(1.0);
+        let kappa = 0.65;
+        let (knee, top) = ((1.0, white), (headroom.exp2(), 1.0f32));
+        let middle = (
+            (1.0 - kappa) * knee.0 + kappa * knee.0 * top.1 / knee.1,
+            (1.0 - kappa) * knee.1 + kappa * top.1,
+        );
+        let a = (
+            knee.0 - 2.0 * middle.0 + top.0,
+            knee.1 - 2.0 * middle.1 + top.1,
+        );
+        let b = (2.0 * (middle.0 - knee.0), 2.0 * (middle.1 - knee.1));
+        for (index, point) in curve[..8].iter_mut().enumerate() {
+            let t = index as f32 / 7.0;
+            let x = knee.0 + t * (b.0 + t * a.0);
+            let y = knee.1 + t * (b.1 + t * a.1);
+            let slope = (2.0 * a.1 * t + b.1) / (2.0 * a.0 * t + b.0);
+            *point = [
+                x,
+                (y / x).log2(),
+                (x * slope - y) / (std::f32::consts::LN_2 * x * y),
+                0.0,
+            ];
+        }
+        curve[8][0] = 8.0;
+        curve
+    }
+
+    const SDR: DXGI_COLOR_SPACE_TYPE = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    const HDR10: DXGI_COLOR_SPACE_TYPE = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+
+    // turns the decoder's nv12 or p010 surfaces into bgra pictures on the gpu, or into hdr10
+    // ones for an hdr source while the presenter shows it on a display in hdr
     struct Converter {
         enumerator: ID3D11VideoProcessorEnumerator,
         processor: ID3D11VideoProcessor,
         // pictures the engine or presenter may still hold; one only the pool holds is free
         pictures: Vec<Arc<Picture>>,
-        staging: Arc<Mutex<Option<ID3D11Texture2D>>>,
+        readback: Arc<Mutex<Readback>>,
         size: (u32, u32),
+        // for an hdr source the processor gives hdr10, which this tone map takes to sdr
+        curve: Option<ID3D11Buffer>,
+        staged: Option<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
+        // what the presenter last asked for, and what the pool's pictures hold
+        wanted: Arc<AtomicBool>,
+        hdr10: bool,
     }
 
     // a converted frame in a texture the presenter opens by its handle; the keyed mutex orders
@@ -242,10 +587,19 @@ mod platform {
         view: ID3D11VideoProcessorOutputView,
         mutex: IDXGIKeyedMutex,
         handle: HANDLE,
-        // the converter's readback texture, which its pictures take turns with, made when a
-        // picture is first painted
-        staging: Arc<Mutex<Option<ID3D11Texture2D>>>,
+        hdr10: bool,
+        curve: Option<ID3D11Buffer>,
+        wanted: Arc<AtomicBool>,
+        readback: Arc<Mutex<Readback>>,
         size: (u32, u32),
+    }
+
+    // what a converter's pictures take turns with to be read back, made when one is first
+    // painted: a staging texture, and for hdr10 pictures a target the tone map draws sdr into
+    #[derive(Default)]
+    struct Readback {
+        staging: Option<ID3D11Texture2D>,
+        toned: Option<ID3D11Texture2D>,
     }
 
     // SAFETY: d3d11 resources are free threaded, and the one context they meet is multithread
@@ -266,28 +620,55 @@ mod platform {
         }
 
         fn read(&self) -> Result<Vec<u8>, String> {
-            let mut kept = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut kept = self.readback.lock().unwrap_or_else(PoisonError::into_inner);
+            let Readback { staging, toned } = &mut *kept;
             let context = &self.gpu.context;
-            // SAFETY: the staging texture has the picture's size and format, the keyed mutex is
-            // held while the copy is queued, and each row read lies inside the mapped pitch
+            // SAFETY: the staging texture and the tone target are the picture's size in bgra,
+            // the keyed mutex is held while the picture is read, and each row read lies inside
+            // the mapped pitch
             unsafe {
-                let staging = match kept.take() {
-                    Some(staging) => staging,
-                    None => self.gpu.texture(
+                let staging = match staging {
+                    Some(made) => made,
+                    None => staging.insert(self.gpu.texture(
                         self.size,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
                         D3D11_USAGE_STAGING,
                         0,
                         D3D11_CPU_ACCESS_READ.0 as u32,
                         0,
-                    )?,
+                    )?),
                 };
-                let staging = &*kept.insert(staging);
+                let toned = match (self.curve.as_ref().filter(|_| self.hdr10), toned) {
+                    (Some(curve), Some(made)) => Some((curve, &*made)),
+                    (Some(curve), toned) => Some((
+                        curve,
+                        &*toned.insert(self.gpu.texture(
+                            self.size,
+                            DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D3D11_USAGE_DEFAULT,
+                            D3D11_BIND_RENDER_TARGET.0 as u32,
+                            0,
+                            0,
+                        )?),
+                    )),
+                    (None, _) => None,
+                };
                 self.mutex.AcquireSync(0, INFINITE).map_err(text)?;
-                context.CopyResource(staging, &self.texture);
+                let copied = match toned {
+                    Some((curve, toned)) => self
+                        .gpu
+                        .tone(curve, &self.texture, toned, self.size)
+                        .map(|()| context.CopyResource(&*staging, toned)),
+                    None => {
+                        context.CopyResource(&*staging, &self.texture);
+                        Ok(())
+                    }
+                };
                 self.mutex.ReleaseSync(0).map_err(text)?;
+                copied?;
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 context
-                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .Map(&*staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                     .map_err(text)?;
                 let row = self.size.0 as usize * 4;
                 let mut bgra = Vec::with_capacity(row * self.size.1 as usize);
@@ -295,9 +676,17 @@ mod platform {
                     let start = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize);
                     bgra.extend_from_slice(std::slice::from_raw_parts(start, row));
                 }
-                context.Unmap(staging, 0);
+                context.Unmap(&*staging, 0);
                 Ok(bgra)
             }
+        }
+
+        fn hdr10(&self) -> bool {
+            self.hdr10
+        }
+
+        fn show_hdr(&self, display: bool) {
+            self.wanted.store(display, Ordering::Relaxed);
         }
     }
 
@@ -305,66 +694,61 @@ mod platform {
         unsafe fn new(
             gpu: &Gpu,
             kind: &IMFMediaType,
+            native: Option<&IMFMediaType>,
             picture: Area,
             coded: (u32, u32),
         ) -> Result<Self, String> {
-            let size = (picture.width, picture.height);
             unsafe {
-                let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
-                    InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-                    InputWidth: coded.0,
-                    InputHeight: coded.1,
-                    OutputWidth: size.0,
-                    OutputHeight: size.1,
-                    Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-                    ..Default::default()
+                let input = color_space(kind, native, picture.height);
+                let (enumerator, processor) = gpu.processor(coded, picture, input)?;
+                let decoded = match kind.GetGUID(&MF_MT_SUBTYPE) {
+                    Ok(subtype) if subtype == MFVideoFormat_P010 => DXGI_FORMAT_P010,
+                    _ => DXGI_FORMAT_NV12,
                 };
-                let enumerator = gpu
-                    .video
-                    .CreateVideoProcessorEnumerator(&content)
-                    .map_err(text)?;
-                let processor = gpu
-                    .video
-                    .CreateVideoProcessor(&enumerator, 0)
-                    .map_err(text)?;
-                let shown = RECT {
-                    left: picture.left as i32,
-                    top: picture.top as i32,
-                    right: (picture.left + picture.width) as i32,
-                    bottom: (picture.top + picture.height) as i32,
+                let hdr_source = [
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020,
+                ]
+                .contains(&input)
+                    && enumerator
+                        .cast::<ID3D11VideoProcessorEnumerator1>()
+                        .and_then(|enumerator| {
+                            enumerator.CheckVideoProcessorFormatConversion(
+                                decoded,
+                                input,
+                                DXGI_FORMAT_R10G10B10A2_UNORM,
+                                HDR10,
+                            )
+                        })
+                        .is_ok_and(|supported| supported.as_bool());
+                let curve = match hdr_source {
+                    true => {
+                        let peak = [&MF_MT_MAX_LUMINANCE_LEVEL, &MF_MT_MAX_MASTERING_LUMINANCE]
+                            .into_iter()
+                            .flat_map(|key| {
+                                [Some(kind), native]
+                                    .into_iter()
+                                    .flatten()
+                                    .map(move |kind| kind.GetUINT32(key))
+                            })
+                            .find_map(|value| value.ok().filter(|&nits| nits > 0))
+                            .map_or(1000.0, |nits| nits as f32);
+                        gpu.playback
+                            .VideoProcessorSetOutputColorSpace1(&processor, HDR10);
+                        Some(gpu.constants(&sdr_curve(peak))?)
+                    }
+                    false => None,
                 };
-                let whole = RECT {
-                    left: 0,
-                    top: 0,
-                    right: size.0 as i32,
-                    bottom: size.1 as i32,
-                };
-                let playback = &gpu.playback;
-                playback.VideoProcessorSetStreamFrameFormat(
-                    &processor,
-                    0,
-                    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-                );
-                playback.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&shown));
-                playback.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&whole));
-                playback.VideoProcessorSetOutputTargetRect(&processor, true, Some(&whole));
-                // drivers would otherwise sharpen or denoise, which the software path never does
-                playback.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
-                playback.VideoProcessorSetStreamColorSpace1(
-                    &processor,
-                    0,
-                    color_space(kind, picture.height),
-                );
-                playback.VideoProcessorSetOutputColorSpace1(
-                    &processor,
-                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-                );
                 Ok(Self {
                     enumerator,
                     processor,
                     pictures: Vec::new(),
-                    staging: Arc::default(),
-                    size,
+                    readback: Arc::default(),
+                    size: (picture.width, picture.height),
+                    curve,
+                    staged: None,
+                    wanted: Arc::default(),
+                    hdr10: false,
                 })
             }
         }
@@ -377,30 +761,22 @@ mod platform {
             {
                 return Ok(free.clone());
             }
+            let format = if self.hdr10 {
+                DXGI_FORMAT_R10G10B10A2_UNORM
+            } else {
+                DXGI_FORMAT_B8G8R8A8_UNORM
+            };
             unsafe {
                 let texture = gpu.texture(
                     self.size,
+                    format,
                     D3D11_USAGE_DEFAULT,
                     (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
                     0,
                     (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
                         | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
                 )?;
-                let described = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-                    ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-                    },
-                };
-                let mut view = None;
-                gpu.video
-                    .CreateVideoProcessorOutputView(
-                        &texture,
-                        &self.enumerator,
-                        &described,
-                        Some(&mut view),
-                    )
-                    .map_err(text)?;
+                let view = gpu.output_view(&texture, &self.enumerator)?;
                 let handle = texture
                     .cast::<IDXGIResource1>()
                     .and_then(|resource| {
@@ -415,9 +791,12 @@ mod platform {
                     gpu,
                     mutex: texture.cast().map_err(text)?,
                     texture,
-                    view: view.ok_or("Direct3D returned no output view")?,
+                    view,
                     handle,
-                    staging: self.staging.clone(),
+                    hdr10: self.hdr10,
+                    curve: self.curve.clone(),
+                    wanted: self.wanted.clone(),
+                    readback: self.readback.clone(),
                     size: self.size,
                 });
                 self.pictures.push(picture.clone());
@@ -433,6 +812,12 @@ mod platform {
             sample: &IMFSample,
         ) -> Result<Arc<Picture>, String> {
             unsafe {
+                let hdr10 = self.curve.is_some() && self.wanted.load(Ordering::Relaxed);
+                if hdr10 != self.hdr10 {
+                    // pictures still held keep their format, and the pool starts over
+                    self.pictures.clear();
+                    self.hdr10 = hdr10;
+                }
                 let picture = self.picture(gpu)?;
                 let surface: IMFDXGIBuffer = sample
                     .GetBufferByIndex(0)
@@ -443,51 +828,54 @@ mod platform {
                     .GetResource(&ID3D11Texture2D::IID, (&raw mut texture).cast())
                     .map_err(text)?;
                 let texture = texture.ok_or("the decoder gave no texture")?;
-                let described = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-                    FourCC: 0,
-                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_VPIV {
-                            MipSlice: 0,
-                            ArraySlice: surface.GetSubresourceIndex().map_err(text)?,
-                        },
-                    },
+                let slice = surface.GetSubresourceIndex().map_err(text)?;
+                let processing = (&self.enumerator, &self.processor);
+                let Some(curve) = self.curve.as_ref().filter(|_| !hdr10) else {
+                    picture.mutex.AcquireSync(0, INFINITE).map_err(text)?;
+                    let blitted = gpu.blt(processing, &texture, slice, &picture.view);
+                    let released = picture.mutex.ReleaseSync(0).map_err(text);
+                    blitted.and(released)?;
+                    return Ok(picture);
                 };
-                let mut input = None;
-                gpu.video
-                    .CreateVideoProcessorInputView(
-                        &texture,
-                        &self.enumerator,
-                        &described,
-                        Some(&mut input),
-                    )
-                    .map_err(text)?;
+                // an hdr source on its way to sdr stops in hdr10 for the tone map
+                let (staged, view) = match &mut self.staged {
+                    Some(staged) => &*staged,
+                    staged => {
+                        let texture = gpu.texture(
+                            self.size,
+                            DXGI_FORMAT_R10G10B10A2_UNORM,
+                            D3D11_USAGE_DEFAULT,
+                            (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                            0,
+                            0,
+                        )?;
+                        let view = gpu.output_view(&texture, &self.enumerator)?;
+                        &*staged.insert((texture, view))
+                    }
+                };
+                gpu.blt(processing, &texture, slice, view)?;
                 picture.mutex.AcquireSync(0, INFINITE).map_err(text)?;
-                let stream = D3D11_VIDEO_PROCESSOR_STREAM {
-                    Enable: true.into(),
-                    pInputSurface: ManuallyDrop::new(input),
-                    ..Default::default()
-                };
-                let blitted = gpu.playback.VideoProcessorBlt(
-                    &self.processor,
-                    &picture.view,
-                    0,
-                    std::slice::from_ref(&stream),
-                );
-                drop(ManuallyDrop::into_inner(stream.pInputSurface));
-                let released = picture.mutex.ReleaseSync(0);
-                blitted.and(released).map_err(text)?;
+                let toned = gpu.tone(curve, staged, &picture.texture, self.size);
+                let released = picture.mutex.ReleaseSync(0).map_err(text);
+                toned.and(released)?;
                 Ok(picture)
             }
         }
     }
 
-    // the decoder's matrix, range and transfer as a dxgi colour space; with no matrix named,
-    // hd pictures count as bt.709 and smaller ones as bt.601, as players commonly guess
-    unsafe fn color_space(kind: &IMFMediaType, height: u32) -> DXGI_COLOR_SPACE_TYPE {
+    // the decoder's matrix, range and transfer as a dxgi colour space, taken from the stream
+    // where the decoder's output type leaves them out; with no matrix named, hd pictures count
+    // as bt.709 and smaller ones as bt.601, as players commonly guess
+    unsafe fn color_space(
+        kind: &IMFMediaType,
+        native: Option<&IMFMediaType>,
+        height: u32,
+    ) -> DXGI_COLOR_SPACE_TYPE {
         let value = |key| {
-            unsafe { kind.GetUINT32(key) }
-                .ok()
+            [Some(kind), native]
+                .into_iter()
+                .flatten()
+                .find_map(|kind| unsafe { kind.GetUINT32(key) }.ok())
                 .map(|value| value as i32)
         };
         let full = value(&MF_MT_VIDEO_NOMINAL_RANGE) == Some(MFNominalRange_0_255.0);
@@ -799,8 +1187,14 @@ mod platform {
                     output.SetGUID(&MF_MT_SUBTYPE, subtype)?;
                     reader.SetCurrentMediaType(VIDEO, None, &output)
                 };
+                let hdr = [MFVideoTransFunc_2084.0, MFVideoTransFunc_HLG.0]
+                    .map(|transfer| Ok(transfer as u32))
+                    .contains(&native.GetUINT32(&MF_MT_TRANSFER_FUNCTION));
                 match gpu {
-                    // ten bit decoders give p010 only
+                    // ten bit decoders give p010 only, and others would cut pq to eight bits
+                    Some(_) if hdr => {
+                        deliver(&MFVideoFormat_P010).or_else(|_| deliver(&MFVideoFormat_NV12))
+                    }
                     Some(_) => {
                         deliver(&MFVideoFormat_NV12).or_else(|_| deliver(&MFVideoFormat_P010))
                     }
@@ -840,7 +1234,14 @@ mod platform {
                     .GetUINT32(&MF_MT_DEFAULT_STRIDE)
                     .map_or(self.coded.0 as i32 * 4, |stride| stride as i32);
                 if let Some(gpu) = self.gpu {
-                    self.converter = Some(Converter::new(gpu, &current, self.picture, self.coded)?);
+                    let native = self.reader.GetNativeMediaType(VIDEO, 0).ok();
+                    self.converter = Some(Converter::new(
+                        gpu,
+                        &current,
+                        native.as_ref(),
+                        self.picture,
+                        self.coded,
+                    )?);
                 }
             }
             Ok(())
@@ -1941,6 +2342,65 @@ mod tests {
                 .max()
                 .unwrap_or(u8::MAX);
             assert!(apart <= 2, "{time}: {apart}");
+        }
+    }
+
+    // ten 256x144 frames of hevc main10 in bt.2100 pq, eight upright bands 32 wide at 10-bit
+    // luma 118, 195, 333, 509, 572, 635, 722 and 854: 0.1, 1, 10, 100, 203, 400, 1000 and
+    // 4000 nits
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hdr_frames_tone_map_to_sdr_as_chromium_does() {
+        use super::platform::{Reader, gpu};
+        use ceri_engine::VideoReader;
+
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let pq = MediaSource::File(
+            [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "pq.mp4"]
+                .iter()
+                .collect(),
+        );
+        let Ok(mut reader) = Reader::open_on(&pq, Some(gpu)) else {
+            // windows decodes hevc only with its video extension installed
+            assert!(
+                Reader::open_on(&pq, None).is_err(),
+                "hevc decodes off the gpu only"
+            );
+            return;
+        };
+        let mut surface = || {
+            let frame = reader
+                .read()
+                .expect("frames should decode")
+                .expect("a frame");
+            frame.surface.expect("a gpu frame comes as a surface")
+        };
+        let sdr = surface();
+        assert!(!sdr.hdr10());
+        sdr.show_hdr(true);
+        let hdr = surface();
+        assert!(
+            hdr.hdr10(),
+            "a pq source on a gpu that maps it hands over hdr10"
+        );
+        let bands = |bgra: Vec<u8>| -> Vec<[u8; 3]> {
+            (0..8)
+                .map(|band| {
+                    let at = (72 * 256 + band * 32 + 16) * 4;
+                    [bgra[at + 2], bgra[at + 1], bgra[at]]
+                })
+                .collect()
+        };
+        // edge reads the same bands back through a canvas as these, give or take its rounding
+        let chromium = [1, 8, 45, 135, 185, 223, 254, 255];
+        for picture in [sdr, hdr] {
+            let read = bands(picture.read().expect("a picture reads back"));
+            let near = read.iter().zip(chromium).all(|(band, expected)| {
+                band.iter().all(|&channel| channel.abs_diff(expected) <= 4)
+            });
+            assert!(near, "hdr10 {}: {read:?}", picture.hdr10());
         }
     }
 

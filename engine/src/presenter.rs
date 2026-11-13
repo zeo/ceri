@@ -3,7 +3,8 @@
 // premultiplied BGRA back buffer and presented on the display's vsync; video frames go to
 // swapchains of their own in visuals under the canvas, which the GPU scales into the boxes
 // the canvas leaves transparent, and a frame the decoder left on the GPU is copied there
-// through a shared texture without reaching memory
+// through a shared texture without reaching memory; while the window is on a display in HDR,
+// frames of HDR video reach theirs as HDR10, as Chromium shows them
 
 use crate::image::Image;
 use crate::paint::{Plane, PlaneFrame, Revision};
@@ -22,14 +23,17 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT,
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_PRESENT, DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGISwapChain1,
+    CreateDXGIFactory1, DXGI_PRESENT, DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH,
+    DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory1,
+    IDXGIFactory2, IDXGIKeyedMutex, IDXGIOutput6, IDXGISwapChain1, IDXGISwapChain3,
 };
+use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::core::Interface;
 
 const BUFFER_COUNT: u32 = 2;
@@ -39,6 +43,7 @@ fn failed(step: &'static str) -> impl Fn(windows::core::Error) -> String {
 }
 
 pub(crate) struct Presenter {
+    hwnd: isize,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     factory: IDXGIFactory2,
@@ -61,6 +66,12 @@ pub(crate) struct Presenter {
     staging: Vec<u8>,
     // decoder surfaces opened on this device, kept while the decoder's pool keeps them
     opened: Vec<(Weak<dyn VideoSurface>, ID3D11Texture2D, IDXGIKeyedMutex)>,
+    // a factory that sees the displays as they are now, and whether the window's is in HDR
+    outputs: IDXGIFactory1,
+    display: Option<(HMONITOR, bool)>,
+    // set once an HDR10 frame could not be shared or its colour space was refused, after
+    // which HDR video is shown as the decoder maps it to SDR, as on an SDR display
+    sdr_only: bool,
 }
 
 // a video frame's swapchain, in a visual that places and scales it inside one that clips it
@@ -71,8 +82,7 @@ struct ShownPlane {
     swapchain: IDXGISwapChain1,
     plane: Plane,
     frame: Arc<Image>,
-    // a swapchain for surfaces is B8G8R8A8 to take a copy, one for pixels R8G8B8A8
-    surfaces: bool,
+    format: DXGI_FORMAT,
 }
 
 impl Presenter {
@@ -134,6 +144,7 @@ impl Presenter {
                 .Commit()
                 .map_err(failed("the composition could not be committed"))?;
             Ok(Self {
+                hwnd,
                 device,
                 context,
                 factory,
@@ -149,6 +160,9 @@ impl Presenter {
                 last_box: [0, 0, width, height],
                 staging: Vec::new(),
                 opened: Vec::new(),
+                outputs: CreateDXGIFactory1().map_err(failed("no DXGI factory"))?,
+                display: None,
+                sdr_only: false,
             })
         }
     }
@@ -292,11 +306,16 @@ impl Presenter {
     // the visuals follow the planes, each new frame is uploaded whole and presented, and the
     // tree is committed when a visual came, went or moved
     fn show_planes(&mut self, planes: &[PlaneFrame]) -> Result<(), String> {
+        let surfaces = || planes.iter().filter_map(|(_, _, surface)| surface.as_ref());
+        let hdr = surfaces().next().is_some() && !self.sdr_only && self.display_hdr();
+        for surface in surfaces() {
+            surface.show_hdr(hdr);
+        }
         let mut moved = false;
         let mut kept = Vec::with_capacity(planes.len());
         for (at, shown) in std::mem::take(&mut self.planes).into_iter().enumerate() {
             if planes.get(at).is_some_and(|(plane, _, surface)| {
-                plane.size == shown.plane.size && surface.is_some() == shown.surfaces
+                plane.size == shown.plane.size && format_of(surface.as_ref(), hdr) == shown.format
             }) {
                 kept.push(shown);
             } else {
@@ -310,7 +329,8 @@ impl Presenter {
         for (at, (plane, frame, surface)) in planes.iter().enumerate() {
             let fresh = at >= self.planes.len();
             if fresh {
-                let shown = self.plane_visual(plane, frame.clone(), surface.is_some())?;
+                let format = format_of(surface.as_ref(), hdr);
+                let shown = self.plane_visual(plane, frame.clone(), format)?;
                 self.planes.push(shown);
             }
             let shown = &mut self.planes[at];
@@ -321,9 +341,9 @@ impl Presenter {
             }
             if fresh || !Arc::ptr_eq(&shown.frame, frame) {
                 shown.frame = frame.clone();
-                let swapchain = shown.swapchain.clone();
+                let (swapchain, format) = (shown.swapchain.clone(), shown.format);
                 match surface {
-                    Some(surface) => self.copy_surface(&swapchain, surface, plane.size)?,
+                    Some(surface) => self.copy_surface(&swapchain, format, surface, plane.size)?,
                     None => upload(&self.context, &swapchain, frame)?,
                 }
             }
@@ -336,28 +356,60 @@ impl Presenter {
         Ok(())
     }
 
+    // whether the display holding most of the window is in HDR, looked up again when the
+    // window reaches another display or DXGI says the displays changed
+    fn display_hdr(&mut self) -> bool {
+        // SAFETY: plain calls on the window this presenter draws into and a factory it owns
+        unsafe {
+            let monitor = MonitorFromWindow(HWND(self.hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
+            if !self.outputs.IsCurrent().as_bool() {
+                let Ok(outputs) = CreateDXGIFactory1() else {
+                    return false;
+                };
+                self.outputs = outputs;
+                self.display = None;
+            }
+            if let Some((known, hdr)) = self.display
+                && known == monitor
+            {
+                return hdr;
+            }
+            let hdr = (0..)
+                .map_while(|at| self.outputs.EnumAdapters1(at).ok())
+                .flat_map(|adapter| (0..).map_while(move |at| adapter.EnumOutputs(at).ok()))
+                .filter_map(|output| output.cast::<IDXGIOutput6>().ok()?.GetDesc1().ok())
+                .any(|output| {
+                    output.Monitor == monitor
+                        && output.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                });
+            self.display = Some((monitor, hdr));
+            hdr
+        }
+    }
+
     // the surface's texture goes to the back buffer on the GPU; when this device cannot open
-    // it the decoder reads it back and its rows are uploaded instead
+    // it, or it is HDR10 and the swapchain is not, the decoder reads it back in SDR and its
+    // rows are uploaded instead
     fn copy_surface(
         &mut self,
         swapchain: &IDXGISwapChain1,
+        format: DXGI_FORMAT,
         surface: &Arc<dyn VideoSurface>,
         (width, height): (u32, u32),
     ) -> Result<(), String> {
-        self.opened.retain(|(kept, ..)| kept.strong_count() > 0);
-        let known = self
-            .opened
-            .iter()
-            .position(|(kept, ..)| std::ptr::addr_eq(kept.as_ptr(), Arc::as_ptr(surface)));
-        let at = match known {
-            Some(at) => Some(at),
-            None => self.open_surface(surface).map(|opened| {
-                self.opened.push(opened);
-                self.opened.len() - 1
-            }),
+        let hdr10 = format == DXGI_FORMAT_R10G10B10A2_UNORM;
+        let at = if surface.hdr10() == hdr10 {
+            self.opened_at(surface)
+        } else {
+            None
         };
-        // SAFETY: the back buffer and the opened texture are both the frame's size in
-        // B8G8R8A8, and the keyed mutex is held while the copy is queued
+        if at.is_none() && hdr10 {
+            // the frame is dropped and the next ones go to a BGRA swapchain
+            self.sdr_only = true;
+            return Ok(());
+        }
+        // SAFETY: the back buffer and the opened texture are both the frame's size in one
+        // format, and the keyed mutex is held while the copy is queued
         unsafe {
             let buffer: ID3D11Texture2D = swapchain
                 .GetBuffer(0)
@@ -396,6 +448,19 @@ impl Presenter {
         }
     }
 
+    fn opened_at(&mut self, surface: &Arc<dyn VideoSurface>) -> Option<usize> {
+        self.opened.retain(|(kept, ..)| kept.strong_count() > 0);
+        let known = self
+            .opened
+            .iter()
+            .position(|(kept, ..)| std::ptr::addr_eq(kept.as_ptr(), Arc::as_ptr(surface)));
+        known.or_else(|| {
+            let opened = self.open_surface(surface)?;
+            self.opened.push(opened);
+            Some(self.opened.len() - 1)
+        })
+    }
+
     fn open_surface(
         &self,
         surface: &Arc<dyn VideoSurface>,
@@ -414,23 +479,31 @@ impl Presenter {
     }
 
     fn plane_visual(
-        &self,
+        &mut self,
         plane: &Plane,
         frame: Arc<Image>,
-        surfaces: bool,
+        format: DXGI_FORMAT,
     ) -> Result<ShownPlane, String> {
-        let format = if surfaces {
-            DXGI_FORMAT_B8G8R8A8_UNORM
-        } else {
-            DXGI_FORMAT_R8G8B8A8_UNORM
-        };
-        let swapchain = swapchain_for(
+        let mut format = format;
+        let mut swapchain = swapchain_for(
             &self.factory,
             &self.device,
             plane.size,
             format,
             DXGI_ALPHA_MODE_IGNORE,
         )?;
+        // RGB10 swapchains count as sRGB until told otherwise, and some drivers refuse HDR10
+        if format == DXGI_FORMAT_R10G10B10A2_UNORM && !shows_hdr10(&swapchain) {
+            self.sdr_only = true;
+            format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            swapchain = swapchain_for(
+                &self.factory,
+                &self.device,
+                plane.size,
+                format,
+                DXGI_ALPHA_MODE_IGNORE,
+            )?;
+        }
         // SAFETY: plain COM calls on interfaces this presenter owns or just made
         unsafe {
             let clip = self
@@ -462,7 +535,7 @@ impl Presenter {
                 swapchain,
                 plane: plane.clone(),
                 frame,
-                surfaces,
+                format,
             })
         }
     }
@@ -489,6 +562,32 @@ impl Presenter {
         }
         .map_err(failed("the frame texture could not be created"))?;
         frame.ok_or_else(|| "Direct3D returned no frame texture".to_string())
+    }
+}
+
+// pixels come as RGBA and decoder surfaces as BGRA, or as HDR10 for a swapchain to match
+// while the display shows HDR
+fn format_of(surface: Option<&Arc<dyn VideoSurface>>, hdr: bool) -> DXGI_FORMAT {
+    match surface {
+        None => DXGI_FORMAT_R8G8B8A8_UNORM,
+        Some(surface) if surface.hdr10() && hdr => DXGI_FORMAT_R10G10B10A2_UNORM,
+        Some(_) => DXGI_FORMAT_B8G8R8A8_UNORM,
+    }
+}
+
+fn shows_hdr10(swapchain: &IDXGISwapChain1) -> bool {
+    // SAFETY: plain COM calls on a swapchain the caller owns
+    unsafe {
+        swapchain.cast::<IDXGISwapChain3>().is_ok_and(|swapchain| {
+            swapchain
+                .CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+                .is_ok_and(|support| {
+                    support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0
+                })
+                && swapchain
+                    .SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+                    .is_ok()
+        })
     }
 }
 
