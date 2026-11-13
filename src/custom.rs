@@ -590,9 +590,11 @@ fn run_app(
         }],
         false => windows,
     };
+    let app_id = identifier.to_string();
     let prepare = move |config: WindowConfig| WindowConfig {
         start_url: app_url(&config.start_url),
         icon: config.icon.or_else(|| icon.clone()),
+        app_id: config.app_id.or_else(|| Some(app_id.clone())),
         ..config
     };
     if let Some(path) = launch::switch_value(arguments.clone(), SCREENSHOT_SWITCH) {

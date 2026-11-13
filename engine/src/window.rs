@@ -184,6 +184,8 @@ pub struct WindowConfig {
     pub content_protected: bool,
     // shown from the moment the window opens until its page paints
     pub background: [u8; 3],
+    // the desktop entry the window belongs to on linux, as its wayland app_id and x11 class
+    pub app_id: Option<String>,
 }
 
 impl Default for WindowConfig {
@@ -210,6 +212,7 @@ impl Default for WindowConfig {
             click_through: false,
             content_protected: false,
             background: [255, 255, 255],
+            app_id: None,
         }
     }
 }
@@ -742,6 +745,11 @@ impl AppWindow {
             attributes = attributes
                 .with_skip_taskbar(config.skip_taskbar)
                 .with_undecorated_shadow(true);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(id) = &config.app_id {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes = attributes.with_name(id, id);
         }
         let primary = event_loop
             .primary_monitor()
