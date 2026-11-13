@@ -31,6 +31,8 @@ pub(crate) struct LayoutInputs {
 // a layout of the document as it stood, with every node's boxes indexed
 pub(super) struct MeasuredLayout {
     version: u64,
+    // the sheet it was styled by, which devtools can replace while the document stays
+    stylesheet: crate::navigation::SheetIdentity,
     state: StyleState,
     boxes: HashMap<NodeId, Vec<BoxGeometry>>,
     layout: LayoutDocument,
@@ -265,6 +267,11 @@ impl ScriptRuntime {
     }
 
     // the style state a layout of the document runs with right now
+    pub(crate) fn current_style_state(&self) -> Option<StyleState> {
+        let inputs = self.layout_inputs.as_ref()?.borrow();
+        Some(self.layout_state(&inputs))
+    }
+
     fn layout_state(&self, inputs: &LayoutInputs) -> StyleState {
         let extras = &inputs.extras;
         let mut state = self.style_state(extras.hovered);
@@ -306,11 +313,12 @@ impl ScriptRuntime {
         let inputs = self.layout_inputs.as_ref()?.borrow();
         let state = self.layout_state(&inputs);
         let version = self.document.borrow().version();
-        let stale = self
-            .measured
-            .borrow()
-            .as_ref()
-            .is_none_or(|measured| measured.version != version || measured.state != state);
+        let stylesheet = crate::navigation::SheetIdentity::of(&inputs.stylesheet);
+        let stale = self.measured.borrow().as_ref().is_none_or(|measured| {
+            measured.version != version
+                || measured.stylesheet != stylesheet
+                || measured.state != state
+        });
         if stale {
             let mut state = state;
             let mut layout = self.run_layout(&inputs, &state);
@@ -324,6 +332,7 @@ impl ScriptRuntime {
             }
             *self.measured.borrow_mut() = Some(MeasuredLayout {
                 version,
+                stylesheet,
                 state,
                 boxes: layout.box_index(),
                 layout,

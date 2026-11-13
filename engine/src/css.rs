@@ -5,6 +5,7 @@ use crate::media::{ContainerQuery, MediaQueryList};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Range;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1224,9 +1225,28 @@ pub(crate) struct StyleState {
     pub(crate) container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
     // modal dialogs above the page, bottom first
     pub(crate) top_layer: Vec<NodeId>,
+    // the user action pseudo-classes devtools holds on for an element, whatever the pointer
+    // and focus do
+    pub(crate) forced: BTreeMap<NodeId, BTreeSet<&'static str>>,
 }
 
+// the pseudo-classes devtools can hold on, by their names
+pub(crate) const FORCEABLE_PSEUDO_CLASSES: [&str; 6] = [
+    "active",
+    "focus",
+    "focus-within",
+    "focus-visible",
+    "hover",
+    "visited",
+];
+
 impl StyleState {
+    fn forces(&self, node: NodeId, class: &str) -> bool {
+        self.forced
+            .get(&node)
+            .is_some_and(|classes| classes.contains(class))
+    }
+
     fn is_hovered(&self, document: &Document, node: NodeId) -> bool {
         self.hovered
             .is_some_and(|hovered| document.is_inclusive_ancestor(node, hovered))
@@ -2214,8 +2234,9 @@ impl Stylesheet {
 
 impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
-        let source = strip_comments(source);
-        let (rules, keyframes, font_faces) = parse_stylesheet(&source, None)?;
+        let (source, shifts) = strip_comments(source);
+        let (mut rules, keyframes, font_faces) = parse_stylesheet(&source, None)?;
+        unshift_rules(&mut rules, &shifts);
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         let styled_pseudo = styled_pseudo_elements(&rules);
@@ -2232,10 +2253,11 @@ impl Stylesheet {
 
     // page rendering follows CSS error handling: an unsupported rule is dropped, the rest applies
     pub fn parse_recovering(source: &str) -> (Self, Vec<String>) {
-        let source = strip_comments(source);
+        let (source, shifts) = strip_comments(source);
         let mut dropped = Vec::new();
-        let (rules, keyframes, font_faces) =
+        let (mut rules, keyframes, font_faces) =
             parse_stylesheet(&source, Some(&mut dropped)).unwrap_or_default();
+        unshift_rules(&mut rules, &shifts);
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         let styled_pseudo = styled_pseudo_elements(&rules);
@@ -2805,6 +2827,60 @@ impl Stylesheet {
             .collect()
     }
 
+    // the rules that match an element in the document, the user agent's first and then in
+    // cascade order, for devtools; a shadow tree's own sheets are left out
+    pub(crate) fn matched_rules(
+        &self,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+    ) -> Vec<MatchedRule> {
+        let Some(element) = document.element(node) else {
+            return Vec::new();
+        };
+        let mut matched = Vec::new();
+        for (user_agent, sheet) in [(true, user_agent_sheet()), (false, self)] {
+            for position in sheet.index.candidates(element) {
+                let Some(rule) = sheet.rules.get(position) else {
+                    continue;
+                };
+                if !rule.applies(document, node, state) {
+                    continue;
+                }
+                let matching: Vec<_> = (0..rule.selectors.len())
+                    .filter(|&index| rule.selectors[index].matches(document, node, pseudo, state))
+                    .collect();
+                let Some(specificity) = matching
+                    .iter()
+                    .map(|&index| rule.selectors[index].specificity())
+                    .max()
+                else {
+                    continue;
+                };
+                let rank = (
+                    user_agent,
+                    specificity.ranked(false, rule.layer),
+                    rule.order,
+                );
+                matched.push((
+                    rank,
+                    MatchedRule {
+                        user_agent,
+                        header: rule.header.clone(),
+                        block: rule.block.clone(),
+                        matching,
+                    },
+                ));
+            }
+        }
+        matched.sort_by_key(|((user_agent, specificity, order), _)| {
+            (!*user_agent, *specificity, *order)
+        });
+        matched.dedup_by_key(|(rank, _)| *rank);
+        matched.into_iter().map(|(_, rule)| rule).collect()
+    }
+
     // the winning declaration of each property among the rules that match, borrowed from
     // this sheet
     fn borrowed_declarations<'a>(
@@ -3115,10 +3191,23 @@ fn presentation_hints(element: &Element) -> impl Iterator<Item = (&'static str, 
         })
 }
 
+// a rule that matches an element, as devtools lists it: where its selector and its
+// declaration block sit in the sheet's text, and which of its selectors match
+pub(crate) struct MatchedRule {
+    pub(crate) user_agent: bool,
+    pub(crate) header: Range<usize>,
+    pub(crate) block: Range<usize>,
+    pub(crate) matching: Vec<usize>,
+}
+
 #[derive(Clone, Debug)]
 struct Rule {
     selectors: Vec<Selector>,
     declarations: Vec<Declaration>,
+    // where the selector the rule was written under and its declaration block sit in the text
+    // it was parsed from
+    header: Range<usize>,
+    block: Range<usize>,
     order: usize,
     // media and container conditions that must all hold
     conditions: Vec<RuleCondition>,
@@ -3637,9 +3726,12 @@ impl PseudoClass {
                 || document.document_element() == Some(node),
                 |root| root == node,
             ),
-            Self::Hover => state.is_hovered(document, node),
-            Self::Focus => state.focused == Some(node),
-            Self::FocusVisible => state.focus_visible && state.focused == Some(node),
+            Self::Hover => state.is_hovered(document, node) || state.forces(node, "hover"),
+            Self::Focus => state.focused == Some(node) || state.forces(node, "focus"),
+            Self::FocusVisible => {
+                (state.focus_visible && state.focused == Some(node))
+                    || state.forces(node, "focus-visible")
+            }
             Self::Checked => {
                 element.name == "input"
                     && element.attr("type").is_some_and(|kind| {
@@ -3656,12 +3748,18 @@ impl PseudoClass {
                     && document.element_sibling(node, true).is_none()
             }
 
-            Self::FocusWithin => state
-                .focused
-                .is_some_and(|focused| document.is_inclusive_ancestor(node, focused)),
-            Self::Active => state
-                .active
-                .is_some_and(|active| document.is_inclusive_ancestor(node, active)),
+            Self::FocusWithin => {
+                state
+                    .focused
+                    .is_some_and(|focused| document.is_inclusive_ancestor(node, focused))
+                    || state.forces(node, "focus-within")
+            }
+            Self::Active => {
+                state
+                    .active
+                    .is_some_and(|active| document.is_inclusive_ancestor(node, active))
+                    || state.forces(node, "active")
+            }
             Self::NthChild(pattern, of) | Self::NthLastChild(pattern, of) => {
                 let last = matches!(self, Self::NthLastChild(..));
                 let counts = |candidate: NodeId| {
@@ -3711,7 +3809,7 @@ impl PseudoClass {
             Self::Link => {
                 matches!(element.name.as_str(), "a" | "area") && element.attr("href").is_some()
             }
-            Self::Visited => false,
+            Self::Visited => state.forces(node, "visited"),
             Self::ReadWrite | Self::ReadOnly => {
                 let text_input = element.name == "input"
                     && !matches!(
@@ -4513,6 +4611,13 @@ impl Rule {
 }
 
 // where parsed rules go, with the cascade layers in the order they first appeared
+impl RuleSink<'_> {
+    fn span(&self, slice: &str) -> Range<usize> {
+        let start = slice.as_ptr() as usize - self.base;
+        start..start + slice.len()
+    }
+}
+
 struct RuleSink<'a> {
     rules: Vec<Rule>,
     keyframes: Vec<Keyframes>,
@@ -4522,6 +4627,8 @@ struct RuleSink<'a> {
     anonymous_layers: usize,
     font_faces: Vec<FontFaceRule>,
     dropped: Option<&'a mut Vec<String>>,
+    // where the text being parsed starts, so a slice of it gives its place
+    base: usize,
 }
 
 // an @font-face rule: where a family's face for some weights and slant can be fetched
@@ -4695,8 +4802,9 @@ impl RuleSink<'_> {
 struct RuleScope {
     conditions: Vec<RuleCondition>,
     layer: Option<String>,
-    // the selector of the style rule this text is nested in
+    // the selector of the style rule this text is nested in, and where it was written
     parent: Option<String>,
+    parent_header: Range<usize>,
 }
 
 // a stylesheet's rules, keyframes and font faces
@@ -4714,6 +4822,7 @@ fn parse_stylesheet(
         anonymous_layers: 0,
         font_faces: Vec::new(),
         dropped,
+        base: source.as_ptr() as usize,
     };
     parse_rules(source, &RuleScope::default(), &mut sink)?;
     Ok(sink.finish())
@@ -4735,7 +4844,7 @@ fn parse_rules(source: &str, scope: &RuleScope, sink: &mut RuleSink<'_>) -> Resu
                     parse_at_rule(header, body, scope, sink)?;
                 } else {
                     let selector = nest_selector(header, scope.parent.as_deref());
-                    parse_rule_body(&selector, body, scope, sink)?;
+                    parse_rule_body(&selector, sink.span(header), body, scope, sink)?;
                 }
             }
         }
@@ -4835,7 +4944,7 @@ fn parse_at_rule(
     }
     // inside a style rule, a conditional rule holds declarations for the same selector
     match inner.parent.clone() {
-        Some(parent) => parse_rule_body(&parent, body, &inner, sink),
+        Some(parent) => parse_rule_body(&parent, inner.parent_header.clone(), body, &inner, sink),
         None => parse_rules(body, &inner, sink),
     }
 }
@@ -4863,6 +4972,7 @@ fn nest_selector(header: &str, parent: Option<&str>) -> String {
 
 fn parse_rule_body(
     selector: &str,
+    header: Range<usize>,
     body: &str,
     scope: &RuleScope,
     sink: &mut RuleSink<'_>,
@@ -4896,6 +5006,8 @@ fn parse_rule_body(
         sink.rules.push(Rule {
             selectors,
             declarations,
+            header: header.clone(),
+            block: sink.span(body),
             order,
             conditions: scope.conditions.clone(),
             layer,
@@ -4903,6 +5015,7 @@ fn parse_rule_body(
     }
     let child_scope = RuleScope {
         parent: Some(selector.to_string()),
+        parent_header: header,
         ..scope.clone()
     };
     for (header, nested_body) in nested {
@@ -4911,6 +5024,7 @@ fn parse_rule_body(
         } else {
             parse_rule_body(
                 &nest_selector(header, Some(selector)),
+                sink.span(header),
                 nested_body,
                 &child_scope,
                 sink,
@@ -5394,7 +5508,7 @@ pub(crate) struct StyleImport {
 // the @import rules a stylesheet starts with, the @layer statements among them, and the
 // rest of its text; imports after the first other rule are ignored, as CSS requires
 pub(crate) fn leading_imports(source: &str) -> (Vec<StyleImport>, String, String) {
-    let source = strip_comments(source);
+    let (source, _) = strip_comments(source);
     let mut imports = Vec::new();
     let mut statements = String::new();
     let mut cursor = 0;
@@ -5541,7 +5655,7 @@ fn parse_declarations(
 }
 
 // the rendering defaults of the HTML standard for the properties this engine applies
-const USER_AGENT_CSS: &str = r#"
+pub(crate) const USER_AGENT_CSS: &str = r#"
 body { margin: 8px }
 p, blockquote, figure, dl, ul, ol, menu, pre, listing, xmp, plaintext { margin-top: 1em; margin-bottom: 1em }
 blockquote, figure { margin-left: 40px; margin-right: 40px }
@@ -6486,7 +6600,7 @@ fn parse_function_argument(source: &str, cursor: &mut usize) -> Result<String, S
     Err(format!("unterminated functional pseudo-class: {source}"))
 }
 
-fn split_selector_list(source: &str) -> Result<Vec<&str>, String> {
+pub(crate) fn split_selector_list(source: &str) -> Result<Vec<&str>, String> {
     let mut selectors = Vec::new();
     let mut start = 0;
     let mut bracket_depth = 0usize;
@@ -7520,8 +7634,11 @@ fn default_display(name: &str) -> Display {
 }
 
 // removes comments, leaving any comment-like text inside strings alone
-fn strip_comments(source: &str) -> String {
+// the text without its comments, and after each comment taken out, where it was in the text
+// left and how many bytes all of them so far took
+fn strip_comments(source: &str) -> (String, Vec<(usize, usize)>) {
     let mut output = String::with_capacity(source.len());
+    let mut shifts = Vec::new();
     let mut characters = source.char_indices().peekable();
     let mut quote = None;
     while let Some((index, character)) = characters.next() {
@@ -7540,6 +7657,7 @@ fn strip_comments(source: &str) -> String {
                 match source[index + 2..].find("*/") {
                     Some(end) => {
                         let resume = index + 2 + end + 2;
+                        shifts.push((output.len(), resume - output.len()));
                         while characters.peek().is_some_and(|(next, _)| *next < resume) {
                             characters.next();
                         }
@@ -7555,7 +7673,23 @@ fn strip_comments(source: &str) -> String {
             }
         }
     }
-    output
+    (output, shifts)
+}
+
+// moves the rules' places in comment-free text back to where they are in the text as written; a
+// comment touching a selector stays outside it, and one touching a block's brace inside it
+fn unshift_rules(rules: &mut [Rule], shifts: &[(usize, usize)]) {
+    if shifts.is_empty() {
+        return;
+    }
+    let shifted = |offset: usize, inclusive: bool| {
+        let before = shifts.partition_point(|&(at, _)| at < offset || (inclusive && at == offset));
+        offset + before.checked_sub(1).map_or(0, |last| shifts[last].1)
+    };
+    for rule in rules {
+        rule.header = shifted(rule.header.start, true)..shifted(rule.header.end, false);
+        rule.block = shifted(rule.block.start, false)..shifted(rule.block.end, true);
+    }
 }
 
 #[cfg(test)]
@@ -8759,5 +8893,25 @@ mod tests {
         );
         assert_eq!(style.color, Color::opaque(255, 0, 0));
         assert_eq!(style.background, Color::opaque(0, 0, 255));
+    }
+
+    #[test]
+    fn rules_know_where_their_selector_and_block_were_written() {
+        let text = "/* a } */ p , em { color: red /* x */ }\n@media (min-width: 1px) { /*b*/ .x{margin:0} }\n.y { & .z { top: 0 } left: 0 }";
+        let sheet = Stylesheet::parse(text).expect("the sheet should parse");
+        let spans: Vec<_> = sheet
+            .rules
+            .iter()
+            .map(|rule| (&text[rule.header.clone()], &text[rule.block.clone()]))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("p , em", " color: red /* x */ "),
+                (".x", "margin:0"),
+                (".y", " & .z { top: 0 } left: 0 "),
+                ("& .z", " top: 0 "),
+            ]
+        );
     }
 }

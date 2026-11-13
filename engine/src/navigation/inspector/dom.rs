@@ -397,7 +397,7 @@ fn text(params: &Json, key: &str) -> NodeArgument {
     NodeArgument::Text(params[key].as_str().unwrap_or_default().to_string())
 }
 
-fn call(
+pub(super) fn call(
     page: &mut Page,
     node: NodeId,
     function: &str,

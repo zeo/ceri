@@ -1039,11 +1039,28 @@ struct Painted {
     generation: u64,
 }
 
+// a stylesheet compared by identity; holding it keeps the next sheet from reusing a replaced
+// one's address while something keyed on it is kept
+#[derive(Clone)]
+pub(crate) struct SheetIdentity(Rc<Stylesheet>);
+
+impl SheetIdentity {
+    pub(crate) fn of(stylesheet: &Rc<Stylesheet>) -> Self {
+        Self(stylesheet.clone())
+    }
+}
+
+impl PartialEq for SheetIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 // everything a layout is a pure function of
 #[derive(PartialEq)]
 struct LayoutKey {
     document: (Option<u64>, *const RefCell<Document>, u64),
-    stylesheet: *const crate::css::Stylesheet,
+    stylesheet: SheetIdentity,
     viewport: Size,
     scale: f32,
     state: StyleState,
@@ -2737,7 +2754,7 @@ impl Browser {
                 Rc::as_ptr(&page.document),
                 document.version(),
             ),
-            stylesheet: Rc::as_ptr(stylesheet),
+            stylesheet: SheetIdentity::of(stylesheet),
             viewport,
             scale: self.viewport.device_pixel_ratio,
             state: keyed_state,

@@ -1,9 +1,10 @@
 // devtools protocol sessions on a browser's page: the Page domain here, the Runtime domain
-// routed to the page's script runtime, the DOM domain in its own module, and the events they
-// owe each session
+// routed to the page's script runtime, the DOM, Overlay and CSS domains in their own modules,
+// and the events they owe each session
 
 mod dom;
 mod overlay;
+mod styles;
 
 use super::{Browser, NavigationError, Size};
 use crate::dom::NodeId;
@@ -22,6 +23,7 @@ pub(super) struct Inspection {
     waiting: Vec<Waiting>,
     highlight: Option<overlay::Highlight>,
     picking: Option<overlay::Picking>,
+    sheets: styles::Sheets,
 }
 
 impl Inspection {
@@ -41,6 +43,7 @@ struct Session {
     outgoing: Sender<String>,
     runtime: bool,
     page: bool,
+    css: bool,
     // the execution context this session last heard of, and the first console entry it has not
     context: Option<u64>,
     seen: u64,
@@ -65,6 +68,7 @@ impl Browser {
             outgoing,
             runtime: false,
             page: false,
+            css: false,
             context: None,
             seen: 0,
             dom: dom::Mirror::default(),
@@ -86,6 +90,9 @@ impl Browser {
         }
         if inspection.sessions.is_empty() {
             inspection.highlight = None;
+            if let Some(page) = &mut self.page {
+                page.runtime.forced_pseudo_classes.clear();
+            }
         }
     }
 
@@ -286,6 +293,10 @@ impl Browser {
                 }
                 Some(answer.unwrap_or_else(|| Err((-32601, format!("'{method}' wasn't found")))))
             }
+            method if method.starts_with("CSS.") => {
+                self.flush_inspector();
+                Some(self.answer_css(session, method, params))
+            }
             _ => Some(Err((-32601, format!("'{method}' wasn't found")))),
         };
         // the events a call causes reach the session before its answer, as in chromium
@@ -389,6 +400,9 @@ impl Browser {
                     let _ = session.outgoing.send(event.to_string());
                 }
             }
+        }
+        if self.inspection.sessions.iter().any(|held| held.css) {
+            self.sync_sheets();
         }
     }
 
@@ -1052,5 +1066,212 @@ mod tests {
             json!({ "mode": "showDistances" }),
         );
         assert_eq!(sent[0]["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn styles_are_matched_with_their_places_edited_and_forced() {
+        let (mut browser, messages) = inspected(
+            "<style>/* top */ p { color: red }\n#note:hover, .x { margin: 1px; /* padding: 2px; */ }\np::before { content: 'a' }</style>\
+             <div style='font-size: 20px'><p id=note style='width: 5px'>x</p></div>",
+        );
+        call(&mut browser, &messages, 1, "DOM.getDocument", json!({}));
+        let sent = call(&mut browser, &messages, 2, "CSS.enable", json!({}));
+        let added = named(&sent, "CSS.styleSheetAdded");
+        assert_eq!(added.len(), 1);
+        let header = &added[0]["header"];
+        assert_eq!(
+            (
+                header["isInline"].as_bool(),
+                header["sourceURL"].as_str(),
+                header["endLine"].as_u64()
+            ),
+            (Some(true), Some("https://app.ceri.invalid/"), Some(2))
+        );
+        let sheet = header["styleSheetId"].clone();
+        let sent = call(
+            &mut browser,
+            &messages,
+            3,
+            "DOM.querySelector",
+            json!({ "nodeId": 1, "selector": "#note" }),
+        );
+        let note = result(&sent, 3)["nodeId"].clone();
+        let matched = |browser: &mut Browser, id: u64| {
+            let params = json!({ "nodeId": note });
+            let sent = call(
+                browser,
+                &messages,
+                id,
+                "CSS.getMatchedStylesForNode",
+                params,
+            );
+            result(&sent, id).clone()
+        };
+        let range = |line: u64, start: u64, end: u64| json!({ "startLine": line, "startColumn": start, "endLine": line, "endColumn": end });
+
+        let styles = matched(&mut browser, 4);
+        let rules = styles["matchedCSSRules"].as_array().unwrap();
+        assert_eq!(rules[0]["rule"]["origin"], "user-agent");
+        assert!(rules[0]["rule"]["styleSheetId"].is_null());
+        let rule = &rules.last().unwrap()["rule"];
+        assert_eq!(rule["styleSheetId"], sheet);
+        assert_eq!(rule["selectorList"]["text"], "p");
+        assert_eq!(
+            rule["selectorList"]["selectors"][0]["range"],
+            range(0, 10, 11)
+        );
+        assert_eq!(rule["style"]["cssText"], " color: red ");
+        assert_eq!(
+            styles["inlineStyle"]["styleSheetId"],
+            format!("style-{note}")
+        );
+        assert_eq!(styles["inlineStyle"]["cssText"], "width: 5px");
+        let inherited = styles["inherited"].as_array().unwrap();
+        assert_eq!(inherited.len(), 3);
+        assert_eq!(
+            inherited[0]["inlineStyle"]["cssProperties"][0]["name"],
+            "font-size"
+        );
+        let pseudo = styles["pseudoElements"].as_array().unwrap();
+        assert_eq!(pseudo.len(), 1);
+        assert_eq!(pseudo[0]["pseudoType"], "before");
+        assert_eq!(
+            pseudo[0]["matches"][0]["rule"]["selectorList"]["text"],
+            "p::before"
+        );
+
+        call(
+            &mut browser,
+            &messages,
+            5,
+            "CSS.forcePseudoState",
+            json!({ "nodeId": note, "forcedPseudoClasses": ["hover"] }),
+        );
+        let styles = matched(&mut browser, 6);
+        let entry = styles["matchedCSSRules"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(entry["matchingSelectors"], json!([0]));
+        let rule = &entry["rule"];
+        assert_eq!(
+            rule["selectorList"]["selectors"][1]["range"],
+            range(1, 13, 15)
+        );
+        let style = rule["style"].clone();
+        assert_eq!(style["range"], range(1, 17, 51));
+        let properties = style["cssProperties"].as_array().unwrap();
+        assert_eq!(
+            (
+                properties[0]["text"].as_str(),
+                properties[0]["parsedOk"].as_bool()
+            ),
+            (Some("margin: 1px;"), Some(true))
+        );
+        assert_eq!(properties[1]["disabled"], true);
+        assert_eq!(properties[1]["range"], range(1, 31, 50));
+
+        let computed = |browser: &mut Browser, id: u64, name: &str| {
+            let params = json!({ "nodeId": note });
+            let sent = call(
+                browser,
+                &messages,
+                id,
+                "CSS.getComputedStyleForNode",
+                params,
+            );
+            let style = result(&sent, id)["computedStyle"].as_array().unwrap();
+            let property = style.iter().find(|property| property["name"] == name);
+            property.map(|property| property["value"].clone())
+        };
+        assert_eq!(computed(&mut browser, 7, "margin-top"), Some(json!("1px")));
+        let edit = |text: &str| json!({ "edits": [{ "styleSheetId": sheet, "range": style["range"], "text": text }] });
+        let sent = call(
+            &mut browser,
+            &messages,
+            8,
+            "CSS.setStyleTexts",
+            edit(" margin: 3px; padding: 2px; "),
+        );
+        assert_eq!(
+            result(&sent, 8)["styles"][0]["cssProperties"][1]["name"],
+            "padding"
+        );
+        assert_eq!(computed(&mut browser, 9, "margin-top"), Some(json!("3px")));
+        assert_eq!(
+            computed(&mut browser, 10, "padding-top"),
+            Some(json!("2px"))
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            11,
+            "CSS.setStyleTexts",
+            edit("} *"),
+        );
+        assert_eq!(sent[0]["error"]["code"], -32000);
+        call(
+            &mut browser,
+            &messages,
+            12,
+            "CSS.forcePseudoState",
+            json!({ "nodeId": note, "forcedPseudoClasses": [] }),
+        );
+        assert_eq!(
+            computed(&mut browser, 13, "margin-top"),
+            Some(json!("20px"))
+        );
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            14,
+            "CSS.setStyleTexts",
+            json!({ "edits": [{ "styleSheetId": format!("style-{note}"), "range": range(0, 0, 10), "text": "width: 7px" }] }),
+        );
+        assert_eq!(
+            named(&sent, "DOM.attributeModified")[0]["value"],
+            "width: 7px"
+        );
+        assert_eq!(computed(&mut browser, 15, "width"), Some(json!("7px")));
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            16,
+            "CSS.setRuleSelector",
+            json!({ "styleSheetId": sheet, "range": range(0, 10, 11), "selector": "p, em" }),
+        );
+        assert_eq!(result(&sent, 16)["selectorList"]["text"], "p, em");
+        let sent = call(
+            &mut browser,
+            &messages,
+            17,
+            "CSS.getStyleSheetText",
+            json!({ "styleSheetId": sheet }),
+        );
+        let text = result(&sent, 17)["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "/* top */ p, em { color: red }\n#note:hover, .x { margin: 3px; padding: 2px; }"
+            ),
+            "{text}"
+        );
+
+        let sent = evaluate(
+            &mut browser,
+            &messages,
+            18,
+            "document.querySelector('style').append('em { color: blue }')",
+        );
+        assert_eq!(
+            named(&sent, "CSS.styleSheetRemoved")[0]["styleSheetId"],
+            sheet
+        );
+        assert_ne!(
+            named(&sent, "CSS.styleSheetAdded")[0]["header"]["styleSheetId"],
+            sheet
+        );
     }
 }

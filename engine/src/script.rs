@@ -495,6 +495,8 @@ pub struct ScriptRuntime {
     // compiled inline on* attributes, keyed by their source so an edit recompiles
     attribute_handlers: HashMap<(NodeId, String), (String, Value)>,
     focused_element: Option<NodeId>,
+    // pseudo-classes devtools holds on, by element
+    pub(crate) forced_pseudo_classes: BTreeMap<NodeId, BTreeSet<&'static str>>,
     // the last user input was a pointer press, so only text controls show focus
     pointer_modality: bool,
     control_values: HashMap<NodeId, String>,
@@ -1554,6 +1556,7 @@ impl ScriptRuntime {
             event_handlers: HashMap::new(),
             attribute_handlers: HashMap::new(),
             focused_element: None,
+            forced_pseudo_classes: BTreeMap::new(),
             pointer_modality: false,
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
@@ -2990,6 +2993,7 @@ impl ScriptRuntime {
                 .focused_element
                 .is_some_and(|node| !self.pointer_modality || self.is_text_control(node)),
             active: self.active_node,
+            forced: self.forced_pseudo_classes.clone(),
             scroll_offsets: self.scroll_offsets.clone(),
             control_values: self.control_values.clone().into_iter().collect(),
             text_selections: self
