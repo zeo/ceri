@@ -1031,6 +1031,7 @@ struct Painted {
     scale: f32,
     fonts: Rc<FontSet>,
     canvas: Arc<Canvas>,
+    planes: bool,
 }
 
 // everything a layout is a pure function of
@@ -2821,6 +2822,18 @@ impl Browser {
         viewport: Size,
         device_pixel_ratio: f32,
     ) -> Result<Arc<Canvas>, NavigationError> {
+        self.paint_planes(viewport, device_pixel_ratio, false)
+            .map(|(canvas, _)| canvas)
+    }
+
+    // with planes, a video a presenter can show under the canvas comes back as its frame and
+    // where it goes, and the canvas leaves its box transparent
+    pub(crate) fn paint_planes(
+        &self,
+        viewport: Size,
+        device_pixel_ratio: f32,
+        planes: bool,
+    ) -> Result<(Arc<Canvas>, Vec<crate::paint::PlaneFrame>), NavigationError> {
         let layout = self.layout(viewport)?;
         let canvases = self
             .page
@@ -2835,9 +2848,15 @@ impl Browser {
         let mut painted = self.painted.borrow_mut();
         let damage = match painted.as_ref() {
             Some(last)
-                if last.scale == device_pixel_ratio && Rc::ptr_eq(&last.fonts, &self.fonts) =>
+                if last.scale == device_pixel_ratio
+                    && last.planes == planes
+                    && Rc::ptr_eq(&last.fonts, &self.fonts) =>
             {
-                crate::paint::damage((&last.layout, &last.canvases), (&layout, &canvases))
+                crate::paint::damage(
+                    (&last.layout, &last.canvases),
+                    (&layout, &canvases),
+                    last.canvas.planes(),
+                )
             }
             _ => crate::paint::Damage::Everything,
         };
@@ -2851,16 +2870,28 @@ impl Browser {
                 &layout,
                 &canvases,
                 device_pixel_ratio,
+                planes,
             )),
         };
+        let shown = canvas
+            .planes()
+            .iter()
+            .filter_map(|plane| {
+                let layer = canvases
+                    .iter()
+                    .find(|layer| layer.node == plane.node && layer.background.is_none())?;
+                Some((plane.clone(), layer.image.clone()))
+            })
+            .collect();
         *painted = Some(Painted {
             layout,
             canvases,
             scale: device_pixel_ratio,
             fonts: self.fonts.clone(),
             canvas: canvas.clone(),
+            planes,
         });
-        Ok(canvas)
+        Ok((canvas, shown))
     }
 
     pub fn describe(&self, viewport: Size) -> Result<String, NavigationError> {
@@ -2895,7 +2926,7 @@ impl Browser {
     }
 
     // decodes an image reference once per document, from data: URLs or app-origin resources
-    fn image_for(&self, page: &Page, base: &AppUrl, reference: &str) -> Option<Rc<Image>> {
+    fn image_for(&self, page: &Page, base: &AppUrl, reference: &str) -> Option<Arc<Image>> {
         let reference = reference.trim();
         let key = crate::script::image_key(base, reference)?;
         if let Some(cached) = page.runtime.image_cache().borrow().get(&key) {
@@ -2917,7 +2948,7 @@ impl Browser {
                     crate::image::decode_image(resource.body(), &resource.mime_type).ok()
                 })
         }
-        .map(Rc::new);
+        .map(Arc::new);
         page.runtime
             .image_cache()
             .borrow_mut()
@@ -6259,6 +6290,82 @@ mod tests {
             })
             .expect("page should paint");
         assert_eq!(pixel_at(&canvas, 20, 10), [180, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_playing_video_shown_as_a_plane_leaves_its_box_clear_and_new_frames_unpainted() {
+        let mut resources = bundle(
+            r#"<video id="v" src="/reel.mp4" muted style="display: block; width: 40px; height: 20px"></video><div id="cover" style="position: absolute; left: 8px; top: 8px; width: 10px; height: 10px; background: rgba(0, 0, 255, 0.6)"></div><p id="status"></p><script>
+                const v = document.getElementById("v");
+                v.onplaying = () => document.getElementById("status").textContent = "playing";
+                v.play();
+            </script>"#,
+        );
+        resources
+            .insert("/reel.mp4", "video/mp4", b"reel".to_vec())
+            .expect("video should be accepted");
+        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(Reel));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("video page should load");
+        assert_eq!(play_until_status(&mut browser), "playing");
+        let viewport = Size {
+            width: 100.0,
+            height: 60.0,
+        };
+        let (canvas, planes) = browser
+            .paint_planes(viewport, 1.0, true)
+            .expect("page should paint");
+        let [(plane, frame)] = &planes[..] else {
+            panic!("the video should be one plane, not {}", planes.len());
+        };
+        assert_eq!(
+            (plane.size, plane.bounds, plane.origin, plane.scale),
+            ((4, 2), [0, 0, 40, 20], (0.0, 0.0), (10.0, 10.0))
+        );
+        assert_eq!(pixel_at(&canvas, 30, 15), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&canvas, 10, 10), [0, 0, 153, 153]);
+        assert_eq!(pixel_at(&canvas, 60, 20)[3], 255);
+        let mut next = None;
+        for _ in 0..2000 {
+            browser.pump().expect("media should pump");
+            browser.advance_time(16).expect("tasks should run");
+            let (again, planes) = browser
+                .paint_planes(viewport, 1.0, true)
+                .expect("page should paint");
+            if planes
+                .first()
+                .is_some_and(|(_, image)| !Arc::ptr_eq(image, frame))
+            {
+                next = Some((again, planes));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (again, planes) = next.expect("a new frame should arrive");
+        assert_eq!(again.revision(), canvas.revision());
+        assert_eq!(planes[0].0, *plane);
+        let document = browser.document().expect("document");
+        let cover = document
+            .borrow()
+            .find_element_by_id("cover")
+            .expect("cover");
+        document.borrow_mut().set_attribute(
+            cover,
+            "style",
+            "position: absolute; left: 8px; top: 8px; width: 10px; height: 10px; background: rgba(255, 0, 0, 0.6)".to_string(),
+        );
+        let (covered, planes) = browser
+            .paint_planes(viewport, 1.0, true)
+            .expect("page should paint");
+        assert_ne!(covered.revision(), canvas.revision());
+        assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].0, *plane);
+        assert_eq!(pixel_at(&covered, 10, 10), [153, 0, 0, 153]);
+        assert_eq!(pixel_at(&covered, 30, 15), [0, 0, 0, 0]);
+        let painted = browser.paint(viewport).expect("page should paint");
+        assert_eq!(pixel_at(&painted, 30, 15)[3], 255);
+        assert_ne!(pixel_at(&painted, 30, 15)[0], 0);
     }
 
     #[test]

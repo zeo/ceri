@@ -33,6 +33,28 @@ pub struct Canvas {
     // coverage
     masks: Vec<Mask>,
     revision: Revision,
+    // video frames a presenter shows under this surface, which leaves their boxes transparent;
+    // none where every frame is painted in
+    planes: Option<Vec<Plane>>,
+}
+
+// a video frame shown under the canvas: the node whose frame it is, the frame size it was
+// fitted at, the device box it shows in, where the frame's corner lands and how many device
+// pixels one frame pixel spans
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Plane {
+    pub(crate) node: crate::dom::NodeId,
+    pub(crate) size: (u32, u32),
+    pub(crate) bounds: [u32; 4],
+    pub(crate) origin: (f32, f32),
+    pub(crate) scale: (f32, f32),
+}
+
+// a plane with the frame it shows
+pub(crate) type PlaneFrame = (Plane, std::sync::Arc<Image>);
+
+fn overlaps(one: [u32; 4], other: [u32; 4]) -> bool {
+    one[0] < other[2] && other[0] < one[2] && one[1] < other[3] && other[1] < one[3]
 }
 
 // numbers what a canvas shows, so a presenter that holds the pixels numbered before can upload
@@ -130,11 +152,16 @@ impl Canvas {
                 id: next_revision(),
                 changed: None,
             },
+            planes: None,
         }
     }
 
     pub(crate) fn revision(&self) -> Revision {
         self.revision
+    }
+
+    pub(crate) fn planes(&self) -> &[Plane] {
+        self.planes.as_deref().unwrap_or_default()
     }
 
     pub fn scale(&self) -> f32 {
@@ -295,7 +322,19 @@ impl Canvas {
         if color.alpha == 0 {
             return;
         }
-        if glyph.subpixels && lcd && self.opaque {
+        // a glyph over a plane blends over transparent pixels, which subpixel blending cannot
+        let over_plane = self.planes().iter().any(|plane| {
+            overlaps(
+                plane.bounds,
+                [
+                    x.max(0) as u32,
+                    y.max(0) as u32,
+                    (x + glyph.width as i32).max(0) as u32,
+                    (y + glyph.height as i32).max(0) as u32,
+                ],
+            )
+        });
+        if glyph.subpixels && lcd && self.opaque && !over_plane {
             self.blend_subpixels(x, y, glyph, color, clip);
             return;
         }
@@ -680,6 +719,7 @@ impl Canvas {
             nudge: (0.0, 0.0),
             masks: Vec::new(),
             revision: Revision::default(),
+            planes: None,
         }
     }
 
@@ -989,6 +1029,7 @@ impl Canvas {
             nudge: self.nudge,
             masks: Vec::new(),
             revision: Revision::default(),
+            planes: None,
         }
     }
 
@@ -1020,6 +1061,7 @@ impl Canvas {
             nudge: self.nudge,
             masks: Vec::new(),
             revision: Revision::default(),
+            planes: None,
         }
     }
 
@@ -2065,15 +2107,17 @@ fn overflow_mask(canvas: &Canvas, layout_box: &LayoutBox, rect: Rect) -> Option<
 }
 
 pub(crate) fn paint(document: &LayoutDocument) -> Canvas {
-    paint_with_canvases(document, &[], 1.0)
+    paint_with_canvases(document, &[], 1.0, false)
 }
 
 // canvas elements reach paint as image layers of their own, so drawing on one repaints it
-// without a new layout
+// without a new layout; with planes a video a presenter can show under the canvas leaves a
+// transparent box instead, unless a backdrop filter would read through it
 pub(crate) fn paint_with_canvases(
     document: &LayoutDocument,
     canvases: &[ImageLayer],
     scale: f32,
+    planes: bool,
 ) -> Canvas {
     let layers;
     let images = if canvases.is_empty() {
@@ -2093,6 +2137,9 @@ pub(crate) fn paint_with_canvases(
         scale,
         BASE,
     );
+    if planes && !has_backdrop(&document.root) {
+        canvas.planes = Some(Vec::new());
+    }
     paint_document(&mut canvas, document, images, None);
     canvas
 }
@@ -2107,10 +2154,12 @@ pub(crate) enum Damage {
     Everything,
 }
 
-// compares the layout and layers a frame was painted from with the next frame's
+// compares the layout and layers a frame was painted from with the next frame's; a new frame
+// of a video shown as one of planes changes nothing painted while its size holds
 pub(crate) fn damage(
     before: (&LayoutDocument, &[ImageLayer]),
     after: (&LayoutDocument, &[ImageLayer]),
+    planes: &[Plane],
 ) -> Damage {
     let ((old, old_canvases), (new, new_canvases)) = (before, after);
     if old.viewport != new.viewport || old.prose_selections != new.prose_selections {
@@ -2130,7 +2179,10 @@ pub(crate) fn damage(
         if before.node != after.node || before.background != after.background {
             return Damage::Everything;
         }
-        if !std::rc::Rc::ptr_eq(&before.image, &after.image) {
+        let shown = planes.iter().any(|plane| {
+            plane.node == after.node && plane.size == (after.image.width, after.image.height)
+        });
+        if !std::sync::Arc::ptr_eq(&before.image, &after.image) && !shown {
             redrawn.push(after.node);
         }
     }
@@ -2275,6 +2327,11 @@ pub(crate) fn repaint(
     for row in reach.top as usize..reach.bottom as usize {
         saved.extend_from_slice(&canvas.pixels[line(row)]);
     }
+    let kept_box = [kept.left, kept.top, kept.right, kept.bottom];
+    let before = canvas.planes.clone();
+    if let Some(planes) = &mut canvas.planes {
+        planes.retain(|plane| !overlaps(plane.bounds, kept_box));
+    }
     canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, BASE);
     let layers = document
         .images
@@ -2295,6 +2352,15 @@ pub(crate) fn repaint(
             after.copy_from_slice(before);
         }
     }
+    if let Some(before) = before {
+        match settled_planes(&before, canvas.planes.take().unwrap_or_default(), kept_box) {
+            Some(planes) => canvas.planes = Some(planes),
+            None => {
+                *canvas = paint_with_canvases(document, canvases, scale, true);
+                return;
+            }
+        }
+    }
     canvas.revision = Revision {
         id: next_revision(),
         changed: Some((
@@ -2302,6 +2368,45 @@ pub(crate) fn repaint(
             [kept.left, kept.top, kept.right, kept.bottom],
         )),
     };
+}
+
+// the planes after a repaint of the kept box: one found again reaching past the box keeps the
+// box it had, since only its part inside was repainted; none when a plane appeared, changed
+// or went away where pixels outside the box still show the frame before, or when two overlap
+fn settled_planes(before: &[Plane], found: Vec<Plane>, kept: [u32; 4]) -> Option<Vec<Plane>> {
+    let inside = |bounds: [u32; 4]| {
+        bounds[0] >= kept[0] && bounds[1] >= kept[1] && bounds[2] <= kept[2] && bounds[3] <= kept[3]
+    };
+    let lost = before.iter().any(|plane| {
+        overlaps(plane.bounds, kept) && !found.iter().any(|again| again.node == plane.node)
+    });
+    if lost {
+        return None;
+    }
+    let planes = found
+        .into_iter()
+        .map(|plane| {
+            if inside(plane.bounds) {
+                return Some(plane);
+            }
+            before
+                .iter()
+                .find(|old| {
+                    **old
+                        == Plane {
+                            bounds: old.bounds,
+                            ..plane.clone()
+                        }
+                })
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let overlapping = planes.iter().enumerate().any(|(at, plane)| {
+        planes[at + 1..]
+            .iter()
+            .any(|other| overlaps(plane.bounds, other.bounds))
+    });
+    (!overlapping).then_some(planes)
 }
 
 fn paint_document(
@@ -2908,6 +3013,7 @@ fn paint_box_surface(
                 clip: content_clip,
                 opacity,
                 repeat: (false, false),
+                video: (layout_box.tag == "video").then_some(layout_box.node),
             },
         );
     }
@@ -2984,6 +3090,7 @@ fn paint_svg(
             clip,
             opacity,
             repeat: (false, false),
+            video: None,
         },
     );
 }
@@ -3059,6 +3166,7 @@ fn paint_layers(
                         clip,
                         opacity,
                         repeat,
+                        video: None,
                     },
                 );
             }
@@ -3532,7 +3640,7 @@ fn fill_arrow(
 }
 
 // an image mapped onto `placement` in layout space and painted only inside `area`,
-// tiled across the area along the axes that repeat
+// tiled across the area along the axes that repeat; a video's frame may become a plane
 struct ImageDraw<'a> {
     image: &'a Image,
     placement: Rect,
@@ -3540,6 +3648,7 @@ struct ImageDraw<'a> {
     clip: Option<Rect>,
     opacity: f32,
     repeat: (bool, bool),
+    video: Option<crate::dom::NodeId>,
 }
 
 fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
@@ -3550,6 +3659,7 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         clip,
         opacity,
         repeat,
+        video,
     } = draw;
     if placement.width <= 0.0
         || placement.height <= 0.0
@@ -3608,6 +3718,36 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         image.width as f32 / (placement.width * scale),
         image.height as f32 / (placement.height * scale),
     );
+    let device = [left, top, right, bottom];
+    // a plane goes under a transparent box, so nothing may scale what shows through it, and
+    // planes never overlap, which keeps their order out of the presenter
+    if let Some(node) = video
+        && !rounded
+        && opacity >= 1.0
+        && canvas.masks.is_empty()
+        && let Some(planes) = &mut canvas.planes
+        && !planes
+            .iter()
+            .any(|plane| plane.node != node && overlaps(plane.bounds, device))
+    {
+        planes.retain(|plane| plane.node != node);
+        if left >= right || top >= bottom {
+            return;
+        }
+        planes.push(Plane {
+            node,
+            size: (image.width, image.height),
+            bounds: device,
+            origin,
+            scale: (1.0 / step.0, 1.0 / step.1),
+        });
+        let stride = canvas.width as usize * 4;
+        for row in top as usize..bottom as usize {
+            canvas.pixels[row * stride + left as usize * 4..row * stride + right as usize * 4]
+                .fill(0);
+        }
+        return;
+    }
     // whole-pixel placement at the image's own resolution copies pixels directly
     let aligned = (step.0 - 1.0).abs() < 1e-4
         && (step.1 - 1.0).abs() < 1e-4
@@ -4516,12 +4656,12 @@ mod tests {
             for (before, after) in frames {
                 let old = damage_layout(before, scrolled);
                 let new = damage_layout(after, scrolled);
-                let Damage::Area(area) = damage((&old, &[]), (&new, &[])) else {
+                let Damage::Area(area) = damage((&old, &[]), (&new, &[]), &[]) else {
                     panic!("{after} should damage an area");
                 };
-                let mut canvas = paint_with_canvases(&old, &[], scale);
+                let mut canvas = paint_with_canvases(&old, &[], scale, false);
                 repaint(&mut canvas, &new, &[], area);
-                let whole = paint_with_canvases(&new, &[], scale);
+                let whole = paint_with_canvases(&new, &[], scale, false);
                 let width = whole.width() as usize;
                 let differing = canvas
                     .rgba_pixels()
@@ -4546,7 +4686,7 @@ mod tests {
     fn damage_falls_back_to_the_whole_frame_where_it_cannot_bound_a_change() {
         let base = damage_layout("", 0.0);
         assert_eq!(
-            damage((&base, &[]), (&damage_layout("", 0.0), &[])),
+            damage((&base, &[]), (&damage_layout("", 0.0), &[]), &[]),
             Damage::Nothing
         );
         for change in [
@@ -4555,7 +4695,7 @@ mod tests {
             "#words { backdrop-filter: blur(1px) }",
         ] {
             assert_eq!(
-                damage((&base, &[]), (&damage_layout(change, 0.0), &[])),
+                damage((&base, &[]), (&damage_layout(change, 0.0), &[]), &[]),
                 Damage::Everything,
                 "{change}"
             );

@@ -110,6 +110,12 @@ pub struct Frame {
     pub scale: f32,
     pub title: Option<String>,
     pub canvas: std::sync::Arc<Canvas>,
+    // video frames to show under the canvas where it leaves them transparent
+    #[cfg_attr(
+        not(all(feature = "windowed", target_os = "windows")),
+        expect(dead_code)
+    )]
+    pub(crate) planes: Vec<crate::paint::PlaneFrame>,
 }
 
 pub struct EngineHost {
@@ -128,6 +134,8 @@ pub struct EngineHost {
     region_press: bool,
     // where a primary press on a draggable element began, until it moves far enough to drag
     drag_press: Option<(f32, f32, crate::dom::NodeId)>,
+    // the frames go to a presenter that can show videos under the canvas
+    planes: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +188,8 @@ enum EngineWorkerCommand {
     Navigate { request_id: u64, url: String },
     Input { request_id: u64, event: InputEvent },
     Render { request_id: u64 },
+    // the frames go to a presenter that shows videos under the canvas
+    Planes,
     Accessibility { request_id: u64 },
     NavigationFailure { request_id: u64 },
     // work arrived from another thread
@@ -299,6 +309,10 @@ impl EngineWorker {
         let request_id = self.next_request();
         self.queue(EngineWorkerCommand::Render { request_id })?;
         Ok(request_id)
+    }
+
+    pub(crate) fn show_planes(&mut self) -> Result<(), String> {
+        self.queue(EngineWorkerCommand::Planes)
     }
 
     pub fn accessibility_tree(&mut self) -> Result<u64, String> {
@@ -527,6 +541,11 @@ fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineW
             request_id,
             result: host.render(),
         },
+        EngineWorkerCommand::Planes => {
+            host.planes = true;
+            host.dirty = true;
+            return None;
+        }
         EngineWorkerCommand::Accessibility { request_id } => EngineWorkerEvent::Accessibility {
             request_id,
             tree: host.accessibility_tree(),
@@ -570,6 +589,7 @@ impl EngineHost {
             last_press: None,
             region_press: false,
             drag_press: None,
+            planes: false,
         }
     }
 
@@ -883,13 +903,16 @@ impl EngineHost {
         if !self.dirty {
             return Ok(None);
         }
-        let canvas = self.browser.paint_scaled(self.viewport, self.scale)?;
+        let (canvas, planes) = self
+            .browser
+            .paint_planes(self.viewport, self.scale, self.planes)?;
         let frame = Frame {
             sequence: self.next_frame,
             viewport: self.viewport,
             scale: self.scale,
             title: self.browser.title(),
             canvas,
+            planes,
         };
         self.next_frame = self.next_frame.saturating_add(1);
         self.dirty = false;

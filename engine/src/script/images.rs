@@ -6,7 +6,7 @@ use super::*;
 use crate::dom::Namespace;
 use crate::image::Image;
 
-pub(crate) type ImageCache = RefCell<HashMap<String, Option<Rc<Image>>>>;
+pub(crate) type ImageCache = RefCell<HashMap<String, Option<Arc<Image>>>>;
 
 #[derive(Default)]
 pub(super) struct ImageLoad {
@@ -124,7 +124,7 @@ impl ScriptRuntime {
     }
 
     // decodes once per document; a failure is tried again on the next request for it
-    fn decoded_image(&mut self, url: &str) -> Option<Rc<Image>> {
+    fn decoded_image(&mut self, url: &str) -> Option<Arc<Image>> {
         if let Some(Some(image)) = self.images.borrow().get(url) {
             return Some(image.clone());
         }
@@ -158,7 +158,7 @@ impl ScriptRuntime {
                 })
             }
         }
-        .map(Rc::new);
+        .map(Arc::new);
         self.images
             .borrow_mut()
             .insert(url.to_string(), decoded.clone());
@@ -167,7 +167,7 @@ impl ScriptRuntime {
 
     // the decoded picture drawImage reads; Err when the load it made failed, which leaves
     // the element broken rather than merely empty
-    pub(super) fn image_content(&self, node: NodeId) -> Result<Option<Rc<Image>>, ()> {
+    pub(super) fn image_content(&self, node: NodeId) -> Result<Option<Arc<Image>>, ()> {
         let Some(load) = self.image_loads.get(&node).filter(|load| !load.pending) else {
             return Ok(None);
         };

@@ -184,7 +184,7 @@ pub struct LayoutDocument {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ImageLayer {
     pub(crate) node: NodeId,
-    pub(crate) image: std::rc::Rc<Image>,
+    pub(crate) image: std::sync::Arc<Image>,
     // the CSS background url this decodes, rather than the element's own content
     pub(crate) background: Option<crate::image::ImageSource>,
 }

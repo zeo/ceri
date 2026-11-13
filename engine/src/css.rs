@@ -516,7 +516,9 @@ impl Cursor {
     }
 }
 
+// four bytes in this order, so a frame of colours uploads as RGBA pixels
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
 pub struct Color {
     pub red: u8,
     pub green: u8,

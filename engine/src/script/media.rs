@@ -55,7 +55,7 @@ struct MediaElement {
     volume: f64,
     muted: Option<bool>,
     preserves_pitch: bool,
-    frame: Option<Rc<Image>>,
+    frame: Option<Arc<Image>>,
     frame_time: f64,
     // a frame came since the last load or seek
     shown: bool,
@@ -203,7 +203,7 @@ impl MediaElement {
             if state.reached == self.seek {
                 let time = self.current_time(now);
                 if let Some((at, image)) = state.take_frame(time, !self.shown) {
-                    self.frame = Some(Rc::new(image));
+                    self.frame = Some(Arc::new(image));
                     self.frame_time = at;
                     self.shown = true;
                     step.frames += 1;
@@ -420,7 +420,7 @@ impl ScriptRuntime {
     }
 
     // the frame drawImage reads, None before one arrives
-    pub(super) fn video_content(&self, node: NodeId) -> Option<Rc<Image>> {
+    pub(super) fn video_content(&self, node: NodeId) -> Option<Arc<Image>> {
         self.media.elements.get(&node)?.frame.clone()
     }
 

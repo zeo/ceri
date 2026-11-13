@@ -32,6 +32,14 @@ enum Output {
 }
 
 impl Output {
+    fn composed(&self) -> bool {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Composition(_) => true,
+            Self::Software(..) => false,
+        }
+    }
+
     fn open(context: &Context<OwnedDisplayHandle>, window: &Rc<Window>) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         {
@@ -69,6 +77,7 @@ impl Output {
                 (frame.canvas.width(), frame.canvas.height()),
                 (width.get(), height.get()),
                 Some(frame.canvas.revision()),
+                &frame.planes,
             ),
             Self::Software(surface, shown) => {
                 let revision = frame.canvas.revision();
@@ -123,6 +132,7 @@ impl Output {
                 (1, 1),
                 (width.get(), height.get()),
                 None,
+                &[],
             ),
             Self::Software(surface, shown) => {
                 *shown = None;
@@ -796,6 +806,7 @@ impl AppWindow {
         self.applied_title = Some(self.config.title.clone());
         self.window = Some(window);
         self.output = Some(output);
+        self.announce_planes();
         let scale = self.window_scale();
         if scale != self.scale {
             self.submit(InputEvent::ScaleChanged(scale));
@@ -1103,6 +1114,15 @@ impl AppWindow {
         }
     }
 
+    // a composition presenter shows videos under the canvas, so the engine stops painting them
+    fn announce_planes(&mut self) {
+        if self.output.as_ref().is_some_and(Output::composed)
+            && let Err(error) = self.worker.show_planes()
+        {
+            eprintln!("ceri: videos stay painted into the page, {error}");
+        }
+    }
+
     // one restart, then the engine's own recovery document
     fn recover(&mut self, detail: &str) -> bool {
         self.restarts = self.restarts.saturating_add(1);
@@ -1121,6 +1141,7 @@ impl AppWindow {
                 }
                 eprintln!("ceri: the engine restarted after {detail}");
                 self.worker = worker;
+                self.announce_planes();
                 self.navigation_pending = !recovering;
                 self.render_request = None;
                 self.latest_frame = None;
@@ -1677,6 +1698,7 @@ mod tests {
                 3,
                 crate::css::Color::opaque(1, 2, 3),
             )),
+            planes: Vec::new(),
         };
         let mut buffer = vec![7; 5 * 3];
         present_frame(&frame, (5, 3), [1, 1, 3, 2], &mut buffer);

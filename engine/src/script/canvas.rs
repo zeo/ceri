@@ -32,7 +32,7 @@ pub(super) struct CanvasContextData {
     fill_style: Color,
     bitmap: Bitmap,
     // the bitmap as paint reads it, rebuilt after the next change
-    snapshot: Option<Rc<Image>>,
+    snapshot: Option<std::sync::Arc<Image>>,
 }
 
 fn mul255(a: u32, b: u32) -> u32 {
@@ -373,7 +373,7 @@ impl ScriptRuntime {
                 if bitmap.pixels.is_empty() || !document.is_connected(*node) {
                     return None;
                 }
-                let image = snapshot.get_or_insert_with(|| Rc::new(bitmap.to_image()));
+                let image = snapshot.get_or_insert_with(|| std::sync::Arc::new(bitmap.to_image()));
                 Some(ImageLayer {
                     node: *node,
                     image: image.clone(),
