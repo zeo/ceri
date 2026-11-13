@@ -23,10 +23,26 @@ Install Rust and the native toolchain for the target platform. Nothing else is n
 ```powershell
 cargo test --all-targets
 cargo test --release -p ceri-engine --test test262 -- --ignored
-cargo run --bin ceri_bundle -- --release --output dist\windows-x64
+cargo run --release --bin ceri_bundle -- --output dist\windows-x64
 ```
 
-The generated bundle holds `ceri.exe` and an `assets` directory. Launch the executable; it resolves its asset root next to itself.
+The bundler builds whichever app it is pointed at with `--project`, the current directory by default, and reads that app's `ceri.json`:
+
+```json
+{
+  "identifier": "Ceri",
+  "name": "Ceri",
+  "binary": "ceri",
+  "publisher": "Ceri contributors",
+  "icons": ["icons/app.ico", "icons/128x128.png", "web/favicon.svg"],
+  "resources": { "web": "assets/web", "sdk": "assets/sdk" },
+  "signCommand": ["signtool", "sign", "/fd", "SHA256", "/a", "{file}"]
+}
+```
+
+Only `identifier` is required. `name` defaults to the Cargo package name, `binary` to its only binary, and `publisher` to its first author. `resources` copies files or directories into the app folder, which is where the runtime looks for its `assets`. `signCommand` runs on each executable the bundle ships, with `{file}` replaced by its path.
+
+The output folder holds `app/`, the executable with its resources, which runs where it is. On Windows it also holds `<name>_<version>_x64-setup.exe`, a per-user installer that needs no administrator rights: it installs to `%LOCALAPPDATA%\Programs\<name>`, adds a Start menu entry and an entry under Installed apps, and takes `/S` to install silently. The uninstaller removes what the runtime registered under the identifier as well: notifications, start at login and URL schemes. On Linux the folder holds `<package>_<version>_amd64.deb`, which installs the app under `/usr/lib/<package>` with a desktop entry and the PNG and SVG icons.
 
 Render one frame of the packaged app without opening a window, which is what CI checks on every push:
 

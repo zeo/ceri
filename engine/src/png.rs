@@ -453,7 +453,7 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut table = [0_u32; 256];

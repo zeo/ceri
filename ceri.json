@@ -1,0 +1,10 @@
+{
+  "identifier": "Ceri",
+  "name": "Ceri",
+  "binary": "ceri",
+  "icons": ["web/favicon.svg"],
+  "resources": {
+    "web": "assets/web",
+    "sdk": "assets/sdk"
+  }
+}

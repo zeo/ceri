@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 mod resources;
-pub use resources::{Resources, resources};
+pub use resources::{Resources, resource_entries, resources};
 
 // from an app's build script: compiles every file under the folder into the app, where
 // ceri::embedded_assets!() hands them to App::assets

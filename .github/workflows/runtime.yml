@@ -56,7 +56,7 @@ jobs:
             "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target/app.png"
           test -s target/app.png
       - name: bundle
-        run: cargo run --locked --bin ceri_bundle -- --output dist/ci
+        run: cargo run --locked --bin ceri_bundle -- --debug --output dist/ci
     strategy:
       fail-fast: false
       matrix:

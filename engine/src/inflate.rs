@@ -4,7 +4,7 @@
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum InflateError {
+pub enum InflateError {
     Truncated,
     Invalid(&'static str),
     TooLarge,
@@ -344,7 +344,7 @@ pub(crate) fn inflate(data: &[u8], limit: usize) -> Result<(Vec<u8>, usize), Inf
     }
 }
 
-pub(crate) fn zlib_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, InflateError> {
+pub fn zlib_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, InflateError> {
     let [method, flags, ..] = *data else {
         return Err(InflateError::Truncated);
     };

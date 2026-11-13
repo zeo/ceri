@@ -56,7 +56,7 @@ impl Writer {
     }
 }
 
-pub(crate) fn zlib_compress(data: &[u8]) -> Vec<u8> {
+pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
     let mut writer = Writer::default();
     writer.bytes.extend_from_slice(&[0x78, 0x9c]);
     let mut block = Vec::with_capacity(BLOCK_SYMBOLS);
@@ -73,6 +73,16 @@ pub(crate) fn zlib_compress(data: &[u8]) -> Vec<u8> {
     writer.align();
     writer.bytes.extend_from_slice(&adler32(data).to_be_bytes());
     writer.bytes
+}
+
+// a gzip member (RFC 1952) around the same deflate stream, with no name or timestamp
+pub fn gzip(data: &[u8]) -> Vec<u8> {
+    let zlib = zlib_compress(data);
+    let mut member = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    member.extend_from_slice(&zlib[2..zlib.len() - 4]);
+    member.extend(crate::png::crc32(data).to_le_bytes());
+    member.extend((data.len() as u32).to_le_bytes());
+    member
 }
 
 fn hash(data: &[u8], at: usize) -> usize {
@@ -465,6 +475,18 @@ fn write_block(writer: &mut Writer, symbols: &[Symbol], raw: &[u8], last: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gzip_member_wraps_the_deflate_stream_with_its_crc_and_length() {
+        let text = b"debian packages are gzipped tars, ".repeat(300);
+        let member = gzip(&text);
+        assert_eq!(member[..4], [0x1f, 0x8b, 8, 0]);
+        let (inflated, used) = crate::inflate::inflate(&member[10..], text.len()).unwrap();
+        assert_eq!(inflated, text);
+        let trailer = &member[10 + used..];
+        assert_eq!(trailer[..4], crate::png::crc32(&text).to_le_bytes());
+        assert_eq!(trailer[4..], (text.len() as u32).to_le_bytes());
+    }
 
     #[test]
     fn streams_inflate_back_to_their_input() {

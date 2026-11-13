@@ -58,6 +58,7 @@ pub use bridge::{
     Capabilities, CommandCall, CommandError, CommandReply, CommandResult, CommandRouter, Grant,
 };
 pub use css::{Color, ColorScheme, Cursor, Display, Stylesheet};
+pub use deflate::{gzip, zlib_compress};
 pub use dom::{
     AccessibilityNode, Document, DomError, Element, Namespace, NodeId, NodeKind, ParseError,
     ScriptSource, StylesheetSource,
@@ -70,6 +71,7 @@ pub use host::{
     PointerButton, RegionPress,
 };
 pub use image::{icon_png, rasterize_icon};
+pub use inflate::{InflateError, zlib_decompress};
 pub use layout::{LayoutDocument, Rect, Size, ThumbDrag, layout};
 #[cfg(feature = "native-http")]
 pub use native_http::{NativeHttpProvider, request_external};

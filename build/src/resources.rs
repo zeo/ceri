@@ -6,13 +6,21 @@ const RT_VERSION: u16 = 16;
 const RT_MANIFEST: u16 = 24;
 const EN_US: u16 = 0x0409;
 
-// the manifest tauri-build embeds by default, so dialogs draw with common controls v6
+// the manifest tauri-build embeds by default, so dialogs draw with common controls v6, and an
+// as-invoker level so windows never guesses from a name like setup.exe that it needs elevation
 const MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
     </dependentAssembly>
   </dependency>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
 </assembly>
 "#;
 
@@ -57,15 +65,30 @@ fn res(resources: &Resources, icon: Option<&[u8]>, name: &str, version: &str) ->
     // every .res file opens with an empty entry that marks it as 32-bit
     let mut file = vec![0, 0, 0, 0, 32, 0, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0];
     file.resize(32, 0);
+    for (kind, id, data) in resource_entries(resources, icon, name, version) {
+        entry(&mut file, kind, id, &data);
+    }
+    file
+}
+
+// the resources as (type, id, data) in US English, which is also what the bundler writes into
+// a setup executable that is already linked
+pub fn resource_entries(
+    resources: &Resources,
+    icon: Option<&[u8]>,
+    name: &str,
+    version: &str,
+) -> Vec<(u16, u16, Vec<u8>)> {
+    let mut entries = Vec::new();
     if let Some(icon) = icon {
         let images = icon_images(icon);
         let mut group = [0, 1, images.len() as u16].map(u16::to_le_bytes).concat();
-        for (id, (directory, image)) in (1..).zip(images) {
-            entry(&mut file, RT_ICON, id, image);
+        for (id, (directory, image)) in (1_u16..).zip(images) {
+            entries.push((RT_ICON, id, image.to_vec()));
             group.extend_from_slice(directory);
             group.extend(id.to_le_bytes());
         }
-        entry(&mut file, RT_GROUP_ICON, 1, &group);
+        entries.push((RT_GROUP_ICON, 1, group));
     }
     let product = resources.product_name.unwrap_or(name);
     let strings = [
@@ -83,9 +106,9 @@ fn res(resources: &Resources, icon: Option<&[u8]>, name: &str, version: &str) ->
         .into_iter()
         .filter_map(|(key, value)| Some((key, value?)))
         .collect();
-    entry(&mut file, RT_VERSION, 1, &version_info(&strings, version));
-    entry(&mut file, RT_MANIFEST, 1, MANIFEST.as_bytes());
-    file
+    entries.push((RT_VERSION, 1, version_info(&strings, version)));
+    entries.push((RT_MANIFEST, 1, MANIFEST.as_bytes().to_vec()));
+    entries
 }
 
 fn entry(file: &mut Vec<u8>, kind: u16, name: u16, data: &[u8]) {
