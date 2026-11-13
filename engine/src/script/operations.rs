@@ -1650,6 +1650,24 @@ impl ScriptRuntime {
                 }
                 Ok(entries)
             }
+            Value::Window => {
+                let mut entries = Vec::new();
+                for key in self.own_property_keys(source, false)? {
+                    if !self
+                        .own_property_of(source, &key)?
+                        .is_some_and(|property| property.enumerable)
+                    {
+                        continue;
+                    }
+                    let value = if with_values {
+                        self.window_get(&key)?
+                    } else {
+                        Value::Undefined
+                    };
+                    entries.push((key, value));
+                }
+                Ok(entries)
+            }
             other => enumerable_object_properties(other.clone()),
         }
     }
