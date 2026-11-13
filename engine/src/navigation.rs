@@ -2835,7 +2835,7 @@ impl Browser {
         planes: bool,
     ) -> Result<(Arc<Canvas>, Vec<crate::paint::PlaneFrame>), NavigationError> {
         let layout = self.layout(viewport)?;
-        let canvases = self
+        let mut canvases = self
             .page
             .as_ref()
             .map(|page| {
@@ -2860,7 +2860,7 @@ impl Browser {
             }
             _ => crate::paint::Damage::Everything,
         };
-        let canvas = match (damage, painted.take()) {
+        let mut canvas = match (damage, painted.take()) {
             (crate::paint::Damage::Nothing, Some(last)) => last.canvas,
             (crate::paint::Damage::Area(area), Some(mut last)) => {
                 crate::paint::repaint(Arc::make_mut(&mut last.canvas), &layout, &canvases, area);
@@ -2873,6 +2873,27 @@ impl Browser {
                 planes,
             )),
         };
+        let unread = |layer: &ImageLayer, canvas: &Canvas| {
+            layer.image.pixels.len() < layer.image.width as usize * layer.image.height as usize
+                && !canvas.planes().iter().any(|plane| plane.node == layer.node)
+        };
+        if let Some(page) = &self.page
+            && canvases.iter().any(|layer| unread(layer, &canvas))
+        {
+            for layer in &mut canvases {
+                if unread(layer, &canvas)
+                    && let Some(image) = page.runtime.video_content(layer.node)
+                {
+                    layer.image = image;
+                }
+            }
+            canvas = Arc::new(crate::paint::paint_with_canvases(
+                &layout,
+                &canvases,
+                device_pixel_ratio,
+                planes,
+            ));
+        }
         let shown = canvas
             .planes()
             .iter()
@@ -2880,9 +2901,13 @@ impl Browser {
                 let layer = canvases
                     .iter()
                     .find(|layer| layer.node == plane.node && layer.background.is_none())?;
-                Some((plane.clone(), layer.image.clone()))
+                let surface = self.page.as_ref()?.runtime.video_surface(plane.node);
+                Some((plane.clone(), layer.image.clone(), surface))
             })
             .collect();
+        if let Some(page) = &self.page {
+            page.runtime.mark_planes(canvas.planes());
+        }
         *painted = Some(Painted {
             layout,
             canvases,
@@ -6227,9 +6252,50 @@ mod tests {
                 width: 4,
                 height: 2,
                 bgra: [0, 0, red, 0].repeat(8),
+                surface: None,
             };
             self.0 += 1;
             Ok(Some(frame))
+        }
+    }
+
+    // the reel as a gpu decoder gives it, each frame a surface that holds its rows
+    struct SurfaceReel;
+
+    struct SurfaceReader(Box<dyn crate::VideoReader>);
+
+    struct Rows(Vec<u8>);
+
+    impl crate::VideoSurface for Rows {
+        fn shared_handle(&self) -> isize {
+            0
+        }
+
+        fn read(&self) -> Result<Vec<u8>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    impl crate::MediaDecoder for SurfaceReel {
+        fn open(&self, source: &crate::MediaSource) -> Result<Box<dyn crate::VideoReader>, String> {
+            Ok(Box::new(SurfaceReader(Reel.open(source)?)))
+        }
+    }
+
+    impl crate::VideoReader for SurfaceReader {
+        fn info(&self) -> crate::MediaInfo {
+            self.0.info()
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.0.seek(seconds)
+        }
+
+        fn read(&mut self) -> Result<Option<crate::VideoFrame>, String> {
+            Ok(self.0.read()?.map(|mut frame| {
+                frame.surface = Some(Arc::new(Rows(std::mem::take(&mut frame.bgra))));
+                frame
+            }))
         }
     }
 
@@ -6304,7 +6370,7 @@ mod tests {
         resources
             .insert("/reel.mp4", "video/mp4", b"reel".to_vec())
             .expect("video should be accepted");
-        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(Reel));
+        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(SurfaceReel));
         browser
             .navigate("https://app.ceri.invalid/")
             .expect("video page should load");
@@ -6316,7 +6382,7 @@ mod tests {
         let (canvas, planes) = browser
             .paint_planes(viewport, 1.0, true)
             .expect("page should paint");
-        let [(plane, frame)] = &planes[..] else {
+        let [(plane, frame, Some(_))] = &planes[..] else {
             panic!("the video should be one plane, not {}", planes.len());
         };
         assert_eq!(
@@ -6333,9 +6399,10 @@ mod tests {
             let (again, planes) = browser
                 .paint_planes(viewport, 1.0, true)
                 .expect("page should paint");
+            // frames decoded since the video became a plane leave their surfaces unread
             if planes
                 .first()
-                .is_some_and(|(_, image)| !Arc::ptr_eq(image, frame))
+                .is_some_and(|(_, image, _)| !Arc::ptr_eq(image, frame) && image.pixels.is_empty())
             {
                 next = Some((again, planes));
                 break;
@@ -6366,6 +6433,38 @@ mod tests {
         let painted = browser.paint(viewport).expect("page should paint");
         assert_eq!(pixel_at(&painted, 30, 15)[3], 255);
         assert_ne!(pixel_at(&painted, 30, 15)[0], 0);
+    }
+
+    #[test]
+    fn a_rounded_video_plane_gives_up_its_box_by_corner_coverage() {
+        let mut resources = bundle(
+            r#"<video id="v" src="/reel.mp4" muted style="display: block; width: 40px; height: 20px; border-radius: 10px"></video><p id="status"></p><script>
+                const v = document.getElementById("v");
+                v.onplaying = () => document.getElementById("status").textContent = "playing";
+                v.play();
+            </script>"#,
+        );
+        resources
+            .insert("/reel.mp4", "video/mp4", b"reel".to_vec())
+            .expect("video should be accepted");
+        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(Reel));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("video page should load");
+        assert_eq!(play_until_status(&mut browser), "playing");
+        let viewport = Size {
+            width: 100.0,
+            height: 60.0,
+        };
+        let (canvas, planes) = browser
+            .paint_planes(viewport, 1.0, true)
+            .expect("page should paint");
+        assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].0.bounds, [0, 0, 40, 20]);
+        assert_eq!(pixel_at(&canvas, 20, 10), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&canvas, 0, 0)[3], 255);
+        let edge = pixel_at(&canvas, 2, 3)[3];
+        assert!(0 < edge && edge < 255, "{edge}");
     }
 
     #[test]

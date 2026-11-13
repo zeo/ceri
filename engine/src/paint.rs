@@ -50,8 +50,12 @@ pub(crate) struct Plane {
     pub(crate) scale: (f32, f32),
 }
 
-// a plane with the frame it shows
-pub(crate) type PlaneFrame = (Plane, std::sync::Arc<Image>);
+// a plane with the frame it shows, and the gpu surface holding that frame when it has one
+pub(crate) type PlaneFrame = (
+    Plane,
+    std::sync::Arc<Image>,
+    Option<std::sync::Arc<dyn crate::video::VideoSurface>>,
+);
 
 fn overlaps(one: [u32; 4], other: [u32; 4]) -> bool {
     one[0] < other[2] && other[0] < one[2] && one[1] < other[3] && other[1] < one[3]
@@ -3719,12 +3723,11 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         image.height as f32 / (placement.height * scale),
     );
     let device = [left, top, right, bottom];
-    // a plane goes under a transparent box, so nothing may scale what shows through it, and
-    // planes never overlap, which keeps their order out of the presenter
+    let plain = !rounded && opacity >= 1.0 && canvas.masks.is_empty();
+    // a plane goes under its box, which the opaque canvas gives up as far as the frame would
+    // cover it, so what is drawn over blends as over a painted frame; planes never overlap,
+    // which keeps their order out of the presenter
     if let Some(node) = video
-        && !rounded
-        && opacity >= 1.0
-        && canvas.masks.is_empty()
         && let Some(planes) = &mut canvas.planes
         && !planes
             .iter()
@@ -3742,10 +3745,31 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
             scale: (1.0 / step.0, 1.0 / step.1),
         });
         let stride = canvas.width as usize * 4;
-        for row in top as usize..bottom as usize {
-            canvas.pixels[row * stride + left as usize * 4..row * stride + right as usize * 4]
-                .fill(0);
+        for row in top..bottom {
+            let start = row as usize * stride;
+            let pixels = &mut canvas.pixels[start + left as usize * 4..start + right as usize * 4];
+            if plain {
+                pixels.fill(0);
+                continue;
+            }
+            for (column, pixel) in (left..right).zip(pixels.as_chunks_mut::<4>().0) {
+                let point = (column as f32 + 0.5, row as f32 + 0.5);
+                let shape = if rounded {
+                    area_device.coverage(point)
+                } else {
+                    1.0
+                };
+                let cover = opacity * shape * mask_coverage(&canvas.masks, point);
+                let keep = 255 - (cover.clamp(0.0, 1.0) * 255.0).round() as u32;
+                for channel in pixel {
+                    *channel = (u32::from(*channel) * keep / 255) as u8;
+                }
+            }
         }
+        return;
+    }
+    // a frame left on the gpu is read back and painted once paint finds it is no plane
+    if image.pixels.len() < image.width as usize * image.height as usize {
         return;
     }
     // whole-pixel placement at the image's own resolution copies pixels directly
@@ -3773,7 +3797,6 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         .map(|pixel_x| taps(pixel_x, origin.0, step.0, image.width, repeat.0))
         .collect::<Vec<_>>();
     // with nothing to scale a pixel by, an opaque one is stored as it is
-    let plain = !rounded && opacity >= 1.0 && canvas.masks.is_empty();
     let stride = canvas.bytes_per_row();
     for pixel_y in top..bottom {
         let Some(row) = taps(pixel_y, origin.1, step.1, image.height, repeat.1) else {

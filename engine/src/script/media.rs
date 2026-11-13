@@ -9,7 +9,7 @@ use crate::dom::Namespace;
 use crate::image::Image;
 use crate::layout::ImageLayer;
 use crate::sound::Sound;
-use crate::video::{MediaDecoder, MediaInfo, MediaSource, Track};
+use crate::video::{MediaDecoder, MediaInfo, MediaSource, Picture, Track, VideoSurface};
 
 const NETWORK_EMPTY: u8 = 0;
 const NETWORK_IDLE: u8 = 1;
@@ -55,7 +55,7 @@ struct MediaElement {
     volume: f64,
     muted: Option<bool>,
     preserves_pitch: bool,
-    frame: Option<Arc<Image>>,
+    frame: Option<Picture>,
     frame_time: f64,
     // a frame came since the last load or seek
     shown: bool,
@@ -202,8 +202,8 @@ impl MediaElement {
             let mut done = false;
             if state.reached == self.seek {
                 let time = self.current_time(now);
-                if let Some((at, image)) = state.take_frame(time, !self.shown) {
-                    self.frame = Some(Arc::new(image));
+                if let Some((at, picture)) = state.take_frame(time, !self.shown) {
+                    self.frame = Some(picture);
                     self.frame_time = at;
                     self.shown = true;
                     step.frames += 1;
@@ -402,7 +402,7 @@ impl ScriptRuntime {
             .filter_map(|(node, element)| {
                 Some(ImageLayer {
                     node: *node,
-                    image: element.frame.clone()?,
+                    image: element.frame.as_ref()?.image(),
                     background: None,
                 })
             })
@@ -420,8 +420,21 @@ impl ScriptRuntime {
     }
 
     // the frame drawImage reads, None before one arrives
-    pub(super) fn video_content(&self, node: NodeId) -> Option<Arc<Image>> {
-        self.media.elements.get(&node)?.frame.clone()
+    pub(crate) fn video_content(&self, node: NodeId) -> Option<Arc<Image>> {
+        Some(self.media.elements.get(&node)?.frame.as_ref()?.pixels())
+    }
+
+    pub(crate) fn video_surface(&self, node: NodeId) -> Option<Arc<dyn VideoSurface>> {
+        self.media.elements.get(&node)?.frame.as_ref()?.surface()
+    }
+
+    // videos the last paint showed as planes have their surfaces left unread
+    pub(crate) fn mark_planes(&self, planes: &[crate::paint::Plane]) {
+        for (node, element) in &self.media.elements {
+            if let Some(track) = &element.track {
+                track.lock().planed = planes.iter().any(|plane| plane.node == *node);
+            }
+        }
     }
 
     fn queue_cues(&mut self, node: NodeId, cues: Vec<Cue>) {

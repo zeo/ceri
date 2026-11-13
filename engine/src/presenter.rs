@@ -2,17 +2,20 @@
 // canvas that changed is uploaded into a texture holding the whole frame, copied into the
 // premultiplied BGRA back buffer and presented on the display's vsync; video frames go to
 // swapchains of their own in visuals under the canvas, which the GPU scales into the boxes
-// the canvas leaves transparent
+// the canvas leaves transparent, and a frame the decoder left on the GPU is copied there
+// through a shared texture without reaching memory
 
 use crate::image::Image;
 use crate::paint::{Plane, PlaneFrame, Revision};
-use std::sync::Arc;
-use windows::Win32::Foundation::{HMODULE, HWND, RECT};
+use crate::video::VideoSurface;
+use std::sync::{Arc, Weak};
+use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR, DCOMPOSITION_BORDER_MODE_HARD,
@@ -25,7 +28,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     DXGI_PRESENT, DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
     DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
+    IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGISwapChain1,
 };
 use windows::core::Interface;
 
@@ -56,6 +59,8 @@ pub(crate) struct Presenter {
     last_box: [u32; 4],
     // the uploaded box swizzled to BGRA, kept to avoid an allocation per frame
     staging: Vec<u8>,
+    // decoder surfaces opened on this device, kept while the decoder's pool keeps them
+    opened: Vec<(Weak<dyn VideoSurface>, ID3D11Texture2D, IDXGIKeyedMutex)>,
 }
 
 // a video frame's swapchain, in a visual that places and scales it inside one that clips it
@@ -66,6 +71,8 @@ struct ShownPlane {
     swapchain: IDXGISwapChain1,
     plane: Plane,
     frame: Arc<Image>,
+    // a swapchain for surfaces is B8G8R8A8 to take a copy, one for pixels R8G8B8A8
+    surfaces: bool,
 }
 
 impl Presenter {
@@ -141,6 +148,7 @@ impl Presenter {
                 shown: None,
                 last_box: [0, 0, width, height],
                 staging: Vec::new(),
+                opened: Vec::new(),
             })
         }
     }
@@ -287,10 +295,9 @@ impl Presenter {
         let mut moved = false;
         let mut kept = Vec::with_capacity(planes.len());
         for (at, shown) in std::mem::take(&mut self.planes).into_iter().enumerate() {
-            if planes
-                .get(at)
-                .is_some_and(|(plane, _)| plane.size == shown.plane.size)
-            {
+            if planes.get(at).is_some_and(|(plane, _, surface)| {
+                plane.size == shown.plane.size && surface.is_some() == shown.surfaces
+            }) {
                 kept.push(shown);
             } else {
                 // SAFETY: the clip visual is a child of the root
@@ -300,10 +307,10 @@ impl Presenter {
             }
         }
         self.planes = kept;
-        for (at, (plane, frame)) in planes.iter().enumerate() {
+        for (at, (plane, frame, surface)) in planes.iter().enumerate() {
             let fresh = at >= self.planes.len();
             if fresh {
-                let shown = self.plane_visual(plane, frame.clone())?;
+                let shown = self.plane_visual(plane, frame.clone(), surface.is_some())?;
                 self.planes.push(shown);
             }
             let shown = &mut self.planes[at];
@@ -314,7 +321,11 @@ impl Presenter {
             }
             if fresh || !Arc::ptr_eq(&shown.frame, frame) {
                 shown.frame = frame.clone();
-                upload(&self.context, &shown.swapchain, frame)?;
+                let swapchain = shown.swapchain.clone();
+                match surface {
+                    Some(surface) => self.copy_surface(&swapchain, surface, plane.size)?,
+                    None => upload(&self.context, &swapchain, frame)?,
+                }
             }
         }
         if moved {
@@ -325,12 +336,99 @@ impl Presenter {
         Ok(())
     }
 
-    fn plane_visual(&self, plane: &Plane, frame: Arc<Image>) -> Result<ShownPlane, String> {
+    // the surface's texture goes to the back buffer on the GPU; when this device cannot open
+    // it the decoder reads it back and its rows are uploaded instead
+    fn copy_surface(
+        &mut self,
+        swapchain: &IDXGISwapChain1,
+        surface: &Arc<dyn VideoSurface>,
+        (width, height): (u32, u32),
+    ) -> Result<(), String> {
+        self.opened.retain(|(kept, ..)| kept.strong_count() > 0);
+        let known = self
+            .opened
+            .iter()
+            .position(|(kept, ..)| std::ptr::addr_eq(kept.as_ptr(), Arc::as_ptr(surface)));
+        let at = match known {
+            Some(at) => Some(at),
+            None => self.open_surface(surface).map(|opened| {
+                self.opened.push(opened);
+                self.opened.len() - 1
+            }),
+        };
+        // SAFETY: the back buffer and the opened texture are both the frame's size in
+        // B8G8R8A8, and the keyed mutex is held while the copy is queued
+        unsafe {
+            let buffer: ID3D11Texture2D = swapchain
+                .GetBuffer(0)
+                .map_err(failed("no video back buffer"))?;
+            match at {
+                Some(at) => {
+                    let (_, texture, mutex) = &self.opened[at];
+                    // windows-rs turns a timeout into success, so the wait is unbounded
+                    mutex
+                        .AcquireSync(0, u32::MAX)
+                        .map_err(failed("a video frame stayed locked"))?;
+                    self.context.CopyResource(&buffer, texture);
+                    mutex
+                        .ReleaseSync(0)
+                        .map_err(failed("a video frame could not be unlocked"))?;
+                }
+                None => {
+                    let bgra = surface.read()?;
+                    if bgra.len() < width as usize * height as usize * 4 {
+                        return Err("a video frame is short of its size".to_string());
+                    }
+                    self.context.UpdateSubresource(
+                        &buffer,
+                        0,
+                        None,
+                        bgra.as_ptr().cast(),
+                        width * 4,
+                        0,
+                    );
+                }
+            }
+            swapchain
+                .Present(1, DXGI_PRESENT(0))
+                .ok()
+                .map_err(failed("a video frame could not be presented"))
+        }
+    }
+
+    fn open_surface(
+        &self,
+        surface: &Arc<dyn VideoSurface>,
+    ) -> Option<(Weak<dyn VideoSurface>, ID3D11Texture2D, IDXGIKeyedMutex)> {
+        // SAFETY: the handle stays open while the surface lives, which outlasts the call
+        unsafe {
+            let texture: ID3D11Texture2D = self
+                .device
+                .cast::<ID3D11Device1>()
+                .ok()?
+                .OpenSharedResource1(HANDLE(surface.shared_handle() as *mut _))
+                .ok()?;
+            let mutex = texture.cast().ok()?;
+            Some((Arc::downgrade(surface), texture, mutex))
+        }
+    }
+
+    fn plane_visual(
+        &self,
+        plane: &Plane,
+        frame: Arc<Image>,
+        surfaces: bool,
+    ) -> Result<ShownPlane, String> {
+        let format = if surfaces {
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        } else {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        };
         let swapchain = swapchain_for(
             &self.factory,
             &self.device,
             plane.size,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
+            format,
             DXGI_ALPHA_MODE_IGNORE,
         )?;
         // SAFETY: plain COM calls on interfaces this presenter owns or just made
@@ -364,6 +462,7 @@ impl Presenter {
                 swapchain,
                 plane: plane.clone(),
                 frame,
+                surfaces,
             })
         }
     }

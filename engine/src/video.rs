@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::bridge::Waker;
 use crate::css::Color;
@@ -32,8 +32,61 @@ pub struct VideoFrame {
     pub time: f64,
     pub width: u32,
     pub height: u32,
-    // rows top to bottom, four bytes per pixel in blue, green, red, unused order
+    // rows top to bottom, four bytes per pixel in blue, green, red, unused order; empty when
+    // the frame comes as a surface
     pub bgra: Vec<u8>,
+    pub surface: Option<Arc<dyn VideoSurface>>,
+}
+
+// a frame left in gpu memory, which a presenter shows without its pixels crossing the cpu
+pub trait VideoSurface: Send + Sync {
+    // an nt handle to the frame as a B8G8R8A8 texture behind a keyed mutex that key 0 takes
+    fn shared_handle(&self) -> isize;
+    // the frame's rows as in VideoFrame::bgra, for when something paints it
+    fn read(&self) -> Result<Vec<u8>, String>;
+}
+
+impl std::fmt::Debug for dyn VideoSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("VideoSurface")
+    }
+}
+
+// a frame as paint and the presenter take it; a surface shown as a plane is read back only
+// when something paints it, and until then its image has a size and no pixels
+pub(crate) struct Picture {
+    image: Arc<Image>,
+    surface: Option<Arc<dyn VideoSurface>>,
+    read: OnceLock<Arc<Image>>,
+}
+
+impl Picture {
+    // the pixels at hand, none for a surface nothing has painted yet
+    pub(crate) fn image(&self) -> Arc<Image> {
+        self.read.get().unwrap_or(&self.image).clone()
+    }
+
+    pub(crate) fn pixels(&self) -> Arc<Image> {
+        let Some(surface) = self
+            .surface
+            .as_ref()
+            .filter(|_| self.image.pixels.is_empty())
+        else {
+            return self.image.clone();
+        };
+        let (width, height) = (self.image.width, self.image.height);
+        self.read
+            .get_or_init(|| {
+                let read = surface.read().ok();
+                let image = read.and_then(|bgra| to_image(width, height, &bgra));
+                Arc::new(image.unwrap_or_else(|| Image::new(width, height)))
+            })
+            .clone()
+    }
+
+    pub(crate) fn surface(&self) -> Option<Arc<dyn VideoSurface>> {
+        self.surface.clone()
+    }
 }
 
 pub trait MediaDecoder: Send + Sync {
@@ -73,17 +126,19 @@ struct Shared {
 #[derive(Default)]
 pub(crate) struct TrackState {
     pub(crate) opened: Option<Result<MediaInfo, String>>,
-    frames: VecDeque<(f64, Image)>,
+    frames: VecDeque<(f64, Picture)>,
     // the seek the frames answer, and a newer one not reached yet
     pub(crate) reached: u64,
     wanted: Option<(u64, f64)>,
     pub(crate) ended: bool,
     closed: bool,
+    // the last paint showed the frames as a plane, so a surface needs no reading back
+    pub(crate) planed: bool,
 }
 
 impl TrackState {
     // the newest frame due at time, or the first one after a seek when the seek just landed
-    pub(crate) fn take_frame(&mut self, time: f64, first: bool) -> Option<(f64, Image)> {
+    pub(crate) fn take_frame(&mut self, time: f64, first: bool) -> Option<(f64, Picture)> {
         if self.wanted.is_some() {
             return None;
         }
@@ -174,7 +229,7 @@ fn decode(
     shared.lock().opened = Some(Ok(reader.info()));
     wake();
     loop {
-        let wanted = {
+        let (wanted, planed) = {
             let mut state = shared.lock();
             while !state.closed
                 && state.wanted.is_none()
@@ -188,7 +243,7 @@ fn decode(
             if state.closed {
                 return;
             }
-            state.wanted
+            (state.wanted, state.planed)
         };
         let (frames, ended) = match wanted {
             Some((_, target)) => seek_to(&mut *reader, target, || shared.lock().wanted != wanted),
@@ -199,7 +254,7 @@ fn decode(
         };
         let frames = frames
             .into_iter()
-            .filter_map(|frame| Some((frame.time, to_image(frame)?)))
+            .filter_map(|frame| Some((frame.time, to_picture(frame, planed)?)))
             .collect::<Vec<_>>();
         let mut state = shared.lock();
         if state.wanted != wanted {
@@ -240,13 +295,37 @@ fn seek_to(
     }
 }
 
-fn to_image(frame: VideoFrame) -> Option<Image> {
-    let area = frame.width as usize * frame.height as usize;
-    if area == 0 || frame.bgra.len() < area * 4 {
+// a painted video's surface is read here, off the engine thread
+fn to_picture(frame: VideoFrame, planed: bool) -> Option<Picture> {
+    let VideoFrame {
+        width,
+        height,
+        bgra,
+        surface,
+        ..
+    } = frame;
+    let image = match &surface {
+        Some(_) if planed && width > 0 && height > 0 => Image {
+            width,
+            height,
+            pixels: Vec::new(),
+        },
+        Some(surface) if bgra.is_empty() => to_image(width, height, &surface.read().ok()?)?,
+        _ => to_image(width, height, &bgra)?,
+    };
+    Some(Picture {
+        image: Arc::new(image),
+        surface,
+        read: OnceLock::new(),
+    })
+}
+
+fn to_image(width: u32, height: u32, bgra: &[u8]) -> Option<Image> {
+    let area = width as usize * height as usize;
+    if area == 0 || bgra.len() < area * 4 {
         return None;
     }
-    let pixels = frame
-        .bgra
+    let pixels = bgra
         .as_chunks::<4>()
         .0
         .iter()
@@ -259,8 +338,8 @@ fn to_image(frame: VideoFrame) -> Option<Image> {
         .take(area)
         .collect();
     Some(Image {
-        width: frame.width,
-        height: frame.height,
+        width,
+        height,
         pixels,
     })
 }

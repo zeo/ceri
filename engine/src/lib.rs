@@ -84,7 +84,7 @@ pub use script::{
     HostBridge, HostRuntimeInfo, ScriptError, ScriptRuntime, TimeZone, seed_local_storage,
 };
 pub use sound::{AudioChunk, AudioInfo, AudioReader};
-pub use video::{MediaDecoder, MediaInfo, MediaSource, VideoFrame, VideoReader};
+pub use video::{MediaDecoder, MediaInfo, MediaSource, VideoFrame, VideoReader, VideoSurface};
 #[cfg(feature = "windowed")]
 pub use window::{
     Lifecycle, Monitor, NativeHandle, WindowAction, WindowConfig, WindowContext, WindowControl,

@@ -37,23 +37,26 @@ mod platform {
         AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
         edit_shift,
     };
+    use ceri_engine::VideoSurface;
     use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
-    use std::sync::OnceLock;
-    use windows::Win32::Foundation::{HMODULE, RECT};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, RECT};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-        D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE,
-        D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-        D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-        D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-        ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext1, ID3D11VideoDevice,
-        ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+        D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice,
+        ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext1,
+        ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+        ID3D11VideoProcessorOutputView,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
@@ -63,6 +66,9 @@ mod platform {
         DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
         DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT_B8G8R8A8_UNORM,
         DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIKeyedMutex, IDXGIResource1,
     };
     use windows::Win32::Media::MediaFoundation::{
         IMF2DBuffer, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
@@ -86,6 +92,7 @@ mod platform {
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::Threading::INFINITE;
     use windows::Win32::System::Variant::{VT_I8, VT_UI8};
     use windows::Win32::UI::Shell::SHCreateMemStream;
     use windows::core::{GUID, Interface, PCWSTR};
@@ -190,6 +197,7 @@ mod platform {
             usage: D3D11_USAGE,
             bind: u32,
             access: u32,
+            misc: u32,
         ) -> Result<ID3D11Texture2D, String> {
             let description = D3D11_TEXTURE2D_DESC {
                 Width: width,
@@ -204,7 +212,7 @@ mod platform {
                 Usage: usage,
                 BindFlags: bind,
                 CPUAccessFlags: access,
-                MiscFlags: 0,
+                MiscFlags: misc,
             };
             let mut texture = None;
             unsafe {
@@ -216,14 +224,69 @@ mod platform {
         }
     }
 
-    // turns the decoder's nv12 or p010 surfaces into bgra on the gpu, then reads the rows back
+    // turns the decoder's nv12 or p010 surfaces into bgra pictures on the gpu
     struct Converter {
         enumerator: ID3D11VideoProcessorEnumerator,
         processor: ID3D11VideoProcessor,
-        target: ID3D11Texture2D,
-        view: ID3D11VideoProcessorOutputView,
-        staging: ID3D11Texture2D,
+        // pictures the engine or presenter may still hold; one only the pool holds is free
+        pictures: Vec<Arc<Picture>>,
+        staging: Arc<Mutex<ID3D11Texture2D>>,
         size: (u32, u32),
+    }
+
+    // a converted frame in a texture the presenter opens by its handle; the keyed mutex orders
+    // the decoder's writes and reads against the presenter's copies
+    struct Picture {
+        gpu: &'static Gpu,
+        texture: ID3D11Texture2D,
+        view: ID3D11VideoProcessorOutputView,
+        mutex: IDXGIKeyedMutex,
+        handle: HANDLE,
+        // the converter's readback texture, which its pictures take turns with
+        staging: Arc<Mutex<ID3D11Texture2D>>,
+        size: (u32, u32),
+    }
+
+    // SAFETY: d3d11 resources are free threaded, and the one context they meet is multithread
+    // protected
+    unsafe impl Send for Picture {}
+    unsafe impl Sync for Picture {}
+
+    impl Drop for Picture {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateSharedHandle and is closed only here
+            let _ = unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    impl VideoSurface for Picture {
+        fn shared_handle(&self) -> isize {
+            self.handle.0 as isize
+        }
+
+        fn read(&self) -> Result<Vec<u8>, String> {
+            let staging = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
+            let context = &self.gpu.context;
+            // SAFETY: the staging texture has the picture's size and format, the keyed mutex is
+            // held while the copy is queued, and each row read lies inside the mapped pitch
+            unsafe {
+                self.mutex.AcquireSync(0, INFINITE).map_err(text)?;
+                context.CopyResource(&*staging, &self.texture);
+                self.mutex.ReleaseSync(0).map_err(text)?;
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                context
+                    .Map(&*staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .map_err(text)?;
+                let row = self.size.0 as usize * 4;
+                let mut bgra = Vec::with_capacity(row * self.size.1 as usize);
+                for y in 0..self.size.1 as usize {
+                    let start = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize);
+                    bgra.extend_from_slice(std::slice::from_raw_parts(start, row));
+                }
+                context.Unmap(&*staging, 0);
+                Ok(bgra)
+            }
+        }
     }
 
     impl Converter {
@@ -252,29 +315,13 @@ mod platform {
                     .video
                     .CreateVideoProcessor(&enumerator, 0)
                     .map_err(text)?;
-                let target = gpu.texture(
+                let staging = gpu.texture(
                     size,
-                    D3D11_USAGE_DEFAULT,
-                    D3D11_BIND_RENDER_TARGET.0 as u32,
+                    D3D11_USAGE_STAGING,
+                    0,
+                    D3D11_CPU_ACCESS_READ.0 as u32,
                     0,
                 )?;
-                let staging =
-                    gpu.texture(size, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?;
-                let described = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-                    ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-                    },
-                };
-                let mut view = None;
-                gpu.video
-                    .CreateVideoProcessorOutputView(
-                        &target,
-                        &enumerator,
-                        &described,
-                        Some(&mut view),
-                    )
-                    .map_err(text)?;
                 let shown = RECT {
                     left: picture.left as i32,
                     top: picture.top as i32,
@@ -310,17 +357,78 @@ mod platform {
                 Ok(Self {
                     enumerator,
                     processor,
-                    target,
-                    view: view.ok_or("Direct3D returned no output view")?,
-                    staging,
+                    pictures: Vec::new(),
+                    staging: Arc::new(Mutex::new(staging)),
                     size,
                 })
             }
         }
 
-        // the sample's surface as bgra rows; a frame in system memory means no gpu decoder
-        unsafe fn convert(&self, gpu: &Gpu, sample: &IMFSample) -> Result<Vec<u8>, String> {
+        unsafe fn picture(&mut self, gpu: &'static Gpu) -> Result<Arc<Picture>, String> {
+            if let Some(free) = self
+                .pictures
+                .iter()
+                .find(|picture| Arc::strong_count(picture) == 1)
+            {
+                return Ok(free.clone());
+            }
             unsafe {
+                let texture = gpu.texture(
+                    self.size,
+                    D3D11_USAGE_DEFAULT,
+                    (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                    0,
+                    (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
+                        | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
+                )?;
+                let described = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                    ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                    },
+                };
+                let mut view = None;
+                gpu.video
+                    .CreateVideoProcessorOutputView(
+                        &texture,
+                        &self.enumerator,
+                        &described,
+                        Some(&mut view),
+                    )
+                    .map_err(text)?;
+                let handle = texture
+                    .cast::<IDXGIResource1>()
+                    .and_then(|resource| {
+                        resource.CreateSharedHandle(
+                            None,
+                            DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
+                            PCWSTR::null(),
+                        )
+                    })
+                    .map_err(text)?;
+                let picture = Arc::new(Picture {
+                    gpu,
+                    mutex: texture.cast().map_err(text)?,
+                    texture,
+                    view: view.ok_or("Direct3D returned no output view")?,
+                    handle,
+                    staging: self.staging.clone(),
+                    size: self.size,
+                });
+                self.pictures.push(picture.clone());
+                Ok(picture)
+            }
+        }
+
+        // the sample's surface drawn into a free picture; a frame in system memory means no
+        // gpu decoder
+        unsafe fn convert(
+            &mut self,
+            gpu: &'static Gpu,
+            sample: &IMFSample,
+        ) -> Result<Arc<Picture>, String> {
+            unsafe {
+                let picture = self.picture(gpu)?;
                 let surface: IMFDXGIBuffer = sample
                     .GetBufferByIndex(0)
                     .and_then(|buffer| buffer.cast())
@@ -349,6 +457,7 @@ mod platform {
                         Some(&mut input),
                     )
                     .map_err(text)?;
+                picture.mutex.AcquireSync(0, INFINITE).map_err(text)?;
                 let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                     Enable: true.into(),
                     pInputSurface: ManuallyDrop::new(input),
@@ -356,25 +465,14 @@ mod platform {
                 };
                 let blitted = gpu.playback.VideoProcessorBlt(
                     &self.processor,
-                    &self.view,
+                    &picture.view,
                     0,
                     std::slice::from_ref(&stream),
                 );
                 drop(ManuallyDrop::into_inner(stream.pInputSurface));
-                blitted.map_err(text)?;
-                gpu.context.CopyResource(&self.staging, &self.target);
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                gpu.context
-                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                    .map_err(text)?;
-                let row = self.size.0 as usize * 4;
-                let mut bgra = Vec::with_capacity(row * self.size.1 as usize);
-                for y in 0..self.size.1 as usize {
-                    let start = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize);
-                    bgra.extend_from_slice(std::slice::from_raw_parts(start, row));
-                }
-                gpu.context.Unmap(&self.staging, 0);
-                Ok(bgra)
+                let released = picture.mutex.ReleaseSync(0);
+                blitted.and(released).map_err(text)?;
+                Ok(picture)
             }
         }
     }
@@ -738,10 +836,16 @@ mod platform {
                 return Ok(None);
             };
             // SAFETY: the sample came from the read above and is still held
-            let bgra = unsafe {
-                match (self.gpu, &self.converter) {
-                    (Some(gpu), Some(converter)) => converter.convert(gpu, &sample)?,
-                    _ => self.copy(&sample.ConvertToContiguousBuffer().map_err(text)?)?,
+            let (bgra, surface) = unsafe {
+                match (self.gpu, self.converter.as_mut()) {
+                    (Some(gpu), Some(converter)) => {
+                        let picture: Arc<dyn VideoSurface> = converter.convert(gpu, &sample)?;
+                        (Vec::new(), Some(picture))
+                    }
+                    _ => (
+                        self.copy(&sample.ConvertToContiguousBuffer().map_err(text)?)?,
+                        None,
+                    ),
                 }
             };
             Ok(Some(VideoFrame {
@@ -749,6 +853,7 @@ mod platform {
                 width: self.picture.width,
                 height: self.picture.height,
                 bgra,
+                surface,
             }))
         }
 
@@ -1551,6 +1656,7 @@ mod platform {
                     width,
                     height,
                     bgra,
+                    surface: None,
                 })
             })
         }
@@ -1721,8 +1827,12 @@ mod tests {
         assert!(started.elapsed().as_secs_f64() < 2.0);
     }
 
-    fn level(frame: &ceri_engine::VideoFrame) -> u8 {
-        frame.bgra[(16 * 64 + 32) * 4 + 2]
+    // a gpu decoder's frame is read back from its surface
+    fn rows(frame: ceri_engine::VideoFrame) -> Vec<u8> {
+        match frame.surface {
+            Some(surface) => surface.read().expect("a surface should read back"),
+            None => frame.bgra,
+        }
     }
 
     #[test]
@@ -1735,11 +1845,10 @@ mod tests {
         assert!((info.duration - 1.0).abs() < 0.05, "{}", info.duration);
         let mut frames = Vec::new();
         while let Some(frame) = reader.read().expect("frames should decode") {
-            assert_eq!(
-                (frame.width, frame.height, frame.bgra.len()),
-                (64, 32, 64 * 32 * 4)
-            );
-            frames.push((frame.time, level(&frame)));
+            let (time, size) = (frame.time, (frame.width, frame.height));
+            let bgra = rows(frame);
+            assert_eq!((size, bgra.len()), ((64, 32), 64 * 32 * 4));
+            frames.push((time, bgra[(16 * 64 + 32) * 4 + 2]));
         }
         assert_eq!(frames.len(), 10, "{frames:?}");
         for (index, (time, level)) in frames.iter().enumerate() {
@@ -1791,7 +1900,7 @@ mod tests {
             let mut reader =
                 Reader::open_on(&MediaSource::File(reel()), gpu).expect("the fixture should open");
             std::iter::from_fn(|| reader.read().expect("frames should decode"))
-                .map(|frame| (frame.time, frame.bgra))
+                .map(|frame| (frame.time, rows(frame)))
                 .collect::<Vec<_>>()
         };
         let (hardware, software) = (frames(Some(gpu)), frames(None));
