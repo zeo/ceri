@@ -15,7 +15,38 @@ use crate::sound::AudioReader;
 pub enum MediaSource {
     // a file the decoder reads in place
     File(PathBuf),
-    Bytes { body: Arc<[u8]>, mime_type: String },
+    Bytes { body: MediaBytes, mime_type: String },
+}
+
+// media held in memory, which every reader of it shares: a fetched body, or a file compiled into
+// the app
+#[derive(Clone)]
+pub enum MediaBytes {
+    Shared(Arc<[u8]>),
+    Static(&'static [u8]),
+}
+
+impl std::ops::Deref for MediaBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Shared(body) => body,
+            Self::Static(body) => body,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MediaBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl From<Vec<u8>> for MediaBytes {
+    fn from(body: Vec<u8>) -> Self {
+        Self::Shared(body.into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

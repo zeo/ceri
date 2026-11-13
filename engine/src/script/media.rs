@@ -9,7 +9,9 @@ use crate::dom::Namespace;
 use crate::image::Image;
 use crate::layout::ImageLayer;
 use crate::sound::Sound;
-use crate::video::{MediaDecoder, MediaInfo, MediaSource, Picture, Track, VideoSurface};
+use crate::video::{
+    MediaBytes, MediaDecoder, MediaInfo, MediaSource, Picture, Track, VideoSurface,
+};
 
 const NETWORK_EMPTY: u8 = 0;
 const NETWORK_IDLE: u8 = 1;
@@ -621,7 +623,7 @@ impl ScriptRuntime {
         self.queue_cues(node, vec![Cue::Event("error")]);
     }
 
-    // a files URL is read in place; anything else is fetched whole
+    // what the embedder holds is read where it is; anything else is fetched whole
     fn media_source(&mut self, url: &str) -> Option<MediaSource> {
         let check = self.content_security_policy().url(
             crate::csp::Directive::Media,
@@ -633,9 +635,9 @@ impl ScriptRuntime {
         }
         let parsed = AppUrl::parse(url).ok();
         if let (Some(parsed), Some(provider)) = (&parsed, &self.resource_provider)
-            && let Some(path) = provider.media_file(parsed)
+            && let Some(source) = provider.media(parsed)
         {
-            return Some(MediaSource::File(path));
+            return Some(source);
         }
         let promise = self.fetch(
             &[Value::String(url.to_string().into())],
@@ -651,7 +653,7 @@ impl ScriptRuntime {
         }?;
         let body = Arc::from(response.body.borrow().bytes.as_slice());
         Some(MediaSource::Bytes {
-            body,
+            body: MediaBytes::Shared(body),
             mime_type: response.mime_type.clone(),
         })
     }

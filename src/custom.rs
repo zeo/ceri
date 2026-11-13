@@ -15,9 +15,9 @@ use crate::tray::{Tray, TrayConfig, TrayEvent};
 use crate::video::DesktopVideo;
 use ceri_engine::{
     APP_ORIGIN, AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost,
-    ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, NavigationError,
-    Resource, ResourceBundle, ResourceProvider, ResourceResponse, Size, SocketConnector,
-    WindowConfig, WindowControl, mime_type_for, run_window_with,
+    ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, MediaBytes,
+    MediaSource, NavigationError, Resource, ResourceBundle, ResourceProvider, ResourceResponse,
+    Size, SocketConnector, WindowConfig, WindowControl, mime_type_for, run_window_with,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -928,10 +928,11 @@ impl ResourceProvider for PackagedAssets {
         crate::http::request(request).map(Some)
     }
 
-    // packaged media on disk is read in place too, so a long video is never held whole
-    fn media_file(&self, url: &AppUrl) -> Option<PathBuf> {
+    // packaged media is read where it is, on disk or in the program, so a long video is never
+    // copied whole
+    fn media(&self, url: &AppUrl) -> Option<MediaSource> {
         if url.is_files() {
-            return self.files.resolve(url.path());
+            return self.files.resolve(url.path()).map(MediaSource::File);
         }
         if self.dev.is_some() {
             return None;
@@ -941,7 +942,13 @@ impl ResourceProvider for PackagedAssets {
             .route(&url.to_string(), RequestTarget::Subresource)
             .ok()?
         {
-            AssetRoute::File(asset) if asset.embedded.is_none() => Some(asset.path),
+            AssetRoute::File(asset) => Some(match asset.embedded {
+                Some(body) => MediaSource::Bytes {
+                    body: MediaBytes::Static(body),
+                    mime_type: mime_type_for(&asset.path).to_string(),
+                },
+                None => MediaSource::File(asset.path),
+            }),
             _ => None,
         }
     }
@@ -974,7 +981,8 @@ fn is_document_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandCall, PackagedAssets, allowed_origins, check_identifier, is_document_path, typed,
+        CommandCall, MediaBytes, MediaSource, PackagedAssets, allowed_origins, check_identifier,
+        is_document_path, typed,
     };
     use crate::assets::AssetOrigin;
     use ceri_engine::{AppUrl, ExternalRequest, ResourceProvider};
@@ -1026,12 +1034,12 @@ mod tests {
                 .expect("missing subresources should not fail")
                 .is_none()
         );
-        let media = |url: &str| provider.media_file(&AppUrl::parse(url).expect("url"));
-        assert!(
-            media("https://app.ceri.invalid/main.js")
-                .is_some_and(|path| path.ends_with("main.js") && path.is_file())
-        );
-        assert_eq!(media("https://app.ceri.invalid/missing.mp4"), None);
+        let media = |url: &str| provider.media(&AppUrl::parse(url).expect("url"));
+        assert!(matches!(
+            media("https://app.ceri.invalid/main.js"),
+            Some(MediaSource::File(path)) if path.ends_with("main.js") && path.is_file()
+        ));
+        assert!(media("https://app.ceri.invalid/missing.mp4").is_none());
         static FILES: crate::assets::EmbeddedAssets = &[("clip.mp4", b"mp4")];
         let embedded = PackagedAssets {
             assets: Arc::new(AssetOrigin::embedded(FILES)),
@@ -1040,7 +1048,11 @@ mod tests {
             dev: None,
         };
         let clip = AppUrl::parse("https://app.ceri.invalid/clip.mp4").expect("url");
-        assert_eq!(embedded.media_file(&clip), None);
+        assert!(matches!(
+            embedded.media(&clip),
+            Some(MediaSource::Bytes { body: MediaBytes::Static(body), mime_type })
+                if body.as_ptr() == FILES[0].1.as_ptr() && mime_type == "video/mp4"
+        ));
 
         let granted = std::env::temp_dir().join(format!("ceri-provider-{}", std::process::id()));
         std::fs::create_dir_all(&granted).expect("grant folder");

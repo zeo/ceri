@@ -481,8 +481,9 @@ pub trait ResourceProvider {
             .map(|resource| resource.map(ResourceResponse::from_resource))
     }
 
-    // the file an audio or video URL names, which a decoder reads in place; none fetches it
-    fn media_file(&self, _url: &AppUrl) -> Option<PathBuf> {
+    // what an audio or video URL names as a decoder reads it, a file in place or bytes the app
+    // already holds; none fetches it
+    fn media(&self, _url: &AppUrl) -> Option<crate::MediaSource> {
         None
     }
 
@@ -3945,6 +3946,16 @@ pub fn mime_type_for(path: &Path) -> &'static str {
         "gif" => "image/gif",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
+        "mp4" | "m4v" => "video/mp4",
+        "m4a" => "audio/mp4",
+        "mp3" => "audio/mpeg",
+        "aac" => "audio/aac",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "ogv" => "video/ogg",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
 }

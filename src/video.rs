@@ -37,12 +37,18 @@ mod platform {
     use super::{
         AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
     };
+    use ceri_engine::MediaBytes;
     use ceri_engine::VideoSurface;
+    use std::ffi::c_void;
     use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, RECT};
+    use windows::Win32::Foundation::{
+        E_NOTIMPL, E_POINTER, S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
+    };
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -100,10 +106,14 @@ mod platform {
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::Com::{
+        ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE, STATFLAG, STATSTG, STGC,
+        STGM_READ, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR, STREAM_SEEK_END, STREAM_SEEK_SET,
+    };
     use windows::Win32::System::Threading::INFINITE;
     use windows::Win32::System::Variant::{VT_I8, VT_UI8};
-    use windows::Win32::UI::Shell::SHCreateMemStream;
     use windows::core::{GUID, Interface, PCSTR, PCWSTR, s};
+    use windows::core::{HRESULT, implement};
 
     pub(super) const TYPES: &[&str] = &[
         "video/mp4",
@@ -960,6 +970,117 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
         Ok(apartment)
     }
 
+    // a stream over bytes the media already holds, so every reader shares them uncopied
+    #[implement(IStream)]
+    struct Held {
+        body: MediaBytes,
+        at: AtomicU64,
+    }
+
+    impl ISequentialStream_Impl for Held_Impl {
+        fn Read(&self, into: *mut c_void, wanted: u32, read: *mut u32) -> HRESULT {
+            let start = (self.at.load(Ordering::Relaxed) as usize).min(self.body.len());
+            let count = (wanted as usize).min(self.body.len() - start);
+            // SAFETY: the caller hands a buffer of at least the wanted length, and the count
+            // stays inside both it and the body
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.body.as_ptr().add(start), into.cast(), count);
+                if !read.is_null() {
+                    *read = count as u32;
+                }
+            }
+            self.at.store((start + count) as u64, Ordering::Relaxed);
+            if count < wanted as usize {
+                S_FALSE
+            } else {
+                S_OK
+            }
+        }
+
+        fn Write(&self, _: *const c_void, _: u32, _: *mut u32) -> HRESULT {
+            STG_E_ACCESSDENIED
+        }
+    }
+
+    impl IStream_Impl for Held_Impl {
+        fn Seek(
+            &self,
+            offset: i64,
+            origin: STREAM_SEEK,
+            landed: *mut u64,
+        ) -> windows::core::Result<()> {
+            let base = match origin {
+                STREAM_SEEK_SET => 0,
+                STREAM_SEEK_CUR => self.at.load(Ordering::Relaxed),
+                STREAM_SEEK_END => self.body.len() as u64,
+                _ => return Err(STG_E_INVALIDFUNCTION.into()),
+            };
+            let at = base
+                .checked_add_signed(offset)
+                .ok_or(windows::core::Error::from(STG_E_INVALIDFUNCTION))?;
+            self.at.store(at, Ordering::Relaxed);
+            if !landed.is_null() {
+                // SAFETY: a non-null landing points at a u64 the caller owns
+                unsafe { *landed = at };
+            }
+            Ok(())
+        }
+
+        fn SetSize(&self, _: u64) -> windows::core::Result<()> {
+            Err(STG_E_ACCESSDENIED.into())
+        }
+
+        fn CopyTo(
+            &self,
+            _: windows::core::Ref<IStream>,
+            _: u64,
+            _: *mut u64,
+            _: *mut u64,
+        ) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+
+        fn Commit(&self, _: &STGC) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn Revert(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn LockRegion(&self, _: u64, _: u64, _: &LOCKTYPE) -> windows::core::Result<()> {
+            Err(STG_E_INVALIDFUNCTION.into())
+        }
+
+        fn UnlockRegion(&self, _: u64, _: u64, _: u32) -> windows::core::Result<()> {
+            Err(STG_E_INVALIDFUNCTION.into())
+        }
+
+        fn Stat(&self, stat: *mut STATSTG, _: &STATFLAG) -> windows::core::Result<()> {
+            if stat.is_null() {
+                return Err(E_POINTER.into());
+            }
+            // SAFETY: a non-null stat points at a STATSTG the caller owns
+            unsafe {
+                *stat = STATSTG {
+                    r#type: STGTY_STREAM.0 as u32,
+                    cbSize: self.body.len() as u64,
+                    grfMode: STGM_READ,
+                    ..Default::default()
+                };
+            }
+            Ok(())
+        }
+
+        fn Clone(&self) -> windows::core::Result<IStream> {
+            Ok(Held {
+                body: self.body.clone(),
+                at: AtomicU64::new(self.at.load(Ordering::Relaxed)),
+            }
+            .into())
+        }
+    }
+
     // a source reader with only the given stream selected, or the missing message without one
     unsafe fn source_reader(
         source: &MediaSource,
@@ -974,7 +1095,11 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     MFCreateSourceReaderFromURL(PCWSTR(path.as_ptr()), attributes)
                 }
                 MediaSource::Bytes { body, mime_type } => {
-                    let stream = SHCreateMemStream(Some(body)).ok_or("could not hold the media")?;
+                    let stream: IStream = Held {
+                        body: body.clone(),
+                        at: AtomicU64::new(0),
+                    }
+                    .into();
                     let bytes = MFCreateMFByteStreamOnStream(&stream).map_err(text)?;
                     let mime_type = wide(mime_type.as_ref());
                     bytes
@@ -1648,10 +1773,9 @@ mod platform {
     use super::{
         AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
     };
+    use ceri_engine::MediaBytes;
     use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
-    use std::path::PathBuf;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     pub(super) const TYPES: &[&str] = &[
@@ -1682,11 +1806,11 @@ mod platform {
     const POLL: u64 = 100_000_000;
 
     // videoscale squares anamorphic pixels, so the sink's size is the natural one
-    const PICTURES: &CStr = c"filesrc name=source ! decodebin ! videoconvert ! videoscale ! \
+    const PICTURES: &str = "decodebin ! videoconvert ! videoscale ! \
         video/x-raw,format=BGRx,pixel-aspect-ratio=1/1 ! \
         appsink name=sink sync=false max-buffers=3 enable-last-sample=false";
     // the rate and channels stay the source's, the engine fits them to the speakers
-    const SOUND: &CStr = c"filesrc name=source ! decodebin ! audioconvert ! \
+    const SOUND: &str = "decodebin ! audioconvert ! \
         audio/x-raw,format=F32LE,layout=interleaved ! \
         appsink name=sink sync=false max-buffers=8 enable-last-sample=false";
     const SIZE: [&CStr; 2] = [c"width", c"height"];
@@ -1740,6 +1864,7 @@ mod platform {
         gst_parse_launch: unsafe extern "C" fn(*const c_char, *mut *mut GError) -> Object,
         gst_bin_get_by_name: unsafe extern "C" fn(Object, *const c_char) -> Object,
         g_object_set: unsafe extern "C" fn(Object, *const c_char, ...),
+        g_object_unref: unsafe extern "C" fn(Object),
         g_error_free: unsafe extern "C" fn(*mut GError),
         g_free: unsafe extern "C" fn(*mut c_void),
         gst_object_unref: unsafe extern "C" fn(Object),
@@ -1806,6 +1931,7 @@ mod platform {
                     gst_parse_launch,
                     gst_bin_get_by_name,
                     g_object_set,
+                    g_object_unref,
                     g_error_free,
                     g_free,
                     gst_object_unref,
@@ -1843,37 +1969,57 @@ mod platform {
         .ok_or_else(|| "gstreamer is not installed".to_string())
     }
 
+    type MemoryStream = unsafe extern "C" fn(*const c_void, isize, *mut c_void) -> Object;
+
+    // gio's g_memory_input_stream_new_from_data, which giostreamsrc reads bytes in memory through
+    fn memory_stream() -> Result<MemoryStream, String> {
+        static NEW: OnceLock<Option<MemoryStream>> = OnceLock::new();
+        // SAFETY: the library stays loaded for the life of the process, and the symbol is cast
+        // to the signature its header declares
+        NEW.get_or_init(|| unsafe {
+            let library = dlopen(c"libgio-2.0.so.0".as_ptr(), RTLD_NOW);
+            if library.is_null() {
+                return None;
+            }
+            let symbol = dlsym(library, c"g_memory_input_stream_new_from_data".as_ptr());
+            (!symbol.is_null()).then(|| std::mem::transmute::<*mut c_void, MemoryStream>(symbol))
+        })
+        .ok_or_else(|| "gio is not installed".to_string())
+    }
+
     // a pipeline from the source to one appsink, prerolled so the sink's caps are settled
     struct Pipeline {
         gst: &'static Gst,
         pipeline: Object,
         sink: Object,
         bus: Object,
-        // bytes handed over in memory, written out for filesrc and removed with the pipeline
-        spilled: Option<PathBuf>,
+        // bytes in memory the source reads, kept until the pipeline is gone
+        held: Option<MediaBytes>,
     }
 
     // SAFETY: gstreamer objects are thread safe, and the engine uses a reader on one thread
     unsafe impl Send for Pipeline {}
 
     impl Pipeline {
-        fn open(source: &MediaSource, description: &CStr) -> Result<Self, String> {
+        fn open(source: &MediaSource, decoding: &str) -> Result<Self, String> {
             let gst = gst()?;
-            let (path, spilled) = match source {
-                MediaSource::File(path) => (path.clone(), None),
-                MediaSource::Bytes { body, .. } => {
-                    static SPILLS: AtomicU64 = AtomicU64::new(0);
-                    let path = std::env::temp_dir().join(format!(
-                        "ceri-media-{}-{}",
-                        std::process::id(),
-                        SPILLS.fetch_add(1, Ordering::Relaxed)
-                    ));
-                    std::fs::write(&path, body).map_err(|error| error.to_string())?;
-                    (path.clone(), Some(path))
-                }
+            let (element, location, held) = match source {
+                MediaSource::File(path) => (
+                    "filesrc",
+                    Some(
+                        CString::new(path.as_os_str().as_encoded_bytes())
+                            .map_err(|_| "the media path holds a nul byte".to_string())?,
+                    ),
+                    None,
+                ),
+                MediaSource::Bytes { body, .. } => ("giostreamsrc", None, Some(body.clone())),
             };
-            let location = CString::new(path.as_os_str().as_encoded_bytes())
-                .map_err(|_| "the media path holds a nul byte".to_string())?;
+            let stream = match &held {
+                Some(_) => Some(memory_stream()?),
+                None => None,
+            };
+            let description = CString::new(format!("{element} name=source ! {decoding}"))
+                .map_err(|_| "the pipeline holds a nul byte".to_string())?;
             // SAFETY: each object is checked before use and released by Drop, which runs as
             // soon as the pipeline exists
             unsafe {
@@ -1884,9 +2030,6 @@ mod platform {
                     if !pipeline.is_null() {
                         (gst.gst_object_unref)(pipeline);
                     }
-                    if let Some(path) = &spilled {
-                        let _ = std::fs::remove_file(path);
-                    }
                     return Err(message);
                 }
                 let opened = Self {
@@ -1894,18 +2037,35 @@ mod platform {
                     pipeline,
                     sink: (gst.gst_bin_get_by_name)(pipeline, c"sink".as_ptr()),
                     bus: (gst.gst_element_get_bus)(pipeline),
-                    spilled,
+                    held,
                 };
                 let source = (gst.gst_bin_get_by_name)(pipeline, c"source".as_ptr());
                 if source.is_null() || opened.sink.is_null() || opened.bus.is_null() {
                     return Err("gstreamer could not build the pipeline".to_string());
                 }
-                (gst.g_object_set)(
-                    source,
-                    c"location".as_ptr(),
-                    location.as_ptr(),
-                    std::ptr::null::<c_char>(),
-                );
+                if let Some(location) = &location {
+                    (gst.g_object_set)(
+                        source,
+                        c"location".as_ptr(),
+                        location.as_ptr(),
+                        std::ptr::null::<c_char>(),
+                    );
+                }
+                if let (Some(body), Some(new)) = (&opened.held, stream) {
+                    // the stream reads the bytes in place, and they outlive the pipeline
+                    let stream = new(
+                        body.as_ptr().cast(),
+                        body.len() as isize,
+                        std::ptr::null_mut(),
+                    );
+                    (gst.g_object_set)(
+                        source,
+                        c"stream".as_ptr(),
+                        stream,
+                        std::ptr::null::<c_char>(),
+                    );
+                    (gst.g_object_unref)(stream);
+                }
                 (gst.gst_object_unref)(source);
                 if (gst.gst_element_set_state)(pipeline, STATE_PAUSED) == STATE_CHANGE_FAILURE
                     || (gst.gst_element_get_state)(
@@ -2063,9 +2223,6 @@ mod platform {
                         (self.gst.gst_object_unref)(object);
                     }
                 }
-            }
-            if let Some(path) = &self.spilled {
-                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -2498,7 +2655,7 @@ mod tests {
     #[test]
     fn an_edit_list_moves_pictures_back_to_zero() {
         let source = |body: &[u8]| MediaSource::Bytes {
-            body: body.into(),
+            body: body.to_vec().into(),
             mime_type: "video/mp4".to_string(),
         };
         let reel = std::fs::read(reel()).expect("the fixture should read");
