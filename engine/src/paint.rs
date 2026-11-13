@@ -258,6 +258,19 @@ impl Canvas {
         std::fs::write(path, encode_png(self.width, self.height, 3, &rgb))
     }
 
+    // a copy with each viewport rectangle filled over it, numbered anew so it uploads whole
+    pub(crate) fn overlaid(&self, fills: &[([f32; 4], Color)]) -> Self {
+        let mut canvas = self.clone();
+        for ([left, top, right, bottom], color) in fills {
+            canvas.fill_rect(*left, *top, right - left, bottom - top, *color);
+        }
+        canvas.revision = Revision {
+            id: next_revision(),
+            changed: None,
+        };
+        canvas
+    }
+
     fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
         if width <= 0.0 || height <= 0.0 || color.alpha == 0 {
             return;

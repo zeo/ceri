@@ -38,7 +38,7 @@ impl Mirror {
         self.active
     }
 
-    fn id(&mut self, node: NodeId) -> u64 {
+    pub(super) fn id(&mut self, node: NodeId) -> u64 {
         *self.ids.entry(node).or_insert_with(|| {
             self.nodes.push(node);
             self.nodes.len() as u64
@@ -147,7 +147,7 @@ impl Mirror {
     }
 
     // sends the frontend every node between the document and this one it does not hold yet
-    fn push(
+    pub(super) fn push(
         &mut self,
         document: &Document,
         url: &str,
@@ -372,7 +372,7 @@ fn failure(message: &str) -> Failure {
 }
 
 // the node a call names by nodeId, backendNodeId or objectId
-fn target(mirror: &Mirror, page: &Page, params: &Json) -> Result<NodeId, Failure> {
+pub(super) fn target(mirror: &Mirror, page: &Page, params: &Json) -> Result<NodeId, Failure> {
     let node = if let Some(id) = params["nodeId"]
         .as_u64()
         .or_else(|| params["backendNodeId"].as_u64())
@@ -416,6 +416,52 @@ fn depth(params: &Json, default: i64) -> Result<i64, Failure> {
         )),
         depth => Ok(depth.max(-1)),
     }
+}
+
+// a node's content, padding, border and margin boxes in the viewport, each as left, top, right
+// and bottom
+pub(super) struct Boxes {
+    pub(super) content: [f64; 4],
+    pub(super) padding: [f64; 4],
+    pub(super) border: [f64; 4],
+    pub(super) margin: [f64; 4],
+}
+
+pub(super) fn measure(page: &mut Page, node: NodeId) -> Result<Boxes, Failure> {
+    let unmeasured = || failure("Could not compute box model.");
+    let measured = call(page, node, BOX_MODEL, Vec::new()).map_err(|_| unmeasured())?;
+    let numbers: Vec<f64> = measured
+        .value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Json::as_f64)
+        .collect();
+    let numbers: [f64; 16] = numbers.try_into().map_err(|_| unmeasured())?;
+    // four numbers from the given one: a rect's left, top, width and height, or the top, right,
+    // bottom and left of its edges
+    let four = |from: usize| -> [f64; 4] { std::array::from_fn(|index| numbers[from + index]) };
+    let inset = |rect: [f64; 4], by: [f64; 4]| {
+        [
+            rect[0] + by[3],
+            rect[1] + by[0],
+            rect[2] - by[1],
+            rect[3] - by[2],
+        ]
+    };
+    let [left, top, width, height] = four(0);
+    let border = [left, top, left + width, top + height];
+    let padding = inset(border, four(8));
+    Ok(Boxes {
+        content: inset(padding, four(12)),
+        padding,
+        border,
+        margin: inset(border, four(4).map(|edge| -edge)),
+    })
+}
+
+fn quad([left, top, right, bottom]: [f64; 4]) -> Json {
+    json!([left, top, right, top, right, bottom, left, bottom])
 }
 
 const BOX_MODEL: &str = "function () {
@@ -634,47 +680,19 @@ pub(super) fn answer(
                 })
             })
         }
-        "DOM.getBoxModel" | "DOM.getContentQuads" => {
-            target(mirror, page, params).and_then(|node| {
-                let measured = call(page, node, BOX_MODEL, Vec::new())
-                    .map_err(|_| failure("Could not compute box model."))?;
-                let numbers: Vec<f64> = measured
-                    .value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Json::as_f64)
-                    .collect();
-                let [left, top, width, height, edges @ ..] = numbers.as_slice() else {
-                    return Err(failure("Could not compute box model."));
-                };
-                let quad = |inset: [f64; 4]| {
-                    let (x0, y0) = (left + inset[3], top + inset[0]);
-                    let (x1, y1) = (left + width - inset[1], top + height - inset[2]);
-                    json!([x0, y0, x1, y0, x1, y1, x0, y1])
-                };
-                let border = quad([0.0; 4]);
-                if method == "DOM.getContentQuads" {
-                    return Ok(json!({ "quads": [border] }));
-                }
-                let side =
-                    |from: usize| -> [f64; 4] { std::array::from_fn(|index| edges[from + index]) };
-                let (margin, borders, padding) = (side(0), side(4), side(8));
-                let inner = |depth: usize| -> [f64; 4] {
-                    std::array::from_fn(|index| {
-                        borders[index] + if depth > 1 { padding[index] } else { 0.0 }
-                    })
-                };
-                Ok(json!({ "model": {
-                    "content": quad(inner(2)),
-                    "padding": quad(inner(1)),
-                    "border": border,
-                    "margin": quad(margin.map(|edge| -edge)),
-                    "width": width.round() as i64,
-                    "height": height.round() as i64,
-                }}))
-            })
-        }
+        "DOM.getBoxModel" | "DOM.getContentQuads" => target(mirror, page, params)
+            .and_then(|node| measure(page, node))
+            .map(|boxes| match method {
+                "DOM.getContentQuads" => json!({ "quads": [quad(boxes.border)] }),
+                _ => json!({ "model": {
+                    "content": quad(boxes.content),
+                    "padding": quad(boxes.padding),
+                    "border": quad(boxes.border),
+                    "margin": quad(boxes.margin),
+                    "width": (boxes.border[2] - boxes.border[0]).round() as i64,
+                    "height": (boxes.border[3] - boxes.border[1]).round() as i64,
+                }}),
+            }),
         "DOM.getNodeForLocation" => {
             let point = [params["x"].as_f64(), params["y"].as_f64()];
             let root = page.document.borrow().root();

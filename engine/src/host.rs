@@ -716,7 +716,27 @@ impl EngineHost {
 
     pub fn input(&mut self, event: InputEvent) -> Result<InputResult, NavigationError> {
         self.pump_workers()?;
+        // a devtools session picking a node takes the pointer from the page
+        let picked = match &event {
+            InputEvent::PointerMove { x, y } => self.browser.pick_hover(self.viewport, *x, *y)?,
+            InputEvent::PointerDown {
+                x,
+                y,
+                button: PointerButton::Primary,
+            } => self.browser.pick_press(self.viewport, *x, *y)?,
+            InputEvent::PointerUp {
+                button: PointerButton::Primary,
+                ..
+            } => self.browser.pick_release(false),
+            InputEvent::Click { .. } => self.browser.pick_release(true),
+            _ => false,
+        };
         let result = match event {
+            _ if picked => InputResult {
+                handled: true,
+                frame_requested: true,
+                ..InputResult::default()
+            },
             InputEvent::Resize(viewport) => {
                 self.viewport = viewport;
                 self.browser.set_viewport(viewport, self.scale);
@@ -3215,5 +3235,58 @@ mod tests {
             .layout(host.viewport())
             .expect("layout should resolve");
         assert_eq!(layout.prose_selections.len(), 3);
+    }
+
+    #[test]
+    fn a_devtools_pick_takes_the_click_from_the_page() {
+        let browser = Browser::new(bundle(
+            r#"<button id="go" style="display: block; width: 80px; height: 24px; margin: 0">run</button><p id="status">idle</p><script>
+                for (const kind of ["pointerdown", "pointerup", "click"]) {
+                    document.getElementById("go").addEventListener(kind, () => {
+                        document.getElementById("status").textContent += " " + kind;
+                    });
+                }
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 160.0,
+                height: 100.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let (outgoing, messages) = std::sync::mpsc::channel();
+        host.browser.attach_inspector(1, outgoing);
+        let pick = r#"{"id": 1, "method": "Overlay.setInspectMode", "params": {"mode": "searchForNode", "highlightConfig": {}}}"#;
+        assert_eq!(host.browser.inspect(1, pick), None);
+        let (x, y) = (20.0, 10.0);
+        let button = PointerButton::Primary;
+        for event in [
+            InputEvent::PointerMove { x, y },
+            InputEvent::PointerDown { x, y, button },
+            InputEvent::PointerUp { x, y, button },
+            InputEvent::Click { x, y },
+        ] {
+            assert!(host.input(event).expect("input should apply").handled);
+        }
+        fn status(host: &EngineHost) -> Option<String> {
+            let document = host.browser().document().expect("document should exist");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status should exist");
+            document.borrow().element_text_content(status)
+        }
+        assert_eq!(status(&host).as_deref(), Some("idle"));
+        assert!(
+            messages
+                .try_iter()
+                .any(|message| message.contains("Overlay.inspectNodeRequested"))
+        );
+        host.input(InputEvent::Click { x, y })
+            .expect("input should apply");
+        assert_eq!(status(&host).as_deref(), Some("idle click"));
     }
 }

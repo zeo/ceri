@@ -3,8 +3,10 @@
 // owe each session
 
 mod dom;
+mod overlay;
 
-use super::Browser;
+use super::{Browser, NavigationError, Size};
+use crate::dom::NodeId;
 use crate::script::Answer;
 use serde_json::{Value as Json, json};
 use std::sync::mpsc::Sender;
@@ -18,11 +20,19 @@ type Failure = (i64, String);
 pub(super) struct Inspection {
     sessions: Vec<Session>,
     waiting: Vec<Waiting>,
+    highlight: Option<overlay::Highlight>,
+    picking: Option<overlay::Picking>,
 }
 
 impl Inspection {
     pub(super) fn attached(&self) -> bool {
         !self.sessions.is_empty()
+    }
+
+    // what a frame shows over the page for the frontend
+    pub(super) fn fills(&self) -> Option<&[overlay::Fill]> {
+        let fills = &self.highlight.as_ref()?.fills;
+        (!fills.is_empty()).then_some(fills.as_slice())
     }
 }
 
@@ -66,6 +76,103 @@ impl Browser {
         self.inspection
             .waiting
             .retain(|held| held.session != session);
+        let inspection = &mut self.inspection;
+        if inspection
+            .picking
+            .as_ref()
+            .is_some_and(|held| held.session == session)
+        {
+            inspection.picking = None;
+        }
+        if inspection.sessions.is_empty() {
+            inspection.highlight = None;
+        }
+    }
+
+    // while a session picks a node, the pointer moves the highlight instead of reaching the
+    // page; true when the pointer was taken
+    pub fn pick_hover(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
+        let Some(picking) = &self.inspection.picking else {
+            return Ok(false);
+        };
+        let (session, Some(config)) = (picking.session, picking.config.clone()) else {
+            return Ok(true);
+        };
+        let node = self.element_at(viewport, x, y)?;
+        let highlighted = self
+            .inspection
+            .highlight
+            .as_ref()
+            .and_then(|held| held.node());
+        if let Some(node) = node.filter(|node| Some(*node) != highlighted) {
+            self.inspection.highlight = Some(overlay::following(node, config));
+            if let Some(page) = &mut self.page {
+                overlay::refresh(&mut self.inspection.highlight, page);
+            }
+            self.report_pick(session, node, false);
+        }
+        Ok(true)
+    }
+
+    pub fn pick_press(&mut self, viewport: Size, x: f32, y: f32) -> Result<bool, NavigationError> {
+        let Some(picking) = &mut self.inspection.picking else {
+            return Ok(false);
+        };
+        picking.pressed = true;
+        let session = picking.session;
+        if let Some(node) = self.element_at(viewport, x, y)? {
+            self.report_pick(session, node, true);
+        }
+        Ok(true)
+    }
+
+    // the release and click after a picking press stay from the page too, and the click ends
+    // the pick
+    pub fn pick_release(&mut self, clicked: bool) -> bool {
+        if !self
+            .inspection
+            .picking
+            .as_ref()
+            .is_some_and(|held| held.pressed)
+        {
+            return false;
+        }
+        if clicked {
+            self.inspection.picking = None;
+            self.inspection.highlight = None;
+        }
+        true
+    }
+
+    fn element_at(
+        &self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<NodeId>, NavigationError> {
+        let node = self.layout(viewport)?.hit_test(x, y);
+        let Some(page) = &self.page else {
+            return Ok(None);
+        };
+        let document = page.document.borrow();
+        Ok(node.map(|node| match document.is_text(node) {
+            true => document.parent(node).unwrap_or(node),
+            false => node,
+        }))
+    }
+
+    fn report_pick(&mut self, session: u64, node: NodeId, pressed: bool) {
+        let url = self.document_url();
+        let Self {
+            inspection, page, ..
+        } = self;
+        let held = inspection
+            .sessions
+            .iter_mut()
+            .find(|held| held.id == session);
+        if let (Some(held), Some(page)) = (held, page.as_ref()) {
+            overlay::report(held, page, &url, node, pressed);
+        }
     }
 
     // answers one protocol message, and gives back the url it asks the window to load
@@ -137,6 +244,25 @@ impl Browser {
                     "Cannot find default execution context".into(),
                 ))),
             },
+            method if method.starts_with("Overlay.") => {
+                let Self {
+                    inspection, page, ..
+                } = self;
+                let Inspection {
+                    sessions,
+                    highlight,
+                    picking,
+                    ..
+                } = inspection;
+                let held = sessions.iter().find(|held| held.id == session);
+                let answer = match (held, page) {
+                    (Some(held), Some(page)) => overlay::answer(
+                        highlight, picking, session, &held.dom, page, method, params,
+                    ),
+                    _ => Some(Err((-32000, "Document is not available".into()))),
+                };
+                Some(answer.unwrap_or_else(|| Err((-32601, format!("'{method}' wasn't found")))))
+            }
             method if method.starts_with("DOM.") => {
                 // a new document resets what the session holds before the call reads it
                 self.flush_inspector();
@@ -188,6 +314,7 @@ impl Browser {
         };
         let context = page.runtime.inspector_context();
         let inspection = &mut self.inspection;
+        overlay::refresh(&mut inspection.highlight, page);
         for settled in page.runtime.inspector_settled() {
             let (token, answer) = settled;
             if let Some(index) = inspection
@@ -833,5 +960,97 @@ mod tests {
             json!({ "x": 100, "y": 60 }),
         );
         assert_eq!(result(&sent, 15)["nodeId"], boxed);
+    }
+
+    fn pixel(browser: &Browser, x: usize, y: usize) -> [u8; 3] {
+        let viewport = Size {
+            width: 300.0,
+            height: 200.0,
+        };
+        let canvas = browser.paint(viewport).expect("the page should paint");
+        let start = (y * canvas.width() as usize + x) * 4;
+        canvas.rgba_pixels()[start..start + 3].try_into().unwrap()
+    }
+
+    #[test]
+    fn highlights_are_drawn_over_the_frame_and_the_pointer_picks_nodes() {
+        let (mut browser, messages) = inspected(
+            "<style>body { margin: 0; background: #fff } #box { width: 100px; height: 50px; padding: 5px; margin: 10px; border: 2px solid #000 }</style>
+             <div id=box></div>",
+        );
+        call(&mut browser, &messages, 1, "DOM.getDocument", json!({}));
+        let sent = call(
+            &mut browser,
+            &messages,
+            2,
+            "DOM.querySelector",
+            json!({ "nodeId": 1, "selector": "#box" }),
+        );
+        let boxed = result(&sent, 2)["nodeId"].clone();
+        let config = json!({
+            "contentColor": { "r": 255, "g": 0, "b": 0, "a": 1 },
+            "marginColor": { "r": 0, "g": 0, "b": 255 },
+        });
+        assert_eq!(pixel(&browser, 60, 40), [255, 255, 255]);
+        call(
+            &mut browser,
+            &messages,
+            3,
+            "Overlay.highlightNode",
+            json!({ "nodeId": boxed, "highlightConfig": config }),
+        );
+        assert_eq!(pixel(&browser, 60, 40), [255, 0, 0]);
+        assert_eq!(pixel(&browser, 5, 5), [0, 0, 255]);
+        // the padding has no colour of its own here, so it shows the page
+        assert_eq!(pixel(&browser, 14, 40), [255, 255, 255]);
+        assert_eq!(pixel(&browser, 200, 150), [255, 255, 255]);
+        call(
+            &mut browser,
+            &messages,
+            4,
+            "Overlay.hideHighlight",
+            json!({}),
+        );
+        assert_eq!(pixel(&browser, 60, 40), [255, 255, 255]);
+
+        let viewport = Size {
+            width: 300.0,
+            height: 200.0,
+        };
+        assert!(!browser.pick_hover(viewport, 60.0, 40.0).unwrap());
+        let sent = call(
+            &mut browser,
+            &messages,
+            5,
+            "Overlay.setInspectMode",
+            json!({ "mode": "searchForNode", "highlightConfig": config }),
+        );
+        assert_eq!(result(&sent, 5), &json!({}));
+        assert!(browser.pick_hover(viewport, 60.0, 40.0).unwrap());
+        let sent = received(&messages);
+        assert_eq!(
+            named(&sent, "Overlay.nodeHighlightRequested")[0]["nodeId"],
+            boxed
+        );
+        assert_eq!(pixel(&browser, 60, 40), [255, 0, 0]);
+        assert!(browser.pick_press(viewport, 60.0, 40.0).unwrap());
+        let sent = received(&messages);
+        assert_eq!(
+            named(&sent, "Overlay.inspectNodeRequested")[0]["backendNodeId"],
+            boxed
+        );
+        assert!(browser.pick_release(false));
+        assert!(browser.pick_release(true));
+        assert!(!browser.pick_hover(viewport, 60.0, 40.0).unwrap());
+        assert_eq!(pixel(&browser, 60, 40), [255, 255, 255]);
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            6,
+            "Overlay.setInspectMode",
+            json!({ "mode": "showDistances" }),
+        );
+        assert_eq!(sent[0]["error"]["code"], -32000);
     }
 }

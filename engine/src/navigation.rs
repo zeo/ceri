@@ -2983,6 +2983,11 @@ impl Browser {
             planes,
             generation,
         });
+        // the highlight goes on a copy, so the kept frame repaints and scrolls without it
+        let canvas = match self.inspection.fills() {
+            Some(fills) => Arc::new(canvas.overlaid(fills)),
+            None => canvas,
+        };
         Ok((canvas, shown))
     }
 
