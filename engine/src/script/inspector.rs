@@ -7,6 +7,8 @@ use super::*;
 use serde_json::{Value as Json, json};
 use std::sync::atomic::AtomicU64;
 
+pub(crate) const FRAME_ID: &str = "ceri-main-frame";
+
 // v8's console message storage keeps as many
 const KEPT_MESSAGES: usize = 1000;
 const PREVIEW_PROPERTIES: usize = 5;
@@ -32,7 +34,7 @@ struct Awaited {
 
 pub(super) struct Inspector {
     context: u64,
-    capturing: bool,
+    pub(super) capturing: bool,
     messages: VecDeque<ConsoleEntry>,
     next_sequence: u64,
     objects: HashMap<u64, (Value, String)>,
@@ -150,8 +152,26 @@ impl ScriptRuntime {
         (events, self.inspector.next_sequence)
     }
 
-    pub(crate) fn inspector_call(&mut self, method: &str, params: &Json) -> Answer {
+    // read from the resources the page loads from, so a paused page can answer too
+    fn resource_content(&self, params: &Json) -> Result<Json, String> {
+        let not_found = || "No resource with given URL found".to_string();
+        let url = params["url"].as_str().ok_or_else(not_found)?;
+        let url = AppUrl::parse(url).map_err(|_| not_found())?;
+        let empty = ResourceBundle::default();
+        let resources = self.resources.as_ref().unwrap_or(&empty);
+        let resource = resolve_runtime_resource(resources, self.resource_provider.as_deref(), &url)
+            .ok()
+            .flatten()
+            .ok_or_else(not_found)?;
+        let (content, base64_encoded) = encoded_body(resource.body(), resource.mime_type());
+        Ok(json!({ "content": content, "base64Encoded": base64_encoded }))
+    }
+
+    pub(crate) fn inspector_call(&mut self, session: u64, method: &str, params: &Json) -> Answer {
         let answer = match method {
+            _ if method.starts_with("Debugger.") => {
+                return self.debugger_call(session, method, params);
+            }
             "Runtime.evaluate" => return self.inspector_evaluate(params),
             "Runtime.callFunctionOn" => return self.inspector_call_function(params),
             "Runtime.awaitPromise" => {
@@ -180,6 +200,7 @@ impl ScriptRuntime {
                     .retain(|_, (_, held)| held.as_str() != group);
                 Ok(json!({}))
             }
+            "Page.getResourceContent" => self.resource_content(params),
             "Runtime.discardConsoleEntries" => {
                 self.inspector.messages.clear();
                 Ok(json!({}))
@@ -284,7 +305,7 @@ impl ScriptRuntime {
 
     // the console's command line api, as globals for one evaluation where the page has none
     // of its own, given back by name so they can be taken away after
-    fn install_command_line(&mut self) -> Vec<String> {
+    pub(super) fn install_command_line(&mut self) -> Vec<String> {
         let inspected = self.inspector.inspected.clone();
         let mut entries = Vec::new();
         for index in 0..5 {
@@ -368,7 +389,7 @@ impl ScriptRuntime {
             true => self.install_command_line(),
             false => Vec::new(),
         };
-        let outcome = self.evaluate_console_source(source);
+        let outcome = self.evaluate_console_input(source);
         for name in installed {
             self.global.borrow_mut().values.remove(&name);
         }
@@ -431,7 +452,10 @@ impl ScriptRuntime {
         preview: bool,
         await_promise: bool,
     ) -> Answer {
-        if let Err(error) = self.drain_microtasks() {
+        // a paused page runs no jobs until it resumes
+        if !self.debugger_paused()
+            && let Err(error) = self.drain_microtasks()
+        {
             self.report_exception(error);
         }
         match outcome {
@@ -495,6 +519,32 @@ impl ScriptRuntime {
         self.run_script_code(code)
     }
 
+    // typed into a console: a script for its completion value, so a debugger shows the source as
+    // written, or else an expression that may await
+    fn evaluate_console_input(&mut self, source: &str) -> Result<Value, ScriptError> {
+        // a leading brace is an object literal, as chromium's console wraps it
+        let object = source.trim_start().starts_with('{')
+            && parser::parse_function_source(
+                "",
+                &format!(
+                    "return (
+{source}
+)"
+                ),
+                false,
+                false,
+            )
+            .is_ok();
+        let script = match parser::parse_script(source) {
+            Ok(script) if !object => script,
+            _ => return self.evaluate_console_source(source),
+        };
+        let code = compiler::Compiler::new(source)
+            .compile_console_script(&script)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        self.run_script_code(code)
+    }
+
     fn parse_console_source(&mut self, source: &str) -> Result<(), ScriptError> {
         let body = format!("return (\n{source}\n)");
         let expression = [false, true]
@@ -506,7 +556,13 @@ impl ScriptRuntime {
         }
     }
 
-    fn result_json(&mut self, value: &Value, group: &str, by_value: bool, preview: bool) -> Json {
+    pub(super) fn result_json(
+        &mut self,
+        value: &Value,
+        group: &str,
+        by_value: bool,
+        preview: bool,
+    ) -> Json {
         let result = match by_value {
             true => self.value_json(value),
             false => self.remote_object(value, group, preview),
@@ -514,7 +570,7 @@ impl ScriptRuntime {
         json!({ "result": result })
     }
 
-    fn thrown_json(&mut self, thrown: &Value, group: &str) -> Json {
+    pub(super) fn thrown_json(&mut self, thrown: &Value, group: &str) -> Json {
         json!({
             "result": self.remote_object(thrown, group, false),
             "exceptionDetails": self.exception_details(thrown, group, "Uncaught"),
@@ -947,6 +1003,19 @@ impl ScriptRuntime {
             preview["subtype"] = subtype.into();
         }
         preview
+    }
+}
+
+// a body as text when it is text, otherwise in base64
+pub(crate) fn encoded_body(bytes: &[u8], mime: &str) -> (String, bool) {
+    let mime = mime.split(';').next().unwrap_or_default().trim();
+    let text = mime.starts_with("text/")
+        || ["json", "javascript", "ecmascript", "xml", "svg"]
+            .iter()
+            .any(|kind| mime.contains(kind));
+    match std::str::from_utf8(bytes) {
+        Ok(body) if text => (body.to_string(), false),
+        _ => (base64(bytes), true),
     }
 }
 

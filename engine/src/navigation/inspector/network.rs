@@ -3,6 +3,7 @@
 
 use super::{Browser, FRAME_ID, Failure, post};
 use crate::netlog::{self, Exchange};
+use crate::script::encoded_body;
 use serde_json::{Value as Json, json};
 use std::collections::VecDeque;
 
@@ -62,7 +63,7 @@ impl Browser {
                         "No data found for resource with given identifier".into(),
                     )
                 })?;
-                let (body, encoded) = encoded(&reply.body, is_text(&reply.mime));
+                let (body, encoded) = encoded_body(&reply.body, &reply.mime);
                 Ok(json!({ "body": body, "base64Encoded": encoded }))
             }
             "Network.getRequestPostData" => {
@@ -70,7 +71,7 @@ impl Browser {
                 if exchange.post_data.is_empty() {
                     return Err((-32000, "No post data available for the request".into()));
                 }
-                let (data, encoded) = encoded(&exchange.post_data, true);
+                let (data, encoded) = encoded_body(&exchange.post_data, "text/plain");
                 Ok(json!({ "postData": data, "base64Encoded": encoded }))
             }
             _ => Err((-32601, format!("'{method}' wasn't found"))),
@@ -241,21 +242,5 @@ fn status_text(status: u16) -> &'static str {
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "",
-    }
-}
-
-fn is_text(mime: &str) -> bool {
-    let mime = mime.split(';').next().unwrap_or_default().trim();
-    mime.starts_with("text/")
-        || ["json", "javascript", "ecmascript", "xml", "svg"]
-            .iter()
-            .any(|kind| mime.contains(kind))
-}
-
-// a body as text when it is text, otherwise in base64
-fn encoded(bytes: &[u8], text: bool) -> (String, bool) {
-    match std::str::from_utf8(bytes) {
-        Ok(body) if text => (body.to_string(), false),
-        _ => (crate::script::base64(bytes), true),
     }
 }

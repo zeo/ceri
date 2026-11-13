@@ -4,6 +4,7 @@
 
 use super::ScriptError;
 use super::ast::*;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -65,8 +66,10 @@ pub(super) enum Op {
     DeclareGlobal(u32),
     TypeofGlobal(u32),
     DeleteGlobal(u32),
+    // a block scope with the layout at this index of the code's blocks
     PushScope(u16),
     PopScope,
+    Debugger,
     CloneScope,
     This,
     GlobalThis,
@@ -216,7 +219,9 @@ pub(super) struct Code {
     pub(super) children: Vec<Rc<Code>>,
     pub(super) classes: Vec<Rc<ClassTemplate>>,
     pub(super) templates: Vec<TemplateSite>,
-    pub(super) scope_size: u16,
+    // the names of the function scope's slots, and of each block scope's
+    pub(super) layout: Rc<[Name]>,
+    pub(super) blocks: Vec<Rc<[Name]>>,
     pub(super) param_slots: Vec<Option<u16>>,
     pub(super) kind: FunctionKind,
     pub(super) is_async: bool,
@@ -225,8 +230,14 @@ pub(super) struct Code {
     pub(super) name: Name,
     pub(super) length: u32,
     pub(super) source: Option<(Rc<str>, usize, usize)>,
+    // the whole source this was compiled from, and where in it each statement's ops start, as
+    // (op index, byte offset) pairs in op order
+    pub(super) text: Rc<str>,
+    pub(super) positions: Box<[(u32, u32)]>,
+    // how many debugger breakpoints sit in these ops
+    pub(super) breakpoints: Cell<u32>,
     // a named function expression sees its own name in an enclosing one-slot scope
-    pub(super) self_named: bool,
+    pub(super) self_scope: Option<Rc<[Name]>>,
     // simple parameter lists bind straight into slots; others run destructuring code
     pub(super) simple_params: bool,
 }
@@ -275,6 +286,8 @@ struct ScopeInfo {
     materialized: bool,
     // the hidden slot holding a with statement's object
     with_object: Option<Name>,
+    // a materialized block's index in the function's blocks
+    block: u16,
 }
 
 impl ScopeInfo {
@@ -285,7 +298,17 @@ impl ScopeInfo {
             size: 0,
             materialized,
             with_object: None,
+            block: 0,
         }
+    }
+
+    // the scope's names in slot order
+    fn layout(&self) -> Rc<[Name]> {
+        let mut names = vec![Name::from(""); self.size as usize];
+        for (name, binding) in &self.bindings {
+            names[binding.index as usize] = name.clone();
+        }
+        names.into()
     }
 
     fn declare(&mut self, name: Name, kind: BindingKind) -> u16 {
@@ -325,6 +348,8 @@ struct FunctionState {
     classes: Vec<Rc<ClassTemplate>>,
     templates: Vec<TemplateSite>,
     scopes: Vec<ScopeInfo>,
+    blocks: Vec<Rc<[Name]>>,
+    positions: Vec<(u32, u32)>,
     is_arrow: bool,
     // global script code: top-level declarations live in the global environment
     is_global: bool,
@@ -353,6 +378,8 @@ impl FunctionState {
             classes: Vec::new(),
             templates: Vec::new(),
             scopes: Vec::new(),
+            blocks: Vec::new(),
+            positions: Vec::new(),
             is_arrow,
             is_global,
             targets: Vec::new(),
@@ -851,7 +878,7 @@ impl Compiler {
         }
         self.emit(Op::Return);
         let state = self.functions.pop().expect("script state");
-        let scope_size = state.scopes[0].size;
+        let layout = state.scopes[0].layout();
         let mut code = self.finish(
             state,
             None,
@@ -864,7 +891,7 @@ impl Compiler {
             true,
             Vec::new(),
         );
-        code.scope_size = scope_size;
+        code.layout = layout;
         Ok(Rc::new(code))
     }
 
@@ -988,6 +1015,30 @@ impl Compiler {
         Ok(code)
     }
 
+    // a function that sees the names of a paused frame's scopes, given outermost first in slot
+    // order, as a closure over that frame's innermost scope does
+    pub(super) fn compile_function_within(
+        mut self,
+        function: &FunctionNode,
+        layers: &[Rc<[Name]>],
+    ) -> Result<Rc<Code>, ScriptError> {
+        self.functions.push(FunctionState::new(false, true, false));
+        for names in layers {
+            let mut scope = ScopeInfo::new(ScopeKind::Outer, true);
+            for (slot, name) in names.iter().enumerate() {
+                let name = match name.is_empty() {
+                    true => Name::from(format!("%slot{slot}").as_str()),
+                    false => name.clone(),
+                };
+                scope.declare(name, BindingKind::Let);
+            }
+            self.state().scopes.push(scope);
+        }
+        let code = self.build_function(function)?;
+        self.functions.pop();
+        Ok(code)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
@@ -1002,15 +1053,13 @@ impl Compiler {
         simple_params: bool,
         param_slots: Vec<Option<u16>>,
     ) -> Code {
-        let scope_size = if state.is_global {
-            0
-        } else {
-            state
+        let layout = match state.is_global {
+            true => Rc::from([]),
+            false => state
                 .scopes
                 .iter()
                 .find(|scope| scope.kind == ScopeKind::Function)
-                .map(|scope| scope.size)
-                .unwrap_or(0)
+                .map_or_else(|| Rc::from([]), ScopeInfo::layout),
         };
         let mut ops = state.ops;
         // the prologue reserves four slots that only become real when an arrow needed them
@@ -1034,7 +1083,8 @@ impl Compiler {
             children: state.children,
             classes: state.classes,
             templates: state.templates,
-            scope_size,
+            layout,
+            blocks: state.blocks,
             param_slots,
             kind,
             is_async,
@@ -1043,7 +1093,10 @@ impl Compiler {
             name: name.into(),
             length,
             source: source.map(|(start, end)| (self.source.clone(), start, end)),
-            self_named,
+            text: self.source.clone(),
+            positions: state.positions.into(),
+            breakpoints: Cell::new(0),
+            self_scope: self_named.then(|| Rc::from([Name::from(name)])),
             simple_params,
         }
     }
@@ -1068,21 +1121,25 @@ impl Compiler {
         for (name, kind) in declarations {
             scope.declare(name.clone(), *kind);
         }
-        let size = scope.size;
-        self.state().scopes.push(scope);
         if materialized {
-            self.emit(Op::PushScope(size));
-            self.state().runtime_scopes += 1;
+            let state = self.state();
+            scope.block = state.blocks.len() as u16;
+            state.blocks.push(scope.layout());
+            state.emit(Op::PushScope(scope.block));
+            state.runtime_scopes += 1;
         }
+        self.state().scopes.push(scope);
         materialized
     }
 
     fn pop_block_scope(&mut self) {
-        let scope = self.state().scopes.pop().expect("a block scope is open");
+        let state = self.state();
+        let scope = state.scopes.pop().expect("a block scope is open");
         if scope.materialized {
             // a block scope can grow after it was opened, as temporaries are added
-            self.emit(Op::PopScope);
-            self.state().runtime_scopes -= 1;
+            state.blocks[scope.block as usize] = scope.layout();
+            state.emit(Op::PopScope);
+            state.runtime_scopes -= 1;
         }
     }
 
@@ -1397,9 +1454,24 @@ impl Compiler {
     }
 
     fn compile_statement(&mut self, statement: &Stmt) -> Result<(), ScriptError> {
+        if let Stmt::Position(offset) = statement {
+            let state = self.state();
+            let at = state.here();
+            // a statement that left no ops, such as a hoisted declaration, gives its place to
+            // the next one
+            match state.positions.last_mut() {
+                Some(last) if last.0 == at => last.1 = *offset as u32,
+                _ => state.positions.push((at, *offset as u32)),
+            }
+            return Ok(());
+        }
         let labels = std::mem::take(&mut self.state().pending_labels);
         match statement {
-            Stmt::Empty | Stmt::Debugger | Stmt::Function(_) => Ok(()),
+            Stmt::Empty | Stmt::Function(_) | Stmt::Position(_) => Ok(()),
+            Stmt::Debugger => {
+                self.emit(Op::Debugger);
+                Ok(())
+            }
             Stmt::Expression(expression) => {
                 self.compile_expression(expression)?;
                 self.emit(Op::Pop);
@@ -2159,7 +2231,7 @@ impl Compiler {
 
     fn compile_function_value(&mut self, function: &Rc<FunctionNode>) -> Result<(), ScriptError> {
         let code = self.build_function(function)?;
-        let named_expression = code.self_named;
+        let named_expression = code.self_scope.is_some();
         let state = self.state();
         let index = state.children.len() as u32;
         state.children.push(code);

@@ -9,6 +9,7 @@ mod compiler;
 mod console;
 mod custom;
 mod dates;
+mod debugger;
 mod dialogs;
 mod encoding;
 mod events;
@@ -50,9 +51,10 @@ use realm::{Intrinsics, Native, create_intrinsics};
 pub use bridge::HostBridge;
 pub(crate) use canvas::{base64, canvas_size};
 pub use dates::TimeZone;
+pub(crate) use debugger::{Incoming, PauseSource, SharedDebug};
 pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
-pub(crate) use inspector::{Answer, NodeArgument, NodeCall};
+pub(crate) use inspector::{Answer, FRAME_ID, NodeArgument, NodeCall, encoded_body};
 pub(crate) use websocket::accept_key;
 
 use crate::Color;
@@ -586,6 +588,7 @@ pub struct ScriptRuntime {
     random_state: u64,
     console_depth: usize,
     inspector: inspector::Inspector,
+    debugger: debugger::Debugger,
     console_timers: HashMap<String, u64>,
     console_counts: HashMap<String, u64>,
     // wall-clock milliseconds when the page clock started
@@ -1636,6 +1639,7 @@ impl ScriptRuntime {
             random_state: numbers::random_seed(),
             console_depth: 0,
             inspector: inspector::Inspector::new(),
+            debugger: debugger::Debugger::default(),
             console_timers: HashMap::new(),
             console_counts: HashMap::new(),
             time_origin: std::time::SystemTime::now()
@@ -2032,6 +2036,7 @@ impl ScriptRuntime {
     pub fn execute(&mut self, source: &str) -> Result<(), ScriptError> {
         let script = parser::parse_script(source)?;
         let code = compiler::Compiler::new(source).compile_script(&script)?;
+        self.register_script(&code, "", false);
         let outcome = self.run_script_code(code);
         if outcome.is_err() {
             self.pending_exception = None;
@@ -2072,7 +2077,11 @@ impl ScriptRuntime {
     pub(crate) fn execute_reporting(&mut self, source: &str) -> Result<(), ScriptError> {
         let outcome = parser::parse_script(source)
             .and_then(|script| compiler::Compiler::new(source).compile_script(&script))
-            .and_then(|code| self.run_script_code(code));
+            .and_then(|code| {
+                self.register_script(&code, "", false);
+                self.run_script_code(code)
+            });
+        self.clear_script_origin();
         if let Err(error) = outcome {
             self.report_exception(error);
         }
@@ -2086,7 +2095,9 @@ impl ScriptRuntime {
         url: AppUrl,
         loader: &mut L,
     ) -> Result<(), ScriptError> {
-        if let Err(error) = self.execute_module_graph(source, url, loader) {
+        let outcome = self.execute_module_graph(source, url, loader);
+        self.clear_script_origin();
+        if let Err(error) = outcome {
             self.report_exception(error);
         }
         self.drain_microtasks()

@@ -73,7 +73,8 @@ impl ScriptRuntime {
         let key = url.to_string();
         let module = parser::parse_module(source)?;
         let mut module = compiler::Compiler::new(source).compile_module(&module)?;
-        let scope = vm::Scope::new(module.code.scope_size as usize, None);
+        self.register_script(&module.code, &key, true);
+        let scope = vm::Scope::new(module.code.layout.clone(), None);
         // an import exported again is resolved through the module it came from, since this
         // module's slot only receives that binding once it links
         let mut exports = Vec::new();

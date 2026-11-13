@@ -81,6 +81,8 @@ pub(super) enum Stmt {
         finalizer: Option<Vec<Stmt>>,
     },
     Debugger,
+    // where the statement after it starts in the source, for a debugger's breakpoints
+    Position(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]

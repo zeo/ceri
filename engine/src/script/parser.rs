@@ -214,11 +214,14 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         while !self.at_eof()? {
             if self.is_word("import")? && !matches!(self.peek_punct_at(1)?, Some("(" | ".")) {
+                items.push(ModuleItem::Statement(Stmt::Position(self.offset()?)));
                 items.push(ModuleItem::Import(self.parse_import()?));
             } else if self.is_word("export")? {
+                items.push(ModuleItem::Statement(Stmt::Position(self.offset()?)));
                 self.advance()?;
                 items.extend(self.parse_export()?);
             } else {
+                items.push(ModuleItem::Statement(Stmt::Position(self.offset()?)));
                 items.push(ModuleItem::Statement(self.parse_statement_list_item()?));
             }
         }
@@ -466,9 +469,15 @@ impl<'a> Parser<'a> {
                     in_prologue = false;
                 }
             }
-            body.push(self.parse_statement_list_item()?);
+            self.parse_list_item(&mut body)?;
         }
         Ok((body, strict))
+    }
+
+    fn parse_list_item(&mut self, body: &mut Vec<Stmt>) -> Result<(), ScriptError> {
+        body.push(Stmt::Position(self.offset()?));
+        body.push(self.parse_statement_list_item()?);
+        Ok(())
     }
 
     fn parse_statement_list_item(&mut self) -> Result<Stmt, ScriptError> {
@@ -719,7 +728,7 @@ impl<'a> Parser<'a> {
             if self.at_eof()? {
                 return Err(self.error_here("expected } before the end of input"));
             }
-            body.push(self.parse_statement_list_item()?);
+            self.parse_list_item(&mut body)?;
         }
         self.advance()?;
         Ok(body)
@@ -854,7 +863,7 @@ impl<'a> Parser<'a> {
                 if self.at_eof()? {
                     return Err(self.error_here("unterminated switch"));
                 }
-                body.push(self.parse_statement_list_item()?);
+                self.parse_list_item(&mut body)?;
             }
             cases.push(SwitchCase { test, body });
         }
@@ -1227,7 +1236,10 @@ impl<'a> Parser<'a> {
             self.context.strict = strict;
             body
         } else {
-            vec![Stmt::Return(Some(self.parse_assignment(allow_in)?))]
+            vec![
+                Stmt::Position(self.offset()?),
+                Stmt::Return(Some(self.parse_assignment(allow_in)?)),
+            ]
         };
         let strict = self.context.strict;
         self.context = saved;
@@ -2169,7 +2181,7 @@ impl<'a> Parser<'a> {
                     name: Self::key_name(&key),
                     params: Vec::new(),
                     rest: None,
-                    body: vec![Stmt::Return(Some(value))],
+                    body: vec![Stmt::Position(value_start), Stmt::Return(Some(value))],
                     kind: FunctionKind::Method,
                     is_async: false,
                     is_generator: false,
@@ -2457,9 +2469,11 @@ mod tests {
     use super::*;
 
     fn script(source: &str) -> Vec<Stmt> {
-        parse_script(source)
+        let mut body = parse_script(source)
             .unwrap_or_else(|error| panic!("{source}: {} at {}", error.message, error.offset))
-            .body
+            .body;
+        body.retain(|statement| !matches!(statement, Stmt::Position(_)));
+        body
     }
 
     fn expression(source: &str) -> Expr {
@@ -2562,8 +2576,13 @@ mod tests {
         let Stmt::Function(function) = &body[3] else {
             panic!("function declaration");
         };
-        assert_eq!(function.body.len(), 2);
-        assert!(matches!(function.body[0], Stmt::Return(None)));
+        let statements: Vec<_> = function
+            .body
+            .iter()
+            .filter(|statement| !matches!(statement, Stmt::Position(_)))
+            .collect();
+        assert_eq!(statements.len(), 2);
+        assert!(matches!(statements[0], Stmt::Return(None)));
         fails("a b");
         fails("throw\nerror");
     }
@@ -2660,7 +2679,7 @@ mod tests {
 
     #[test]
     fn modules_parse_every_import_and_export_form() {
-        let module = parse_module(
+        let mut module = parse_module(
             "import a, { b as c, default as d } from './x.js'; import * as ns from './y.js'; import './z.js';
              import json from './data.json' with { type: 'json' };
              export const e = 1, f = 2; export function g() {} export class H {}
@@ -2669,6 +2688,9 @@ mod tests {
              const top = await import('./late.js'); console.log(import.meta.url);",
         )
         .unwrap_or_else(|error| panic!("{} at {}", error.message, error.offset));
+        module
+            .items
+            .retain(|item| !matches!(item, ModuleItem::Statement(Stmt::Position(_))));
         assert_eq!(module.items.len(), 14);
         assert!(
             matches!(&module.items[0], ModuleItem::Import(import) if import.bindings.len() == 3)

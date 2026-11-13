@@ -6,6 +6,10 @@ use crate::navigation::{
 };
 use crate::paint::Canvas;
 pub use crate::script::KeyModifiers;
+use crate::script::{Incoming, PauseSource};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -398,6 +402,12 @@ fn run_live_engine_worker(
     notify: Waker,
     page: Option<Arc<Mutex<crate::devtools::PageInfo>>>,
 ) {
+    let commands = Rc::new(commands);
+    let queued = Rc::new(RefCell::new(VecDeque::new()));
+    host.browser.set_pause_source(Rc::new(PausedQueue {
+        commands: commands.clone(),
+        queued: queued.clone(),
+    }));
     let send = |event| {
         let sent = events.send(event).is_ok();
         notify();
@@ -421,7 +431,7 @@ fn run_live_engine_worker(
             .map(|delay| Duration::from_millis(delay.max(1)));
         let wait = wake.into_iter().chain(slot).min();
         hold_fine_timer(&mut fine_timer, wait.is_some_and(|wait| wait < frame * 2));
-        let command = match held.take() {
+        let command = match held.take().or_else(|| queued.borrow_mut().pop_front()) {
             Some(command) => Some(command),
             None => match wait {
                 Some(delay) => match commands.recv_timeout(delay) {
@@ -542,6 +552,67 @@ fn hold_fine_timer(held: &mut bool, wanted: bool) {
 
 #[cfg(not(all(target_os = "windows", feature = "windowed")))]
 fn hold_fine_timer(_: &mut bool, _: bool) {}
+
+// the worker's queue as a page paused in its debugger reads it: devtools messages go to the
+// debugger and the rest waits in order for the page to run again
+struct PausedQueue {
+    commands: Rc<Receiver<EngineWorkerCommand>>,
+    queued: Rc<RefCell<VecDeque<EngineWorkerCommand>>>,
+}
+
+impl PausedQueue {
+    fn sort(&self, command: EngineWorkerCommand) -> Option<Incoming> {
+        use crate::devtools::Inbound;
+        let command = match command {
+            EngineWorkerCommand::Inspector(Inbound::Message { session, text }) => {
+                return Some(Incoming::Message { session, text });
+            }
+            command => command,
+        };
+        let incoming = match &command {
+            EngineWorkerCommand::Inspector(Inbound::Detach { session }) => {
+                Some(Incoming::Detached(*session))
+            }
+            EngineWorkerCommand::Shutdown => Some(Incoming::Closed),
+            _ => None,
+        };
+        let mut queued = self.queued.borrow_mut();
+        match queued.back_mut() {
+            Some(last) if is_pointer_move(last) && is_pointer_move(&command) => *last = command,
+            _ => queued.push_back(command),
+        }
+        incoming
+    }
+}
+
+impl PauseSource for PausedQueue {
+    fn next(&self) -> Incoming {
+        loop {
+            let Ok(command) = self.commands.recv() else {
+                return Incoming::Closed;
+            };
+            if let Some(incoming) = self.sort(command) {
+                return incoming;
+            }
+        }
+    }
+
+    fn poll(&self) -> Option<Incoming> {
+        while let Ok(command) = self.commands.try_recv() {
+            if let Some(incoming) = self.sort(command) {
+                return Some(incoming);
+            }
+        }
+        None
+    }
+
+    fn defer(&self, session: u64, text: String) {
+        let message = crate::devtools::Inbound::Message { session, text };
+        self.queued
+            .borrow_mut()
+            .push_back(EngineWorkerCommand::Inspector(message));
+    }
+}
 
 fn is_pointer_move(command: &EngineWorkerCommand) -> bool {
     matches!(

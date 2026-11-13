@@ -1613,8 +1613,10 @@ impl Browser {
             runtime.set_locale(locale.clone());
         }
         runtime.set_viewport_metrics(self.viewport);
-        if crate::devtools_serving() || self.inspection.attached() {
+        let inspecting = crate::devtools_serving() || self.inspection.attached();
+        if inspecting {
             runtime.capture_console();
+            runtime.set_debugger(self.inspection.debug.clone());
         }
         for failure in failed_sheets {
             runtime.report(failure);
@@ -1635,7 +1637,11 @@ impl Browser {
                 .set_history_state_serialized(state)
                 .map_err(|error| NavigationError::Script(error.to_string()))?;
         }
-        self.execute_scripts(&url, &script_sources, &policies, &mut runtime);
+        let html = inspecting.then_some(source.as_str());
+        if inspecting {
+            self.announce_document(&url, &runtime);
+        }
+        self.execute_scripts(&url, html, &script_sources, &policies, &mut runtime);
         if let Err(error) = runtime.apply_autofocus() {
             let error = NavigationError::Script(error.to_string());
             let status = recovery_status(&error);
@@ -3290,9 +3296,12 @@ impl Browser {
 
     // a script that fails to load or run is reported and the rest of the page goes on, as in
     // browsers
+    // html is the document's source while a debugger may want to know where in it each
+    // script was written
     fn execute_scripts(
         &self,
         base: &AppUrl,
+        html: Option<&str>,
         sources: &[(Option<String>, ScriptSource)],
         policies: &Policies,
         runtime: &mut ScriptRuntime,
@@ -3302,16 +3311,38 @@ impl Browser {
             provider: self.resource_provider.as_deref(),
             policies,
         };
+        let mut cursor = 0;
         for (nonce, source) in sources {
             let element = Initiator {
                 nonce: nonce.as_deref(),
                 parser_inserted: true,
             };
+            if let Some(html) = html {
+                let origin = match source {
+                    ScriptSource::Inline(text) | ScriptSource::InlineModule(text) => html
+                        .get(cursor..)
+                        .and_then(|rest| rest.find(text.as_str()))
+                        .map(|found| {
+                            cursor += found + text.len();
+                            let (line, column) = place_in(html, cursor - text.len());
+                            (base.to_string(), line, column)
+                        }),
+                    ScriptSource::External(reference) => base
+                        .resolve(reference)
+                        .ok()
+                        .map(|url| (url.to_string(), 0, 0)),
+                    _ => None,
+                };
+                if let Some((url, line, column)) = origin {
+                    runtime.set_script_origin(url, line, column);
+                }
+            }
             if let Err(error) =
                 self.execute_script(base, source, element, &mut module_loader, runtime)
             {
                 runtime.report(format!("script failed to load: {error}"));
             }
+            runtime.clear_script_origin();
         }
     }
 
@@ -3583,6 +3614,16 @@ fn load_sheet(
             Ok(Some(expand_imports(load, text, &url, 0, policies)))
         }
     }
+}
+
+// a byte offset in a document as the devtools protocol's zero-based line and UTF-16 column
+fn place_in(html: &str, offset: usize) -> (u32, u32) {
+    let before = &html[..offset];
+    let line = before.matches('\n').count() + before.matches('\r').count()
+        - before.matches("\r\n").count();
+    let start = before.rfind(['\n', '\r']).map_or(0, |found| found + 1);
+    let column = before[start..].encode_utf16().count();
+    (line as u32, column as u32)
 }
 
 fn joined_sheets(sheets: &[(SheetSource, String)]) -> String {

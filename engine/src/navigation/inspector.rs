@@ -1,5 +1,5 @@
-// devtools protocol sessions on a browser's page: the Page domain here, the Runtime domain
-// routed to the page's script runtime, the DOM, Overlay, CSS and Network domains in their own
+// devtools protocol sessions on a browser's page: the Page domain here, the Runtime and Debugger
+// domains routed to the page's script runtime, the DOM, Overlay, CSS and Network domains in their own
 // modules, and the events they owe each session
 
 mod dom;
@@ -7,13 +7,12 @@ mod network;
 mod overlay;
 mod styles;
 
-use super::{Browser, NavigationError, Size};
+use super::{AppUrl, Browser, NavigationError, Size};
 use crate::dom::NodeId;
-use crate::script::Answer;
+use crate::script::{Answer, FRAME_ID, PauseSource, ScriptRuntime, SharedDebug};
 use serde_json::{Value as Json, json};
+use std::rc::Rc;
 use std::sync::mpsc::Sender;
-
-const FRAME_ID: &str = "ceri-main-frame";
 
 // a protocol error's code and message
 type Failure = (i64, String);
@@ -26,6 +25,8 @@ pub(super) struct Inspection {
     picking: Option<overlay::Picking>,
     sheets: styles::Sheets,
     network: network::Kept,
+    // the debugger's sessions and breakpoints, which outlive each page's runtime
+    pub(super) debug: SharedDebug,
 }
 
 impl Inspection {
@@ -79,7 +80,16 @@ impl Browser {
         });
     }
 
+    // where a page paused in its debugger reads the window's devtools messages
+    pub(crate) fn set_pause_source(&mut self, source: Rc<dyn PauseSource>) {
+        self.inspection.debug.borrow_mut().set_source(source);
+    }
+
     pub fn detach_inspector(&mut self, session: u64) {
+        match &mut self.page {
+            Some(page) => page.runtime.debugger_detached(session),
+            None => self.inspection.debug.borrow_mut().forget(session),
+        }
         self.inspection.sessions.retain(|held| held.id != session);
         self.inspection
             .waiting
@@ -237,25 +247,21 @@ impl Browser {
                 }
                 None => Some(Err((-32602, "Invalid parameters: url".to_string()))),
             },
-            method if method.starts_with("Runtime.") => match &mut self.page {
-                Some(page) => match page.runtime.inspector_call(method, params) {
-                    Answer::Now(answer) => Some(answer.map_err(|message| (-32000, message))),
-                    Answer::Later(token) => {
-                        self.inspection.waiting.push(Waiting {
-                            context: page.runtime.inspector_context(),
-                            token,
-                            session,
-                            id,
-                        });
-                        None
+            method
+                if method.starts_with("Runtime.")
+                    || method.starts_with("Debugger.")
+                    || method == "Page.getResourceContent" =>
+            {
+                if method == "Debugger.enable" {
+                    // the context the scripts belong to is announced before them
+                    self.flush_inspector();
+                    if let Some(held) = self.session(session) {
+                        let outgoing = held.outgoing.clone();
+                        self.inspection.debug.borrow_mut().enable(session, outgoing);
                     }
-                    Answer::Unknown => Some(Err((-32601, format!("'{method}' wasn't found")))),
-                },
-                None => Some(Err((
-                    -32000,
-                    "Cannot find default execution context".into(),
-                ))),
-            },
+                }
+                self.answer_runtime(session, id, method, params)
+            }
             method if method.starts_with("Overlay.") => {
                 let Self {
                     inspection, page, ..
@@ -320,6 +326,44 @@ impl Browser {
         navigate
     }
 
+    fn answer_runtime(
+        &mut self,
+        session: u64,
+        id: u64,
+        method: &str,
+        params: &Json,
+    ) -> Option<Result<Json, Failure>> {
+        let Some(page) = &mut self.page else {
+            return Some(Err((
+                -32000,
+                "Cannot find default execution context".into(),
+            )));
+        };
+        match page.runtime.inspector_call(session, method, params) {
+            Answer::Now(answer) => Some(answer.map_err(|message| (-32000, message))),
+            Answer::Later(token) => {
+                self.inspection.waiting.push(Waiting {
+                    context: page.runtime.inspector_context(),
+                    token,
+                    session,
+                    id,
+                });
+                None
+            }
+            Answer::Unknown => Some(Err((-32601, format!("'{method}' wasn't found")))),
+        }
+    }
+
+    // tells the sessions of a document about to run its scripts, so its frame and context reach
+    // them before the scripts it parses and any pause in those
+    pub(super) fn announce_document(&mut self, url: &AppUrl, runtime: &ScriptRuntime) {
+        let frame = self.frame_at(Some(url), self.next_document_id);
+        let context = runtime.inspector_context();
+        for session in &mut self.inspection.sessions {
+            enter_context(session, context, &frame);
+        }
+    }
+
     // sends each session what changed since the last call: a new document's context, console
     // entries, and answers whose promises settled
     pub fn flush_inspector(&mut self) {
@@ -327,13 +371,21 @@ impl Browser {
             return;
         }
         let frame = self.frame();
-        let origin = frame["securityOrigin"].clone();
         let url = self.document_url();
         let Some(page) = &mut self.page else {
             return;
         };
         let context = page.runtime.inspector_context();
         let inspection = &mut self.inspection;
+        let paused = inspection.debug.borrow_mut().take_waiting();
+        for (session, id, token) in paused {
+            inspection.waiting.push(Waiting {
+                context,
+                token,
+                session,
+                id,
+            });
+        }
         overlay::refresh(&mut inspection.highlight, page);
         for settled in page.runtime.inspector_settled() {
             let (token, answer) = settled;
@@ -360,40 +412,7 @@ impl Browser {
         });
         for session in &mut inspection.sessions {
             if session.context != Some(context) {
-                let old = session.context.replace(context);
-                if session.page && old.is_some() {
-                    post(
-                        session,
-                        "Page.frameNavigated",
-                        json!({ "frame": frame, "type": "Navigation" }),
-                    );
-                }
-                if session.runtime {
-                    if let Some(old) = old {
-                        post(
-                            session,
-                            "Runtime.executionContextDestroyed",
-                            json!({ "executionContextId": old, "executionContextUniqueId": old.to_string() }),
-                        );
-                        post(session, "Runtime.executionContextsCleared", json!({}));
-                    }
-                    post(
-                        session,
-                        "Runtime.executionContextCreated",
-                        json!({ "context": {
-                            "id": context,
-                            "origin": origin,
-                            "name": "",
-                            "uniqueId": context.to_string(),
-                            "auxData": { "isDefault": true, "type": "default", "frameId": FRAME_ID },
-                        }}),
-                    );
-                    session.seen = 0;
-                }
-                if session.dom.active() {
-                    post(session, "DOM.documentUpdated", json!({}));
-                }
-                session.dom = dom::Mirror::default();
+                enter_context(session, context, &frame);
             }
             let mut events = Vec::new();
             session
@@ -438,19 +457,63 @@ impl Browser {
     }
 
     fn frame(&self) -> Json {
-        let origin = self.current_url.as_ref().map_or("null", |url| url.origin());
+        self.frame_at(
+            self.current_url.as_ref(),
+            self.current_document_id.unwrap_or_default(),
+        )
+    }
+
+    fn frame_at(&self, url: Option<&AppUrl>, loader: u64) -> Json {
         json!({
             "id": FRAME_ID,
-            "loaderId": self.loader(),
-            "url": self.document_url(),
+            "loaderId": loader.to_string(),
+            "url": url.map_or_else(|| "about:blank".to_string(), ToString::to_string),
             "domainAndRegistry": "",
-            "securityOrigin": origin,
+            "securityOrigin": url.map_or("null", |url| url.origin()),
             "mimeType": "text/html",
             "secureContextType": "Secure",
             "crossOriginIsolatedContextType": "NotIsolated",
             "gatedAPIFeatures": [],
         })
     }
+}
+
+// the session's view moves to a new document: its frame, its context and an empty DOM
+fn enter_context(session: &mut Session, context: u64, frame: &Json) {
+    let old = session.context.replace(context);
+    if session.page && old.is_some() {
+        post(
+            session,
+            "Page.frameNavigated",
+            json!({ "frame": frame, "type": "Navigation" }),
+        );
+    }
+    if session.runtime {
+        if let Some(old) = old {
+            post(
+                session,
+                "Runtime.executionContextDestroyed",
+                json!({ "executionContextId": old, "executionContextUniqueId": old.to_string() }),
+            );
+            post(session, "Runtime.executionContextsCleared", json!({}));
+        }
+        post(
+            session,
+            "Runtime.executionContextCreated",
+            json!({ "context": {
+                "id": context,
+                "origin": frame["securityOrigin"],
+                "name": "",
+                "uniqueId": context.to_string(),
+                "auxData": { "isDefault": true, "type": "default", "frameId": FRAME_ID },
+            }}),
+        );
+        session.seen = 0;
+    }
+    if session.dom.active() {
+        post(session, "DOM.documentUpdated", json!({}));
+    }
+    session.dom = dom::Mirror::default();
 }
 
 fn post(session: &Session, method: &str, params: Json) {
@@ -472,6 +535,9 @@ fn error(id: u64, code: i64, message: &str) -> Json {
 mod tests {
     use super::*;
     use crate::navigation::ResourceBundle;
+    use crate::script::Incoming;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::mpsc::{self, Receiver};
 
     fn inspected(page: &str) -> (Browser, Receiver<String>) {
@@ -677,10 +743,16 @@ mod tests {
             json!({ "objectId": object }),
         );
         assert_eq!(sent[0]["error"]["code"], -32000);
-        let sent = call(&mut browser, &messages, 7, "Debugger.enable", json!({}));
+        let sent = call(
+            &mut browser,
+            &messages,
+            7,
+            "Runtime.queryObjects",
+            json!({}),
+        );
         assert_eq!(
             sent[0]["error"],
-            json!({ "code": -32601, "message": "'Debugger.enable' wasn't found" })
+            json!({ "code": -32601, "message": "'Runtime.queryObjects' wasn't found" })
         );
     }
 
@@ -1415,5 +1487,323 @@ mod tests {
             params,
         );
         assert_eq!(sent[0]["error"]["code"], -32000);
+    }
+
+    const DEBUGGED: &str = "<!doctype html>\n<script>\nvar a = 1;\nfunction f(x) {\n  let y = x + 1;\n\n  return y;\n}\n</script>\n<script src=/app.js></script>";
+
+    fn debugged() -> (Browser, Receiver<String>) {
+        let mut resources = ResourceBundle::default();
+        for (path, mime, body) in [
+            ("/index.html", "text/html; charset=utf-8", DEBUGGED),
+            ("/app.js", "text/javascript", "window.b = f(1);\n"),
+        ] {
+            resources
+                .insert(path, mime, body.as_bytes())
+                .expect("resource");
+        }
+        let mut browser = Browser::new(resources);
+        let (outgoing, messages) = mpsc::channel();
+        browser.attach_inspector(1, outgoing);
+        browser.navigate("https://app.ceri.invalid/").expect("load");
+        browser.flush_inspector();
+        received(&messages);
+        (browser, messages)
+    }
+
+    // a window's queue as a test lays it out: what a paused page reads, in order
+    #[derive(Default)]
+    struct Scripted {
+        incoming: RefCell<VecDeque<Incoming>>,
+        deferred: RefCell<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn queue(&self, id: u64, method: &str, params: Json) {
+            let text = json!({ "id": id, "method": method, "params": params }).to_string();
+            self.incoming
+                .borrow_mut()
+                .push_back(Incoming::Message { session: 1, text });
+        }
+    }
+
+    impl PauseSource for Scripted {
+        fn next(&self) -> Incoming {
+            self.incoming
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Incoming::Closed)
+        }
+
+        fn poll(&self) -> Option<Incoming> {
+            None
+        }
+
+        fn defer(&self, _: u64, text: String) {
+            self.deferred.borrow_mut().push(text);
+        }
+    }
+
+    fn located(frame: &Json) -> (u64, u64) {
+        let location = &frame["location"];
+        (
+            location["lineNumber"].as_u64().unwrap(),
+            location["columnNumber"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn scripts_are_reported_where_the_page_wrote_them_and_breakpoints_land_on_statements() {
+        let (mut browser, messages) = debugged();
+        call(&mut browser, &messages, 9, "Runtime.enable", json!({}));
+        let sent = call(&mut browser, &messages, 1, "Debugger.enable", json!({}));
+        let parsed = named(&sent, "Debugger.scriptParsed");
+        let page = "https://app.ceri.invalid/";
+        assert_eq!(parsed.len(), 2, "{sent:?}");
+        assert_eq!(parsed[0]["url"], page);
+        assert_eq!([&parsed[0]["startLine"], &parsed[0]["startColumn"]], [1, 8]);
+        assert_eq!([&parsed[0]["endLine"], &parsed[0]["endColumn"]], [8, 0]);
+        assert_eq!(parsed[1]["url"], "https://app.ceri.invalid/app.js");
+        assert_eq!(parsed[1]["startLine"], 0);
+        let context = browser.page.as_ref().unwrap().runtime.inspector_context();
+        assert!(
+            parsed
+                .iter()
+                .all(|params| params["executionContextId"] == context)
+        );
+        assert!(result(&sent, 1)["debuggerId"].is_string());
+        let script = parsed[0]["scriptId"].clone();
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            2,
+            "Debugger.getScriptSource",
+            json!({ "scriptId": script }),
+        );
+        let text = &DEBUGGED[24..DEBUGGED.find("</script>").unwrap()];
+        assert_eq!(result(&sent, 2)["scriptSource"], text);
+        let page_content = json!({ "frameId": FRAME_ID, "url": page });
+        let sent = call(
+            &mut browser,
+            &messages,
+            6,
+            "Page.getResourceContent",
+            page_content,
+        );
+        assert_eq!(
+            *result(&sent, 6),
+            json!({ "content": DEBUGGED, "base64Encoded": false })
+        );
+
+        let range = json!({
+            "start": { "scriptId": script, "lineNumber": 3, "columnNumber": 0 },
+            "end": { "scriptId": script, "lineNumber": 7, "columnNumber": 0 },
+        });
+        let sent = call(
+            &mut browser,
+            &messages,
+            3,
+            "Debugger.getPossibleBreakpoints",
+            range,
+        );
+        let places: Vec<_> = result(&sent, 3)["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|location| {
+                (
+                    location["lineNumber"].as_u64().unwrap(),
+                    location["columnNumber"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(places, [(3, 0), (4, 2), (6, 2)]);
+
+        let by_url = json!({ "url": page, "lineNumber": 5 });
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "Debugger.setBreakpointByUrl",
+            by_url.clone(),
+        );
+        let set = result(&sent, 4);
+        assert_eq!(set["breakpointId"], format!("1:5:0:{page}"));
+        assert_eq!(located(&json!({ "location": set["locations"][0] })), (6, 2));
+        let sent = call(
+            &mut browser,
+            &messages,
+            5,
+            "Debugger.setBreakpointByUrl",
+            by_url,
+        );
+        assert_eq!(sent[0]["error"]["code"], -32000);
+
+        // a reload parses the scripts again and the breakpoint follows them
+        browser.navigate(page).expect("reload");
+        browser.flush_inspector();
+        let sent = received(&messages);
+        let methods: Vec<_> = sent
+            .iter()
+            .filter_map(|message| message["method"].as_str())
+            .collect();
+        let first_parse = methods
+            .iter()
+            .position(|method| *method == "Debugger.scriptParsed")
+            .unwrap();
+        assert!(methods[..first_parse].contains(&"Runtime.executionContextCreated"));
+        let resolved = named(&sent, "Debugger.breakpointResolved");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            located(&json!({ "location": resolved[0]["location"] })),
+            (6, 2)
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_pauses_and_the_paused_frames_answer_until_a_resume() {
+        let (mut browser, messages) = debugged();
+        let source = Rc::new(Scripted::default());
+        browser.set_pause_source(source.clone());
+        call(&mut browser, &messages, 1, "Runtime.enable", json!({}));
+        call(&mut browser, &messages, 2, "Debugger.enable", json!({}));
+        let page = "https://app.ceri.invalid/";
+        let at = json!({ "url": page, "lineNumber": 4 });
+        call(
+            &mut browser,
+            &messages,
+            3,
+            "Debugger.setBreakpointByUrl",
+            at,
+        );
+
+        source.queue(10, "Runtime.evaluate", json!({ "expression": "1" }));
+        source.queue(11, "DOM.getDocument", json!({}));
+        let frame = json!({ "callFrameId": "0", "expression": "x + a", "returnByValue": true });
+        source.queue(12, "Debugger.evaluateOnCallFrame", frame);
+        source.queue(13, "Debugger.stepOver", json!({}));
+        let frame = json!({ "callFrameId": "0", "expression": "y", "returnByValue": true });
+        source.queue(14, "Debugger.evaluateOnCallFrame", frame);
+        source.queue(15, "Debugger.resume", json!({}));
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "Runtime.evaluate",
+            json!({ "expression": "f(41)", "returnByValue": true }),
+        );
+
+        let paused = named(&sent, "Debugger.paused");
+        assert_eq!(paused.len(), 2, "{sent:?}");
+        assert_eq!(named(&sent, "Debugger.resumed").len(), 2);
+        let top = &paused[0]["callFrames"][0];
+        assert_eq!(top["functionName"], "f");
+        assert_eq!(located(top), (4, 2));
+        assert_eq!(paused[0]["hitBreakpoints"][0], format!("1:4:0:{page}"));
+        let kinds: Vec<_> = top["scopeChain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scope| scope["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["local", "global"]);
+        assert_eq!(paused[0]["callFrames"].as_array().unwrap().len(), 2);
+        assert_eq!(located(&paused[1]["callFrames"][0]), (6, 2));
+        assert_eq!(paused[1]["hitBreakpoints"], json!([]));
+        assert_eq!(result(&sent, 10)["result"]["value"], 1.0);
+        assert_eq!(result(&sent, 12)["result"]["value"], 42.0);
+        assert_eq!(result(&sent, 14)["result"]["value"], 42.0);
+        assert_eq!(result(&sent, 4)["result"]["value"], 42.0);
+        let deferred = source.deferred.borrow();
+        assert_eq!(deferred.len(), 1);
+        assert!(deferred[0].contains("DOM.getDocument"));
+    }
+
+    #[test]
+    fn debugger_statements_and_uncaught_throws_pause_while_breakpoints_are_active() {
+        let (mut browser, messages) = debugged();
+        let source = Rc::new(Scripted::default());
+        browser.set_pause_source(source.clone());
+        call(&mut browser, &messages, 1, "Debugger.enable", json!({}));
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            2,
+            "Runtime.evaluate",
+            json!({ "expression": "(function g() { debugger; return 1; })()" }),
+        );
+        let paused = named(&sent, "Debugger.paused");
+        assert_eq!(paused.len(), 1, "{sent:?}");
+        assert_eq!(paused[0]["reason"], "other");
+        assert_eq!(paused[0]["callFrames"][0]["functionName"], "g");
+        let scopes = paused[0]["callFrames"][0]["scopeChain"].as_array().unwrap();
+        let kinds: Vec<_> = scopes.iter().map(|scope| &scope["type"]).collect();
+        assert_eq!(kinds, ["local", "global"]);
+        // the console's own source is announced when a pause first shows it
+        let script = paused[0]["callFrames"][0]["location"]["scriptId"].clone();
+        assert!(
+            named(&sent, "Debugger.scriptParsed")
+                .iter()
+                .any(|params| params["scriptId"] == script)
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            8,
+            "Debugger.getScriptSource",
+            json!({ "scriptId": script }),
+        );
+        let written = "(function g() { debugger; return 1; })()";
+        assert_eq!(result(&sent, 8)["scriptSource"], written);
+
+        call(
+            &mut browser,
+            &messages,
+            3,
+            "Debugger.setBreakpointsActive",
+            json!({ "active": false }),
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "Runtime.evaluate",
+            json!({ "expression": "(function () { debugger; return 1; })()" }),
+        );
+        assert!(named(&sent, "Debugger.paused").is_empty());
+
+        call(
+            &mut browser,
+            &messages,
+            5,
+            "Debugger.setPauseOnExceptions",
+            json!({ "state": "uncaught" }),
+        );
+        let throwing = "(function () { try { throw 1 } catch (e) {} throw new Error('boom') })()";
+        let sent = call(
+            &mut browser,
+            &messages,
+            6,
+            "Runtime.evaluate",
+            json!({ "expression": throwing }),
+        );
+        let paused = named(&sent, "Debugger.paused");
+        assert_eq!(paused.len(), 1, "{sent:?}");
+        assert_eq!(paused[0]["reason"], "exception");
+        assert_eq!(paused[0]["data"]["uncaught"], true);
+        assert!(
+            paused[0]["data"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("boom")
+        );
+        assert!(result(&sent, 6)["exceptionDetails"].is_object());
+
+        let sent = call(&mut browser, &messages, 7, "Debugger.resume", json!({}));
+        assert_eq!(
+            sent[0]["error"]["message"],
+            "Can only perform operation while paused."
+        );
     }
 }

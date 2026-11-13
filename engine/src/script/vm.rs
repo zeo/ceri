@@ -2,7 +2,7 @@
 // JavaScript-to-JavaScript calls; generators and async functions suspend their frame and
 // resume it later, and exceptions unwind through try handlers and finally blocks
 
-use super::ast::FunctionKind;
+use super::ast::{FunctionKind, Name};
 use super::compiler::{self, Code, NO_TARGET, Op};
 use super::object::{
     JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, new_object,
@@ -16,13 +16,16 @@ pub(super) type ScopeRef = Rc<RefCell<Scope>>;
 pub(super) struct Scope {
     pub(super) slots: Vec<Value>,
     pub(super) parent: Option<ScopeRef>,
+    // what each slot is called, for a debugger
+    pub(super) names: Rc<[Name]>,
 }
 
 impl Scope {
-    pub(super) fn new(size: usize, parent: Option<ScopeRef>) -> ScopeRef {
+    pub(super) fn new(names: Rc<[Name]>, parent: Option<ScopeRef>) -> ScopeRef {
         Rc::new(RefCell::new(Scope {
-            slots: vec![Value::Undefined; size],
+            slots: vec![Value::Undefined; names.len()],
             parent,
+            names,
         }))
     }
 }
@@ -108,13 +111,13 @@ enum Pending {
 }
 
 pub(super) struct Frame {
-    code: Rc<Code>,
+    pub(super) code: Rc<Code>,
     closure: Option<Rc<Closure>>,
-    pc: usize,
+    pub(super) pc: usize,
     stack: Vec<Value>,
-    scope: Option<ScopeRef>,
+    pub(super) scope: Option<ScopeRef>,
     scopes: u16,
-    this: Value,
+    pub(super) this: Value,
     new_target: Value,
     function: Value,
     arguments: Vec<Value>,
@@ -128,6 +131,15 @@ pub(super) struct Frame {
     delegate_mode: ResumeMode,
     // the mode of the last async yield* call, which decides how its result unpacks
     delegate_last: ResumeMode,
+}
+
+impl Frame {
+    // whether a throw in this frame lands in one of its catch blocks
+    pub(super) fn catches(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| handler.catch != NO_TARGET)
+    }
 }
 
 pub(super) enum RunResult {
@@ -145,7 +157,7 @@ impl ScriptRuntime {
     // ---- entry points ----
 
     pub(super) fn run_script_code(&mut self, code: Rc<Code>) -> Result<Value, ScriptError> {
-        let scope = Scope::new(code.scope_size as usize, None);
+        let scope = Scope::new(code.layout.clone(), None);
         let frame = Frame::new(
             code,
             None,
@@ -667,14 +679,14 @@ impl ScriptRuntime {
         construct: bool,
     ) -> Frame {
         let code = closure.code.clone();
-        let parent = if code.self_named {
-            let scope = Scope::new(1, closure.scope.clone());
+        let parent = if let Some(names) = &code.self_scope {
+            let scope = Scope::new(names.clone(), closure.scope.clone());
             scope.borrow_mut().slots[0] = function.clone();
             Some(scope)
         } else {
             closure.scope.clone()
         };
-        let scope = Scope::new(code.scope_size as usize, parent);
+        let scope = Scope::new(code.layout.clone(), parent);
         // TDZ: lexical bindings start uninitialized; params and vars start undefined
         let mut frame = Frame::new(
             code.clone(),
@@ -771,12 +783,18 @@ impl ScriptRuntime {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
         self.nested_runs += 1;
-        let result = self.run_frames(frame);
+        let base = self.debugger.mirror.len();
+        let result = self.run_frames(frame, base);
+        self.debugger.mirror.truncate(base);
         self.nested_runs -= 1;
+        if self.nested_runs == 0 {
+            self.debug_task_ended();
+        }
         result
     }
 
-    fn run_frames(&mut self, entry: Frame) -> Result<RunResult, ScriptError> {
+    // base is how many frames of the runs around this one a debugger sees
+    fn run_frames(&mut self, entry: Frame, base: usize) -> Result<RunResult, ScriptError> {
         let mut frames = vec![entry];
         loop {
             self.steps += 1;
@@ -787,6 +805,9 @@ impl ScriptRuntime {
             if self.interrupted {
                 return Err(super::runtime_error("script exceeded its step limit"));
             }
+            if self.debugger.active {
+                self.debug_step(&frames, base);
+            }
             let outcome = self.step(&mut frames);
             match outcome {
                 Ok(Some(result)) => return Ok(result),
@@ -794,6 +815,9 @@ impl ScriptRuntime {
                 Err(error) if self.interrupted => return Err(error),
                 Err(error) => {
                     let thrown = self.take_thrown(error);
+                    if self.debugger.active {
+                        self.debug_thrown(&frames, base, &thrown);
+                    }
                     if let Some(result) = self.unwind(&mut frames, thrown)? {
                         return Ok(result);
                     }
@@ -1157,8 +1181,9 @@ impl ScriptRuntime {
                     .stack
                     .push(Value::Bool(true));
             }
-            Op::PushScope(size) => {
-                let scope = Scope::new(size as usize, frame.scope.clone());
+            Op::PushScope(block) => {
+                let names = frame.code.blocks[block as usize].clone();
+                let scope = Scope::new(names, frame.scope.clone());
                 // lexical bindings in a block start in their temporal dead zone
                 for slot in scope.borrow_mut().slots.iter_mut() {
                     *slot = Value::Uninitialized;
@@ -1169,10 +1194,13 @@ impl ScriptRuntime {
             Op::PopScope => {
                 Self::restore_scopes(frame, frame.scopes.saturating_sub(1));
             }
+            Op::Debugger => {}
             Op::CloneScope => {
                 let scope = frame.scope.clone().expect("a scope to copy");
-                let copy = Scope::new(0, scope.borrow().parent.clone());
-                copy.borrow_mut().slots = scope.borrow().slots.clone();
+                let scope = scope.borrow();
+                let copy = Scope::new(scope.names.clone(), scope.parent.clone());
+                copy.borrow_mut().slots = scope.slots.clone();
+                drop(scope);
                 frame.scope = Some(copy);
             }
             Op::This => {
