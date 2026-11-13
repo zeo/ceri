@@ -1033,6 +1033,7 @@ struct Painted {
     fonts: Rc<FontSet>,
     canvas: Arc<Canvas>,
     planes: bool,
+    generation: u64,
 }
 
 // everything a layout is a pure function of
@@ -1051,6 +1052,13 @@ struct CachedLayout {
     layout: Rc<LayoutDocument>,
     // the elements in motion, when all of it only repaints them
     motion: Option<BTreeSet<NodeId>>,
+    // shared by layouts that differ only in where their scrollers are scrolled to
+    generation: u64,
+}
+
+fn next_generation() -> u64 {
+    static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy)]
@@ -2733,6 +2741,31 @@ impl Browser {
         {
             return Ok(cached.layout.clone());
         }
+        let scrolled = self.layout_cache.borrow().as_ref().and_then(|cached| {
+            let last = &cached.key;
+            let scroll_only = last.document == key.document
+                && last.stylesheet == key.stylesheet
+                && last.viewport == key.viewport
+                && last.scale == key.scale
+                && last.selections == key.selections
+                && last.state
+                    == StyleState {
+                        scroll_offsets: last.state.scroll_offsets.clone(),
+                        ..key.state.clone()
+                    };
+            scroll_only
+                .then(|| crate::layout::rescroll(&cached.layout, &key.state.scroll_offsets))?
+                .map(|layout| (Rc::new(layout), cached.motion.clone(), cached.generation))
+        });
+        if let Some((layout, motion, generation)) = scrolled {
+            *self.layout_cache.borrow_mut() = Some(CachedLayout {
+                key,
+                layout: layout.clone(),
+                motion,
+                generation,
+            });
+            return Ok(layout);
+        }
         page.populate_custom_properties(&document, &mut style_state);
         let repainted = self.layout_cache.borrow().as_ref().and_then(|cached| {
             let last = &cached.key;
@@ -2771,6 +2804,7 @@ impl Browser {
                 key,
                 layout: layout.clone(),
                 motion,
+                generation: next_generation(),
             });
             return Ok(layout);
         }
@@ -2810,6 +2844,7 @@ impl Browser {
             key,
             layout: layout.clone(),
             motion,
+            generation: next_generation(),
         });
         Ok(layout)
     }
@@ -2846,23 +2881,46 @@ impl Browser {
             })
             .unwrap_or_default();
         let _fonts = crate::font::use_fonts(self.fonts.clone(), device_pixel_ratio);
+        let generation = self
+            .layout_cache
+            .borrow()
+            .as_ref()
+            .map_or(0, |cached| cached.generation);
         let mut painted = self.painted.borrow_mut();
+        let reusable = |last: &Painted| {
+            last.scale == device_pixel_ratio
+                && last.planes == planes
+                && Rc::ptr_eq(&last.fonts, &self.fonts)
+        };
+        let scrolled = painted
+            .as_ref()
+            .filter(|last| {
+                reusable(last)
+                    && last.generation == generation
+                    && last.canvases.len() == canvases.len()
+                    && last.canvases.iter().zip(&canvases).all(|(before, after)| {
+                        before.node == after.node
+                            && before.background == after.background
+                            && Arc::ptr_eq(&before.image, &after.image)
+                    })
+            })
+            .and_then(|last| crate::paint::scroll_repaint(&last.canvas, &last.layout, &layout));
         let damage = match painted.as_ref() {
-            Some(last)
-                if last.scale == device_pixel_ratio
-                    && last.planes == planes
-                    && Rc::ptr_eq(&last.fonts, &self.fonts) =>
-            {
-                crate::paint::damage(
-                    (&last.layout, &last.canvases),
-                    (&layout, &canvases),
-                    last.canvas.planes(),
-                )
-            }
+            _ if scrolled.is_some() => crate::paint::Damage::Nothing,
+            Some(last) if reusable(last) => crate::paint::damage(
+                (&last.layout, &last.canvases),
+                (&layout, &canvases),
+                last.canvas.planes(),
+            ),
             _ => crate::paint::Damage::Everything,
         };
         let mut canvas = match (damage, painted.take()) {
-            (crate::paint::Damage::Nothing, Some(last)) => last.canvas,
+            (crate::paint::Damage::Nothing, Some(mut last)) => {
+                if let Some(plan) = scrolled {
+                    crate::paint::scroll(Arc::make_mut(&mut last.canvas), plan, &layout, &canvases);
+                }
+                last.canvas
+            }
             (crate::paint::Damage::Area(area), Some(mut last)) => {
                 crate::paint::repaint(Arc::make_mut(&mut last.canvas), &layout, &canvases, area);
                 last.canvas
@@ -2916,6 +2974,7 @@ impl Browser {
             fonts: self.fonts.clone(),
             canvas: canvas.clone(),
             planes,
+            generation,
         });
         Ok((canvas, shown))
     }
@@ -8769,6 +8828,71 @@ A</div>
             .expect("scrolled scrollbar page should layout");
         assert_eq!(layout.body().children[0].scroll_offset, (0.0, 10.0));
         assert_eq!(layout.body().children[0].children[0].rect.y, -10.0);
+    }
+
+    #[test]
+    fn browser_moves_scrolled_pixels_instead_of_painting_them_again() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                body { margin: 0; background: #121315; color: #e8e8e8 }
+                #list { height: 50px; overflow: auto; margin: 6px; border-radius: 5px }
+                #list p { height: 15px; margin: 0; background: linear-gradient(#202124, #34353a) }
+                #bar { position: fixed; bottom: 2px; left: 4px; width: 50px; height: 10px; background: #345 }
+                #tall { height: 300px }
+            </style>
+            <div id="list"><p>one</p><p>two</p><p>three</p><p>four</p><p>five</p><p>six</p></div>
+            <div id="tall">rest of the page</div><div id="bar"></div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 100.0,
+        };
+        browser.paint(viewport).expect("the page should paint");
+        for (x, y, delta) in [
+            (20.0, 20.0, 12.0),
+            (20.0, 20.0, -5.0),
+            (90.0, 80.0, 40.0),
+            (90.0, 80.0, -27.0),
+        ] {
+            let (generation, layout, shown) = browser
+                .painted
+                .borrow()
+                .as_ref()
+                .map(|last| (last.generation, last.layout.clone(), last.canvas.clone()))
+                .expect("a frame was painted");
+            assert!(
+                browser
+                    .scroll_at(viewport, x, y, 0.0, delta)
+                    .expect("the wheel should dispatch")
+            );
+            let canvas = browser
+                .paint(viewport)
+                .expect("the scrolled page should paint");
+            let scrolled = browser.painted.take().expect("the frame was kept");
+            let whole = browser
+                .paint(viewport)
+                .expect("the page should paint whole");
+            assert_eq!(
+                scrolled.generation, generation,
+                "scrolling {delta} at {x},{y} laid the page out again"
+            );
+            assert!(
+                crate::paint::scroll_repaint(&shown, &layout, &scrolled.layout).is_some(),
+                "scrolling {delta} at {x},{y} painted again instead of moving pixels"
+            );
+            browser.painted.replace(Some(scrolled));
+            assert!(
+                canvas
+                    .rgba_pixels()
+                    .iter()
+                    .zip(whole.rgba_pixels())
+                    .all(|(a, b)| a.abs_diff(*b) <= 1),
+                "scrolling {delta} at {x},{y} differs from a whole frame"
+            );
+        }
     }
 
     #[test]

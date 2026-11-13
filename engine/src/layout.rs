@@ -37,6 +37,10 @@ impl Rect {
     pub fn bottom(self) -> f32 {
         self.y + self.height
     }
+
+    pub fn right(self) -> f32 {
+        self.x + self.width
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7208,6 +7212,48 @@ fn finalize_scroll(layout: &mut LayoutBox, padding: ResolvedEdges, style_state: 
     );
 }
 
+// what laying out again with only the scroll offsets changed would give, by moving each
+// scroller's content as finalize_scroll does; none when a sticky box would have to settle again
+pub(crate) fn rescroll(
+    document: &LayoutDocument,
+    offsets: &std::collections::BTreeMap<NodeId, (f32, f32)>,
+) -> Option<LayoutDocument> {
+    fn has_sticky(layout: &LayoutBox) -> bool {
+        layout.position == Position::Sticky || layout.children.iter().any(has_sticky)
+    }
+    fn scroll(
+        layout: &mut LayoutBox,
+        offsets: &std::collections::BTreeMap<NodeId, (f32, f32)>,
+    ) -> bool {
+        if matches!(layout.overflow, Overflow::Auto | Overflow::Hidden) || layout.is_document() {
+            let scrollport = scrollbar_metrics(layout).scrollport;
+            let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
+            let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
+            let requested = offsets.get(&layout.node).copied().unwrap_or_default();
+            let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
+            if offset != layout.scroll_offset {
+                if layout.children.iter().any(has_sticky) {
+                    return false;
+                }
+                let shift = (
+                    layout.scroll_offset.0 - offset.0,
+                    layout.scroll_offset.1 - offset.1,
+                );
+                for child in &mut layout.children {
+                    translate_scroll_box(child, shift.0, shift.1);
+                }
+                layout.scroll_offset = offset;
+            }
+        }
+        layout
+            .children
+            .iter_mut()
+            .all(|child| scroll(child, offsets))
+    }
+    let mut moved = document.clone();
+    scroll(&mut moved.root, offsets).then_some(moved)
+}
+
 fn apply_sticky_descendants(
     children: &mut [LayoutBox],
     scrollport: Rect,
@@ -10771,6 +10817,56 @@ mod tests {
             widths(&format!("{style}<div style='height: 10px'></div>")),
             (vec![100.0], false)
         );
+    }
+
+    #[test]
+    fn rescrolling_matches_laying_out_again() {
+        let markup = concat!(
+            "<style>body { margin: 0 } #list { height: 40px; overflow: auto; margin: 5px }",
+            "#list div { height: 17px } #bar { position: fixed; top: 3px; width: 9px; height: 9px }",
+            "#held { position: relative } #tag { position: absolute; right: 2px }",
+            "#tall { height: 300px }</style><div id='bar'></div><div id='list'><div>a</div>",
+            "<div id='held'>b <i id='tag'>c</i></div><div>d</div><div>e</div></div>",
+            "<p>words that wrap over the width</p><div id='tall'></div>",
+        );
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let list = document
+            .find_element_by_id("list")
+            .expect("the list exists");
+        let offsets = |list_offset: f32, root: f32| {
+            let mut state = StyleState::default();
+            state.scroll_offsets.insert(list, (0.0, list_offset));
+            state.scroll_offsets.insert(document.root(), (0.0, root));
+            state
+        };
+        let size = Size {
+            width: 120.0,
+            height: 100.0,
+        };
+        for ((list_from, root_from), (list_to, root_to)) in [
+            ((0.0, 0.0), (9.5, 0.0)),
+            ((9.5, 0.0), (0.0, 40.0)),
+            ((0.0, 40.0), (500.0, 500.0)),
+        ] {
+            let old =
+                layout_with_state(&document, &stylesheet, size, &offsets(list_from, root_from));
+            let state = offsets(list_to, root_to);
+            let new = layout_with_state(&document, &stylesheet, size, &state);
+            assert_eq!(
+                rescroll(&old, &state.scroll_offsets).as_ref(),
+                Some(&new),
+                "{list_from},{root_from} to {list_to},{root_to}"
+            );
+        }
+        let sticky = Document::parse_markup(
+            "<style>p { position: sticky; top: 0 } div { height: 300px }</style><p>s</p><div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&sticky.style_text()).expect("css should parse");
+        let old = layout_with_state(&sticky, &stylesheet, size, &StyleState::default());
+        let moved = std::collections::BTreeMap::from([(sticky.root(), (0.0, 20.0))]);
+        assert!(rescroll(&old, &moved).is_none());
     }
 
     #[test]

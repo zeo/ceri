@@ -1,7 +1,7 @@
 use crate::border::BorderStyle;
 use crate::css::{
     BackgroundLayer, BackgroundSize, Color, Gradient, GradientKind, GradientStop, LayerImage,
-    ObjectFit, Overflow, PseudoElement, Radial, RadialSize, Style,
+    ObjectFit, Overflow, Position, PseudoElement, Radial, RadialSize, Style,
 };
 use crate::image::Image;
 use crate::layout::{
@@ -1232,15 +1232,19 @@ fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
         );
     }
     for run in &layout_box.text {
-        bounds = union_rect(
-            bounds,
-            Rect {
-                x: run.x + offset.0,
-                y: run.y + offset.1,
-                width: run.width,
-                height: run.font_size * 1.5,
-            },
-        );
+        let glyphs = Rect {
+            x: run.x + offset.0,
+            y: run.y + offset.1,
+            width: run.width,
+            height: run.font_size * 1.5,
+        };
+        bounds = union_rect(bounds, glyphs);
+        // a blurred text shadow spreads twice its blur, as paint_text_shadow draws it
+        if let Some(shadow) = run.decoration.shadow {
+            let reach = shadow.blur.max(0.0) * 2.0;
+            let cast = translate_rect(glyphs, (shadow.x, shadow.y));
+            bounds = union_rect(bounds, outset_rect(cast, reach));
+        }
     }
     for child in &layout_box.children {
         bounds = union_rect(bounds, subtree_bounds(child, offset));
@@ -2374,6 +2378,395 @@ pub(crate) fn repaint(
     };
 }
 
+// a frame laid out from the last one by moving one scroller's content a whole number of device
+// pixels: the pixels already there move with it, and only what scrolls into view, the bars and
+// whatever stays put over the scrollport paint again
+pub(crate) struct ScrollRepaint {
+    moved: DeviceBounds,
+    shift: (i32, i32),
+    repairs: Vec<Rect>,
+}
+
+// none when moving pixels could show anything a full paint would not: a backdrop that is not
+// one flat colour, or transforms, filters, masks and planes on the way
+pub(crate) fn scroll_repaint(
+    canvas: &Canvas,
+    before: &LayoutDocument,
+    after: &LayoutDocument,
+) -> Option<ScrollRepaint> {
+    fn scrolled(
+        before: &LayoutBox,
+        after: &LayoutBox,
+        path: &mut Vec<usize>,
+        found: &mut Vec<Vec<usize>>,
+    ) {
+        if before.scroll_offset != after.scroll_offset {
+            found.push(path.clone());
+        }
+        for (index, (before, after)) in before.children.iter().zip(&after.children).enumerate() {
+            path.push(index);
+            scrolled(before, after, path, found);
+            path.pop();
+        }
+    }
+    // a positioned box may stay put or escape the scroller's clip; unless it moved with the
+    // content and stays inside the clip, it paints again where it was, where it is, and where
+    // the moving pixels carried its old copy
+    fn settle(
+        (old, new): (&LayoutBox, &LayoutBox),
+        offsets: ((f32, f32), (f32, f32)),
+        (clip, delta): (Rect, (f32, f32)),
+        repairs: &mut Vec<Rect>,
+    ) -> bool {
+        if matches!(
+            new.position,
+            Position::Sticky | Position::Absolute | Position::Fixed
+        ) {
+            let (Some(was), Some(now)) = (ink(old, offsets.0), ink(new, offsets.1)) else {
+                return false;
+            };
+            let carried = translate_rect(was, (-delta.0, -delta.1));
+            let near = |a: f32, b: f32| (a - b).abs() < 1.0e-3;
+            let kept = near(now.x, carried.x)
+                && near(now.y, carried.y)
+                && near(now.width, carried.width)
+                && near(now.height, carried.height)
+                && contains_rect(clip, was)
+                && contains_rect(clip, now);
+            if !kept {
+                repairs.extend([was, now]);
+                repairs.extend(intersect_clip(Some(clip), carried));
+                return true;
+            }
+        }
+        let inner = (
+            visual_offset_for(old, offsets.0),
+            visual_offset_for(new, offsets.1),
+        );
+        old.children
+            .iter()
+            .zip(&new.children)
+            .all(|pair| settle(pair, inner, (clip, delta), repairs))
+    }
+    if !canvas.planes().is_empty() || has_backdrop(&after.root) {
+        return None;
+    }
+    let mut found = Vec::new();
+    scrolled(&before.root, &after.root, &mut Vec::new(), &mut found);
+    let [path] = found.as_slice() else {
+        return None;
+    };
+    let mut chain = vec![(&after.root, (0.0, 0.0))];
+    let mut old = &before.root;
+    for &index in path {
+        let (parent, ancestor_offset) = *chain.last()?;
+        chain.push((
+            &parent.children[index],
+            visual_offset_for(parent, ancestor_offset),
+        ));
+        old = &old.children[index];
+    }
+    let (scroller, scroller_offset) = *chain.last()?;
+    let delta = (
+        scroller.scroll_offset.0 - old.scroll_offset.0,
+        scroller.scroll_offset.1 - old.scroll_offset.1,
+    );
+    let scale = canvas.scale;
+    let whole = |value: f32| {
+        let device = value * scale;
+        ((device - device.round()).abs() < 1.0e-3).then_some(device.round() as i32)
+    };
+    let shift = (whole(delta.0)?, whole(delta.1)?);
+    let mut clip = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: after.viewport.width,
+        height: after.viewport.height,
+    };
+    for &(layout_box, ancestor_offset) in &chain {
+        if layout_box.transform.is_some()
+            || !layout_box.filters.own.is_empty()
+            || !layout_box.masks.is_empty()
+            || layout_box.clip_path.is_some()
+        {
+            return None;
+        }
+        if layout_box.overflow.clips() || layout_box.is_document() {
+            let offset = visual_offset_for(layout_box, ancestor_offset);
+            clip = intersect_clip(
+                Some(clip),
+                translate_rect(overflow_clip_rect(layout_box), offset),
+            )?;
+        }
+    }
+    // the backdrop the content scrolls over must be one colour wherever the clip reaches
+    let mut flat = false;
+    for &(layout_box, ancestor_offset) in chain.iter().rev() {
+        if !layout_box.backgrounds.is_empty()
+            || layout_box.shadows.iter().any(|shadow| shadow.inset)
+            || !layout_box.text.is_empty()
+            || layout_box.control.is_some()
+            || layout_box.control_value.is_some()
+            || layout_box.svg.is_some()
+            || layout_box
+                .outline
+                .is_some_and(|outline| outline.offset < 0.0)
+        {
+            return None;
+        }
+        if !layout_box.is_document() {
+            let rect = visual_rect_for(layout_box, ancestor_offset);
+            let border = layout_box.border.widths;
+            let padding = Rect {
+                x: rect.x + border.left,
+                y: rect.y + border.top,
+                width: rect.width - border.left - border.right,
+                height: rect.height - border.top - border.bottom,
+            };
+            if !contains_rect(padding, clip) {
+                return None;
+            }
+        }
+        if layout_box.background.alpha == 255 {
+            flat = true;
+            break;
+        }
+    }
+    if !flat && canvas_background(&after.root).is_some_and(|root| !root.backgrounds.is_empty()) {
+        return None;
+    }
+    let width = canvas.width as f32;
+    let height = canvas.height as f32;
+    // a pixel the clip's edge crosses blends what lies on both sides, so it paints again; an
+    // edge on a pixel boundary blends nothing
+    let inward = |edge: f32, toward: f32| {
+        let device = edge * scale;
+        match (device - device.round()).abs() < 1e-3 {
+            true => device.round(),
+            false => device.round() + toward,
+        }
+    };
+    let moved = DeviceBounds {
+        left: inward(clip.x, 1.0).clamp(0.0, width) as u32,
+        top: inward(clip.y, 1.0).clamp(0.0, height) as u32,
+        right: inward(clip.right(), -1.0).clamp(0.0, width) as u32,
+        bottom: inward(clip.bottom(), -1.0).clamp(0.0, height) as u32,
+    };
+    if moved.right <= moved.left + shift.0.unsigned_abs()
+        || moved.bottom <= moved.top + shift.1.unsigned_abs()
+    {
+        return None;
+    }
+    let mut repairs = Vec::new();
+    // what stays put over or around the content: the pixels moving carry its old copy along
+    let mut stationary = Vec::new();
+    for pair in chain.windows(2) {
+        let &[(parent, ancestor_offset), (next, _)] = pair else {
+            continue;
+        };
+        let offset = visual_offset_for(parent, ancestor_offset);
+        for child in parent
+            .children
+            .iter()
+            .filter(|child| !std::ptr::eq(*child, next))
+        {
+            stationary.push(ink(child, offset)?);
+        }
+    }
+    let inner = (
+        visual_offset_for(old, scroller_offset),
+        visual_offset_for(scroller, scroller_offset),
+    );
+    if !old
+        .children
+        .iter()
+        .zip(&scroller.children)
+        .all(|pair| settle(pair, inner, (clip, delta), &mut repairs))
+    {
+        return None;
+    }
+    let metrics = scrollbar_metrics(scroller);
+    for track in [metrics.vertical_track, metrics.horizontal_track]
+        .into_iter()
+        .flatten()
+    {
+        let track = translate_rect(track, inner.1);
+        repairs.push(track);
+        stationary.push(track);
+    }
+    for &(layout_box, ancestor_offset) in &chain {
+        let rect = visual_rect_for(layout_box, ancestor_offset);
+        for (corner, (horizontal, vertical)) in layout_box.radii.into_iter().enumerate() {
+            if horizontal <= 0.0 && vertical <= 0.0 {
+                continue;
+            }
+            let corner = Rect {
+                x: if matches!(corner, 0 | 3) {
+                    rect.x
+                } else {
+                    rect.right() - horizontal
+                },
+                y: if corner < 2 {
+                    rect.y
+                } else {
+                    rect.bottom() - vertical
+                },
+                width: horizontal,
+                height: vertical,
+            };
+            stationary.push(corner);
+        }
+    }
+    for rect in stationary {
+        repairs.extend(intersect_clip(Some(clip), rect));
+        repairs.extend(intersect_clip(
+            Some(clip),
+            translate_rect(rect, (-delta.0, -delta.1)),
+        ));
+    }
+    let device = |left: u32, top: u32, right: u32, bottom: u32| Rect {
+        x: left as f32 / scale,
+        y: top as f32 / scale,
+        width: right.saturating_sub(left) as f32 / scale,
+        height: bottom.saturating_sub(top) as f32 / scale,
+    };
+    let edge = device(moved.left, moved.top, moved.right, moved.bottom);
+    repairs.extend(
+        [
+            Rect {
+                height: edge.y - clip.y,
+                ..clip
+            },
+            Rect {
+                y: edge.bottom(),
+                height: clip.bottom() - edge.bottom(),
+                ..clip
+            },
+            Rect {
+                width: edge.x - clip.x,
+                ..clip
+            },
+            Rect {
+                x: edge.right(),
+                width: clip.right() - edge.right(),
+                ..clip
+            },
+        ]
+        .into_iter()
+        .filter(|band| band.width > 0.0 && band.height > 0.0),
+    );
+    let (dx, dy) = (shift.0.unsigned_abs(), shift.1.unsigned_abs());
+    if shift.1 > 0 {
+        repairs.push(device(
+            moved.left,
+            moved.bottom - dy,
+            moved.right,
+            moved.bottom,
+        ));
+    } else if shift.1 < 0 {
+        repairs.push(device(moved.left, moved.top, moved.right, moved.top + dy));
+    }
+    if shift.0 > 0 {
+        repairs.push(device(
+            moved.right - dx,
+            moved.top,
+            moved.right,
+            moved.bottom,
+        ));
+    } else if shift.0 < 0 {
+        repairs.push(device(moved.left, moved.top, moved.left + dx, moved.bottom));
+    }
+    Some(ScrollRepaint {
+        moved,
+        shift,
+        repairs: merge_rects(repairs),
+    })
+}
+
+pub(crate) fn scroll(
+    canvas: &mut Canvas,
+    plan: ScrollRepaint,
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+) {
+    let ScrollRepaint {
+        moved,
+        shift,
+        repairs,
+    } = plan;
+    let shown = canvas.revision.id;
+    let stride = canvas.bytes_per_row();
+    let (dx, dy) = (
+        shift.0.unsigned_abs() as usize,
+        shift.1.unsigned_abs() as usize,
+    );
+    let width = (moved.right - moved.left) as usize - dx;
+    let (from_x, to_x) = match shift.0 > 0 {
+        true => (moved.left as usize + dx, moved.left as usize),
+        false => (moved.left as usize, moved.left as usize + dx),
+    };
+    let rows = moved.top as usize..moved.bottom as usize - dy;
+    let mut copy = |row: usize| {
+        let (from, to) = match shift.1 > 0 {
+            true => (row + dy, row),
+            false => (row, row + dy),
+        };
+        canvas.pixels.copy_within(
+            from * stride + from_x * 4..from * stride + (from_x + width) * 4,
+            to * stride + to_x * 4,
+        );
+    };
+    // rows move up from the top down and down from the bottom up, so none is read once written
+    if shift.1 > 0 {
+        rows.for_each(&mut copy);
+    } else {
+        rows.rev().for_each(&mut copy);
+    }
+    let mut changed = [moved.left, moved.top, moved.right, moved.bottom];
+    for rect in repairs {
+        if let Some(bounds) = DeviceBounds::of(canvas, rect, None) {
+            changed = [
+                changed[0].min(bounds.left.saturating_sub(3)),
+                changed[1].min(bounds.top.saturating_sub(3)),
+                changed[2].max((bounds.right + 3).min(canvas.width)),
+                changed[3].max((bounds.bottom + 3).min(canvas.height)),
+            ];
+        }
+        let last = canvas.revision.id;
+        repaint(canvas, document, canvases, rect);
+        if canvas.revision.id != last && canvas.revision.changed.is_none() {
+            // the repaint fell back to painting everything
+            return;
+        }
+    }
+    canvas.revision = Revision {
+        id: next_revision(),
+        changed: Some((shown, changed)),
+    };
+}
+
+fn contains_rect(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.right() <= outer.right()
+        && inner.bottom() <= outer.bottom()
+}
+
+// two rects become their union where it covers little more than both, so an area paints once
+// and two thin bands at right angles stay apart
+fn merge_rects(mut rects: Vec<Rect>) -> Vec<Rect> {
+    let area = |rect: Rect| rect.width * rect.height;
+    let touch = |a: Rect, b: Rect| area(union_rect(a, b)) <= (area(a) + area(b)) * 1.25;
+    let mut merged = Vec::<Rect>::new();
+    while let Some(mut rect) = rects.pop() {
+        while let Some(at) = merged.iter().position(|other| touch(rect, *other)) {
+            rect = union_rect(rect, merged.swap_remove(at));
+        }
+        merged.push(rect);
+    }
+    merged
+}
+
 // the planes after a repaint of the kept box: one found again reaching past the box keeps the
 // box it had, since only its part inside was repainted; none when a plane appeared, changed
 // or went away where pixels outside the box still show the frame before, or when two overlap
@@ -2526,7 +2919,7 @@ fn paint_context(
     ancestor_offset: (f32, f32),
 ) {
     let opacity = layout_box.opacity;
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || misses(layout_box, ancestor_offset, clip) {
         return;
     }
     if let Some(transform) = layout_box.transform {
@@ -2661,6 +3054,12 @@ fn paint_context(
             opacity,
         },
     );
+}
+
+// a subtree whose ink lies outside the clip paints nothing a repaint keeps
+fn misses(layout_box: &LayoutBox, ancestor_offset: (f32, f32), clip: Option<Rect>) -> bool {
+    clip.zip(ink(layout_box, ancestor_offset))
+        .is_some_and(|(clip, ink)| intersect_clip(Some(clip), ink).is_none())
 }
 
 fn filter_layer(layer: &mut Canvas, filters: &[crate::filter::Filter]) {
@@ -2892,6 +3291,9 @@ fn paint_non_context_subtree(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
+    if misses(layout_box, ancestor_offset, clip) {
+        return;
+    }
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
     let content_clip = paint_box_surface(
@@ -4705,6 +5107,99 @@ mod tests {
         }
     }
 
+    const SCROLL_PAGE: &str = concat!(
+        "<html><body><header id='bar'>pinned bar</header><main><p>Recordings, 12 today</p>",
+        "<section id='list'><div class='row'>alpha</div><div class='row'>beta</div>",
+        "<div class='row' id='held'>gamma <i id='tag'>new</i></div><div class='row'>delta</div>",
+        "<div class='row'>epsilon</div><div class='row'>zeta</div><div class='row'>eta</div>",
+        "<div class='row'>theta</div><div class='row'>iota</div><b id='loose'>loose</b>",
+        "</section><div id='over'>over</div><div id='filler'></div></main></body></html>",
+    );
+
+    const SCROLL_STYLE: &str = concat!(
+        "html, body { margin: 0; background: #121315; color: #e8e8e8; font: 13px sans-serif }",
+        "main { padding: 13px } p { margin: 0 0 7px }",
+        "#bar { position: fixed; bottom: 3px; left: 40px; width: 70px; height: 14px; background: #345 }",
+        "#list { height: 90px; overflow: auto; border: 1px solid #333; border-radius: 6px }",
+        ".row { height: 18px; padding: 0 5px; background: linear-gradient(#202124, #2a2b2e) }",
+        ".row { text-shadow: 0 1px 3px #000 } #held { position: relative }",
+        "#tag { position: absolute; right: 4px; top: 2px; color: #8af }",
+        "#loose { position: absolute; left: 90px; top: 50px; background: #533 }",
+        "#over { position: absolute; left: 20px; top: 60px; width: 30px; height: 9px }",
+        "#over { background: rgba(255, 128, 0, 0.5) } #filler { height: 400px }",
+    );
+
+    fn scroll_layout(list: f32, root: f32) -> LayoutDocument {
+        let document = Document::parse_markup(SCROLL_PAGE).expect("document should parse");
+        let mut state = crate::css::StyleState::default();
+        let scroller = document
+            .find_element_by_id("list")
+            .expect("the list exists");
+        state.scroll_offsets.insert(scroller, (0.0, list));
+        state.scroll_offsets.insert(document.root(), (0.0, root));
+        let stylesheet = Stylesheet::parse(SCROLL_STYLE).expect("stylesheet should parse");
+        crate::layout::layout_with_state(
+            &document,
+            &stylesheet,
+            Size {
+                width: 157.0,
+                height: 233.0,
+            },
+            &state,
+        )
+    }
+
+    #[test]
+    fn scrolling_the_pixels_matches_a_whole_frame_to_a_level() {
+        let moves = [
+            ((0.0, 0.0), (6.0, 0.0)),
+            ((6.0, 0.0), (36.0, 0.0)),
+            ((36.0, 0.0), (12.0, 0.0)),
+            ((12.0, 30.0), (24.0, 30.0)),
+            ((6.0, 0.0), (6.0, 12.0)),
+            ((6.0, 12.0), (6.0, 72.0)),
+            ((6.0, 72.0), (6.0, 12.0)),
+        ];
+        for scale in [1.0, 1.5, 2.0] {
+            for ((list, root), (next_list, next_root)) in moves {
+                let old = scroll_layout(list, root);
+                let new = scroll_layout(next_list, next_root);
+                let mut canvas = paint_with_canvases(&old, &[], scale, false);
+                let plan = scroll_repaint(&canvas, &old, &new).unwrap_or_else(|| {
+                    panic!("{list},{root} to {next_list},{next_root} should move pixels")
+                });
+                scroll(&mut canvas, plan, &new, &[]);
+                // positions moved in f32 can round a gradient channel the other way, a level at most
+                let whole = paint_with_canvases(&new, &[], scale, false);
+                let width = whole.width() as usize;
+                let differing = canvas
+                    .rgba_pixels()
+                    .chunks(4)
+                    .zip(whole.rgba_pixels().chunks(4))
+                    .enumerate()
+                    .filter(|(_, (a, b))| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > 1))
+                    .map(|(index, _)| (index % width, index / width))
+                    .collect::<Vec<_>>();
+                assert!(
+                    differing.is_empty(),
+                    "{list},{root} to {next_list},{next_root} at {scale}x: {} pixels from {:?} to {:?} differ",
+                    differing.len(),
+                    differing.first(),
+                    differing.last(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrolling_falls_back_where_pixels_cannot_move() {
+        let old = scroll_layout(0.0, 0.0);
+        let canvas = paint_with_canvases(&old, &[], 1.5, false);
+        // a css pixel is a pixel and a half at 1.5x
+        assert!(scroll_repaint(&canvas, &old, &scroll_layout(1.0, 0.0)).is_none());
+        assert!(scroll_repaint(&canvas, &old, &scroll_layout(6.0, 12.0)).is_none());
+    }
+
     #[test]
     fn damage_falls_back_to_the_whole_frame_where_it_cannot_bound_a_change() {
         let base = damage_layout("", 0.0);
@@ -4723,6 +5218,33 @@ mod tests {
                 "{change}"
             );
         }
+    }
+
+    #[test]
+    fn a_text_shadow_cast_into_view_paints_from_a_box_outside_it() {
+        let document = Document::parse_markup("<html><body><div><p>shadow</p></div></body></html>")
+            .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #ffffff }",
+            "div { height: 40px; overflow: hidden } p { margin: -80px 0 0; font: 16px sans-serif }",
+            "p { color: #fff; text-shadow: 0 90px 0 #f00 }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 60.0,
+                height: 40.0,
+            },
+        ));
+        assert!(
+            canvas
+                .rgba_pixels()
+                .chunks(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] < 100),
+            "the shadow should show in the viewport"
+        );
     }
 
     #[test]
