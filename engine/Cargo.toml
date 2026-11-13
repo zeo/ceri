@@ -17,6 +17,7 @@ native-http = ["dep:ureq"]
 
 [dependencies]
 brotli-decompressor = "=6.1.0"
+serde_json = "=1.0.154"
 softbuffer = { version = "=0.4.8", optional = true }
 winit = { version = "=0.30.13", optional = true }
 ureq = { version = "=3.4.0", optional = true, default-features = false, features = [

@@ -15,6 +15,7 @@ mod events;
 mod geometry;
 mod images;
 mod import_map;
+mod inspector;
 mod interfaces;
 mod intl;
 mod json;
@@ -51,6 +52,8 @@ pub(crate) use canvas::canvas_size;
 pub use dates::TimeZone;
 pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
+pub(crate) use inspector::Answer;
+pub(crate) use websocket::accept_key;
 
 use crate::Color;
 use crate::csp::{Directive, Initiator, Policies};
@@ -580,6 +583,7 @@ pub struct ScriptRuntime {
     pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
     random_state: u64,
     console_depth: usize,
+    inspector: inspector::Inspector,
     console_timers: HashMap<String, u64>,
     console_counts: HashMap<String, u64>,
     // wall-clock milliseconds when the page clock started
@@ -1623,6 +1627,7 @@ impl ScriptRuntime {
             pattern_cache: HashMap::new(),
             random_state: numbers::random_seed(),
             console_depth: 0,
+            inspector: inspector::Inspector::new(),
             console_timers: HashMap::new(),
             console_counts: HashMap::new(),
             time_origin: std::time::SystemTime::now()
@@ -2804,7 +2809,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn report(&mut self, message: impl Into<String>) {
-        self.logs.push(message.into());
+        self.push_log(message.into());
     }
 
     pub(crate) fn content_security_policy(&self) -> Rc<Policies> {

@@ -5,6 +5,8 @@ use super::object::{ObjectClass, is_private_key};
 use super::operations::{is_primitive, symbol_description};
 use super::*;
 
+const KEPT_LOG_LINES: usize = 4000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConsoleMethod {
     Log,
@@ -14,8 +16,10 @@ pub(super) enum ConsoleMethod {
     Error,
     Trace,
     Dir,
+    Dirxml,
     Table,
     Group,
+    GroupCollapsed,
     GroupEnd,
     Time,
     TimeLog,
@@ -34,10 +38,10 @@ pub(super) const CONSOLE_METHODS: &[(&str, ConsoleMethod)] = &[
     ("error", ConsoleMethod::Error),
     ("trace", ConsoleMethod::Trace),
     ("dir", ConsoleMethod::Dir),
-    ("dirxml", ConsoleMethod::Dir),
+    ("dirxml", ConsoleMethod::Dirxml),
     ("table", ConsoleMethod::Table),
     ("group", ConsoleMethod::Group),
-    ("groupCollapsed", ConsoleMethod::Group),
+    ("groupCollapsed", ConsoleMethod::GroupCollapsed),
     ("groupEnd", ConsoleMethod::GroupEnd),
     ("time", ConsoleMethod::Time),
     ("timeLog", ConsoleMethod::TimeLog),
@@ -339,8 +343,16 @@ impl ScriptRuntime {
     fn console_write(&mut self, text: String) {
         let indent = "  ".repeat(self.console_depth);
         for line in text.split('\n') {
-            self.logs.push(format!("{indent}{line}"));
+            self.push_log(format!("{indent}{line}"));
         }
+    }
+
+    // a page that logs on every frame would otherwise grow the log without bound
+    pub(super) fn push_log(&mut self, line: String) {
+        if self.logs.len() == KEPT_LOG_LINES {
+            self.logs.drain(..KEPT_LOG_LINES / 2);
+        }
+        self.logs.push(line);
     }
 
     pub(super) fn call_console(
@@ -355,8 +367,27 @@ impl ScriptRuntime {
                 Some(value) => value.string_value(),
             }
         };
+        let kind = match method {
+            M::Log => Some("log"),
+            M::Info => Some("info"),
+            M::Debug => Some("debug"),
+            M::Warn => Some("warning"),
+            M::Error => Some("error"),
+            M::Trace => Some("trace"),
+            M::Dir => Some("dir"),
+            M::Dirxml => Some("dirxml"),
+            M::Table => Some("table"),
+            M::Group => Some("startGroup"),
+            M::GroupCollapsed => Some("startGroupCollapsed"),
+            M::GroupEnd => Some("endGroup"),
+            M::Clear => Some("clear"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.console_record(kind, arguments.clone());
+        }
         match method {
-            M::Log | M::Info | M::Debug | M::Warn | M::Error | M::Dir => {
+            M::Log | M::Info | M::Debug | M::Warn | M::Error | M::Dir | M::Dirxml => {
                 let text = self.console_text(&arguments);
                 self.console_write(text);
             }
@@ -372,7 +403,7 @@ impl ScriptRuntime {
                 let text = self.console_text(&arguments);
                 self.console_write(text);
             }
-            M::Group => {
+            M::Group | M::GroupCollapsed => {
                 if !arguments.is_empty() {
                     let text = self.console_text(&arguments);
                     self.console_write(text);
@@ -391,10 +422,25 @@ impl ScriptRuntime {
                 } else {
                     self.console_timers.get(&label).copied()
                 };
-                let text = match started {
-                    Some(started) => format!("{label}: {}ms", self.clock.saturating_sub(started)),
-                    None => format!("Timer '{label}' does not exist"),
+                let (kind, text) = match started {
+                    Some(started) => {
+                        let elapsed = self.clock.saturating_sub(started);
+                        let kind = if method == M::TimeEnd {
+                            "timeEnd"
+                        } else {
+                            "log"
+                        };
+                        self.console_record(
+                            kind,
+                            vec![Value::String(format!("{label}: {elapsed} ms").into())],
+                        );
+                        (kind, format!("{label}: {elapsed}ms"))
+                    }
+                    None => ("warning", format!("Timer '{label}' does not exist")),
                 };
+                if kind == "warning" {
+                    self.console_record(kind, vec![Value::String(text.clone().into())]);
+                }
                 self.console_write(text);
             }
             M::Count => {
@@ -402,6 +448,7 @@ impl ScriptRuntime {
                 let count = self.console_counts.entry(label.clone()).or_insert(0);
                 *count += 1;
                 let text = format!("{label}: {count}");
+                self.console_record("count", vec![Value::String(text.clone().into())]);
                 self.console_write(text);
             }
             M::CountReset => {
@@ -410,6 +457,12 @@ impl ScriptRuntime {
             }
             M::Assert => {
                 if !arguments.first().is_some_and(Value::truthy) {
+                    // v8 drops the condition and names the call when nothing else is given
+                    let rest = match arguments.len() {
+                        0 | 1 => vec![Value::String("console.assert".into())],
+                        _ => arguments[1..].to_vec(),
+                    };
+                    self.console_record("assert", rest);
                     let text = self.console_text(&arguments[arguments.len().min(1)..]);
                     self.console_write(if text.is_empty() {
                         "Assertion failed".to_string()
@@ -429,12 +482,13 @@ impl ScriptRuntime {
         let message = error.message.clone();
         let value = self.take_thrown(error);
         let text = self.inspect(&value, 0, &mut Vec::new());
-        if self.report_error_event(&text, value) {
+        if self.report_error_event(&text, value.clone()) {
             return;
         }
         if let Some(sender) = &self.worker_sender {
             let _ = sender.try_send(WorkerEvent::Error(message));
         }
-        self.logs.push(format!("Uncaught {text}"));
+        self.console_record("exception", vec![value]);
+        self.push_log(format!("Uncaught {text}"));
     }
 }

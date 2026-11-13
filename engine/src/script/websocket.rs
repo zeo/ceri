@@ -206,7 +206,7 @@ fn protocol_error(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
-pub(super) fn accept_key(key: &str) -> String {
+pub(crate) fn accept_key(key: &str) -> String {
     super::canvas::base64(&super::sha1_digest(
         format!("{key}{ACCEPT_GUID}").as_bytes(),
     ))

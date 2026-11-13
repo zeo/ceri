@@ -32,6 +32,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
 const SCALE_SWITCH: &str = "ceri-scale";
 const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
+// chromium's switch, so tools that launch a browser with it can attach
+const DEVTOOLS_SWITCH: &str = "remote-debugging-port";
 
 // reaches the running app's windows from commands, hooks and threads; quiet until the loop runs
 #[derive(Clone, Default)]
@@ -154,6 +156,7 @@ pub struct App {
     content_security_policy: Option<String>,
     local_storage_import: Option<(PathBuf, String)>,
     dev_url: Option<String>,
+    devtools: bool,
 }
 
 type LaunchRequest = Box<dyn Fn(&AppHandle, Vec<OsString>, PathBuf) + Send + Sync>;
@@ -229,6 +232,13 @@ impl App {
     // http://localhost:5173, instead of the packaged pages; a release build ignores it
     pub fn dev_url(mut self, url: impl Into<String>) -> Self {
         self.dev_url = Some(url.into());
+        self
+    }
+
+    // lets --remote-debugging-port=<port> serve the devtools protocol from a release build;
+    // a debug build always does
+    pub fn devtools(mut self, enabled: bool) -> Self {
+        self.devtools = enabled;
         self
     }
 
@@ -486,6 +496,7 @@ impl App {
                 icon: self.icon,
                 content_security_policy: self.content_security_policy,
                 dev,
+                devtools: cfg!(debug_assertions) || self.devtools,
             },
             &identifier,
             self.windows,
@@ -547,6 +558,7 @@ struct Bridge {
     icon: Option<Vec<u8>>,
     content_security_policy: Option<String>,
     dev: Option<DevServer>,
+    devtools: bool,
 }
 
 impl Bridge {
@@ -668,6 +680,16 @@ fn run_app(
         }
         None => None,
     };
+    if let Some(port) =
+        launch::switch_value(arguments.clone(), DEVTOOLS_SWITCH).filter(|_| bridge.devtools)
+    {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| format!("--{DEVTOOLS_SWITCH} needs a port number, not {port}"))?;
+        let address = ceri_engine::serve_devtools(port)
+            .map_err(|error| format!("could not serve devtools on port {port}: {error}"))?;
+        eprintln!("DevTools listening on http://{address}/json/list");
+    }
     if let Some((config, on_event)) = tray {
         let events = handle.clone();
         let config = TrayConfig {

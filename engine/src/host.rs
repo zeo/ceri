@@ -6,8 +6,8 @@ use crate::navigation::{
 };
 use crate::paint::Canvas;
 pub use crate::script::KeyModifiers;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -184,7 +184,7 @@ pub enum EngineWorkerEvent {
     Failed(NavigationError),
 }
 
-enum EngineWorkerCommand {
+pub(crate) enum EngineWorkerCommand {
     Navigate { request_id: u64, url: String },
     Input { request_id: u64, event: InputEvent },
     Render { request_id: u64 },
@@ -196,6 +196,7 @@ enum EngineWorkerCommand {
     Wake,
     // an event for the page's ceri.listen callbacks
     HostEvent { name: String, payload: String },
+    Inspector(crate::devtools::Inbound),
     Shutdown,
 }
 
@@ -203,6 +204,8 @@ pub struct EngineWorker {
     commands: SyncSender<EngineWorkerCommand>,
     events: Receiver<EngineWorkerEvent>,
     next_request_id: u64,
+    // the window's entry in the devtools target list, while devtools are served
+    _devtools: Option<crate::devtools::Registration>,
 }
 
 impl EngineWorker {
@@ -232,6 +235,7 @@ impl EngineWorker {
                 commands,
                 events: event_receiver,
                 next_request_id: 1,
+                _devtools: None,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("engine worker stopped during initialization".to_string()),
@@ -248,6 +252,10 @@ impl EngineWorker {
         let (events, event_receiver) = mpsc::channel();
         let (ready, ready_receiver) = mpsc::channel();
         let wake = commands.clone();
+        let devtools = crate::devtools::register(commands.clone());
+        let page = devtools
+            .as_ref()
+            .map(|registration| registration.page.clone());
         thread::Builder::new()
             .name("ceri-engine".to_string())
             .spawn(move || {
@@ -268,6 +276,7 @@ impl EngineWorker {
                     command_receiver,
                     events,
                     notify,
+                    page,
                 );
             })
             .map_err(|error| format!("could not start engine worker: {error}"))?;
@@ -276,6 +285,7 @@ impl EngineWorker {
                 commands,
                 events: event_receiver,
                 next_request_id: 1,
+                _devtools: devtools,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("engine worker stopped during initialization".to_string()),
@@ -386,6 +396,7 @@ fn run_live_engine_worker(
     commands: Receiver<EngineWorkerCommand>,
     events: Sender<EngineWorkerEvent>,
     notify: Waker,
+    page: Option<Arc<Mutex<crate::devtools::PageInfo>>>,
 ) {
     let send = |event| {
         let sent = events.send(event).is_ok();
@@ -475,7 +486,22 @@ fn run_live_engine_worker(
             Some(command) => answer(&mut host, command),
             None => None,
         };
+        host.browser.flush_inspector();
         if let Some(event) = event {
+            if let Some(page) = &page
+                && matches!(
+                    event,
+                    EngineWorkerEvent::Navigated { .. } | EngineWorkerEvent::Frame { .. }
+                )
+            {
+                let mut page = page.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                page.title = host.title().unwrap_or_default();
+                page.url = host
+                    .browser
+                    .current_url()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+            }
             if let EngineWorkerEvent::Frame { result, .. } = &event {
                 announced = false;
                 if matches!(result, Ok(Some(_))) {
@@ -563,6 +589,26 @@ fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineW
                 Ok(()) => None,
                 Err(error) => Some(EngineWorkerEvent::Failed(error)),
             };
+        }
+        EngineWorkerCommand::Inspector(inbound) => {
+            use crate::devtools::Inbound;
+            match inbound {
+                Inbound::Attach { session, outgoing } => {
+                    host.browser.attach_inspector(session, outgoing)
+                }
+                Inbound::Detach { session } => host.browser.detach_inspector(session),
+                Inbound::Message { session, text } => {
+                    // whatever the session ran may have changed the page
+                    host.dirty = true;
+                    if let Some(url) = host.browser.inspect(session, &text) {
+                        return Some(EngineWorkerEvent::Navigated {
+                            request_id: 0,
+                            result: host.navigate(&url),
+                        });
+                    }
+                }
+            }
+            return None;
         }
         EngineWorkerCommand::Shutdown => return None,
     })

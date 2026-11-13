@@ -801,7 +801,21 @@ impl Compiler {
         self.name(&message)
     }
 
-    pub(super) fn compile_script(mut self, script: &Script) -> Result<Rc<Code>, ScriptError> {
+    pub(super) fn compile_script(self, script: &Script) -> Result<Rc<Code>, ScriptError> {
+        self.compile_global(script, false)
+    }
+
+    // a script that returns its last statement's value when that statement is an expression,
+    // as a console shows it
+    pub(super) fn compile_console_script(self, script: &Script) -> Result<Rc<Code>, ScriptError> {
+        self.compile_global(script, true)
+    }
+
+    fn compile_global(
+        mut self,
+        script: &Script,
+        completion: bool,
+    ) -> Result<Rc<Code>, ScriptError> {
         self.functions
             .push(FunctionState::new(false, true, script.strict));
         // global declarations: var and function names become global bindings up front
@@ -821,10 +835,20 @@ impl Compiler {
             let index = self.name(&name);
             self.emit(Op::InitGlobal(index));
         }
-        for statement in &script.body {
+        let completed = match script.body.split_last() {
+            Some((Stmt::Expression(last), body)) if completion => Some((last, body)),
+            _ => None,
+        };
+        let body = completed.map_or(&script.body[..], |(_, body)| body);
+        for statement in body {
             self.compile_statement(statement)?;
         }
-        self.emit(Op::Undefined);
+        match completed {
+            Some((last, _)) => self.compile_expression(last)?,
+            None => {
+                self.emit(Op::Undefined);
+            }
+        }
         self.emit(Op::Return);
         let state = self.functions.pop().expect("script state");
         let scope_size = state.scopes[0].size;

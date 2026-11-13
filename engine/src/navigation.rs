@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod inspector;
+
 // the milliseconds between frames while something animates
 pub(crate) const FRAME_INTERVAL: u64 = 16;
 
@@ -997,6 +999,7 @@ pub struct Browser {
     history_index: Option<usize>,
     current_document_id: Option<u64>,
     next_document_id: u64,
+    inspection: inspector::Inspection,
     local_storage: StorageHandle,
     session_storage: StorageHandle,
     hovered_node: Option<NodeId>,
@@ -1147,6 +1150,7 @@ impl Browser {
             history_index: None,
             current_document_id: None,
             next_document_id: 1,
+            inspection: Default::default(),
             local_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             session_storage: Rc::new(RefCell::new(crate::script::StorageData::new())),
             hovered_node: None,
@@ -1578,6 +1582,9 @@ impl Browser {
             runtime.set_locale(locale.clone());
         }
         runtime.set_viewport_metrics(self.viewport);
+        if crate::devtools_serving() || self.inspection.attached() {
+            runtime.capture_console();
+        }
         for failure in failed_sheets {
             runtime.report(failure);
         }

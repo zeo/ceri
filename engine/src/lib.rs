@@ -10,6 +10,7 @@ mod colors;
 mod csp;
 mod css;
 mod deflate;
+mod devtools;
 mod dom;
 #[cfg(windows)]
 mod dwrite;
@@ -59,6 +60,7 @@ pub use bridge::{
 };
 pub use css::{Color, ColorScheme, Cursor, Display, Stylesheet};
 pub use deflate::{gzip, zlib_compress};
+pub use devtools::{devtools_serving, serve_devtools};
 pub use dom::{
     AccessibilityNode, Document, DomError, Element, Namespace, NodeId, NodeKind, ParseError,
     ScriptSource, StylesheetSource,
