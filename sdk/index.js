@@ -137,6 +137,8 @@ export const appWindow = Object.freeze({
   setAlwaysOnTop: (on) => invoke("window:set-always-on-top", { on }),
   setZoom: (zoom) => invoke("window:set-zoom", { zoom }),
   setTitle: (title) => invoke("window:set-title", { title }),
+  setProgress: (progress) =>
+    invoke("window:set-progress", typeof progress === "number" ? { progress } : (progress ?? {})),
   state: command("window:state"),
   isMaximized: () => invoke("window:state").then((state) => state.maximized),
   onResized: (handler) => listen("window:resized", (event) => handler(event.payload)),
@@ -217,6 +219,11 @@ export const deepLink = Object.freeze({
   getCurrent: () => invoke("deep-link:get-current"),
   onOpenUrl: (handler) => listen("deep-link", ({ payload }) => handler(payload.urls)),
 });
+
+// a count over the app's icon; null or zero takes it away
+export function setBadgeCount(count) {
+  return invoke("app:set-badge-count", { count: count ?? null });
+}
 
 export function appVersion() {
   return invoke("app:version");

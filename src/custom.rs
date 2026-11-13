@@ -11,6 +11,7 @@ use crate::instance;
 use crate::launch::{self, ASSETS_SWITCH, ENTRY_SWITCH};
 use crate::notification::Notifier;
 use crate::shortcut::{GlobalShortcuts, ShortcutState};
+use crate::taskbar::{Progress, Taskbar};
 use crate::tray::{Tray, TrayConfig, TrayEvent};
 use crate::video::DesktopVideo;
 use ceri_engine::{
@@ -39,6 +40,7 @@ pub struct AppHandle {
     files: FileScope,
     tray: Arc<OnceLock<Tray>>,
     notifier: Arc<OnceLock<Notifier>>,
+    taskbar: Arc<OnceLock<Taskbar>>,
     shortcuts: GlobalShortcuts,
     opened_urls: Arc<Mutex<Vec<String>>>,
 }
@@ -92,6 +94,24 @@ impl AppHandle {
             Some(notifier) => notifier.show(title, body),
             None => Err("notifications start with the app".to_string()),
         }
+    }
+
+    // a window's progress on its taskbar button; the linux launcher shows one for the whole app
+    pub fn set_progress(&self, window: &str, progress: Progress) -> Result<(), String> {
+        let (control, taskbar) = self.taskbar()?;
+        taskbar.set_progress(control, window, progress)
+    }
+
+    // a count over the app's icon, which none or zero takes away
+    pub fn set_badge_count(&self, count: Option<u64>) -> Result<(), String> {
+        let (control, taskbar) = self.taskbar()?;
+        taskbar.set_badge_count(control, count.filter(|count| *count > 0))
+    }
+
+    fn taskbar(&self) -> Result<(&WindowControl, &Taskbar), String> {
+        self.windows()
+            .zip(self.taskbar.get())
+            .ok_or_else(|| "the taskbar starts with the app".to_string())
     }
 
     // closes every window without asking and ends the loop, once it runs
@@ -461,6 +481,7 @@ impl App {
                 version: self.version,
                 files: self.handle.files.clone(),
                 notifier: self.handle.notifier.clone(),
+                taskbar: self.handle.taskbar.clone(),
                 embedded: self.assets,
                 icon: self.icon,
                 content_security_policy: self.content_security_policy,
@@ -517,6 +538,7 @@ struct Bridge {
     version: Option<String>,
     files: FileScope,
     notifier: Arc<OnceLock<Notifier>>,
+    taskbar: Arc<OnceLock<Taskbar>>,
     autostart: Autostart,
     shortcuts: GlobalShortcuts,
     opened_urls: Arc<Mutex<Vec<String>>>,
@@ -535,6 +557,7 @@ impl Bridge {
                 control: control.cloned(),
                 version: self.version.clone(),
                 notifier: self.notifier.clone(),
+                taskbar: self.taskbar.clone(),
                 autostart: self.autostart.clone(),
                 shortcuts: self.shortcuts.clone(),
                 opened_urls: self.opened_urls.clone(),
@@ -572,6 +595,7 @@ fn run_app(
         .icon
         .clone()
         .or_else(|| app_icon_source(launch.assets.as_ref()));
+    let _ = bridge.taskbar.set(Taskbar::new(identifier));
     let _ = bridge.notifier.set(Notifier::new(
         identifier,
         &bridge.name,

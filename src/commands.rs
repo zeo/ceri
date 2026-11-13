@@ -5,6 +5,7 @@ use crate::autostart::Autostart;
 use crate::dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 use crate::notification::Notifier;
 use crate::shortcut::GlobalShortcuts;
+use crate::taskbar::{Progress, Taskbar};
 use ceri_engine::{
     CommandCall, CommandError, CommandReply, CommandRouter, NativeHandle, WindowAction,
     WindowControl,
@@ -59,12 +60,19 @@ pub struct CommandRoutes {
     pub control: Option<WindowControl>,
     pub version: Option<String>,
     pub notifier: Arc<OnceLock<Notifier>>,
+    pub taskbar: Arc<OnceLock<Taskbar>>,
     pub autostart: Autostart,
     pub shortcuts: GlobalShortcuts,
     pub opened_urls: Arc<Mutex<Vec<String>>>,
 }
 
 impl CommandRoutes {
+    fn taskbar(&self) -> Result<&Taskbar, CommandError> {
+        self.taskbar
+            .get()
+            .ok_or_else(|| CommandError::failed("the taskbar starts with the app"))
+    }
+
     // commands every app has, for the page to drive its own window
     fn builtin(&self, call: &CommandCall) -> Option<Result<String, CommandError>> {
         if call.command == "app:version" {
@@ -118,6 +126,18 @@ impl CommandRoutes {
             "window:set-title" => {
                 arguments::<Title>(call).and_then(|title| act(WindowAction::Title(title.title)))
             }
+            "window:set-progress" => arguments::<ProgressRequest>(call).and_then(|request| {
+                self.taskbar()?
+                    .set_progress(control, label, request.into())
+                    .map_err(CommandError::failed)?;
+                Ok("null".to_string())
+            }),
+            "app:set-badge-count" => arguments::<BadgeRequest>(call).and_then(|request| {
+                self.taskbar()?
+                    .set_badge_count(control, request.count.filter(|count| *count > 0))
+                    .map_err(CommandError::failed)?;
+                Ok("null".to_string())
+            }),
             "window:state" => match control.state(label) {
                 Some(state) => json(&serde_json::json!({
                     "maximized": state.maximized,
@@ -137,6 +157,43 @@ impl CommandRoutes {
             _ => return None,
         })
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProgressState {
+    None,
+    Normal,
+    Indeterminate,
+    Paused,
+    Error,
+}
+
+// electron's fraction from 0 to 1 and tauri's states; a progress alone is normal
+#[derive(Deserialize)]
+struct ProgressRequest {
+    #[serde(default)]
+    state: Option<ProgressState>,
+    #[serde(default)]
+    progress: Option<f64>,
+}
+
+impl From<ProgressRequest> for Progress {
+    fn from(request: ProgressRequest) -> Self {
+        let done = request.progress.unwrap_or(0.0);
+        match (request.state, request.progress) {
+            (None, None) | (Some(ProgressState::None), _) => Progress::None,
+            (None | Some(ProgressState::Normal), _) => Progress::Normal(done),
+            (Some(ProgressState::Indeterminate), _) => Progress::Indeterminate,
+            (Some(ProgressState::Paused), _) => Progress::Paused(done),
+            (Some(ProgressState::Error), _) => Progress::Error(done),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BadgeRequest {
+    count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -446,6 +503,29 @@ mod tests {
     }
 
     #[test]
+    fn a_progress_alone_is_normal_and_a_state_alone_keeps_its_own() {
+        let progress = |payload: &str| {
+            Progress::from(serde_json::from_str::<ProgressRequest>(payload).expect("request"))
+        };
+        assert_eq!(progress("{}"), Progress::None);
+        assert_eq!(progress(r#"{"progress":0.5}"#), Progress::Normal(0.5));
+        assert_eq!(
+            progress(r#"{"state":"none","progress":0.5}"#),
+            Progress::None
+        );
+        assert_eq!(
+            progress(r#"{"state":"indeterminate"}"#),
+            Progress::Indeterminate
+        );
+        assert_eq!(
+            progress(r#"{"state":"paused","progress":0.2}"#),
+            Progress::Paused(0.2)
+        );
+        assert_eq!(progress(r#"{"state":"error"}"#), Progress::Error(0.0));
+        assert!(serde_json::from_str::<ProgressRequest>(r#"{"state":"busy"}"#).is_err());
+    }
+
+    #[test]
     fn commands_answer_inline_from_threads_and_name_unknown_ones() {
         let mut commands = Commands::default();
         commands.add("echo", |call| Ok(call.payload.clone()));
@@ -460,6 +540,7 @@ mod tests {
             control: None,
             version: Some("1.2.3".to_string()),
             notifier: Arc::default(),
+            taskbar: Arc::default(),
             autostart: Autostart::new("dev.ceri.router-test", "Router Test"),
             shortcuts: GlobalShortcuts::default(),
             opened_urls: Arc::new(Mutex::new(vec!["clip://open".to_string()])),

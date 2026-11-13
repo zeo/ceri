@@ -20,6 +20,7 @@ mod instance;
 mod notification;
 pub mod opener;
 mod shortcut;
+mod taskbar;
 mod tray;
 mod video;
 
@@ -31,6 +32,7 @@ pub use custom::{App, AppHandle, run};
 pub use dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
 pub use files::FileScope;
 pub use shortcut::{GlobalShortcuts, ShortcutState};
+pub use taskbar::Progress;
 pub use tray::{MenuItem, Tray, TrayConfig, TrayEvent};
 
 #[doc(hidden)]

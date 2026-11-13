@@ -66,6 +66,12 @@ export interface WindowResized {
   readonly fullscreen: boolean;
 }
 
+export interface ProgressOptions {
+  // normal when a progress is given and none otherwise; linux launchers show no indeterminate
+  readonly state?: "none" | "normal" | "indeterminate" | "paused" | "error";
+  readonly progress?: number;
+}
+
 export interface AppWindow {
   show(): Promise<void>;
   hide(): Promise<void>;
@@ -82,6 +88,8 @@ export interface AppWindow {
   setAlwaysOnTop(on: boolean): Promise<void>;
   setZoom(zoom: number): Promise<void>;
   setTitle(title: string): Promise<void>;
+  // the taskbar button's bar; a number is the fraction done from 0 to 1, and none clears it
+  setProgress(progress?: number | ProgressOptions | null): Promise<void>;
   state(): Promise<WindowState>;
   isMaximized(): Promise<boolean>;
   onResized(handler: (size: WindowResized) => void): Promise<Unlisten>;
@@ -184,6 +192,9 @@ export interface DeepLink {
 }
 
 export const deepLink: DeepLink;
+
+// a count over the app's icon; null or zero takes it away
+export function setBadgeCount(count: number | null): Promise<void>;
 
 export function appVersion(): Promise<string>;
 
