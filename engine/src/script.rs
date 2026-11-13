@@ -52,7 +52,7 @@ pub(crate) use canvas::canvas_size;
 pub use dates::TimeZone;
 pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
-pub(crate) use inspector::Answer;
+pub(crate) use inspector::{Answer, NodeArgument, NodeCall};
 pub(crate) use websocket::accept_key;
 
 use crate::Color;

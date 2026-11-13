@@ -40,6 +40,10 @@ pub(super) struct Inspector {
     awaited: Vec<Awaited>,
     next_token: u64,
     next_exception: u64,
+    // the nodes last selected in the elements panel, newest first, for $0 to $4
+    inspected: Vec<NodeId>,
+    // the console's last result, for $_
+    last_result: Value,
 }
 
 impl Inspector {
@@ -54,8 +58,22 @@ impl Inspector {
             awaited: Vec::new(),
             next_token: 1,
             next_exception: 1,
+            inspected: Vec::new(),
+            last_result: Value::Undefined,
         }
     }
+}
+
+// a value the DOM domain hands to page script
+pub(crate) enum NodeArgument {
+    Text(String),
+    Node(Option<NodeId>),
+}
+
+// what a call on a node gave back: the nodes in it, and the value as JSON
+pub(crate) struct NodeCall {
+    pub(crate) nodes: Vec<NodeId>,
+    pub(crate) value: Json,
 }
 
 // an answer now, or a token whose answer comes once the promise it waits on settles
@@ -195,6 +213,113 @@ impl ScriptRuntime {
         Answer::Now(answer)
     }
 
+    pub(crate) fn inspector_node_object(&mut self, node: NodeId, group: &str) -> Json {
+        let value = self.node_value(node);
+        self.remote_object(&value, group, false)
+    }
+
+    pub(crate) fn inspector_object_node(&self, object_id: &str) -> Option<NodeId> {
+        let id = self.object_number(Some(object_id))?;
+        match &self.inspector.objects.get(&id)?.0 {
+            Value::Element(handle) => Some(handle.id),
+            Value::Document => Some(self.document.borrow().root()),
+            _ => None,
+        }
+    }
+
+    // runs a function with the node as this, so the DOM domain edits through the same calls
+    // page script makes and observers see them as chromium's would
+    pub(crate) fn inspector_node_call(
+        &mut self,
+        node: NodeId,
+        function: &str,
+        arguments: Vec<NodeArgument>,
+    ) -> Result<NodeCall, String> {
+        let arguments = arguments
+            .into_iter()
+            .map(|argument| match argument {
+                NodeArgument::Text(text) => Value::String(text.into()),
+                NodeArgument::Node(Some(node)) => self.node_value(node),
+                NodeArgument::Node(None) => Value::Null,
+            })
+            .collect();
+        let this = self.node_value(node);
+        let outcome = self
+            .evaluate_console_source(function)
+            .and_then(|function| self.call_function(function, this, arguments));
+        if let Err(error) = self.drain_microtasks() {
+            self.report_exception(error);
+        }
+        let value = match outcome {
+            Ok(value) => value,
+            Err(error) => {
+                let message = error.message.clone();
+                self.take_thrown(error);
+                return Err(message);
+            }
+        };
+        let root = self.document.borrow().root();
+        let node_of = |value: &Value| match value {
+            Value::Element(handle) => Some(handle.id),
+            Value::Document => Some(root),
+            _ => None,
+        };
+        let nodes: Vec<NodeId> = match &value {
+            Value::Array(items) => items.borrow().iter().filter_map(node_of).collect(),
+            single => node_of(single).into_iter().collect(),
+        };
+        let value = match nodes.is_empty() {
+            true => self.value_json(&value)["value"].take(),
+            false => Json::Null,
+        };
+        Ok(NodeCall { nodes, value })
+    }
+
+    pub(crate) fn inspect_node(&mut self, node: NodeId) {
+        let inspected = &mut self.inspector.inspected;
+        inspected.retain(|held| *held != node);
+        inspected.insert(0, node);
+        inspected.truncate(5);
+    }
+
+    // the console's command line api, as globals for one evaluation where the page has none
+    // of its own, given back by name so they can be taken away after
+    fn install_command_line(&mut self) -> Vec<String> {
+        let inspected = self.inspector.inspected.clone();
+        let mut entries = Vec::new();
+        for index in 0..5 {
+            let node = inspected
+                .get(index)
+                .copied()
+                .filter(|node| self.document.borrow().contains(*node));
+            let value = node.map_or(Value::Undefined, |node| self.node_value(node));
+            entries.push((format!("${index}"), value));
+        }
+        entries.push(("$_".to_string(), self.inspector.last_result.clone()));
+        for (name, source) in [
+            (
+                "$",
+                "(selector, root = document) => root.querySelector(selector)",
+            ),
+            (
+                "$$",
+                "(selector, root = document) => Array.from(root.querySelectorAll(selector))",
+            ),
+        ] {
+            if let Ok(function) = self.evaluate_console_source(source) {
+                entries.push((name.to_string(), function));
+            }
+        }
+        let mut installed = Vec::new();
+        for (name, value) in entries {
+            if matches!(self.lookup_global(&name), None | Some(Value::Undefined)) {
+                self.global.borrow_mut().values.insert(name.clone(), value);
+                installed.push(name);
+            }
+        }
+        installed
+    }
+
     // answers for awaited promises that have settled since the last call
     pub(crate) fn inspector_settled(&mut self) -> Vec<(u64, Result<Json, String>)> {
         let (settled, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.inspector.awaited)
@@ -238,7 +363,18 @@ impl ScriptRuntime {
             return Answer::Now(Ok(self.thrown_json(&thrown, &group)));
         }
         let source = params["expression"].as_str().unwrap_or_default();
+        let command_line = params["includeCommandLineAPI"] == true;
+        let installed = match command_line {
+            true => self.install_command_line(),
+            false => Vec::new(),
+        };
         let outcome = self.evaluate_console_source(source);
+        for name in installed {
+            self.global.borrow_mut().values.remove(&name);
+        }
+        if command_line && let Ok(value) = &outcome {
+            self.inspector.last_result = value.clone();
+        }
         self.finish_evaluation(
             outcome,
             group,

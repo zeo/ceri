@@ -1,5 +1,8 @@
 // devtools protocol sessions on a browser's page: the Page domain here, the Runtime domain
-// routed to the page's script runtime, and the events both owe each session
+// routed to the page's script runtime, the DOM domain in its own module, and the events they
+// owe each session
+
+mod dom;
 
 use super::Browser;
 use crate::script::Answer;
@@ -7,6 +10,9 @@ use serde_json::{Value as Json, json};
 use std::sync::mpsc::Sender;
 
 const FRAME_ID: &str = "ceri-main-frame";
+
+// a protocol error's code and message
+type Failure = (i64, String);
 
 #[derive(Default)]
 pub(super) struct Inspection {
@@ -28,6 +34,7 @@ struct Session {
     // the execution context this session last heard of, and the first console entry it has not
     context: Option<u64>,
     seen: u64,
+    dom: dom::Mirror,
 }
 
 // an answer held until a promise settles in the context that made it
@@ -50,6 +57,7 @@ impl Browser {
             page: false,
             context: None,
             seen: 0,
+            dom: dom::Mirror::default(),
         });
     }
 
@@ -129,6 +137,29 @@ impl Browser {
                     "Cannot find default execution context".into(),
                 ))),
             },
+            method if method.starts_with("DOM.") => {
+                // a new document resets what the session holds before the call reads it
+                self.flush_inspector();
+                let url = self.document_url();
+                let mut events = Vec::new();
+                let Self {
+                    inspection, page, ..
+                } = self;
+                let held = inspection
+                    .sessions
+                    .iter_mut()
+                    .find(|held| held.id == session);
+                let answer = match (held, page) {
+                    (Some(held), Some(page)) => {
+                        dom::answer(&mut held.dom, page, &url, method, params, &mut events)
+                    }
+                    _ => Some(Err((-32000, "Document is not available".into()))),
+                };
+                for event in events {
+                    self.send(session, event);
+                }
+                Some(answer.unwrap_or_else(|| Err((-32601, format!("'{method}' wasn't found")))))
+            }
             _ => Some(Err((-32601, format!("'{method}' wasn't found")))),
         };
         // the events a call causes reach the session before its answer, as in chromium
@@ -151,6 +182,7 @@ impl Browser {
         }
         let frame = self.frame();
         let origin = frame["securityOrigin"].clone();
+        let url = self.document_url();
         let Some(page) = &mut self.page else {
             return;
         };
@@ -211,6 +243,17 @@ impl Browser {
                     );
                     session.seen = 0;
                 }
+                if session.dom.active() {
+                    post(session, "DOM.documentUpdated", json!({}));
+                }
+                session.dom = dom::Mirror::default();
+            }
+            let mut events = Vec::new();
+            session
+                .dom
+                .reconcile(&page.document.borrow(), &url, &mut events);
+            for event in events {
+                let _ = session.outgoing.send(event.to_string());
             }
             if session.runtime {
                 let (events, next) = page.runtime.console_events(session.seen);
@@ -233,19 +276,22 @@ impl Browser {
         send_to(&self.inspection.sessions, session, message);
     }
 
+    fn document_url(&self) -> String {
+        self.current_url
+            .as_ref()
+            .map_or_else(|| "about:blank".to_string(), ToString::to_string)
+    }
+
     fn loader(&self) -> String {
         self.current_document_id.unwrap_or_default().to_string()
     }
 
     fn frame(&self) -> Json {
-        let (url, origin) = match &self.current_url {
-            Some(url) => (url.to_string(), url.origin()),
-            None => ("about:blank".to_string(), "null"),
-        };
+        let origin = self.current_url.as_ref().map_or("null", |url| url.origin());
         json!({
             "id": FRAME_ID,
             "loaderId": self.loader(),
-            "url": url,
+            "url": self.document_url(),
             "domainAndRegistry": "",
             "securityOrigin": origin,
             "mimeType": "text/html",
@@ -480,10 +526,10 @@ mod tests {
             json!({ "objectId": object }),
         );
         assert_eq!(sent[0]["error"]["code"], -32000);
-        let sent = call(&mut browser, &messages, 7, "DOM.enable", json!({}));
+        let sent = call(&mut browser, &messages, 7, "Debugger.enable", json!({}));
         assert_eq!(
             sent[0]["error"],
-            json!({ "code": -32601, "message": "'DOM.enable' wasn't found" })
+            json!({ "code": -32601, "message": "'Debugger.enable' wasn't found" })
         );
     }
 
@@ -526,5 +572,266 @@ mod tests {
         );
         assert_eq!(sent[2]["params"]["executionContextId"], first);
         assert_ne!(sent[4]["params"]["context"]["id"], first);
+    }
+
+    fn named<'a>(messages: &'a [Json], method: &str) -> Vec<&'a Json> {
+        messages
+            .iter()
+            .filter(|message| message["method"] == method)
+            .map(|message| &message["params"])
+            .collect()
+    }
+
+    fn evaluate(
+        browser: &mut Browser,
+        messages: &Receiver<String>,
+        id: u64,
+        expression: &str,
+    ) -> Vec<Json> {
+        call(
+            browser,
+            messages,
+            id,
+            "Runtime.evaluate",
+            json!({ "expression": expression }),
+        )
+    }
+
+    #[test]
+    fn the_document_mirror_follows_the_page_changes() {
+        let (mut browser, messages) =
+            inspected("<div id=list><p class=a>one</p>\n<p>two</p></div><span>x</span>");
+        let sent = call(&mut browser, &messages, 1, "DOM.getDocument", json!({}));
+        let root = &result(&sent, 1)["root"];
+        assert_eq!(root["nodeType"], 9);
+        assert_eq!(root["documentURL"], "https://app.ceri.invalid/");
+        let html = &root["children"][0];
+        assert_eq!(html["nodeName"], "HTML");
+        let body = &html["children"][1];
+        assert_eq!(
+            (body["nodeName"].as_str(), body["childNodeCount"].as_u64()),
+            (Some("BODY"), Some(2))
+        );
+        assert!(body["children"].is_null());
+        let body = body["nodeId"].clone();
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            2,
+            "DOM.requestChildNodes",
+            json!({ "nodeId": body, "depth": -1 }),
+        );
+        let set = named(&sent, "DOM.setChildNodes");
+        assert_eq!(set[0]["parentId"], body);
+        let div = &set[0]["nodes"][0];
+        assert_eq!(div["attributes"], json!(["id", "list"]));
+        // the line break between the paragraphs is left out
+        assert_eq!(div["childNodeCount"], 2);
+        let first = &div["children"][0];
+        assert_eq!(first["children"][0]["nodeValue"], "one");
+        let (first, second) = (
+            first["nodeId"].clone(),
+            div["children"][1]["nodeId"].clone(),
+        );
+        let text = div["children"][1]["children"][0]["nodeId"].clone();
+        let span = set[0]["nodes"][1]["nodeId"].clone();
+        assert_eq!(sent.last().unwrap()["id"], 2);
+
+        let sent = evaluate(
+            &mut browser,
+            &messages,
+            3,
+            "const [one, two] = document.querySelectorAll('p'); one.title = 't'; one.removeAttribute('class');
+             two.firstChild.data = 'deux'; document.querySelector('span').remove();
+             document.getElementById('list').append(document.createElement('em'))",
+        );
+        assert_eq!(
+            named(&sent, "DOM.attributeModified")[0],
+            &json!({ "nodeId": first, "name": "title", "value": "t" })
+        );
+        assert_eq!(
+            named(&sent, "DOM.attributeRemoved")[0],
+            &json!({ "nodeId": first, "name": "class" })
+        );
+        assert_eq!(
+            named(&sent, "DOM.characterDataModified")[0],
+            &json!({ "nodeId": text, "characterData": "deux" })
+        );
+        assert_eq!(
+            named(&sent, "DOM.childNodeRemoved")[0],
+            &json!({ "parentNodeId": body, "nodeId": span })
+        );
+        let inserted = named(&sent, "DOM.childNodeInserted");
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0]["previousNodeId"], second);
+        assert_eq!(inserted[0]["node"]["nodeName"], "EM");
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "DOM.requestChildNodes",
+            json!({ "nodeId": 0 }),
+        );
+        assert_eq!(
+            sent[0]["error"]["message"],
+            "Could not find node with given id"
+        );
+        let sent = call(&mut browser, &messages, 5, "DOM.undo", json!({}));
+        assert_eq!(sent[0]["error"]["code"], -32601);
+
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("the page should load again");
+        browser.flush_inspector();
+        assert_eq!(named(&received(&messages), "DOM.documentUpdated").len(), 1);
+    }
+
+    #[test]
+    fn nodes_are_pushed_inspected_edited_searched_and_measured() {
+        let (mut browser, messages) = inspected(
+            "<style>body { margin: 0 } #box { width: 100px; height: 50px; padding: 5px; margin: 10px; border: 2px solid }</style>
+             <section><div id=box><em>deep</em></div></section>",
+        );
+        call(&mut browser, &messages, 1, "DOM.getDocument", json!({}));
+        let sent = evaluate(&mut browser, &messages, 2, "document.querySelector('em')");
+        let object = result(&sent, 2)["result"]["objectId"].clone();
+        let sent = call(
+            &mut browser,
+            &messages,
+            3,
+            "DOM.requestNode",
+            json!({ "objectId": object }),
+        );
+        let em = result(&sent, 3)["nodeId"].clone();
+        assert_ne!(em, 0);
+        let pushed: Vec<_> = named(&sent, "DOM.setChildNodes")
+            .iter()
+            .flat_map(|params| {
+                params["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|node| node["nodeId"].clone())
+            })
+            .collect();
+        assert!(pushed.contains(&em), "{sent:?}");
+
+        call(
+            &mut browser,
+            &messages,
+            4,
+            "DOM.setInspectedNode",
+            json!({ "nodeId": em }),
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            5,
+            "Runtime.evaluate",
+            json!({ "expression": "$0.tagName + typeof $", "includeCommandLineAPI": true }),
+        );
+        assert_eq!(result(&sent, 5)["result"]["value"], "EMfunction");
+        let sent = evaluate(&mut browser, &messages, 6, "typeof $0");
+        assert_eq!(result(&sent, 6)["result"]["value"], "undefined");
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            7,
+            "DOM.setAttributesAsText",
+            json!({ "nodeId": em, "text": "data-x=\"1\" title=hi" }),
+        );
+        assert_eq!(named(&sent, "DOM.attributeModified").len(), 2);
+        let sent = call(
+            &mut browser,
+            &messages,
+            8,
+            "DOM.getOuterHTML",
+            json!({ "nodeId": em }),
+        );
+        assert_eq!(
+            result(&sent, 8)["outerHTML"],
+            "<em data-x=\"1\" title=\"hi\">deep</em>"
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            9,
+            "DOM.setAttributesAsText",
+            json!({ "nodeId": em, "text": "", "name": "title" }),
+        );
+        assert_eq!(
+            named(&sent, "DOM.attributeRemoved")[0],
+            &json!({ "nodeId": em, "name": "title" })
+        );
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            10,
+            "DOM.performSearch",
+            json!({ "query": "DATA-X" }),
+        );
+        let search = result(&sent, 10).clone();
+        assert_eq!(search["resultCount"], 1);
+        let sent = call(
+            &mut browser,
+            &messages,
+            11,
+            "DOM.getSearchResults",
+            json!({ "searchId": search["searchId"], "fromIndex": 0, "toIndex": 1 }),
+        );
+        assert_eq!(result(&sent, 11)["nodeIds"], json!([em]));
+        let sent = call(
+            &mut browser,
+            &messages,
+            12,
+            "DOM.performSearch",
+            json!({ "query": "section > div" }),
+        );
+        assert_eq!(result(&sent, 12)["resultCount"], 1);
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            13,
+            "DOM.querySelector",
+            json!({ "nodeId": 1, "selector": "#box" }),
+        );
+        let boxed = result(&sent, 13)["nodeId"].clone();
+        let sent = call(
+            &mut browser,
+            &messages,
+            14,
+            "DOM.getBoxModel",
+            json!({ "nodeId": boxed }),
+        );
+        let model = &result(&sent, 14)["model"];
+        assert_eq!(
+            (model["width"].as_i64(), model["height"].as_i64()),
+            (Some(114), Some(64))
+        );
+        assert_eq!(
+            model["border"],
+            json!([10.0, 10.0, 124.0, 10.0, 124.0, 74.0, 10.0, 74.0])
+        );
+        assert_eq!(
+            model["content"],
+            json!([17.0, 17.0, 117.0, 17.0, 117.0, 67.0, 17.0, 67.0])
+        );
+        assert_eq!(
+            model["margin"],
+            json!([0.0, 0.0, 134.0, 0.0, 134.0, 84.0, 0.0, 84.0])
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            15,
+            "DOM.getNodeForLocation",
+            json!({ "x": 100, "y": 60 }),
+        );
+        assert_eq!(result(&sent, 15)["nodeId"], boxed);
     }
 }
