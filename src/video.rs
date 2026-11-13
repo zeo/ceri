@@ -230,7 +230,7 @@ mod platform {
         processor: ID3D11VideoProcessor,
         // pictures the engine or presenter may still hold; one only the pool holds is free
         pictures: Vec<Arc<Picture>>,
-        staging: Arc<Mutex<ID3D11Texture2D>>,
+        staging: Arc<Mutex<Option<ID3D11Texture2D>>>,
         size: (u32, u32),
     }
 
@@ -242,8 +242,9 @@ mod platform {
         view: ID3D11VideoProcessorOutputView,
         mutex: IDXGIKeyedMutex,
         handle: HANDLE,
-        // the converter's readback texture, which its pictures take turns with
-        staging: Arc<Mutex<ID3D11Texture2D>>,
+        // the converter's readback texture, which its pictures take turns with, made when a
+        // picture is first painted
+        staging: Arc<Mutex<Option<ID3D11Texture2D>>>,
         size: (u32, u32),
     }
 
@@ -265,17 +266,28 @@ mod platform {
         }
 
         fn read(&self) -> Result<Vec<u8>, String> {
-            let staging = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut kept = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
             let context = &self.gpu.context;
             // SAFETY: the staging texture has the picture's size and format, the keyed mutex is
             // held while the copy is queued, and each row read lies inside the mapped pitch
             unsafe {
+                let staging = match kept.take() {
+                    Some(staging) => staging,
+                    None => self.gpu.texture(
+                        self.size,
+                        D3D11_USAGE_STAGING,
+                        0,
+                        D3D11_CPU_ACCESS_READ.0 as u32,
+                        0,
+                    )?,
+                };
+                let staging = &*kept.insert(staging);
                 self.mutex.AcquireSync(0, INFINITE).map_err(text)?;
-                context.CopyResource(&*staging, &self.texture);
+                context.CopyResource(staging, &self.texture);
                 self.mutex.ReleaseSync(0).map_err(text)?;
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 context
-                    .Map(&*staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                     .map_err(text)?;
                 let row = self.size.0 as usize * 4;
                 let mut bgra = Vec::with_capacity(row * self.size.1 as usize);
@@ -283,7 +295,7 @@ mod platform {
                     let start = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize);
                     bgra.extend_from_slice(std::slice::from_raw_parts(start, row));
                 }
-                context.Unmap(&*staging, 0);
+                context.Unmap(staging, 0);
                 Ok(bgra)
             }
         }
@@ -315,13 +327,6 @@ mod platform {
                     .video
                     .CreateVideoProcessor(&enumerator, 0)
                     .map_err(text)?;
-                let staging = gpu.texture(
-                    size,
-                    D3D11_USAGE_STAGING,
-                    0,
-                    D3D11_CPU_ACCESS_READ.0 as u32,
-                    0,
-                )?;
                 let shown = RECT {
                     left: picture.left as i32,
                     top: picture.top as i32,
@@ -358,7 +363,7 @@ mod platform {
                     enumerator,
                     processor,
                     pictures: Vec::new(),
-                    staging: Arc::new(Mutex::new(staging)),
+                    staging: Arc::default(),
                     size,
                 })
             }
@@ -538,6 +543,17 @@ mod platform {
         text.encode_wide().chain([0]).collect()
     }
 
+    // the source resolver refuses the verbatim paths canonicalize gives
+    fn resolvable(path: &std::path::Path) -> std::ffi::OsString {
+        match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+            Some(rest) => match rest.strip_prefix(r"UNC\") {
+                Some(share) => format!(r"\\{share}").into(),
+                None => rest.into(),
+            },
+            None => path.into(),
+        }
+    }
+
     fn started() -> Result<(), String> {
         static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
         STARTED
@@ -566,7 +582,7 @@ mod platform {
         unsafe {
             let reader = match source {
                 MediaSource::File(path) => {
-                    let path = wide(path.as_os_str());
+                    let path = wide(&resolvable(path));
                     MFCreateSourceReaderFromURL(PCWSTR(path.as_ptr()), attributes)
                 }
                 MediaSource::Bytes { body, mime_type } => {
@@ -1833,6 +1849,14 @@ mod tests {
             Some(surface) => surface.read().expect("a surface should read back"),
             None => frame.bgra,
         }
+    }
+
+    // the files and app origins hand over canonical paths, verbatim on windows
+    #[test]
+    fn canonical_paths_open() {
+        let canonical = |path: PathBuf| MediaSource::File(path.canonicalize().expect("a fixture"));
+        assert!(DesktopVideo.open(&canonical(reel())).is_ok());
+        assert!(DesktopVideo.open_audio(&canonical(voiced())).is_ok());
     }
 
     #[test]

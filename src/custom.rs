@@ -926,8 +926,22 @@ impl ResourceProvider for PackagedAssets {
         crate::http::request(request).map(Some)
     }
 
+    // packaged media on disk is read in place too, so a long video is never held whole
     fn media_file(&self, url: &AppUrl) -> Option<PathBuf> {
-        url.is_files().then(|| self.files.resolve(url.path()))?
+        if url.is_files() {
+            return self.files.resolve(url.path());
+        }
+        if self.dev.is_some() {
+            return None;
+        }
+        match self
+            .assets
+            .route(&url.to_string(), RequestTarget::Subresource)
+            .ok()?
+        {
+            AssetRoute::File(asset) if asset.embedded.is_none() => Some(asset.path),
+            _ => None,
+        }
     }
 
     fn connect_socket(&self, url: &str) -> Option<SocketConnector> {
@@ -1010,6 +1024,21 @@ mod tests {
                 .expect("missing subresources should not fail")
                 .is_none()
         );
+        let media = |url: &str| provider.media_file(&AppUrl::parse(url).expect("url"));
+        assert!(
+            media("https://app.ceri.invalid/main.js")
+                .is_some_and(|path| path.ends_with("main.js") && path.is_file())
+        );
+        assert_eq!(media("https://app.ceri.invalid/missing.mp4"), None);
+        static FILES: crate::assets::EmbeddedAssets = &[("clip.mp4", b"mp4")];
+        let embedded = PackagedAssets {
+            assets: Arc::new(AssetOrigin::embedded(FILES)),
+            allowed_origins: Vec::new(),
+            files: Default::default(),
+            dev: None,
+        };
+        let clip = AppUrl::parse("https://app.ceri.invalid/clip.mp4").expect("url");
+        assert_eq!(embedded.media_file(&clip), None);
 
         let granted = std::env::temp_dir().join(format!("ceri-provider-{}", std::process::id()));
         std::fs::create_dir_all(&granted).expect("grant folder");
