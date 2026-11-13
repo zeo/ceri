@@ -30,6 +30,7 @@ mod media;
 #[cfg(feature = "native-http")]
 mod native_http;
 mod navigation;
+mod netlog;
 mod paint;
 mod png;
 #[cfg(all(feature = "windowed", target_os = "windows"))]

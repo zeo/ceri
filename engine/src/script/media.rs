@@ -642,6 +642,7 @@ impl ScriptRuntime {
         let promise = self.fetch(
             &[Value::String(url.to_string().into())],
             crate::csp::Directive::Media,
+            "Media",
         );
         let response = match &promise.borrow().outcome {
             PromiseOutcome::Fulfilled(Value::Response(response))

@@ -253,7 +253,11 @@ impl ScriptRuntime {
             init.push(("body".to_string(), body));
         }
         let url = Value::String(xhr.url.clone().into());
-        let promise = self.fetch(&[url, plain_object(init)], crate::csp::Directive::Connect);
+        let promise = self.fetch(
+            &[url, plain_object(init)],
+            crate::csp::Directive::Connect,
+            "XHR",
+        );
         let outcome = match &promise.borrow().outcome {
             PromiseOutcome::Fulfilled(Value::Response(response)) => Ok(response.clone()),
             _ => Err(()),

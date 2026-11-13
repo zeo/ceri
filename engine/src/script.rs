@@ -48,7 +48,7 @@ use operations::{VmIterator, is_callable, number_to_string, plain_object, symbol
 use realm::{Intrinsics, Native, create_intrinsics};
 
 pub use bridge::HostBridge;
-pub(crate) use canvas::canvas_size;
+pub(crate) use canvas::{base64, canvas_size};
 pub use dates::TimeZone;
 pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
@@ -714,16 +714,21 @@ fn resolve_runtime_request(
     provider: Option<&dyn ResourceProvider>,
     request: &ResourceRequest,
 ) -> Result<Option<Resource>, ScriptError> {
-    if request.method() == "GET"
-        && let Some(resource) = resources.resource_at(request.url()).cloned()
-    {
-        return Ok(Some(resource));
-    }
-    provider
-        .map(|provider| provider.provide_request(request))
-        .transpose()
-        .map(|resource| resource.flatten())
-        .map_err(|error| runtime_error(error.to_string()))
+    let sent = crate::netlog::send();
+    let resolved = match resources.resource_at(request.url()) {
+        Some(resource) if request.method() == "GET" => Ok(Some(resource.clone())),
+        _ => provider
+            .map(|provider| provider.provide_request(request))
+            .transpose()
+            .map(|resource| resource.flatten())
+            .map_err(|error| runtime_error(error.to_string())),
+    };
+    crate::netlog::record(sent, request, None, || match &resolved {
+        Ok(Some(resource)) => Ok(crate::netlog::Reply::resource(request.url(), resource)),
+        Ok(None) => Ok(crate::netlog::Reply::status(request.url(), 404)),
+        Err(error) => Err(error.message.clone()),
+    });
+    resolved
 }
 
 fn resolve_runtime_response_with_redirects(
@@ -7934,7 +7939,11 @@ impl ScriptRuntime {
                     )))),
                 }
             }
-            Builtin::Fetch => Ok(Value::Promise(self.fetch(&arguments, Directive::Connect))),
+            Builtin::Fetch => Ok(Value::Promise(self.fetch(
+                &arguments,
+                Directive::Connect,
+                "Fetch",
+            ))),
             Builtin::CryptoGetRandomValues => {
                 let fail = "Failed to execute 'getRandomValues' on 'Crypto'";
                 let Some(Value::TypedArray(array)) = arguments.first().map(Value::resolve) else {
@@ -9057,7 +9066,13 @@ impl ScriptRuntime {
     }
 
     // a load for the page, checked against the policy directive its destination falls under
-    fn fetch(&mut self, arguments: &[Value], destination: Directive) -> PromiseHandle {
+    // kind is the protocol's resource type the network log shows the request as
+    fn fetch(
+        &mut self,
+        arguments: &[Value],
+        destination: Directive,
+        kind: &'static str,
+    ) -> PromiseHandle {
         let input = arguments
             .first()
             .cloned()
@@ -9123,18 +9138,28 @@ impl ScriptRuntime {
             Err(error) => return self.rejected_promise(error.to_string()),
         };
         if let Some(target) = external {
-            return self.fetch_external(target, &request);
+            return self.fetch_external(target, &request, kind);
         }
         if self.resources.is_none() && self.resource_provider.is_none() {
             return self.rejected_promise("fetch is unavailable without a resource bundle");
         }
         let resources = self.resources.clone().unwrap_or_default();
-        let response = match resolve_runtime_response_with_redirects(
+        let sent = crate::netlog::send();
+        let resolved = resolve_runtime_response_with_redirects(
             &resources,
             self.resource_provider.as_deref(),
             &request,
             options.redirect,
-        ) {
+        );
+        crate::netlog::record(sent, &request, Some(kind), || match &resolved {
+            Ok(Some(resolved)) => Ok(crate::netlog::Reply::response(
+                &resolved.url,
+                &resolved.response,
+            )),
+            Ok(None) => Ok(crate::netlog::Reply::status(request.url(), 404)),
+            Err(error) => Err(error.message.clone()),
+        });
+        let response = match resolved {
             Ok(Some(response)) => response,
             Ok(None) => {
                 return self.fulfilled_promise(Value::Response(Rc::new(response_data(
@@ -9167,7 +9192,12 @@ impl ScriptRuntime {
     }
 
     // outside origins reach the network only when the host provider allows them
-    fn fetch_external(&self, target: String, request: &ResourceRequest) -> PromiseHandle {
+    fn fetch_external(
+        &self,
+        target: String,
+        request: &ResourceRequest,
+        kind: &'static str,
+    ) -> PromiseHandle {
         let Some(provider) = self.resource_provider.as_deref() else {
             return self
                 .rejected_promise(format!("fetch to {target} needs a host resource provider"));
@@ -9181,7 +9211,23 @@ impl ScriptRuntime {
             Ok(external) => external,
             Err(error) => return self.rejected_promise(error.to_string()),
         };
-        match provider.provide_external(&external) {
+        let sent = crate::netlog::send();
+        let provided = provider.provide_external(&external);
+        crate::netlog::record_to(
+            sent,
+            target.clone(),
+            request,
+            Some(kind),
+            || match &provided {
+                Ok(Some(response)) => Ok(crate::netlog::Reply::response(&target, response)),
+                Ok(None) => Err(format!(
+                    "the host does not permit fetching {}",
+                    external.origin()
+                )),
+                Err(error) => Err(error.to_string()),
+            },
+        );
+        match provided {
             Ok(Some(response)) => self.fulfilled_promise(Value::Response(Rc::new(response_data(
                 target,
                 response.status(),

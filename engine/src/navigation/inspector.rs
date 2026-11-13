@@ -1,8 +1,9 @@
 // devtools protocol sessions on a browser's page: the Page domain here, the Runtime domain
-// routed to the page's script runtime, the DOM, Overlay and CSS domains in their own modules,
-// and the events they owe each session
+// routed to the page's script runtime, the DOM, Overlay, CSS and Network domains in their own
+// modules, and the events they owe each session
 
 mod dom;
+mod network;
 mod overlay;
 mod styles;
 
@@ -24,6 +25,7 @@ pub(super) struct Inspection {
     highlight: Option<overlay::Highlight>,
     picking: Option<overlay::Picking>,
     sheets: styles::Sheets,
+    network: network::Kept,
 }
 
 impl Inspection {
@@ -44,6 +46,7 @@ struct Session {
     runtime: bool,
     page: bool,
     css: bool,
+    network: bool,
     // the execution context this session last heard of, and the first console entry it has not
     context: Option<u64>,
     seen: u64,
@@ -69,6 +72,7 @@ impl Browser {
             runtime: false,
             page: false,
             css: false,
+            network: false,
             context: None,
             seen: 0,
             dom: dom::Mirror::default(),
@@ -94,6 +98,7 @@ impl Browser {
                 page.runtime.forced_pseudo_classes.clear();
             }
         }
+        self.stop_recording();
     }
 
     // while a session picks a node, the pointer moves the highlight instead of reaching the
@@ -297,6 +302,10 @@ impl Browser {
                 self.flush_inspector();
                 Some(self.answer_css(session, method, params))
             }
+            method if method.starts_with("Network.") => {
+                self.flush_inspector();
+                Some(self.answer_network(session, method, params))
+            }
             _ => Some(Err((-32601, format!("'{method}' wasn't found")))),
         };
         // the events a call causes reach the session before its answer, as in chromium
@@ -404,6 +413,7 @@ impl Browser {
         if self.inspection.sessions.iter().any(|held| held.css) {
             self.sync_sheets();
         }
+        self.flush_network();
     }
 
     fn session(&mut self, id: u64) -> Option<&mut Session> {
@@ -1273,5 +1283,137 @@ mod tests {
             named(&sent, "CSS.styleSheetAdded")[0]["header"]["styleSheetId"],
             sheet
         );
+    }
+
+    #[test]
+    fn requests_are_recorded_with_their_answers_while_the_network_is_enabled() {
+        let mut resources = ResourceBundle::default();
+        let page = "<link rel=stylesheet href=/app.css><img src=/dot.png><script>\
+            fetch('/data.json', { method: 'POST', body: 'q=1' });\
+            fetch('/data.json');\
+            const xhr = new XMLHttpRequest(); xhr.open('GET', '/missing.json', false); xhr.send();\
+            </script>";
+        for (path, mime, body) in [
+            ("/index.html", "text/html; charset=utf-8", page.as_bytes()),
+            ("/app.css", "text/css", b"p { color: red }".as_slice()),
+            ("/data.json", "application/json", br#"{"a":1}"#.as_slice()),
+            (
+                "/dot.png",
+                "image/png",
+                [0x89, b'P', b'N', b'G', 0, 0xff].as_slice(),
+            ),
+        ] {
+            resources.insert(path, mime, body).expect("resource");
+        }
+        let mut browser = Browser::new(resources);
+        let (outgoing, messages) = mpsc::channel();
+        browser.attach_inspector(1, outgoing);
+        browser.navigate("https://app.ceri.invalid/").expect("load");
+        browser.flush_inspector();
+        received(&messages);
+
+        let sent = call(&mut browser, &messages, 1, "Network.enable", json!({}));
+        assert!(named(&sent, "Network.requestWillBeSent").is_empty());
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("reload");
+        browser
+            .advance_time(0)
+            .expect("the image should be delivered");
+        browser.flush_inspector();
+        let sent = received(&messages);
+        let requests = named(&sent, "Network.requestWillBeSent");
+        let seen: Vec<_> = requests
+            .iter()
+            .map(|params| {
+                (
+                    params["type"].as_str().unwrap(),
+                    params["request"]["method"].as_str().unwrap(),
+                    params["request"]["url"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let origin = "https://app.ceri.invalid";
+        assert_eq!(seen[0], ("Document", "GET", &*format!("{origin}/")));
+        for expected in [
+            ("Stylesheet", "GET", format!("{origin}/app.css")),
+            ("Image", "GET", format!("{origin}/dot.png")),
+            ("Fetch", "POST", format!("{origin}/data.json")),
+            ("Fetch", "GET", format!("{origin}/data.json")),
+            ("XHR", "GET", format!("{origin}/missing.json")),
+        ] {
+            assert!(
+                seen.contains(&(expected.0, expected.1, &*expected.2)),
+                "{expected:?} in {seen:?}"
+            );
+        }
+        let loader = browser.loader();
+        assert!(requests.iter().all(|params| params["loaderId"] == loader));
+        let id_of = |kind: &str, method: &str| {
+            let index = seen
+                .iter()
+                .position(|seen| seen.0 == kind && seen.1 == method)
+                .unwrap();
+            requests[index]["requestId"].clone()
+        };
+        let responses = named(&sent, "Network.responseReceived");
+        let status_of = |id: &Json| {
+            let params = responses.iter().find(|params| params["requestId"] == *id);
+            params.map(|params| params["response"]["status"].clone())
+        };
+        assert_eq!(status_of(&id_of("Document", "GET")), Some(json!(200)));
+        assert_eq!(status_of(&id_of("XHR", "GET")), Some(json!(404)));
+        // the bundle answers only GET, and there is no provider for the POST
+        assert_eq!(status_of(&id_of("Fetch", "POST")), Some(json!(404)));
+        let finished = named(&sent, "Network.loadingFinished");
+        assert_eq!(finished.len(), requests.len());
+
+        let body = |browser: &mut Browser, id: u64, request: Json| {
+            let params = json!({ "requestId": request });
+            let sent = call(browser, &messages, id, "Network.getResponseBody", params);
+            result(&sent, id).clone()
+        };
+        assert_eq!(
+            body(&mut browser, 2, id_of("Stylesheet", "GET")),
+            json!({ "body": "p { color: red }", "base64Encoded": false })
+        );
+        assert_eq!(
+            body(&mut browser, 3, id_of("Image", "GET")),
+            json!({ "body": "iVBORwD/", "base64Encoded": true })
+        );
+        let params = json!({ "requestId": id_of("Fetch", "POST") });
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "Network.getRequestPostData",
+            params,
+        );
+        assert_eq!(result(&sent, 4)["postData"], "q=1");
+        let params = json!({ "requestId": id_of("Fetch", "GET") });
+        let sent = call(
+            &mut browser,
+            &messages,
+            5,
+            "Network.getRequestPostData",
+            params,
+        );
+        assert_eq!(sent[0]["error"]["code"], -32000);
+
+        call(&mut browser, &messages, 6, "Network.disable", json!({}));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("reload");
+        browser.flush_inspector();
+        assert!(named(&received(&messages), "Network.requestWillBeSent").is_empty());
+        let params = json!({ "requestId": id_of("Stylesheet", "GET") });
+        let sent = call(
+            &mut browser,
+            &messages,
+            7,
+            "Network.getResponseBody",
+            params,
+        );
+        assert_eq!(sent[0]["error"]["code"], -32000);
     }
 }

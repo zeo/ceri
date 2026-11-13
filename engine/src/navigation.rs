@@ -1440,6 +1440,15 @@ impl Browser {
     }
 
     fn load_subresource_with_url(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
+        let sent = crate::netlog::send();
+        let loaded = self.find_subresource(url);
+        crate::netlog::record(sent, &ResourceRequest::get(url.clone()), None, || {
+            recorded(url, &loaded)
+        });
+        loaded
+    }
+
+    fn find_subresource(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
         match self.resources.load_subresource(url) {
             Ok(resource) => Ok(LoadedResource {
                 url: url.clone(),
@@ -1491,7 +1500,12 @@ impl Browser {
         if requested_url.is_files() {
             return Err(NavigationError::WrongOrigin);
         }
-        let LoadedResource { url, resource } = match self.load_navigation_request(&request) {
+        let sent = crate::netlog::send();
+        let loaded = self.load_navigation_request(&request);
+        crate::netlog::record_navigation(sent, &request, self.next_document_id, || {
+            recorded(&requested_url, &loaded)
+        });
+        let LoadedResource { url, resource } = match loaded {
             Ok(resource) => resource,
             Err(NavigationError::ResourceNotFound(path)) => {
                 self.install_error_page(
@@ -3435,21 +3449,36 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
             .resolve(reference)
             .map_err(|error| runtime_error(error.to_string()))?;
         crate::script::permit_module(self.policies, &url)?;
-        let (url, resource) = match self.resources.load_subresource(&url) {
-            Ok(resource) => (url.clone(), resource),
-            Err(NavigationError::ResourceNotFound(path)) => {
-                let Some(provider) = self.provider else {
-                    return Err(runtime_error(format!("module {path} was not found")));
-                };
-                let Some((loaded_url, resource)) = load_provider_resource(provider, &url)
-                    .map_err(|error| runtime_error(error.to_string()))?
-                else {
-                    return Err(runtime_error(format!("module {path} was not found")));
-                };
-                (loaded_url, resource)
-            }
-            Err(error) => return Err(runtime_error(error.to_string())),
+        let sent = crate::netlog::send();
+        let loaded = match self.resources.load_subresource(&url) {
+            Ok(resource) => Ok(LoadedResource {
+                url: url.clone(),
+                resource,
+            }),
+            Err(NavigationError::ResourceNotFound(path)) => self
+                .provider
+                .map(|provider| load_provider_resource(provider, &url))
+                .transpose()
+                .and_then(|loaded| {
+                    let (url, resource) = loaded
+                        .flatten()
+                        .ok_or(NavigationError::ResourceNotFound(path))?;
+                    Ok(LoadedResource { url, resource })
+                }),
+            Err(error) => Err(error),
         };
+        crate::netlog::record(
+            sent,
+            &ResourceRequest::get(url.clone()),
+            Some("Script"),
+            || recorded(&url, &loaded),
+        );
+        let LoadedResource { url, resource } = loaded.map_err(|error| match error {
+            NavigationError::ResourceNotFound(path) => {
+                runtime_error(format!("module {path} was not found"))
+            }
+            error => runtime_error(error.to_string()),
+        })?;
         if !is_javascript(&resource) {
             return Err(runtime_error(format!(
                 "module {} has unsupported MIME type {}",
@@ -3460,6 +3489,24 @@ impl ModuleSourceLoader for PackagedModuleLoader<'_> {
         let source = String::from_utf8(resource.body)
             .map_err(|_| runtime_error(format!("module {} is not UTF-8", url.path())))?;
         Ok((url, source))
+    }
+}
+
+// what a load gave, as the network log keeps it
+fn recorded(
+    url: &AppUrl,
+    loaded: &Result<LoadedResource, NavigationError>,
+) -> Result<crate::netlog::Reply, String> {
+    match loaded {
+        Ok(loaded) => Ok(crate::netlog::Reply::resource(
+            &loaded.url,
+            &loaded.resource,
+        )),
+        Err(NavigationError::ResourceNotFound(_)) => Ok(crate::netlog::Reply::status(url, 404)),
+        Err(NavigationError::HttpStatus { status, .. }) => {
+            Ok(crate::netlog::Reply::status(url, *status))
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
