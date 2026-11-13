@@ -33,9 +33,9 @@ impl MediaDecoder for DesktopVideo {
 
 #[cfg(target_os = "windows")]
 mod platform {
+    use super::mp4::{edit_shift, fragmented_end, headers};
     use super::{
         AudioChunk, AudioInfo, AudioReader, MediaInfo, MediaSource, VideoFrame, VideoReader,
-        edit_shift,
     };
     use ceri_engine::VideoSurface;
     use std::mem::ManuallyDrop;
@@ -1178,7 +1178,10 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO)
                     .map_or((1, 1), split);
                 let (width, height) = natural_size(shown.width, shown.height, aspect);
-                let duration = duration(&reader);
+                let headers = headers(source);
+                let shift = edit_shift(&headers, b"vide").unwrap_or(0.0);
+                let duration = fragmented_end(&headers, b"vide")
+                    .map_or_else(|| duration(&reader), |end| end + shift);
                 let output = MFCreateMediaType().map_err(text)?;
                 output
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -1214,7 +1217,7 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     gpu,
                     converter: None,
                     pending: None,
-                    shift: edit_shift(source, b"vide").unwrap_or(0.0),
+                    shift,
                     _apartment: apartment,
                 };
                 opened.take_format()?;
@@ -1394,14 +1397,17 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     .SetCurrentMediaType(AUDIO, None, &output)
                     .map_err(text)?;
                 let (rate, channels) = layout(&reader)?;
+                let headers = headers(source);
+                let shift = edit_shift(&headers, b"soun").unwrap_or(0.0);
                 Ok(Self {
                     info: AudioInfo {
                         rate,
                         channels,
-                        duration: duration(&reader),
+                        duration: fragmented_end(&headers, b"soun")
+                            .map_or_else(|| duration(&reader), |end| end + shift),
                     },
                     reader,
-                    shift: edit_shift(source, b"soun").unwrap_or(0.0),
+                    shift,
                     _apartment: apartment,
                 })
             }
@@ -1453,39 +1459,52 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
     }
 }
 
-// media foundation's mp4 source ignores a track's edit list, which ffmpeg and chromium apply; an
-// x264 file with b-frames would otherwise start its pictures two frames late, and aac its sound
-// 1024 samples of encoder priming late
 #[cfg(any(target_os = "windows", test))]
-fn edit_shift(source: &MediaSource, handler: &[u8; 4]) -> Option<f64> {
-    use std::io::{Cursor, Read, Seek, SeekFrom};
+mod mp4 {
+    use super::MediaSource;
 
-    // a moov this large is no movie header worth reading whole
-    const LIMIT: u64 = 64 << 20;
+    // the movie and fragment headers of an mp4, in file order, read until the boxes stop parsing
+    pub(super) fn headers(source: &MediaSource) -> Vec<([u8; 4], Vec<u8>)> {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
 
-    fn movie(mut file: impl Read + Seek) -> Option<Vec<u8>> {
-        loop {
-            let mut head = [0; 8];
-            file.read_exact(&mut head).ok()?;
-            let mut size = u64::from(u32::from_be_bytes(head[..4].try_into().ok()?));
-            let mut header = 8;
-            if size == 1 {
-                let mut large = [0; 8];
-                file.read_exact(&mut large).ok()?;
-                size = u64::from_be_bytes(large);
-                header = 16;
-            }
-            let body = size.checked_sub(header)?;
-            if &head[4..] == b"moov" {
-                if body > LIMIT {
-                    return None;
+        // a header this large is none worth reading whole
+        const LIMIT: u64 = 64 << 20;
+
+        fn walk(mut file: impl Read + Seek) -> Vec<([u8; 4], Vec<u8>)> {
+            let mut found = Vec::new();
+            let mut next = || -> Option<()> {
+                let mut head = [0; 8];
+                file.read_exact(&mut head).ok()?;
+                let mut size = u64::from(u32::from_be_bytes(head[..4].try_into().ok()?));
+                let mut header = 8;
+                if size == 1 {
+                    let mut large = [0; 8];
+                    file.read_exact(&mut large).ok()?;
+                    size = u64::from_be_bytes(large);
+                    header = 16;
                 }
-                let mut moov = vec![0; body as usize];
-                file.read_exact(&mut moov).ok()?;
-                return Some(moov);
-            }
-            file.seek(SeekFrom::Current(i64::try_from(body).ok()?))
-                .ok()?;
+                let body = size.checked_sub(header)?;
+                let kind: [u8; 4] = head[4..].try_into().ok()?;
+                if [*b"moov", *b"moof"].contains(&kind) {
+                    if body > LIMIT {
+                        return None;
+                    }
+                    let mut data = vec![0; body as usize];
+                    file.read_exact(&mut data).ok()?;
+                    found.push((kind, data));
+                } else {
+                    file.seek(SeekFrom::Current(i64::try_from(body).ok()?))
+                        .ok()?;
+                }
+                Some(())
+            };
+            while next().is_some() {}
+            found
+        }
+
+        match source {
+            MediaSource::File(path) => std::fs::File::open(path).map_or_else(|_| Vec::new(), walk),
+            MediaSource::Bytes { body, .. } => walk(Cursor::new(&body[..])),
         }
     }
 
@@ -1512,44 +1531,116 @@ fn edit_shift(source: &MediaSource, handler: &[u8; 4]) -> Option<f64> {
         })
     }
 
+    fn unsigned(data: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?))
+    }
+
     // mvhd and mdhd put the timescale after a version byte, flags and two dates
     fn timescale(header: &[u8]) -> Option<f64> {
-        let at = if header.first()? == &1 { 20 } else { 12 };
-        let scale = u32::from_be_bytes(header.get(at..at + 4)?.try_into().ok()?);
+        let scale = unsigned(header, if header.first()? == &1 { 20 } else { 12 })?;
         (scale > 0).then_some(f64::from(scale))
     }
 
-    let moov = match source {
-        MediaSource::File(path) => movie(std::fs::File::open(path).ok()?)?,
-        MediaSource::Bytes { body, .. } => movie(Cursor::new(&body[..]))?,
-    };
-    let movie_scale = timescale(child(&moov, b"mvhd")?)?;
-    let track = children(&moov)
-        .filter(|(kind, _)| *kind == b"trak")
-        .find(|(_, trak)| {
-            child(trak, b"mdia")
-                .and_then(|mdia| child(mdia, b"hdlr"))
-                .and_then(|hdlr| hdlr.get(8..12))
-                == Some(handler)
-        })?
-        .1;
-    let media_scale = timescale(child(child(track, b"mdia")?, b"mdhd")?)?;
-    let list = child(child(track, b"edts")?, b"elst")?;
-    let wide = list.first()? == &1;
-    let count = u32::from_be_bytes(list.get(4..8)?.try_into().ok()?) as usize;
-    let entry = if wide { 20 } else { 12 };
-    let mut delay = 0.0;
-    for index in 0..count {
-        let at = 8 + index * entry;
-        let duration = number(list, at, wide)?;
-        let media_time = number(list, at + if wide { 8 } else { 4 }, wide)?;
-        if media_time == -1 {
-            delay += duration as f64 / movie_scale;
-        } else {
-            return Some(delay - media_time as f64 / media_scale);
-        }
+    fn movie(headers: &[([u8; 4], Vec<u8>)]) -> Option<&[u8]> {
+        headers
+            .iter()
+            .find(|(kind, _)| kind == b"moov")
+            .map(|(_, body)| &body[..])
     }
-    None
+
+    fn track<'a>(moov: &'a [u8], handler: &[u8; 4]) -> Option<&'a [u8]> {
+        children(moov)
+            .filter(|(kind, _)| *kind == b"trak")
+            .find(|(_, trak)| {
+                child(trak, b"mdia")
+                    .and_then(|mdia| child(mdia, b"hdlr"))
+                    .and_then(|hdlr| hdlr.get(8..12))
+                    == Some(handler)
+            })
+            .map(|(_, trak)| trak)
+    }
+
+    // media foundation's mp4 source ignores a track's edit list, which ffmpeg and chromium apply; an
+    // x264 file with b-frames would otherwise start its pictures two frames late, and aac its sound
+    // 1024 samples of encoder priming late
+    pub(super) fn edit_shift(headers: &[([u8; 4], Vec<u8>)], handler: &[u8; 4]) -> Option<f64> {
+        let moov = movie(headers)?;
+        let movie_scale = timescale(child(moov, b"mvhd")?)?;
+        let track = track(moov, handler)?;
+        let media_scale = timescale(child(child(track, b"mdia")?, b"mdhd")?)?;
+        let list = child(child(track, b"edts")?, b"elst")?;
+        let wide = list.first()? == &1;
+        let count = unsigned(list, 4)? as usize;
+        let entry = if wide { 20 } else { 12 };
+        let mut delay = 0.0;
+        for index in 0..count {
+            let at = 8 + index * entry;
+            let duration = number(list, at, wide)?;
+            let media_time = number(list, at + if wide { 8 } else { 4 }, wide)?;
+            if media_time == -1 {
+                delay += duration as f64 / movie_scale;
+            } else {
+                return Some(delay - media_time as f64 / media_scale);
+            }
+        }
+        None
+    }
+
+    // media foundation dates a fragmented mp4's end at its last fragment's start plus one sample, so
+    // the track's end is summed from its fragments as ffmpeg does
+    pub(super) fn fragmented_end(headers: &[([u8; 4], Vec<u8>)], handler: &[u8; 4]) -> Option<f64> {
+        let moov = movie(headers)?;
+        let extends = child(moov, b"mvex")?;
+        let track = track(moov, handler)?;
+        let tkhd = child(track, b"tkhd")?;
+        let id = unsigned(tkhd, if tkhd.first()? == &1 { 20 } else { 12 })?;
+        let scale = timescale(child(child(track, b"mdia")?, b"mdhd")?)?;
+        let fallback = children(extends)
+            .filter(|(kind, _)| *kind == b"trex")
+            .find(|(_, trex)| unsigned(trex, 4) == Some(id))
+            .and_then(|(_, trex)| unsigned(trex, 12))
+            .unwrap_or(0);
+        let mut end = 0u64;
+        let fragments = headers.iter().filter(|(kind, _)| kind == b"moof");
+        for (_, moof) in fragments {
+            for (_, traf) in children(moof).filter(|(kind, _)| *kind == b"traf") {
+                let tfhd = child(traf, b"tfhd")?;
+                if unsigned(tfhd, 4)? != id {
+                    continue;
+                }
+                let flags = unsigned(tfhd, 0)? & 0xff_ffff;
+                let at = 8 + 8 * usize::from(flags & 1 != 0) + 4 * usize::from(flags & 2 != 0);
+                let default = if flags & 8 != 0 {
+                    unsigned(tfhd, at)?
+                } else {
+                    fallback
+                };
+                if let Some(tfdt) = child(traf, b"tfdt") {
+                    end = if tfdt.first()? == &1 {
+                        number(tfdt, 4, true)?.max(0) as u64
+                    } else {
+                        u64::from(unsigned(tfdt, 4)?)
+                    };
+                }
+                for (_, trun) in children(traf).filter(|(kind, _)| *kind == b"trun") {
+                    let flags = unsigned(trun, 0)? & 0xff_ffff;
+                    let count = u64::from(unsigned(trun, 4)?);
+                    if flags & 0x100 == 0 {
+                        end = end.saturating_add(count * u64::from(default));
+                        continue;
+                    }
+                    let first =
+                        8 + 4 * usize::from(flags & 1 != 0) + 4 * usize::from(flags & 4 != 0);
+                    let stride = 4 * (flags & 0xf00).count_ones() as usize;
+                    for sample in 0..count as usize {
+                        let duration = unsigned(trun, first + sample * stride)?;
+                        end = end.saturating_add(u64::from(duration));
+                    }
+                }
+            }
+        }
+        (end > 0).then(|| end as f64 / scale)
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2422,11 +2513,14 @@ mod tests {
             .collect::<PathBuf>(),
         )
         .expect("the fixture should read");
-        let shift =
-            super::edit_shift(&source(&edited), b"vide").expect("the file has an edit list");
+        let shift = super::mp4::edit_shift(&super::mp4::headers(&source(&edited)), b"vide")
+            .expect("the file has an edit list");
         assert!((shift + 2.0 / 30.0).abs() < 1e-6, "{shift}");
         if cfg!(target_os = "windows") {
-            assert_eq!(super::edit_shift(&source(&reel), b"vide"), Some(0.0));
+            assert_eq!(
+                super::mp4::edit_shift(&super::mp4::headers(&source(&reel)), b"vide"),
+                Some(0.0)
+            );
             let mut reader = DesktopVideo
                 .open(&source(&edited))
                 .expect("the fixture should open");
@@ -2437,9 +2531,40 @@ mod tests {
             assert!(first.time.abs() < 1e-6, "{}", first.time);
         }
         assert_eq!(
-            super::edit_shift(&source(b"\x1a\x45\xdf\xa3 not a movie"), b"vide"),
+            super::mp4::edit_shift(
+                &super::mp4::headers(&source(b"\x1a\x45\xdf\xa3 not a movie")),
+                b"vide"
+            ),
             None
         );
+    }
+
+    // a second of the reel's first ten pictures at 64x48 in fragments of four, four and two
+    #[test]
+    fn a_fragmented_movie_lasts_to_its_last_fragments_end() {
+        let fragmented = MediaSource::File(
+            [
+                env!("CARGO_MANIFEST_DIR"),
+                "tests",
+                "fixtures",
+                "fragmented.mp4",
+            ]
+            .iter()
+            .collect(),
+        );
+        let headers = super::mp4::headers(&fragmented);
+        assert_eq!(super::mp4::fragmented_end(&headers, b"vide"), Some(1.0));
+        assert_eq!(super::mp4::fragmented_end(&headers, b"soun"), None);
+        let plain = super::mp4::headers(&MediaSource::File(reel()));
+        assert_eq!(super::mp4::fragmented_end(&plain, b"vide"), None);
+        if cfg!(target_os = "windows") {
+            let duration = DesktopVideo
+                .open(&fragmented)
+                .expect("the fixture should open")
+                .info()
+                .duration;
+            assert!((duration - 1.0).abs() < 1e-6, "{duration}");
+        }
     }
 
     #[test]
