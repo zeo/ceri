@@ -100,6 +100,7 @@ pub(super) enum Native {
     Promise(Rc<super::promises::PromiseFunction>),
     ParseInt,
     ParseFloat,
+    Eval,
     // true for the component forms
     EncodeUri(bool),
     DecodeUri(bool),
@@ -588,6 +589,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(&number, "parseInt", parse_int.clone());
     build.value(&number, "parseFloat", parse_float.clone());
     globals.push(("parseInt", parse_int));
+    globals.push((
+        "eval",
+        Value::Object(build.function(Native::Eval, "eval", 1)),
+    ));
     globals.push(("parseFloat", parse_float));
     for (name, native) in [
         ("encodeURI", Native::EncodeUri(false)),
@@ -1304,6 +1309,16 @@ impl ScriptRuntime {
             .compile_function(&function)
             .map_err(|error| self.throw_error("SyntaxError", error.message))?;
         Ok(self.new_closure(code, None, None))
+    }
+
+    // source run as global code for the value of its last expression statement
+    fn evaluate_global_text(&mut self, source: &str) -> Result<Value, ScriptError> {
+        let script = super::parser::parse_script(source)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        let code = Compiler::new(source)
+            .compile_console_script(&script)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        self.run_script_code(code)
     }
 
     // a native function object created at run time, such as a proxy's revoke function
@@ -2481,6 +2496,12 @@ impl ScriptRuntime {
                 let text = self.coerce_string(first)?;
                 Ok(Value::Number(super::numbers::parse_float(&text)))
             }
+            // every call is an indirect eval, so source runs as global code and can't see the
+            // caller's locals
+            Native::Eval => match first {
+                Value::String(source) => self.evaluate_global_text(&source),
+                other => Ok(other),
+            },
             Native::EncodeUri(component) => {
                 let text = self.coerce_string(first)?;
                 let keep = if component {

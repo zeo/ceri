@@ -362,6 +362,8 @@ struct FunctionState {
     new_target_slot: Option<u16>,
     home_slot: Option<u16>,
     temps: u16,
+    // the slot console and eval scripts keep their statements' completion value in
+    completion: Option<Name>,
     strict: bool,
     pending_labels: Vec<Name>,
     // async generators await yielded and returned values
@@ -390,6 +392,7 @@ impl FunctionState {
             new_target_slot: None,
             home_slot: None,
             temps: 0,
+            completion: None,
             strict,
             pending_labels: Vec::new(),
             async_generator: false,
@@ -862,16 +865,16 @@ impl Compiler {
             let index = self.name(&name);
             self.emit(Op::InitGlobal(index));
         }
-        let completed = match script.body.split_last() {
-            Some((Stmt::Expression(last), body)) if completion => Some((last, body)),
-            _ => None,
-        };
-        let body = completed.map_or(&script.body[..], |(_, body)| body);
-        for statement in body {
+        if completion {
+            let slot = self.alloc_temp();
+            self.state().completion = Some(slot);
+            self.clear_completion()?;
+        }
+        for statement in &script.body {
             self.compile_statement(statement)?;
         }
-        match completed {
-            Some((last, _)) => self.compile_expression(last)?,
+        match self.state().completion.clone() {
+            Some(slot) => self.compile_get_name(&slot)?,
             None => {
                 self.emit(Op::Undefined);
             }
@@ -1309,6 +1312,15 @@ impl Compiler {
         Ok(())
     }
 
+    fn clear_completion(&mut self) -> Result<(), ScriptError> {
+        if let Some(slot) = self.state().completion.clone() {
+            self.emit(Op::Undefined);
+            self.compile_set_name(&slot, true)?;
+            self.emit(Op::Pop);
+        }
+        Ok(())
+    }
+
     fn alloc_temp(&mut self) -> Name {
         let state = self.state();
         state.temps += 1;
@@ -1466,6 +1478,21 @@ impl Compiler {
             return Ok(());
         }
         let labels = std::mem::take(&mut self.state().pending_labels);
+        // these statements complete with undefined unless a statement inside gives a value
+        if matches!(
+            statement,
+            Stmt::If { .. }
+                | Stmt::With { .. }
+                | Stmt::While { .. }
+                | Stmt::DoWhile { .. }
+                | Stmt::For { .. }
+                | Stmt::ForIn { .. }
+                | Stmt::ForOf { .. }
+                | Stmt::Switch { .. }
+                | Stmt::Try { .. }
+        ) {
+            self.clear_completion()?;
+        }
         match statement {
             Stmt::Empty | Stmt::Function(_) | Stmt::Position(_) => Ok(()),
             Stmt::Debugger => {
@@ -1474,6 +1501,9 @@ impl Compiler {
             }
             Stmt::Expression(expression) => {
                 self.compile_expression(expression)?;
+                if let Some(slot) = self.state().completion.clone() {
+                    self.compile_set_name(&slot, true)?;
+                }
                 self.emit(Op::Pop);
                 Ok(())
             }
@@ -2021,7 +2051,23 @@ impl Compiler {
             self.state().handler_depth -= 1;
             self.emit(Op::CompletionNormal);
             self.patch_here(at);
+            // a finally block that completes normally keeps the value the try gave
+            let kept = match self.state().completion.clone() {
+                Some(slot) => {
+                    let kept = self.alloc_temp();
+                    self.compile_get_name(&slot)?;
+                    self.compile_set_name(&kept, true)?;
+                    self.emit(Op::Pop);
+                    Some((slot, kept))
+                }
+                None => None,
+            };
             self.compile_block(finalizer)?;
+            if let Some((slot, kept)) = kept {
+                self.compile_get_name(&kept)?;
+                self.compile_set_name(&slot, true)?;
+                self.emit(Op::Pop);
+            }
             self.emit(Op::EndFinally);
         }
         Ok(())
@@ -2375,8 +2421,13 @@ impl Compiler {
             self.compile_expression(superclass)?;
         }
         let name = class.name.clone().unwrap_or_else(|| "".into());
+        // the parser named the constructor method before a binding could name the class
         let constructor = match &class.constructor {
-            Some(constructor) => constructor.clone(),
+            Some(constructor) if constructor.name.as_ref() == Some(&name) => constructor.clone(),
+            Some(constructor) => Rc::new(FunctionNode {
+                name: Some(name.clone()),
+                ..(**constructor).clone()
+            }),
             None => Rc::new(default_constructor(&name, has_super, class.source)),
         };
         let constructor_code = self.build_function(&constructor)?;

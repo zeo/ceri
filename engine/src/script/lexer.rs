@@ -2,6 +2,7 @@
 // expression and when a closing brace continues a template, so both are rescanned on request
 
 use super::ScriptError;
+use crate::unicode_tables::{ID_CONTINUE, ID_START};
 use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,23 +56,25 @@ fn is_line_terminator(character: char) -> bool {
 }
 
 fn is_identifier_start(character: char) -> bool {
-    character == '$' || character == '_' || character.is_alphabetic()
+    character == '$' || character == '_' || in_ranges(ID_START, character as u32)
 }
 
 fn is_identifier_part(character: char) -> bool {
-    is_identifier_start(character)
-        || character.is_alphanumeric()
-        || matches!(character, '\u{200c}' | '\u{200d}')
-        || is_combining_mark(character)
+    character == '$' || character == '_' || in_ranges(ID_CONTINUE, character as u32)
 }
 
-// the combining marks and connector punctuation that identifiers may continue with
-fn is_combining_mark(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe20..=0xfe2f
-            | 0x203f | 0x2040 | 0x2054 | 0xfe33 | 0xfe34 | 0xfe4d..=0xfe4f | 0xff3f
-    )
+fn in_ranges(ranges: &[(u32, u32)], point: u32) -> bool {
+    ranges
+        .binary_search_by(|&(first, last)| {
+            if last < point {
+                std::cmp::Ordering::Less
+            } else if first > point {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 impl<'a> Lexer<'a> {

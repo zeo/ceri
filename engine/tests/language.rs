@@ -1643,3 +1643,38 @@ fn bigints_follow_the_specification() {
         ("console", "console.log(10n, [1n])", "10n [ 1n ]"),
     ]);
 }
+
+#[test]
+fn global_eval_runs_in_the_global_scope() {
+    check(&[
+        (
+            "completion value",
+            "console.log(eval('1 + 1'), eval('if (true) { 3 } else { 4 }'), eval('var q = 5; q * 2'), eval('1; if (false) 2'), eval('1; var z;'), eval('do { 3; break; } while (0)'), eval('try { 4 } finally { 5 }'), eval('let i = 0; while (i < 3) i++'))",
+            "2 3 10 undefined 1 3 4 2",
+        ),
+        (
+            "declarations become globals",
+            "(function () { var local = 1; (0, eval)('var leaked = typeof local'); })(); console.log(leaked, globalThis.leaked)",
+            "undefined undefined",
+        ),
+        (
+            "non-strings pass through",
+            "const o = {}; console.log(eval(o) === o, eval(7), eval(), eval.length, eval.name)",
+            "true 7 undefined 1 eval",
+        ),
+        (
+            "syntax errors",
+            "try { eval('let = ;'); } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+    ]);
+}
+
+#[test]
+fn anonymous_classes_take_the_name_they_are_bound_to() {
+    check(&[(
+        "class names",
+        "var A = class {}; var B = class { constructor() {} }; let C = class { m() {} }; const o = { D: class { constructor() {} } }; class E { constructor() {} } console.log(A.name, B.name, C.name, o.D.name, E.name, (class { constructor() {} }).name === '')",
+        "A B C D E true",
+    )]);
+}

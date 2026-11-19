@@ -8,7 +8,7 @@
 import sys
 from pathlib import Path
 
-VERSION = "16.0.0"
+VERSION = "17.0.0"
 HANGUL_FIRST, HANGUL_LAST = 0xAC00, 0xD7A3
 
 
@@ -50,6 +50,39 @@ def read_exclusions(path):
     return excluded
 
 
+def read_identifiers(path):
+    starts, continues = [], []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        data = line.split("#", 1)[0].strip()
+        if not data:
+            continue
+        fields = data.split(";")
+        if len(fields) == 3 and fields[1].strip() == "InCB":
+            # the one property with a value after its name
+            continue
+        if len(fields) != 2:
+            raise ValueError(f"unexpected DerivedCoreProperties line: {line!r}")
+        points = fields[0].split("..")
+        if len(points) == 1:
+            first = last = hex_point(points[0])
+        elif len(points) == 2:
+            first, last = hex_point(points[0]), hex_point(points[1])
+        else:
+            raise ValueError(f"unexpected code point range: {line!r}")
+        if first > last:
+            raise ValueError(f"reversed code point range: {line!r}")
+        name = fields[1].strip()
+        if name == "ID_Start":
+            starts.append((first, last))
+        elif name == "ID_Continue":
+            continues.append((first, last))
+    for ranges in (starts, continues):
+        for (first, last), (next_first, _) in zip(ranges, ranges[1:]):
+            if next_first <= last:
+                raise ValueError(f"overlapping identifier ranges near {first:04X}")
+    return starts, continues
+
+
 def expand(point, canonical, compatibility, compat, seen=()):
     if point in seen:
         raise ValueError(f"decomposition cycle at {point:04X}")
@@ -81,6 +114,8 @@ def main():
     ucd, output = Path(sys.argv[1]), Path(sys.argv[2])
     classes, canonical, compatibility = read_unicode_data(ucd / "UnicodeData.txt")
     exclusions = read_exclusions(ucd / "CompositionExclusions.txt")
+    identifier_starts, identifier_continues = read_identifiers(
+        ucd / "DerivedCoreProperties.txt")
 
     decomposed, entries = [], []
     for point in sorted(set(canonical) | set(compatibility)):
@@ -140,10 +175,27 @@ def main():
         "pub(crate) static COMPOSITIONS: &[(u32, u32, u32)] = &[",
     ]
     lines += [f"    (0x{a:X}, 0x{b:X}, 0x{c:X})," for a, b, c in compositions]
+    lines += [
+        "];",
+        "",
+        "// (first, last) for code points an identifier can start with; '$' and '_' are the",
+        "// only additions the lexer makes",
+        "pub(crate) static ID_START: &[(u32, u32)] = &[",
+    ]
+    lines += [f"    (0x{first:X}, 0x{last:X})," for first, last in identifier_starts]
+    lines += [
+        "];",
+        "",
+        "// (first, last) for code points an identifier can continue with; '$' and '_' are the",
+        "// only additions the lexer makes",
+        "pub(crate) static ID_CONTINUE: &[(u32, u32)] = &[",
+    ]
+    lines += [f"    (0x{first:X}, 0x{last:X})," for first, last in identifier_continues]
     lines += ["];", ""]
     output.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     print(f"{len(entries)} decompositions, {len(compositions)} compositions, "
-          f"{len(ranges(classes))} class ranges")
+          f"{len(ranges(classes))} class ranges, {len(identifier_starts)} identifier starts, "
+          f"{len(identifier_continues)} identifier continues")
 
 
 if __name__ == "__main__":
