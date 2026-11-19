@@ -26,6 +26,7 @@ pub(crate) enum LineBreakClass {
     GL,
     H2,
     H3,
+    HH,
     HL,
     HY,
     ID,
@@ -160,11 +161,15 @@ pub(crate) fn break_opportunities(text: &str, word_break: WordBreak) -> Vec<(usi
             back -= 1;
         }
         let across = classes[back];
+        // the class before the pair's before, for the rules that look at a hyphen's
+        // context, or none when the text starts there
+        let behind = index.checked_sub(2).map(|back| classes[back]);
         let spaced = before == SP;
         let decision = decide(Pair {
             before,
             after,
             across,
+            behind,
             spaced,
             raw_before: raw[index - 1],
             attached: attached[index],
@@ -195,6 +200,8 @@ struct Pair {
     after: LineBreakClass,
     // the class before a run of spaces that ends at the boundary
     across: LineBreakClass,
+    // the class before the pair's before, or none at the start of the text
+    behind: Option<LineBreakClass>,
     spaced: bool,
     raw_before: LineBreakClass,
     attached: bool,
@@ -209,6 +216,7 @@ fn decide(pair: Pair) -> Option<Break> {
         before,
         after,
         across,
+        behind,
         spaced,
         raw_before,
         attached,
@@ -244,7 +252,7 @@ fn decide(pair: Pair) -> Option<Break> {
         return None;
     }
     // LB12a
-    if after == GL && !matches!(before, SP | BA | HY) {
+    if after == GL && !matches!(before, SP | BA | HY | HH) {
         return None;
     }
     // LB13: no break before closing punctuation, exclamations or slashes
@@ -278,11 +286,23 @@ fn decide(pair: Pair) -> Option<Break> {
     if after == CB || before == CB {
         return Some(Break::Allowed);
     }
+    // LB20a: a hyphen at the start of a word stays with the letter after it
+    let word_initial = matches!(before, HY | HH)
+        && (before != HH || before_char == '\u{2010}')
+        && matches!(after, AL | HL)
+        && behind.is_none_or(|class| matches!(class, BK | CR | LF | NL | SP | ZW | CB | GL));
+    if word_initial {
+        return None;
+    }
     // LB21, LB21b
-    if matches!(after, BA | HY | NS) || before == BB {
+    if matches!(after, BA | HH | HY | NS) || before == BB {
         return None;
     }
     if before == SY && after == HL {
+        return None;
+    }
+    // LB21a: a hyphen after a Hebrew letter stays with what follows it
+    if matches!(before, HY | HH) && after != HL && behind == Some(HL) {
         return None;
     }
     // LB22: no break before ellipses
@@ -383,5 +403,18 @@ mod tests {
         assert!(break_opportunities("\u{4E00}\u{4E01}", WordBreak::KeepAll).is_empty());
         // a url may break after its slashes, not inside its words
         assert_eq!(breaks("https://example.com/a/b"), vec![8, 20, 22]);
+    }
+
+    #[test]
+    fn unicode_17_hyphen_rules_hold() {
+        // a word-initial hyphen stays with the letter after it, as with the suffix -ing
+        assert_eq!(breaks("free -ing"), vec![5]);
+        assert_eq!(breaks("well-known"), vec![5]);
+        // only the plain hyphen of the unambiguous set takes the word-initial rule
+        assert_eq!(breaks("free \u{2012}ing"), vec![5, 8]);
+        // a hyphen after a Hebrew letter stays with what follows it
+        assert_eq!(breaks("\u{05D0}\u{05D1}\u{05BE}x y"), vec![8]);
+        // while a maqaf between hebrew letters may still break after itself
+        assert_eq!(breaks("\u{05D0}\u{05D1}\u{05BE}\u{05D2}\u{05D3}"), vec![6]);
     }
 }

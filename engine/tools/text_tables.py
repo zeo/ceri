@@ -11,13 +11,13 @@ import re
 import sys
 from pathlib import Path
 
-VERSION = "16.0.0"
+VERSION = "17.0.0"
 
 LINE_BREAK_CLASSES = [
     "AI", "AK", "AL", "AP", "AS", "B2", "BA", "BB", "BK", "CB", "CJ", "CL", "CM", "CP", "CR",
-    "EB", "EM", "EX", "GL", "H2", "H3", "HL", "HY", "ID", "IN", "IS", "JL", "JT", "JV", "LF",
-    "NL", "NS", "NU", "OP", "PO", "PR", "QU", "RI", "SA", "SG", "SP", "SY", "VF", "VI", "WJ",
-    "XX", "ZW", "ZWJ",
+    "EB", "EM", "EX", "GL", "H2", "H3", "HH", "HL", "HY", "ID", "IN", "IS", "JL", "JT", "JV",
+    "LF", "NL", "NS", "NU", "OP", "PO", "PR", "QU", "RI", "SA", "SG", "SP", "SY", "VF", "VI",
+    "WJ", "XX", "ZW", "ZWJ",
 ]
 
 BIDI_CLASSES = [
