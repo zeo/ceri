@@ -117,6 +117,9 @@ pub(super) enum Op {
     CallMethod(u16),
     CallSpread,
     CallMethodSpread,
+    // a call of the global eval by name, the spec's one direct eval, which runs in
+    // the calling frame's strictness
+    CallEval(u16),
     New(u16),
     NewSpread,
     SuperCall(u16),
@@ -665,7 +668,7 @@ fn error(message: impl Into<String>) -> ScriptError {
 }
 
 // declarations hoisted to the function scope: var names and the functions declared at top level
-fn collect_var_names(statements: &[Stmt], names: &mut Vec<Name>) {
+pub(super) fn collect_var_names(statements: &[Stmt], names: &mut Vec<Name>) {
     for statement in statements {
         collect_var_names_in(statement, names);
     }
@@ -768,7 +771,7 @@ fn lexical_declarations(statements: &[Stmt]) -> Vec<(Name, BindingKind)> {
     output
 }
 
-fn block_functions(statements: &[Stmt]) -> Vec<Rc<FunctionNode>> {
+pub(super) fn block_functions(statements: &[Stmt]) -> Vec<Rc<FunctionNode>> {
     statements
         .iter()
         .filter_map(|statement| match statement {
@@ -832,38 +835,82 @@ impl Compiler {
     }
 
     pub(super) fn compile_script(self, script: &Script) -> Result<Rc<Code>, ScriptError> {
-        self.compile_global(script, false)
+        self.compile_global(script, false, false)
     }
 
     // a script that returns its last statement's value when that statement is an expression,
     // as a console shows it
     pub(super) fn compile_console_script(self, script: &Script) -> Result<Rc<Code>, ScriptError> {
-        self.compile_global(script, true)
+        self.compile_global(script, true, false)
+    }
+
+    // eval code: its lexical declarations live in a scope of its own, instantiated
+    // uninitialized before the body runs, and its vars and functions too when it is
+    // strict; a sloppy eval still declares its vars on the caller's global
+    pub(super) fn compile_eval_script(self, script: &Script) -> Result<Rc<Code>, ScriptError> {
+        self.compile_global(script, true, true)
     }
 
     fn compile_global(
         mut self,
         script: &Script,
         completion: bool,
+        eval_code: bool,
     ) -> Result<Rc<Code>, ScriptError> {
         self.functions
             .push(FunctionState::new(false, true, script.strict));
         // global declarations: var and function names become global bindings up front
         let mut vars = Vec::new();
         collect_var_names(&script.body, &mut vars);
-        for name in vars {
-            let index = self.name(&name);
-            self.emit(Op::DeclareGlobal(index));
-        }
+        let functions = block_functions(&script.body);
+        let lexicals = lexical_declarations(&script.body);
+        // a strict eval keeps its vars and functions in its own scope; a sloppy one's
+        // become globals, since its caller's var environment is the global
+        let scoped_declarations = if eval_code && script.strict {
+            let mut declarations = lexicals;
+            declarations.extend(vars.iter().map(|name| (name.clone(), BindingKind::Var)));
+            declarations.extend(
+                functions
+                    .iter()
+                    .map(|function| (function.name.clone().expect("declarations are named"), BindingKind::Var)),
+            );
+            declarations
+        } else {
+            for name in &vars {
+                let index = self.name(name);
+                self.emit(Op::DeclareGlobal(index));
+            }
+            lexicals
+        };
         // the VM creates this scope for the frame; it holds the script's temporaries
         self.state()
             .scopes
             .push(ScopeInfo::new(ScopeKind::Function, true));
-        for function in block_functions(&script.body) {
-            self.compile_function_value(&function)?;
-            let name = function.name.clone().expect("declarations are named");
-            let index = self.name(&name);
-            self.emit(Op::InitGlobal(index));
+        // the scope the eval's declarations live in, pushed before the body so they
+        // exist uninitialized from the first statement
+        let eval_scope = eval_code && !scoped_declarations.is_empty();
+        if eval_scope {
+            self.push_block_scope(&scoped_declarations);
+        }
+        if eval_code && script.strict {
+            for name in &vars {
+                self.emit(Op::Undefined);
+                self.compile_set_name(name, true)?;
+                self.emit(Op::Pop);
+            }
+            for function in functions {
+                self.compile_function_value(&function)?;
+                let name = function.name.clone().expect("declarations are named");
+                self.compile_set_name(&name, true)?;
+                self.emit(Op::Pop);
+            }
+        } else {
+            for function in functions {
+                self.compile_function_value(&function)?;
+                let name = function.name.clone().expect("declarations are named");
+                let index = self.name(&name);
+                self.emit(Op::InitGlobal(index));
+            }
         }
         if completion {
             let slot = self.alloc_temp();
@@ -872,6 +919,9 @@ impl Compiler {
         }
         for statement in &script.body {
             self.compile_statement(statement)?;
+        }
+        if eval_scope {
+            self.pop_block_scope();
         }
         match self.state().completion.clone() {
             Some(slot) => self.compile_get_name(&slot)?,
@@ -2676,13 +2726,18 @@ impl Compiler {
                 arguments,
                 optional,
             } => {
+                // a call of the global eval by name is the one direct eval, which
+                // sees the calling frame's strictness
+                let direct_eval = !*optional
+                    && matches!(callee.as_ref(), Expr::Identifier(name) if &**name == "eval")
+                    && self.resolve("eval").is_none();
                 self.compile_callee(callee)?;
                 if *optional {
                     // [this callee]: a nullish callee ends the chain
                     let skip = self.emit(Op::JumpIfNullishChain(0));
                     self.chain_jumps_push(skip);
                 }
-                self.compile_call_arguments(arguments, true)?;
+                self.compile_call_arguments(arguments, true, direct_eval)?;
             }
             Expr::New { callee, arguments } => {
                 self.compile_expression(callee)?;
@@ -2972,6 +3027,7 @@ impl Compiler {
         &mut self,
         arguments: &[Argument],
         method: bool,
+        direct_eval: bool,
     ) -> Result<(), ScriptError> {
         if arguments
             .iter()
@@ -2990,7 +3046,9 @@ impl Compiler {
                 }
             }
             let count = arguments.len() as u16;
-            self.emit(if method {
+            self.emit(if direct_eval {
+                Op::CallEval(count)
+            } else if method {
                 Op::CallMethod(count)
             } else {
                 Op::Call(count)

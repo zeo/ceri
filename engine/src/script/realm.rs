@@ -1312,11 +1312,43 @@ impl ScriptRuntime {
     }
 
     // source run as global code for the value of its last expression statement
-    fn evaluate_global_text(&mut self, source: &str) -> Result<Value, ScriptError> {
-        let script = super::parser::parse_script(source)
-            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+    // eval's declarations only take the global when the global can take them, as
+    // the spec's restricted global properties never can
+    const RESTRICTED_FUNCTION: [&str; 4] = ["undefined", "NaN", "Infinity", "globalThis"];
+    const RESTRICTED_VAR: [&str; 3] = ["undefined", "NaN", "Infinity"];
+
+    pub(super) fn evaluate_global_text(
+        &mut self,
+        source: &str,
+        strict: bool,
+    ) -> Result<Value, ScriptError> {
+        let script = if strict {
+            super::parser::parse_script_strict(source)
+        } else {
+            super::parser::parse_script(source)
+        }
+        .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        if !script.strict {
+            for function in super::compiler::block_functions(&script.body) {
+                let name = function.name.clone().expect("declarations are named");
+                if Self::RESTRICTED_FUNCTION.contains(&&*name) {
+                    return Err(self.type_error(format!(
+                        "cannot declare the global function {name}"
+                    )));
+                }
+            }
+            let mut vars = Vec::new();
+            super::compiler::collect_var_names(&script.body, &mut vars);
+            for name in vars {
+                if Self::RESTRICTED_VAR.contains(&&*name) {
+                    return Err(self.type_error(format!(
+                        "cannot declare the global variable {name}"
+                    )));
+                }
+            }
+        }
         let code = Compiler::new(source)
-            .compile_console_script(&script)
+            .compile_eval_script(&script)
             .map_err(|error| self.throw_error("SyntaxError", error.message))?;
         self.run_script_code(code)
     }
@@ -2496,10 +2528,10 @@ impl ScriptRuntime {
                 let text = self.coerce_string(first)?;
                 Ok(Value::Number(super::numbers::parse_float(&text)))
             }
-            // every call is an indirect eval, so source runs as global code and can't see the
-            // caller's locals
+            // every call through the native is an indirect eval, so source runs as
+            // global code with only its own directive deciding strictness
             Native::Eval => match first {
-                Value::String(source) => self.evaluate_global_text(&source),
+                Value::String(source) => self.evaluate_global_text(&source, false),
                 other => Ok(other),
             },
             Native::EncodeUri(component) => {

@@ -1512,6 +1512,34 @@ impl ScriptRuntime {
                 };
                 return self.call_in_loop(frames, callee, this, arguments);
             }
+            Op::CallEval(count) => {
+                let arguments = Self::pop_arguments(frame, count as usize);
+                let callee = Self::pop(frame);
+                let _this = Self::pop(frame);
+                // the builtin reached by name runs its source in this frame's
+                // strictness; a replaced eval is a plain call
+                let direct = matches!(
+                    callee.resolve(),
+                    Value::Object(ref object)
+                        if matches!(object.borrow().class, ObjectClass::Native(Native::Eval))
+                );
+                if direct {
+                    let strict = frame.code.strict;
+                    let first = arguments.first().cloned().unwrap_or(Value::Undefined);
+                    let value = if let Value::String(source) = &first {
+                        self.evaluate_global_text(source, strict)?
+                    } else {
+                        first
+                    };
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(value);
+                    return Ok(None);
+                }
+                return self.call_in_loop(frames, callee, Value::Undefined, arguments);
+            }
             Op::CallSpread | Op::CallMethodSpread => {
                 let list = Self::pop(frame);
                 let callee = Self::pop(frame);

@@ -2438,6 +2438,15 @@ pub(super) fn parse_script(source: &str) -> Result<Script, ScriptError> {
     parser.parse_script()
 }
 
+// for a direct eval whose caller is strict: the source compiles strict no matter
+// what its own directives say
+pub(super) fn parse_script_strict(source: &str) -> Result<Script, ScriptError> {
+    let mut parser = Parser::new(source);
+    parser.context.in_function = false;
+    parser.context.strict = true;
+    parser.parse_script()
+}
+
 pub(super) fn parse_module(source: &str) -> Result<Module, ScriptError> {
     Parser::new(source).parse_module()
 }

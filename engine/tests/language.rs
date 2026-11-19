@@ -1685,6 +1685,62 @@ fn anonymous_classes_take_the_name_they_are_bound_to() {
 }
 
 #[test]
+fn eval_declares_its_own_lexical_environment() {
+    check(&[
+        (
+            "lexical bindings exist before they initialize",
+            "try { eval('typeof x; let x;'); console.log('no throw') } catch (e) { console.log('threw', e instanceof ReferenceError) }",
+            "threw true",
+        ),
+        (
+            "const bindings too, from an indirect eval",
+            "try { (0, eval)('typeof y; const y = null;'); console.log('no throw') } catch (e) { console.log('threw', e instanceof ReferenceError) }",
+            "threw true",
+        ),
+        (
+            "class bindings too",
+            "try { (0, eval)('typeof C; class C {};'); console.log('no throw') } catch (e) { console.log('threw', e instanceof ReferenceError) }",
+            "threw true",
+        ),
+        (
+            "sloppy vars still become globals",
+            "eval('var leaked = 1'); console.log(this.leaked)",
+            "1",
+        ),
+        (
+            "strict vars stay in the eval",
+            "console.log((function () { 'use strict'; eval('var sv = 1'); return typeof this.sv; }).call(this))",
+            "undefined",
+        ),
+        (
+            "strict functions stay in the eval",
+            "console.log((function () { 'use strict'; eval('function ef(){}'); return typeof this.ef; }).call(this))",
+            "undefined",
+        ),
+        (
+            "a direct eval in strict code is strict",
+            "console.log((function () { 'use strict'; try { eval('_u = 11;'); return 'no throw' } catch (e) { return e instanceof ReferenceError ? 'threw' : 'other ' + e } })())",
+            "threw",
+        ),
+        (
+            "an indirect eval in strict code stays sloppy",
+            "console.log((function () { 'use strict'; try { (0, eval)('iw = 5;'); return 'no throw' } catch (e) { return 'threw' } })(), this.iw)",
+            "no throw 5",
+        ),
+        (
+            "functions conflicting with a restricted global throw",
+            "let caught = 'none'; try { eval('function shouldNotBeDefined(){} function NaN(){}'); } catch (e) { caught = e instanceof TypeError ? 'TypeError' : 'other' } console.log(typeof this.shouldNotBeDefined, caught)",
+            "undefined TypeError",
+        ),
+        (
+            "vars conflicting with a restricted global throw",
+            "try { eval('var shouldNotBeDefined; function NaN(){}'); } catch (e) { } console.log(typeof this.shouldNotBeDefined)",
+            "undefined",
+        ),
+    ]);
+}
+
+#[test]
 fn svelte_scheduler_shape_compiles() {
     check(&[
         (
