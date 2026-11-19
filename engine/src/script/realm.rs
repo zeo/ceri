@@ -47,6 +47,11 @@ pub(super) enum Native {
     ObjectValueOf,
     ObjectProtoGetter,
     ObjectProtoSetter,
+    // the legacy accessor helpers, from the annex that adds them to the prototype
+    ObjectDefineGetter,
+    ObjectDefineSetter,
+    ObjectLookupGetter,
+    ObjectLookupSetter,
     FunctionConstructor,
     FunctionPrototype,
     FunctionCall,
@@ -377,6 +382,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         ("toString", Native::ObjectToString, 0),
         ("toLocaleString", Native::ObjectToLocaleString, 0),
         ("valueOf", Native::ObjectValueOf, 0),
+        ("__defineGetter__", Native::ObjectDefineGetter, 2),
+        ("__defineSetter__", Native::ObjectDefineSetter, 2),
+        ("__lookupGetter__", Native::ObjectLookupGetter, 1),
+        ("__lookupSetter__", Native::ObjectLookupSetter, 1),
     ] {
         build.method(&object_prototype, key, native, length);
     }
@@ -2123,6 +2132,54 @@ impl ScriptRuntime {
                     }
                 }
                 Ok(Value::Undefined)
+            }
+            // the legacy accessor helpers: define through Object.defineProperty's
+            // own rules, enumerable and configurable as the annex makes them, and
+            // look a property up the chain for its get or set half
+            Native::ObjectDefineGetter | Native::ObjectDefineSetter => {
+                let getter = matches!(native, Native::ObjectDefineGetter);
+                let target = self.coerce_object(this)?;
+                let accessor = argument(&arguments, 1);
+                if !is_callable(&accessor) {
+                    return Err(self.type_error(if getter {
+                        "Getter must be a function"
+                    } else {
+                        "Setter must be a function"
+                    }));
+                }
+                let key = self.coerce_key(argument(&arguments, 0))?;
+                let descriptor = self.new_plain_object();
+                {
+                    let mut object = descriptor.borrow_mut();
+                    object.insert(
+                        if getter { "get" } else { "set" }.into(),
+                        accessor,
+                    );
+                    object.insert("enumerable".into(), Value::Bool(true));
+                    object.insert("configurable".into(), Value::Bool(true));
+                }
+                self.define_property_value(&target, key, &Value::Object(descriptor))?;
+                Ok(Value::Undefined)
+            }
+            Native::ObjectLookupGetter | Native::ObjectLookupSetter => {
+                let getter = matches!(native, Native::ObjectLookupGetter);
+                let mut target = self.coerce_object(this)?;
+                let key = self.coerce_key(argument(&arguments, 0))?;
+                loop {
+                    if let Some(property) = self.own_property_of(&target, &key)? {
+                        return Ok(match property.slot {
+                            Slot::Accessor { get, .. } if getter => {
+                                get.unwrap_or(Value::Undefined)
+                            }
+                            Slot::Accessor { set, .. } => set.unwrap_or(Value::Undefined),
+                            _ => Value::Undefined,
+                        });
+                    }
+                    target = match self.prototype_of(&target) {
+                        Some(prototype) => Value::Object(prototype),
+                        None => return Ok(Value::Undefined),
+                    };
+                }
             }
             Native::FunctionConstructor => {
                 self.construct_native(Native::FunctionConstructor, arguments, Value::Undefined)

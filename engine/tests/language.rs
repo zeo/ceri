@@ -1955,6 +1955,62 @@ fn direct_eval_declares_in_its_caller() {
 }
 
 #[test]
+fn object_prototype_accessors_helpers_follow_the_annex() {
+    check(&[
+        (
+            "defineGetter defines an enumerable configurable accessor",
+            "var subject = {}; var get = function() { return 42; }; var r = subject.__defineGetter__('a', get); var d = Object.getOwnPropertyDescriptor(subject, 'a'); console.log(r, d.get === get, d.set, d.enumerable, d.configurable, subject.a)",
+            "undefined true undefined true true 42",
+        ),
+        (
+            "defineSetter keeps an existing getter, replaces the setter",
+            "var subject = {}; var get = function() { return 'g'; }; var s1 = function() {}; var s2 = function() {}; subject.__defineGetter__('a', get); subject.__defineSetter__('a', s1); subject.__defineSetter__('a', s2); var d = Object.getOwnPropertyDescriptor(subject, 'a'); console.log(d.get === get, d.set === s2)",
+            "true true",
+        ),
+        (
+            "a data property becomes an accessor",
+            "var subject = { a: 1 }; subject.__defineGetter__('a', function() { return 'now getter' }); console.log(subject.a, Object.getOwnPropertyDescriptor(subject, 'a').value)",
+            "now getter undefined",
+        ),
+        (
+            "a non-callable getter throws before the key is read",
+            "var calls = 0; var key = { toString: function() { calls++ } }; var subject = {}; var threw = 'no'; try { subject.__defineGetter__(key, 1); } catch (e) { threw = e instanceof TypeError ? 'type' : 'other' } console.log(threw, calls)",
+            "type 0",
+        ),
+        (
+            "a throwing key conversion propagates",
+            "var subject = {}; var key = { toString: function() { throw 7 } }; var caught = 'no'; try { subject.__defineGetter__(key, function() {}); } catch (e) { caught = e } console.log(caught)",
+            "7",
+        ),
+        (
+            "undefined and null receivers throw",
+            "var f = Object.prototype.__defineGetter__; var out = []; for (var receiver of [undefined, null]) { try { f.call(receiver, 'a', function() {}); out.push('no') } catch (e) { out.push(e instanceof TypeError ? 'type' : 'other') } } var l = Object.prototype.__lookupGetter__; try { l.call(undefined, 'a'); out.push('no') } catch (e) { out.push(e instanceof TypeError ? 'type' : 'other') } console.log(out.join(' '))",
+            "type type type",
+        ),
+        (
+            "lookupGetter finds the getter half",
+            "var get = function() {}; var root = Object.defineProperty({}, 'target', { get: get }); var subject = Object.create(root); console.log(subject.__lookupGetter__('target') === get, subject.__lookupSetter__('target'))",
+            "true undefined",
+        ),
+        (
+            "a data property stops the lookup",
+            "var get = function() {}; var root = Object.defineProperty({}, 'target', { get: get }); var subject = Object.create(root, { target: { value: 1 } }); console.log(subject.__lookupGetter__('target'))",
+            "undefined",
+        ),
+        (
+            "lookupSetter walks the chain",
+            "var set = function() {}; var subject = Object.create(Object.create(Object.prototype, { a: { set: set, configurable: true } })); console.log(subject.__lookupSetter__('a') === set, subject.__lookupGetter__('a'))",
+            "true undefined",
+        ),
+        (
+            "names and lengths",
+            "console.log(Object.prototype.__defineGetter__.name, Object.prototype.__defineGetter__.length, Object.prototype.__lookupSetter__.name, Object.prototype.__lookupSetter__.length)",
+            "__defineGetter__ 2 __lookupSetter__ 1",
+        ),
+    ]);
+}
+
+#[test]
 fn svelte_scheduler_shape_compiles() {
     check(&[
         (
