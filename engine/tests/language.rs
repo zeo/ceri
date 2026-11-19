@@ -1869,6 +1869,27 @@ fn array_methods_take_primitive_receivers() {
             "console.log(Array.prototype.reduce.call('abc', function (a, c) { return a + c; }, ''))",
             "abc",
         ),
+        (
+            "the callback's receiver is the primitive's wrapper",
+            r#"
+function isBoolean(prev, cur, idx, obj) { return obj instanceof Boolean; }
+Boolean.prototype[0] = true;
+Boolean.prototype.length = 1;
+console.log(Array.prototype.reduce.call(false, isBoolean, 1));
+"#,
+            "true",
+        ),
+        (
+            "and every other callback method agrees",
+            r#"
+Number.prototype[0] = 3;
+Number.prototype.length = 1;
+let seen = [];
+Array.prototype.forEach.call(4, function (v, i, o) { seen.push(o instanceof Number, v); });
+console.log(seen.join(" "));
+"#,
+            "true 3",
+        ),
     ]);
 }
 

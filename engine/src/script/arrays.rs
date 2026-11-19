@@ -148,6 +148,21 @@ impl ScriptRuntime {
         }
     }
 
+    // the receiver a callback's last argument sees: a primitive as its wrapper object
+    fn callback_receiver(&mut self, this: &Value) -> Result<Value, ScriptError> {
+        if matches!(
+            this,
+            Value::Bool(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_)
+        ) {
+            return self.coerce_object(this.clone());
+        }
+        Ok(this.clone())
+    }
+
     // a mutating method on a generic receiver such as a Proxy over an array: push and pop
     // follow the standard's own steps, and the rest run on a copy whose changes are written
     // back through the receiver's properties
@@ -346,6 +361,7 @@ impl ScriptRuntime {
                 let values = self.receiver_values(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
                 let receiver = argument(&arguments, 1);
+                let object = self.callback_receiver(&this)?;
                 let length = values.len();
                 let mut mapped = Vec::new();
                 for index in 0..length {
@@ -356,7 +372,7 @@ impl ScriptRuntime {
                     let result = self.call_function(
                         callback.clone(),
                         receiver.clone(),
-                        vec![value.clone(), Value::Number(index as f64), this.clone()],
+                        vec![value.clone(), Value::Number(index as f64), object.clone()],
                     )?;
                     match method {
                         M::Map => mapped.push(result),
@@ -380,12 +396,13 @@ impl ScriptRuntime {
                 let values = self.receiver_values(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
                 let receiver = argument(&arguments, 1);
+                let object = self.callback_receiver(&this)?;
                 for index in (0..values.len()).rev() {
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
                     let result = self.call_function(
                         callback.clone(),
                         receiver.clone(),
-                        vec![value.clone(), Value::Number(index as f64), this.clone()],
+                        vec![value.clone(), Value::Number(index as f64), object.clone()],
                     )?;
                     if result.truthy() {
                         return Ok(match method {
@@ -402,6 +419,7 @@ impl ScriptRuntime {
             M::Reduce | M::ReduceRight => {
                 let values = self.receiver_values(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
+                let object = self.callback_receiver(&this)?;
                 let indices: Vec<usize> = if matches!(method, M::Reduce) {
                     (0..values.len()).collect()
                 } else {
@@ -429,7 +447,7 @@ impl ScriptRuntime {
                             accumulator,
                             value,
                             Value::Number(index as f64),
-                            this.clone(),
+                            object.clone(),
                         ],
                     )?;
                 }
@@ -546,12 +564,13 @@ impl ScriptRuntime {
                     (self.integer(argument(&arguments, 0), 1.0)?, None)
                 };
                 let mut result = Vec::new();
+                let object = self.callback_receiver(&this)?;
                 for (index, value) in values.into_iter().enumerate() {
                     let value = match &mapper {
                         Some(mapper) => self.call_function(
                             mapper.clone(),
                             argument(&arguments, 1),
-                            vec![value, Value::Number(index as f64), this.clone()],
+                            vec![value, Value::Number(index as f64), object.clone()],
                         )?,
                         None => value,
                     };
