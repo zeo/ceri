@@ -1894,6 +1894,67 @@ console.log(seen.join(" "));
 }
 
 #[test]
+fn direct_eval_declares_in_its_caller() {
+    check(&[
+        (
+            "an arrow's arguments appear from the eval",
+            "const f = (p = eval(\"var arguments = 'param'\")) => arguments; console.log(f(), globalThis.arguments)",
+            "param undefined",
+        ),
+        (
+            "a function's var lands in its scope",
+            "function g() { eval('var x = 41; x++;'); return x; } console.log(g())",
+            "42",
+        ),
+        (
+            "an existing arguments binding is assigned, not recreated",
+            "function h() { var arguments = 'old'; eval('var arguments = \"new\"'); return arguments; } console.log(h())",
+            "new",
+        ),
+        (
+            "a strict caller keeps the eval's vars to itself",
+            "function s() { 'use strict'; eval('var sv = 5'); return typeof sv; } console.log(s())",
+            "undefined",
+        ),
+        (
+            "a closure made after sees the eval's binding",
+            "function c() { eval('var e = 7;'); return () => e; } console.log(c()())",
+            "7",
+        ),
+        (
+            "an eval's function is callable by name",
+            "function k() { eval('function inner() { return \"ok\" }'); return inner(); } console.log(k())",
+            "ok",
+        ),
+        (
+            "the eval's var shadows the global for the caller",
+            "var g = 'global'; function m() { eval('var g = \"inner\"'); return g; } console.log(m(), g)",
+            "inner global",
+        ),
+        (
+            "the eval still returns its completion value",
+            "function n() { var q = eval('2; 3; q = 5;'); return [q, typeof q].join(' '); } console.log(n())",
+            "5 number",
+        ),
+        (
+            "a parameter expression's closure misses the body's var",
+            "var x = 'outside'; var probeParams, probeBody; (function(_ = probeParams = function() { return x; }) { var x = 'inside'; probeBody = function() { return x; }; }()); console.log(probeParams(), probeBody())",
+            "outside inside",
+        ),
+        (
+            "a sloppy write to a function expression's name is ignored",
+            "let ref = function BindingIdentifier() { eval('BindingIdentifier = 1'); return BindingIdentifier; }; console.log(ref() === ref)",
+            "true",
+        ),
+        (
+            "an eval's binding is deletable, and reading it then throws",
+            "var initial = null, postDeletion; (function() { eval('initial = x; delete x; postDeletion = function() { x; }; var x;'); }()); var verdict; try { postDeletion(); verdict = 'no' } catch (e) { verdict = e instanceof ReferenceError ? 'threw' : 'other' } console.log(initial, verdict)",
+            "undefined threw",
+        ),
+    ]);
+}
+
+#[test]
 fn svelte_scheduler_shape_compiles() {
     check(&[
         (

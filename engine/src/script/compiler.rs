@@ -61,6 +61,16 @@ pub(super) enum Op {
     GetGlobal(u32),
     SetGlobal(u32),
     InitGlobal(u32),
+    // a name no scope knew at compile time: a sloppy direct eval may have added it
+    // to the chain, so the chain is looked over before the global
+    GetLookup(u32),
+    SetLookup(u32),
+    // removes a binding a direct eval grew past a scope's compiled layout, which
+    // starts as deletable; the plain slots the compiler laid out never are
+    DeleteGrown {
+        depth: u16,
+        index: u16,
+    },
     // a top-level const of a classic script: a global binding that rejects assignment
     InitGlobalConst(u32),
     DeclareGlobal(u32),
@@ -68,6 +78,9 @@ pub(super) enum Op {
     DeleteGlobal(u32),
     // a block scope with the layout at this index of the code's blocks
     PushScope(u16),
+    // a function's variable environment, which parameter expressions move into a
+    // scope of its own over the frame's
+    PushVarScope(u16),
     PopScope,
     Debugger,
     CloneScope,
@@ -287,10 +300,13 @@ struct ScopeInfo {
     bindings: HashMap<Name, Binding>,
     size: u16,
     materialized: bool,
-    // the hidden slot holding a with statement's object
+    // the with object's hidden slot
     with_object: Option<Name>,
     // a materialized block's index in the function's blocks
     block: u16,
+    // bindings at or past this index were grown at run time by a direct eval, so
+    // they are deletable; u16::MAX when none are
+    grown_from: u16,
 }
 
 impl ScopeInfo {
@@ -302,6 +318,7 @@ impl ScopeInfo {
             materialized,
             with_object: None,
             block: 0,
+            grown_from: u16::MAX,
         }
     }
 
@@ -367,6 +384,9 @@ struct FunctionState {
     temps: u16,
     // the slot console and eval scripts keep their statements' completion value in
     completion: Option<Name>,
+    // body vars declare here when parameter expressions move them out of the
+    // function scope, as the function instantiation steps give
+    var_target: Option<usize>,
     strict: bool,
     pending_labels: Vec<Name>,
     // async generators await yielded and returned values
@@ -396,6 +416,7 @@ impl FunctionState {
             home_slot: None,
             temps: 0,
             completion: None,
+            var_target: None,
             strict,
             pending_labels: Vec::new(),
             async_generator: false,
@@ -485,6 +506,14 @@ pub(super) struct ModuleCode {
     pub(super) reexports: Vec<(Name, Name, Name)>,
     pub(super) star_exports: Vec<Name>,
     pub(super) namespace_exports: Vec<(Name, Name)>,
+}
+
+// one of a direct eval caller's live scopes, innermost first
+pub(super) struct CallerScope {
+    // the scope's names, with any a direct eval added past the layout
+    pub(super) names: Vec<Name>,
+    pub(super) slots: u16,
+    pub(super) var_scope: bool,
 }
 
 enum Folded {
@@ -851,6 +880,137 @@ impl Compiler {
         self.compile_global(script, true, true)
     }
 
+    // a direct eval inside a function: the caller's live scopes sit under the eval's
+    // own, innermost first, so its code resolves the caller's bindings through them;
+    // a sloppy one declares its vars and functions in the caller's variable
+    // environment, growing it by the bindings that are new, whose names are returned
+    // for the caller to add
+    pub(super) fn compile_eval_in_scope(
+        mut self,
+        script: &Script,
+        caller: &[CallerScope],
+    ) -> Result<(Rc<Code>, Vec<Name>), ScriptError> {
+        let mut state = FunctionState::new(false, false, script.strict);
+        // the caller's scopes, outermost first so resolution walks them under the eval's own
+        for scope in caller.iter().rev() {
+            let mut info = ScopeInfo::new(ScopeKind::Block, true);
+            info.size = scope.slots;
+            // bindings past the live slots are ones earlier evals grew, deletable
+            info.grown_from = scope.slots;
+            for (index, name) in scope.names.iter().enumerate() {
+                info.bindings.insert(
+                    name.clone(),
+                    Binding {
+                        index: index as u16,
+                        kind: BindingKind::Var,
+                    },
+                );
+            }
+            state.scopes.push(info);
+        }
+        // the variable environment among them, the innermost one a sloppy eval extends
+        let var_target = caller
+            .iter()
+            .position(|scope| scope.var_scope)
+            .map(|position| caller.len() - 1 - position);
+        self.functions.push(state);
+        let mut vars = Vec::new();
+        collect_var_names(&script.body, &mut vars);
+        let functions = block_functions(&script.body);
+        let lexicals = lexical_declarations(&script.body);
+        let mut grown: Vec<Name> = Vec::new();
+        let scoped_declarations = if script.strict {
+            let mut declarations = lexicals;
+            declarations.extend(vars.iter().map(|name| (name.clone(), BindingKind::Var)));
+            declarations.extend(functions.iter().map(|function| {
+                (
+                    function.name.clone().expect("declarations are named"),
+                    BindingKind::Var,
+                )
+            }));
+            declarations
+        } else {
+            match var_target {
+                Some(target) => {
+                    // each name the caller's scopes do not know becomes a binding in
+                    // its variable environment, appended past the live slots
+                    for name in vars.iter().chain(functions.iter().map(|function| {
+                        function.name.as_ref().expect("declarations are named")
+                    })) {
+                        if self.resolve(name).is_none() {
+                            grown.push(name.clone());
+                            self.state().scopes[target].declare(name.clone(), BindingKind::Var);
+                        }
+                    }
+                }
+                None => {
+                    for name in &vars {
+                        let index = self.name(name);
+                        self.emit(Op::DeclareGlobal(index));
+                    }
+                }
+            }
+            lexicals
+        };
+        // the eval's own scope, holding its temporaries and, when strict, its vars
+        self.state()
+            .scopes
+            .push(ScopeInfo::new(ScopeKind::Function, true));
+        let own = self.state().scopes.len() - 1;
+        let eval_scope = !scoped_declarations.is_empty();
+        if eval_scope {
+            self.push_block_scope(&scoped_declarations);
+        }
+        if script.strict {
+            // the pushed scope holds the vars uninitialized, so they take undefined
+            // before the body runs
+            for name in &vars {
+                self.emit(Op::Undefined);
+                self.compile_set_name(name, true)?;
+                self.emit(Op::Pop);
+            }
+            for function in &functions {
+                self.compile_function_value(function)?;
+                let name = function.name.clone().expect("declarations are named");
+                self.compile_set_name(&name, true)?;
+                self.emit(Op::Pop);
+            }
+        } else {
+            for function in &functions {
+                self.compile_function_value(function)?;
+                let name = function.name.clone().expect("declarations are named");
+                self.compile_set_name(&name, true)?;
+                self.emit(Op::Pop);
+            }
+        }
+        let completion = self.alloc_temp();
+        self.state().completion = Some(completion.clone());
+        self.clear_completion()?;
+        for statement in &script.body {
+            self.compile_statement(statement)?;
+        }
+        if eval_scope {
+            self.pop_block_scope();
+        }
+        self.compile_get_name(&completion)?;
+        self.emit(Op::Return);
+        let state = self.functions.pop().expect("eval state");
+        let layout = state.scopes[own].layout();
+        let mut code = self.finish(
+            state,
+            None,
+            FunctionKind::Normal,
+            false,
+            false,
+            "",
+            0,
+            false,
+            true,
+            Vec::new(),
+        );
+        code.layout = layout;
+        Ok((Rc::new(code), grown))
+    }
     fn compile_global(
         mut self,
         script: &Script,
@@ -1168,8 +1328,22 @@ impl Compiler {
         state.scopes[index].declare(name.clone(), kind)
     }
 
-    fn push_block_scope(&mut self, declarations: &[(Name, BindingKind)]) -> bool {
-        let materialized = !declarations.is_empty();
+    // the body's variable environment when parameter expressions give it a scope
+    // of its own: materialized above the parameters, so the bindings the body
+    // declares land over them and closures from the parameter list never see them
+    fn push_var_environment(&mut self) {
+        let mut scope = ScopeInfo::new(ScopeKind::Function, true);
+        let state = self.state();
+        scope.block = state.blocks.len() as u16;
+        let layout = scope.layout();
+        state.blocks.push(layout);
+        state.emit(Op::PushVarScope(scope.block));
+        state.runtime_scopes += 1;
+        state.scopes.push(scope);
+        state.var_target = Some(state.scopes.len() - 1);
+    }
+
+    fn push_block_scope(&mut self, declarations: &[(Name, BindingKind)]) -> bool {        let materialized = !declarations.is_empty();
         let mut scope = ScopeInfo::new(ScopeKind::Block, materialized);
         for (name, kind) in declarations {
             scope.declare(name.clone(), *kind);
@@ -1214,6 +1388,23 @@ impl Compiler {
             }
         }
         None
+    }
+
+    // whether a resolved binding sits past its scope's compiled layout, where a
+    // direct eval grew it at run time
+    fn grown_binding(&self, depth: u16, index: u16) -> bool {
+        let mut up = depth;
+        for state in self.functions.iter().rev() {
+            for scope in state.scopes.iter().rev() {
+                if up == 0 {
+                    return index >= scope.grown_from;
+                }
+                if scope.materialized {
+                    up -= 1;
+                }
+            }
+        }
+        false
     }
 
     // the with objects a name passes on its way out to where it is bound, innermost first
@@ -1303,7 +1494,13 @@ impl Compiler {
                 });
             }
             None => {
-                self.emit(Op::GetGlobal(name_index));
+                // a name no scope knows may be one a sloppy direct eval added to
+                // the chain at run time, so code in a sloppy function looks there
+                if !self.state().strict && !self.state().is_global {
+                    self.emit(Op::GetLookup(name_index));
+                } else {
+                    self.emit(Op::GetGlobal(name_index));
+                }
             }
         }
         Ok(())
@@ -1354,6 +1551,8 @@ impl Compiler {
             None => {
                 if initialize {
                     self.emit(Op::InitGlobal(name_index));
+                } else if !self.state().strict && !self.state().is_global {
+                    self.emit(Op::SetLookup(name_index));
                 } else {
                     self.emit(Op::SetGlobal(name_index));
                 }
@@ -1434,7 +1633,13 @@ impl Compiler {
         let mut vars = Vec::new();
         collect_var_names(body, &mut vars);
         for name in vars {
-            self.declare_in_function_scope(&name, BindingKind::Var);
+            // body vars sit in the function's variable environment, which parameter
+            // expressions move into a scope of its own
+            let target = self
+                .state()
+                .var_target
+                .unwrap_or_else(|| self.state().function_scope_index());
+            self.state().scopes[target].declare(name, BindingKind::Var);
         }
         for (name, kind) in lexical_declarations(body) {
             self.declare(&name, kind);
@@ -1487,12 +1692,15 @@ impl Compiler {
                     .iter()
                     .any(|scope| scope.kind == ScopeKind::Function)
             {
-                let function_scope = self.state().function_scope_index();
+                let function_scope = self
+                    .state()
+                    .var_target
+                    .unwrap_or_else(|| self.state().function_scope_index());
                 if !self.state().scopes[function_scope]
                     .bindings
                     .contains_key(&name)
                 {
-                    self.declare_in_function_scope(&name, BindingKind::Var);
+                    self.state().scopes[function_scope].declare(name.clone(), BindingKind::Var);
                 }
                 let index = self.state().scopes[function_scope].bindings[&name].index;
                 let depth = self.state().scopes[function_scope + 1..]
@@ -2358,6 +2566,14 @@ impl Compiler {
         for _ in 0..4 {
             self.emit(Op::Nop);
         }
+        // with parameter expressions the body's vars live in a variable
+        // environment of their own over the parameters, so closures made in the
+        // parameter list never see them, as the function instantiation steps give
+        let has_param_expressions = function.rest.is_some()
+            || function
+                .params
+                .iter()
+                .any(|param| matches!(param, Pattern::Default { .. }));
         let simple_params = function.rest.is_none()
             && function
                 .params
@@ -2380,7 +2596,9 @@ impl Compiler {
                 bound_names(rest, &mut names);
             }
             for name in names {
-                self.declare(&name, BindingKind::Param);
+                // parameters stay in the function scope under the body's own
+                let index = self.state().function_scope_index();
+                self.state().scopes[index].declare(name, BindingKind::Param);
             }
             self.emit(Op::GetIterator(None));
             for param in &function.params {
@@ -2393,17 +2611,32 @@ impl Compiler {
             }
             self.emit(Op::IterClose);
         }
+        // the parameters are evaluated against the frame's own scope; the body's
+        // variable environment enters the chain only here
+        if has_param_expressions {
+            self.push_var_environment();
+        }
         if !is_arrow
             && function_uses_arguments(&function.body, &function.params)
             && self
                 .resolve("arguments")
                 .is_none_or(|(depth, _, _)| depth > 0)
         {
-            let slot = self.declare(&"arguments".into(), BindingKind::Var);
+            // the arguments object is written to the frame's own scope, whatever
+            // environment the body's vars moved to
+            let index = self.state().function_scope_index();
+            let slot = self.state().scopes[index].declare("arguments".into(), BindingKind::Var);
             self.state().arguments_slot = Some(slot);
         }
         self.declare_function_body(&function.body)?;
         self.compile_statements(&function.body)?;
+        // the body's variable environment only grows here, after every declaration
+        // has taken its slot
+        if let Some(target) = self.state().var_target {
+            let layout = self.state().scopes[target].layout();
+            let block = self.state().scopes[target].block as usize;
+            self.state().blocks[block] = layout;
+        }
         if function.kind == FunctionKind::DerivedConstructor
             || function.kind == FunctionKind::ClassConstructor
         {
@@ -3215,11 +3448,19 @@ impl Compiler {
                     }
                 }
                 Expr::Identifier(name) => {
-                    if self.resolve(name).is_some() {
-                        self.emit(Op::False);
-                    } else {
-                        let index = self.name(name);
-                        self.emit(Op::DeleteGlobal(index));
+                    match self.resolve(name) {
+                        // a binding a direct eval grew past its scope's layout is
+                        // deletable, as the eval declaration steps made it
+                        Some((depth, index, _)) if self.grown_binding(depth, index) => {
+                            self.emit(Op::DeleteGrown { depth, index });
+                        }
+                        Some(_) => {
+                            self.emit(Op::False);
+                        }
+                        None => {
+                            let index = self.name(name);
+                            self.emit(Op::DeleteGlobal(index));
+                        }
                     }
                 }
                 other => {

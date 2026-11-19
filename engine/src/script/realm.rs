@@ -1321,8 +1321,7 @@ impl ScriptRuntime {
         &mut self,
         source: &str,
         strict: bool,
-    ) -> Result<Value, ScriptError> {
-        let script = if strict {
+    ) -> Result<Value, ScriptError> {        let script = if strict {
             super::parser::parse_script_strict(source)
         } else {
             super::parser::parse_script(source)
@@ -1351,6 +1350,52 @@ impl ScriptRuntime {
             .compile_eval_script(&script)
             .map_err(|error| self.throw_error("SyntaxError", error.message))?;
         self.run_script_code(code)
+    }
+
+    // a direct eval inside a function: its code compiles against the caller's live
+    // scopes, and a sloppy one's var and function declarations land in the variable
+    // environment among them, growing it by the bindings that are new
+    pub(super) fn evaluate_text_in_caller(
+        &mut self,
+        source: &str,
+        strict: bool,
+        chain: Vec<(super::vm::ScopeRef, bool)>,
+    ) -> Result<Value, ScriptError> {
+        let script = if strict {
+            super::parser::parse_script_strict(source)
+        } else {
+            super::parser::parse_script(source)
+        }
+        .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        let caller: Vec<super::compiler::CallerScope> = chain
+            .iter()
+            .map(|(scope, var_scope)| {
+                let scope = scope.borrow();
+                super::compiler::CallerScope {
+                    names: scope
+                        .names
+                        .iter()
+                        .chain(scope.extra.iter())
+                        .cloned()
+                        .collect(),
+                    slots: scope.slots.len() as u16,
+                    var_scope: *var_scope,
+                }
+            })
+            .collect();
+        let (code, grown) = Compiler::new(source)
+            .compile_eval_in_scope(&script, &caller)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        if !grown.is_empty()
+            && let Some((scope, _)) = chain.iter().find(|(_, flag)| *flag)
+        {
+            let mut scope = scope.borrow_mut();
+            for name in grown {
+                scope.slots.push(Value::Undefined);
+                scope.extra.push(name);
+            }
+        }
+        self.run_eval_code(code, chain[0].0.clone())
     }
 
     // a native function object created at run time, such as a proxy's revoke function
