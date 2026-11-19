@@ -92,6 +92,24 @@ fn preact_runs_a_counter_and_a_list() {
 }
 
 #[test]
+fn svelte_5_dev_runtime_resolves_a_batch() {
+    let mut browser = open("svelte5");
+    let status = text(&mut browser, "status");
+    assert_eq!(
+        status, "seen 1",
+        "the dev runtime should flush an effect; status {status:?}, logs {:?}",
+        browser.console_logs()
+    );
+    let errors = browser
+        .console_logs()
+        .iter()
+        .filter(|line| line.starts_with("Uncaught"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "svelte5 reported {errors:?}");
+}
+
+#[test]
 fn vue_runs_a_counter_and_a_list() {
     exercise("vue");
 }

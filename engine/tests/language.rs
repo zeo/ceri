@@ -1667,6 +1667,11 @@ fn global_eval_runs_in_the_global_scope() {
             "try { eval('let = ;'); } catch (e) { console.log(e instanceof SyntaxError) }",
             "true",
         ),
+        (
+            "arrows and promises keep the completion slot in range",
+            "const first = eval('(() => { const app = typeof window !== \"undefined\" ? 1 : 0; return { rows: app, ready: true }; })()'); const second = eval('Promise.resolve(1).then(() => 2); 7'); console.log(first.rows, first.ready, second)",
+            "1 true 7",
+        ),
     ]);
 }
 
@@ -1677,4 +1682,63 @@ fn anonymous_classes_take_the_name_they_are_bound_to() {
         "var A = class {}; var B = class { constructor() {} }; let C = class { m() {} }; const o = { D: class { constructor() {} } }; class E { constructor() {} } console.log(A.name, B.name, C.name, o.D.name, E.name, (class { constructor() {} }).name === '')",
         "A B C D E true",
     )]);
+}
+
+#[test]
+fn svelte_scheduler_shape_compiles() {
+    check(&[
+        (
+            "private field and method together",
+            "class A { #x = 1; #get() { return this.#x; } run() { this.#x = 2; return this.#get(); } } console.log(new A().run())",
+            "2",
+        ),
+        (
+            "private method with hoisted vars in loops",
+            r#"
+var Batch = class Batch {
+  #scheduled = [];
+  #resolve() {
+    var roots = [];
+    for (const effect of this.#scheduled) {
+      if ((effect.f & 16384) !== 0 || (effect.f & 6144) === 0) continue;
+      var e = effect;
+      var covered = false;
+      while (e.parent !== null) {
+        e = e.parent;
+        var flags = e.f;
+        if ((flags & 96) !== 0) {
+          if ((flags & 1024) === 0) { covered = true; break; }
+          e.f = 3;
+        }
+      }
+      if (!covered) roots.push(e);
+    }
+    this.#scheduled = [];
+    return roots;
+  }
+  run(list) { this.#scheduled = list; return this.#resolve().length; }
+};
+const b = new Batch();
+console.log(b.run([{ f: 6144, parent: { parent: null, f: 1 } }]));
+"#,
+            "1",
+        ),
+        (
+            "continue in a for-of keeps one block per iteration",
+            r#"
+function f(list) {
+  var out = 0;
+  for (const x of list) {
+    if (x < 0) continue;
+    var e = x;
+    e += 1;
+    out += e;
+  }
+  return out;
+}
+console.log(f([-1, 1, 2]), f([1, -1, 1]));
+"#,
+            "5 4",
+        ),
+    ]);
 }

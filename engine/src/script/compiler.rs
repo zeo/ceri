@@ -1845,11 +1845,8 @@ impl Compiler {
         // the key iterator stays on the stack under every iteration
         let start = self.here();
         let exit = self.emit(Op::ForInNext(0));
+        // a continue lands at the loop head, outside the per-iteration scope
         let pushed = self.compile_for_head_binding(left)?;
-        if pushed {
-            let index = self.state().targets.len() - 1;
-            self.state().targets[index].continue_scopes += 1;
-        }
         self.compile_statement(body)?;
         if pushed {
             self.pop_block_scope();
@@ -1917,11 +1914,8 @@ impl Compiler {
             finally: NO_TARGET,
         });
         self.state().handler_depth += 1;
+        // a continue lands after the per-iteration scope is popped
         let pushed = self.compile_for_head_binding(left)?;
-        if pushed {
-            let index = self.state().targets.len() - 1;
-            self.state().targets[index].continue_scopes += 1;
-        }
         self.compile_statement(body)?;
         if pushed {
             self.pop_block_scope();
