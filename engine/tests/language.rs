@@ -1741,6 +1741,92 @@ fn eval_declares_its_own_lexical_environment() {
 }
 
 #[test]
+fn declarations_reject_what_the_spec_rejects_early() {
+    check(&[
+        (
+            "a block's lexical declarations are distinct",
+            "{ let f = 1; { let f = 2; } console.log(f) }",
+            "1",
+        ),
+        (
+            "duplicate lexical names in a block",
+            "try { eval('{ let f; const f; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a block's function is lexical",
+            "try { eval('{ function f() {} let f; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a var hoisted out of a nested statement collides with a block's let",
+            "try { eval('{ let f; if (1) var f; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a block's function still compiles alone",
+            "{ function f() { return 3; } } console.log(f())",
+            "3",
+        ),
+        (
+            "switch clauses share one scope",
+            "try { eval('switch (0) { case 1: let f; default: let f; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a switch's function is lexical across clauses",
+            "try { eval('switch (0) { case 1: function f() {} default: var f; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "parameters collide with the body's lexicals",
+            "try { eval('function f(a) { let a; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "duplicate parameters stay legal in a sloppy function",
+            "function f(a, a) { return a; } console.log(f(1, 2))",
+            "2",
+        ),
+        (
+            "a catch parameter is one scope with its block",
+            "try { eval('try {} catch (e) { let e; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a destructured catch parameter may not repeat a name",
+            "try { eval('try {} catch ({ e, e }) {}'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a script's functions are vars and may repeat",
+            "eval('function f() {} var f;'); console.log(typeof f)",
+            "function",
+        ),
+        (
+            "a script's let collides with a hoisted function",
+            "try { eval('function f() {} let f;'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "strict mode refuses to bind eval",
+            "console.log((function () { 'use strict'; try { return eval('(function () { var eval; })') ? 'no throw' : 'x' } catch (e) { return 'threw ' + (e instanceof SyntaxError) } })())",
+            "threw true",
+        ),
+        (
+            "strict mode refuses to bind arguments as a parameter",
+            "console.log((function () { 'use strict'; try { return eval('(function (arguments) {})') ? 'eval ran' : 'x' } catch (e) { return 'threw ' + (e instanceof SyntaxError) } })())",
+            "threw true",
+        ),
+        (
+            "sloppy mode still binds eval",
+            "function eval() { return 1; } console.log(eval())",
+            "1",
+        ),
+    ]);
+}
+
+#[test]
 fn svelte_scheduler_shape_compiles() {
     check(&[
         (

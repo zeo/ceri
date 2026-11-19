@@ -204,6 +204,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_script(mut self) -> Result<Script, ScriptError> {
         let (body, strict) = self.parse_body_with_directives(true)?;
         self.expect_eof()?;
+        self.check_declarations(&[body.as_slice()], None, true, false)?;
         Ok(Script { body, strict })
     }
 
@@ -404,6 +405,18 @@ impl<'a> Parser<'a> {
         })
     }
 
+    // a binding identifier in a declared position, which strict mode refuses
+    // when it names eval or arguments
+    fn parse_declared_identifier(&mut self) -> Result<Name, ScriptError> {
+        let name = self.parse_binding_identifier()?;
+        if self.context.strict && (&*name == "eval" || &*name == "arguments") {
+            return Err(self.error_here(format!(
+                "cannot declare {name} in strict mode"
+            )));
+        }
+        Ok(name)
+    }
+
     fn parse_binding_identifier(&mut self) -> Result<Name, ScriptError> {
         match self.peek_kind()? {
             TokenKind::Identifier(name) if !self.is_reserved(&name) => {
@@ -478,6 +491,98 @@ impl<'a> Parser<'a> {
         body.push(Stmt::Position(self.offset()?));
         body.push(self.parse_statement_list_item()?);
         Ok(())
+    }
+
+    // the spec's declaration early errors: the names a statement list binds
+    // before it runs must not collide, so a lexical name is never a duplicate,
+    // never a hoisted var, and never a parameter of the function body it opens
+    fn check_declarations(
+        &mut self,
+        bodies: &[&[Stmt]],
+        params: Option<(&[Pattern], Option<&Pattern>)>,
+        functions_are_var: bool,
+        parameters_may_not_repeat: bool,
+    ) -> Result<(), ScriptError> {
+        let mut lexicals: Vec<(Name, usize)> = Vec::new();
+        let mut vars: Vec<Name> = Vec::new();
+        for body in bodies {
+            let mut offset = 0;
+            for statement in *body {
+                match statement {
+                    Stmt::Position(at) => offset = *at,
+                    Stmt::Declaration {
+                        kind: DeclarationKind::Var,
+                        ..
+                    } => var_hoist_names(statement, &mut vars),
+                    Stmt::Declaration { declarators, .. } => {
+                        let mut names = Vec::new();
+                        for declarator in declarators {
+                            bound_names(&declarator.target, &mut names);
+                        }
+                        lexicals.extend(names.into_iter().map(|name| (name, offset)));
+                    }
+                    Stmt::Class(class) => {
+                        if let Some(name) = &class.name {
+                            lexicals.push((name.clone(), offset));
+                        }
+                    }
+                    // a function declared in a block binds lexically there,
+                    // while one in a script or a function body declares a var
+                    // hoisted to that scope
+                    Stmt::Function(function) => match &function.name {
+                        Some(name) if functions_are_var => vars.push(name.clone()),
+                        Some(name) => lexicals.push((name.clone(), offset)),
+                        _ => {}
+                    },
+                    _ => var_hoist_names(statement, &mut vars),
+                }
+            }
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, offset) in &lexicals {
+            if seen.contains(&&**name) {
+                return Err(self.declaration_error(name, *offset));
+            }
+            seen.push(name);
+        }
+        for (name, offset) in &lexicals {
+            if vars.contains(name) {
+                return Err(self.declaration_error(name, *offset));
+            }
+        }
+        if let Some((params, rest)) = params {
+            let mut bound = Vec::new();
+            for param in params {
+                bound_names(param, &mut bound);
+            }
+            if let Some(rest) = rest {
+                bound_names(rest, &mut bound);
+            }
+            if parameters_may_not_repeat {
+                let mut seen_params: Vec<&str> = Vec::new();
+                for name in &bound {
+                    if seen_params.contains(&&**name) {
+                        let offset = self.peek().map(|token| token.start).unwrap_or(0);
+                        return Err(self.declaration_error(name, offset));
+                    }
+                    seen_params.push(name);
+                }
+            }
+            for (name, offset) in &lexicals {
+                if bound.contains(name) {
+                    return Err(self.declaration_error(name, *offset));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn declaration_error(&self, name: &str, offset: usize) -> ScriptError {
+        ScriptError {
+            offset,
+            message: format!("identifier '{name}' has already been declared"),
+            name: "SyntaxError".to_string(),
+        }
     }
 
     fn parse_statement_list_item(&mut self) -> Result<Stmt, ScriptError> {
@@ -731,6 +836,7 @@ impl<'a> Parser<'a> {
             self.parse_list_item(&mut body)?;
         }
         self.advance()?;
+        self.check_declarations(&[body.as_slice()], None, false, false)?;
         Ok(body)
     }
 
@@ -867,6 +973,10 @@ impl<'a> Parser<'a> {
             }
             cases.push(SwitchCase { test, body });
         }
+        // all clauses of a switch share one scope, so their declarations
+        // collide across the cases as one list
+        let bodies: Vec<&[Stmt]> = cases.iter().map(|case| case.body.as_slice()).collect();
+        self.check_declarations(&bodies, None, false, false)?;
         Ok(Stmt::Switch {
             discriminant,
             cases,
@@ -887,6 +997,17 @@ impl<'a> Parser<'a> {
             };
             self.expect_punct("{")?;
             let body = self.parse_block_body()?;
+            // the catch's bindings are one scope with the block it opens, so
+            // its parameters may not repeat and may not collide with the
+            // block's lexical declarations
+            if let Some(pattern) = &param {
+                self.check_declarations(
+                    &[body.as_slice()],
+                    Some((std::slice::from_ref(pattern), None)),
+                    false,
+                    true,
+                )?;
+            }
             Some(CatchClause { param, body })
         } else {
             None
@@ -939,7 +1060,7 @@ impl<'a> Parser<'a> {
             while !self.eat_punct("}")? {
                 if self.eat_punct("...")? {
                     rest = Some(Box::new(Pattern::Identifier(
-                        self.parse_binding_identifier()?,
+                        self.parse_declared_identifier()?,
                     )));
                     self.expect_punct("}")?;
                     break;
@@ -949,7 +1070,7 @@ impl<'a> Parser<'a> {
                     TokenKind::Identifier(_) | TokenKind::EscapedIdentifier(_)
                 ) && !matches!(self.peek_punct_at(1)?, Some(":"));
                 if shorthand {
-                    let name = self.parse_binding_identifier()?;
+                    let name = self.parse_declared_identifier()?;
                     let mut value = Pattern::Identifier(name.clone());
                     if self.eat_punct("=")? {
                         value = Pattern::Default {
@@ -969,7 +1090,7 @@ impl<'a> Parser<'a> {
             }
             return Ok(Pattern::Object { properties, rest });
         }
-        Ok(Pattern::Identifier(self.parse_binding_identifier()?))
+        Ok(Pattern::Identifier(self.parse_declared_identifier()?))
     }
 
     fn parse_binding_element(&mut self) -> Result<Pattern, ScriptError> {
@@ -1182,7 +1303,7 @@ impl<'a> Parser<'a> {
             if is_async {
                 self.advance()?;
             }
-            let name = self.parse_binding_identifier()?;
+            let name = self.parse_declared_identifier()?;
             self.advance()?;
             return Ok(Some(self.parse_arrow_body(
                 start,
@@ -1233,6 +1354,12 @@ impl<'a> Parser<'a> {
         let body = if self.eat_punct("{")? {
             let (body, strict) = self.parse_body_with_directives(false)?;
             self.expect_punct("}")?;
+            self.check_declarations(
+                &[body.as_slice()],
+                Some((params.as_slice(), rest.as_ref())),
+                true,
+                false,
+            )?;
             self.context.strict = strict;
             body
         } else {
@@ -1988,6 +2115,12 @@ impl<'a> Parser<'a> {
         self.expect_punct("{")?;
         let (body, strict) = self.parse_body_with_directives(false)?;
         self.expect_punct("}")?;
+        self.check_declarations(
+            &[body.as_slice()],
+            Some((params.as_slice(), rest.as_ref())),
+            true,
+            false,
+        )?;
         self.context = saved;
         Ok(Rc::new(FunctionNode {
             name,
@@ -2008,7 +2141,7 @@ impl<'a> Parser<'a> {
         is_async: bool,
     ) -> Result<Rc<FunctionNode>, ScriptError> {
         let is_generator = self.eat_punct("*")?;
-        let name = self.parse_binding_identifier()?;
+        let name = self.parse_declared_identifier()?;
         self.parse_function_rest(
             start,
             Some(name),
@@ -2032,7 +2165,7 @@ impl<'a> Parser<'a> {
             let saved = self.context;
             self.context.in_generator = is_generator;
             self.context.in_async = is_async;
-            let name = self.parse_binding_identifier();
+            let name = self.parse_declared_identifier();
             self.context = saved;
             Some(name?)
         };
@@ -2079,7 +2212,7 @@ impl<'a> Parser<'a> {
         let saved = self.context;
         self.context.strict = true;
         let name = if self.is_binding_identifier()? {
-            Some(self.parse_binding_identifier()?)
+            Some(self.parse_declared_identifier()?)
         } else if declaration {
             return Err(self.error_here("a class declaration needs a name"));
         } else {
@@ -2275,7 +2408,7 @@ impl<'a> Parser<'a> {
         }
         let mut bindings = Vec::new();
         if self.is_binding_identifier()? {
-            let local = self.parse_binding_identifier()?;
+            let local = self.parse_declared_identifier()?;
             bindings.push(ImportBinding::Named {
                 imported: "default".into(),
                 local,
@@ -2292,13 +2425,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_punct("*")? {
             self.expect_word("as")?;
-            bindings.push(ImportBinding::Namespace(self.parse_binding_identifier()?));
+            bindings.push(ImportBinding::Namespace(self.parse_declared_identifier()?));
         } else {
             self.expect_punct("{")?;
             while !self.eat_punct("}")? {
                 let imported = self.parse_module_export_name()?;
                 let local = if self.eat_word("as")? {
-                    self.parse_binding_identifier()?
+                    self.parse_declared_identifier()?
                 } else {
                     imported.clone()
                 };
@@ -2417,7 +2550,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Stmt, ScriptError> {
         let is_generator = self.eat_punct("*")?;
         let name = if self.is_binding_identifier()? {
-            self.parse_binding_identifier()?
+            self.parse_declared_identifier()?
         } else {
             "default".into()
         };
@@ -2436,6 +2569,84 @@ pub(super) fn parse_script(source: &str) -> Result<Script, ScriptError> {
     let mut parser = Parser::new(source);
     parser.context.in_function = false;
     parser.parse_script()
+}
+
+// var names a statement hoists to the function or script scope that holds it,
+// walking nested statements but never into functions or classes, which bind
+// everything at their own level
+fn var_hoist_names(statement: &Stmt, names: &mut Vec<Name>) {
+    match statement {
+        Stmt::Declaration {
+            kind: DeclarationKind::Var,
+            declarators,
+        } => {
+            for declarator in declarators {
+                bound_names(&declarator.target, names);
+            }
+        }
+        Stmt::Block(body) => var_hoisted(body, names),
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            var_hoist_names(consequent, names);
+            if let Some(alternate) = alternate {
+                var_hoist_names(alternate, names);
+            }
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Declaration {
+                kind: DeclarationKind::Var,
+                declarators,
+            }) = init
+            {
+                for declarator in declarators {
+                    bound_names(&declarator.target, names);
+                }
+            }
+            var_hoist_names(body, names);
+        }
+        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+            if let ForHead::Declaration {
+                kind: DeclarationKind::Var,
+                target,
+            } = left
+            {
+                bound_names(target, names);
+            }
+            var_hoist_names(body, names);
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::With { body, .. } => var_hoist_names(body, names),
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                var_hoisted(&case.body, names);
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            var_hoisted(block, names);
+            if let Some(handler) = handler {
+                var_hoisted(&handler.body, names);
+            }
+            if let Some(finalizer) = finalizer {
+                var_hoisted(finalizer, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn var_hoisted(statements: &[Stmt], names: &mut Vec<Name>) {
+    for statement in statements {
+        var_hoist_names(statement, names);
+    }
 }
 
 // for a direct eval whose caller is strict: the source compiles strict no matter
