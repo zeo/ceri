@@ -119,13 +119,24 @@ impl ScriptRuntime {
                 .map(|unit| Value::String(String::from_utf16_lossy(&[unit]).into()))
                 .collect()),
             Value::Object(_) => self.array_like_list(this),
-            other => match self.iterate_to_vec(other.clone()) {
-                Ok(values) => Ok(values),
-                Err(_) => {
-                    self.pending_exception = None;
-                    Ok(Vec::new())
+            other => {
+                // a primitive receiver coerces to its wrapper object, whose
+                // missing length reads as nothing to iterate
+                if matches!(
+                    other,
+                    Value::Bool(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_)
+                ) {
+                    let wrapper = self.coerce_object(other.clone())?;
+                    return self.array_like_list(&wrapper);
                 }
-            },
+                match self.iterate_to_vec(other.clone()) {
+                    Ok(values) => Ok(values),
+                    Err(_) => {
+                        self.pending_exception = None;
+                        Ok(Vec::new())
+                    }
+                }
+            }
         }
     }
 

@@ -422,8 +422,6 @@ test/built-ins/Array/prototype/includes/get-prop.js
 test/built-ins/Array/prototype/includes/length-boundaries.js
 test/built-ins/Array/prototype/includes/length-zero-returns-false.js
 test/built-ins/Array/prototype/includes/resizable-buffer.js
-test/built-ins/Array/prototype/indexOf/15.4.4.14-1-3.js
-test/built-ins/Array/prototype/indexOf/15.4.4.14-1-5.js
 test/built-ins/Array/prototype/indexOf/15.4.4.14-5-12.js
 test/built-ins/Array/prototype/indexOf/15.4.4.14-5-16.js
 test/built-ins/Array/prototype/indexOf/15.4.4.14-9-11.js
@@ -463,8 +461,6 @@ test/built-ins/Array/prototype/join/resizable-buffer.js
 test/built-ins/Array/prototype/keys/resizable-buffer-grow-mid-iteration.js
 test/built-ins/Array/prototype/keys/resizable-buffer-shrink-mid-iteration.js
 test/built-ins/Array/prototype/keys/resizable-buffer.js
-test/built-ins/Array/prototype/lastIndexOf/15.4.4.15-1-3.js
-test/built-ins/Array/prototype/lastIndexOf/15.4.4.15-1-5.js
 test/built-ins/Array/prototype/lastIndexOf/15.4.4.15-2-1.js
 test/built-ins/Array/prototype/lastIndexOf/15.4.4.15-3-28.js
 test/built-ins/Array/prototype/lastIndexOf/15.4.4.15-5-12.js
@@ -890,13 +886,11 @@ test/built-ins/Array/prototype/toReversed/ignores-species.js
 test/built-ins/Array/prototype/toReversed/length-decreased-while-iterating.js
 test/built-ins/Array/prototype/toReversed/length-exceeding-array-length-limit.js
 test/built-ins/Array/prototype/toReversed/length-increased-while-iterating.js
-test/built-ins/Array/prototype/toReversed/this-value-boolean.js
 test/built-ins/Array/prototype/toSorted/holes-not-preserved.js
 test/built-ins/Array/prototype/toSorted/ignores-species.js
 test/built-ins/Array/prototype/toSorted/length-decreased-while-iterating.js
 test/built-ins/Array/prototype/toSorted/length-exceeding-array-length-limit.js
 test/built-ins/Array/prototype/toSorted/length-increased-while-iterating.js
-test/built-ins/Array/prototype/toSorted/this-value-boolean.js
 test/built-ins/Array/prototype/toSpliced/discarded-element-not-read.js
 test/built-ins/Array/prototype/toSpliced/elements-read-in-order.js
 test/built-ins/Array/prototype/toSpliced/holes-not-preserved.js
@@ -906,7 +900,6 @@ test/built-ins/Array/prototype/toSpliced/length-decreased-while-iterating.js
 test/built-ins/Array/prototype/toSpliced/length-exceeding-array-length-limit.js
 test/built-ins/Array/prototype/toSpliced/length-increased-while-iterating.js
 test/built-ins/Array/prototype/toSpliced/mutate-while-iterating.js
-test/built-ins/Array/prototype/toSpliced/this-value-boolean.js
 test/built-ins/Array/prototype/toString/S15.4.4.2_A3_T1.js
 test/built-ins/Array/prototype/toString/non-callable-join-string-tag.js
 test/built-ins/Array/prototype/unshift/S15.4.4.13_A4_T1.js
@@ -927,7 +920,6 @@ test/built-ins/Array/prototype/with/length-decreased-while-iterating.js
 test/built-ins/Array/prototype/with/length-exceeding-array-length-limit.js
 test/built-ins/Array/prototype/with/length-increased-while-iterating.js
 test/built-ins/Array/prototype/with/no-get-replaced-index.js
-test/built-ins/Array/prototype/with/this-value-boolean.js
 test/built-ins/ArrayBuffer/Symbol.species/length.js
 test/built-ins/ArrayBuffer/Symbol.species/return-value.js
 test/built-ins/ArrayBuffer/Symbol.species/symbol-species-name.js

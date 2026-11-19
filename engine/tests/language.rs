@@ -1827,6 +1827,52 @@ fn declarations_reject_what_the_spec_rejects_early() {
 }
 
 #[test]
+fn array_methods_take_primitive_receivers() {
+    check(&[
+        (
+            "reduce over a boolean keeps its initial value",
+            "let calls = 0; const r = Array.prototype.reduce.call(false, function () { calls++; }, 1); console.log(r, calls)",
+            "1 0",
+        ),
+        (
+            "reduce over a number keeps its initial value",
+            "console.log(Array.prototype.reduce.call(2.5, function () { return 9; }, 7))",
+            "7",
+        ),
+        (
+            "reduce over a number without an initial value throws",
+            "try { Array.prototype.reduce.call(2.5, function () {}); console.log('no throw') } catch (e) { console.log('threw', e instanceof TypeError) }",
+            "threw true",
+        ),
+        (
+            "map over a number maps nothing",
+            "console.log(Array.prototype.map.call(11, function (v) { return v; }).length)",
+            "0",
+        ),
+        (
+            "filter over a boolean filters nothing",
+            "console.log(Array.prototype.filter.call(true, function () { return true; }).length)",
+            "0",
+        ),
+        (
+            "includes over a symbol finds nothing",
+            "console.log(Array.prototype.includes.call(Symbol('s'), 'x'))",
+            "false",
+        ),
+        (
+            "forEach over a bigint visits nothing",
+            "let visits = 0; Array.prototype.forEach.call(10n, function () { visits++; }); console.log(visits)",
+            "0",
+        ),
+        (
+            "a string receiver still iterates its characters",
+            "console.log(Array.prototype.reduce.call('abc', function (a, c) { return a + c; }, ''))",
+            "abc",
+        ),
+    ]);
+}
+
+#[test]
 fn svelte_scheduler_shape_compiles() {
     check(&[
         (
@@ -1884,3 +1930,4 @@ console.log(f([-1, 1, 2]), f([1, -1, 1]));
         ),
     ]);
 }
+
