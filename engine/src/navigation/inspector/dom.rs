@@ -1,7 +1,7 @@
 // the DOM domain: each session mirrors the part of the tree its frontend holds, so a flush can
 // tell it what the document changed since, as chromium's mutation events would have
 
-use super::{FRAME_ID, Failure};
+use super::{Failure, frame_id};
 use crate::dom::{Document, Namespace, NodeId, NodeKind};
 use crate::navigation::Page;
 use crate::script::{NodeArgument, NodeCall};
@@ -712,7 +712,7 @@ pub(super) fn answer(
                     true => pushed(mirror, page, Some(node), events),
                     false => 0,
                 };
-                Ok(json!({ "backendNodeId": backend, "frameId": FRAME_ID, "nodeId": id }))
+                Ok(json!({ "backendNodeId": backend, "frameId": frame_id(), "nodeId": id }))
             })
         }
         "DOM.performSearch" => {

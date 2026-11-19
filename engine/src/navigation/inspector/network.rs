@@ -1,7 +1,7 @@
 // the Network domain: each request the page's thread made while a session records, sent as its
 // will-be-sent, response, data and finish events, with bodies kept for the frontend to ask for
 
-use super::{Browser, FRAME_ID, Failure, post};
+use super::{Browser, Failure, frame_id, post};
 use crate::netlog::{self, Exchange};
 use crate::script::encoded_body;
 use serde_json::{Value as Json, json};
@@ -153,7 +153,7 @@ fn events(id: &str, exchange: &Exchange) -> Vec<(&'static str, Json)> {
             "initiator": { "type": initiator },
             "redirectHasExtraInfo": false,
             "type": kind,
-            "frameId": FRAME_ID,
+            "frameId": frame_id(),
         }),
     )];
     let finished = exchange.finished;
@@ -188,7 +188,7 @@ fn events(id: &str, exchange: &Exchange) -> Vec<(&'static str, Json)> {
                         },
                     },
                     "hasExtraInfo": false,
-                    "frameId": FRAME_ID,
+                    "frameId": frame_id(),
                 }),
             ));
             if length > 0 {

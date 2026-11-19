@@ -236,6 +236,8 @@ static INTERFACES: &[Interface] = &[
             ("slot", Attr("slot")),
             ("getBoundingClientRect", Method(0)),
             ("getClientRects", Method(0)),
+            ("checkVisibility", Method(0)),
+            ("scrollIntoView", Method(0)),
             ("setPointerCapture", Method(1)),
             ("releasePointerCapture", Method(1)),
             ("hasPointerCapture", Method(1)),
@@ -347,6 +349,7 @@ static INTERFACES: &[Interface] = &[
             ("createRange", Method(0)),
             ("getSelection", Method(0)),
             ("elementFromPoint", Method(2)),
+            ("elementsFromPoint", Method(2)),
             ("append", Method(0)),
             ("prepend", Method(0)),
             ("replaceChildren", Method(0)),
@@ -1589,6 +1592,22 @@ impl ScriptRuntime {
                 let data = self.coerce_string(first)?;
                 let created = self.document.borrow_mut().create_comment(data);
                 self.node_value(created)
+            }
+            ("elementsFromPoint", Access::Call) if on_document => {
+                let x = self.coerce_number(first)?;
+                let y = self.coerce_number(second)?;
+                let elements = self.elements_from_point(x, y);
+                Self::new_array(
+                    elements
+                        .into_iter()
+                        .map(|node| self.node_value(node))
+                        .collect(),
+                )
+            }
+            ("checkVisibility", Access::Call) => Value::Bool(self.check_visibility(node, &first)?),
+            ("scrollIntoView", Access::Call) => {
+                self.scroll_into_view(node, &first)?;
+                Value::Undefined
             }
             ("elementFromPoint", Access::Call) if on_document => {
                 let x = self.coerce_number(first)?;

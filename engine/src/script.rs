@@ -54,7 +54,7 @@ pub use dates::TimeZone;
 pub(crate) use debugger::{Incoming, PauseSource, SharedDebug};
 pub(crate) use geometry::LayoutInputs;
 pub(crate) use images::image_key;
-pub(crate) use inspector::{Answer, FRAME_ID, NodeArgument, NodeCall, encoded_body};
+pub(crate) use inspector::{Answer, NodeArgument, NodeCall, encoded_body, frame_id, set_frame_id};
 pub(crate) use websocket::accept_key;
 
 use crate::Color;

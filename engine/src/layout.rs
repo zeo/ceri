@@ -1493,6 +1493,11 @@ impl LayoutDocument {
         scroll_target_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
     }
 
+    // a node's box when it scrolls, with where in the viewport its content shows
+    pub(crate) fn scroll_box(&self, node: NodeId) -> Option<(ScrollTarget, Rect)> {
+        find_scroll_box(&self.root, node, (0.0, 0.0))
+    }
+
     // maps a pointer over a scrollbar thumb to the drag state that moves it
     pub(crate) fn thumb_drag_at(&self, x: f32, y: f32) -> Option<ThumbDrag> {
         thumb_drag_box(&self.root, x, y, Some(self.root.rect), (0.0, 0.0))
@@ -2484,6 +2489,33 @@ fn scroll_target_box(
         }
     }
     None
+}
+
+fn find_scroll_box(
+    layout: &LayoutBox,
+    node: NodeId,
+    ancestor_offset: (f32, f32),
+) -> Option<(ScrollTarget, Rect)> {
+    let visual_offset = visual_offset_for(layout, ancestor_offset);
+    if layout.node == node {
+        let (max_x, max_y) = user_scroll_range(layout);
+        if max_x > 0.0 || max_y > 0.0 {
+            let target = ScrollTarget {
+                node,
+                max_x,
+                max_y,
+                offset: layout.scroll_offset,
+            };
+            return Some((
+                target,
+                translate_rect(overflow_clip_rect(layout), visual_offset),
+            ));
+        }
+    }
+    layout
+        .children
+        .iter()
+        .find_map(|child| find_scroll_box(child, node, visual_offset))
 }
 
 fn contains_point(rect: Rect, x: f32, y: f32) -> bool {

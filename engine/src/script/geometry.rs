@@ -2,7 +2,7 @@
 // style, media queries, the performance timeline and idle callbacks
 
 use super::object::{JsObject, ObjectClass, Property, new_object};
-use super::operations::{is_callable, number_to_string, plain_object};
+use super::operations::{is_callable, is_primitive, number_to_string, plain_object};
 use super::realm::Native;
 use super::*;
 use crate::css::{
@@ -418,6 +418,125 @@ impl ScriptRuntime {
             .flat_map(|node| std::iter::once(node).chain(document.ancestors(node)))
             .find(|&node| document.element(node).is_some())
             .or_else(|| document.document_element())
+    }
+
+    // every element at a viewport point from the top down; this follows the top element's
+    // ancestry, so a box overlapping it from elsewhere in the tree is left out
+    pub(super) fn elements_from_point(&self, x: f64, y: f64) -> Vec<NodeId> {
+        let Some(top) = self.element_from_point(x, y) else {
+            return Vec::new();
+        };
+        let document = self.document.borrow();
+        std::iter::once(top)
+            .chain(document.ancestors(top))
+            .filter(|&node| document.element(node).is_some())
+            .collect()
+    }
+
+    // whether an element is rendered, as Element.checkVisibility answers: it needs a box, and
+    // the options can also ask for a nonzero opacity up its ancestry and a visible visibility
+    pub(super) fn check_visibility(
+        &mut self,
+        node: NodeId,
+        options: &Value,
+    ) -> Result<bool, ScriptError> {
+        if self.node_boxes(node).is_empty() {
+            return Ok(false);
+        }
+        let mut asked = |names: [&str; 2]| -> Result<bool, ScriptError> {
+            if is_primitive(options) {
+                return Ok(false);
+            }
+            for name in names {
+                if self.get_property(options, name)?.truthy() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let opacity = asked(["checkOpacity", "opacityProperty"])?;
+        let visibility = asked(["checkVisibilityCSS", "visibilityProperty"])?;
+        if visibility
+            && self
+                .computed_snapshot(node)
+                .get("visibility")
+                .map(String::as_str)
+                != Some("visible")
+        {
+            return Ok(false);
+        }
+        if opacity {
+            let ancestry: Vec<NodeId> = {
+                let document = self.document.borrow();
+                std::iter::once(node)
+                    .chain(document.ancestors(node))
+                    .filter(|&ancestor| document.element(ancestor).is_some())
+                    .collect()
+            };
+            for ancestor in ancestry {
+                if self
+                    .computed_snapshot(ancestor)
+                    .get("opacity")
+                    .map(String::as_str)
+                    == Some("0")
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    // scrolls each box around an element, innermost first, until the element shows where the
+    // block and inline alignments put it, as Element.scrollIntoView does
+    pub(super) fn scroll_into_view(
+        &mut self,
+        node: NodeId,
+        options: &Value,
+    ) -> Result<(), ScriptError> {
+        let (block, inline) = match options {
+            Value::Bool(false) => ("end".to_string(), "nearest".to_string()),
+            options if !is_primitive(options) => {
+                let mut read = |name: &str, default: &str| -> Result<String, ScriptError> {
+                    match self.get_property(options, name)? {
+                        Value::Undefined => Ok(default.to_string()),
+                        value => self.coerce_string(value),
+                    }
+                };
+                (read("block", "start")?, read("inline", "nearest")?)
+            }
+            _ => ("start".to_string(), "nearest".to_string()),
+        };
+        let Some(mut rect) = self.bounding_box(node) else {
+            return Ok(());
+        };
+        let ancestors: Vec<NodeId> = self.document.borrow().ancestors(node).collect();
+        let boxes: Vec<_> = match self.measure() {
+            Some(measured) => ancestors
+                .into_iter()
+                .filter_map(|ancestor| measured.layout.scroll_box(ancestor))
+                .collect(),
+            None => return Ok(()),
+        };
+        let root = self.document.borrow().root();
+        for (target, port) in boxes {
+            let x = align_delta(rect.x, rect.width, port.x, port.width, &inline);
+            let y = align_delta(rect.y, rect.height, port.y, port.height, &block);
+            let offset = (
+                (target.offset.0 + x).clamp(0.0, target.max_x),
+                (target.offset.1 + y).clamp(0.0, target.max_y),
+            );
+            rect.x -= offset.0 - target.offset.0;
+            rect.y -= offset.1 - target.offset.1;
+            if self.set_scroll_offset(target.node, offset) {
+                if target.node == root {
+                    self.dispatch_window_event("scroll")?;
+                } else {
+                    self.dispatch_node_event(target.node, "scroll")?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn bounding_box(&self, node: NodeId) -> Option<Rect> {
@@ -1209,5 +1328,19 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             .resolve(0.0, font_size)
             .filter(|spacing| *spacing != 0.0)
             .map_or_else(|| "normal".to_string(), px),
+    }
+}
+
+// how far a scrollport moves so a span inside it lines up as the alignment asks; nearest
+// moves the least that shows the span, or not at all when it already shows or overfills
+fn align_delta(start: f32, size: f32, port: f32, port_size: f32, alignment: &str) -> f32 {
+    let (end, port_end) = (start + size, port + port_size);
+    match alignment {
+        "start" => start - port,
+        "end" => end - port_end,
+        "center" => (start + end - port - port_end) / 2.0,
+        _ if (start < port) == (end > port_end) => 0.0,
+        _ if (start < port) == (size <= port_size) => start - port,
+        _ => end - port_end,
     }
 }

@@ -8,10 +8,12 @@ mod overlay;
 mod styles;
 
 use super::{AppUrl, Browser, NavigationError, Size};
+use crate::css::ColorScheme;
 use crate::dom::NodeId;
-use crate::script::{Answer, FRAME_ID, PauseSource, ScriptRuntime, SharedDebug};
+use crate::script::{Answer, PauseSource, ScriptRuntime, SharedDebug, frame_id};
 use serde_json::{Value as Json, json};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 // a protocol error's code and message
@@ -52,6 +54,12 @@ struct Session {
     context: Option<u64>,
     seen: u64,
     dom: dom::Mirror,
+    // the document whose lifecycle the session was told of, while it asks for lifecycle events
+    lifecycle: Option<Option<u64>>,
+    // the named worlds the session made, each a context over the page's own realm
+    worlds: Vec<String>,
+    // scripts for each new document, with their identifiers and worlds
+    scripts: Vec<(u64, String, String)>,
 }
 
 // an answer held until a promise settles in the context that made it
@@ -77,7 +85,25 @@ impl Browser {
             context: None,
             seen: 0,
             dom: dom::Mirror::default(),
+            lifecycle: None,
+            worlds: Vec::new(),
+            scripts: Vec::new(),
         });
+    }
+
+    // answers a call the window's host handled for a session
+    pub(crate) fn answer_inspector(&self, session: u64, id: u64, answer: Result<Json, Failure>) {
+        let response = match answer {
+            Ok(result) => json!({ "id": id, "result": result }),
+            Err((code, message)) => error(id, code, &message),
+        };
+        self.send(session, response);
+    }
+
+    pub(crate) fn document_scroll(&self) -> (f32, f32) {
+        self.page
+            .as_ref()
+            .map_or((0.0, 0.0), |page| page.runtime.document_scroll_offset())
     }
 
     // where a page paused in its debugger reads the window's devtools messages
@@ -229,7 +255,66 @@ impl Browser {
                 }
                 Some(Ok(json!({})))
             }
-            "Runtime.runIfWaitingForDebugger" => Some(Ok(json!({}))),
+            // a page has no child targets, keeps no browser log apart from its console, and is
+            // focused for its sessions already
+            "Runtime.runIfWaitingForDebugger"
+            | "Target.setAutoAttach"
+            | "Log.enable"
+            | "Log.disable"
+            | "Inspector.enable"
+            | "Inspector.disable"
+            | "Emulation.setFocusEmulationEnabled" => Some(Ok(json!({}))),
+            "Emulation.setEmulatedMedia" => Some(self.emulate_media(params)),
+            "Page.setLifecycleEventsEnabled" => {
+                let enabled = params["enabled"] == true;
+                if let Some(held) = self.session(session) {
+                    held.lifecycle = enabled.then_some(None);
+                }
+                Some(Ok(json!({})))
+            }
+            "Page.createIsolatedWorld" => {
+                let name = params["worldName"].as_str().unwrap_or_default().to_string();
+                let origin = self.frame()["securityOrigin"].clone();
+                let context = self
+                    .page
+                    .as_ref()
+                    .map(|page| page.runtime.inspector_context());
+                match (self.session(session), context) {
+                    (Some(held), Some(context)) => {
+                        let world = add_world(held, &name);
+                        if held.runtime {
+                            announce_world(held, context, world, &name, &origin);
+                        }
+                        Some(Ok(
+                            json!({ "executionContextId": world_id(context, world) }),
+                        ))
+                    }
+                    _ => Some(Err((-32000, "Could not create isolated world".into()))),
+                }
+            }
+            "Page.addScriptToEvaluateOnNewDocument" => {
+                let source = params["source"].as_str().unwrap_or_default().to_string();
+                let world = params["worldName"].as_str().unwrap_or_default().to_string();
+                let immediately = params["runImmediately"] == true && world.is_empty();
+                let identifier = NEXT_SCRIPT.fetch_add(1, Ordering::Relaxed);
+                if let Some(held) = self.session(session) {
+                    if !world.is_empty() {
+                        add_world(held, &world);
+                    }
+                    held.scripts.push((identifier, source.clone(), world));
+                }
+                if immediately && let Some(page) = &mut self.page {
+                    let _ = page.runtime.execute_reporting(&source);
+                }
+                Some(Ok(json!({ "identifier": identifier.to_string() })))
+            }
+            "Page.removeScriptToEvaluateOnNewDocument" => {
+                let identifier = params["identifier"].as_str().unwrap_or_default();
+                if let Some(held) = self.session(session) {
+                    held.scripts.retain(|(id, ..)| id.to_string() != identifier);
+                }
+                Some(Ok(json!({})))
+            }
             "Page.getResourceTree" => Some(Ok(json!({
                 "frameTree": { "frame": self.frame(), "resources": [] },
             }))),
@@ -241,9 +326,9 @@ impl Browser {
             "Page.navigate" => match params["url"].as_str() {
                 Some(url) => {
                     navigate = Some(url.to_string());
-                    Some(Ok(
-                        json!({ "frameId": FRAME_ID, "loaderId": self.loader() }),
-                    ))
+                    // the document the navigation makes, as its frameNavigated will name it
+                    let loader = self.next_document_id.to_string();
+                    Some(Ok(json!({ "frameId": frame_id(), "loaderId": loader })))
                 }
                 None => Some(Err((-32602, "Invalid parameters: url".to_string()))),
             },
@@ -355,13 +440,48 @@ impl Browser {
     }
 
     // tells the sessions of a document about to run its scripts, so its frame and context reach
-    // them before the scripts it parses and any pause in those
-    pub(super) fn announce_document(&mut self, url: &AppUrl, runtime: &ScriptRuntime) {
+    // them before the scripts it parses and any pause in those, and runs their scripts for it
+    pub(super) fn announce_document(&mut self, url: &AppUrl, runtime: &mut ScriptRuntime) {
         let frame = self.frame_at(Some(url), self.next_document_id);
         let context = runtime.inspector_context();
         for session in &mut self.inspection.sessions {
             enter_context(session, context, &frame);
         }
+        let sources: Vec<String> = self
+            .inspection
+            .sessions
+            .iter()
+            .flat_map(|session| &session.scripts)
+            .filter(|(_, _, world)| world.is_empty())
+            .map(|(_, source, _)| source.clone())
+            .collect();
+        for source in sources {
+            let _ = runtime.execute_reporting(&source);
+        }
+    }
+
+    // prefers-color-scheme and prefers-reduced-motion follow the session; a media type or any
+    // other preference the engine can't show is refused rather than ignored
+    fn emulate_media(&mut self, params: &Json) -> Result<Json, Failure> {
+        let unsupported = |what: &str| Err((-32000, format!("Emulating {what} is not supported")));
+        if !matches!(params["media"].as_str(), None | Some("" | "screen")) {
+            return unsupported("a media type");
+        }
+        let mut preferences = self.user_preferences();
+        for feature in params["features"].as_array().into_iter().flatten() {
+            let value = feature["value"].as_str().unwrap_or_default();
+            match (feature["name"].as_str().unwrap_or_default(), value) {
+                (_, "") => {}
+                ("prefers-color-scheme", "light") => preferences.color_scheme = ColorScheme::Light,
+                ("prefers-color-scheme", "dark") => preferences.color_scheme = ColorScheme::Dark,
+                ("prefers-reduced-motion", "reduce") => preferences.reduced_motion = true,
+                ("prefers-reduced-motion", "no-preference") => preferences.reduced_motion = false,
+                ("forced-colors", "none") | ("prefers-contrast", "no-preference") => {}
+                (name, _) => return unsupported(name),
+            }
+        }
+        self.set_user_preferences(preferences);
+        Ok(json!({}))
     }
 
     // sends each session what changed since the last call: a new document's context, console
@@ -428,6 +548,27 @@ impl Browser {
                     let _ = session.outgoing.send(event.to_string());
                 }
             }
+            // a document is whole once the call that loaded it returns, so its events go at once
+            if let Some(told) = session.lifecycle
+                && told != Some(context)
+            {
+                session.lifecycle = Some(Some(context));
+                let timestamp = crate::netlog::now();
+                for name in [
+                    "init",
+                    "commit",
+                    "DOMContentLoaded",
+                    "load",
+                    "networkAlmostIdle",
+                    "networkIdle",
+                ] {
+                    post(
+                        session,
+                        "Page.lifecycleEvent",
+                        json!({ "frameId": frame_id(), "loaderId": frame["loaderId"], "name": name, "timestamp": timestamp }),
+                    );
+                }
+            }
         }
         if self.inspection.sessions.iter().any(|held| held.css) {
             self.sync_sheets();
@@ -452,10 +593,6 @@ impl Browser {
             .map_or_else(|| "about:blank".to_string(), ToString::to_string)
     }
 
-    fn loader(&self) -> String {
-        self.current_document_id.unwrap_or_default().to_string()
-    }
-
     fn frame(&self) -> Json {
         self.frame_at(
             self.current_url.as_ref(),
@@ -465,7 +602,7 @@ impl Browser {
 
     fn frame_at(&self, url: Option<&AppUrl>, loader: u64) -> Json {
         json!({
-            "id": FRAME_ID,
+            "id": frame_id(),
             "loaderId": loader.to_string(),
             "url": url.map_or_else(|| "about:blank".to_string(), ToString::to_string),
             "domainAndRegistry": "",
@@ -505,15 +642,51 @@ fn enter_context(session: &mut Session, context: u64, frame: &Json) {
                 "origin": frame["securityOrigin"],
                 "name": "",
                 "uniqueId": context.to_string(),
-                "auxData": { "isDefault": true, "type": "default", "frameId": FRAME_ID },
+                "auxData": { "isDefault": true, "type": "default", "frameId": frame_id() },
             }}),
         );
+        for (index, name) in session.worlds.iter().enumerate() {
+            announce_world(session, context, index, name, &frame["securityOrigin"]);
+        }
         session.seen = 0;
     }
     if session.dom.active() {
         post(session, "DOM.documentUpdated", json!({}));
     }
     session.dom = dom::Mirror::default();
+}
+
+static NEXT_SCRIPT: AtomicU64 = AtomicU64::new(1);
+
+fn add_world(session: &mut Session, name: &str) -> usize {
+    match session.worlds.iter().position(|held| held == name) {
+        Some(index) => index,
+        None => {
+            session.worlds.push(name.to_string());
+            session.worlds.len() - 1
+        }
+    }
+}
+
+// a world's id sits above any document's own context id, so each document's worlds are told
+// apart and calls into them run in that document's realm
+fn world_id(context: u64, world: usize) -> u64 {
+    (1 << 40) | (context << 8) | (world as u64 + 1)
+}
+
+fn announce_world(session: &Session, context: u64, world: usize, name: &str, origin: &Json) {
+    let id = world_id(context, world);
+    post(
+        session,
+        "Runtime.executionContextCreated",
+        json!({ "context": {
+            "id": id,
+            "origin": origin,
+            "name": name,
+            "uniqueId": id.to_string(),
+            "auxData": { "isDefault": false, "type": "isolated", "frameId": frame_id() },
+        }}),
+    );
 }
 
 fn post(session: &Session, method: &str, params: Json) {
@@ -1419,7 +1592,7 @@ mod tests {
                 "{expected:?} in {seen:?}"
             );
         }
-        let loader = browser.loader();
+        let loader = browser.frame()["loaderId"].clone();
         assert!(requests.iter().all(|params| params["loaderId"] == loader));
         let id_of = |kind: &str, method: &str| {
             let index = seen
@@ -1582,7 +1755,7 @@ mod tests {
         );
         let text = &DEBUGGED[24..DEBUGGED.find("</script>").unwrap()];
         assert_eq!(result(&sent, 2)["scriptSource"], text);
-        let page_content = json!({ "frameId": FRAME_ID, "url": page });
+        let page_content = json!({ "frameId": frame_id(), "url": page });
         let sent = call(
             &mut browser,
             &messages,
@@ -1805,5 +1978,101 @@ mod tests {
             sent[0]["error"]["message"],
             "Can only perform operation while paused."
         );
+    }
+
+    #[test]
+    fn automation_worlds_scripts_lifecycle_and_media_follow_the_page() {
+        let (mut browser, messages) =
+            inspected("<script>window.seen = window.early; document.title = 'worlds'</script>");
+        call(&mut browser, &messages, 1, "Page.enable", json!({}));
+        let sent = call(&mut browser, &messages, 2, "Runtime.enable", json!({}));
+        let main = sent[0]["params"]["context"]["id"].clone();
+        call(
+            &mut browser,
+            &messages,
+            3,
+            "Page.setLifecycleEventsEnabled",
+            json!({ "enabled": true }),
+        );
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame_id(), "worldName": "utility" }),
+        );
+        let created = named(&sent, "Runtime.executionContextCreated");
+        let world = &created[0]["context"];
+        assert_eq!(world["name"], "utility");
+        assert_eq!(world["auxData"]["isDefault"], false);
+        assert_eq!(world["auxData"]["type"], "isolated");
+        assert_eq!(world["id"], result(&sent, 4)["executionContextId"]);
+        assert_ne!(world["id"], main);
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            5,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": "window.early = 'first'" }),
+        );
+        assert!(result(&sent, 5)["identifier"].is_string());
+        let reload = json!({ "id": 6, "method": "Page.reload", "params": {} });
+        let url = browser
+            .inspect(1, &reload.to_string())
+            .expect("a reload should navigate");
+        browser.navigate(&url).expect("the page should load again");
+        browser.flush_inspector();
+        let sent = received(&messages);
+        let lifecycle: Vec<_> = named(&sent, "Page.lifecycleEvent")
+            .iter()
+            .map(|event| event["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            lifecycle,
+            [
+                "init",
+                "commit",
+                "DOMContentLoaded",
+                "load",
+                "networkAlmostIdle",
+                "networkIdle"
+            ]
+        );
+        let worlds: Vec<_> = named(&sent, "Runtime.executionContextCreated")
+            .iter()
+            .map(|event| event["context"]["name"].clone())
+            .collect();
+        assert_eq!(worlds, [json!(""), json!("utility")]);
+        let sent = evaluate(&mut browser, &messages, 7, "window.seen");
+        assert_eq!(result(&sent, 7)["result"]["value"], "first");
+
+        let sent = call(
+            &mut browser,
+            &messages,
+            8,
+            "Emulation.setEmulatedMedia",
+            json!({ "media": "", "features": [
+                { "name": "prefers-color-scheme", "value": "dark" },
+                { "name": "prefers-reduced-motion", "value": "reduce" },
+                { "name": "forced-colors", "value": "none" },
+            ] }),
+        );
+        assert_eq!(result(&sent, 8), &json!({}));
+        let sent = evaluate(
+            &mut browser,
+            &messages,
+            9,
+            "matchMedia('(prefers-color-scheme: dark)').matches && matchMedia('(prefers-reduced-motion: reduce)').matches",
+        );
+        assert_eq!(result(&sent, 9)["result"]["value"], true);
+        let sent = call(
+            &mut browser,
+            &messages,
+            10,
+            "Emulation.setEmulatedMedia",
+            json!({ "media": "print" }),
+        );
+        assert_eq!(sent[0]["error"]["code"], -32000);
     }
 }

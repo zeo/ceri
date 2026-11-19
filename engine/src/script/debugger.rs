@@ -3,7 +3,7 @@
 // sessions look at the stack
 
 use super::compiler::{Code, Op};
-use super::inspector::FRAME_ID;
+use super::inspector::frame_id;
 use super::object::new_object;
 use super::operations::same_value;
 use super::vm::{Frame, ScopeRef};
@@ -322,7 +322,7 @@ impl ScriptRuntime {
                 "endColumn": end_column,
                 "executionContextId": self.inspector_context(),
                 "hash": hash(&script.text),
-                "executionContextAuxData": { "isDefault": true, "type": "default", "frameId": FRAME_ID },
+                "executionContextAuxData": { "isDefault": true, "type": "default", "frameId": frame_id() },
                 "isLiveEdit": false,
                 "sourceMapURL": "",
                 "hasSourceURL": false,

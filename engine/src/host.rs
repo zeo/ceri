@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod automation;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
     Primary,
@@ -260,9 +262,15 @@ impl EngineWorker {
         let page = devtools
             .as_ref()
             .map(|registration| registration.page.clone());
+        let target = devtools
+            .as_ref()
+            .map(|registration| registration.id.clone());
         thread::Builder::new()
             .name("ceri-engine".to_string())
             .spawn(move || {
+                if let Some(target) = target {
+                    crate::script::set_frame_id(&target);
+                }
                 let mut browser = match factory() {
                     Ok(browser) => browser,
                     Err(error) => {
@@ -671,6 +679,10 @@ fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineW
                 Inbound::Message { session, text } => {
                     // whatever the session ran may have changed the page
                     host.dirty = true;
+                    if let Some((id, answer)) = host.automation_call(&text) {
+                        host.browser.answer_inspector(session, id, answer);
+                        return None;
+                    }
                     if let Some(url) = host.browser.inspect(session, &text) {
                         return Some(EngineWorkerEvent::Navigated {
                             request_id: 0,
@@ -1092,6 +1104,7 @@ mod tests {
         APP_ORIGIN, AppUrl, Resource, ResourceBundle, ResourceProvider, ResourceRequest,
         ResourceResponse,
     };
+    use serde_json::{Value as Json, json};
     use std::collections::BTreeMap;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -2550,6 +2563,106 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("card:true:true:10")
+        );
+    }
+
+    #[test]
+    fn devtools_input_and_screenshots_reach_the_host() {
+        let browser = Browser::new(bundle(
+            r#"<button id="go" style="display: block; width: 100px; height: 30px; margin: 0">go</button><input id="field" style="display: block; width: 100px; height: 30px; margin: 0; padding: 0; border: 0"><p id="status">idle</p><script>
+                const status = document.getElementById("status");
+                document.getElementById("go").addEventListener("click", () => { status.textContent = "clicked"; });
+                document.getElementById("field").addEventListener("input", (event) => { status.textContent = event.target.value; });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 160.0,
+                height: 100.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let mut id = 0;
+        let mut call = |host: &mut EngineHost, method: &str, params: Json| {
+            id += 1;
+            let message = json!({ "id": id, "method": method, "params": params });
+            let (answered, answer) = host
+                .automation_call(&message.to_string())
+                .unwrap_or_else(|| panic!("the host should answer {method}"));
+            assert_eq!(answered, id);
+            answer.unwrap_or_else(|error| panic!("{method} failed: {error:?}"))
+        };
+        let status = |host: &EngineHost| {
+            let document = host.browser().document().expect("document should exist");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status should exist");
+            document.borrow().element_text_content(status)
+        };
+        let press = |kind: &str, x: f32, y: f32| json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 });
+        call(
+            &mut host,
+            "Input.dispatchMouseEvent",
+            press("mousePressed", 50.0, 15.0),
+        );
+        call(
+            &mut host,
+            "Input.dispatchMouseEvent",
+            press("mouseReleased", 50.0, 15.0),
+        );
+        assert_eq!(status(&host).as_deref(), Some("clicked"));
+
+        call(
+            &mut host,
+            "Input.dispatchMouseEvent",
+            press("mousePressed", 50.0, 45.0),
+        );
+        call(
+            &mut host,
+            "Input.dispatchMouseEvent",
+            press("mouseReleased", 50.0, 45.0),
+        );
+        for key in ["d", "e"] {
+            let down = json!({ "type": "keyDown", "key": key, "code": "", "text": key });
+            call(&mut host, "Input.dispatchKeyEvent", down);
+            call(
+                &mut host,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyUp", "key": key }),
+            );
+        }
+        let backspace =
+            json!({ "type": "rawKeyDown", "key": "Backspace", "code": "Backspace", "text": "" });
+        call(&mut host, "Input.dispatchKeyEvent", backspace);
+        call(&mut host, "Input.insertText", json!({ "text": "xy" }));
+        assert_eq!(status(&host).as_deref(), Some("dxy"));
+
+        let metrics = call(&mut host, "Page.getLayoutMetrics", json!({}));
+        assert_eq!(metrics["cssLayoutViewport"]["clientWidth"], 160.0);
+        assert_eq!(metrics["cssVisualViewport"]["scale"], 1);
+        // the status paragraph runs past the viewport's foot
+        assert!(metrics["cssContentSize"]["height"].as_f64() > Some(100.0));
+
+        let shot = |host: &mut EngineHost,
+                    call: &mut dyn FnMut(&mut EngineHost, &str, Json) -> Json,
+                    params: Json| {
+            let answer = call(host, "Page.captureScreenshot", params);
+            let data = answer["data"].as_str().expect("a screenshot carries data");
+            let (_, bytes) =
+                crate::image::decode_data_url(&format!("data:image/png;base64,{data}"))
+                    .expect("the data should be base64");
+            let image = crate::png::decode_png(&bytes).expect("the data should be a png");
+            (image.width, image.height)
+        };
+        assert_eq!(shot(&mut host, &mut call, json!({})), (160, 100));
+        let clip = json!({ "clip": { "x": 0, "y": 0, "width": 80, "height": 40, "scale": 1 } });
+        assert_eq!(shot(&mut host, &mut call, clip), (80, 40));
+        assert!(
+            host.automation_call(r#"{"id":9,"method":"Page.navigate","params":{}}"#)
+                .is_none()
         );
     }
 

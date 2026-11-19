@@ -7,7 +7,19 @@ use super::*;
 use serde_json::{Value as Json, json};
 use std::sync::atomic::AtomicU64;
 
-pub(crate) const FRAME_ID: &str = "ceri-main-frame";
+thread_local! {
+    static FRAME_ID: RefCell<String> = RefCell::new("ceri-main-frame".to_string());
+}
+
+// a page's main frame shares its id with the devtools target the page's window is, as a
+// chromium page's does, so automation can find one from the other
+pub(crate) fn frame_id() -> String {
+    FRAME_ID.with_borrow(Clone::clone)
+}
+
+pub(crate) fn set_frame_id(id: &str) {
+    FRAME_ID.set(id.to_string());
+}
 
 // v8's console message storage keeps as many
 const KEPT_MESSAGES: usize = 1000;

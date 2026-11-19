@@ -1,7 +1,7 @@
 // the CSS domain: the page's sheets, the rules that match a node with where each was written,
 // its computed style, edits to sheets and style attributes, and pseudo-classes held on
 
-use super::{FRAME_ID, Failure, dom, post};
+use super::{Failure, dom, frame_id, post};
 use crate::css::{
     self, FORCEABLE_PSEUDO_CLASSES, MatchedRule, PseudoElement, Stylesheet, USER_AGENT_CSS,
 };
@@ -528,7 +528,7 @@ fn header(id: u64, sheet: &Listed) -> Json {
     let (end_line, end_column) = lines.position(&sheet.text, sheet.text.len());
     json!({
         "styleSheetId": sheet_id(id),
-        "frameId": FRAME_ID,
+        "frameId": frame_id(),
         "sourceURL": sheet.url,
         "origin": "regular",
         "title": "",

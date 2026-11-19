@@ -1639,7 +1639,7 @@ impl Browser {
         }
         let html = inspecting.then_some(source.as_str());
         if inspecting {
-            self.announce_document(&url, &runtime);
+            self.announce_document(&url, &mut runtime);
         }
         self.execute_scripts(&url, html, &script_sources, &policies, &mut runtime);
         if let Err(error) = runtime.apply_autofocus() {
@@ -6935,6 +6935,42 @@ mod tests {
             Some(format!(
                 "{family}|0.6px|{family}|{family}|18.2px|head||HTML"
             ))
+        );
+    }
+
+    #[test]
+    fn visibility_hit_lists_and_scrolling_into_view_follow_the_layout() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0; font: 16px/20px sans-serif } div { margin: 0 }</style><div id="outer" style="height: 50px; overflow: auto"><div id="spacer" style="height: 200px"></div><div id="target" style="height: 20px">t</div></div><div id="hidden" style="display: none">h</div><div id="faded" style="opacity: 0"><span id="inner">x</span></div><div id="invisible" style="visibility: hidden">i</div><div style="height: 1000px"></div><div id="far">far</div><p id="status">idle</p><script>
+                const $ = (id) => document.getElementById(id);
+                const hits = document.elementsFromPoint(2, 2).map((element) => element.id || element.tagName).join(" ");
+                const visible = [
+                    $("hidden").checkVisibility(), $("inner").checkVisibility(),
+                    $("inner").checkVisibility({ checkOpacity: true }), $("invisible").checkVisibility(),
+                    $("invisible").checkVisibility({ visibilityProperty: true }),
+                ].join(" ");
+                $("target").scrollIntoView();
+                const first = [$("outer").scrollTop, scrollY].join(" ");
+                $("far").scrollIntoView({ block: "end" });
+                $("status").textContent = [hits, visible, first, Math.round($("far").getBoundingClientRect().bottom)].join("|");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("spacer outer BODY HTML|false true false true false|170 30|300")
         );
     }
 
