@@ -3858,9 +3858,32 @@ impl ScriptRuntime {
                 "languages" => Ok(Value::Array(Rc::new(RefCell::new(vec![Value::String(
                     self.locale.as_str().into(),
                 )])))),
-                _ => Err(runtime_error(format!(
-                    "navigator has no property {property}"
-                ))),
+                "userAgent" => Ok(Value::String(crate::devtools::user_agent().into())),
+                "appVersion" => Ok(Value::String(
+                    crate::devtools::user_agent()
+                        .trim_start_matches("Mozilla/")
+                        .into(),
+                )),
+                // the names every browser answers with, whatever it is
+                "appName" => Ok(Value::String("Netscape".into())),
+                "appCodeName" => Ok(Value::String("Mozilla".into())),
+                "product" => Ok(Value::String("Gecko".into())),
+                "vendor" | "vendorSub" | "productSub" => Ok(Value::String("".into())),
+                "platform" => Ok(Value::String(
+                    match std::env::consts::OS {
+                        "windows" => "Win32",
+                        "macos" => "MacIntel",
+                        _ => "Linux x86_64",
+                    }
+                    .into(),
+                )),
+                "onLine" | "cookieEnabled" => Ok(Value::Bool(true)),
+                "webdriver" | "pdfViewerEnabled" => Ok(Value::Bool(false)),
+                "maxTouchPoints" => Ok(Value::Number(0.0)),
+                "hardwareConcurrency" => Ok(Value::Number(
+                    std::thread::available_parallelism().map_or(1, |count| count.get()) as f64,
+                )),
+                _ => Ok(Value::Undefined),
             },
             Value::Clipboard => match property {
                 "readText" => Ok(Value::Builtin(Builtin::ClipboardReadText)),
@@ -16168,6 +16191,33 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("1 function ReferenceError")
+        );
+    }
+
+    #[test]
+    fn navigator_names_the_runtime_and_the_platform() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const agent = navigator.userAgent;
+                document.getElementById("status").textContent = [
+                    agent.startsWith("Mozilla/5.0 ("), agent.includes("Ceri/"),
+                    ["Windows", "Linux", "Mac"].some((name) => agent.includes(name)),
+                    typeof navigator.platform, navigator.onLine, navigator.hardwareConcurrency >= 1,
+                    navigator.appName, navigator.notAThing,
+                ].join(" ");
+                "#,
+            )
+            .expect("navigator should answer");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("true true true string true true Netscape ")
         );
     }
 

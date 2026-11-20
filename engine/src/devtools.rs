@@ -315,7 +315,7 @@ fn product() -> String {
     format!("Ceri/{}", env!("CARGO_PKG_VERSION"))
 }
 
-fn user_agent() -> String {
+pub(crate) fn user_agent() -> String {
     let platform = match std::env::consts::OS {
         "windows" => "Windows NT 10.0; Win64; x64",
         "macos" => "Macintosh; Intel Mac OS X 10_15_7",
