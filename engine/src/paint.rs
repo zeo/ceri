@@ -590,6 +590,7 @@ impl Canvas {
             }
             return;
         }
+        let _profile = crate::profile::scope("paint: shape");
         let device = self.device_shape(shape);
         let clip = clip.map(|clip| self.device_shape(Shape::square(clip)));
         let left = device.x.floor().max(0.0) as u32;
@@ -601,9 +602,21 @@ impl Canvas {
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
         let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
+        let (left, right) = (left.min(self.width), right.min(self.width));
+        let steady = paint.steady();
+        let mut columns = None;
         for pixel_y in top.min(self.height)..bottom.min(self.height) {
-            for pixel_x in left.min(self.width)..right.min(self.width) {
-                let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+            let row = pixel_y as f32 + 0.5;
+            // most of a row lies whole inside the shape, where only the paint is asked for
+            let whole = device.whole_run(row, left..right);
+            let whole = match clip {
+                Some(clip) => run_where(whole, |pixel| {
+                    clip.coverage((pixel as f32 + 0.5, row)) > 0.0
+                }),
+                None => whole,
+            };
+            for pixel_x in (left..whole.start).chain(whole.end..right) {
+                let center = (pixel_x as f32 + 0.5, row);
                 if let Some(clip) = clip
                     && clip.coverage(center) <= 0.0
                 {
@@ -618,6 +631,48 @@ impl Canvas {
                     continue;
                 }
                 self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
+            }
+            let color_at = |pixel_x: u32| paint.color_at((pixel_x as f32 + 0.5, row));
+            match steady {
+                // the row is one color between the first and the last pixel its tile covers
+                Steady::AlongRows => {
+                    let drawn = run_where(whole, |pixel_x| color_at(pixel_x).alpha != 0);
+                    let color = color_at(drawn.start);
+                    if color.alpha == 255 && self.masks.is_empty() {
+                        let at = pixel_y as usize * self.width as usize * 4;
+                        let sample = [color.red, color.green, color.blue, 255];
+                        let run = at + drawn.start as usize * 4..at + drawn.end as usize * 4;
+                        for slot in self.pixels[run].as_chunks_mut::<4>().0.iter_mut() {
+                            slot.copy_from_slice(&sample);
+                        }
+                    } else {
+                        for pixel_x in drawn {
+                            self.blend_pixel(pixel_x, pixel_y, color);
+                        }
+                    }
+                }
+                // every row its tile covers repeats the first such row
+                Steady::DownColumns => {
+                    if !paint.covers_row(row) {
+                        continue;
+                    }
+                    let colors = columns
+                        .get_or_insert_with(|| (left..right).map(color_at).collect::<Vec<_>>());
+                    for pixel_x in whole {
+                        let color = colors[(pixel_x - left) as usize];
+                        if color.alpha != 0 {
+                            self.blend_pixel(pixel_x, pixel_y, color);
+                        }
+                    }
+                }
+                Steady::Nowhere => {
+                    for pixel_x in whole {
+                        let color = color_at(pixel_x);
+                        if color.alpha != 0 {
+                            self.blend_pixel(pixel_x, pixel_y, color);
+                        }
+                    }
+                }
             }
         }
     }
@@ -637,9 +692,17 @@ impl Canvas {
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
         let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
+        let _profile = crate::profile::scope("paint: border");
         for pixel_y in top..bottom {
-            for pixel_x in left..right {
-                let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+            let row = pixel_y as f32 + 0.5;
+            // the ring leaves out what lies whole inside the inner shape
+            let inside = if hollow {
+                inner.whole_run(row, left..right)
+            } else {
+                left..left
+            };
+            for pixel_x in (left..inside.start).chain(inside.end..right) {
+                let center = (pixel_x as f32 + 0.5, row);
                 if let Some(clip) = clip
                     && clip.coverage(center) <= 0.0
                 {
@@ -1276,6 +1339,18 @@ fn narrow(bounds: [u32; 4], clip: Option<Shape>) -> [u32; 4] {
     ]
 }
 
+// the pixels from the first to the last that pass a test which holds over one unbroken run
+fn run_where(pixels: std::ops::Range<u32>, holds: impl Fn(u32) -> bool) -> std::ops::Range<u32> {
+    let Some(start) = pixels.clone().find(|&pixel| holds(pixel)) else {
+        return pixels.start..pixels.start;
+    };
+    let end = pixels
+        .rev()
+        .find(|&pixel| holds(pixel))
+        .map_or(start, |last| last + 1);
+    start..end
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DeviceBounds {
     left: u32,
@@ -1545,6 +1620,43 @@ impl Shape {
         (0.5 - self.signed_distance(point)).clamp(0.0, 1.0)
     }
 
+    // the pixels of a row, by the height of their centers, that the shape covers whole: half
+    // a pixel inside every edge and clear of the corner curves, by the arithmetic of the
+    // signed distance, so coverage there is exactly one
+    fn whole_run(self, row: f32, pixels: std::ops::Range<u32>) -> std::ops::Range<u32> {
+        if self.y - row > -0.5 || row - self.y - self.height > -0.5 {
+            return pixels.start..pixels.start;
+        }
+        let bottom = row > self.y + self.height / 2.0;
+        // how far in from its side a corner's curve ends, where the row crosses the corner
+        let curve = |corner: usize| {
+            let (radius_x, radius_y) = self.radii[corner];
+            let (radius_x, radius_y) = (radius_x.min(self.width), radius_y.min(self.height));
+            let along_y = if bottom {
+                row - (self.y + self.height - radius_y)
+            } else {
+                self.y + radius_y - row
+            };
+            (radius_x > 0.0 && radius_y > 0.0 && along_y > 0.0).then_some(radius_x)
+        };
+        let (near, far) = if bottom {
+            (curve(3), curve(2))
+        } else {
+            (curve(0), curve(1))
+        };
+        let middle = self.x + self.width / 2.0;
+        run_where(pixels, |pixel| {
+            let x = pixel as f32 + 0.5;
+            self.x - x <= -0.5
+                && x - self.x - self.width <= -0.5
+                && if x > middle {
+                    far.is_none_or(|radius| x - (self.x + self.width - radius) <= 0.0)
+                } else {
+                    near.is_none_or(|radius| self.x + radius - x <= 0.0)
+                }
+        })
+    }
+
     fn signed_distance(self, point: (f32, f32)) -> f32 {
         let edge = (self.x - point.0)
             .max(point.0 - self.x - self.width)
@@ -1590,11 +1702,41 @@ enum Paint {
     Ramp(Ramp),
 }
 
+// where a paint repeats itself, which spares working every pixel out: the same color along
+// each row of its tile, or the same down each column
+#[derive(Clone, Copy)]
+enum Steady {
+    AlongRows,
+    DownColumns,
+    Nowhere,
+}
+
 impl Paint {
     fn color_at(&self, point: (f32, f32)) -> Color {
         match self {
             Self::Solid(color) => *color,
             Self::Ramp(ramp) => ramp.color_at(point),
+        }
+    }
+
+    fn steady(&self) -> Steady {
+        match self {
+            Self::Solid(_) => Steady::AlongRows,
+            Self::Ramp(ramp) => match ramp.shape {
+                RampShape::Linear(_, (0.0, _)) => Steady::AlongRows,
+                RampShape::Linear(_, (_, 0.0)) => Steady::DownColumns,
+                _ => Steady::Nowhere,
+            },
+        }
+    }
+
+    // whether the paint's tile, or a repeat of it, covers the row at this height
+    fn covers_row(&self, row: f32) -> bool {
+        match self {
+            Self::Solid(_) => true,
+            Self::Ramp(ramp) => {
+                ramp.repeat.1 || (0.0..ramp.size.1).contains(&((row - ramp.corner.1) / ramp.scale))
+            }
         }
     }
 }
@@ -1738,7 +1880,10 @@ impl Ramp {
 
 // the line through the tile's center whose ends meet the corners, and its length
 fn linear_ramp(angle: f32, width: f32, height: f32) -> (RampShape, f32) {
-    let direction = (angle.sin(), -angle.cos());
+    // the sine and cosine of a straight direction come out a hair off zero, which would
+    // tilt a gradient that runs straight down or across
+    let straight = |part: f32| if part.abs() < 1e-6 { 0.0 } else { part };
+    let direction = (straight(angle.sin()), straight(-angle.cos()));
     let length = (width * direction.0).abs() + (height * direction.1).abs();
     let start = (
         width / 2.0 - direction.0 * length / 2.0,
@@ -5343,6 +5488,92 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a shape filled by whole runs and by steady rows or columns of its paint must come out
+    // as it does asking every pixel for its coverage and color
+    #[test]
+    fn shapes_fill_by_runs_as_they_do_pixel_by_pixel() {
+        fn fill_each_pixel(canvas: &mut Canvas, shape: Shape, paint: &Paint, clip: Option<Rect>) {
+            let device = canvas.device_shape(shape);
+            let clip = clip.map(|clip| canvas.device_shape(Shape::square(clip)));
+            for pixel_y in 0..canvas.height {
+                for pixel_x in 0..canvas.width {
+                    let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+                    let coverage = device.coverage(center);
+                    let color = paint.color_at(center);
+                    if clip.is_some_and(|clip| clip.coverage(center) <= 0.0)
+                        || coverage <= 0.0
+                        || color.alpha == 0
+                    {
+                        continue;
+                    }
+                    canvas.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
+                }
+            }
+        }
+        let scale = 1.5;
+        let ramp = |axis: (f32, f32), repeat: (bool, bool)| {
+            Paint::Ramp(Ramp {
+                corner: (9.0, 6.0),
+                scale,
+                size: (40.0, 30.0),
+                repeat,
+                shape: RampShape::Linear((0.0, 0.0), axis),
+                repeating: false,
+                stops: vec![
+                    (0.0, [200.0, 30.0, 10.0, 1.0]),
+                    (0.6, [5.0, 60.0, 110.0, 0.5]),
+                    (1.0, [0.0, 0.0, 0.0, 0.0]),
+                ],
+            })
+        };
+        let paints = [
+            Paint::Solid(Color::rgba(20, 90, 200, 255)),
+            Paint::Solid(Color::rgba(20, 90, 200, 120)),
+            ramp((0.0, 1.0 / 30.0), (false, false)),
+            ramp((1.0 / 40.0, 0.0), (false, false)),
+            ramp((1.0 / 40.0, 0.0), (true, true)),
+            ramp((0.02, 0.02), (false, true)),
+        ];
+        let shapes = [
+            ([(8.0, 8.0); 4], (3.3, 2.7, 50.5, 37.2)),
+            (
+                [(30.0, 12.0), (0.0, 0.0), (4.0, 20.0), (60.0, 60.0)],
+                (0.0, 0.0, 44.0, 41.0),
+            ),
+            ([(3.0, 3.0); 4], (10.2, 10.6, 0.8, 20.0)),
+            ([(2.0, 2.0); 4], (-6.0, -4.0, 30.0, 70.0)),
+            // every edge 0.45 of a device pixel past a pixel center
+            ([(4.0, 4.0); 4], (4.7, 4.7, 30.6, 22.6)),
+        ];
+        let clips = [
+            None,
+            Some(Rect {
+                x: 7.3,
+                y: 5.1,
+                width: 21.4,
+                height: 17.9,
+            }),
+        ];
+        for paint in &paints {
+            for (radii, (x, y, width, height)) in shapes {
+                for clip in clips {
+                    let shape = Shape {
+                        x,
+                        y,
+                        width,
+                        height,
+                        radii,
+                    };
+                    let mut by_runs = Canvas::scaled(60.0, 44.0, scale, Color::WHITE);
+                    let mut by_pixels = Canvas::scaled(60.0, 44.0, scale, Color::WHITE);
+                    by_runs.fill_shape(shape, paint, clip);
+                    fill_each_pixel(&mut by_pixels, shape, paint, clip);
+                    assert!(by_runs.pixels == by_pixels.pixels, "{shape:?} in {clip:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn text_coverage_thickens_light_text_more_than_dark_text() {
