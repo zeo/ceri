@@ -2430,6 +2430,42 @@ fn a_deleted_eval_binding_stops_shadowing() {
 }
 
 #[test]
+fn eval_declares_globals_by_the_global_objects_own_attributes() {
+    check(&[
+        (
+            "a var may name an existing global",
+            "eval('var NaN'); eval('var undefined'); console.log(typeof NaN, typeof undefined)",
+            "number undefined",
+        ),
+        (
+            "a function may replace a configurable global",
+            "eval('function globalThis() { return 1; }'); console.log(typeof globalThis)",
+            "function",
+        ),
+        (
+            "the restricted globals are non-writable and non-configurable",
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'NaN'); console.log(d.writable, d.enumerable, d.configurable, Number.isNaN(d.value))",
+            "false false false true",
+        ),
+        (
+            "a function may not replace a non-configurable accessor",
+            "Object.defineProperty(globalThis, 'fixedFn', { get: function () { return 1; }, configurable: false }); try { eval('function fixedFn() {}'); console.log('no throw') } catch (e) { console.log(e instanceof TypeError, fixedFn) }",
+            "true 1",
+        ),
+        (
+            "a var may still name it",
+            "Object.defineProperty(globalThis, 'fixedVar', { get: function () { return 2; }, configurable: false }); eval('var fixedVar'); console.log(fixedVar)",
+            "2",
+        ),
+        (
+            "nothing is declared when one function is refused",
+            "try { eval('var early; function NaN() {}'); } catch (e) {} console.log(typeof early)",
+            "undefined",
+        ),
+    ]);
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (

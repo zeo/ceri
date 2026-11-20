@@ -1879,7 +1879,8 @@ impl ScriptRuntime {
             Slot::Accessor {
                 get: Some(getter), ..
             } => self.call_function(getter, Value::Window, Vec::new()),
-            _ => Ok(Value::Undefined),
+            Slot::Data(value) => Ok(value),
+            Slot::Accessor { .. } => Ok(Value::Undefined),
         })
     }
 
@@ -1917,6 +1918,16 @@ impl ScriptRuntime {
                 } => self
                     .call_function(setter, Value::Window, vec![value])
                     .map(drop),
+                Slot::Data(_) if property.writable => {
+                    let mut global = self.global.borrow_mut();
+                    if let Some(property) = global.accessors.get_mut(name) {
+                        property.slot = Slot::Data(value);
+                    }
+                    Ok(())
+                }
+                Slot::Data(_) if strict => Err(self.type_error(format!(
+                    "Cannot assign to read only property '{name}' of object '#<Window>'"
+                ))),
                 _ if strict => Err(self.type_error(format!(
                     "Cannot set property {name} of #<Window> which has only a getter"
                 ))),

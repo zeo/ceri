@@ -453,7 +453,8 @@ struct NodeHandle {
 #[derive(Default)]
 struct Environment {
     values: HashMap<String, Value>,
-    // getters and setters defined on the global object, kept apart from its data properties
+    // the global object's accessors and data properties with other attributes than a
+    // plain one's, kept apart from its plain data properties
     accessors: HashMap<String, object::Property>,
     // the names scripts declared with let, const or class, which an eval's var may not take
     lexicals: HashSet<String>,
@@ -1445,6 +1446,23 @@ impl ScriptRuntime {
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value)),
         );
+        // the value properties nothing may write, delete or redefine
+        for (name, value) in [
+            ("NaN", Value::Number(f64::NAN)),
+            ("Infinity", Value::Number(f64::INFINITY)),
+            ("undefined", Value::Undefined),
+        ] {
+            let property = object::Property {
+                slot: object::Slot::Data(value),
+                enumerable: false,
+                writable: false,
+                configurable: false,
+            };
+            global
+                .borrow_mut()
+                .accessors
+                .insert(name.to_string(), property);
+        }
         let local_storage =
             local_storage.unwrap_or_else(|| Rc::new(RefCell::new(StorageData::new())));
         let session_storage =

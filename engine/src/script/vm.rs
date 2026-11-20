@@ -1428,6 +1428,18 @@ impl ScriptRuntime {
                 let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 let strict = frame.code.strict;
                 let initialize = matches!(op, Op::InitGlobal(_));
+                // a function declaration replaces a configurable property outright, as
+                // CreateGlobalFunctionBinding defines it
+                if initialize {
+                    let mut global = self.global.borrow_mut();
+                    if global
+                        .accessors
+                        .get(&*name)
+                        .is_some_and(|property| property.configurable)
+                    {
+                        global.accessors.remove(&*name);
+                    }
+                }
                 self.set_global(&name, value, strict && !initialize)?;
             }
             Op::InitGlobalConst(name) => {

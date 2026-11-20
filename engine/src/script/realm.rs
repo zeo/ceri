@@ -1236,8 +1236,6 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     globals.push(("Proxy", Value::Object(proxy)));
 
     globals.push(("globalThis", Value::Window));
-    globals.push(("NaN", Value::Number(f64::NAN)));
-    globals.push(("Infinity", Value::Number(f64::INFINITY)));
 
     let dom = super::interfaces::create(&build, &object_prototype, &mut globals);
     let events = super::events::create(&build, &object_prototype, &mut globals);
@@ -1418,23 +1416,25 @@ impl ScriptRuntime {
         if let Some(name) = lexical {
             return Err(self.redeclaration(&name));
         }
+        // the global object here is always extensible, so CanDeclareGlobalVar holds for
+        // every name and CanDeclareGlobalFunction fails only on a property a function
+        // may not redefine
         for name in &eval.functions {
-            if Self::RESTRICTED_FUNCTION.contains(&&**name) {
+            let declarable = match self.own_property_of(&Value::Window, name)? {
+                None => true,
+                Some(property) => {
+                    property.configurable
+                        || matches!(property.slot, Slot::Data(_))
+                            && property.writable
+                            && property.enumerable
+                }
+            };
+            if !declarable {
                 return Err(self.type_error(format!("cannot declare the global function {name}")));
-            }
-        }
-        for name in &eval.declared {
-            if Self::RESTRICTED_VAR.contains(&&**name) {
-                return Err(self.type_error(format!("cannot declare the global variable {name}")));
             }
         }
         Ok(())
     }
-
-    // eval's declarations only take the global when the global can take them, as
-    // the spec's restricted global properties never can
-    const RESTRICTED_FUNCTION: [&str; 4] = ["undefined", "NaN", "Infinity", "globalThis"];
-    const RESTRICTED_VAR: [&str; 3] = ["undefined", "NaN", "Infinity"];
 
     fn redeclaration(&mut self, name: &str) -> ScriptError {
         self.throw_error(
@@ -1745,11 +1745,13 @@ impl ScriptRuntime {
                 }
                 let mut global = self.global.borrow_mut();
                 match property.slot {
-                    Slot::Data(value) => {
+                    Slot::Data(value)
+                        if property.writable && property.enumerable && property.configurable =>
+                    {
                         global.accessors.remove(&key);
                         global.values.insert(key, value);
                     }
-                    Slot::Accessor { .. } => {
+                    _ => {
                         global.values.remove(&key);
                         global.accessors.insert(key, property);
                     }
