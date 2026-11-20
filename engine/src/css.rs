@@ -777,24 +777,32 @@ struct StyleInputs {
 
 type StyleMemo = HashMap<(NodeId, Option<PseudoElement>), Vec<(StyleInputs, Style, Option<u64>)>>;
 
+// the content string of each generated box asked about, which layout asks on every visit
+type ContentMemo = HashMap<(NodeId, Option<PseudoElement>), Option<String>>;
+
 thread_local! {
     static STYLE_MEMO: RefCell<Option<StyleMemo>> = const { RefCell::new(None) };
+    static CONTENT_MEMO: RefCell<Option<ContentMemo>> = const { RefCell::new(None) };
 }
 
 pub(crate) struct MemoizedStyles {
-    previous: Option<StyleMemo>,
+    previous: (Option<StyleMemo>, Option<ContentMemo>),
 }
 
 impl Drop for MemoizedStyles {
     fn drop(&mut self) {
-        STYLE_MEMO.with(|memo| *memo.borrow_mut() = self.previous.take());
+        STYLE_MEMO.with(|memo| *memo.borrow_mut() = self.previous.0.take());
+        CONTENT_MEMO.with(|memo| *memo.borrow_mut() = self.previous.1.take());
     }
 }
 
 // the document, stylesheet and state must stay unchanged while the guard lives
 pub(crate) fn memoize_styles() -> MemoizedStyles {
     MemoizedStyles {
-        previous: STYLE_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+        previous: (
+            STYLE_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+            CONTENT_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+        ),
     }
 }
 
@@ -2425,6 +2433,21 @@ impl Stylesheet {
         if !self.has_generated_content() {
             return None;
         }
+        let key = (context.node, context.pseudo);
+        let known = CONTENT_MEMO.with(|memo| memo.borrow().as_ref()?.get(&key).cloned());
+        if let Some(content) = known {
+            return content;
+        }
+        let content = self.cascade_content(context);
+        CONTENT_MEMO.with(|memo| {
+            if let Some(memo) = memo.borrow_mut().as_mut() {
+                memo.insert(key, content.clone());
+            }
+        });
+        content
+    }
+
+    fn cascade_content(&self, context: StyleContext<'_>) -> Option<String> {
         let values = self.cascaded_values(
             context.document,
             context.node,
