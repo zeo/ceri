@@ -349,9 +349,7 @@ impl Canvas {
             for pixel_y in top..bottom {
                 let start = pixel_y as usize * stride + left as usize * 4;
                 let end = pixel_y as usize * stride + right as usize * 4;
-                for slot in self.pixels[start..end].as_chunks_mut::<4>().0.iter_mut() {
-                    slot.copy_from_slice(&sample);
-                }
+                self.pixels[start..end].as_chunks_mut::<4>().0.fill(sample);
             }
             return;
         }
@@ -642,9 +640,7 @@ impl Canvas {
                         let at = pixel_y as usize * self.width as usize * 4;
                         let sample = [color.red, color.green, color.blue, 255];
                         let run = at + drawn.start as usize * 4..at + drawn.end as usize * 4;
-                        for slot in self.pixels[run].as_chunks_mut::<4>().0.iter_mut() {
-                            slot.copy_from_slice(&sample);
-                        }
+                        self.pixels[run].as_chunks_mut::<4>().0.fill(sample);
                     } else {
                         for pixel_x in drawn {
                             self.blend_pixel(pixel_x, pixel_y, color);
