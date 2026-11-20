@@ -56,11 +56,17 @@ fn is_line_terminator(character: char) -> bool {
 }
 
 fn is_identifier_start(character: char) -> bool {
-    character == '$' || character == '_' || in_ranges(ID_START, character as u32)
+    if character.is_ascii() {
+        return character.is_ascii_alphabetic() || character == '$' || character == '_';
+    }
+    in_ranges(ID_START, character as u32)
 }
 
 fn is_identifier_part(character: char) -> bool {
-    character == '$' || character == '_' || in_ranges(ID_CONTINUE, character as u32)
+    if character.is_ascii() {
+        return character.is_ascii_alphanumeric() || character == '$' || character == '_';
+    }
+    in_ranges(ID_CONTINUE, character as u32)
 }
 
 fn in_ranges(ranges: &[(u32, u32)], point: u32) -> bool {
@@ -621,6 +627,24 @@ impl<'a> Lexer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_identifier_characters_agree_with_the_tables() {
+        for character in (0u8..128).map(char::from) {
+            let point = character as u32;
+            let special = character == '$' || character == '_';
+            assert_eq!(
+                is_identifier_start(character),
+                special || in_ranges(ID_START, point),
+                "{character:?}"
+            );
+            assert_eq!(
+                is_identifier_part(character),
+                special || in_ranges(ID_CONTINUE, point),
+                "{character:?}"
+            );
+        }
+    }
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         let mut lexer = Lexer::new(source);
