@@ -2660,6 +2660,7 @@ type KeptMap<Key, Inputs, Answer> = HashMap<Key, Vec<Kept<Inputs, Answer>>>;
 #[derive(PartialEq)]
 struct KeptUnder {
     stylesheet: u64,
+    document: u64,
     selector_version: u64,
     fonts: (*const crate::font::FontSet, u64),
     scale: u32,
@@ -2773,6 +2774,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
         let fonts = crate::font::active_fonts();
         let under = lasting.then(|| KeptUnder {
             stylesheet: stylesheet.identity(),
+            document: document.identity(),
             selector_version: document.selector_version(),
             fonts: (Rc::as_ptr(&fonts), fonts.web_face_changes()),
             scale: crate::font::device_scale().to_bits(),
@@ -2888,7 +2890,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         )
     });
     if let Some((layout, earlier)) = known {
-        if cfg!(debug_assertions) && earlier {
+        if cfg!(feature = "recheck") && earlier {
             let reported = crate::css::moment_reports();
             let fresh = layout_element_fresh(input);
             assert!(fresh == layout, "a kept box went stale: {node:?}");
@@ -6567,7 +6569,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         )
     });
     if let Some((width, earlier)) = known {
-        if cfg!(debug_assertions) && earlier {
+        if cfg!(feature = "recheck") && earlier {
             let reported = crate::css::moment_reports();
             let fresh = measure_intrinsic_width(input, minimum);
             assert!(fresh == width, "a kept width went stale: {node:?}");

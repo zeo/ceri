@@ -133,6 +133,17 @@ impl Clone for LiveRanges {
     }
 }
 
+// tells a document from every other, a copy of it included: what is kept about one must
+// not be taken for the other once they differ
+#[derive(Debug)]
+struct Identity(u64);
+
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        Self(next_stamp())
+    }
+}
+
 // a number no other change to any document has had, so two documents never share one
 fn next_stamp() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -144,6 +155,7 @@ pub struct Document {
     slots: Vec<Slot>,
     free: Vec<u32>,
     root: NodeId,
+    identity: Identity,
     // bumped by every change to the tree, an attribute or character data
     version: u64,
     // the stamp nodes written now are marked with, and whether anyone has read it
@@ -272,6 +284,7 @@ impl Document {
                 index: 0,
                 generation: 0,
             },
+            identity: Identity(next_stamp()),
             version: 0,
             stamp: next_stamp(),
             stamp_read: std::cell::Cell::new(false),
@@ -524,6 +537,10 @@ impl Document {
 
     pub(crate) fn selector_version(&self) -> u64 {
         self.selector_version
+    }
+
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity.0
     }
 
     fn is_character_data(&self, id: NodeId) -> bool {

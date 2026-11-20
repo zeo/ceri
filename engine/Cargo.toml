@@ -14,6 +14,9 @@ path = "src/lib.rs"
 default = []
 windowed = ["dep:softbuffer", "dep:winit"]
 native-http = ["dep:ureq"]
+# works out again every cascade, box and width taken from an earlier layout and panics where
+# one differs; for the test gates, not for an app
+recheck = []
 
 [dependencies]
 brotli-decompressor = "=6.1.0"

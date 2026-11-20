@@ -790,6 +790,7 @@ type Cascade = HashMap<String, (Specificity, usize, String)>;
 // followed apart, since a pointer move restyles little
 #[derive(Clone, Debug, PartialEq)]
 struct Matching {
+    document: u64,
     selector_version: u64,
     hovered_part: Option<(NodeId, PseudoElement)>,
     focused: Option<NodeId>,
@@ -811,6 +812,7 @@ struct Matching {
 impl Matching {
     fn of(document: &Document, state: &StyleState) -> Self {
         Self {
+            document: document.identity(),
             selector_version: document.selector_version(),
             hovered_part: state.hovered_part,
             focused: state.focused,
@@ -3356,7 +3358,9 @@ impl Stylesheet {
             if let Some((kept, values)) = cascades.entries.get(&key)
                 && kept.as_deref() == inline
             {
-                debug_assert_eq!(*values, cascade(), "a kept cascade went stale");
+                if cfg!(feature = "recheck") {
+                    assert_eq!(*values, cascade(), "a kept cascade went stale");
+                }
                 return values.clone();
             }
         }
