@@ -8191,7 +8191,7 @@ mod tests {
             let document = document.borrow();
             document.text_content(document.find_element_by_id(id).unwrap())
         };
-        let mut run = |browser: &mut Browser, milliseconds: u32| {
+        let run = |browser: &mut Browser, milliseconds: u32| {
             for _ in 0..milliseconds {
                 browser.advance_time(1).expect("time should advance");
             }
@@ -8207,6 +8207,48 @@ mod tests {
         run(&mut browser, 100);
         assert_eq!(text(&browser, "count"), "13");
         assert_eq!(text(&browser, "seen"), "hidden:true:10 visible:false:60 ");
+    }
+
+    #[test]
+    fn positioned_boxes_and_level_zero_contexts_stack_in_tree_order_over_content_in_flow() {
+        let pixel_and_hit = |body: &str| {
+            let mut browser = Browser::new(bundle(&format!(
+                "<style>body {{ margin: 0 }} div, span {{ display: block }}</style>{body}"
+            )));
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load");
+            let viewport = Size {
+                width: 120.0,
+                height: 120.0,
+            };
+            let canvas = browser.paint(viewport).unwrap();
+            let at = (90 * canvas.width() as usize + 50) * 4;
+            let pixel = canvas.rgba_pixels()[at..at + 3].to_vec();
+            let hit = browser.layout(viewport).unwrap().hit_test(50.0, 90.0);
+            let document = browser.document().unwrap();
+            let id =
+                hit.and_then(|node| document.borrow().attribute(node, "id").map(str::to_string));
+            (pixel, id)
+        };
+        let blue = (vec![0, 0, 255], Some("over".to_string()));
+        let over = "<span id='over' style='position:absolute;inset:auto 0 0;height:40px;background:blue'></span>";
+        // a filtered box, alone or inside a positioned one, lies under a later positioned box
+        for under in [
+            "<div style='position:absolute;inset:0;background:red;filter:brightness(0.5)'></div>",
+            "<div style='position:absolute;inset:0;overflow:hidden'><div style='position:absolute;inset:0;background:red;filter:brightness(0.5)'></div></div>",
+            "<div style='width:100px;height:100px;background:red;transform:translateX(1px)'></div>",
+        ] {
+            let page = format!(
+                "<div style='position:relative;width:100px;height:100px'>{under}{over}</div>"
+            );
+            assert_eq!(pixel_and_hit(&page), blue, "{under}");
+        }
+        // a positioned box lies over content in flow that comes after it
+        let page = format!(
+            "<div style='position:relative;width:100px;height:100px'>{over}<div style='height:100px;background:red'></div></div>"
+        );
+        assert_eq!(pixel_and_hit(&page), blue);
     }
 
     #[test]

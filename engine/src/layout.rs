@@ -2190,8 +2190,12 @@ fn hit_test_context(
     let mut contexts = stacking_context_entries(layout, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().rev().filter(|entry| entry.z_index >= 0) {
-        if let Some(path) = hit_test_context(entry.layout, x, y, entry.clip, entry.ancestor_offset)
-        {
+        let hit = if entry.layout.creates_stacking_context {
+            hit_test_context(entry.layout, x, y, entry.clip, entry.ancestor_offset)
+        } else {
+            hit_test_non_context(entry.layout, x, y, entry.clip, entry.ancestor_offset)
+        };
+        if let Some(path) = hit {
             return Some(path);
         }
     }
@@ -2272,7 +2276,7 @@ fn hit_test_non_context_children(
     let child_clip = stacking_child_clip(layout, clip, visual_offset);
     for index in paint_order(&layout.children).into_iter().rev() {
         let child = &layout.children[index];
-        if child.creates_stacking_context {
+        if child.creates_stacking_context || child.paints_positioned() {
             continue;
         }
         if let Some(path) = hit_test_non_context(child, x, y, child_clip, visual_offset) {
@@ -2350,7 +2354,10 @@ fn collect_stacking_contexts<'a>(
         let child = &layout.children[index];
         let child_order = *order;
         *order += 1;
-        if child.creates_stacking_context {
+        // a positioned box that makes no context of its own still paints with the contexts
+        // at level zero, in tree order, over the content in flow; the contexts inside it
+        // stay entries of this context
+        if child.creates_stacking_context || child.paints_positioned() {
             entries.push(StackingContextEntry {
                 layout: child,
                 clip: child_clip,
@@ -2359,7 +2366,8 @@ fn collect_stacking_contexts<'a>(
                 z_index: child.z_index,
                 order: child_order,
             });
-        } else {
+        }
+        if !child.creates_stacking_context {
             let clips = child.overflow.clips();
             if clips {
                 clippers.push((child, visual_offset));
@@ -2388,6 +2396,14 @@ fn stacking_child_clip(
         )
     } else {
         clip
+    }
+}
+
+impl LayoutBox {
+    // whether the box paints in its stacking context's positioned layer without being a
+    // context itself; an inline box paints with its line
+    pub(crate) fn paints_positioned(&self) -> bool {
+        self.position != Position::Static && !self.creates_stacking_context && !self.inline
     }
 }
 

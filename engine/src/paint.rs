@@ -3775,14 +3775,25 @@ fn paint_context_entry(
         .clippers
         .iter()
         .any(|&(clipper, _)| scrolls_in_own_layer(canvas, clipper));
-    paint_context(
-        canvas,
-        entry.layout,
-        images,
-        prose_selections,
-        entry.clip,
-        entry.ancestor_offset,
-    );
+    if entry.layout.creates_stacking_context {
+        paint_context(
+            canvas,
+            entry.layout,
+            images,
+            prose_selections,
+            entry.clip,
+            entry.ancestor_offset,
+        );
+    } else {
+        paint_non_context_subtree(
+            canvas,
+            entry.layout,
+            images,
+            prose_selections,
+            entry.clip,
+            entry.ancestor_offset,
+        );
+    }
     canvas.opaque = opaque;
     for _ in &masks {
         canvas.pop_mask();
@@ -3799,7 +3810,7 @@ fn paint_non_context_children(
 ) {
     for index in paint_order(&layout_box.children) {
         let child = &layout_box.children[index];
-        if child.creates_stacking_context || child.inline {
+        if child.creates_stacking_context || child.inline || child.paints_positioned() {
             continue;
         }
         paint_non_context_subtree(
