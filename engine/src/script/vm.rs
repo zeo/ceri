@@ -1403,12 +1403,7 @@ impl ScriptRuntime {
                         scope.slots[index] = Value::Undefined;
                         true
                     }
-                    None if depth == GLOBAL => {
-                        let mut global = self.global.borrow_mut();
-                        global.values.remove(&*key);
-                        global.accessors.remove(&*key);
-                        true
-                    }
+                    None if depth == GLOBAL => self.delete_property(&Value::Window, &key, false)?,
                     None => false,
                 };
                 frames
@@ -1474,14 +1469,12 @@ impl ScriptRuntime {
             }
             Op::DeleteGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
-                let mut global = self.global.borrow_mut();
-                global.values.remove(&*name);
-                global.accessors.remove(&*name);
+                let deleted = self.delete_property(&Value::Window, &name, false)?;
                 frames
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::Bool(true));
+                    .push(Value::Bool(deleted));
             }
             Op::PushScope(block) => {
                 let layout = frame.code.blocks[block as usize].clone();

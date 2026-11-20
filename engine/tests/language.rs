@@ -2458,6 +2458,16 @@ fn eval_declares_globals_by_the_global_objects_own_attributes() {
             "2",
         ),
         (
+            "deleting a restricted global fails",
+            "console.log(delete NaN, delete globalThis.Infinity, typeof NaN, typeof Infinity)",
+            "false false number number",
+        ),
+        (
+            "a function with an eval call still reads the globals",
+            "function f() { eval(''); return [undefined, NaN, typeof missing, typeof Infinity].join(); } console.log(f())",
+            ",NaN,undefined,number",
+        ),
+        (
             "nothing is declared when one function is refused",
             "try { eval('var early; function NaN() {}'); } catch (e) {} console.log(typeof early)",
             "undefined",
