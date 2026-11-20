@@ -2736,6 +2736,24 @@ mod tests {
         assert_eq!(shot(&mut host, &mut call, clip), (80, 40));
         let zoomed = json!({ "clip": { "x": 10, "y": 10, "width": 20, "height": 10, "scale": 2 } });
         assert_eq!(shot(&mut host, &mut call, zoomed), (40, 20));
+        // a jpeg starts with its marker ff d8 ff, and any other format is refused
+        let jpeg = call(
+            &mut host,
+            "Page.captureScreenshot",
+            json!({ "format": "jpeg", "quality": 50 }),
+        );
+        assert!(
+            jpeg["data"]
+                .as_str()
+                .expect("jpeg data")
+                .starts_with("/9j/")
+        );
+        let webp =
+            json!({ "id": 98, "method": "Page.captureScreenshot", "params": { "format": "webp" } });
+        let (_, answer) = host
+            .automation_call(&webp.to_string())
+            .expect("the host answers screenshots");
+        assert!(answer.is_err());
         // a clip on the last half pixel takes the edge pixel, where it used to panic
         let edge =
             json!({ "clip": { "x": 159.5, "y": 99.5, "width": 1, "height": 1, "scale": 1 } });

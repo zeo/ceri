@@ -177,9 +177,16 @@ impl EngineHost {
 
     // the viewport as the window shows it, or the part of it a clip names in page pixels
     fn screenshot(&mut self, params: &Json) -> Result<Json, Failure> {
-        if !matches!(params["format"].as_str(), None | Some("png")) {
-            return Err((-32000, "Only png screenshots are supported".to_string()));
-        }
+        let jpeg = match params["format"].as_str() {
+            None | Some("png") => false,
+            Some("jpeg") => true,
+            Some(_) => {
+                return Err((
+                    -32000,
+                    "Only png and jpeg screenshots are supported".to_string(),
+                ));
+            }
+        };
         let failed = |error: crate::navigation::NavigationError| (-32000, error.to_string());
         self.pump_workers().map_err(failed)?;
         let (canvas, _) = self
@@ -228,8 +235,16 @@ impl EngineHost {
                 out.extend_from_slice(&pixels[at..at + 3]);
             }
         }
-        let png = encode_png(out_width as u32, out_height as u32, 3, &out);
-        Ok(json!({ "data": base64(&png) }))
+        let (out_width, out_height) = (out_width as u32, out_height as u32);
+        let encoded = if jpeg {
+            // chromium's default quality when the caller names none
+            let quality = params["quality"].as_u64().unwrap_or(80).min(100) as u8;
+            crate::jpeg::encode_jpeg(out_width, out_height, &out, quality)
+                .ok_or((-32000, "The screenshot could not be encoded".to_string()))?
+        } else {
+            encode_png(out_width, out_height, 3, &out)
+        };
+        Ok(json!({ "data": base64(&encoded) }))
     }
 }
 
