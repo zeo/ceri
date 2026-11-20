@@ -836,6 +836,19 @@ pub(super) fn create(
     }
     let image_data = build.function(Native::DomConstructor("ImageData"), "ImageData", 2);
     globals.push(("ImageData", Value::Object(image_data)));
+    // signals come from a controller or from these statics, never from new
+    let abort_signal = build.function(Native::DomConstructor("AbortSignal"), "AbortSignal", 0);
+    for (name, builtin) in [
+        ("abort", Builtin::AbortSignalAbort),
+        ("timeout", Builtin::AbortSignalTimeout),
+        ("any", Builtin::AbortSignalAny),
+        ("@@hasInstance", Builtin::AbortSignalHasInstance),
+    ] {
+        abort_signal
+            .borrow_mut()
+            .define(name.to_string(), Property::hidden(Value::Builtin(builtin)));
+    }
+    globals.push(("AbortSignal", Value::Object(abort_signal)));
     DomInterfaces { prototypes }
 }
 
@@ -1783,6 +1796,9 @@ impl ScriptRuntime {
         }
         if interface == "ImageData" {
             return self.construct_image_data(&arguments);
+        }
+        if interface == "AbortSignal" {
+            return Err(self.type_error("Illegal constructor"));
         }
         if interface == "EventTarget" {
             let prototype = match new_target {

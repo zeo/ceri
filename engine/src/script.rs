@@ -437,6 +437,16 @@ enum Builtin {
     AbortControllerAbort(AbortControllerHandle),
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
+    AbortSignalRemoveEventListener(AbortSignalHandle),
+    // the statics: a signal already aborted, one a timer aborts, one that follows others
+    AbortSignalAbort,
+    AbortSignalTimeout,
+    AbortSignalAny,
+    AbortSignalHasInstance,
+    // aborts the second signal with the first one's reason
+    AbortSignalFollow(AbortSignalHandle, AbortSignalHandle),
+    // aborts the signal with the reason it is called with
+    AbortSignalAbortWith(AbortSignalHandle),
     WorkerPostMessage(WorkerHandle),
     WorkerTerminate(WorkerHandle),
     WorkerAddEventListener(WorkerHandle),
@@ -1186,6 +1196,7 @@ struct AbortSignalData {
     aborted: bool,
     reason: Option<Value>,
     listeners: Vec<Value>,
+    onabort: Option<Value>,
 }
 
 struct AbortControllerData {
@@ -4380,9 +4391,11 @@ impl ScriptRuntime {
                     Ok(Value::Builtin(Builtin::AbortSignalAddEventListener(signal)))
                 }
                 "throwIfAborted" => Ok(Value::Builtin(Builtin::AbortSignalThrowIfAborted(signal))),
-                _ => Err(runtime_error(format!(
-                    "AbortSignal has no property {property}"
-                ))),
+                "removeEventListener" => Ok(Value::Builtin(
+                    Builtin::AbortSignalRemoveEventListener(signal),
+                )),
+                "onabort" => Ok(signal.borrow().onabort.clone().unwrap_or(Value::Null)),
+                _ => Ok(Value::Undefined),
             },
             Value::Response(response) => match property {
                 "type" => Ok(Value::String(response.response_type.clone().into())),
@@ -4721,6 +4734,10 @@ impl ScriptRuntime {
             }
             Value::ClassList(handle) if property == "value" => {
                 self.set_element_attribute(&handle, "class", value_string)
+            }
+            Value::AbortSignal(signal) if property == "onabort" => {
+                signal.borrow_mut().onabort = is_callable(&value).then_some(value);
+                true
             }
             Value::Style(handle) if property == "cssText" => {
                 if value_string.trim().is_empty() {
@@ -6940,12 +6957,31 @@ impl ScriptRuntime {
     }
 
     fn construct_abort_controller(&self) -> Value {
-        let signal = Rc::new(RefCell::new(AbortSignalData {
-            aborted: false,
-            reason: None,
-            listeners: Vec::new(),
-        }));
+        let signal = new_abort_signal();
         Value::AbortController(Rc::new(RefCell::new(AbortControllerData { signal })))
+    }
+
+    // the first abort wins: it sets the reason, drops what was registered with the signal and
+    // tells the handler and the listeners
+    fn abort_signal(
+        &mut self,
+        signal: AbortSignalHandle,
+        reason: Value,
+    ) -> Result<(), ScriptError> {
+        let listeners = {
+            let mut signal = signal.borrow_mut();
+            if signal.aborted {
+                return Ok(());
+            }
+            signal.aborted = true;
+            signal.reason = Some(reason);
+            let mut listeners: Vec<Value> = signal.onabort.clone().into_iter().collect();
+            listeners.append(&mut signal.listeners);
+            listeners
+        };
+        self.remove_event_listeners_for_signal(&signal);
+        let event = self.host_event("abort", HostEventFields::default());
+        self.deliver(&event, Value::AbortSignal(signal), listeners)
     }
 
     fn submit_form(&mut self, node: NodeId) -> Result<(), ScriptError> {
@@ -8598,18 +8634,68 @@ impl ScriptRuntime {
             Builtin::AbortControllerAbort(controller) => {
                 let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);
                 let signal = controller.borrow().signal.clone();
-                let listeners = {
-                    let mut signal = signal.borrow_mut();
-                    if signal.aborted {
-                        return Ok(Value::Undefined);
+                self.abort_signal(signal, reason)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::AbortSignalAbortWith(signal) => {
+                let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);
+                self.abort_signal(signal, reason)?;
+                Ok(Value::Undefined)
+            }
+            Builtin::AbortSignalFollow(source, signal) => {
+                let reason = source.borrow().reason.clone();
+                self.abort_signal(signal, reason.unwrap_or_else(abort_error_value))?;
+                Ok(Value::Undefined)
+            }
+            Builtin::AbortSignalAbort => {
+                let signal = new_abort_signal();
+                let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);
+                self.abort_signal(signal.clone(), reason)?;
+                Ok(Value::AbortSignal(signal))
+            }
+            Builtin::AbortSignalTimeout => {
+                let delay = arguments.first().map_or(Ok(0.0), Value::number)?;
+                let signal = new_abort_signal();
+                self.schedule_task(
+                    vec![
+                        Value::Builtin(Builtin::AbortSignalAbortWith(signal.clone())),
+                        Value::Number(delay),
+                        dom_exception("TimeoutError", "signal timed out"),
+                    ],
+                    TaskKind::Timeout,
+                )?;
+                Ok(Value::AbortSignal(signal))
+            }
+            Builtin::AbortSignalAny => {
+                let sources = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let signal = new_abort_signal();
+                for source in self.iterate_to_vec(sources)? {
+                    let Value::AbortSignal(source) = source else {
+                        return Err(self.type_error(
+                            "Failed to execute 'any' on 'AbortSignal': Failed to convert value to 'AbortSignal'.",
+                        ));
+                    };
+                    if source.borrow().aborted {
+                        let reason = source.borrow().reason.clone();
+                        self.abort_signal(signal.clone(), reason.unwrap_or_else(abort_error_value))?;
+                        break;
                     }
-                    signal.aborted = true;
-                    signal.reason = Some(reason);
-                    std::mem::take(&mut signal.listeners)
-                };
-                self.remove_event_listeners_for_signal(&signal);
-                let event = self.host_event("abort", HostEventFields::default());
-                self.deliver(&event, Value::AbortSignal(signal), listeners)?;
+                    let follow = Builtin::AbortSignalFollow(source.clone(), signal.clone());
+                    source.borrow_mut().listeners.push(Value::Builtin(follow));
+                }
+                Ok(Value::AbortSignal(signal))
+            }
+            Builtin::AbortSignalHasInstance => Ok(Value::Bool(matches!(
+                arguments.first(),
+                Some(Value::AbortSignal(_))
+            ))),
+            Builtin::AbortSignalRemoveEventListener(signal) => {
+                if let Some(callback) = arguments.get(1) {
+                    signal
+                        .borrow_mut()
+                        .listeners
+                        .retain(|listener| !values_equal(listener, callback));
+                }
                 Ok(Value::Undefined)
             }
             Builtin::AbortSignalAddEventListener(signal) => {
@@ -11155,6 +11241,15 @@ impl CloneValue {
             })),
         })
     }
+}
+
+fn new_abort_signal() -> AbortSignalHandle {
+    Rc::new(RefCell::new(AbortSignalData {
+        aborted: false,
+        reason: None,
+        listeners: Vec::new(),
+        onabort: None,
+    }))
 }
 
 fn abort_error_value() -> Value {
@@ -15990,6 +16085,56 @@ mod tests {
             document.borrow().element_text_content(status).as_deref(),
             Some("0")
         );
+    }
+
+    #[test]
+    fn abort_signals_come_aborted_from_a_timer_or_from_following_others() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [typeof AbortSignal, AbortSignal.abort("why").reason];
+                const done = AbortSignal.abort();
+                seen.push(done.aborted, done.reason.name, done instanceof AbortSignal, {} instanceof AbortSignal);
+                try {
+                    new AbortSignal();
+                } catch (error) {
+                    seen.push(error.name);
+                }
+                const first = new AbortController();
+                const second = new AbortController();
+                const either = AbortSignal.any([first.signal, second.signal]);
+                const heard = [];
+                const dropped = () => heard.push("dropped");
+                either.addEventListener("abort", dropped);
+                either.removeEventListener("abort", dropped);
+                either.onabort = (event) => heard.push("handler:" + event.type);
+                either.addEventListener("abort", () => heard.push("listener"));
+                second.abort("second");
+                first.abort("first");
+                seen.push(either.aborted, either.reason, heard.join("+"), first.signal.missing);
+                seen.push(AbortSignal.any([done, first.signal]).reason.name);
+                const timed = AbortSignal.timeout(20);
+                timed.addEventListener("abort", () => {
+                    document.getElementById("status").textContent += " " + timed.reason.name;
+                });
+                seen.push(timed.aborted);
+                document.getElementById("status").textContent = seen.join(" ");
+                "#,
+            )
+            .expect("abort signals should work");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        let text = || document.borrow().element_text_content(status);
+        let before = "function why true AbortError true false TypeError true second handler:abort+listener  AbortError false";
+        assert_eq!(text().as_deref(), Some(before));
+        runtime.advance_time(19).expect("timers should run");
+        assert_eq!(text().as_deref(), Some(before));
+        runtime.advance_time(1).expect("timers should run");
+        assert_eq!(text(), Some(format!("{before} TimeoutError")));
     }
 
     #[test]
