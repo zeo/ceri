@@ -698,6 +698,37 @@ pub(super) fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
     })
 }
 
+// CSS.escape, the cssom's serialization of an identifier
+pub(super) fn css_escape(text: &str) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut escaped = String::with_capacity(text.len());
+    for (index, &character) in characters.iter().enumerate() {
+        let digit = character.is_ascii_digit();
+        match character {
+            '\0' => escaped.push('\u{FFFD}'),
+            '\u{1}'..='\u{1F}' | '\u{7F}' => {
+                escaped.push_str(&format!("\\{:x} ", character as u32))
+            }
+            _ if digit && (index == 0 || (index == 1 && characters[0] == '-')) => {
+                escaped.push_str(&format!("\\{:x} ", character as u32));
+            }
+            '-' if index == 0 && characters.len() == 1 => escaped.push_str("\\-"),
+            _ if !character.is_ascii()
+                || character == '-'
+                || character == '_'
+                || character.is_ascii_alphanumeric() =>
+            {
+                escaped.push(character);
+            }
+            _ => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+        }
+    }
+    escaped
+}
+
 // the characters encodeURI leaves as they are beyond the ones encodeURIComponent does
 pub(super) const URI_RESERVED: &str = ";/?:@&=+$,#";
 

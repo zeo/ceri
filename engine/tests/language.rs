@@ -2068,3 +2068,24 @@ console.log(f([-1, 1, 2]), f([1, -1, 1]));
         ),
     ]);
 }
+
+#[test]
+fn css_escapes_identifiers_and_answers_supports_like_cssom() {
+    check(&[
+        (
+            "escape",
+            r##"console.log(JSON.stringify([CSS.escape("1a"), CSS.escape("-1a"), CSS.escape("-"), CSS.escape("--x"), CSS.escape("a b"), CSS.escape("#id.x"), CSS.escape("a\u0001"), CSS.escape("\0"), CSS.escape("é_9"), CSS.escape(5)]))"##,
+            r##"["\\31 a","-\\31 a","\\-","--x","a\\ b","\\#id\\.x","a\\1 ","�","é_9","\\35 "]"##,
+        ),
+        (
+            "supports",
+            r#"console.log(CSS.supports("display", "grid"), CSS.supports("display: grid"), CSS.supports("(display: nonsense)"), CSS.supports("color", "red"))"#,
+            "true true false true",
+        ),
+        (
+            "missing argument",
+            "try { CSS.escape(); } catch (error) { console.log(error instanceof TypeError); }",
+            "true",
+        ),
+    ]);
+}

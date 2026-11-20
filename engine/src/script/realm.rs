@@ -108,6 +108,8 @@ pub(super) enum Native {
     Eval,
     // true for the component forms
     EncodeUri(bool),
+    CssEscape,
+    CssSupports,
     DecodeUri(bool),
     GlobalIsNaN,
     GlobalIsFinite,
@@ -611,6 +613,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     ] {
         globals.push((name, Value::Object(build.function(native, name, 1))));
     }
+    let css = plain(&object_prototype);
+    build.method(&css, "escape", Native::CssEscape, 1);
+    build.method(&css, "supports", Native::CssSupports, 1);
+    globals.push(("CSS", Value::Object(css)));
     globals.push((
         "isNaN",
         Value::Object(build.function(Native::GlobalIsNaN, "isNaN", 1)),
@@ -2647,6 +2653,32 @@ impl ScriptRuntime {
                 Ok(Value::String(
                     super::strings::encode_uri(&text, keep).into(),
                 ))
+            }
+            Native::CssEscape => {
+                if arguments.is_empty() {
+                    return Err(self.type_error("CSS.escape requires an argument"));
+                }
+                let text = self.coerce_string(first)?;
+                Ok(Value::String(super::strings::css_escape(&text).into()))
+            }
+            // CSS.supports(property, value) or CSS.supports(condition), where a condition
+            // that doesn't parse is tried again wrapped in parentheses
+            Native::CssSupports => {
+                if arguments.is_empty() {
+                    return Err(self.type_error("CSS.supports requires an argument"));
+                }
+                let first_text = self.coerce_string(first)?;
+                let supported = match arguments.get(1) {
+                    Some(value) => {
+                        let value = self.coerce_string(value.clone())?;
+                        crate::media::supports(&format!("({first_text}: {value})"))
+                    }
+                    None => {
+                        crate::media::supports(&first_text)
+                            || crate::media::supports(&format!("({first_text})"))
+                    }
+                };
+                Ok(Value::Bool(supported))
             }
             Native::DecodeUri(component) => {
                 let text = self.coerce_string(first)?;
