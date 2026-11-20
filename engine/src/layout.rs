@@ -8757,12 +8757,13 @@ fn append_atomic(
             context.align,
         );
     }
-    // a replaced box, a box that clips or one with no line of text sits on its bottom margin
-    // edge; inline-block takes its last line, the other inline boxes their first
+    // a replaced box, an inline-block that clips or a box with no line of text sits on its
+    // bottom margin edge; inline-block takes its last line, the other inline boxes their first
     // a text control keeps the baseline of its text however it clips, and a flex container
     // takes the baseline of its first item, which without a line of text is its bottom edge
     let control = matches!(node.name(), "input" | "textarea" | "select" | "button");
-    let baseline = ((!style.overflow.clips() || control) && !node.replaced())
+    let clipped = style.display == Display::InlineBlock && style.overflow.clips() && !control;
+    let baseline = (!clipped && !node.replaced())
         .then(|| match style.display {
             Display::InlineBlock => last_baseline(&laid_out),
             Display::InlineFlex => laid_out
@@ -11806,6 +11807,31 @@ mod tests {
         let widths = ["span", "u"].map(|tag| find_box(&result.root, tag).expect("item").rect.width);
         assert!(widths[0] > 0.0);
         assert_eq!(widths[0], widths[1]);
+    }
+
+    #[test]
+    fn a_clipping_inline_flex_box_keeps_the_baseline_of_its_first_item() {
+        let line = |display: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; padding: 0; }} body {{ font-size: 16px; line-height: 20px; }} span {{ display: {display}; overflow: hidden; margin-bottom: 30px; }}</style><div><span>text</span></div>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 800.0,
+                    height: 300.0,
+                },
+            );
+            find_box(&result.root, "div").expect("line").rect.height
+        };
+        // the margin hangs below the baseline of the text, where a clipping inline-block
+        // stands wholly above the baseline and the line adds its own descent beneath
+        assert_eq!(line("inline-flex"), 50.0);
+        assert_eq!(line("inline-grid"), 50.0);
+        assert!(line("inline-block") > 50.0);
     }
 
     #[test]
