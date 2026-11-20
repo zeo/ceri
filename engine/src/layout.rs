@@ -5941,8 +5941,19 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             while occupied[row_index].get(column).copied().unwrap_or(false) {
                 column += 1;
             }
-            let columns = table_span(cell, "colspan", 1000);
-            let spanned_rows = table_span(cell, "rowspan", group_end).min(group_end);
+            // a td shown as anything but a cell sits inside a cell made for it, which spans
+            // nothing
+            let spans = cell_style.display == Display::TableCell;
+            let columns = if spans {
+                table_span(cell, "colspan", 1000)
+            } else {
+                1
+            };
+            let spanned_rows = if spans {
+                table_span(cell, "rowspan", group_end).min(group_end)
+            } else {
+                1
+            };
             for slots in &mut occupied[row_index..row_index + spanned_rows] {
                 if slots.len() < column + columns {
                     slots.resize(column + columns, false);
@@ -12016,6 +12027,27 @@ mod tests {
                 .y
         };
         assert_eq!([top("second"), top("last")], [22.0, 42.0]);
+    }
+
+    #[test]
+    fn a_td_shown_as_a_flex_box_fills_one_column_whatever_it_spans() {
+        let markup = "<style>* { margin: 0; padding: 0; } table { width: 300px; table-layout: fixed; border-collapse: collapse; } #flex { display: flex; } small { font-size: smaller; } p { font-size: 12px; }</style><table><tr><td>a</td><td>b</td><td>c</td></tr><tr><td id='flex' colspan='3'>d</td></tr></table><p><small id='small'>e</small></p>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let flex = index[&document.find_element_by_id("flex").expect("cell")][0].rect;
+        assert_eq!(flex.width, 100.0);
+        // a step down in font size is a division by 1.2
+        let line = find_box(&result.root, "p").expect("paragraph");
+        assert_eq!(line.text[0].font_size, 10.0);
     }
 
     #[test]

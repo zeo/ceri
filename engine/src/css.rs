@@ -6254,7 +6254,7 @@ h6 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; font-weight: 
 b, strong { font-weight: bolder }
 th, optgroup { font-weight: bold }
 em, i, cite, var, dfn, address { font-style: italic }
-small, sub, sup { font-size: 0.83em }
+small, sub, sup { font-size: smaller }
 sub { vertical-align: sub }
 sup { vertical-align: super }
 code, kbd, pre, samp, tt, listing, xmp, plaintext { font-family: monospace }
@@ -6788,7 +6788,22 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             }
         }
         "color" => style.color = parse_color(value).unwrap_or(style.color),
-        "font-size" => style.font_size = parse_length(value).unwrap_or(style.font_size),
+        "font-size" => {
+            // the named sizes, with medium the 16px default, and a step down or up of 1.2
+            style.font_size = match value.trim().to_ascii_lowercase().as_str() {
+                "xx-small" => Length::px(9.0),
+                "x-small" => Length::px(10.0),
+                "small" => Length::px(13.0),
+                "medium" => Length::px(16.0),
+                "large" => Length::px(18.0),
+                "x-large" => Length::px(24.0),
+                "xx-large" => Length::px(32.0),
+                "xxx-large" => Length::px(48.0),
+                "smaller" => Length::em(1.0 / 1.2),
+                "larger" => Length::em(1.2),
+                _ => parse_length(value).unwrap_or(style.font_size),
+            }
+        }
         "line-height" => {
             if let Some((height, absolute)) = parse_line_height(value) {
                 style.line_height = height;
