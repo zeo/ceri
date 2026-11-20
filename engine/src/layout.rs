@@ -5116,6 +5116,16 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             if (child.rect.height - inner - target).abs() > 0.01 {
                 child = lay_out(item, cell_width, Some(cell_height), Some(target)).unwrap_or(child);
             }
+        } else if [
+            item.style.height,
+            item.style.min_height,
+            item.style.max_height,
+        ]
+        .iter()
+        .any(|length| length.has_percent())
+        {
+            // rows were sized with percentage heights as auto; now they resolve against the area
+            child = lay_out(item, cell_width, Some(cell_height), None).unwrap_or(child);
         }
         let free_x = cell_width - child.rect.width - item.margin.left - item.margin.right;
         let free_y = cell_height - child.rect.height - item.margin.top - item.margin.bottom;
@@ -10139,6 +10149,30 @@ mod tests {
         assert!((grid.children[1].rect.x - 73.333).abs() < 0.01);
         assert_eq!(grid.children[2].rect.y, 40.0);
         assert_eq!(grid.children[3].rect.y, 40.0);
+    }
+
+    #[test]
+    fn grid_item_percentage_heights_resolve_against_the_area() {
+        // clip's editor: a fixed height grid whose flexible row holds a 100% tall child, which
+        // must take the row's height rather than its own content's
+        let document = Document::parse_markup(
+            "<style>#grid { display: grid; width: 200px; height: 120px; grid-template-rows: minmax(0, 1fr) 20px; } #grid > div { margin: 0; } #fill { height: 100%; } #fill > i { display: block; height: 500px; } #half { min-height: 50%; }</style><div id='grid'><div id='fill'><i></i></div><div id='half'></div></div>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 240.0,
+                height: 160.0,
+            },
+        );
+        let grid = &result.root.children[0];
+        assert_eq!(grid.rect.height, 120.0);
+        assert_eq!(grid.children[0].rect.height, 100.0);
+        assert_eq!(grid.children[1].rect.y, 100.0);
+        assert_eq!(grid.children[1].rect.height, 20.0);
     }
 
     #[test]
