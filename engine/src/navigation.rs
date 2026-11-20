@@ -8252,6 +8252,37 @@ mod tests {
     }
 
     #[test]
+    fn a_non_scaling_stroke_keeps_its_width_in_a_stretched_svg() {
+        let stroke_height = |effect: &str| {
+            let mut browser = Browser::new(bundle(&format!(
+                r##"<style>body {{ margin: 0 }} svg {{ display: block; width: 100px; height: 40px }}
+                path {{ stroke: #f00; stroke-width: 1; fill: none; vector-effect: {effect} }}</style>
+                <svg viewBox="0 0 100 2" preserveAspectRatio="none"><path d="M0 1H100" /></svg>"##
+            )));
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load");
+            let canvas = browser
+                .paint(Size {
+                    width: 120.0,
+                    height: 60.0,
+                })
+                .unwrap();
+            // red over white leaves the green channel short by the row's coverage
+            let covered = (0..40)
+                .map(|row| {
+                    let at = (row * canvas.width() as usize + 50) * 4;
+                    f32::from(255 - canvas.rgba_pixels()[at + 1]) / 255.0
+                })
+                .sum::<f32>();
+            (covered * 10.0).round() / 10.0
+        };
+        // the viewBox stretches twenty times down: a scaling stroke grows with it
+        assert_eq!(stroke_height("none"), 20.0);
+        assert_eq!(stroke_height("non-scaling-stroke"), 1.0);
+    }
+
+    #[test]
     fn animation_frames_come_as_often_as_the_display_refreshes() {
         assert_eq!(
             [30_000, 60_000, 120_000, 144_000, 240_000, 500_000].map(frame_interval),

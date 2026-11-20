@@ -26,6 +26,7 @@ pub(crate) const PROPERTIES: &[&str] = &[
     "fill-rule",
     "fill-opacity",
     "stroke-opacity",
+    "vector-effect",
 ];
 
 // attributes of svg elements that act as author style below every author rule
@@ -39,6 +40,7 @@ pub(crate) const PRESENTATION_ATTRIBUTES: &[&str] = &[
     "fill-rule",
     "fill-opacity",
     "stroke-opacity",
+    "vector-effect",
     "opacity",
     "color",
     "display",
@@ -79,6 +81,9 @@ pub(crate) struct Presentation {
     pub(crate) even_odd: bool,
     pub(crate) fill_opacity: f32,
     pub(crate) stroke_opacity: f32,
+    // vector-effect: non-scaling-stroke, which is not inherited: the stroke keeps its width
+    // in the page's pixels however the shape is scaled
+    pub(crate) non_scaling_stroke: bool,
 }
 
 impl Default for Presentation {
@@ -93,6 +98,7 @@ impl Default for Presentation {
             even_odd: false,
             fill_opacity: 1.0,
             stroke_opacity: 1.0,
+            non_scaling_stroke: false,
         }
     }
 }
@@ -125,6 +131,7 @@ pub(crate) fn apply_property(
                 presentation.stroke_width = width;
             }
         }
+        "vector-effect" => presentation.non_scaling_stroke = keyword == "non-scaling-stroke",
         "stroke-linecap" => match keyword.as_str() {
             "butt" => presentation.line_cap = LineCap::Butt,
             "round" => presentation.line_cap = LineCap::Round,
@@ -175,6 +182,7 @@ pub(crate) fn reset_property(presentation: &mut Presentation, from: &Presentatio
         "fill-rule" => presentation.even_odd = from.even_odd,
         "fill-opacity" => presentation.fill_opacity = from.fill_opacity,
         "stroke-opacity" => presentation.stroke_opacity = from.stroke_opacity,
+        "vector-effect" => presentation.non_scaling_stroke = from.non_scaling_stroke,
         _ => {}
     }
 }
@@ -804,6 +812,8 @@ fn shape_path(element: &Element, viewport: Point, font_size: f32) -> Option<Vec<
 struct Stroke {
     color: Color,
     width: f32,
+    // the width is in the pixels of the page the scene is drawn into, not in user units
+    non_scaling: bool,
     cap: LineCap,
     join: LineJoin,
     miter_limit: f32,
@@ -1062,6 +1072,7 @@ fn painted(path: Vec<Segment>, frame: Frame, style: &Style, font_size: f32) -> S
             .map(|color| Stroke {
                 color,
                 width,
+                non_scaling: presentation.non_scaling_stroke,
                 cap: presentation.line_cap,
                 join: presentation.line_join,
                 miter_limit: presentation.miter_limit,
@@ -1110,7 +1121,25 @@ fn paint_shape(shape: &Shape, image: &mut Image, transform: Affine, fade: f32) {
         fill_edges(image, &edges, even_odd, color.scale_alpha(fade));
     }
     if let Some(stroke) = shape.stroke {
-        let scale = matrix[0].hypot(matrix[1]).max(matrix[2].hypot(matrix[3]));
+        let scale_of = |matrix: Affine| matrix[0].hypot(matrix[1]).max(matrix[2].hypot(matrix[3]));
+        // a non-scaling stroke is outlined around the path as it lands on the image
+        let (stroke, subpaths, matrix) = if stroke.non_scaling {
+            let landed = subpaths
+                .iter()
+                .map(|(points, closed)| {
+                    let points = points.iter().map(|&point| map(matrix, point));
+                    (points.collect::<Vec<_>>(), *closed)
+                })
+                .collect::<Vec<_>>();
+            let stroke = Stroke {
+                width: stroke.width * scale_of(transform),
+                ..stroke
+            };
+            (stroke, landed, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        } else {
+            (stroke, subpaths, matrix)
+        };
+        let scale = scale_of(matrix);
         let device_radius = stroke.width / 2.0 * scale;
         let disc_steps = if device_radius > TOLERANCE {
             (std::f32::consts::PI / (1.0 - TOLERANCE / device_radius).acos()).ceil()

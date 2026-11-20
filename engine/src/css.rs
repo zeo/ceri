@@ -1762,7 +1762,10 @@ impl Style {
             visibility: parent_text.visibility,
             cursor: parent_text.cursor,
             drag_region: parent_text.drag_region,
-            svg: parent_text.svg,
+            svg: crate::svg::Presentation {
+                non_scaling_stroke: false,
+                ..parent_text.svg
+            },
             pointer_events: parent_text.pointer_events,
             selectable: parent_text.selectable,
             float: Float::None,
@@ -5820,6 +5823,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "transition-timing-function",
     "translate",
     "user-select",
+    "vector-effect",
     "vertical-align",
     "visibility",
     "width",
