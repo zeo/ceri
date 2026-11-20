@@ -112,14 +112,20 @@ impl Picture {
         else {
             return self.image.clone();
         };
+        if let Some(read) = self.read.get() {
+            return read.clone();
+        }
         let (width, height) = (self.image.width, self.image.height);
-        self.read
-            .get_or_init(|| {
-                let read = surface.read().ok();
-                let image = read.and_then(|bgra| to_image(width, height, &bgra));
-                Arc::new(image.unwrap_or_else(|| Image::new(width, height)))
-            })
-            .clone()
+        // a read that fails is tried again by the next paint, where keeping its blank would
+        // leave a paused video black until another frame came
+        match surface
+            .read()
+            .ok()
+            .and_then(|bgra| to_image(width, height, &bgra))
+        {
+            Some(image) => self.read.get_or_init(|| Arc::new(image)).clone(),
+            None => Arc::new(Image::new(width, height)),
+        }
     }
 
     pub(crate) fn surface(&self) -> Option<Arc<dyn VideoSurface>> {
@@ -384,4 +390,48 @@ fn to_image(width: u32, height: u32, bgra: &[u8]) -> Option<Image> {
         height,
         pixels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // a surface whose first read fails
+    struct Flaky(AtomicUsize);
+
+    impl VideoSurface for Flaky {
+        fn shared_handle(&self) -> isize {
+            0
+        }
+
+        fn read(&self) -> Result<Vec<u8>, String> {
+            match self.0.fetch_add(1, Ordering::Relaxed) {
+                0 => Err("busy".to_string()),
+                _ => Ok(vec![10, 20, 30, 255]),
+            }
+        }
+    }
+
+    #[test]
+    fn a_surface_whose_read_fails_is_read_again_and_then_kept() {
+        let surface = Arc::new(Flaky(AtomicUsize::new(0)));
+        let picture = Picture {
+            image: Arc::new(Image {
+                width: 1,
+                height: 1,
+                pixels: Vec::new(),
+            }),
+            surface: Some(surface.clone()),
+            read: OnceLock::new(),
+        };
+        let blank = picture.pixels();
+        assert_eq!(blank.pixels, Image::new(1, 1).pixels);
+        // nothing was kept, so paint still sees a frame without pixels and asks again
+        assert!(picture.image().pixels.is_empty());
+        let read = picture.pixels();
+        assert_ne!(read.pixels, blank.pixels);
+        assert!(Arc::ptr_eq(&read, &picture.pixels()));
+        assert_eq!(surface.0.load(Ordering::Relaxed), 2);
+    }
 }
