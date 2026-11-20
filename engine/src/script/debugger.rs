@@ -9,12 +9,16 @@ use super::operations::same_value;
 use super::vm::{Frame, ScopeRef};
 use super::*;
 use serde_json::{Value as Json, json};
+use std::fmt::Write;
+use std::rc::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::Sender;
 
 // how many ops run between looks for a pause request, so a busy loop can still be paused
 const POLL_STEPS: u32 = 1 << 16;
 const PAUSED_ONLY: &str = "Can only perform operation while paused.";
+// how many frames an error's stack names, as v8 keeps
+const STACK_FRAMES: usize = 10;
 
 static NEXT_SCRIPT: AtomicU64 = AtomicU64::new(1);
 
@@ -136,12 +140,7 @@ struct Script {
 impl Script {
     // a byte offset in the text as the protocol's line and UTF-16 column in the document
     fn location(&self, offset: usize) -> (u32, u32) {
-        let line = self.lines.partition_point(|start| *start <= offset) - 1;
-        let column = utf16_length(&self.text[self.lines[line]..offset]);
-        match line {
-            0 => (self.line, self.column + column),
-            _ => (self.line + line as u32, column),
-        }
+        locate(&self.text, &self.lines, (self.line, self.column), offset)
     }
 
     fn offset(&self, line: u32, column: u32) -> Option<usize> {
@@ -181,6 +180,19 @@ impl Script {
     }
 }
 
+// where a script's text came from, for a stack to name without a devtools session
+struct Origin {
+    // held so the text's address stays its own
+    text: Weak<str>,
+    url: String,
+    line: u32,
+    column: u32,
+    lines: Vec<usize>,
+}
+
+// a frame's code and the op it is at
+pub(super) type Site = (Rc<Code>, usize);
+
 #[derive(Clone)]
 pub(super) struct Snapshot {
     code: Rc<Code>,
@@ -196,6 +208,13 @@ pub(super) struct Debugger {
     scripts: Vec<Script>,
     // the url and document position the next compiled script came from
     origin: Option<(String, u32, u32)>,
+    // the scripts still alive, by the address of their text
+    origins: HashMap<usize, Origin>,
+    // every running frame, outermost first, as of its last op, kept whether or not a session
+    // is debugging
+    pub(super) calls: Vec<Site>,
+    // the last value thrown and not caught since, with the frames it was thrown in
+    thrown: Option<(Value, Vec<Site>)>,
     // the breakpoints in compiled ops, by the code's address and op index; the code is held so
     // its address stays its own
     resolved: HashMap<(usize, u32), (Rc<Code>, Vec<String>)>,
@@ -259,6 +278,18 @@ impl ScriptRuntime {
             .origin
             .take()
             .unwrap_or_else(|| (url.to_string(), 0, 0));
+        let origins = &mut self.debugger.origins;
+        origins.retain(|_, origin| origin.text.strong_count() > 0);
+        origins.insert(
+            text_address(&code.text),
+            Origin {
+                text: Rc::downgrade(&code.text),
+                url: url.clone(),
+                line,
+                column,
+                lines: line_starts(&code.text),
+            },
+        );
         if !self.inspector.capturing {
             return;
         }
@@ -344,7 +375,17 @@ impl ScriptRuntime {
             .position(|script| Rc::ptr_eq(&script.text, &code.text))
         {
             Some(index) => index,
-            None => self.add_script(code.text.clone(), None, String::new(), 0, 0, false),
+            None => {
+                // a script that ran before any session was there still has where it came from
+                let (url, line, column) = self
+                    .debugger
+                    .origins
+                    .get(&text_address(&code.text))
+                    .map_or((String::new(), 0, 0), |origin| {
+                        (origin.url.clone(), origin.line, origin.column)
+                    });
+                self.add_script(code.text.clone(), None, url, line, column, false)
+            }
         }
     }
 
@@ -355,6 +396,82 @@ impl ScriptRuntime {
             .iter()
             .position(|script| script.id == id)
             .ok_or_else(|| format!("No script for id: {id}"))
+    }
+
+    // the running frames innermost first, one line each as v8 writes an error's stack
+    pub(super) fn write_stack(&self, stack: &mut String) {
+        for (code, pc) in self.debugger.calls.iter().rev().take(STACK_FRAMES) {
+            let offset = statement_offset(code, *pc);
+            let (url, (line, column)) = match self.debugger.origins.get(&text_address(&code.text)) {
+                Some(origin) => (
+                    origin.url.as_str(),
+                    locate(
+                        &code.text,
+                        &origin.lines,
+                        (origin.line, origin.column),
+                        offset,
+                    ),
+                ),
+                // text that is no whole script, an eval's or the Function constructor's
+                None => {
+                    let before = &code.text[..offset];
+                    ("", locate(before, &line_starts(before), (0, 0), offset))
+                }
+            };
+            let url = if url.is_empty() { "<anonymous>" } else { url };
+            let (line, column) = (line + 1, column + 1);
+            let _ = match code.name.is_empty() {
+                true => write!(stack, "\n    at {url}:{line}:{column}"),
+                false => write!(stack, "\n    at {} ({url}:{line}:{column})", code.name),
+            };
+        }
+    }
+
+    // a value thrown inside the running frames, on its way to a handler
+    pub(super) fn note_thrown(&mut self, thrown: &Value) {
+        let debugger = &mut self.debugger;
+        // a value thrown out of a nested run is thrown again in the run around it
+        if debugger
+            .thrown
+            .as_ref()
+            .is_some_and(|(last, _)| same_value(last, thrown))
+        {
+            return;
+        }
+        let frames = debugger.calls.iter().rev().take(STACK_FRAMES);
+        debugger.thrown = Some((thrown.clone(), frames.cloned().collect()));
+    }
+
+    pub(super) fn note_caught(&mut self) {
+        self.debugger.thrown = None;
+    }
+
+    // the frames an uncaught value was thrown in, innermost first; none when it was not
+    // thrown by running code
+    pub(super) fn take_thrown_frames(&mut self, thrown: &Value) -> Vec<Site> {
+        match self.debugger.thrown.take() {
+            Some((last, frames)) if same_value(&last, thrown) => frames,
+            _ => Vec::new(),
+        }
+    }
+
+    // frames as the protocol's stack trace lists them
+    pub(super) fn stack_frames_json(&mut self, frames: &[Site]) -> Vec<Json> {
+        frames
+            .iter()
+            .map(|(code, pc)| {
+                let script = self.script_of(code);
+                let script = &self.debugger.scripts[script];
+                let (line, column) = script.location(statement_offset(code, *pc));
+                json!({
+                    "functionName": &*code.name,
+                    "scriptId": script.id,
+                    "url": script.url,
+                    "lineNumber": line,
+                    "columnNumber": column,
+                })
+            })
+            .collect()
     }
 
     fn location_json(&self, index: usize, offset: usize) -> Json {
@@ -934,14 +1051,7 @@ impl ScriptRuntime {
     fn call_frame(&mut self, index: usize, snapshot: &Snapshot) -> Json {
         let script = self.script_of(&snapshot.code);
         let code = &snapshot.code;
-        let statement = code
-            .positions
-            .partition_point(|(at, _)| *at as usize <= snapshot.pc);
-        let offset = match statement {
-            0 => code.source.as_ref().map_or(0, |(_, start, _)| *start),
-            statement => code.positions[statement - 1].1 as usize,
-        };
-        let location = self.location_json(script, offset);
+        let location = self.location_json(script, statement_offset(code, snapshot.pc));
         let module = self.debugger.scripts[script].module;
         let url = self.debugger.scripts[script].url.clone();
         let scopes = self.scope_chain(snapshot, module);
@@ -1088,6 +1198,30 @@ fn each_code(code: &Rc<Code>, visit: &mut impl FnMut(&Rc<Code>)) {
     }
     for class in &code.classes {
         each_code(&class.constructor, visit);
+    }
+}
+
+// where in its text the statement an op belongs to starts
+fn statement_offset(code: &Code, pc: usize) -> usize {
+    let statement = code.positions.partition_point(|(at, _)| *at as usize <= pc);
+    match statement {
+        0 => code.source.as_ref().map_or(0, |(_, start, _)| *start),
+        statement => code.positions[statement - 1].1 as usize,
+    }
+}
+
+fn text_address(text: &Rc<str>) -> usize {
+    Rc::as_ptr(text) as *const u8 as usize
+}
+
+// a byte offset in a text as the protocol's line and UTF-16 column, in the document the text
+// starts in at the given line and column
+fn locate(text: &str, lines: &[usize], start: (u32, u32), offset: usize) -> (u32, u32) {
+    let line = lines.partition_point(|start| *start <= offset) - 1;
+    let column = utf16_length(&text[lines[line]..offset]);
+    match line {
+        0 => (start.0, start.1 + column),
+        _ => (start.0 + line as u32, column),
     }
 }
 

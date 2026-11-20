@@ -1009,6 +1009,99 @@ mod tests {
         );
     }
 
+    const THROWING: &str = "<script>
+function made() {
+  return new Error(\"x\");
+}
+var error = made();
+function inner() {
+  throw new TypeError(\"boom\");
+}
+function outer() {
+  inner();
+}
+setTimeout(function later() {
+  throw 1;
+}, 5);
+</script>";
+
+    #[test]
+    fn an_error_s_stack_names_the_frames_it_was_made_in() {
+        let (mut browser, messages) = inspected(THROWING);
+        let stack = json!({ "expression": "error.stack" });
+        let sent = call(&mut browser, &messages, 1, "Runtime.evaluate", stack);
+        // a frame is at the start of its statement, counted from one as v8 prints it
+        assert_eq!(
+            result(&sent, 1)["result"]["value"],
+            "Error: x\n    at made (https://app.ceri.invalid/:3:3)\n    at https://app.ceri.invalid/:5:1"
+        );
+    }
+
+    #[test]
+    fn an_uncaught_exception_reports_where_it_was_thrown() {
+        let (mut browser, messages) = inspected(THROWING);
+        let page = "https://app.ceri.invalid/";
+        let sent = call(&mut browser, &messages, 1, "Runtime.enable", json!({}));
+        assert!(named(&sent, "Runtime.exceptionThrown").is_empty());
+        let outer = json!({ "expression": "outer()" });
+        let sent = call(&mut browser, &messages, 2, "Runtime.evaluate", outer);
+        let details = &result(&sent, 2)["exceptionDetails"];
+        assert_eq!(details["lineNumber"], 6, "{details}");
+        assert_eq!(details["columnNumber"], 2);
+        assert_eq!(details["url"], page);
+        let frames = details["stackTrace"]["callFrames"].as_array().unwrap();
+        assert_eq!(frames.len(), 3, "{details}");
+        assert_eq!(frames[0]["functionName"], "inner");
+        assert_eq!(frames[0]["scriptId"], details["scriptId"]);
+        assert_eq!(frames[1]["functionName"], "outer");
+        assert_eq!(frames[1]["url"], page);
+        assert_eq!(
+            (&frames[1]["lineNumber"], &frames[1]["columnNumber"]),
+            (&json!(9), &json!(2))
+        );
+        let description = details["exception"]["description"].as_str().unwrap();
+        let expected =
+            format!("TypeError: boom\n    at inner ({page}:7:3)\n    at outer ({page}:10:3)\n");
+        assert!(description.starts_with(&expected), "{description}");
+
+        // a value that is no error still has the place it was thrown
+        browser.advance_time(10).expect("the timer should run");
+        browser.flush_inspector();
+        let sent = received(&messages);
+        let thrown = named(&sent, "Runtime.exceptionThrown");
+        let details = &thrown[0]["exceptionDetails"];
+        assert_eq!(details["exception"]["value"], 1.0, "{details}");
+        assert_eq!(details["lineNumber"], 12);
+        assert_eq!(details["columnNumber"], 2);
+        let frames = details["stackTrace"]["callFrames"].as_array().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["functionName"], "later");
+    }
+
+    #[test]
+    fn a_session_attached_after_the_scripts_ran_still_places_an_exception() {
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert(
+                "/index.html",
+                "text/html; charset=utf-8",
+                THROWING.as_bytes(),
+            )
+            .expect("page should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("the page should load");
+        let (outgoing, messages) = mpsc::channel();
+        browser.attach_inspector(1, outgoing);
+        let outer = json!({ "expression": "outer()" });
+        let sent = call(&mut browser, &messages, 1, "Runtime.evaluate", outer);
+        let details = &result(&sent, 1)["exceptionDetails"];
+        assert_eq!(details["url"], "https://app.ceri.invalid/", "{details}");
+        assert_eq!(details["lineNumber"], 6);
+        assert_eq!(details["columnNumber"], 2);
+    }
+
     #[test]
     fn a_reload_replaces_the_context_and_reports_uncaught_errors() {
         let (mut browser, messages) =

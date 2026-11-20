@@ -2351,7 +2351,8 @@ impl ScriptRuntime {
             }
             Native::ErrorCaptureStackTrace => {
                 if let Value::Object(object) = &first {
-                    let text = self.coerce_string(first.clone())?;
+                    let mut text = self.coerce_string(first.clone())?;
+                    self.write_stack(&mut text);
                     object.borrow_mut().define(
                         "stack".to_string(),
                         Property::hidden(Value::String(text.into())),

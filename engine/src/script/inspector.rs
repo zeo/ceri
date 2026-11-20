@@ -1,6 +1,7 @@
 // what the devtools protocol's Runtime domain sees of a page: console entries kept with their
 // values, values handed out by id, and evaluation in the page's global scope
 
+use super::debugger::Site;
 use super::object::{ObjectClass, Slot, is_private_key, is_symbol_key};
 use super::operations::{is_callable, number_to_string, symbol_description};
 use super::*;
@@ -33,6 +34,8 @@ struct ConsoleEntry {
     // the protocol's ConsoleAPICalled type, or exception for an uncaught error
     kind: &'static str,
     arguments: Vec<Value>,
+    // for an uncaught error, the frames it was thrown in
+    frames: Vec<Site>,
     timestamp: f64,
 }
 
@@ -108,6 +111,14 @@ impl ScriptRuntime {
     }
 
     pub(super) fn console_record(&mut self, kind: &'static str, arguments: Vec<Value>) {
+        self.record(kind, arguments, Vec::new());
+    }
+
+    pub(super) fn exception_record(&mut self, thrown: Value, frames: Vec<Site>) {
+        self.record("exception", vec![thrown], frames);
+    }
+
+    fn record(&mut self, kind: &'static str, arguments: Vec<Value>, frames: Vec<Site>) {
         if !self.inspector.capturing {
             return;
         }
@@ -121,6 +132,7 @@ impl ScriptRuntime {
             sequence,
             kind,
             arguments,
+            frames,
             timestamp,
         });
     }
@@ -132,15 +144,18 @@ impl ScriptRuntime {
             .messages
             .iter()
             .filter(|entry| entry.sequence >= from)
-            .map(|entry| (entry.kind, entry.arguments.clone(), entry.timestamp))
+            .map(|entry| {
+                let frames = entry.frames.clone();
+                (entry.kind, entry.arguments.clone(), frames, entry.timestamp)
+            })
             .collect();
         let context = self.inspector.context;
         let events = entries
             .into_iter()
-            .map(|(kind, arguments, timestamp)| {
+            .map(|(kind, arguments, frames, timestamp)| {
                 if kind == "exception" {
                     let thrown = arguments.into_iter().next().unwrap_or(Value::Undefined);
-                    let details = self.exception_details(&thrown, "console", "Uncaught");
+                    let details = self.exception_details(&thrown, &frames, "console");
                     return json!({
                         "method": "Runtime.exceptionThrown",
                         "params": { "timestamp": timestamp, "exceptionDetails": details },
@@ -225,7 +240,7 @@ impl ScriptRuntime {
                         let thrown = self.throw_error("SyntaxError", error.message);
                         let thrown = self.take_thrown(thrown);
                         Ok(
-                            json!({ "exceptionDetails": self.exception_details(&thrown, "console", "Uncaught") }),
+                            json!({ "exceptionDetails": self.exception_details(&thrown, &[], "console") }),
                         )
                     }
                 }
@@ -583,23 +598,33 @@ impl ScriptRuntime {
     }
 
     pub(super) fn thrown_json(&mut self, thrown: &Value, group: &str) -> Json {
+        let frames = self.take_thrown_frames(thrown);
         json!({
             "result": self.remote_object(thrown, group, false),
-            "exceptionDetails": self.exception_details(thrown, group, "Uncaught"),
+            "exceptionDetails": self.exception_details(thrown, &frames, group),
         })
     }
 
-    fn exception_details(&mut self, thrown: &Value, group: &str, text: &str) -> Json {
+    // frames are where the value was thrown, innermost first, when running code threw it
+    fn exception_details(&mut self, thrown: &Value, frames: &[Site], group: &str) -> Json {
         let id = self.inspector.next_exception;
         self.inspector.next_exception += 1;
-        json!({
+        let mut details = json!({
             "exceptionId": id,
-            "text": text,
+            "text": "Uncaught",
             "lineNumber": 0,
             "columnNumber": 0,
             "exception": self.remote_object(thrown, group, false),
             "executionContextId": self.inspector.context,
-        })
+        });
+        let frames = self.stack_frames_json(frames);
+        if let Some(top) = frames.first() {
+            for key in ["lineNumber", "columnNumber", "scriptId", "url"] {
+                details[key] = top[key].clone();
+            }
+            details["stackTrace"] = json!({ "callFrames": frames });
+        }
+        details
     }
 
     // a value as JSON, as returnByValue asks; what JSON cannot hold goes as an unserializable

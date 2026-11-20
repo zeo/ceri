@@ -481,6 +481,7 @@ impl ScriptRuntime {
     pub(super) fn report_exception(&mut self, error: ScriptError) {
         let message = error.message.clone();
         let value = self.take_thrown(error);
+        let frames = self.take_thrown_frames(&value);
         let text = self.inspect(&value, 0, &mut Vec::new());
         if self.report_error_event(&text, value.clone()) {
             return;
@@ -488,7 +489,7 @@ impl ScriptRuntime {
         if let Some(sender) = &self.worker_sender {
             let _ = sender.try_send(WorkerEvent::Error(message));
         }
-        self.console_record("exception", vec![value]);
+        self.exception_record(value, frames);
         self.push_log(format!("Uncaught {text}"));
     }
 }

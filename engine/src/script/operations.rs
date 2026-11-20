@@ -213,11 +213,20 @@ impl ScriptRuntime {
             "message".to_string(),
             Property::hidden(Value::String(message.to_string().into())),
         );
-        object.define(
+        self.with_stack(object)
+    }
+
+    // an error object with its stack: what it shows as its name and message, then the frames
+    // running as it is made
+    pub(super) fn with_stack(&self, object: JsObject) -> Value {
+        let object = new_object(object);
+        let mut stack = super::object_display(&object);
+        self.write_stack(&mut stack);
+        object.borrow_mut().define(
             "stack".to_string(),
-            Property::hidden(Value::String(String::new().into())),
+            Property::hidden(Value::String(stack.into())),
         );
-        Value::Object(new_object(object))
+        Value::Object(object)
     }
 
     pub(super) fn error_prototype(&self, kind: &str) -> ObjectHandle {

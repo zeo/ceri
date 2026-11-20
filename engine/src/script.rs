@@ -15158,6 +15158,31 @@ mod tests {
     }
 
     #[test]
+    fn an_error_s_stack_names_its_frames_with_no_devtools_session() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime.set_script_origin("https://app.ceri.invalid/app.js".to_string(), 0, 0);
+        runtime
+            .execute(
+                "function f() {\n  null.x;\n}\ntry { f() } catch (error) {\n  \
+                 document.getElementById('status').textContent =\n    \
+                 error.stack + '|' + eval('new RangeError().stack');\n}",
+            )
+            .expect("the script should run");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        let text = document.borrow().element_text_content(status).unwrap();
+        let app = "https://app.ceri.invalid/app.js";
+        assert!(text.starts_with("TypeError: "), "{text}");
+        let frames = format!(
+            "\n    at f ({app}:2:3)\n    at {app}:4:7|RangeError\n    at <anonymous>:1:1\n    at {app}:5:3"
+        );
+        assert!(text.ends_with(&frames), "{text}");
+    }
+
+    #[test]
     fn exposes_import_meta_url_to_modules() {
         let document = document("<p id='status'>idle</p>");
         let base =

@@ -799,11 +799,7 @@ impl ScriptRuntime {
         {
             object.define("cause".to_string(), Property::hidden(cause.clone()));
         }
-        object.define(
-            "stack".to_string(),
-            Property::hidden(Value::String(String::new().into())),
-        );
-        Ok(Value::Object(new_object(object)))
+        Ok(self.with_stack(object))
     }
 
     // ---- the run loop ----
@@ -820,8 +816,10 @@ impl ScriptRuntime {
         }
         self.nested_runs += 1;
         let base = self.debugger.mirror.len();
+        let below = self.debugger.calls.len();
         let result = self.run_frames(frame, base);
         self.debugger.mirror.truncate(base);
+        self.debugger.calls.truncate(below);
         self.nested_runs -= 1;
         if self.nested_runs == 0 {
             self.debug_task_ended();
@@ -832,6 +830,7 @@ impl ScriptRuntime {
     // base is how many frames of the runs around this one a debugger sees
     fn run_frames(&mut self, entry: Frame, base: usize) -> Result<RunResult, ScriptError> {
         let mut frames = vec![entry];
+        let below = self.debugger.calls.len();
         loop {
             self.steps += 1;
             if self.step_limit.is_some_and(|limit| self.steps > limit) {
@@ -844,6 +843,7 @@ impl ScriptRuntime {
             if self.debugger.active {
                 self.debug_step(&frames, base);
             }
+            self.note_frames(&frames, below);
             let outcome = self.step(&mut frames);
             match outcome {
                 Ok(Some(result)) => return Ok(result),
@@ -851,6 +851,7 @@ impl ScriptRuntime {
                 Err(error) if self.interrupted => return Err(error),
                 Err(error) => {
                     let thrown = self.take_thrown(error);
+                    self.note_thrown(&thrown);
                     if self.debugger.active {
                         self.debug_thrown(&frames, base, &thrown);
                     }
@@ -860,6 +861,26 @@ impl ScriptRuntime {
                 }
             }
         }
+    }
+
+    // keeps the code and op of every running frame, for an error made now to name: the top
+    // frame's op moves in place, and a call or a return leaves the frames below as they were
+    #[inline]
+    fn note_frames(&mut self, frames: &[Frame], below: usize) {
+        let calls = &mut self.debugger.calls;
+        let top = frames.last().expect("a frame is running");
+        let depth = below + frames.len();
+        if calls.len() == depth && Rc::ptr_eq(&calls[depth - 1].0, &top.code) {
+            calls[depth - 1].1 = top.pc;
+            return;
+        }
+        let keep = calls.len().min(depth - 1).max(below);
+        calls.truncate(keep);
+        calls.extend(
+            frames[keep - below..]
+                .iter()
+                .map(|frame| (frame.code.clone(), frame.pc)),
+        );
     }
 
     // throws a value inside the frame stack: the nearest handler takes it, or the run ends
@@ -879,6 +900,7 @@ impl ScriptRuntime {
                 if handler.catch != NO_TARGET {
                     frame.stack.push(thrown);
                     frame.pc = handler.catch as usize;
+                    self.note_caught();
                 } else {
                     frame.pending.push(Pending::Throw(thrown));
                     frame.pc = handler.finally as usize;
