@@ -133,6 +133,8 @@ pub(super) struct Frame {
     delegate_mode: ResumeMode,
     // the mode of the last async yield* call, which decides how its result unpacks
     delegate_last: ResumeMode,
+    // a direct eval's frame, which shares its caller's this binding
+    eval: bool,
 }
 
 impl Frame {
@@ -1097,7 +1099,7 @@ impl ScriptRuntime {
         if frames.len() >= MAX_FRAMES {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
-        frames.push(Frame::new(
+        let mut frame = Frame::new(
             code,
             closure,
             Some(scope),
@@ -1105,7 +1107,9 @@ impl ScriptRuntime {
             new_target,
             function,
             Vec::new(),
-        ));
+        );
+        frame.eval = true;
+        frames.push(frame);
         Ok(None)
     }
 
@@ -2516,8 +2520,13 @@ impl ScriptRuntime {
             return Err(self.reference_error("super constructor may only be called once"));
         }
         let this = self.construct(parent, arguments, Some(new_target))?;
+        for frame in frames.iter_mut().rev() {
+            frame.this = this.clone();
+            if !frame.eval {
+                break;
+            }
+        }
         let frame = frames.last_mut().expect("frame");
-        frame.this = this.clone();
         if let Some(closure) = frame.closure.clone() {
             self.initialize_fields(&closure, &this)?;
         }
@@ -2942,6 +2951,7 @@ impl Frame {
             resume: None,
             delegate_mode: ResumeMode::Next,
             delegate_last: ResumeMode::Next,
+            eval: false,
         }
     }
 }

@@ -2283,6 +2283,11 @@ fn direct_eval_sees_the_callers_this_and_function_state() {
             "true",
         ),
         (
+            "super() in a derived constructor",
+            "class A { constructor() { this.a = 1; } } class B extends A { constructor() { eval('super()'); this.b = 2; } } var b = new B(); console.log(b.a, b.b, b instanceof B)",
+            "1 2 true",
+        ),
+        (
             "new.target outside a function is refused",
             "try { eval('new.target'); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
             "true",
