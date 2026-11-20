@@ -1694,6 +1694,7 @@ impl Browser {
 
     // records which animatable values changed, so layout can blend from the old ones
     pub fn sample_transitions(&mut self, viewport: Size) -> Result<bool, NavigationError> {
+        let _profile = crate::profile::scope("frame: motion");
         let Some(page) = self.page.as_ref() else {
             return Ok(false);
         };

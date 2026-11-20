@@ -488,6 +488,9 @@ impl Default for ViewportMetrics {
     }
 }
 
+// the selector version the lists were found at, then the options and the form controls
+type ControlLists = (u64, Rc<[Vec<NodeId>; 2]>);
+
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
     resources: Option<ResourceBundle>,
@@ -534,6 +537,9 @@ pub struct ScriptRuntime {
     reported_selection: ranges::SelectionSnapshot,
     layout_inputs: Option<Rc<RefCell<geometry::LayoutInputs>>>,
     measured: RefCell<Option<geometry::MeasuredLayout>>,
+    // the document's options and its form controls, found again only once its elements or
+    // attributes change: the style state is built from them for every layout and measure
+    controls: RefCell<Option<ControlLists>>,
     media_queries: Vec<geometry::MediaQueryRecord>,
     media_list_prototype: Option<ObjectHandle>,
     performance: Value,
@@ -1614,6 +1620,7 @@ impl ScriptRuntime {
             reported_selection: None,
             layout_inputs: None,
             measured: RefCell::new(None),
+            controls: RefCell::new(None),
             media_queries: Vec::new(),
             media_list_prototype: None,
             performance: Value::Undefined,
@@ -3064,27 +3071,38 @@ impl ScriptRuntime {
                 state.unchecked.insert(*control);
             }
         }
+        let controls = {
+            let document = self.document.borrow();
+            let version = document.selector_version();
+            let mut controls = self.controls.borrow_mut();
+            match controls.as_ref() {
+                Some((found_at, lists)) if *found_at == version => lists.clone(),
+                _ => {
+                    let lists = Rc::new(
+                        [
+                            "option",
+                            "button, input, select, textarea, optgroup, option, fieldset",
+                        ]
+                        .map(|selector| {
+                            document
+                                .find_elements_by_selector(selector)
+                                .unwrap_or_default()
+                        }),
+                    );
+                    *controls = Some((version, lists.clone()));
+                    lists
+                }
+            }
+        };
         // a selected option matches :checked and is what a closed select shows
-        let options = self
-            .document
-            .borrow()
-            .find_elements_by_selector("option")
-            .unwrap_or_default();
-        for option in options {
+        for &option in &controls[0] {
             if self.is_option_selected(option) {
                 state.checked.insert(option);
             } else {
                 state.unchecked.insert(option);
             }
         }
-        let disabled_paths = self
-            .document
-            .borrow()
-            .find_elements_by_selector(
-                "button, input, select, textarea, optgroup, option, fieldset",
-            )
-            .unwrap_or_default();
-        for control in disabled_paths {
+        for &control in &controls[1] {
             if self.is_disabled(control) {
                 state.disabled.insert(control);
             }
@@ -3636,6 +3654,7 @@ impl ScriptRuntime {
                     ..task
                 });
             }
+            let _profile = crate::profile::scope("script: callback");
             if let Err(error) = self.call(callback, arguments) {
                 self.report_exception(error);
             }
@@ -3643,9 +3662,16 @@ impl ScriptRuntime {
             executed += 1;
         }
         self.clock = target;
-        self.pump_audio()?;
-        self.drain_microtasks()?;
-        self.run_layout_observers()?;
+        {
+            let _profile = crate::profile::scope("script: audio");
+            self.pump_audio()?;
+            self.drain_microtasks()?;
+        }
+        {
+            let _profile = crate::profile::scope("script: observers");
+            self.run_layout_observers()?;
+        }
+        let _profile = crate::profile::scope("script: workers");
         self.pump_workers()?;
         Ok(executed)
     }
