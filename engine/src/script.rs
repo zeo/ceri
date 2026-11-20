@@ -19037,6 +19037,26 @@ mod tests {
     }
 
     #[test]
+    fn replace_child_puts_the_next_sibling_where_the_old_node_stood() {
+        let document = document(
+            r#"<main><ul id="list"><li>a</li><li>b</li><li>c</li></ul><p id="status">idle</p></main>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const list = document.getElementById("list");
+                list.replaceChild(list.children[1], list.children[0]);
+                const near = list.textContent;
+                list.replaceChild(list.children[1], list.children[0]);
+                document.getElementById("status").textContent = near + "|" + list.textContent;
+                "#,
+            )
+            .expect("replaceChild should execute");
+        assert_eq!(status_text(&document).as_deref(), Some("bc|c"));
+    }
+
+    #[test]
     fn replace_children_detaches_old_nodes_and_reattaches_passed_handles() {
         let document = document(
             r#"<main id="root"><div id="mount"><span id="old">old</span>tail</div><p id="status">idle</p></main>"#,

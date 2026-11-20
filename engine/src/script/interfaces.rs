@@ -1554,9 +1554,19 @@ impl ScriptRuntime {
                     if let Err(error) = checked {
                         return Err(self.dom_error(error));
                     }
-                    let next = self.document.borrow().sibling(old, true);
+                    // a replacement that already follows the old node goes where it stood,
+                    // ahead of what came after it
+                    let next = {
+                        let document = self.document.borrow();
+                        document
+                            .sibling(old, true)
+                            .and_then(|next| match next == child {
+                                true => document.sibling(child, true),
+                                false => Some(next),
+                            })
+                    };
                     self.remove_node(old)?;
-                    let reference = next.filter(|&next| next != child);
+                    let reference = next;
                     self.insert_node(node, child, reference)?;
                 }
                 self.node_value(old)
