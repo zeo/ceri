@@ -225,6 +225,11 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         ],
     },
     EventInterface {
+        name: "PromiseRejectionEvent",
+        parent: "Event",
+        members: &[("promise", Any), ("reason", Any)],
+    },
+    EventInterface {
         name: "PopStateEvent",
         parent: "Event",
         members: &[("state", Any)],
@@ -476,6 +481,7 @@ fn event_defaults(event_type: &str) -> (&'static str, bool, bool) {
         "hashchange" => ("HashChangeEvent", false, false),
         "message" | "messageerror" => ("MessageEvent", false, false),
         "error" => ("ErrorEvent", false, true),
+        "unhandledrejection" | "rejectionhandled" => ("PromiseRejectionEvent", false, true),
         "resize" => ("UIEvent", false, false),
         _ => ("Event", false, false),
     }
@@ -716,8 +722,10 @@ impl ScriptRuntime {
             ] {
                 set(name, Value::Bool(on));
             }
+            // a rejection event carries its promise and reason where others carry data and error
+            let rejection = interface == "PromiseRejectionEvent";
             if let Some(value) = fields.value {
-                set("data", value);
+                set(if rejection { "promise" } else { "data" }, value);
             }
             if let Some(state) = fields.state {
                 set("state", state);
@@ -726,7 +734,7 @@ impl ScriptRuntime {
                 set("message", Value::String(message.into()));
             }
             if let Some(error) = fields.error {
-                set("error", error);
+                set(if rejection { "reason" } else { "error" }, error);
             }
             if let Some(related) = fields.related_target {
                 set("relatedTarget", related);

@@ -234,6 +234,7 @@ impl ScriptRuntime {
                 let promise = Rc::new(RefCell::new(PromiseData {
                     outcome: PromiseOutcome::Pending,
                     reactions: Vec::new(),
+                    handled: false,
                 }));
                 let state = Rc::new(RefCell::new(AsyncFunctionData {
                     frame: Some(frame),
@@ -2691,6 +2692,7 @@ impl ScriptRuntime {
         let promise = Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Pending,
             reactions: Vec::new(),
+            handled: false,
         }));
         let state = Rc::new(RefCell::new(AsyncFunctionData {
             frame: Some(Box::new(frame)),
@@ -2766,6 +2768,7 @@ impl ScriptRuntime {
         let promise = Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Pending,
             reactions: Vec::new(),
+            handled: false,
         }));
         data.borrow_mut().queue.push_back(AsyncGeneratorRequest {
             mode,
@@ -2884,6 +2887,7 @@ impl ScriptRuntime {
                 let promise = Rc::new(RefCell::new(PromiseData {
                     outcome: PromiseOutcome::Pending,
                     reactions: Vec::new(),
+                    handled: false,
                 }));
                 let state = Rc::new(RefCell::new(AsyncFunctionData {
                     frame: Some(frame),

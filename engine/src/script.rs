@@ -606,6 +606,8 @@ pub struct ScriptRuntime {
     next_task_id: u64,
     tasks: Vec<ScheduledTask>,
     microtasks: VecDeque<Microtask>,
+    // promises rejected with nothing waiting on them, reported once the microtasks have run
+    rejections: RefCell<Vec<PromiseHandle>>,
     pending_navigation: Option<NavigationRequest>,
     pending_history: Vec<NavigationRequest>,
     // the value being thrown, with the message of the Rust error that carries it
@@ -1339,6 +1341,8 @@ enum PromiseOutcome {
 struct PromiseData {
     outcome: PromiseOutcome,
     reactions: Vec<PromiseReaction>,
+    // something waits on the promise, so a rejection of it is not left unhandled
+    handled: bool,
 }
 
 struct Microtask {
@@ -1684,6 +1688,7 @@ impl ScriptRuntime {
             next_task_id: 1,
             tasks: Vec::new(),
             microtasks: VecDeque::new(),
+            rejections: RefCell::default(),
             pending_navigation: None,
             pending_history: Vec::new(),
             pending_exception: None,
@@ -6983,6 +6988,7 @@ impl ScriptRuntime {
         let promise = Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Pending,
             reactions: Vec::new(),
+            handled: false,
         }));
         if let Some(executor) = arguments.first() {
             if !is_callable(executor) {
@@ -7263,12 +7269,9 @@ impl ScriptRuntime {
                 Ok(Value::Range(self.new_range(LiveRange::collapsed(start))))
             }
             Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
-            Builtin::PromiseReject => Ok(Value::Promise(Rc::new(RefCell::new(PromiseData {
-                outcome: PromiseOutcome::Rejected(
-                    arguments.first().cloned().unwrap_or(Value::Undefined),
-                ),
-                reactions: Vec::new(),
-            })))),
+            Builtin::PromiseReject => Ok(Value::Promise(self.rejected_promise_value(
+                arguments.first().cloned().unwrap_or(Value::Undefined),
+            ))),
             Builtin::PromiseResolve => Ok(Value::Promise(
                 self.promise_resolve(arguments.first().cloned().unwrap_or(Value::Undefined))?,
             )),
@@ -9263,6 +9266,7 @@ impl ScriptRuntime {
         Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Fulfilled(value),
             reactions: Vec::new(),
+            handled: false,
         }))
     }
 
@@ -9270,6 +9274,7 @@ impl ScriptRuntime {
         Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Pending,
             reactions: Vec::new(),
+            handled: false,
         }))
     }
 
@@ -9279,10 +9284,13 @@ impl ScriptRuntime {
     }
 
     fn rejected_promise_value(&self, reason: Value) -> PromiseHandle {
-        Rc::new(RefCell::new(PromiseData {
+        let promise = Rc::new(RefCell::new(PromiseData {
             outcome: PromiseOutcome::Rejected(reason),
             reactions: Vec::new(),
-        }))
+            handled: false,
+        }));
+        self.rejections.borrow_mut().push(promise.clone());
+        promise
     }
 
     // the resolve function of a promise: promises and thenables are adopted, anything
@@ -9349,6 +9357,7 @@ impl ScriptRuntime {
         };
         let outcome = {
             let mut promise = promise.borrow_mut();
+            promise.handled = true;
             match &promise.outcome {
                 PromiseOutcome::Pending => {
                     promise.reactions.push(reaction);
@@ -9398,8 +9407,40 @@ impl ScriptRuntime {
             promise.outcome = outcome.clone();
             std::mem::take(&mut promise.reactions)
         };
+        if matches!(outcome, PromiseOutcome::Rejected(_)) && !promise.borrow().handled {
+            self.rejections.borrow_mut().push(promise.clone());
+        }
         for reaction in reactions {
             self.queue_reaction(reaction, outcome.clone());
+        }
+    }
+
+    // a promise rejected while nothing waited on it, and still alone after the microtasks ran,
+    // goes to the window's unhandledrejection listeners and then, unless one cancels it, to
+    // the console
+    fn report_unhandled_rejections(&mut self) {
+        for promise in self.rejections.take() {
+            let reason = match &*promise.borrow() {
+                PromiseData {
+                    outcome: PromiseOutcome::Rejected(reason),
+                    handled: false,
+                    ..
+                } => reason.clone(),
+                _ => continue,
+            };
+            promise.borrow_mut().handled = true;
+            let fields = events::HostEventFields {
+                value: Some(Value::Promise(promise)),
+                error: Some(reason.clone()),
+                ..Default::default()
+            };
+            let cancelled = self
+                .fire(events::ListenerTarget::Window, "unhandledrejection", fields)
+                .is_ok_and(|dispatch| dispatch.default_prevented);
+            if !cancelled {
+                let text = self.inspect(&reason, 0, &mut Vec::new());
+                self.push_log(format!("Uncaught (in promise) {text}"));
+            }
         }
     }
 
@@ -9411,6 +9452,7 @@ impl ScriptRuntime {
         };
         let outcome = {
             let mut promise = promise.borrow_mut();
+            promise.handled = true;
             match &promise.outcome {
                 PromiseOutcome::Pending => {
                     promise.reactions.push(reaction);
@@ -9450,7 +9492,11 @@ impl ScriptRuntime {
                 (MicrotaskKind::Adopt(_) | MicrotaskKind::Plain, Ok(_)) => {}
             }
             executed += 1;
+            if self.microtasks.is_empty() {
+                self.report_unhandled_rejections();
+            }
         }
+        self.report_unhandled_rejections();
         self.sync_selection_change()?;
         self.prune_event_targets();
         self.collect_detached_nodes();
@@ -16220,6 +16266,51 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("1 function ReferenceError")
+        );
+    }
+
+    #[test]
+    fn a_rejection_nothing_handles_reaches_the_window_and_the_console() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                addEventListener("unhandledrejection", (event) => {
+                    seen.push(event.type + ":" + (event.reason?.message ?? event.reason) + ":" + (event.promise instanceof Promise));
+                    if (event.reason === "quiet") event.preventDefault();
+                    document.getElementById("status").textContent = seen.join(" ");
+                });
+                Promise.reject(new Error("lost"));
+                Promise.reject("quiet");
+                Promise.reject(new Error("caught")).catch(() => {});
+                (async () => { throw new Error("thrown"); })();
+                const later = Promise.reject(new Error("awaited"));
+                (async () => { try { await later; } catch {} })();
+                Promise.reject(new Error("chained")).then(() => {});
+                "#,
+            )
+            .expect("rejections should be reported, not thrown");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "unhandledrejection:lost:true unhandledrejection:quiet:true unhandledrejection:thrown:true unhandledrejection:chained:true"
+            )
+        );
+        let logs = runtime.logs().join("|");
+        assert!(logs.contains("Uncaught (in promise) Error: lost"), "{logs}");
+        assert!(
+            logs.contains("Uncaught (in promise) Error: chained"),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains("quiet") && !logs.contains("Error: caught") && !logs.contains("awaited"),
+            "{logs}"
         );
     }
 
