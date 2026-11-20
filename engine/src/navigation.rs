@@ -8313,6 +8313,39 @@ mod tests {
     }
 
     #[test]
+    fn computed_border_widths_snap_to_device_pixels_with_or_without_a_box() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>div { border: 1px solid; border-left-width: 2.5px }</style>
+            <div id="shown"></div><div id="hidden" style="display: none"></div>
+            <p id="status"></p><script>
+                const read = (id) => {
+                    const style = getComputedStyle(document.getElementById(id));
+                    return style.borderTopWidth + " " + style.borderLeftWidth;
+                };
+                document.getElementById("status").textContent = read("shown") + ", " + read("hidden");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 300.0,
+                height: 200.0,
+            },
+            1.5,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().unwrap();
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").unwrap();
+        // one and a half device pixels round down to one, three and three quarters to three
+        assert_eq!(
+            document.text_content(status),
+            "0.666667px 2px, 0.666667px 2px"
+        );
+    }
+
+    #[test]
     fn computed_display_is_block_level_for_items_floats_and_out_of_flow_boxes() {
         let mut browser = Browser::new(bundle(
             r##"<span id="plain">a</span>

@@ -807,10 +807,13 @@ impl ScriptRuntime {
             own: &own,
             blockified,
         };
+        // a box that is not laid out still snaps its border widths to device pixels
+        let fonts = crate::font::use_fonts(inputs.fonts.clone(), self.viewport.device_pixel_ratio);
         for &property in COMPUTED {
             let value = computed_value(property, &computed);
             values.insert(property.to_string(), value);
         }
+        drop(fonts);
         for &(property, initial) in PLAIN {
             let value = own
                 .get(property)
