@@ -1929,7 +1929,6 @@ test/built-ins/Object/defineProperty/15.2.3.6-4-354-2.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-354-6.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-360-1.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-360-5.js
-test/built-ins/Object/defineProperty/15.2.3.6-4-45.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-531-11.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-531-15.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-531-2.js
@@ -1959,9 +1958,6 @@ test/built-ins/Object/freeze/typedarray-backed-by-resizable-buffer.js
 test/built-ins/Object/fromEntries/evaluation-order.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-10.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-11.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-178.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-179.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-180.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-4.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-5.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-6.js
@@ -1969,7 +1965,6 @@ test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-7.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-8.js
 test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-9.js
 test/built-ins/Object/getOwnPropertyDescriptors/observable-operations.js
-test/built-ins/Object/getOwnPropertyNames/15.2.3.4-4-1.js
 test/built-ins/Object/getOwnPropertyNames/15.2.3.4-4-44.js
 test/built-ins/Object/getOwnPropertyNames/15.2.3.4-4-47.js
 test/built-ins/Object/getOwnPropertyNames/15.2.3.4-4-48.js
