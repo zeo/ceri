@@ -7822,6 +7822,197 @@ mod tests {
         );
     }
 
+    // a few hundred seeded writes, pointer moves and scrolls, each followed by a frame painted
+    // over an earlier one while the last is still held; it must not differ from the same
+    // layout painted whole
+    #[test]
+    fn a_frame_painted_over_an_earlier_one_matches_a_whole_paint_after_any_change() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+            body { margin: 0; font-size: 14px }
+            #root { position: relative; width: 360px }
+            .card { margin: 6px; padding: 6px; border: 1px solid #456; border-radius: 6px;
+                box-shadow: 0 3px 8px #0006; background: linear-gradient(#eef, #cdf) }
+            .ring { outline: 3px solid #c33; outline-offset: 2px }
+            .glow { box-shadow: 0 0 12px 4px #39f, inset 0 0 6px #000 }
+            .dark { background: #223; color: #fff; text-shadow: 1px 2px 3px #f00 }
+            .abs { position: absolute; left: 200px; top: 20px; width: 40px; height: 40px;
+                background: #f80 }
+            .tilt { transform: rotate(8deg) }
+            .fade { opacity: 0.5 }
+            #scroller { height: 60px; overflow: auto }
+            span:hover, .card:hover { background: #ffc }
+            li { margin-left: 20px }
+            </style>
+            <div id="root"><div class="card"><span>one</span> two <b>three</b></div><div class="card glow"><input type="checkbox" checked><input type="range" value="30"><input value="text"></div><ul><li>first</li><li class="ring">second</li></ul><div id="scroller"><p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p></div><div class="abs"></div><p>tail text that wraps across the width of the root box more than once to make lines</p></div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 400.0,
+            height: 320.0,
+        };
+        let document = browser.document().unwrap();
+        let root = document.borrow().find_element_by_id("root").unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut pick = |below: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % below
+        };
+        const PROPERTIES: [(&str, [&str; 4]); 12] = [
+            ("left", ["3px", "120px", "auto", "40%"]),
+            ("top", ["0", "33px", "auto", "70px"]),
+            ("width", ["30px", "55%", "auto", "140px"]),
+            ("height", ["18px", "44px", "auto", "9px"]),
+            ("margin-left", ["0", "9px", "30px", "-4px"]),
+            (
+                "background",
+                ["#e33", "#3a6", "none", "linear-gradient(90deg, #fff, #339)"],
+            ),
+            ("color", ["#000", "#c0c", "#fff", "#06c"]),
+            (
+                "box-shadow",
+                [
+                    "none",
+                    "0 0 9px #000",
+                    "4px 4px 0 #f00",
+                    "inset 0 2px 5px #00f",
+                ],
+            ),
+            (
+                "outline",
+                [
+                    "none",
+                    "2px solid #0a0",
+                    "5px solid #00f",
+                    "1px dotted #000",
+                ],
+            ),
+            ("opacity", ["1", "0.4", "0.8", "1"]),
+            (
+                "transform",
+                ["none", "translate(7px, 3px)", "rotate(5deg)", "none"],
+            ),
+            ("border-radius", ["0", "4px", "50%", "12px 2px"]),
+        ];
+        const CLASSES: [&str; 8] = [
+            "card",
+            "card glow",
+            "ring",
+            "dark",
+            "abs",
+            "tilt",
+            "fade",
+            "",
+        ];
+        const TEXTS: [&str; 4] = [
+            "a",
+            "longer words here to wrap around the line",
+            "",
+            "x y z",
+        ];
+        let mut held = browser.paint(viewport).unwrap();
+        for step in 0..200 {
+            let (elements, texts) = {
+                let document = document.borrow();
+                let nodes = document.subtree(root);
+                let texts = nodes
+                    .iter()
+                    .copied()
+                    .filter(|&node| {
+                        matches!(document.kind(node), Some(crate::dom::NodeKind::Text(_)))
+                    })
+                    .collect::<Vec<_>>();
+                let elements = nodes
+                    .into_iter()
+                    .filter(|&node| document.is_element(node))
+                    .collect::<Vec<_>>();
+                (elements, texts)
+            };
+            let element = elements[pick(elements.len())];
+            let change = pick(9);
+            let mut scrolled = false;
+            match change {
+                0..=2 => {
+                    let (property, values) = PROPERTIES[pick(PROPERTIES.len())];
+                    document.borrow_mut().set_style_property(
+                        element,
+                        property,
+                        values[pick(4)].to_string(),
+                    );
+                }
+                3 => {
+                    document.borrow_mut().set_attribute(
+                        element,
+                        "class",
+                        CLASSES[pick(8)].to_string(),
+                    );
+                }
+                4 if !texts.is_empty() => {
+                    document
+                        .borrow_mut()
+                        .set_character_data(texts[pick(texts.len())], TEXTS[pick(4)].to_string());
+                }
+                5 => {
+                    let mut document = document.borrow_mut();
+                    let added = document.create_element(["div", "span", "p"][pick(3)]);
+                    let words = document.create_text(TEXTS[pick(4)]);
+                    document
+                        .append_child(added, words)
+                        .expect("text should append");
+                    document
+                        .insert_before(element, added, None)
+                        .expect("element should insert");
+                }
+                6 if element != root && elements.len() > 8 => {
+                    document.borrow_mut().remove(element);
+                }
+                7 => {
+                    browser
+                        .dispatch_at(viewport, pick(380) as f32, pick(300) as f32, "pointermove")
+                        .expect("pointer move should dispatch");
+                }
+                _ => {
+                    scrolled = true;
+                    browser
+                        .scroll_at(
+                            viewport,
+                            50.0,
+                            pick(300) as f32,
+                            0.0,
+                            pick(60) as f32 - 30.0,
+                        )
+                        .expect("scroll should dispatch");
+                }
+            }
+            let frame = browser.paint(viewport).unwrap();
+            let layout = browser.layout(viewport).unwrap();
+            let whole = crate::paint::paint_with_canvases(&layout, &[], 1.0, false);
+            // pixels a scroll moves were drawn at another place, where a gradient or a blur
+            // can round a step differently, so a scrolled frame may be off by one and the
+            // next frame starts from a whole paint
+            let furthest = frame
+                .rgba_pixels()
+                .iter()
+                .zip(whole.rgba_pixels())
+                .map(|(painted, wanted)| painted.abs_diff(*wanted))
+                .max();
+            assert!(
+                furthest <= Some(u8::from(scrolled)),
+                "after change {change} of step {step}: off by {furthest:?}"
+            );
+            if scrolled {
+                *browser.painted.borrow_mut() = None;
+            }
+            // the frame before stays held through the next paint, as a window holds it
+            held = frame;
+        }
+        drop(held);
+    }
+
     #[test]
     fn a_frame_still_held_is_left_alone_and_the_one_before_it_is_painted_over() {
         let viewport = Size {
