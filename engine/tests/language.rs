@@ -2486,6 +2486,21 @@ fn a_scope_past_the_slot_limit_is_refused() {
             "var parts = ['function blocks() {']; for (var i = 0; i < 70000; i++) parts.push('{ let b; }'); parts.push('}'); var s = parts.join(''); try { eval(s); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
             "true",
         ),
+        (
+            "one block's lets",
+            "var parts = ['{']; for (var i = 0; i < 70000; i++) parts.push('let b' + i + ';'); parts.push('}'); var s = parts.join(''); try { eval(s); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "a body's variable environment",
+            "var parts = ['function f(a = 0) {']; for (var i = 0; i < 70000; i++) parts.push('var v' + i + ';'); parts.push('}'); var s = parts.join(''); try { eval(s); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "a strict eval's vars",
+            "var parts = ['\"use strict\";']; for (var i = 0; i < 70000; i++) parts.push('var v' + i + ';'); var s = parts.join(''); try { eval(s); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
     ]);
 }
 

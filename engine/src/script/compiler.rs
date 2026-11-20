@@ -398,10 +398,11 @@ impl ScopeInfo {
             return existing.index;
         }
         let index = self.size;
-        match self.size.checked_add(1) {
-            Some(size) => self.size = size,
-            None => self.overflowed = true,
-        }
+        let Some(size) = self.size.checked_add(1) else {
+            self.overflowed = true;
+            return 0;
+        };
+        self.size = size;
         self.bindings.insert(name, Binding { index, kind });
         index
     }
