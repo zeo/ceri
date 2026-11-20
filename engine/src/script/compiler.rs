@@ -358,6 +358,7 @@ struct ScopeInfo {
     block: u16,
     role: ScopeRole,
     grows: bool,
+    overflowed: bool,
 }
 
 impl ScopeInfo {
@@ -371,6 +372,7 @@ impl ScopeInfo {
             block: 0,
             role: ScopeRole::Block,
             grows: false,
+            overflowed: false,
         }
     }
 
@@ -389,12 +391,17 @@ impl ScopeInfo {
         })
     }
 
+    // a slot index is a u16, so a scope that would outgrow it is marked, and the
+    // function holding it fails to compile rather than alias slots
     fn declare(&mut self, name: Name, kind: BindingKind) -> u16 {
         if let Some(existing) = self.bindings.get(&name) {
             return existing.index;
         }
         let index = self.size;
-        self.size += 1;
+        match self.size.checked_add(1) {
+            Some(size) => self.size = size,
+            None => self.overflowed = true,
+        }
         self.bindings.insert(name, Binding { index, kind });
         index
     }
@@ -453,6 +460,8 @@ struct FunctionState {
     pending_labels: Vec<Name>,
     // async generators await yielded and returned values
     async_generator: bool,
+    // a scope or the block list outgrew its u16 indexes
+    overflowed: bool,
 }
 
 impl FunctionState {
@@ -484,6 +493,7 @@ impl FunctionState {
             strict,
             pending_labels: Vec::new(),
             async_generator: false,
+            overflowed: false,
         }
     }
 
@@ -546,6 +556,21 @@ impl FunctionState {
         };
     }
 
+    // the block a materialized scope's layout goes in
+    fn next_block(&mut self) -> u16 {
+        u16::try_from(self.blocks.len()).unwrap_or_else(|_| {
+            self.overflowed = true;
+            0
+        })
+    }
+
+    fn check_limits(&self) -> Result<(), ScriptError> {
+        if self.overflowed || self.scopes.iter().any(|scope| scope.overflowed) {
+            return Err(error("too many bindings in one scope"));
+        }
+        Ok(())
+    }
+
     fn function_scope_index(&self) -> usize {
         self.scopes
             .iter()
@@ -593,7 +618,8 @@ pub(super) struct EvalCode {
 struct EvalTarget {
     // the caller scope's position in the eval's scopes
     scope: usize,
-    extra: Vec<Name>,
+    // the slots of the names earlier evals and this one added
+    added: HashMap<Name, usize>,
     slots: usize,
     grown: Vec<Name>,
 }
@@ -927,10 +953,18 @@ impl Compiler {
             && let Some(scope) = target
         {
             let caller = &caller[caller.len() - 1 - scope];
+            let names = caller.layout.names.len();
+            let added = caller
+                .extra
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| !name.is_empty())
+                .map(|(position, name)| (name.clone(), names + position))
+                .collect();
             state.eval_target = Some(EvalTarget {
                 scope,
-                extra: caller.extra.clone(),
-                slots: caller.layout.names.len() + caller.extra.len(),
+                added,
+                slots: names + caller.extra.len(),
                 grown: Vec::new(),
             });
         }
@@ -975,6 +1009,7 @@ impl Compiler {
         self.compile_get_name(&completion)?;
         self.emit(Op::Return);
         let mut state = self.functions.pop().expect("eval state");
+        state.check_limits()?;
         let grown = state
             .eval_target
             .take()
@@ -1011,22 +1046,15 @@ impl Compiler {
         let scope = &state.scopes[target.scope];
         let index = match scope.bindings.get(name) {
             Some(binding) if binding.kind != BindingKind::Hidden => binding.index as usize,
-            _ => {
-                let names = scope.size as usize - target.extra.len();
-                match target.extra.iter().position(|extra| extra == name) {
-                    Some(position) => names + position,
-                    None => {
-                        let position = match target.grown.iter().position(|grown| grown == name) {
-                            Some(position) => position,
-                            None => {
-                                target.grown.push(name.clone());
-                                target.grown.len() - 1
-                            }
-                        };
-                        target.slots + position
-                    }
+            _ => match target.added.get(name) {
+                Some(index) => *index,
+                None => {
+                    let index = target.slots + target.grown.len();
+                    target.grown.push(name.clone());
+                    target.added.insert(name.clone(), index);
+                    index
                 }
-            }
+            },
         };
         let index = u16::try_from(index)
             .ok()
@@ -1147,6 +1175,7 @@ impl Compiler {
         }
         self.emit(Op::Return);
         let state = self.functions.pop().expect("script state");
+        state.check_limits()?;
         let layout = state.scopes[0].layout();
         let mut code = self.finish(
             state,
@@ -1250,6 +1279,7 @@ impl Compiler {
         self.emit(Op::Undefined);
         self.emit(Op::Return);
         let state = self.functions.pop().expect("module state");
+        state.check_limits()?;
         let code = Rc::new(self.finish(
             state,
             None,
@@ -1395,7 +1425,7 @@ impl Compiler {
         let mut scope = ScopeInfo::new(ScopeKind::Function, true);
         scope.role = ScopeRole::Var;
         let state = self.state();
-        scope.block = state.blocks.len() as u16;
+        scope.block = state.next_block();
         let layout = scope.layout();
         state.blocks.push(layout);
         state.emit(Op::PushVarScope(scope.block));
@@ -1412,7 +1442,7 @@ impl Compiler {
         }
         if materialized {
             let state = self.state();
-            scope.block = state.blocks.len() as u16;
+            scope.block = state.next_block();
             state.blocks.push(scope.layout());
             state.emit(Op::PushScope(scope.block));
             state.runtime_scopes += 1;
@@ -1424,6 +1454,7 @@ impl Compiler {
     fn pop_block_scope(&mut self) {
         let state = self.state();
         let scope = state.scopes.pop().expect("a block scope is open");
+        state.overflowed |= scope.overflowed;
         if scope.materialized {
             // a block scope can grow after it was opened, as temporaries are added
             state.blocks[scope.block as usize] = scope.layout();
@@ -2795,6 +2826,7 @@ impl Compiler {
         }
         self.emit(Op::Return);
         let state = self.functions.pop().expect("function state");
+        state.check_limits()?;
         let mut code = self.finish(
             state,
             Some(function.source),

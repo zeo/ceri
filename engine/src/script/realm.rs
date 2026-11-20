@@ -1385,6 +1385,7 @@ impl ScriptRuntime {
         chain: &[ScopeRef],
         eval: &EvalCode,
     ) -> Result<(), ScriptError> {
+        let declared: HashSet<&str> = eval.declared.iter().map(|name| &**name).collect();
         for scope in chain {
             let layout = scope.borrow().layout.clone();
             // annex b lets a var share a catch parameter's name
@@ -1398,7 +1399,7 @@ impl ScriptRuntime {
                     BindingKind::Hidden => false,
                     _ => !var_scope,
                 };
-                if lexical && eval.declared.contains(name) {
+                if lexical && declared.contains(&**name) {
                     return Err(self.redeclaration(name));
                 }
             }

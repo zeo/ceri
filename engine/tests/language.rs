@@ -2466,6 +2466,30 @@ fn eval_declares_globals_by_the_global_objects_own_attributes() {
 }
 
 #[test]
+fn a_scope_past_the_slot_limit_is_refused() {
+    let declarations = "var parts = ['function big() {']; for (var i = 0; i < 70000; i++) parts.push('var v' + i + ';'); parts.push('return v69999; }'); var s = parts.join('');";
+    check(&[
+        (
+            "a function's vars",
+            &format!(
+                "{declarations} try {{ eval(s); console.log('no throw') }} catch (e) {{ console.log(e instanceof SyntaxError) }}"
+            ),
+            "true",
+        ),
+        (
+            "an eval growing its caller",
+            "var parts = []; for (var i = 0; i < 70000; i++) parts.push('var w' + i + ';'); var s = parts.join(''); function g() { eval(s); return typeof w0; } try { g(); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "a function's blocks",
+            "var parts = ['function blocks() {']; for (var i = 0; i < 70000; i++) parts.push('{ let b; }'); parts.push('}'); var s = parts.join(''); try { eval(s); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+    ]);
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (
