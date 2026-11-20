@@ -3755,11 +3755,11 @@ fn scrolls_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
         && (x > 0.0 || y > 0.0)
 }
 
-// chromium gives a fixed box, a modal dialog among them, a layer of its own on a dense display,
-// and text in a layer that is not opaque all over is drawn in grayscale
+// chromium gives a box in the top layer a layer of its own, and a fixed box too on a dense
+// display, and text in a layer that is not opaque all over is drawn in grayscale
 fn floats_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
-    canvas.scale >= 1.5
-        && (layout_box.position == Position::Fixed || layout_box.z_index == i32::MAX)
+    (layout_box.z_index == i32::MAX
+        || (canvas.scale >= 1.5 && layout_box.position == Position::Fixed))
         && (layout_box.background.alpha < 255
             || layout_box
                 .radii

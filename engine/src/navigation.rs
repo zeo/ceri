@@ -10409,6 +10409,56 @@ A</div>
         assert_eq!(pixel_at(&canvas, 1, 2), [0, 0, 0, 255]);
     }
 
+    #[test]
+    fn text_in_a_rounded_modal_is_grayscale_and_in_a_rounded_fixed_box_from_a_dense_display() {
+        let mut resources = bundle(
+            r##"<html><head><style>
+                @font-face { font-family: "Ceri Web"; src: url(/fonts/ceri-test.woff2) format("woff2") }
+                body { margin: 0; background: #000; color: #fff; font: 17px/40px "Ceri Web" }
+                .card { left: 0; width: 200px; height: 40px; margin: 0; padding: 0; border: 0; background: #222; color: #fff; border-radius: 6px }
+            </style></head><body>
+            <p style="margin: 0; height: 40px">ABAB fi AB</p>
+            <div class="card" style="position: fixed; top: 40px">ABAB fi AB</div>
+            <dialog id="box" class="card" style="top: 80px">ABAB fi AB</dialog>
+            <script>document.getElementById("box").showModal();</script></body></html>"##,
+        );
+        let font = std::fs::read(format!(
+            "{}/tests/fixtures/fonts/ceri-test.woff2",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture font should exist");
+        resources
+            .insert("/fonts/ceri-test.woff2", "font/ttf", font)
+            .expect("font should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 240.0,
+            height: 130.0,
+        };
+        // pixels in a band of the page, by device scale, whose channels differ: the fringes
+        // of text blended per subpixel
+        let fringes = |scale: f32, band: u32| {
+            let canvas = browser.paint_scaled(viewport, scale).expect("page paints");
+            let rows =
+                (band as f32 * 40.0 * scale) as u32..((band + 1) as f32 * 40.0 * scale) as u32;
+            rows.flat_map(|y| (0..canvas.width()).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let [red, green, blue, _] = pixel_at(&canvas, x, y);
+                    red.abs_diff(green).max(green.abs_diff(blue)) > 24
+                })
+                .count()
+        };
+        assert!(fringes(1.0, 0) > 0, "page text blends per subpixel");
+        assert!(fringes(1.0, 1) > 0, "a fixed box is no layer at 1x");
+        assert_eq!(fringes(1.0, 2), 0, "a modal is a layer at any scale");
+        assert!(fringes(1.5, 0) > 0);
+        assert_eq!(fringes(1.5, 1), 0, "a fixed box is a layer from 1.5x");
+        assert_eq!(fringes(1.5, 2), 0);
+    }
+
     fn image_bundle(source: &str) -> ResourceBundle {
         let mut resources = bundle(source);
         for name in ["rgb8.png", "rgba8.png", "baseline-420.jpg", "frame.gif"] {
