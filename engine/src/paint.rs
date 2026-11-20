@@ -1313,8 +1313,81 @@ impl DeviceBounds {
     }
 }
 
+// a subtree's bounds, and how far glyphs, outlines and focus rings can reach past them, which
+// is none under a transform
+type Extent = (Rect, Option<f32>);
+type Extents = std::collections::HashMap<(usize, [u32; 2]), Extent>;
+
+thread_local! {
+    // the extent of each box asked about while one layout paints, by the box's address and
+    // the offset it was asked at: the paint asks at every box on its way down, and each
+    // answer walks the whole subtree
+    static EXTENTS: RefCell<Option<Extents>> = const { RefCell::new(None) };
+}
+
+struct MemoizedExtents {
+    began: bool,
+}
+
+impl Drop for MemoizedExtents {
+    fn drop(&mut self) {
+        if self.began {
+            EXTENTS.with(|extents| *extents.borrow_mut() = None);
+        }
+    }
+}
+
+// the boxes asked about must stay where and as they are while the guard lives
+fn memoize_extents() -> MemoizedExtents {
+    EXTENTS.with(|extents| {
+        let mut extents = extents.borrow_mut();
+        let began = extents.is_none();
+        if began {
+            *extents = Some(std::collections::HashMap::new());
+        }
+        MemoizedExtents { began }
+    })
+}
+
 // everything a subtree can paint: its boxes, shadows and text, in layout space
 fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
+    subtree_extent(layout_box, ancestor_offset).0
+}
+
+fn subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    let key = (
+        std::ptr::from_ref(layout_box) as usize,
+        [ancestor_offset.0.to_bits(), ancestor_offset.1.to_bits()],
+    );
+    let known = EXTENTS.with(|extents| extents.borrow().as_ref()?.get(&key).copied());
+    if let Some(extent) = known {
+        return extent;
+    }
+    let extent = measure_subtree_extent(layout_box, ancestor_offset);
+    EXTENTS.with(|extents| {
+        if let Some(extents) = extents.borrow_mut().as_mut() {
+            extents.insert(key, extent);
+        }
+    });
+    extent
+}
+
+fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    let outline = layout_box
+        .outline
+        .as_ref()
+        .map_or(0.0, |outline| outline.width + outline.offset.max(0.0));
+    // glyphs overhang the runs measured below by less than their font size; a box with none
+    // paints nothing past its bounds but its outline
+    let glyphs = if layout_box.text.is_empty()
+        && layout_box.control.is_none()
+        && layout_box.control_value.is_none()
+    {
+        0.0
+    } else {
+        layout_box.font_size
+    };
+    let mut reach = layout_box.transform.is_none().then(|| outline.max(glyphs));
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let mut bounds = visual_rect_for(layout_box, ancestor_offset);
     for shadow in layout_box.shadows.iter().filter(|shadow| !shadow.inset) {
@@ -1345,9 +1418,14 @@ fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
         }
     }
     for child in &layout_box.children {
-        bounds = union_rect(bounds, subtree_bounds(child, offset));
+        let (child_bounds, child_reach) = subtree_extent(child, offset);
+        bounds = union_rect(bounds, child_bounds);
+        reach = reach.zip(child_reach).map(|(most, next)| most.max(next));
     }
-    outset_rect(bounds, crate::filter::reach(&layout_box.filters.own))
+    (
+        outset_rect(bounds, crate::filter::reach(&layout_box.filters.own)),
+        reach,
+    )
 }
 
 fn outset_rect(rect: Rect, amount: f32) -> Rect {
@@ -2422,25 +2500,8 @@ fn has_backdrop(layout_box: &LayoutBox) -> bool {
 // everything a box and its subtree can paint, none under a transform; glyphs, outlines and
 // focus rings can reach past the boxes and runs subtree_bounds measures
 fn ink(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Option<Rect> {
-    fn reach(layout_box: &LayoutBox) -> Option<f32> {
-        if layout_box.transform.is_some() {
-            return None;
-        }
-        let outline = layout_box
-            .outline
-            .as_ref()
-            .map_or(0.0, |outline| outline.width + outline.offset.max(0.0));
-        layout_box
-            .children
-            .iter()
-            .try_fold(outline.max(layout_box.font_size), |most, child| {
-                Some(most.max(reach(child)?))
-            })
-    }
-    Some(outset_rect(
-        subtree_bounds(layout_box, ancestor_offset),
-        reach(layout_box)?,
-    ))
+    let (bounds, reach) = subtree_extent(layout_box, ancestor_offset);
+    Some(outset_rect(bounds, reach?))
 }
 
 // paints area again over the frame before, which already shows the rest; a clip rounds its
@@ -2529,6 +2590,7 @@ pub(crate) fn repaint_areas(
 ) {
     let shown = canvas.revision.id;
     let mut boxes = Boxes::default();
+    let _extents = memoize_extents();
     for &area in areas {
         let last = canvas.revision.id;
         repaint(canvas, document, canvases, area);
@@ -2982,6 +3044,7 @@ fn paint_document(
     clip: Option<Rect>,
 ) {
     let _profile = crate::profile::scope("paint: document");
+    let _extents = memoize_extents();
     // the root background paints the whole canvas, as CSS backgrounds require; its images
     // stay with the root box
     if let Some(root) = canvas_background(&document.root) {

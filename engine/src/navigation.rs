@@ -7771,10 +7771,9 @@ mod tests {
             .changed
             .expect("the frame should repaint over the last");
         assert_eq!(base, shown);
-        // each square with the margin a repaint leaves around what changed
         assert_eq!(
             boxes.iter().collect::<Vec<_>>(),
-            [[0, 0, 26, 26], [184, 134, 226, 176]]
+            [[0, 0, 10, 10], [200, 150, 210, 160]]
         );
     }
 
