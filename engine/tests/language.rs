@@ -2524,6 +2524,8 @@ fn deep_native_reentry_throws_instead_of_overflowing() {
     let cases = [
         "function r() { eval('r()'); } try { r(); } catch (e) { console.log(e instanceof RangeError); }",
         "function r() { [1].map(r); } try { r(); } catch (e) { console.log(e instanceof RangeError); }",
+        "function r() { r.call(null); } try { r(); } catch (e) { console.log(e instanceof RangeError); }",
+        "var o = { get x() { return this.x; } }; try { o.x; } catch (e) { console.log(e instanceof RangeError); }",
     ];
     for source in cases {
         let output = std::thread::Builder::new()
