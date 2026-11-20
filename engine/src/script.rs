@@ -10865,6 +10865,9 @@ impl Value {
             Self::Number(value) => Ok(*value),
             Self::String(value) => Ok(operations::string_to_number(value)),
             Self::Bool(value) => Ok(f64::from(*value as u8)),
+            // as ToNumber has them, so clearTimeout(undefined) is a call like any other
+            Self::Undefined => Ok(f64::NAN),
+            Self::Null => Ok(0.0),
             _ => Err(runtime_error("value is not numeric")),
         }
     }
@@ -16221,6 +16224,34 @@ mod tests {
     }
 
     #[test]
+    fn a_timer_that_was_never_set_is_cleared_without_complaint() {
+        let document = document("<ul id='list'><li>a</li></ul><p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                let never;
+                clearTimeout(never);
+                clearTimeout(null);
+                clearInterval(undefined);
+                cancelAnimationFrame(never);
+                const items = document.querySelectorAll("li");
+                document.getElementById("status").textContent =
+                    [items.item(never).textContent, items.item(null).textContent].join(" ");
+                "#,
+            )
+            .expect("clearing nothing should be allowed");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("a a")
+        );
+    }
+
+    #[test]
     fn navigator_names_the_runtime_and_the_platform() {
         let document = document("<p id='status'>idle</p>");
         let mut runtime = ScriptRuntime::new(document.clone());
@@ -20279,6 +20310,66 @@ mod tests {
             document.borrow().element_text_content(status).as_deref(),
             Some(
                 "left: 40%; width: 0.5%|40%|0.5%|2px !important|left: 40%; --tint: red; top: 2px !important|null"
+            )
+        );
+    }
+
+    #[test]
+    fn a_delegated_click_handler_walks_the_composed_path_and_retargets_the_event() {
+        let document = document(
+            "<main id='root'><button id='press'><span id='label'>go</span></button><p id='status'>idle</p></main>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const seen = [];
+                const step = (name, run) => {
+                    try {
+                        seen.push(name + ":" + run());
+                    } catch (error) {
+                        seen.push(name + ":" + error.name + " " + error.message);
+                    }
+                };
+                const press = document.getElementById("press");
+                press.$$click = function (event) {
+                    seen.push("handler:" + (this === press) + ":" + event.currentTarget.id + ":" + event.target.id);
+                };
+                document.addEventListener("click", (e) => {
+                    let node = e.target;
+                    const original = e.target;
+                    const retarget = (value) => Object.defineProperty(e, "target", { configurable: true, value });
+                    step("current", () => {
+                        Object.defineProperty(e, "currentTarget", { configurable: true, get: () => node || document });
+                        return typeof e.currentTarget;
+                    });
+                    step("path", () => e.composedPath().map((n) => n.id || n.nodeName || "window").join(">"));
+                    step("retarget", () => (retarget(e.composedPath()[0]), e.target.id));
+                    step("walk", () => {
+                        const path = e.composedPath();
+                        for (let i = 0; i < path.length - 2; i++) {
+                            node = path[i];
+                            const handler = node.$$click;
+                            if (handler && !node.disabled) handler.call(node, e);
+                            if (e.cancelBubble) break;
+                        }
+                        return "done";
+                    });
+                    step("restore", () => (retarget(original), e.target.id));
+                });
+                document.getElementById("label").click();
+                document.getElementById("status").textContent = seen.join(" ");
+                "##,
+            )
+            .expect("the delegated handler should run");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "current:object path:label>press>root>#document>window retarget:label handler:true:press:label walk:done restore:label"
             )
         );
     }
