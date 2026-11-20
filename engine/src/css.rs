@@ -786,11 +786,11 @@ type ContentMemo = HashMap<(NodeId, Option<PseudoElement>), Option<String>>;
 type Cascade = HashMap<String, (Specificity, usize, String)>;
 
 // what selectors and rule conditions read besides the sheet: the tree and its attributes, by
-// the document's selector version, and these parts of the state
+// the document's selector version, and these parts of the state; the hovered element is
+// followed apart, since a pointer move restyles little
 #[derive(Clone, Debug, PartialEq)]
 struct Matching {
     selector_version: u64,
-    hovered: Option<NodeId>,
     hovered_part: Option<(NodeId, PseudoElement)>,
     focused: Option<NodeId>,
     focus_visible: bool,
@@ -812,7 +812,6 @@ impl Matching {
     fn of(document: &Document, state: &StyleState) -> Self {
         Self {
             selector_version: document.selector_version(),
-            hovered: state.hovered,
             hovered_part: state.hovered_part,
             focused: state.focused,
             focus_visible: state.focus_visible,
@@ -843,6 +842,7 @@ type KeptCascade = (Option<String>, Rc<Cascade>);
 #[derive(Clone, Debug, Default)]
 struct Cascades {
     matching: Option<Matching>,
+    hovered: Option<NodeId>,
     // the style pass the matching was last checked in
     pass: u64,
     entries: HashMap<(NodeId, Option<PseudoElement>), KeptCascade>,
@@ -1894,6 +1894,9 @@ pub struct Stylesheet {
     motion_rules: Vec<usize>,
     // a number no differently parsed sheet has
     identity: u64,
+    // the compounds that carry :hover, or none where one sits inside another pseudo-class
+    // and what it restyles is not worked out
+    hovers: Option<Vec<HoverUse>>,
     // shadow root style elements, by their text
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
     // whether a selector reads text nodes or the style attribute, which change without the
@@ -1903,6 +1906,38 @@ pub struct Stylesheet {
     // the pseudo-elements some rule styles, so the rest are not cascaded for nothing
     styled_pseudo_elements: Vec<PseudoElement>,
     font_faces: Vec<FontFaceRule>,
+}
+
+// a compound that carries :hover: the tag, id and classes an element needs to match it, and
+// whether it is its selector's subject
+#[derive(Clone, Debug)]
+struct HoverUse {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
+    subject: bool,
+}
+
+fn hover_uses(rules: &[Rule]) -> Option<Vec<HoverUse>> {
+    let mut uses = Vec::new();
+    for selector in rules.iter().flat_map(|rule| &rule.selectors) {
+        for (index, part) in selector.parts.iter().enumerate() {
+            let compound = &part.compound;
+            for class in &compound.pseudo_classes {
+                if matches!(class, PseudoClass::Hover) {
+                    uses.push(HoverUse {
+                        tag: compound.tag.clone(),
+                        id: compound.id.clone(),
+                        classes: compound.classes.clone(),
+                        subject: index + 1 == selector.parts.len(),
+                    });
+                } else if class.inner().into_iter().any(Selector::mentions_hover) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(uses)
 }
 
 fn next_identity() -> u64 {
@@ -2361,6 +2396,7 @@ impl Stylesheet {
         let styled_pseudo = styled_pseudo_elements(&rules);
         Ok(Self {
             identity: next_identity(),
+            hovers: hover_uses(&rules),
             reads_unversioned: reads_unversioned(&rules),
             cascades: RefCell::default(),
             rules,
@@ -2386,6 +2422,7 @@ impl Stylesheet {
         (
             Self {
                 identity: next_identity(),
+                hovers: hover_uses(&rules),
                 reads_unversioned: reads_unversioned(&rules),
                 cascades: RefCell::default(),
                 rules,
@@ -3188,6 +3225,51 @@ impl Stylesheet {
         self.identity
     }
 
+    // the elements a move of the pointer from over one element to over another can restyle,
+    // each standing for its whole subtree, or none where that is not worked out. only the
+    // elements on one of the two ancestor chains and not the other change whether they are
+    // hovered, and a rule follows that only through a :hover compound one of them fits; what
+    // the rule then styles is that element, or lies beside or below it
+    pub(crate) fn hover_reach(
+        &self,
+        document: &Document,
+        from: Option<NodeId>,
+        to: Option<NodeId>,
+    ) -> Option<Vec<NodeId>> {
+        let chain = |node: Option<NodeId>| {
+            std::iter::successors(node, |&node| document.parent(node)).collect::<Vec<_>>()
+        };
+        let (left, entered) = (chain(from), chain(to));
+        let changed = left
+            .iter()
+            .filter(|node| !entered.contains(node))
+            .chain(entered.iter().filter(|node| !left.contains(node)));
+        let mut roots = Vec::new();
+        for &node in changed {
+            let Some(element) = document.element(node) else {
+                continue;
+            };
+            for sheet in [self, user_agent_sheet()] {
+                for hover in sheet.hovers.as_ref()? {
+                    let fits = hover.tag.as_deref().is_none_or(|tag| tag == element.name)
+                        && hover
+                            .id
+                            .as_deref()
+                            .is_none_or(|id| element.attr("id") == Some(id))
+                        && hover.classes.iter().all(|class| element.has_class(class));
+                    let root = match document.parent(node) {
+                        Some(parent) if !hover.subject => parent,
+                        _ => node,
+                    };
+                    if fits && !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
+            }
+        }
+        Some(roots)
+    }
+
     // whether everything its selectors read moves the document's selector version, with the
     // user agent's sheet beside it
     pub(crate) fn follows_versions(&self) -> bool {
@@ -3254,7 +3336,21 @@ impl Stylesheet {
                 if cascades.matching.as_ref() != Some(&matching) {
                     cascades.entries.clear();
                     cascades.matching = Some(matching);
+                } else if cascades.hovered != state.hovered {
+                    match self.hover_reach(document, cascades.hovered, state.hovered) {
+                        Some(roots) => {
+                            let restyled = roots
+                                .iter()
+                                .flat_map(|&root| document.subtree(root))
+                                .collect::<std::collections::HashSet<_>>();
+                            cascades
+                                .entries
+                                .retain(|(node, _), _| !restyled.contains(node));
+                        }
+                        None => cascades.entries.clear(),
+                    }
                 }
+                cascades.hovered = state.hovered;
                 cascades.pass = pass;
             }
             if let Some((kept, values)) = cascades.entries.get(&key)
@@ -3890,18 +3986,18 @@ impl Selector {
                 let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) =
                     attribute;
                 name.eq_ignore_ascii_case("style")
-            }) || compound.pseudo_classes.iter().any(|class| match class {
-                PseudoClass::Empty => true,
-                PseudoClass::NthChild(_, selectors)
-                | PseudoClass::NthLastChild(_, selectors)
-                | PseudoClass::Not(selectors)
-                | PseudoClass::Is(selectors)
-                | PseudoClass::Where(selectors)
-                | PseudoClass::Host(selectors) => selectors.iter().any(Selector::reads_unversioned),
-                PseudoClass::Has(selectors) => selectors
-                    .iter()
-                    .any(|relative| relative.selector.reads_unversioned()),
-                _ => false,
+            }) || compound.pseudo_classes.iter().any(|class| {
+                matches!(class, PseudoClass::Empty)
+                    || class.inner().into_iter().any(Selector::reads_unversioned)
+            })
+        })
+    }
+
+    fn mentions_hover(&self) -> bool {
+        self.parts.iter().any(|part| {
+            part.compound.pseudo_classes.iter().any(|class| {
+                matches!(class, PseudoClass::Hover)
+                    || class.inner().into_iter().any(Selector::mentions_hover)
             })
         })
     }
@@ -3962,6 +4058,23 @@ impl CompoundSelector {
 }
 
 impl PseudoClass {
+    // the selectors inside a functional pseudo-class
+    fn inner(&self) -> Vec<&Selector> {
+        match self {
+            Self::NthChild(_, selectors)
+            | Self::NthLastChild(_, selectors)
+            | Self::Not(selectors)
+            | Self::Is(selectors)
+            | Self::Where(selectors)
+            | Self::Host(selectors) => selectors.iter().collect(),
+            Self::Has(selectors) => selectors
+                .iter()
+                .map(|relative| &relative.selector)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn matches(
         &self,
         element: &Element,

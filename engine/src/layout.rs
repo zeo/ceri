@@ -2663,8 +2663,8 @@ struct KeptUnder {
     selector_version: u64,
     fonts: (*const crate::font::FontSet, u64),
     scale: u32,
-    // without the clock, which only motion reads, and the custom properties, which follow
-    // from the rest
+    // without the clock, which only motion reads, the custom properties, which follow from
+    // the rest, and the hovered element, which is followed apart
     state: StyleState,
 }
 
@@ -2678,6 +2678,7 @@ struct KeptUnder {
 struct KeptAnswers {
     // none where no answer outlives its pass; the font set is held so its address stays its
     under: Option<(KeptUnder, Rc<crate::font::FontSet>)>,
+    hovered: Option<NodeId>,
     passes: u64,
     // the number of the pass in progress and the document's change stamp at its start
     pass: Option<(u64, u64)>,
@@ -2778,6 +2779,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             state: StyleState {
                 clock: 0,
                 custom_properties: HashMap::new(),
+                hovered: None,
                 ..state.clone()
             },
         });
@@ -2785,7 +2787,25 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             kept.boxes.clear();
             kept.widths.clear();
             kept.under = under.map(|under| (under, fonts));
+        } else if kept.hovered != state.hovered {
+            // a pointer move restyles a few subtrees, and with them the chain above each
+            match stylesheet.hover_reach(document, kept.hovered, state.hovered) {
+                Some(roots) => {
+                    let mut stale = std::collections::HashSet::new();
+                    for &root in &roots {
+                        stale.extend(document.subtree(root));
+                        stale.extend(document.ancestors(root));
+                    }
+                    kept.boxes.retain(|(node, _), _| !stale.contains(node));
+                    kept.widths.retain(|(node, ..), _| !stale.contains(node));
+                }
+                None => {
+                    kept.boxes.clear();
+                    kept.widths.clear();
+                }
+            }
         }
+        kept.hovered = state.hovered;
         kept.passes += 1;
         kept.pass = Some((kept.passes, document.change_stamp()));
         KeptPass { outer }
@@ -9496,6 +9516,8 @@ mod tests {
             .wide > .tall { margin-left: 10px }
             p + div { padding: 3px }
             div:hover { border: 2px solid black }
+            .row:hover > span { margin-left: 6px }
+            p:hover + div { height: 9px }
             .abs { position: absolute; left: 10px; top: 5px; width: 30px; height: 10px }
             .spin { animation: grow 1s infinite }
             @keyframes grow { from { width: 10px } to { width: 90px } }
