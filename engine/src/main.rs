@@ -21,6 +21,8 @@ struct Options {
     font: Option<PathBuf>,
     bold_font: Option<PathBuf>,
     frames: usize,
+    // where the pointer starts and ends over the timed frames, moving once a frame
+    sweep: Option<[(f32, f32); 2]>,
     profile: bool,
 }
 
@@ -127,7 +129,7 @@ fn main() -> Result<(), String> {
         println!("advanced {milliseconds}ms: {} task(s)", executed.tasks_run);
     }
     let timed = if options.frames > 0 {
-        report_frame_times(&mut host, options.frames, options.profile)?
+        report_frame_times(&mut host, options.frames, options.sweep, options.profile)?
     } else {
         None
     };
@@ -184,6 +186,7 @@ fn main() -> Result<(), String> {
 fn report_frame_times(
     host: &mut EngineHost,
     frames: usize,
+    sweep: Option<[(f32, f32); 2]>,
     profile: bool,
 ) -> Result<Option<ceri_engine::Frame>, String> {
     ceri_engine::profile::enable(profile);
@@ -197,8 +200,16 @@ fn report_frame_times(
         Vec::with_capacity(frames),
     ];
     let mut last = None;
-    for _ in 0..frames {
+    for frame in 0..frames {
         let started = std::time::Instant::now();
+        if let Some([from, to]) = sweep {
+            let along = frame as f32 / (frames - 1).max(1) as f32;
+            host.input(InputEvent::PointerMove {
+                x: from.0 + (to.0 - from.0) * along,
+                y: from.1 + (to.1 - from.1) * along,
+            })
+            .map_err(|error| error.to_string())?;
+        }
         host.input(InputEvent::AdvanceTime(16))
             .map_err(|error| error.to_string())?;
         let ticked = started.elapsed();
@@ -284,6 +295,7 @@ where
     let mut font = None;
     let mut bold_font = None;
     let mut frames = 0_usize;
+    let mut sweep = None;
     let mut profile = false;
     let mut ticks = Vec::new();
     let mut args = args.into_iter();
@@ -314,10 +326,17 @@ where
             "--font" => font = Some(PathBuf::from(next_value(&mut args, "--font")?)),
             "--bold-font" => bold_font = Some(PathBuf::from(next_value(&mut args, "--bold-font")?)),
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
+            "--sweep" => {
+                let value = next_value(&mut args, "--sweep")?;
+                let (from, to) = value
+                    .split_once(':')
+                    .ok_or_else(|| "sweep must use X,Y:X,Y coordinates".to_string())?;
+                sweep = Some([parse_point(from.to_string())?, parse_point(to.to_string())?]);
+            }
             "--profile" => profile = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--frames N] [--profile] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--frames N] [--sweep X,Y:X,Y] [--profile] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -340,6 +359,7 @@ where
         font,
         bold_font,
         frames,
+        sweep,
         profile,
         viewport: Size {
             width: width as f32,
