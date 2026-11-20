@@ -8619,13 +8619,19 @@ fn append_atomic(
     }
     // a replaced box, a box that clips or one with no line of text sits on its bottom margin
     // edge; inline-block takes its last line, the other inline boxes their first
-    let baseline = (!style.overflow.clips() && !node.replaced())
-        .then(|| {
-            if style.display == Display::InlineBlock {
-                last_baseline(&laid_out)
-            } else {
-                first_baseline(&laid_out)
-            }
+    // a text control keeps the baseline of its text however it clips, and a flex container
+    // takes the baseline of its first item, which without a line of text is its bottom edge
+    let control = matches!(node.name(), "input" | "textarea" | "select" | "button");
+    let baseline = ((!style.overflow.clips() || control) && !node.replaced())
+        .then(|| match style.display {
+            Display::InlineBlock => last_baseline(&laid_out),
+            Display::InlineFlex => laid_out
+                .children
+                .iter()
+                .find(|child| !child.position.is_out_of_flow())
+                .map(|item| first_baseline(item).unwrap_or(item.rect.y + item.rect.height))
+                .or_else(|| first_baseline(&laid_out)),
+            _ => first_baseline(&laid_out),
         })
         .flatten()
         .map_or(outer_height, |baseline| {
@@ -11536,6 +11542,43 @@ mod tests {
         );
         assert_eq!(find_box(&result.root, "nav").expect("nav").rect.width, 76.0);
         assert_eq!(find_box(&result.root, "u").expect("u").rect.width, 10.0);
+    }
+
+    #[test]
+    fn an_empty_text_field_sits_on_the_line_as_a_filled_one_does() {
+        let line = |field: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; }} section {{ font-size: 13px; line-height: 19px; }} input {{ height: 23px; font-size: 12px; padding: 0 4px; border: 1px solid; }}</style><section>{field}</section>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 300.0,
+                    height: 200.0,
+                },
+            );
+            let section = find_box(&result.root, "section").expect("section");
+            let input = find_box(section, "input").expect("input");
+            (section.rect.height, input.rect.y - section.rect.y)
+        };
+        let filled = line("<input value='abc'>");
+        assert_eq!(line("<input>"), filled);
+        assert_eq!(line("<input placeholder='hint'>"), filled);
+        assert_eq!(line("<input type='password'>"), filled);
+        assert_eq!(line("<input value='abc' style='overflow: hidden'>"), filled);
+        // a checkbox has no text, so the label that leads with one sits with the box's bottom
+        // on the baseline and the line grows past the 19px its text alone would take
+        let boxed = line(
+            "<label style='display: inline-flex'><input type='checkbox' style='width: 30px; height: 17px; padding: 0; border: 0'><span>text</span></label>",
+        );
+        assert!(boxed.0 > 19.0, "{boxed:?}");
+        let worded = line(
+            "<label style='display: inline-flex'><span>text</span><input type='checkbox' style='width: 30px; height: 17px; padding: 0; border: 0'></label>",
+        );
+        assert!(worded.0 < boxed.0, "{worded:?} {boxed:?}");
     }
 
     #[test]
