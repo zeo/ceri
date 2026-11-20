@@ -3186,9 +3186,12 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .resolve(containing_width, font_size)
         .map(inner_width)
         .unwrap_or(f32::INFINITY);
+    // a width handed down by a flex or grid container still answers to the box's own limits
     let content_width = size_override
         .0
-        .unwrap_or_else(|| content_width.min(max_width).max(min_width));
+        .unwrap_or(content_width)
+        .min(max_width)
+        .max(min_width);
     // auto margins share the width a block leaves over, which centers it
     if mode == LayoutMode::Flow {
         let free = containing_width - content_width - horizontal_inner - margin.left - margin.right;
@@ -12048,6 +12051,28 @@ mod tests {
         // a step down in font size is a division by 1.2
         let line = find_box(&result.root, "p").expect("paragraph");
         assert_eq!(line.text[0].font_size, 10.0);
+    }
+
+    #[test]
+    fn an_item_of_a_flex_column_keeps_to_its_widest_and_narrowest() {
+        let widths = |align: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; padding: 0; }} div {{ display: flex; flex-direction: column; width: 400px; align-items: {align}; }} p {{ max-width: 150px; }} b {{ min-width: 90px; }}</style><div><p>one two three four five six seven eight nine ten eleven twelve</p><b>x</b></div>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 800.0,
+                    height: 300.0,
+                },
+            );
+            ["p", "b"].map(|tag| find_box(&result.root, tag).expect("item").rect.width)
+        };
+        assert_eq!(widths("stretch"), [150.0, 400.0]);
+        assert_eq!(widths("center"), [150.0, 90.0]);
     }
 
     #[test]
