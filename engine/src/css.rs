@@ -904,6 +904,11 @@ pub(crate) fn use_layout_environment(environment: LayoutEnvironment) -> ActiveEn
     ActiveEnvironment { previous }
 }
 
+// the font the ch unit measures with where the caller is
+pub(crate) fn zero_font() -> (crate::font::FontStack, crate::font::FontStyle) {
+    ZERO_FONT.with(std::cell::Cell::get)
+}
+
 pub(crate) fn layout_environment() -> LayoutEnvironment {
     LAYOUT_ENVIRONMENT.with(|current| current.get())
 }

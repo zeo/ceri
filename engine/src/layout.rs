@@ -958,6 +958,7 @@ pub fn layout_with_state(
         root_font_size: root_font_size(document, stylesheet, viewport, style_state),
     });
     let _styles = crate::css::memoize_styles();
+    let _widths = memoize_widths();
     let mut root = LayoutBox {
         node: document.root(),
         tag: "#document".to_string(),
@@ -6229,8 +6230,80 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
     intrinsic_width(input, false)
 }
 
+// what an intrinsic width was measured under, beyond the element and which width it was
+#[derive(Clone, Copy, PartialEq)]
+struct IntrinsicInputs {
+    containing_width: u32,
+    font_size: u32,
+    weight: FontWeight,
+    text: InheritedText,
+    zero_font: (crate::font::FontStack, crate::font::FontStyle),
+    environment: crate::css::LayoutEnvironment,
+}
+
+type IntrinsicKey = (NodeId, Option<PseudoElement>, bool, bool);
+type IntrinsicMemo = HashMap<IntrinsicKey, Vec<(IntrinsicInputs, f32)>>;
+
+thread_local! {
+    // nested flex and grid containers ask for the same widths many times over in one layout
+    static INTRINSIC_MEMO: std::cell::RefCell<Option<IntrinsicMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct MemoizedWidths {
+    previous: Option<IntrinsicMemo>,
+}
+
+impl Drop for MemoizedWidths {
+    fn drop(&mut self) {
+        INTRINSIC_MEMO.with(|memo| *memo.borrow_mut() = self.previous.take());
+    }
+}
+
+// the document, stylesheet and state must stay unchanged while the guard lives
+fn memoize_widths() -> MemoizedWidths {
+    MemoizedWidths {
+        previous: INTRINSIC_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+    }
+}
+
 // an element's outer width at its widest (max-content) or its narrowest (min-content)
 fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
+    let key = (
+        input.node.node,
+        input.node.generated.map(|(pseudo, _)| pseudo),
+        minimum,
+        input.own_width,
+    );
+    let inputs = IntrinsicInputs {
+        containing_width: input.containing_width.to_bits(),
+        font_size: input.parent.font_size.to_bits(),
+        weight: input.parent.weight,
+        text: input.parent.text,
+        zero_font: crate::css::zero_font(),
+        environment: crate::css::layout_environment(),
+    };
+    let known = INTRINSIC_MEMO.with(|memo| {
+        memo.borrow()
+            .as_ref()?
+            .get(&key)?
+            .iter()
+            .find(|(seen, _)| *seen == inputs)
+            .map(|&(_, width)| width)
+    });
+    if let Some(width) = known {
+        return width;
+    }
+    let width = measure_intrinsic_width(input, minimum);
+    INTRINSIC_MEMO.with(|memo| {
+        if let Some(memo) = memo.borrow_mut().as_mut() {
+            memo.entry(key).or_default().push((inputs, width));
+        }
+    });
+    width
+}
+
+fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     let _profile = crate::profile::scope("layout: intrinsic width");
     let MaxContentInput {
         node,
