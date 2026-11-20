@@ -1026,8 +1026,11 @@ impl Canvas {
             (still.x + still.width - margin).floor(),
             (still.y + still.height - margin).floor(),
         ];
+        let mut within = Blurred::new(frame, 0.0, left..right);
+        let mut blurred = Blurred::new(shape, sigma, left..right);
         for pixel_y in top..bottom {
             let row = pixel_y as f32;
+            let (within_row, blurred_row) = (within.row(row + 0.5), blurred.row(row + 0.5));
             let skipped = if row >= hollow[1] && row + 1.0 <= hollow[3] && hollow[0] < hollow[2] {
                 hollow[0].max(0.0) as u32..hollow[2].max(0.0) as u32
             } else {
@@ -1046,12 +1049,12 @@ impl Canvas {
                 {
                     continue;
                 }
-                let inside = shadow_coverage(frame, 0.0, center);
+                let inside = within.at(&within_row, pixel_x - 1);
                 let shade = if inset { inside } else { 1.0 - inside };
                 if shade <= 0.0 {
                     continue;
                 }
-                let covered = shadow_coverage(shape, sigma, center);
+                let covered = blurred.at(&blurred_row, pixel_x - 1);
                 let alpha = shade * if inset { 1.0 - covered } else { covered };
                 if alpha > 0.0 {
                     self.blend_pixel(pixel_x - 1, pixel_y, color.scale_alpha(alpha.min(1.0)));
@@ -1999,54 +2002,184 @@ struct ShadowFill {
     color: Color,
 }
 
-// how much of a pixel a shape covers once blurred by a gaussian of deviation `sigma`, in
-// device pixels; a blurred edge is the error function of the distance to it, exact axis by
-// axis for a square shape, and an unblurred square covers each pixel by its overlap
-fn shadow_coverage(shape: Shape, sigma: f32, point: (f32, f32)) -> f32 {
-    let sharp = sigma < 0.5;
-    let scale = sigma * std::f32::consts::SQRT_2;
-    if shape.is_square() {
-        let axis = |start: f32, length: f32, at: f32| {
-            if length <= 0.0 {
-                0.0
-            } else if sharp {
-                ((start + length).min(at + 0.5) - start.max(at - 0.5)).clamp(0.0, 1.0)
-            } else {
-                0.5 * (erf((at - start) / scale) - erf((at - start - length) / scale))
-            }
+// how much of each pixel a shape covers once blurred by a gaussian of deviation `sigma`, in
+// device pixels, asked a row of pixel centers at a time. a blurred edge is the error function
+// of the distance to it, exact axis by axis for a square shape, and an unblurred square
+// covers each pixel by its overlap. a rounded shape blurs row by row, as gpui draws shadows:
+// each row is a span whose ends follow the corner curve and blurs exactly across, and four
+// rows under the gaussian sum the blur down. what the pixels of a row share is worked out
+// once a row, and what stays the same from row to row once a column
+struct Blurred {
+    shape: Shape,
+    sigma: f32,
+    left: u32,
+    // by column: a square shape's coverage across, or a rounded one's span on the rows clear
+    // of its corners, with the reach the span was worked out for
+    across: Vec<Option<(u32, f32)>>,
+}
+
+enum BlurredRow {
+    // a square shape's coverage down, at the row's height
+    Square(f32),
+    Sharp(f32),
+    // for the left half and the right, then the step between the four rows summed
+    Rounded([BlurredHalf; 2], f32),
+}
+
+struct BlurredHalf {
+    // the reach and the weight of each of the four rows summed
+    samples: [(f32, f32); 4],
+    // whether all four reach the same
+    level: bool,
+    // the pixels so far inside every reach that each row's span is exactly one, and the
+    // coverage they all then have
+    settled: (std::ops::Range<u32>, f32),
+}
+
+fn blurred_axis(start: f32, length: f32, at: f32, sigma: f32) -> f32 {
+    if length <= 0.0 {
+        0.0
+    } else if sigma < 0.5 {
+        ((start + length).min(at + 0.5) - start.max(at - 0.5)).clamp(0.0, 1.0)
+    } else {
+        let scale = sigma * std::f32::consts::SQRT_2;
+        0.5 * (erf((at - start) / scale) - erf((at - start - length) / scale))
+    }
+}
+
+impl Blurred {
+    fn new(shape: Shape, sigma: f32, columns: std::ops::Range<u32>) -> Self {
+        Self {
+            shape,
+            sigma,
+            left: columns.start,
+            across: vec![None; columns.len()],
+        }
+    }
+
+    fn row(&self, y: f32) -> BlurredRow {
+        let (shape, sigma) = (self.shape, self.sigma);
+        let columns = self.left..self.left + self.across.len() as u32;
+        if shape.is_square() {
+            return BlurredRow::Square(blurred_axis(shape.y, shape.height, y, sigma));
+        }
+        if sigma < 0.5 {
+            return BlurredRow::Sharp(y);
+        }
+        let half = (shape.width / 2.0, shape.height / 2.0);
+        let local = y - shape.y - half.1;
+        let start = (-3.0 * sigma).clamp(local - half.1, local + half.1);
+        let end = (3.0 * sigma).clamp(local - half.1, local + half.1);
+        let step = (end - start) / 4.0;
+        let scale = sigma * std::f32::consts::SQRT_2;
+        let middle = shape.x + half.0;
+        let corners = if local > 0.0 {
+            [(3, false), (2, true)]
+        } else {
+            [(0, false), (1, true)]
         };
-        return axis(shape.x, shape.width, point.0) * axis(shape.y, shape.height, point.1);
+        let halves = corners.map(|(corner, right)| {
+            let (radius_x, radius_y) = shape.radii[corner];
+            let radius = ((radius_x + radius_y) / 2.0).min(half.0).min(half.1);
+            let samples: [(f32, f32); 4] = std::array::from_fn(|sample| {
+                let offset = start + step * (sample as f32 + 0.5);
+                let row = (half.1 - radius - (local - offset).abs()).min(0.0);
+                let reach = half.0 - radius + (radius * radius - row * row).max(0.0).sqrt();
+                let weight = (-offset * offset / (2.0 * sigma * sigma)).exp()
+                    / (sigma * (2.0 * std::f32::consts::PI).sqrt());
+                (reach, weight)
+            });
+            let level = samples
+                .iter()
+                .all(|sample| sample.0.to_bits() == samples[0].0.to_bits());
+            // the error function comes out as exactly one a little past four deviations, so
+            // well inside the shortest reach every span is one; the ends are checked by the
+            // arithmetic `at` uses, and what lies between them is further inside still
+            let inside = samples
+                .iter()
+                .fold(f32::INFINITY, |least, sample| least.min(sample.0))
+                - 4.5 * scale;
+            let whole = |pixel: u32| {
+                let local = pixel as f32 + 0.5 - shape.x - shape.width / 2.0;
+                (local > 0.0) == right
+                    && samples.iter().all(|&(reach, _)| {
+                        0.5 * (erf((local + reach) / scale) - erf((local - reach) / scale)) == 1.0
+                    })
+            };
+            let (from, to) = if right {
+                (middle, middle + inside)
+            } else {
+                (middle - inside, middle)
+            };
+            let from = (from.ceil().max(columns.start as f32) as u32).min(columns.end);
+            let to = (to.floor().max(0.0) as u32).min(columns.end);
+            let run = if from < to && whole(from) && whole(to - 1) {
+                from..to
+            } else {
+                0..0
+            };
+            BlurredHalf {
+                samples,
+                level,
+                settled: (run, samples.iter().map(|&(_, weight)| weight * step).sum()),
+            }
+        });
+        BlurredRow::Rounded(halves, step)
     }
-    if sharp {
-        return (0.5 - shape.signed_distance(point)).clamp(0.0, 1.0);
+
+    fn at(&mut self, row: &BlurredRow, pixel_x: u32) -> f32 {
+        let (shape, sigma) = (self.shape, self.sigma);
+        let x = pixel_x as f32 + 0.5;
+        let kept = &mut self.across[(pixel_x - self.left) as usize];
+        match row {
+            BlurredRow::Square(down) => {
+                let across = match *kept {
+                    Some((_, across)) => across,
+                    None => {
+                        let across = blurred_axis(shape.x, shape.width, x, sigma);
+                        *kept = Some((0, across));
+                        across
+                    }
+                };
+                across * down
+            }
+            BlurredRow::Sharp(y) => (0.5 - shape.signed_distance((x, *y))).clamp(0.0, 1.0),
+            BlurredRow::Rounded(halves, step) => {
+                let scale = sigma * std::f32::consts::SQRT_2;
+                let local = x - shape.x - shape.width / 2.0;
+                let BlurredHalf {
+                    samples,
+                    level,
+                    settled,
+                } = &halves[usize::from(local > 0.0)];
+                if settled.0.contains(&pixel_x) {
+                    return settled.1;
+                }
+                let span = |reach: f32| {
+                    0.5 * (erf((local + reach) / scale) - erf((local - reach) / scale))
+                };
+                if !level {
+                    return samples
+                        .iter()
+                        .map(|&(reach, weight)| span(reach) * weight * step)
+                        .sum();
+                }
+                let reach = samples[0].0;
+                let across = match *kept {
+                    Some((known, across)) if known == reach.to_bits() => across,
+                    _ => {
+                        let across = span(reach);
+                        *kept = Some((reach.to_bits(), across));
+                        across
+                    }
+                };
+                samples
+                    .iter()
+                    .map(|&(_, weight)| across * weight * step)
+                    .sum()
+            }
+        }
     }
-    // a rounded shape blurs row by row, as gpui draws shadows: each row is a span whose ends
-    // follow the corner curve and blurs exactly across, and four rows under the gaussian sum
-    // the blur down
-    let half = (shape.width / 2.0, shape.height / 2.0);
-    let local = (point.0 - shape.x - half.0, point.1 - shape.y - half.1);
-    let corner = match (local.0 > 0.0, local.1 > 0.0) {
-        (false, false) => 0,
-        (true, false) => 1,
-        (true, true) => 2,
-        (false, true) => 3,
-    };
-    let (radius_x, radius_y) = shape.radii[corner];
-    let radius = ((radius_x + radius_y) / 2.0).min(half.0).min(half.1);
-    let start = (-3.0 * sigma).clamp(local.1 - half.1, local.1 + half.1);
-    let end = (3.0 * sigma).clamp(local.1 - half.1, local.1 + half.1);
-    let step = (end - start) / 4.0;
-    (0..4)
-        .map(|sample| {
-            let offset = start + step * (sample as f32 + 0.5);
-            let row = (half.1 - radius - (local.1 - offset).abs()).min(0.0);
-            let reach = half.0 - radius + (radius * radius - row * row).max(0.0).sqrt();
-            let span = 0.5 * (erf((local.0 + reach) / scale) - erf((local.0 - reach) / scale));
-            let weight = (-offset * offset / (2.0 * sigma * sigma)).exp()
-                / (sigma * (2.0 * std::f32::consts::PI).sqrt());
-            span * weight * step
-        })
-        .sum()
 }
 
 // abramowitz and stegun 7.1.26, within 1.5e-7
@@ -5488,6 +5621,148 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // how much of a pixel a shape covers once blurred by a gaussian of deviation `sigma`, in
+    // device pixels; a blurred edge is the error function of the distance to it, exact axis by
+    // axis for a square shape, and an unblurred square covers each pixel by its overlap
+    fn shadow_coverage(shape: Shape, sigma: f32, point: (f32, f32)) -> f32 {
+        let sharp = sigma < 0.5;
+        let scale = sigma * std::f32::consts::SQRT_2;
+        if shape.is_square() {
+            let axis = |start: f32, length: f32, at: f32| {
+                if length <= 0.0 {
+                    0.0
+                } else if sharp {
+                    ((start + length).min(at + 0.5) - start.max(at - 0.5)).clamp(0.0, 1.0)
+                } else {
+                    0.5 * (erf((at - start) / scale) - erf((at - start - length) / scale))
+                }
+            };
+            return axis(shape.x, shape.width, point.0) * axis(shape.y, shape.height, point.1);
+        }
+        if sharp {
+            return (0.5 - shape.signed_distance(point)).clamp(0.0, 1.0);
+        }
+        // a rounded shape blurs row by row, as gpui draws shadows: each row is a span whose ends
+        // follow the corner curve and blurs exactly across, and four rows under the gaussian sum
+        // the blur down
+        let half = (shape.width / 2.0, shape.height / 2.0);
+        let local = (point.0 - shape.x - half.0, point.1 - shape.y - half.1);
+        let corner = match (local.0 > 0.0, local.1 > 0.0) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        let (radius_x, radius_y) = shape.radii[corner];
+        let radius = ((radius_x + radius_y) / 2.0).min(half.0).min(half.1);
+        let start = (-3.0 * sigma).clamp(local.1 - half.1, local.1 + half.1);
+        let end = (3.0 * sigma).clamp(local.1 - half.1, local.1 + half.1);
+        let step = (end - start) / 4.0;
+        (0..4)
+            .map(|sample| {
+                let offset = start + step * (sample as f32 + 0.5);
+                let row = (half.1 - radius - (local.1 - offset).abs()).min(0.0);
+                let reach = half.0 - radius + (radius * radius - row * row).max(0.0).sqrt();
+                let span = 0.5 * (erf((local.0 + reach) / scale) - erf((local.0 - reach) / scale));
+                let weight = (-offset * offset / (2.0 * sigma * sigma)).exp()
+                    / (sigma * (2.0 * std::f32::consts::PI).sqrt());
+                span * weight * step
+            })
+            .sum()
+    }
+
+    // a shadow filled a row at a time must come out as it does asking every pixel for the
+    // blurred coverage on its own
+    #[test]
+    fn shadows_fill_by_rows_as_they_do_pixel_by_pixel() {
+        fn fill_each_pixel(canvas: &mut Canvas, shadow: &ShadowFill, clip: Option<Rect>) {
+            let shape = canvas.device_shape(shadow.shape);
+            let frame = canvas.device_shape(shadow.frame);
+            let clip = clip.map(|clip| canvas.device_shape(Shape::square(clip)));
+            let sigma = shadow.blur * canvas.scale / 2.0;
+            // a shadow is drawn as far as its blur radius and no further
+            let reach = if shadow.inset {
+                frame
+            } else {
+                shape.outset(shadow.blur * canvas.scale)
+            };
+            for pixel_y in 0..canvas.height {
+                for pixel_x in 0..canvas.width {
+                    let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+                    let reached = pixel_x as f32 >= reach.x.floor()
+                        && (pixel_x as f32) < (reach.x + reach.width).ceil()
+                        && pixel_y as f32 >= reach.y.floor()
+                        && (pixel_y as f32) < (reach.y + reach.height).ceil();
+                    if !reached || clip.is_some_and(|clip| clip.coverage(center) <= 0.0) {
+                        continue;
+                    }
+                    let inside = shadow_coverage(frame, 0.0, center);
+                    let covered = shadow_coverage(shape, sigma, center);
+                    let alpha = if shadow.inset {
+                        inside * (1.0 - covered)
+                    } else {
+                        (1.0 - inside) * covered
+                    };
+                    if alpha > 0.0 {
+                        let color = shadow.color.scale_alpha(alpha.min(1.0));
+                        canvas.blend_pixel(pixel_x, pixel_y, color);
+                    }
+                }
+            }
+        }
+        let rounded = [(9.0, 9.0), (2.0, 14.0), (0.0, 0.0), (20.0, 6.0)];
+        let boxes = [
+            (SQUARE_CORNERS, (12.3, 9.7, 40.4, 30.2)),
+            (rounded, (12.3, 9.7, 40.4, 30.2)),
+            ([(40.0, 40.0); 4], (20.0, 12.0, 24.0, 24.0)),
+            (rounded, (-5.0, 30.0, 30.0, 40.0)),
+        ];
+        let clips = [
+            None,
+            Some(Rect {
+                x: 9.3,
+                y: 4.1,
+                width: 33.4,
+                height: 27.9,
+            }),
+        ];
+        for (radii, (x, y, width, height)) in boxes {
+            for blur in [0.0, 0.4, 3.0, 14.0] {
+                for inset in [false, true] {
+                    for clip in clips {
+                        let frame = Shape {
+                            x,
+                            y,
+                            width,
+                            height,
+                            radii,
+                        };
+                        let shadow = |spread: f32| ShadowFill {
+                            shape: Shape {
+                                x: x + 2.0,
+                                y: y + 3.0,
+                                ..frame.outset(spread)
+                            },
+                            blur,
+                            frame,
+                            inset,
+                            color: Color::rgba(10, 20, 30, 200),
+                        };
+                        let spread = if inset { -2.5 } else { 1.5 };
+                        let mut by_rows = Canvas::scaled(66.0, 60.0, 1.5, Color::WHITE);
+                        let mut by_pixels = Canvas::scaled(66.0, 60.0, 1.5, Color::WHITE);
+                        by_rows.fill_shadow(shadow(spread), clip);
+                        fill_each_pixel(&mut by_pixels, &shadow(spread), clip);
+                        assert!(
+                            by_rows.pixels == by_pixels.pixels,
+                            "{frame:?} blurred {blur} inset {inset} in {clip:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // a shape filled by whole runs and by steady rows or columns of its paint must come out
     // as it does asking every pixel for its coverage and color
