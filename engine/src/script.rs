@@ -542,6 +542,8 @@ pub struct ScriptRuntime {
     controls: RefCell<Option<ControlLists>>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
+    // whether the page's window shows; a hidden page runs no animation frames
+    visible: bool,
     media_queries: Vec<geometry::MediaQueryRecord>,
     media_list_prototype: Option<ObjectHandle>,
     performance: Value,
@@ -1624,6 +1626,7 @@ impl ScriptRuntime {
             measured: RefCell::new(None),
             controls: RefCell::new(None),
             frame_interval: crate::navigation::FRAME_INTERVAL,
+            visible: true,
             media_queries: Vec::new(),
             media_list_prototype: None,
             performance: Value::Undefined,
@@ -3537,8 +3540,33 @@ impl ScriptRuntime {
     pub fn next_task_delay(&self) -> Option<u64> {
         self.tasks
             .iter()
+            .filter(|task| self.runs(task))
             .map(|task| task.due.saturating_sub(self.clock))
             .min()
+    }
+
+    // animation frames wait while the page is hidden, as there is no frame to prepare
+    fn runs(&self, task: &ScheduledTask) -> bool {
+        self.visible || !matches!(task.kind, TaskKind::AnimationFrame)
+    }
+
+    // a page that loads in a hidden window starts hidden, with no event
+    pub(crate) fn start_hidden(&mut self, hidden: bool) {
+        self.visible = !hidden;
+    }
+
+    // the page's window was shown, or hidden or minimised
+    pub(crate) fn set_visible(&mut self, visible: bool) -> Result<(), ScriptError> {
+        if self.visible == visible {
+            return Ok(());
+        }
+        self.visible = visible;
+        self.fire(
+            ListenerTarget::Node(self.document_node()),
+            "visibilitychange",
+            HostEventFields::default(),
+        )?;
+        self.drain_microtasks()
     }
 
     // workers post messages from their own threads, which the page only hears when pumped
@@ -9698,7 +9726,7 @@ impl ScriptRuntime {
         self.tasks
             .iter()
             .enumerate()
-            .filter(|(_, task)| task.due <= until)
+            .filter(|(_, task)| task.due <= until && self.runs(task))
             .min_by_key(|(_, task)| (task.due, task.id))
             .map(|(index, _)| index)
     }

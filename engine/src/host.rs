@@ -38,6 +38,8 @@ pub enum InputEvent {
     Resize(Size),
     // how often the window's display refreshes, in millihertz
     RefreshRate(u32),
+    // the window was shown, or hidden or minimised
+    Visible(bool),
     PointerMove {
         x: f32,
         y: f32,
@@ -140,6 +142,8 @@ pub struct EngineHost {
     range_drag: Option<crate::layout::RangeDrag>,
     next_frame: u64,
     dirty: bool,
+    // a hidden window is painted no frames; what changed meanwhile shows when it returns
+    visible: bool,
     // milliseconds of host clock, used to count rapid presses as one series
     clock: u64,
     last_press: Option<Press>,
@@ -757,6 +761,7 @@ impl EngineHost {
             range_drag: None,
             next_frame: 1,
             dirty: true,
+            visible: true,
             clock: 0,
             last_press: None,
             region_press: false,
@@ -874,6 +879,14 @@ impl EngineHost {
             InputEvent::RefreshRate(millihertz) => {
                 self.browser.set_refresh_rate(millihertz);
                 InputResult::default()
+            }
+            InputEvent::Visible(visible) => {
+                self.visible = visible;
+                self.browser.set_visible(visible)?;
+                InputResult {
+                    frame_requested: visible,
+                    ..InputResult::default()
+                }
             }
             InputEvent::ScaleChanged(scale) => {
                 self.scale = normalize_scale(scale);
@@ -1096,7 +1109,7 @@ impl EngineHost {
 
     pub fn render(&mut self) -> Result<Option<Frame>, NavigationError> {
         self.pump_workers()?;
-        if !self.dirty {
+        if !self.is_dirty() {
             return Ok(None);
         }
         let (canvas, planes) = self
@@ -1132,7 +1145,7 @@ impl EngineHost {
 
     // whether a render would produce a new frame
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.dirty && self.visible
     }
 
     fn pump_workers(&mut self) -> Result<(), NavigationError> {

@@ -532,6 +532,7 @@ struct AppWindow {
     scale: f32,
     // the display's refresh rate in millihertz, once the engine was told
     refresh_rate: Option<u32>,
+    page_shown: bool,
     zoom: f32,
     window: Option<Rc<Window>>,
     output: Option<Output>,
@@ -614,6 +615,7 @@ where
             viewport,
             scale: 1.0,
             refresh_rate: None,
+            page_shown: true,
             zoom: 1.0,
             window: None,
             output: None,
@@ -836,8 +838,14 @@ impl AppWindow {
             return;
         };
         match action {
-            WindowAction::Show => window.set_visible(true),
-            WindowAction::Hide => window.set_visible(false),
+            WindowAction::Show => {
+                window.set_visible(true);
+                self.show_page(true);
+            }
+            WindowAction::Hide => {
+                window.set_visible(false);
+                self.show_page(false);
+            }
             WindowAction::Focus => {
                 window.set_visible(true);
                 window.set_minimized(false);
@@ -984,7 +992,10 @@ impl AppWindow {
                 self.follow_refresh_rate();
                 self.publish();
             }
-            WindowEvent::Occluded(_) => self.publish(),
+            WindowEvent::Occluded(occluded) => {
+                self.show_page(!occluded);
+                self.publish();
+            }
             WindowEvent::CursorLeft { .. } => {
                 if self.edge.take().is_some() {
                     self.show_cursor();
@@ -1425,6 +1436,14 @@ impl AppWindow {
         };
         if self.submit(InputEvent::PreferencesChanged(preferences)) {
             self.preferences = preferences;
+        }
+    }
+
+    // tells the page whether its window shows, when that changes
+    fn show_page(&mut self, shown: bool) {
+        if self.page_shown != shown {
+            self.page_shown = shown;
+            self.submit(InputEvent::Visible(shown));
         }
     }
 

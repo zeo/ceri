@@ -11,6 +11,8 @@ The engine thread runs a frame in four steps. The names in brackets are the prof
 3. Paint compares the new layout with the one on the canvas (`paint: damage`) and repaints the areas that differ (`paint: repaint`, `paint: document`). A first frame, or one whose size changed, paints everything (`paint: whole frame`). Shapes, borders, shadows, text, images and SVG scenes have phases of their own.
 4. The window uploads the boxes that changed to its frame texture and presents.
 
+Frames come as often as the display refreshes: the window tells the engine its monitor's refresh rate, and animation frames, the wakes of anything in motion and the frame slots follow it, in whole milliseconds no longer than the display's interval (8 ms at 120 Hz, 16 ms until a window says otherwise). A hidden or minimised window gets no frames at all: `document.visibilityState` turns `hidden`, `visibilitychange` fires, animation frame callbacks wait, and timers, workers and media go on.
+
 A frame that changes nothing costs a comparison of keys: the layout of an unchanged document under an unchanged state is the same `Rc` as before, and the canvas is handed out again.
 
 ## What is kept between frames

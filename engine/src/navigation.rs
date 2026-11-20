@@ -1026,6 +1026,7 @@ pub struct Browser {
     host_bridge: Option<crate::script::HostBridge>,
     waker: Option<crate::bridge::Waker>,
     frame_interval: u64,
+    visible: bool,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
     fonts: Rc<FontSet>,
@@ -1195,6 +1196,7 @@ impl Browser {
             host_bridge: None,
             waker: None,
             frame_interval: FRAME_INTERVAL,
+            visible: true,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
@@ -1282,7 +1284,8 @@ impl Browser {
     // frame, or messages from its workers
     pub fn next_wake(&self) -> Option<u64> {
         let page = self.page.as_ref()?;
-        let motion = (!self.transitions.is_empty()
+        // a hidden page shows no transition or animation, but its workers and media go on
+        let motion = ((self.visible && !self.transitions.is_empty())
             || page.runtime.has_live_workers()
             || page.runtime.media_playing())
         .then_some(self.frame_interval);
@@ -1290,7 +1293,7 @@ impl Browser {
         let animation = page
             .animation_wake
             .get()
-            .filter(|_| !self.preferences.reduced_motion)
+            .filter(|_| self.visible && !self.preferences.reduced_motion)
             .map(|at| match at.saturating_sub(page.runtime.now()) {
                 0 => self.frame_interval,
                 delay => delay,
@@ -1337,6 +1340,19 @@ impl Browser {
 
     pub(crate) fn frame_interval(&self) -> u64 {
         self.frame_interval
+    }
+
+    // whether the window shows the page; a hidden one fires visibilitychange, stops running
+    // animation frames and wakes for no motion
+    pub fn set_visible(&mut self, visible: bool) -> Result<(), NavigationError> {
+        self.visible = visible;
+        match self.page.as_mut() {
+            Some(page) => page
+                .runtime
+                .set_visible(visible)
+                .map_err(|error| NavigationError::Script(error.to_string())),
+            None => Ok(()),
+        }
     }
 
     pub fn device_pixel_ratio(&self) -> f32 {
@@ -1640,6 +1656,7 @@ impl Browser {
         }
         runtime.set_viewport_metrics(self.viewport);
         runtime.set_frame_interval(self.frame_interval);
+        runtime.start_hidden(!self.visible);
         let inspecting = crate::devtools_serving() || self.inspection.attached();
         if inspecting {
             runtime.capture_console();
@@ -8146,6 +8163,50 @@ mod tests {
             document.text_content(status),
             "true true true true true 3 2 24 24 true IndexSizeError"
         );
+    }
+
+    #[test]
+    fn a_hidden_page_hears_of_it_and_runs_no_animation_frames_until_shown() {
+        let mut browser = Browser::new(bundle(
+            r##"<p id="count">0</p><p id="seen"></p><script>
+                let count = 0;
+                const frame = () => {
+                    document.getElementById("count").textContent = ++count;
+                    requestAnimationFrame(frame);
+                };
+                requestAnimationFrame(frame);
+                let ticks = 0;
+                setInterval(() => ticks++, 10);
+                document.addEventListener("visibilitychange", () => {
+                    document.getElementById("seen").textContent +=
+                        document.visibilityState + ":" + document.hidden + ":" + ticks + " ";
+                });
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let text = |browser: &Browser, id: &str| {
+            let document = browser.document().unwrap();
+            let document = document.borrow();
+            document.text_content(document.find_element_by_id(id).unwrap())
+        };
+        let mut run = |browser: &mut Browser, milliseconds: u32| {
+            for _ in 0..milliseconds {
+                browser.advance_time(1).expect("time should advance");
+            }
+        };
+        run(&mut browser, 100);
+        assert_eq!(text(&browser, "count"), "6");
+        browser.set_visible(false).expect("the page should hide");
+        assert_eq!(browser.next_wake(), Some(10));
+        run(&mut browser, 500);
+        // timers went on while no frame ran
+        assert_eq!(text(&browser, "count"), "6");
+        browser.set_visible(true).expect("the page should show");
+        run(&mut browser, 100);
+        assert_eq!(text(&browser, "count"), "13");
+        assert_eq!(text(&browser, "seen"), "hidden:true:10 visible:false:60 ");
     }
 
     #[test]

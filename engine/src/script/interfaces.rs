@@ -331,6 +331,8 @@ static INTERFACES: &[Interface] = &[
             ("activeElement", ReadOnly),
             ("defaultView", ReadOnly),
             ("readyState", ReadOnly),
+            ("visibilityState", ReadOnly),
+            ("hidden", ReadOnly),
             ("children", ReadOnly),
             ("firstElementChild", ReadOnly),
             ("lastElementChild", ReadOnly),
@@ -1319,6 +1321,10 @@ impl ScriptRuntime {
             }
             ("defaultView", Access::Get) => Value::Window,
             ("readyState", Access::Get) => Value::String("complete".into()),
+            ("visibilityState", Access::Get) => {
+                Value::String(if self.visible { "visible" } else { "hidden" }.into())
+            }
+            ("hidden", Access::Get) => Value::Bool(!self.visible),
             ("width" | "height", Access::Get) => {
                 self.canvas_element_member(handle, member.name(), None)?
             }
