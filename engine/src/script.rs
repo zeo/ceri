@@ -439,6 +439,7 @@ enum Builtin {
     AbortControllerAbort(AbortControllerHandle),
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
+    CanvasGradientAddColorStop(canvas::GradientHandle),
     AbortSignalRemoveEventListener(AbortSignalHandle),
     // the statics: a signal already aborted, one a timer aborts, one that follows others
     AbortSignalAbort,
@@ -4801,6 +4802,11 @@ impl ScriptRuntime {
                 Self::set_canvas_smoothing_quality(&context, &value_string);
                 true
             }
+            Value::CanvasContext(context)
+                if self.set_canvas_gradient(&context, property, &value) =>
+            {
+                true
+            }
             Value::CanvasContext(context) => {
                 let number = self.coerce_number(value.clone()).unwrap_or(f64::NAN) as f32;
                 context
@@ -8691,6 +8697,9 @@ impl ScriptRuntime {
                 let signal = controller.borrow().signal.clone();
                 self.abort_signal(signal, reason)?;
                 Ok(Value::Undefined)
+            }
+            Builtin::CanvasGradientAddColorStop(gradient) => {
+                self.add_color_stop(&gradient, &arguments)
             }
             Builtin::AbortSignalAbortWith(signal) => {
                 let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);

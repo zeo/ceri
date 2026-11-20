@@ -35,6 +35,11 @@ const METHODS: &[&str] = &[
     "fill",
     "stroke",
     "strokeRect",
+    "clip",
+    "setLineDash",
+    "getLineDash",
+    "createLinearGradient",
+    "createRadialGradient",
     "fillRect",
     "clearRect",
     "drawImage",
@@ -80,31 +85,168 @@ enum Sampling {
     Mitchell,
 }
 
+// a gradient a context made: its line or its two circles in the user space of whatever
+// later paints with it, and the stops script adds
+pub(super) struct Gradient {
+    // the start point and radius, then the end point and radius; a line has no radii
+    from: (f32, f32, f32),
+    to: (f32, f32, f32),
+    radial: bool,
+    stops: Vec<(f32, Color)>,
+}
+
+pub(super) type GradientHandle = Rc<RefCell<Gradient>>;
+
+impl Gradient {
+    // the colour at a point, none where a radial gradient reaches no circle or there are no
+    // stops; channels are mixed as they stand, not premultiplied, as canvas gradients are
+    fn color_at(&self, point: (f32, f32)) -> Option<Color> {
+        let (first, last) = (self.stops.first()?, self.stops.last()?);
+        let (dx, dy) = (self.to.0 - self.from.0, self.to.1 - self.from.1);
+        let (px, py) = (point.0 - self.from.0, point.1 - self.from.1);
+        let at = if self.radial {
+            // the largest t whose circle, between the two, passes through the point
+            let dr = self.to.2 - self.from.2;
+            let a = dx * dx + dy * dy - dr * dr;
+            let b = px * dx + py * dy + self.from.2 * dr;
+            let c = px * px + py * py - self.from.2 * self.from.2;
+            let t = if a.abs() < 1e-6 {
+                (b.abs() > 1e-6).then(|| c / (2.0 * b))?
+            } else {
+                let root = b * b - a * c;
+                (root >= 0.0).then(|| (b + root.sqrt()) / a)?
+            };
+            (self.from.2 + t * dr >= 0.0).then_some(t)?
+        } else {
+            let length = dx * dx + dy * dy;
+            if length <= 0.0 {
+                return None;
+            }
+            (px * dx + py * dy) / length
+        };
+        if at <= first.0 {
+            return Some(first.1);
+        }
+        if at >= last.0 {
+            return Some(last.1);
+        }
+        let after = self.stops.iter().position(|stop| stop.0 > at)?;
+        let (low, high) = (self.stops[after - 1], self.stops[after]);
+        let share = (at - low.0) / (high.0 - low.0);
+        let mix = |from: u8, to: u8| {
+            (f32::from(from) + (f32::from(to) - f32::from(from)) * share).round() as u8
+        };
+        Some(Color {
+            red: mix(low.1.red, high.1.red),
+            green: mix(low.1.green, high.1.green),
+            blue: mix(low.1.blue, high.1.blue),
+            alpha: mix(low.1.alpha, high.1.alpha),
+        })
+    }
+}
+
+// what a fill or a stroke takes its colour from
+#[derive(Clone)]
+enum Paint {
+    Color(Color),
+    // the gradient, and the object script holds it by
+    Gradient(GradientHandle, Value),
+}
+
+// how what is drawn meets what is there; each of these changes only where the shape lands
+#[derive(Clone, Copy, PartialEq)]
+enum Composite {
+    SourceOver,
+    DestinationOver,
+    DestinationOut,
+    SourceAtop,
+    Xor,
+    Lighter,
+    Multiply,
+    Screen,
+    Darken,
+    Lighten,
+}
+
+impl Composite {
+    const NAMES: &[(&str, Self)] = &[
+        ("source-over", Self::SourceOver),
+        ("destination-over", Self::DestinationOver),
+        ("destination-out", Self::DestinationOut),
+        ("source-atop", Self::SourceAtop),
+        ("xor", Self::Xor),
+        ("lighter", Self::Lighter),
+        ("multiply", Self::Multiply),
+        ("screen", Self::Screen),
+        ("darken", Self::Darken),
+        ("lighten", Self::Lighten),
+    ];
+
+    // premultiplied source onto premultiplied backdrop, channels from 0 to 1
+    fn blend(self, source: [f32; 4], backdrop: [f32; 4]) -> [f32; 4] {
+        let (sa, ba) = (source[3], backdrop[3]);
+        let alpha = match self {
+            Self::DestinationOut => ba * (1.0 - sa),
+            Self::SourceAtop => ba,
+            Self::Xor => sa + ba - 2.0 * sa * ba,
+            Self::Lighter => (sa + ba).min(1.0),
+            _ => sa + ba - sa * ba,
+        };
+        let channel = |s: f32, b: f32| match self {
+            Self::SourceOver => s + b * (1.0 - sa),
+            Self::DestinationOver => b + s * (1.0 - ba),
+            Self::DestinationOut => b * (1.0 - sa),
+            Self::SourceAtop => s * ba + b * (1.0 - sa),
+            Self::Xor => s * (1.0 - ba) + b * (1.0 - sa),
+            Self::Lighter => (s + b).min(1.0),
+            Self::Multiply => s * b + s * (1.0 - ba) + b * (1.0 - sa),
+            Self::Screen => s + b - s * b,
+            Self::Darken => (s * ba).min(b * sa) + s * (1.0 - ba) + b * (1.0 - sa),
+            Self::Lighten => (s * ba).max(b * sa) + s * (1.0 - ba) + b * (1.0 - sa),
+        };
+        [
+            channel(source[0], backdrop[0]),
+            channel(source[1], backdrop[1]),
+            channel(source[2], backdrop[2]),
+            alpha,
+        ]
+    }
+}
+
 // the drawing state save pushes and restore pops
 #[derive(Clone)]
 struct DrawState {
     // user space to the bitmap's pixels
     transform: Affine,
-    fill_style: Color,
-    stroke_style: Color,
+    fill_style: Paint,
+    stroke_style: Paint,
     line_width: f32,
     cap: LineCap,
     join: LineJoin,
     miter_limit: f32,
+    dash: Vec<f32>,
+    dash_offset: f32,
     alpha: f32,
+    composite: Composite,
+    // how much of each pixel of the bitmap drawing may reach, out of 255; none is all of it
+    clip: Option<Rc<Vec<u8>>>,
 }
 
 impl Default for DrawState {
     fn default() -> Self {
         Self {
             transform: IDENTITY,
-            fill_style: Color::BLACK,
-            stroke_style: Color::BLACK,
+            fill_style: Paint::Color(Color::BLACK),
+            stroke_style: Paint::Color(Color::BLACK),
             line_width: 1.0,
             cap: LineCap::Butt,
             join: LineJoin::Miter,
             miter_limit: 10.0,
+            dash: Vec::new(),
+            dash_offset: 0.0,
             alpha: 1.0,
+            composite: Composite::SourceOver,
+            clip: None,
         }
     }
 }
@@ -342,26 +484,76 @@ impl CanvasContextData {
         }
     }
 
-    // source-over of a colour through a coverage, thinned by the global alpha
-    fn paint(&mut self, coverage: Option<Coverage>, color: Color) {
+    // a paint through a coverage onto the bitmap: thinned by the global alpha and the clip,
+    // then composited as the state says
+    fn paint(&mut self, coverage: Option<Coverage>, paint: &Paint) {
         let Some(coverage) = coverage else {
             return;
         };
-        let source = premultiply([color.red, color.green, color.blue, color.alpha]);
+        // a gradient is laid out in the user space of the moment it paints
+        let back = inverse(self.state.transform);
         let alpha = self.state.alpha;
+        let composite = self.state.composite;
+        let clip = self.state.clip.clone();
         let stride = self.bitmap.width as usize;
         for (index, &value) in coverage.values.iter().enumerate() {
-            let amount = (f32::from(value) * alpha).round() as u32;
-            if amount > 0 {
-                let x = coverage.left as usize + index % coverage.width;
-                let y = coverage.top as usize + index / coverage.width;
-                source_over(
-                    &mut self.bitmap.pixels[y * stride + x],
-                    scale(source, amount),
-                );
+            let x = coverage.left as usize + index % coverage.width;
+            let y = coverage.top as usize + index / coverage.width;
+            let at = y * stride + x;
+            let reach = clip.as_ref().map_or(255.0, |clip| f32::from(clip[at]));
+            let amount = (f32::from(value) * alpha * reach / 255.0).round() as u32;
+            if amount == 0 {
+                continue;
+            }
+            let color = match paint {
+                Paint::Color(color) => *color,
+                Paint::Gradient(gradient, _) => {
+                    let Some(back) = back else {
+                        return;
+                    };
+                    let point = crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5));
+                    match gradient.borrow().color_at(point) {
+                        Some(color) => color,
+                        None => continue,
+                    }
+                }
+            };
+            let source = scale(
+                premultiply([color.red, color.green, color.blue, color.alpha]),
+                amount,
+            );
+            let pixel = &mut self.bitmap.pixels[at];
+            if composite == Composite::SourceOver {
+                source_over(pixel, source);
+            } else {
+                let unit = |pixel: [u8; 4]| pixel.map(|channel| f32::from(channel) / 255.0);
+                let blended = composite.blend(unit(source), unit(*pixel));
+                *pixel = blended.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
             }
         }
         self.snapshot = None;
+    }
+
+    // the clip shrinks to where it and the path's inside both reach
+    fn clip_to(&mut self, path: &[Segment], even_odd: bool) {
+        let (width, height) = self.size();
+        let mut next = vec![0_u8; width as usize * height as usize];
+        if let Some(coverage) =
+            crate::svg::path_coverage(path, IDENTITY, None, even_odd, self.size())
+        {
+            for (index, &value) in coverage.values.iter().enumerate() {
+                let x = coverage.left as usize + index % coverage.width;
+                let y = coverage.top as usize + index / coverage.width;
+                let at = y * width as usize + x;
+                let reach = self
+                    .state
+                    .clip
+                    .as_ref()
+                    .map_or(255, |clip| u32::from(clip[at]));
+                next[at] = mul255(value.into(), reach) as u8;
+            }
+        }
+        self.state.clip = Some(Rc::new(next));
     }
 
     fn size(&self) -> (u32, u32) {
@@ -370,7 +562,8 @@ impl CanvasContextData {
 
     fn fill_path(&mut self, path: &[Segment], even_odd: bool) {
         let coverage = crate::svg::path_coverage(path, IDENTITY, None, even_odd, self.size());
-        self.paint(coverage, self.state.fill_style);
+        let paint = self.state.fill_style.clone();
+        self.paint(coverage, &paint);
     }
 
     // the pen is as wide as the transform in force now makes it, so the path goes back to
@@ -388,10 +581,13 @@ impl CanvasContextData {
             cap: self.state.cap,
             join: self.state.join,
             miter_limit: self.state.miter_limit,
+            dash: &self.state.dash,
+            dash_offset: self.state.dash_offset,
         };
         let coverage =
             crate::svg::path_coverage(&user, self.state.transform, Some(pen), false, self.size());
-        self.paint(coverage, self.state.stroke_style);
+        let paint = self.state.stroke_style.clone();
+        self.paint(coverage, &paint);
     }
 
     // a rectangle of user space as a path in the bitmap's pixels, the current path untouched
@@ -408,16 +604,43 @@ impl CanvasContextData {
 
     // whether rectangles can take the area-coverage path, which draws what skia draws for
     // an axis-aligned rectangle
-    fn plain(&self) -> bool {
-        self.state.transform == IDENTITY && self.state.alpha == 1.0
+    fn plain(&self) -> Option<Color> {
+        let state = &self.state;
+        match state.fill_style {
+            Paint::Color(color)
+                if state.transform == IDENTITY
+                    && state.alpha == 1.0
+                    && state.clip.is_none()
+                    && state.composite == Composite::SourceOver =>
+            {
+                Some(color)
+            }
+            _ => None,
+        }
     }
 
     // an attribute of the drawing state; a value outside what the attribute takes is ignored
     pub(super) fn set_drawing_property(&mut self, property: &str, text: &str, number: f32) {
         let state = &mut self.state;
         match property {
-            "fillStyle" => state.fill_style = Color::parse(text).unwrap_or(state.fill_style),
-            "strokeStyle" => state.stroke_style = Color::parse(text).unwrap_or(state.stroke_style),
+            "fillStyle" => {
+                if let Some(color) = Color::parse(text) {
+                    state.fill_style = Paint::Color(color);
+                }
+            }
+            "strokeStyle" => {
+                if let Some(color) = Color::parse(text) {
+                    state.stroke_style = Paint::Color(color);
+                }
+            }
+            "lineDashOffset" if number.is_finite() => state.dash_offset = number,
+            "globalCompositeOperation" => {
+                if let Some(&(_, composite)) =
+                    Composite::NAMES.iter().find(|(name, _)| *name == text)
+                {
+                    state.composite = composite;
+                }
+            }
             "lineWidth" if number.is_finite() && number > 0.0 => state.line_width = number,
             "miterLimit" if number.is_finite() && number > 0.0 => state.miter_limit = number,
             "globalAlpha" if (0.0..=1.0).contains(&number) => state.alpha = number,
@@ -1028,8 +1251,25 @@ impl ScriptRuntime {
         }
         Ok(match property {
             "canvas" => self.node_value(context.borrow().node),
-            "fillStyle" => Value::String(color_css(context.borrow().state.fill_style).into()),
-            "strokeStyle" => Value::String(color_css(context.borrow().state.stroke_style).into()),
+            "fillStyle" | "strokeStyle" => {
+                let context = context.borrow();
+                let paint = match property {
+                    "fillStyle" => &context.state.fill_style,
+                    _ => &context.state.stroke_style,
+                };
+                match paint {
+                    Paint::Color(color) => Value::String(color_css(*color).into()),
+                    Paint::Gradient(_, object) => object.clone(),
+                }
+            }
+            "lineDashOffset" => Value::Number(context.borrow().state.dash_offset.into()),
+            "globalCompositeOperation" => {
+                let composite = context.borrow().state.composite;
+                let name = Composite::NAMES
+                    .iter()
+                    .find(|(_, other)| *other == composite);
+                Value::String(name.map_or("source-over", |(name, _)| name).into())
+            }
             "lineWidth" => Value::Number(context.borrow().state.line_width.into()),
             "miterLimit" => Value::Number(context.borrow().state.miter_limit.into()),
             "globalAlpha" => Value::Number(context.borrow().state.alpha.into()),
@@ -1055,6 +1295,61 @@ impl ScriptRuntime {
             }
             _ => Value::Undefined,
         })
+    }
+
+    // a fill or stroke style given as a gradient the context made; anything else is a colour
+    pub(super) fn set_canvas_gradient(
+        &mut self,
+        context: &CanvasContextHandle,
+        property: &str,
+        value: &Value,
+    ) -> bool {
+        if !matches!(property, "fillStyle" | "strokeStyle") || !matches!(value, Value::Object(_)) {
+            return false;
+        }
+        let Ok(Value::Builtin(Builtin::CanvasGradientAddColorStop(gradient))) =
+            self.get_property(value, "addColorStop")
+        else {
+            return false;
+        };
+        let mut context = context.borrow_mut();
+        match property {
+            "fillStyle" => context.state.fill_style = Paint::Gradient(gradient, value.clone()),
+            _ => context.state.stroke_style = Paint::Gradient(gradient, value.clone()),
+        }
+        true
+    }
+
+    // addColorStop(offset, colour): stops stay in offset order, a later one after its equals
+    pub(super) fn add_color_stop(
+        &mut self,
+        gradient: &GradientHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let offset = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let offset = self.coerce_number(offset)? as f32;
+        if !(0.0..=1.0).contains(&offset) {
+            return Err(self.throw_value(dom_exception(
+                "IndexSizeError",
+                "Failed to execute 'addColorStop' on 'CanvasGradient': The provided value is outside the range (0.0, 1.0).",
+            )));
+        }
+        let text = arguments
+            .get(1)
+            .map(Value::string_value)
+            .unwrap_or_default();
+        let Some(color) = Color::parse(&text) else {
+            return Err(self.throw_value(dom_exception(
+                "SyntaxError",
+                &format!(
+                    "Failed to execute 'addColorStop' on 'CanvasGradient': The value provided ('{text}') could not be parsed as a color."
+                ),
+            )));
+        };
+        let mut gradient = gradient.borrow_mut();
+        let at = gradient.stops.partition_point(|stop| stop.0 <= offset);
+        gradient.stops.insert(at, (offset, color));
+        Ok(Value::Undefined)
     }
 
     // an enum attribute ignores a value outside its set, as webidl has it
@@ -1127,8 +1422,8 @@ impl ScriptRuntime {
                     let path = context.rect_path((n(0), n(1), n(2), n(3)));
                     context.stroke_path(&path);
                 }
-                "fillRect" if context.plain() => {
-                    let fill = context.state.fill_style;
+                "fillRect" if context.plain().is_some() => {
+                    let fill = context.plain().unwrap_or(Color::BLACK);
                     context.bitmap.fill_rect((n(0), n(1), n(2), n(3)), fill);
                     context.snapshot = None;
                 }
@@ -1229,6 +1524,65 @@ impl ScriptRuntime {
                 let path = context.path.clone();
                 context.stroke_path(&path);
                 Ok(Value::Undefined)
+            }
+            "clip" => {
+                let even_odd = arguments
+                    .iter()
+                    .any(|argument| argument.string_value() == "evenodd");
+                let mut context = context.borrow_mut();
+                let path = context.path.clone();
+                context.clip_to(&path, even_odd);
+                Ok(Value::Undefined)
+            }
+            // an odd count repeats to make a whole pattern, and a negative or unreal length
+            // leaves the pattern as it was
+            "setLineDash" => {
+                let list = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let mut dash = Vec::new();
+                for length in self.iterate_to_vec(list)? {
+                    dash.push(self.coerce_number(length)? as f32);
+                }
+                if dash
+                    .iter()
+                    .all(|length| length.is_finite() && *length >= 0.0)
+                {
+                    if dash.len() % 2 == 1 {
+                        dash.extend_from_within(..);
+                    }
+                    context.borrow_mut().state.dash = dash;
+                }
+                Ok(Value::Undefined)
+            }
+            "getLineDash" => Ok(Value::Array(Rc::new(RefCell::new(
+                context
+                    .borrow()
+                    .state
+                    .dash
+                    .iter()
+                    .map(|&length| Value::Number(length.into()))
+                    .collect(),
+            )))),
+            "createLinearGradient" | "createRadialGradient" => {
+                let radial = name == "createRadialGradient";
+                let count = if radial { 6 } else { 4 };
+                let Some(numbers) = self.canvas_numbers(name, arguments, count)? else {
+                    return Err(self.type_error(format!(
+                        "Failed to execute '{name}' on 'CanvasRenderingContext2D': The provided double value is non-finite."
+                    )));
+                };
+                let (from, to) = match radial {
+                    true => (
+                        (numbers[0], numbers[1], numbers[2]),
+                        (numbers[3], numbers[4], numbers[5]),
+                    ),
+                    false => ((numbers[0], numbers[1], 0.0), (numbers[2], numbers[3], 0.0)),
+                };
+                Ok(gradient_object(Rc::new(RefCell::new(Gradient {
+                    from,
+                    to,
+                    radial,
+                    stops: Vec::new(),
+                }))))
             }
             "drawImage" => {
                 self.draw_canvas_image(context, arguments)?;
@@ -1569,6 +1923,14 @@ impl ScriptRuntime {
     }
 }
 
+// a CanvasGradient as script holds it: its one method, which carries the gradient
+fn gradient_object(gradient: GradientHandle) -> Value {
+    plain_object([(
+        "addColorStop".to_string(),
+        Value::Builtin(Builtin::CanvasGradientAddColorStop(gradient)),
+    )])
+}
+
 fn image_data_object(width: u32, height: u32, data: Vec<u8>) -> Value {
     let length = data.len();
     plain_object([
@@ -1653,6 +2015,68 @@ mod tests {
         assert_eq!(
             document.text_content(status),
             "255,0,0,255 0,0,0,0 0,0,255,255 0,0,0,0 #ff0000 0,255,0,255 0,255,0,255 0,0,0,0 0,0,0,128 255,255,255,255 0,0,0,0 2 1 1  2 butt"
+        );
+    }
+
+    #[test]
+    fn gradients_dashes_clips_and_blend_modes_follow_the_drawing_state() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="20" height="20"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const c = document.getElementById("c").getContext("2d");
+                const at = (x, y) => [...c.getImageData(x, y, 1, 1).data].join(",");
+                const seen = [];
+                const fade = c.createLinearGradient(0, 0, 20, 0);
+                fade.addColorStop(1, "#fff");
+                fade.addColorStop(0, "#000");
+                c.fillStyle = fade;
+                c.fillRect(0, 0, 20, 4);
+                seen.push(at(0, 1), at(19, 1), typeof c.fillStyle, c.fillStyle === fade);
+                c.setLineDash([4]);
+                seen.push(c.getLineDash().join("/"));
+                c.setLineDash([1, -1]);
+                seen.push(c.getLineDash().join("/"));
+                c.strokeStyle = "#f00";
+                c.lineWidth = 2;
+                c.beginPath();
+                c.moveTo(0, 7);
+                c.lineTo(20, 7);
+                c.stroke();
+                seen.push(at(1, 7), at(5, 7), at(9, 7));
+                c.save();
+                c.beginPath();
+                c.rect(0, 10, 4, 4);
+                c.clip();
+                c.fillStyle = "#0f0";
+                c.fillRect(0, 10, 20, 4);
+                c.restore();
+                seen.push(at(2, 11), at(8, 11), c.fillStyle === fade);
+                c.fillStyle = "#808080";
+                c.fillRect(0, 16, 4, 4);
+                c.globalCompositeOperation = "multiply";
+                c.fillRect(0, 16, 4, 4);
+                c.globalCompositeOperation = "no-such-mode";
+                seen.push(at(1, 17), c.globalCompositeOperation);
+                try {
+                    fade.addColorStop(2, "#000");
+                } catch (error) {
+                    seen.push(error.name);
+                }
+                document.getElementById("status").textContent = seen.join(" ");
+                "##,
+            )
+            .expect("canvas drawing should run");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.text_content(status),
+            "6,6,6,255 249,249,249,255 object true 4/4 4/4 255,0,0,255 0,0,0,0 255,0,0,255 0,255,0,255 0,0,0,0 true 64,64,64,255 multiply IndexSizeError"
         );
     }
 

@@ -1164,13 +1164,73 @@ pub(crate) struct Coverage {
     pub(crate) values: Vec<u8>,
 }
 
-// the pen a path is stroked with, its width in the path's own units
+// the pen a path is stroked with, its width and dashes in the path's own units
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Pen {
+pub(crate) struct Pen<'a> {
     pub(crate) width: f32,
     pub(crate) cap: LineCap,
     pub(crate) join: LineJoin,
     pub(crate) miter_limit: f32,
+    // the lengths drawn and skipped in turn, none for a solid line, and how far into the
+    // pattern the line starts
+    pub(crate) dash: &'a [f32],
+    pub(crate) dash_offset: f32,
+}
+
+// the pieces of a line that a dash pattern draws, each an open line of its own
+fn dashed(points: &[Point], closed: bool, dash: &[f32], offset: f32) -> Vec<Vec<Point>> {
+    let period: f32 = dash.iter().sum();
+    if dash.is_empty() || !period.is_finite() || period <= 0.0 {
+        return vec![points.to_vec()];
+    }
+    // where in the pattern the line starts: which length, and how far into it
+    let mut along = offset.rem_euclid(period);
+    let mut index = 0;
+    while along >= dash[index] {
+        along -= dash[index];
+        index = (index + 1) % dash.len();
+    }
+    let mut left = dash[index] - along;
+    let mut pieces = Vec::new();
+    let mut piece: Vec<Point> = Vec::new();
+    let ends = points.iter().copied().chain(closed.then(|| points[0]));
+    let mut from = points[0];
+    for to in ends.skip(1) {
+        let mut length = (to.0 - from.0).hypot(to.1 - from.1);
+        while length > 0.0 {
+            let drawn = index % 2 == 0;
+            if drawn && piece.is_empty() {
+                piece.push(from);
+            }
+            let step = left.min(length);
+            let share = step / length;
+            from = (
+                from.0 + (to.0 - from.0) * share,
+                from.1 + (to.1 - from.1) * share,
+            );
+            length -= step;
+            left -= step;
+            if drawn {
+                piece.push(from);
+            }
+            if left <= 0.0 {
+                if drawn {
+                    pieces.push(std::mem::take(&mut piece));
+                }
+                index = (index + 1) % dash.len();
+                left = dash[index];
+                // a pattern of nothing but zeros would never move on
+                if left <= 0.0 && dash[(index + 1) % dash.len()] <= 0.0 {
+                    return pieces;
+                }
+            }
+        }
+        from = to;
+    }
+    if piece.len() > 1 {
+        pieces.push(piece);
+    }
+    pieces
 }
 
 // what a path covers on a surface of this size once `matrix` has placed it: its inside by
@@ -1178,7 +1238,7 @@ pub(crate) struct Pen {
 pub(crate) fn path_coverage(
     path: &[Segment],
     matrix: Affine,
-    pen: Option<Pen>,
+    pen: Option<Pen<'_>>,
     even_odd: bool,
     size: (u32, u32),
 ) -> Option<Coverage> {
@@ -1203,14 +1263,15 @@ pub(crate) fn path_coverage(
             };
             let scale = matrix[0].hypot(matrix[1]).max(matrix[2].hypot(matrix[3]));
             let mut polygons = Vec::new();
+            let steps = disc_steps(pen.width / 2.0 * scale);
             for (points, closed) in &subpaths {
-                stroke_polygons(
-                    points,
-                    *closed,
-                    &stroke,
-                    disc_steps(pen.width / 2.0 * scale),
-                    &mut polygons,
-                );
+                if pen.dash.is_empty() || points.len() < 2 {
+                    stroke_polygons(points, *closed, &stroke, steps, &mut polygons);
+                    continue;
+                }
+                for piece in dashed(points, *closed, pen.dash, pen.dash_offset) {
+                    stroke_polygons(&piece, false, &stroke, steps, &mut polygons);
+                }
             }
             for polygon in polygons {
                 let device = polygon
