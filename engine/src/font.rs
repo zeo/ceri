@@ -117,6 +117,22 @@ impl FontFace {
             return Err("font has no usable unicode character map".to_string());
         }
         let os2 = tables.get(b"OS/2").map(|table| table.0);
+        // directwrite, which chromium draws text with on windows, takes a face's line metrics
+        // from OS/2: the typographic ones when the face asks for them, else the windows
+        // ascent and descent with what they leave of the hhea line gap
+        let windows_metrics = os2.filter(|_| cfg!(windows)).and_then(|os2| {
+            let signed = |at: usize| read_i16(&data, os2 + at).ok().map(f32::from);
+            let unsigned = |at: usize| read_u16(&data, os2 + at).ok().map(f32::from);
+            if read_u16(&data, os2 + 62).ok()? & 0x80 != 0 {
+                return Some((signed(68)?, signed(70)?, signed(72)?));
+            }
+            let (up, down) = (unsigned(74)?, unsigned(76)?);
+            (up + down > 0.0).then(|| {
+                let gap = line_gap - ((up + down) - (ascent - descent));
+                (up, -down, gap.max(0.0))
+            })
+        });
+        let (ascent, descent, line_gap) = windows_metrics.unwrap_or((ascent, descent, line_gap));
         let weight = os2
             .and_then(|os2| read_u16(&data, os2 + 4).ok())
             .filter(|weight| (1..=1000).contains(weight))
@@ -1922,7 +1938,8 @@ impl FontSet {
             .unwrap_or(&[])
             .iter()
             .map(String::as_str)
-            .chain(["sans-serif"])
+            // a stack that names nothing installed ends at the standard font, a serif
+            .chain(["serif"])
         {
             for entry in self.web_faces_for(family, style) {
                 push(entry);

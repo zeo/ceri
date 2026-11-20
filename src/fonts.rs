@@ -59,7 +59,9 @@ impl SystemFonts {
         if let Some(face) = self.installed(family, style) {
             return Some(face);
         }
-        let preferred = [Some(family), css_generic(family)]
+        // what is configured for system-ui, then for the sans-serif it is one of
+        let sans = (css_generic(family) == Some("system-ui")).then_some("sans-serif");
+        let preferred = [Some(family), css_generic(family), sans]
             .into_iter()
             .flatten()
             .filter_map(|name| self.preferred.get(name))
@@ -68,7 +70,7 @@ impl SystemFonts {
         if preferred.is_some() {
             return preferred;
         }
-        if let Some(default) = generic_family(family) {
+        if let Some(default) = generic_family(family).or_else(|| substitute(family)) {
             return self.installed(default, style);
         }
         // a width variant that is not installed, such as arial narrow, takes its base family,
@@ -244,27 +246,60 @@ const WIDTH_WORDS: &[&str] = &[
     "wide",
 ];
 
+// the generic families chromium answers; a name such as -apple-system or ui-sans-serif is
+// one it does not know off a mac, so a stack moves on past it
 fn css_generic(family: &str) -> Option<&'static str> {
     match family {
-        "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" => Some("sans-serif"),
-        "serif" | "ui-serif" => Some("serif"),
-        "monospace" | "ui-monospace" => Some("monospace"),
+        "sans-serif" | "serif" | "monospace" | "system-ui" | "cursive" | "fantasy" | "math" => [
+            "sans-serif",
+            "serif",
+            "monospace",
+            "system-ui",
+            "cursive",
+            "fantasy",
+            "math",
+        ]
+        .into_iter()
+        .find(|name| *name == family),
+        "-apple-system" | "blinkmacsystemfont" if cfg!(target_os = "macos") => Some("system-ui"),
         _ => None,
     }
 }
 
+// the family each generic stands for, as chromium's defaults have them on each platform
 fn generic_family(family: &str) -> Option<&'static str> {
+    let windows = cfg!(target_os = "windows");
+    let mac = cfg!(target_os = "macos");
     Some(match css_generic(family)? {
-        "sans-serif" if cfg!(target_os = "windows") => "segoe ui",
-        "sans-serif" if cfg!(target_os = "macos") => "helvetica",
+        "sans-serif" if windows => "arial",
+        "sans-serif" if mac => "helvetica",
         "sans-serif" => "dejavu sans",
-        "serif" if cfg!(target_os = "windows") => "times new roman",
-        "serif" if cfg!(target_os = "macos") => "times",
-        "serif" => "dejavu serif",
-        _ if cfg!(target_os = "windows") => "consolas",
-        _ if cfg!(target_os = "macos") => "menlo",
+        "system-ui" if windows => "segoe ui",
+        "system-ui" if mac => "helvetica neue",
+        "system-ui" => "dejavu sans",
+        "serif" | "math" | "cursive" | "fantasy" if !windows && !mac => "dejavu serif",
+        "serif" if windows => "times new roman",
+        "serif" => "times",
+        "cursive" if windows => "comic sans ms",
+        "cursive" => "apple chancery",
+        "fantasy" if windows => "impact",
+        "fantasy" => "papyrus",
+        "math" if windows => "cambria math",
+        "math" => "stix two math",
+        _ if windows => "consolas",
+        _ if mac => "menlo",
         _ => "dejavu sans mono",
     })
+}
+
+// the families windows stands in for names it does not ship
+fn substitute(family: &str) -> Option<&'static str> {
+    match family {
+        "helvetica" if cfg!(target_os = "windows") => Some("arial"),
+        "courier" if cfg!(target_os = "windows") => Some("courier new"),
+        "times" if cfg!(target_os = "windows") => Some("times new roman"),
+        _ => None,
+    }
 }
 
 // the directories to index and the preferred families for a name
