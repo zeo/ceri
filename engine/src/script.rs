@@ -455,6 +455,8 @@ struct Environment {
     values: HashMap<String, Value>,
     // getters and setters defined on the global object, kept apart from its data properties
     accessors: HashMap<String, object::Property>,
+    // the names scripts declared with let, const or class, which an eval's var may not take
+    lexicals: HashSet<String>,
 }
 
 impl Environment {

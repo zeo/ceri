@@ -2219,6 +2219,217 @@ fn direct_eval_keeps_the_callers_bindings_immutable() {
 }
 
 #[test]
+fn direct_eval_declares_only_what_its_variable_environment_lacks() {
+    check(&[
+        (
+            "an outer binding of the name stays apart",
+            "function o() { var x = 'o'; function f() { eval('var x = 1'); return x; } var inner = f(); return [inner, x].join(); } console.log(o())",
+            "1,o",
+        ),
+        (
+            "a strict closure sees the eval's var",
+            "function o() { eval('var x = 1'); return (function () { 'use strict'; return x; })(); } console.log(o())",
+            "1",
+        ),
+        (
+            "a closure made before the eval sees it too",
+            "function v() { var h = function () { return typeof late; }; eval('var late = 1'); return h(); } console.log(v())",
+            "number",
+        ),
+    ]);
+}
+
+#[test]
+fn direct_eval_sees_the_callers_this_and_function_state() {
+    check(&[
+        (
+            "this in a method",
+            "var obj = { m() { return eval('this'); } }; console.log(obj.m() === obj)",
+            "true",
+        ),
+        (
+            "this in a strict function",
+            "function s() { 'use strict'; return eval('this'); } console.log(s())",
+            "undefined",
+        ),
+        (
+            "arguments",
+            "function f() { return eval('arguments.length'); } console.log(f(1, 2, 3))",
+            "3",
+        ),
+        (
+            "new.target",
+            "function F() { this.t = eval('new.target'); } console.log(new F().t === F)",
+            "true",
+        ),
+        (
+            "super property",
+            "var base = { greet() { return 'hi'; } }; var o = { __proto__: base, m() { return eval('super.greet()'); } }; console.log(o.m())",
+            "hi",
+        ),
+        (
+            "an arrow's this",
+            "var obj = { m() { return (() => eval('this'))(); } }; console.log(obj.m() === obj)",
+            "true",
+        ),
+        (
+            "an arrow's arguments",
+            "function f() { return (() => eval('arguments[0]'))(); } console.log(f(7))",
+            "7",
+        ),
+        (
+            "an arrow made by the eval",
+            "var obj = { m() { return eval('(() => this)()'); } }; console.log(obj.m() === obj)",
+            "true",
+        ),
+        (
+            "new.target outside a function is refused",
+            "try { eval('new.target'); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "super outside a method is refused",
+            "function f() { try { eval('super.x'); return 'no throw'; } catch (e) { return e instanceof SyntaxError; } } console.log(f())",
+            "true",
+        ),
+    ]);
+}
+
+#[test]
+fn direct_eval_sees_block_catch_and_with_scopes() {
+    check(&[
+        (
+            "a block's let",
+            "{ let y = 5; console.log(eval('y')) }",
+            "5",
+        ),
+        (
+            "a catch parameter",
+            "try { throw 1 } catch (e) { console.log(eval('e')) }",
+            "1",
+        ),
+        (
+            "a with object",
+            "with ({ w: 3 }) { console.log(eval('w')) }",
+            "3",
+        ),
+        (
+            "a with object in a function",
+            "function f() { with ({ w: 4 }) { return eval('w'); } } console.log(f())",
+            "4",
+        ),
+        (
+            "a var declared inside a with lands in the function",
+            "function f() { var o = {}; with (o) { eval('var v = 2'); } return [typeof o.v, v].join(); } console.log(f())",
+            "undefined,2",
+        ),
+        (
+            "a with object nearer than an eval var wins",
+            "function f() { eval('var w = 1'); with ({ w: 2 }) { return w; } } console.log(f())",
+            "2",
+        ),
+        (
+            "an eval var nearer than a with object wins",
+            "var r; with ({ w: 2 }) { r = (function () { eval('var w = 1'); return w; })(); } console.log(r)",
+            "1",
+        ),
+    ]);
+}
+
+#[test]
+fn direct_eval_refuses_a_var_a_lexical_binding_already_holds() {
+    check(&[
+        (
+            "a script's let",
+            "let L = 1; try { eval('var L = 2'); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError, L) }",
+            "true 1",
+        ),
+        (
+            "a function body's let",
+            "function w() { let L; { eval('var L = 2'); } } try { w(); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "a block's let",
+            "function w() { { let L; eval('var L = 2'); } } try { w(); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "a function declaration too",
+            "function w() { let F; { eval('function F() {}'); } } try { w(); console.log('no throw') } catch (e) { console.log(e instanceof SyntaxError) }",
+            "true",
+        ),
+        (
+            "nothing is declared when it refuses",
+            "function w() { var r; { let L; try { eval('var ok, L'); } catch (e) {} } return typeof ok; } console.log(w())",
+            "undefined",
+        ),
+        (
+            "a catch parameter may share the name",
+            "function c() { var r; try { throw 1 } catch (e) { eval('var e = 2'); r = e; } return r + ',' + typeof e; } console.log(c())",
+            "2,undefined",
+        ),
+    ]);
+}
+
+#[test]
+fn eval_is_direct_whenever_the_name_holds_the_intrinsic() {
+    check(&[
+        (
+            "a local named eval",
+            "function f() { var eval = globalThis.eval; var x = 'local'; return eval('x'); } console.log(f())",
+            "local",
+        ),
+        (
+            "spread arguments",
+            "function f() { var x = 'spread'; return eval(...['x']); } console.log(f())",
+            "spread",
+        ),
+        (
+            "an eval found on a with object",
+            "function f() { var x = 'with'; with ({ eval }) return eval('x'); } console.log(f())",
+            "with",
+        ),
+        (
+            "another function found on a with object is called with it",
+            "var o = { eval: function () { return this === o; } }; with (o) console.log(eval('1'))",
+            "true",
+        ),
+        (
+            "a copy is still indirect",
+            "function f() { var x = 'l'; var e = eval; return e('typeof x'); } console.log(f())",
+            "undefined",
+        ),
+        (
+            "an optional call is indirect",
+            "function f() { var x = 'l'; return eval?.('typeof x'); } console.log(f())",
+            "undefined",
+        ),
+    ]);
+}
+
+#[test]
+fn a_deleted_eval_binding_stops_shadowing() {
+    check(&[
+        (
+            "inside the eval",
+            "var gx = 'g'; function v() { return eval('var gx = 1; delete gx; gx'); } console.log(v())",
+            "g",
+        ),
+        (
+            "from the caller",
+            "var gy = 'g'; function v() { eval('var gy = 1'); var before = gy; var deleted = delete gy; return [before, deleted, gy].join(); } console.log(v())",
+            "1,true,g",
+        ),
+        (
+            "a declared var is not deletable",
+            "function v() { var d = 1; return eval('delete d'); } console.log(v())",
+            "false",
+        ),
+    ]);
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (

@@ -2,8 +2,8 @@
 // Boolean, Number, String, Array and the iterator and generator prototypes) and the native
 // functions behind their methods
 
-use super::ast::FunctionKind;
-use super::compiler::Compiler;
+use super::ast::{EvalContext, FunctionKind};
+use super::compiler::{BindingKind, CallerScope, Code, Compiler, EvalCode, ScopeRole};
 use super::object::{
     ArrayIteration, ArrayIterationKind, JsObject, ObjectClass, ObjectHandle, Property,
     SYMBOL_PREFIX, Slot, array_index, is_private_key, is_symbol_key, new_object,
@@ -11,7 +11,7 @@ use super::object::{
 use super::operations::{
     is_callable, is_primitive, number_to_string, same_value, symbol_description,
 };
-use super::vm::{AsyncResumeHandle, ResumeMode};
+use super::vm::{AsyncResumeHandle, ResumeMode, Scope, ScopeRef};
 use super::*;
 
 #[derive(Clone)]
@@ -1326,87 +1326,121 @@ impl ScriptRuntime {
         Ok(self.new_closure(code, None, None))
     }
 
-    // source run as global code for the value of its last expression statement
+    // an indirect eval: its source runs as sloppy global code
+    fn evaluate_indirect(&mut self, source: &str) -> Result<Value, ScriptError> {
+        let (code, scope) = self.instantiate_eval(source, false, EvalContext::default(), None)?;
+        self.run_eval_code(code, scope)
+    }
+
+    // eval code compiled over the scope chain it runs on, with its declarations
+    // instantiated: a sloppy one's vars and functions may not take a name a lexical
+    // binding holds between it and its variable environment, a global one must be
+    // declarable on the global, and a function's variable environment grows by the
+    // names it lacks
+    pub(super) fn instantiate_eval(
+        &mut self,
+        source: &str,
+        strict: bool,
+        context: EvalContext,
+        scope: Option<ScopeRef>,
+    ) -> Result<(Rc<Code>, ScopeRef), ScriptError> {
+        let script = super::parser::parse_eval(source, strict, context)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        let mut chain = Vec::new();
+        let mut walk = scope.clone();
+        while let Some(current) = walk {
+            walk = current.borrow().parent.clone();
+            chain.push(current);
+        }
+        let caller: Vec<CallerScope> = chain
+            .iter()
+            .map(|scope| {
+                let scope = scope.borrow();
+                CallerScope {
+                    layout: scope.layout.clone(),
+                    extra: scope.extra.clone(),
+                }
+            })
+            .collect();
+        let eval = Compiler::new(source)
+            .compile_eval(&script, &caller, context)
+            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
+        if !script.strict {
+            self.check_eval_declarations(&chain, &eval)?;
+        }
+        if let Some(target) = chain
+            .iter()
+            .find(|scope| scope.borrow().layout.role == ScopeRole::Var)
+        {
+            let mut target = target.borrow_mut();
+            for name in eval.grown {
+                target.slots.push(Value::Undefined);
+                target.extra.push(name);
+            }
+        }
+        let scope = Scope::new(eval.code.layout.clone(), scope);
+        Ok((eval.code, scope))
+    }
+
+    fn check_eval_declarations(
+        &mut self,
+        chain: &[ScopeRef],
+        eval: &EvalCode,
+    ) -> Result<(), ScriptError> {
+        for scope in chain {
+            let layout = scope.borrow().layout.clone();
+            // annex b lets a var share a catch parameter's name
+            if matches!(layout.role, ScopeRole::With | ScopeRole::Catch) {
+                continue;
+            }
+            let var_scope = layout.role == ScopeRole::Var;
+            for (name, kind) in layout.names.iter().zip(layout.kinds.iter()) {
+                let lexical = match kind {
+                    BindingKind::Let | BindingKind::Const | BindingKind::Class => true,
+                    BindingKind::Hidden => false,
+                    _ => !var_scope,
+                };
+                if lexical && eval.declared.contains(name) {
+                    return Err(self.redeclaration(name));
+                }
+            }
+            if var_scope {
+                return Ok(());
+            }
+        }
+        let lexical = {
+            let global = self.global.borrow();
+            eval.declared
+                .iter()
+                .find(|name| global.lexicals.contains(&***name))
+                .cloned()
+        };
+        if let Some(name) = lexical {
+            return Err(self.redeclaration(&name));
+        }
+        for name in &eval.functions {
+            if Self::RESTRICTED_FUNCTION.contains(&&**name) {
+                return Err(self.type_error(format!("cannot declare the global function {name}")));
+            }
+        }
+        for name in &eval.declared {
+            if Self::RESTRICTED_VAR.contains(&&**name) {
+                return Err(self.type_error(format!("cannot declare the global variable {name}")));
+            }
+        }
+        Ok(())
+    }
+
     // eval's declarations only take the global when the global can take them, as
     // the spec's restricted global properties never can
     const RESTRICTED_FUNCTION: [&str; 4] = ["undefined", "NaN", "Infinity", "globalThis"];
     const RESTRICTED_VAR: [&str; 3] = ["undefined", "NaN", "Infinity"];
 
-    pub(super) fn evaluate_global_text(
-        &mut self,
-        source: &str,
-        strict: bool,
-    ) -> Result<Value, ScriptError> {
-        let script = if strict {
-            super::parser::parse_script_strict(source)
-        } else {
-            super::parser::parse_script(source)
-        }
-        .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-        if !script.strict {
-            for function in super::compiler::block_functions(&script.body) {
-                let name = function.name.clone().expect("declarations are named");
-                if Self::RESTRICTED_FUNCTION.contains(&&*name) {
-                    return Err(
-                        self.type_error(format!("cannot declare the global function {name}"))
-                    );
-                }
-            }
-            let mut vars = Vec::new();
-            super::ast::collect_var_names(&script.body, &mut vars);
-            for name in vars {
-                if Self::RESTRICTED_VAR.contains(&&*name) {
-                    return Err(
-                        self.type_error(format!("cannot declare the global variable {name}"))
-                    );
-                }
-            }
-        }
-        let code = Compiler::new(source)
-            .compile_eval_script(&script)
-            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-        self.run_script_code(code)
-    }
-
-    // a direct eval inside a function: its code compiles against the caller's live
-    // scopes, and a sloppy one's var and function declarations land in the variable
-    // environment among them, growing it by the bindings that are new
-    pub(super) fn evaluate_text_in_caller(
-        &mut self,
-        source: &str,
-        strict: bool,
-        chain: Vec<(super::vm::ScopeRef, bool)>,
-    ) -> Result<Value, ScriptError> {
-        let script = if strict {
-            super::parser::parse_script_strict(source)
-        } else {
-            super::parser::parse_script(source)
-        }
-        .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-        let caller: Vec<super::compiler::CallerScope> = chain
-            .iter()
-            .map(|(scope, _)| {
-                let scope = scope.borrow();
-                super::compiler::CallerScope {
-                    layout: scope.layout.clone(),
-                    extra: scope.extra.clone(),
-                    slots: scope.slots.len() as u16,
-                }
-            })
-            .collect();
-        let (code, grown) = Compiler::new(source)
-            .compile_eval_in_scope(&script, &caller)
-            .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-        if !grown.is_empty()
-            && let Some((scope, _)) = chain.iter().find(|(_, flag)| *flag)
-        {
-            let mut scope = scope.borrow_mut();
-            for name in grown {
-                scope.slots.push(Value::Undefined);
-                scope.extra.push(name);
-            }
-        }
-        self.run_eval_code(code, chain[0].0.clone())
+    fn redeclaration(&mut self, name: &str) -> ScriptError {
+        self.throw_error(
+            "SyntaxError",
+            format!("identifier '{name}' has already been declared"),
+        )
     }
 
     // a native function object created at run time, such as a proxy's revoke function
@@ -2635,7 +2669,7 @@ impl ScriptRuntime {
             // every call through the native is an indirect eval, so source runs as
             // global code with only its own directive deciding strictness
             Native::Eval => match first {
-                Value::String(source) => self.evaluate_global_text(&source, false),
+                Value::String(source) => self.evaluate_indirect(&source),
                 other => Ok(other),
             },
             Native::EncodeUri(component) => {

@@ -62,6 +62,7 @@ const STRICT_RESERVED: [&str; 8] = [
 #[derive(Clone, Copy, Default)]
 struct Context {
     in_function: bool,
+    allow_new_target: bool,
     in_async: bool,
     in_generator: bool,
     in_class_field: bool,
@@ -77,6 +78,8 @@ pub(super) struct Parser<'a> {
     position: usize,
     previous_end: usize,
     context: Context,
+    // the context of the first call of a name eval in the function being parsed
+    eval_context: Option<EvalContext>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,6 +202,7 @@ impl<'a> Parser<'a> {
             position: 0,
             previous_end: 0,
             context: Context::default(),
+            eval_context: None,
         }
     }
 
@@ -1322,12 +1326,14 @@ impl<'a> Parser<'a> {
             }
             let name = self.parse_declared_identifier()?;
             self.advance()?;
+            let outer_eval = self.eval_context.take();
             return Ok(Some(self.parse_arrow_body(
                 start,
                 vec![Pattern::Identifier(name)],
                 None,
                 is_async,
                 allow_in,
+                outer_eval,
             )?));
         }
         if !matches!(self.peek_at(lookahead)?.kind, TokenKind::Punct("(")) {
@@ -1335,6 +1341,8 @@ impl<'a> Parser<'a> {
         }
         let saved_position = self.position;
         let saved_context = self.context;
+        // an eval called in the parameters belongs to the arrow they turn out to open
+        let outer_eval = self.eval_context.take();
         if is_async {
             self.advance()?;
             self.context.in_async = true;
@@ -1347,12 +1355,13 @@ impl<'a> Parser<'a> {
         self.context = saved_context;
         if !arrow_follows {
             self.position = saved_position;
+            self.eval_context = outer_eval;
             return Ok(None);
         }
         let (params, rest) = attempt.expect("checked above");
         self.advance()?;
         Ok(Some(self.parse_arrow_body(
-            start, params, rest, is_async, allow_in,
+            start, params, rest, is_async, allow_in, outer_eval,
         )?))
     }
 
@@ -1363,6 +1372,7 @@ impl<'a> Parser<'a> {
         rest: Option<Pattern>,
         is_async: bool,
         allow_in: bool,
+        outer_eval: Option<EvalContext>,
     ) -> Result<Expr, ScriptError> {
         let saved = self.context;
         self.context.in_async = is_async;
@@ -1387,6 +1397,7 @@ impl<'a> Parser<'a> {
         };
         let strict = self.context.strict;
         self.context = saved;
+        let eval_context = std::mem::replace(&mut self.eval_context, outer_eval);
         Ok(Expr::Function(Rc::new(FunctionNode {
             name: None,
             params,
@@ -1397,6 +1408,7 @@ impl<'a> Parser<'a> {
             is_generator: false,
             strict,
             source: (start, self.previous_end),
+            eval_context,
         })))
     }
 
@@ -1643,6 +1655,15 @@ impl<'a> Parser<'a> {
                     };
                 }
                 TokenKind::Punct("(") => {
+                    if matches!(&expression, Expr::Identifier(name) if &**name == "eval") {
+                        let context = EvalContext {
+                            new_target: self.context.allow_new_target,
+                            super_member: self.context.allow_super_member,
+                            super_call: self.context.allow_super_call,
+                            class_field: self.context.in_class_field,
+                        };
+                        self.eval_context.get_or_insert(context);
+                    }
                     expression = Expr::Call {
                         callee: Box::new(expression),
                         arguments: self.parse_arguments()?,
@@ -1686,7 +1707,7 @@ impl<'a> Parser<'a> {
         self.advance()?;
         if self.eat_punct(".")? {
             self.expect_word("target")?;
-            if !self.context.in_function {
+            if !self.context.allow_new_target {
                 return Err(self.error_here("new.target is only valid inside a function"));
             }
             return Ok(Expr::NewTarget);
@@ -2117,9 +2138,11 @@ impl<'a> Parser<'a> {
         super_call: bool,
     ) -> Result<Rc<FunctionNode>, ScriptError> {
         let saved = self.context;
+        let outer_eval = self.eval_context.take();
         self.context.in_async = is_async;
         self.context.in_generator = is_generator;
         self.context.in_function = true;
+        self.context.allow_new_target = true;
         self.context.in_class_field = false;
         if kind != FunctionKind::Normal {
             self.context.allow_super_member = true;
@@ -2139,6 +2162,7 @@ impl<'a> Parser<'a> {
             false,
         )?;
         self.context = saved;
+        let eval_context = std::mem::replace(&mut self.eval_context, outer_eval);
         Ok(Rc::new(FunctionNode {
             name,
             params,
@@ -2149,6 +2173,7 @@ impl<'a> Parser<'a> {
             is_generator,
             strict,
             source: (start, self.previous_end),
+            eval_context,
         }))
     }
 
@@ -2318,8 +2343,10 @@ impl<'a> Parser<'a> {
             // a field, whose initializer runs as a method on the instance or the class
             let function = if self.eat_punct("=")? {
                 let saved_field = self.context;
+                let outer_eval = self.eval_context.take();
                 self.context.in_class_field = true;
                 self.context.in_function = true;
+                self.context.allow_new_target = true;
                 self.context.allow_super_member = true;
                 self.context.allow_super_call = false;
                 self.context.in_async = false;
@@ -2327,6 +2354,7 @@ impl<'a> Parser<'a> {
                 let value_start = self.offset()?;
                 let value = self.parse_assignment(true)?;
                 self.context = saved_field;
+                let eval_context = std::mem::replace(&mut self.eval_context, outer_eval);
                 Some(Rc::new(FunctionNode {
                     name: Self::key_name(&key),
                     params: Vec::new(),
@@ -2337,6 +2365,7 @@ impl<'a> Parser<'a> {
                     is_generator: false,
                     strict: true,
                     source: (value_start, self.previous_end),
+                    eval_context,
                 }))
             } else {
                 None
@@ -2365,7 +2394,9 @@ impl<'a> Parser<'a> {
         _is_static: bool,
     ) -> Result<Rc<FunctionNode>, ScriptError> {
         let saved = self.context;
+        let outer_eval = self.eval_context.take();
         self.context.in_function = true;
+        self.context.allow_new_target = true;
         self.context.in_async = false;
         self.context.in_generator = false;
         self.context.allow_super_member = true;
@@ -2374,6 +2405,7 @@ impl<'a> Parser<'a> {
         self.expect_punct("{")?;
         let body = self.parse_block_body()?;
         self.context = saved;
+        let eval_context = std::mem::replace(&mut self.eval_context, outer_eval);
         Ok(Rc::new(FunctionNode {
             name: Some("static".into()),
             params: Vec::new(),
@@ -2384,6 +2416,7 @@ impl<'a> Parser<'a> {
             is_generator: false,
             strict: true,
             source: (start, self.previous_end),
+            eval_context,
         }))
     }
 
@@ -2588,12 +2621,19 @@ pub(super) fn parse_script(source: &str) -> Result<Script, ScriptError> {
     parser.parse_script()
 }
 
-// for a direct eval whose caller is strict: the source compiles strict no matter
-// what its own directives say
-pub(super) fn parse_script_strict(source: &str) -> Result<Script, ScriptError> {
+// eval code, which a strict caller makes strict whatever its own directives say,
+// and which may use what the code around the call allows
+pub(super) fn parse_eval(
+    source: &str,
+    strict: bool,
+    context: EvalContext,
+) -> Result<Script, ScriptError> {
     let mut parser = Parser::new(source);
-    parser.context.in_function = false;
-    parser.context.strict = true;
+    parser.context.strict = strict;
+    parser.context.allow_new_target = context.new_target;
+    parser.context.allow_super_member = context.super_member;
+    parser.context.allow_super_call = context.super_call;
+    parser.context.in_class_field = context.class_field;
     parser.parse_script()
 }
 

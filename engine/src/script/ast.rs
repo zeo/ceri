@@ -350,6 +350,18 @@ pub(super) struct FunctionNode {
     pub(super) strict: bool,
     // the source text, which Function.prototype.toString returns
     pub(super) source: (usize, usize),
+    // set when the body calls something named eval, which may be a direct eval
+    pub(super) eval_context: Option<EvalContext>,
+}
+
+// what the code around a direct eval lets the eval's source use
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct EvalContext {
+    pub(super) new_target: bool,
+    pub(super) super_member: bool,
+    pub(super) super_call: bool,
+    // a class field initializer, where the source may not name arguments
+    pub(super) class_field: bool,
 }
 
 impl FunctionNode {

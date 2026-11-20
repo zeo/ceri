@@ -3,7 +3,7 @@
 // resume it later, and exceptions unwind through try handlers and finally blocks
 
 use super::ast::{FunctionKind, Name};
-use super::compiler::{self, Code, Layout, NO_TARGET, Op, ScopeRole};
+use super::compiler::{self, BindingKind, Code, GLOBAL, Layout, NO_TARGET, Op, ScopeRole};
 use super::object::{
     JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, new_object,
 };
@@ -175,14 +175,12 @@ impl ScriptRuntime {
         }
     }
 
-    // eval code in a caller's context: its scope sits on the caller's innermost,
-    // so the caller's bindings stay visible through the parent chain
+    // an indirect eval's code, run as global code
     pub(super) fn run_eval_code(
         &mut self,
         code: Rc<Code>,
-        parent: ScopeRef,
+        scope: ScopeRef,
     ) -> Result<Value, ScriptError> {
-        let scope = Scope::new(code.layout.clone(), Some(parent));
         let frame = Frame::new(
             code,
             None,
@@ -901,9 +899,150 @@ impl ScriptRuntime {
         scope
     }
 
-    // a scope on the running frame's chain that holds the name, for the lookups a
-    // sloppy direct eval makes possible
-    fn scope_slot(frame: &Frame, name: &Name) -> Option<(ScopeRef, usize)> {
+    // what answers for a name before its fallback binding: a with object that has
+    // it, or a binding a direct eval grew, on the scopes nearer than depth
+    fn shadowing(
+        &mut self,
+        scope: Option<ScopeRef>,
+        name: &str,
+        depth: u16,
+    ) -> Result<Option<Shadow>, ScriptError> {
+        let mut walk = scope;
+        let mut level = 0;
+        while let Some(current) = walk {
+            if depth != GLOBAL && level >= depth {
+                break;
+            }
+            let (object, grown, parent) = {
+                let scope = current.borrow();
+                (
+                    (scope.layout.role == ScopeRole::With).then(|| scope.slots[0].clone()),
+                    scope
+                        .extra
+                        .iter()
+                        .position(|extra| &**extra == name)
+                        .map(|position| scope.layout.names.len() + position),
+                    scope.parent.clone(),
+                )
+            };
+            if let Some(object) = object {
+                if self.with_has(&object, name)? {
+                    return Ok(Some(Shadow::With(object)));
+                }
+            } else if let Some(index) = grown {
+                return Ok(Some(Shadow::Grown(current, index)));
+            }
+            walk = parent;
+            level += 1;
+        }
+        Ok(None)
+    }
+
+    // whether a with object answers for a name its @@unscopables leaves alone
+    fn with_has(&mut self, object: &Value, key: &str) -> Result<bool, ScriptError> {
+        if !self.has_property(object, key)? {
+            return Ok(false);
+        }
+        let unscopables = self.get_property(object, "@@unscopables")?;
+        if super::operations::is_primitive(&unscopables) {
+            return Ok(true);
+        }
+        Ok(!self.get_property(&unscopables, key)?.truthy())
+    }
+
+    // a compiled binding's value, which throws in its dead zone
+    fn read_local(
+        &mut self,
+        frame: &Frame,
+        depth: u16,
+        index: u16,
+        name: u32,
+    ) -> Result<Value, ScriptError> {
+        let scope = Self::scope_at(frame, depth);
+        let value = match scope.borrow().slots[index as usize].clone() {
+            Value::Binding(cell, _) => cell.borrow().clone(),
+            value => value,
+        };
+        if matches!(value, Value::Uninitialized) {
+            let name = frame.code.names[name as usize].clone();
+            return Err(self.reference_error(format!("cannot access {name} before initialization")));
+        }
+        Ok(value)
+    }
+
+    fn write_local(
+        &mut self,
+        frame: &Frame,
+        depth: u16,
+        index: u16,
+        name: u32,
+        value: Value,
+    ) -> Result<(), ScriptError> {
+        let scope = Self::scope_at(frame, depth);
+        let mut scope = scope.borrow_mut();
+        match &mut scope.slots[index as usize] {
+            Value::Binding(cell, true) if !matches!(*cell.borrow(), Value::Uninitialized) => {
+                *cell.borrow_mut() = value;
+            }
+            Value::Binding(_, false) => {
+                drop(scope);
+                let name = frame.code.names[name as usize].clone();
+                return Err(self.type_error(format!("Assignment to constant variable '{name}'")));
+            }
+            Value::Binding(..) | Value::Uninitialized => {
+                drop(scope);
+                let name = frame.code.names[name as usize].clone();
+                return Err(
+                    self.reference_error(format!("cannot access {name} before initialization"))
+                );
+            }
+            slot => *slot = value,
+        }
+        Ok(())
+    }
+
+    // a name op's value when nothing shadows the name
+    fn read_fallback(
+        &mut self,
+        frame: &Frame,
+        name: u32,
+        depth: u16,
+        index: u16,
+    ) -> Result<Value, ScriptError> {
+        if depth == GLOBAL {
+            let key = frame.code.names[name as usize].clone();
+            return self.get_global(&key);
+        }
+        self.read_local(frame, depth, index, name)
+    }
+
+    fn read_name(
+        &mut self,
+        frame: &Frame,
+        name: u32,
+        depth: u16,
+        index: u16,
+    ) -> Result<(Value, Value), ScriptError> {
+        let key = frame.code.names[name as usize].clone();
+        Ok(match self.shadowing(frame.scope.clone(), &key, depth)? {
+            Some(Shadow::With(object)) => {
+                let value = self.get_property(&object, &key)?;
+                (object, value)
+            }
+            Some(Shadow::Grown(scope, index)) => {
+                let value = scope.borrow().slots[index].clone();
+                (Value::Undefined, value)
+            }
+            None => (
+                Value::Undefined,
+                self.read_fallback(frame, name, depth, index)?,
+            ),
+        })
+    }
+
+    // the this and new.target of the function an arrow's code sits in, which it keeps
+    // in its hidden slots there
+    fn lexical_value(frame: &Frame, hidden: &str) -> Option<Value> {
         let mut walk = frame.scope.clone();
         while let Some(scope) = walk {
             let found = {
@@ -912,21 +1051,51 @@ impl ScriptRuntime {
                     .layout
                     .names
                     .iter()
-                    .position(|slot| *slot == *name)
-                    .or_else(|| {
-                        scope
-                            .extra
-                            .iter()
-                            .position(|slot| *slot == *name)
-                            .map(|position| scope.layout.names.len() + position)
-                    })
+                    .position(|name| &**name == hidden)
+                    .map(|index| scope.slots[index].clone())
             };
-            if let Some(index) = found {
-                return Some((scope, index));
+            if found.is_some() {
+                return found;
             }
             walk = scope.borrow().parent.clone();
         }
         None
+    }
+
+    // a direct eval runs in a frame of its own over the caller's scopes, with the
+    // caller's this, new.target, function and home object
+    fn direct_eval(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        source: &str,
+    ) -> Result<Option<RunResult>, ScriptError> {
+        let frame = frames.last().expect("a frame is running");
+        let (this, new_target) = if frame.code.kind == FunctionKind::Arrow {
+            (
+                Self::lexical_value(frame, "%this").unwrap_or(Value::Window),
+                Self::lexical_value(frame, "%newtarget").unwrap_or(Value::Undefined),
+            )
+        } else {
+            (frame.this.clone(), frame.new_target.clone())
+        };
+        let closure = frame.closure.clone();
+        let function = frame.function.clone();
+        let (strict, context) = (frame.code.strict, frame.code.eval_context);
+        let scope = frame.scope.clone();
+        let (code, scope) = self.instantiate_eval(source, strict, context, scope)?;
+        if frames.len() >= MAX_FRAMES {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
+        frames.push(Frame::new(
+            code,
+            closure,
+            Some(scope),
+            this,
+            new_target,
+            function,
+            Vec::new(),
+        ));
+        Ok(None)
     }
 
     // returns from the top frame, running finally blocks on the way out
@@ -1123,52 +1292,12 @@ impl ScriptRuntime {
                     .push(Value::Object(copy));
             }
             Op::GetLocal { depth, index, name } => {
-                let scope = Self::scope_at(frame, depth);
-                let value = scope.borrow().slots[index as usize].clone();
-                let value = match value {
-                    Value::Binding(cell, _) => cell.borrow().clone(),
-                    value => value,
-                };
-                if matches!(value, Value::Uninitialized) {
-                    let name = frame.code.names[name as usize].clone();
-                    return Err(
-                        self.reference_error(format!("cannot access {name} before initialization"))
-                    );
-                }
-                frame.stack.push(value);
+                let value = self.read_local(frame, depth, index, name)?;
+                frames.last_mut().expect("frame").stack.push(value);
             }
             Op::SetLocal { depth, index, name } => {
                 let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let scope = Self::scope_at(frame, depth);
-                let mut scope = scope.borrow_mut();
-                let slot = &mut scope.slots[index as usize];
-                match slot {
-                    Value::Binding(cell, true) => {
-                        if matches!(*cell.borrow(), Value::Uninitialized) {
-                            let name = frame.code.names[name as usize].clone();
-                            drop(scope);
-                            return Err(self.reference_error(format!(
-                                "cannot access {name} before initialization"
-                            )));
-                        }
-                        *cell.borrow_mut() = value;
-                    }
-                    Value::Binding(_, false) => {
-                        let name = frame.code.names[name as usize].clone();
-                        drop(scope);
-                        return Err(
-                            self.type_error(format!("Assignment to constant variable '{name}'"))
-                        );
-                    }
-                    Value::Uninitialized => {
-                        let name = frame.code.names[name as usize].clone();
-                        drop(scope);
-                        return Err(self.reference_error(format!(
-                            "cannot access {name} before initialization"
-                        )));
-                    }
-                    slot => *slot = value,
-                }
+                self.write_local(frame, depth, index, name, value)?;
             }
             Op::InitLocal { depth, index } => {
                 let value = Self::pop(frame);
@@ -1184,52 +1313,102 @@ impl ScriptRuntime {
                 let value = self.get_global(&name)?;
                 frames.last_mut().expect("frame").stack.push(value);
             }
-            Op::GetLookup(name) => {
-                let name = frame.code.names[name as usize].clone();
-                let value = match Self::scope_slot(frame, &name) {
-                    Some((scope, index)) => {
-                        let value = scope.borrow().slots[index].clone();
-                        match value {
-                            Value::Binding(cell, _) => cell.borrow().clone(),
-                            value => value,
-                        }
-                    }
-                    None => self.get_global(&name)?,
-                };
+            Op::GetName { name, depth, index } => {
+                let (_, value) = self.read_name(frame, name, depth, index)?;
                 if matches!(value, Value::Uninitialized) {
+                    let name = frame.code.names[name as usize].clone();
                     return Err(
                         self.reference_error(format!("cannot access {name} before initialization"))
                     );
                 }
                 frames.last_mut().expect("frame").stack.push(value);
             }
-            Op::SetLookup(name) => {
-                let name = frame.code.names[name as usize].clone();
+            Op::CalleeName { name, depth, index } => {
+                let (this, callee) = self.read_name(frame, name, depth, index)?;
+                let stack = &mut frames.last_mut().expect("frame").stack;
+                stack.push(this);
+                stack.push(callee);
+            }
+            Op::TypeofName { name, depth, index } => {
+                let key = frame.code.names[name as usize].clone();
+                let value = match self.shadowing(frame.scope.clone(), &key, depth)? {
+                    Some(Shadow::With(object)) => self.get_property(&object, &key)?,
+                    Some(Shadow::Grown(scope, index)) => scope.borrow().slots[index].clone(),
+                    None if depth == GLOBAL => match self.get_global_accessor(&key) {
+                        Some(value) => value?,
+                        None => self.lookup_global(&key).unwrap_or(Value::Undefined),
+                    },
+                    None => self.read_local(frame, depth, index, name)?,
+                };
+                let kind = self.type_of(&value);
+                frames
+                    .last_mut()
+                    .expect("frame")
+                    .stack
+                    .push(Value::String(kind.to_string().into()));
+            }
+            Op::SetName {
+                name,
+                depth,
+                index,
+                kind,
+            } => {
+                let key = frame.code.names[name as usize].clone();
                 let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                match Self::scope_slot(frame, &name) {
-                    Some((scope, index)) => {
-                        let mut scope = scope.borrow_mut();
-                        match &mut scope.slots[index] {
-                            Value::Binding(cell, true) => {
-                                if matches!(*cell.borrow(), Value::Uninitialized) {
-                                    drop(scope);
-                                    return Err(self.reference_error(format!(
-                                        "cannot access {name} before initialization"
-                                    )));
-                                }
-                                *cell.borrow_mut() = value;
-                            }
-                            Value::Binding(_, false) => {
-                                drop(scope);
-                                return Err(self.type_error(format!(
-                                    "Assignment to constant variable '{name}'"
-                                )));
-                            }
-                            slot => *slot = value,
-                        }
+                let strict = frame.code.strict;
+                match self.shadowing(frame.scope.clone(), &key, depth)? {
+                    Some(Shadow::With(object)) => {
+                        self.set_property(&object, &key, value, strict)?
                     }
-                    None => self.set_global(&name, value, frame.code.strict)?,
+                    Some(Shadow::Grown(scope, index)) => scope.borrow_mut().slots[index] = value,
+                    None if depth == GLOBAL => self.set_global(&key, value, strict)?,
+                    None => match kind {
+                        BindingKind::Const | BindingKind::Import => {
+                            return Err(
+                                self.type_error(format!("Assignment to constant variable '{key}'"))
+                            );
+                        }
+                        BindingKind::SelfName if strict => {
+                            return Err(
+                                self.type_error(format!("Assignment to constant variable '{key}'"))
+                            );
+                        }
+                        // a sloppy write to a function expression's own name is dropped
+                        BindingKind::SelfName => {}
+                        _ => self.write_local(frame, depth, index, name, value)?,
+                    },
                 }
+            }
+            Op::DeleteName { name, depth } => {
+                let key = frame.code.names[name as usize].clone();
+                let strict = frame.code.strict;
+                let deleted = match self.shadowing(frame.scope.clone(), &key, depth)? {
+                    Some(Shadow::With(object)) => self.delete_property(&object, &key, strict)?,
+                    // an eval's binding is deletable, as the eval declaration steps made it
+                    Some(Shadow::Grown(scope, index)) => {
+                        let mut scope = scope.borrow_mut();
+                        let position = index - scope.layout.names.len();
+                        scope.extra[position] = "".into();
+                        scope.slots[index] = Value::Undefined;
+                        true
+                    }
+                    None if depth == GLOBAL => {
+                        let mut global = self.global.borrow_mut();
+                        global.values.remove(&*key);
+                        global.accessors.remove(&*key);
+                        true
+                    }
+                    None => false,
+                };
+                frames
+                    .last_mut()
+                    .expect("frame")
+                    .stack
+                    .push(Value::Bool(deleted));
+            }
+            Op::DeclareLexical(name) => {
+                let name = frame.code.names[name as usize].to_string();
+                self.global.borrow_mut().lexicals.insert(name);
             }
             Op::TypeofGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
@@ -1297,24 +1476,6 @@ impl ScriptRuntime {
                 let scope = Scope::new(layout, frame.scope.clone());
                 frame.scope = Some(scope);
                 frame.scopes += 1;
-            }
-            Op::DeleteGrown { depth, index } => {
-                let scope = Self::scope_at(frame, depth);
-                let mut scope = scope.borrow_mut();
-                let grown = index >= scope.layout.names.len() as u16;
-                if grown {
-                    let position = index as usize - scope.layout.names.len();
-                    scope.slots[index as usize] = Value::Uninitialized;
-                    if let Some(name) = scope.extra.get_mut(position) {
-                        *name = "".into();
-                    }
-                }
-                drop(scope);
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Bool(grown));
             }
             Op::PopScope => {
                 Self::restore_scopes(frame, frame.scopes.saturating_sub(1));
@@ -1529,13 +1690,7 @@ impl ScriptRuntime {
             Op::WithHas(name) => {
                 let object = Self::pop(frame);
                 let key = frame.code.names[name as usize].clone();
-                let mut has = self.has_property(&object, &key)?;
-                if has {
-                    let unscopables = self.get_property(&object, "@@unscopables")?;
-                    if !super::operations::is_primitive(&unscopables) {
-                        has = !self.get_property(&unscopables, &key)?.truthy();
-                    }
-                }
+                let has = self.with_has(&object, &key)?;
                 let stack = &mut frames.last_mut().expect("frame").stack;
                 stack.push(object);
                 stack.push(Value::Bool(has));
@@ -1638,43 +1793,31 @@ impl ScriptRuntime {
                 };
                 return self.call_in_loop(frames, callee, this, arguments);
             }
-            Op::CallEval(count) => {
-                let arguments = Self::pop_arguments(frame, count as usize);
+            Op::CallEval(_) | Op::CallEvalSpread => {
+                let arguments = match op {
+                    Op::CallEval(count) => Self::pop_arguments(frame, count as usize),
+                    _ => match Self::pop(frame) {
+                        Value::Array(array) => array.borrow().clone(),
+                        _ => Vec::new(),
+                    },
+                };
                 let callee = Self::pop(frame);
-                let _this = Self::pop(frame);
-                // the builtin reached by name runs its source in this frame's
-                // strictness; a replaced eval is a plain call
+                let this = Self::pop(frame);
                 let direct = matches!(
                     callee.resolve(),
                     Value::Object(ref object)
                         if matches!(object.borrow().class, ObjectClass::Native(Native::Eval))
                 );
-                if direct {
-                    let strict = frame.code.strict;
-                    let first = arguments.first().cloned().unwrap_or(Value::Undefined);
-                    // the caller's live scopes, innermost first: a sloppy eval in a
-                    // function declares its vars in the variable environment it finds here
-                    let mut chain: Vec<(ScopeRef, bool)> = Vec::new();
-                    let mut walk = frame.scope.clone();
-                    while let Some(scope) = walk {
-                        let flag = scope.borrow().layout.role == ScopeRole::Var;
-                        walk = scope.borrow().parent.clone();
-                        chain.push((scope, flag));
-                    }
-                    let in_caller = chain.iter().any(|(_, flag)| *flag);
-                    let value = if let Value::String(source) = &first {
-                        if in_caller {
-                            self.evaluate_text_in_caller(source, strict, chain)?
-                        } else {
-                            self.evaluate_global_text(source, strict)?
-                        }
-                    } else {
-                        first
-                    };
-                    frames.last_mut().expect("frame").stack.push(value);
-                    return Ok(None);
+                if !direct {
+                    return self.call_in_loop(frames, callee, this, arguments);
                 }
-                return self.call_in_loop(frames, callee, Value::Undefined, arguments);
+                return match arguments.into_iter().next() {
+                    Some(Value::String(source)) => self.direct_eval(frames, &source),
+                    first => {
+                        frame.stack.push(first.unwrap_or(Value::Undefined));
+                        Ok(None)
+                    }
+                };
             }
             Op::CallSpread | Op::CallMethodSpread => {
                 let list = Self::pop(frame);
@@ -2785,6 +2928,12 @@ impl Frame {
             delegate_last: ResumeMode::Next,
         }
     }
+}
+
+// what answers for a name ahead of its compiled binding
+enum Shadow {
+    With(Value),
+    Grown(ScopeRef, usize),
 }
 
 // a wrapper so an async resumption can sit inside the Builtin enum
