@@ -8057,6 +8057,37 @@ mod tests {
     }
 
     #[test]
+    fn setting_an_attribute_or_a_class_to_what_it_is_is_observed_and_restyles_nothing() {
+        let mut document = crate::dom::Document::parse_markup(
+            r#"<main><button id="go" class="gel" disabled style="left: 4px">go</button></main>"#,
+        )
+        .expect("document should parse");
+        let button = document.find_element_by_id("go").unwrap();
+        document.observe_mutations(true);
+        let before = (
+            document.version(),
+            document.selector_version(),
+            document.change_stamp(),
+        );
+        document.set_attribute(button, "disabled", String::new());
+        document.set_attribute(button, "class", "gel".to_string());
+        document.set_style_property(button, "left", "4px".to_string());
+        document.remove_attribute(button, "hidden");
+        assert_eq!(document.take_mutations().len(), 3);
+        assert_eq!(
+            (document.version(), document.selector_version()),
+            (before.0, before.1)
+        );
+        assert!(document.unwritten_since(button, before.2));
+        document.set_attribute(button, "class", "gel wide".to_string());
+        assert_ne!(
+            (document.version(), document.selector_version()),
+            (before.0, before.1)
+        );
+        assert!(!document.unwritten_since(button, before.2));
+    }
+
+    #[test]
     fn kept_cascades_follow_classes_siblings_hover_and_inline_style() {
         let mut browser = Browser::new(bundle(
             r##"<style>#box { width: 50px; height: 20px } .wide #box { width: 70px }

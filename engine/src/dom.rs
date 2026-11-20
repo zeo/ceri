@@ -401,9 +401,14 @@ impl Document {
         slot.node.as_ref()
     }
 
-    // every write to a node comes through here, so it is also where the node and the chain
-    // above it are stamped as written
+    // every write to a node comes through here or through an element edit, so these are
+    // where the node and the chain above it are stamped as written
     fn data_mut(&mut self, id: NodeId) -> Option<&mut NodeData> {
+        self.mark_written(id)?;
+        self.slots[id.index as usize].node.as_mut()
+    }
+
+    fn mark_written(&mut self, id: NodeId) -> Option<()> {
         let stamp = self.writing_stamp();
         let mut above = self.data(id)?.parent;
         let data = self.slots[id.index as usize].node.as_mut()?;
@@ -423,7 +428,7 @@ impl Document {
                 above = data.parent;
             }
         }
-        self.slots[id.index as usize].node.as_mut()
+        Some(())
     }
 
     // the stamp writes take now: a new one once the last has been read, so whoever read it
@@ -567,6 +572,7 @@ impl Document {
 
     pub fn element_mut(&mut self, id: NodeId) -> Option<&mut Element> {
         self.version += 1;
+        self.selector_version = next_stamp();
         match &mut self.data_mut(id)?.kind {
             NodeKind::Element(element) => Some(element),
             _ => None,
@@ -716,20 +722,30 @@ impl Document {
             id,
             Mutation::Attribute {
                 name: attribute.to_string(),
-                old,
+                old: old.clone(),
             },
         );
         // a refused style attribute reads as empty, so script edits start from nothing
         let unblocked = attribute == "style" && self.blocked_styles.remove(&id);
-        if attribute != "style" {
-            self.selector_version = next_stamp();
+        let NodeKind::Element(element) = &mut self.slots[id.index as usize].node.as_mut()?.kind
+        else {
+            return None;
+        };
+        if unblocked {
+            element.attrs.remove("style");
         }
-        self.element_mut(id).map(|element| {
-            if unblocked {
-                element.attrs.remove("style");
+        let result = edit(element);
+        // an edit that leaves the attribute as it was is one for observers to see and for
+        // nothing else: frameworks set a class or a flag again on every update, and that
+        // must not cost the styles and boxes kept for the page
+        if unblocked || element.attr(attribute) != old.as_deref() {
+            self.version += 1;
+            if attribute != "style" {
+                self.selector_version = next_stamp();
             }
-            edit(element)
-        })
+            self.mark_written(id);
+        }
+        Some(result)
     }
 
     pub(crate) fn content_security_policy(&self) -> &Rc<crate::csp::Policies> {
