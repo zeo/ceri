@@ -892,9 +892,40 @@ impl Canvas {
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
         let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
+        // the middle shows no shadow: an inset one fades out a few deviations inside its
+        // shape, and an outer one hides under its frame; corners curve in by under a third
+        // of their radius
+        let (still, margin) = if inset {
+            (shape, 4.0 * sigma + 1.0)
+        } else {
+            (frame, 1.0)
+        };
+        let corner = still
+            .radii
+            .iter()
+            .fold(0.0_f32, |most, radius| most.max(radius.0).max(radius.1));
+        let margin = margin + corner * 0.3;
+        let hollow = [
+            (still.x + margin).ceil(),
+            (still.y + margin).ceil(),
+            (still.x + still.width - margin).floor(),
+            (still.y + still.height - margin).floor(),
+        ];
         for pixel_y in top..bottom {
-            for pixel_x in left..right {
-                let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+            let row = pixel_y as f32;
+            let skipped = if row >= hollow[1] && row + 1.0 <= hollow[3] && hollow[0] < hollow[2] {
+                hollow[0].max(0.0) as u32..hollow[2].max(0.0) as u32
+            } else {
+                0..0
+            };
+            let mut pixel_x = left;
+            while pixel_x < right {
+                if skipped.contains(&pixel_x) {
+                    pixel_x = skipped.end;
+                    continue;
+                }
+                let center = (pixel_x as f32 + 0.5, row + 0.5);
+                pixel_x += 1;
                 if let Some(clip) = clip
                     && clip.coverage(center) <= 0.0
                 {
@@ -908,7 +939,7 @@ impl Canvas {
                 let covered = shadow_coverage(shape, sigma, center);
                 let alpha = shade * if inset { 1.0 - covered } else { covered };
                 if alpha > 0.0 {
-                    self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(alpha.min(1.0)));
+                    self.blend_pixel(pixel_x - 1, pixel_y, color.scale_alpha(alpha.min(1.0)));
                 }
             }
         }
