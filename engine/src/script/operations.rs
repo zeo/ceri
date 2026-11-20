@@ -1881,7 +1881,21 @@ impl ScriptRuntime {
         if let Some(value) = self.global.borrow().values.get(name) {
             return Some(value.resolve());
         }
-        self.member(Value::Window, name).ok()
+        if let Ok(value) = self.member(Value::Window, name) {
+            return Some(value);
+        }
+        // what window inherits is in scope as well: addEventListener, toString
+        let mut current = Some(self.intrinsics.dom.prototype("EventTarget"));
+        while let Some(object) = current {
+            let borrowed = object.borrow();
+            if let Some(property) = borrowed.property(name)
+                && let Slot::Data(value) = &property.slot
+            {
+                return Some(value.resolve());
+            }
+            current = borrowed.prototype_or(&self.intrinsics);
+        }
+        None
     }
 
     // the getter a global accessor runs, or undefined when it has none

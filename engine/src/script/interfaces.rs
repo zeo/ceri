@@ -1134,6 +1134,11 @@ impl ScriptRuntime {
         {
             return Ok(None);
         }
+        // called bare, as addEventListener(...) in a script, the target is the window
+        let this = match this {
+            Value::Undefined | Value::Null => &Value::Window,
+            this => this,
+        };
         let Some(target) = self.listener_target(this) else {
             return Err(self.type_error(format!(
                 "Illegal invocation of '{name}' on a value that is not an EventTarget"

@@ -16138,6 +16138,40 @@ mod tests {
     }
 
     #[test]
+    fn names_window_inherits_are_in_scope_without_naming_window() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                let heard = 0;
+                const count = () => heard++;
+                addEventListener("resize", count);
+                dispatchEvent(new Event("resize"));
+                removeEventListener("resize", count);
+                dispatchEvent(new Event("resize"));
+                let missing = "";
+                try {
+                    notAGlobalAnywhere;
+                } catch (error) {
+                    missing = error.name;
+                }
+                document.getElementById("status").textContent =
+                    [heard, typeof hasOwnProperty, missing].join(" ");
+                "#,
+            )
+            .expect("inherited names should resolve");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("1 function ReferenceError")
+        );
+    }
+
+    #[test]
     fn abort_signal_removes_window_listeners() {
         let document = document("<p id='status'>idle</p>");
         let mut runtime = ScriptRuntime::new(document.clone());
