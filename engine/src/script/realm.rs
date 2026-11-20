@@ -2172,9 +2172,6 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
-            // the legacy accessor helpers: define through Object.defineProperty's
-            // own rules, enumerable and configurable as the annex makes them, and
-            // look a property up the chain for its get or set half
             Native::ObjectDefineGetter | Native::ObjectDefineSetter => {
                 let getter = matches!(native, Native::ObjectDefineGetter);
                 let target = self.coerce_object(this)?;

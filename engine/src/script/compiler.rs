@@ -421,8 +421,6 @@ struct LoopTarget {
     continues: Vec<usize>,
     handlers: u16,
     scopes: u16,
-    // scopes counted where a continue lands, inside a per-iteration scope
-    continue_scopes: u16,
 }
 
 struct FunctionState {
@@ -2100,7 +2098,6 @@ impl Compiler {
             continues: Vec::new(),
             handlers,
             scopes,
-            continue_scopes: scopes,
         });
     }
 
@@ -2135,11 +2132,7 @@ impl Compiler {
         };
         let target = &state.targets[position];
         let handlers = target.handlers;
-        let scopes = if is_continue {
-            target.continue_scopes
-        } else {
-            target.scopes
-        };
+        let scopes = target.scopes;
         let at = state.emit(Op::Exit {
             target: 0,
             handlers,
