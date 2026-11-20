@@ -2490,13 +2490,13 @@ impl Stylesheet {
         inherited: &BTreeMap<String, String>,
         state: &mut StyleState,
     ) {
-        let mut properties = inherited.clone();
-        let mut changed = false;
+        // most elements declare none and pass on the map they inherited as it is
+        let mut own = None;
         for (property, (_, _, value)) in self.cascaded_values(document, node, None, state).iter() {
             if !property.starts_with("--") {
                 continue;
             }
-            changed = true;
+            let properties = own.get_or_insert_with(|| inherited.clone());
             match value.trim().to_ascii_lowercase().as_str() {
                 "initial" => {
                     properties.remove(property);
@@ -2507,11 +2507,14 @@ impl Stylesheet {
                 }
             }
         }
-        if changed || inherited.is_empty() {
-            state.custom_properties.insert(node, properties.clone());
+        if own.is_some() || inherited.is_empty() {
+            state
+                .custom_properties
+                .insert(node, own.clone().unwrap_or_default());
         }
+        let properties = own.as_ref().unwrap_or(inherited);
         for child in document.element_children(node).collect::<Vec<_>>() {
-            self.populate_element_custom_properties(document, child, &properties, state);
+            self.populate_element_custom_properties(document, child, properties, state);
         }
     }
 
