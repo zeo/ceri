@@ -4673,7 +4673,6 @@ test/language/expressions/conditional/tco-pos.js
 test/language/expressions/delete/11.4.1-4.a-12.js
 test/language/expressions/delete/11.4.1-4.a-13.js
 test/language/expressions/delete/11.4.1-4.a-15.js
-test/language/expressions/delete/11.4.1-4.a-4.js
 test/language/expressions/delete/11.4.1-4.a-5.js
 test/language/expressions/delete/11.4.1-4.a-7.js
 test/language/expressions/delete/11.4.1-4.a-8-s.js
