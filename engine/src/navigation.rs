@@ -8283,6 +8283,28 @@ mod tests {
     }
 
     #[test]
+    fn computed_width_and_height_are_of_the_box_that_box_sizing_names() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>div { width: 100px; height: 40px; padding: 10px; border: 2px solid }
+            #border { box-sizing: border-box }</style>
+            <div id="content"></div><div id="border"></div><p id="status"></p><script>
+                const read = (id) => {
+                    const style = getComputedStyle(document.getElementById(id));
+                    return style.width + " " + style.height;
+                };
+                document.getElementById("status").textContent = read("content") + ", " + read("border");
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().unwrap();
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").unwrap();
+        assert_eq!(document.text_content(status), "100px 40px, 100px 40px");
+    }
+
+    #[test]
     fn animation_frames_come_as_often_as_the_display_refreshes() {
         assert_eq!(
             [30_000, 60_000, 120_000, 144_000, 240_000, 500_000].map(frame_interval),

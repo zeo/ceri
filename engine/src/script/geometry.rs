@@ -1235,7 +1235,12 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
                         padding.top + padding.bottom + border.top + border.bottom,
                     )
                 };
-                px((extent - edges).max(0.0))
+                // the resolved value is the size box-sizing names: the border box or the content
+                if style.box_sizing == crate::css::BoxSizing::BorderBox {
+                    px(extent)
+                } else {
+                    px((extent - edges).max(0.0))
+                }
             }
             None => "auto".to_string(),
         },
