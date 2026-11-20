@@ -16330,6 +16330,53 @@ mod tests {
     }
 
     #[test]
+    fn promise_all_over_async_callbacks_that_catch_settles_with_their_values() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const ask = (id) => (id === "bad" ? Promise.reject(new Error("no")) : Promise.resolve({ id }));
+                let turn = 0;
+                async function refresh() {
+                    const current = ++turn;
+                    try {
+                        const catalog = await Promise.resolve([{ id: "a", on: true }, { id: "bad", on: true }, { id: "c", on: false }, { id: "d", on: true }]);
+                        if (current !== turn) return;
+                        const ids = await Promise.all(
+                            catalog
+                                .filter((entry) => entry.on)
+                                .map(async (entry) => {
+                                    try {
+                                        await ask(entry.id);
+                                        return entry.id;
+                                    } catch {
+                                        return null;
+                                    }
+                                }),
+                        );
+                        if (current !== turn) return;
+                        const kept = new Set(ids.filter((id) => id !== null));
+                        document.getElementById("status").textContent = [...kept].join(",") + " " + kept.has("d");
+                    } catch {
+                        document.getElementById("status").textContent = "failed";
+                    }
+                }
+                refresh();
+                "#,
+            )
+            .expect("the refresh should run");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("a,d true")
+        );
+    }
+
+    #[test]
     fn a_timer_that_was_never_set_is_cleared_without_complaint() {
         let document = document("<ul id='list'><li>a</li></ul><p id='status'>idle</p>");
         let mut runtime = ScriptRuntime::new(document.clone());
