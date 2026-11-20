@@ -345,6 +345,8 @@ static INTERFACES: &[Interface] = &[
             ("createTextNode", Method(1)),
             ("createComment", Method(1)),
             ("createDocumentFragment", Method(0)),
+            ("importNode", Method(1)),
+            ("adoptNode", Method(1)),
             ("createEvent", Method(1)),
             ("createRange", Method(0)),
             ("getSelection", Method(0)),
@@ -1081,7 +1083,7 @@ impl ScriptRuntime {
                 Value::Document,
                 "getElementById" | "querySelector" | "querySelectorAll" | "createElement"
                 | "createTextNode" | "createRange" | "getSelection" | "documentElement"
-                | "activeElement",
+                | "activeElement" | "importNode" | "adoptNode",
             ) => Value::Document,
             _ => Value::Element(handle),
         };

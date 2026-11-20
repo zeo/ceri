@@ -2139,3 +2139,24 @@ fn canvas_smoothing_samples_like_chromium() {
         ),
     ]);
 }
+
+#[test]
+fn documents_import_and_adopt_nodes() {
+    check(&[
+        (
+            "import a template's content deep, as svelte does for a video",
+            r#"const t = document.createElement("template"); t.innerHTML = "<video muted></video><b>x</b>"; const copy = document.importNode(t.content, true); console.log(copy.childNodes.length, copy.firstChild.nodeName, copy.firstChild.muted, t.content.childNodes.length, document.importNode(t.content).childNodes.length)"#,
+            "2 VIDEO true 2 0",
+        ),
+        (
+            "adopt takes a node out of its parent",
+            r#"const p = document.getElementById("status"); const s = document.createElement("span"); p.append(s); const back = document.adoptNode(s); console.log(back === s, s.parentNode, p.childNodes.length)"#,
+            "true null 0",
+        ),
+        (
+            "a document can be neither imported nor adopted",
+            r#"for (const f of ["importNode", "adoptNode"]) { try { document[f](document); } catch (e) { console.log(e.name); } } try { document.importNode(5); } catch (e) { console.log(e instanceof TypeError); }"#,
+            "NotSupportedError\nNotSupportedError\ntrue",
+        ),
+    ]);
+}

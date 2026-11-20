@@ -257,6 +257,8 @@ enum Builtin {
     DocumentQuerySelectorAll,
     DocumentCreateElement,
     DocumentCreateTextNode,
+    DocumentImportNode,
+    DocumentAdoptNode,
     DocumentCreateRange,
     DocumentGetSelection,
     LocationAssign,
@@ -3636,6 +3638,8 @@ impl ScriptRuntime {
                 "querySelectorAll" => Ok(Value::Builtin(Builtin::DocumentQuerySelectorAll)),
                 "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
                 "createTextNode" => Ok(Value::Builtin(Builtin::DocumentCreateTextNode)),
+                "importNode" => Ok(Value::Builtin(Builtin::DocumentImportNode)),
+                "adoptNode" => Ok(Value::Builtin(Builtin::DocumentAdoptNode)),
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "documentElement" => Ok(self
@@ -6997,6 +7001,56 @@ impl ScriptRuntime {
                     return Err(runtime_error("element name must not be empty"));
                 }
                 let node = self.document.borrow_mut().create_element(&name);
+                Ok(self.node_value(node))
+            }
+            // one document holds every node, so importing is a clone and adopting a removal
+            Builtin::DocumentImportNode | Builtin::DocumentAdoptNode => {
+                let import = matches!(builtin, Builtin::DocumentImportNode);
+                let method = if import { "importNode" } else { "adoptNode" };
+                let node = match arguments.first().map(Value::resolve) {
+                    Some(Value::Element(handle)) => handle.id,
+                    Some(Value::Document) => {
+                        return Err(self.throw_value(dom_exception(
+                            "NotSupportedError",
+                            &format!("Failed to execute '{method}' on 'Document': The node provided is a document, which may not be {}.", if import { "imported" } else { "adopted" }),
+                        )));
+                    }
+                    _ => {
+                        return Err(self.type_error(format!(
+                            "Failed to execute '{method}' on 'Document': parameter 1 is not of type 'Node'."
+                        )));
+                    }
+                };
+                if self.document.borrow().shadow_host(node).is_some() {
+                    let (name, message) = if import {
+                        (
+                            "NotSupportedError",
+                            "The node provided is a shadow root, which may not be imported.",
+                        )
+                    } else {
+                        (
+                            "HierarchyRequestError",
+                            "The node provided is a shadow root, which may not be adopted.",
+                        )
+                    };
+                    return Err(self.throw_value(dom_exception(
+                        name,
+                        &format!("Failed to execute '{method}' on 'Document': {message}"),
+                    )));
+                }
+                if import {
+                    let deep = arguments.get(1).is_some_and(Value::truthy);
+                    let copy = self
+                        .document
+                        .borrow_mut()
+                        .clone_node(node, deep)
+                        .ok_or_else(|| runtime_error("node is no longer in the document"))?;
+                    self.load_images_in(copy);
+                    return Ok(self.node_value(copy));
+                }
+                if self.document.borrow().parent(node).is_some() {
+                    self.remove_node(node)?;
+                }
                 Ok(self.node_value(node))
             }
             Builtin::DocumentCreateTextNode => {
