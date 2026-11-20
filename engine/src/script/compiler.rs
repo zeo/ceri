@@ -1559,19 +1559,48 @@ impl Compiler {
     fn declare_function_body(&mut self, body: &[Stmt]) -> Result<(), ScriptError> {
         let mut vars = Vec::new();
         collect_var_names(body, &mut vars);
-        for name in vars {
-            // body vars sit in the function's variable environment, which parameter
-            // expressions move into a scope of its own
-            let target = self
-                .state()
-                .var_target
-                .unwrap_or_else(|| self.state().function_scope_index());
-            self.state().scopes[target].declare(name, BindingKind::Var);
+        let functions = block_functions(body);
+        let state = self.state();
+        match state.var_target {
+            // body vars sit in a variable environment of their own over the parameters,
+            // and one named like a parameter binding, the arguments object included,
+            // starts with its value unless a body function takes the name
+            Some(target) => {
+                let parameters = state.function_scope_index();
+                for name in vars {
+                    if state.scopes[target].bindings.contains_key(&name) {
+                        continue;
+                    }
+                    let slot = state.scopes[target].declare(name.clone(), BindingKind::Var);
+                    let shadowed = functions
+                        .iter()
+                        .any(|function| function.name.as_ref() == Some(&name));
+                    if let Some(parameter) = state.scopes[parameters].bindings.get(&name).copied()
+                        && !shadowed
+                    {
+                        let name = state.name(&name);
+                        state.emit(Op::GetLocal {
+                            depth: 1,
+                            index: parameter.index,
+                            name,
+                        });
+                        state.emit(Op::InitLocal {
+                            depth: 0,
+                            index: slot,
+                        });
+                    }
+                }
+            }
+            None => {
+                let target = state.function_scope_index();
+                for name in vars {
+                    state.scopes[target].declare(name, BindingKind::Var);
+                }
+            }
         }
         for (name, kind) in lexical_declarations(body) {
             self.declare(&name, kind);
         }
-        let functions = block_functions(body);
         for function in &functions {
             let name = function.name.clone().expect("declarations are named");
             self.declare(&name, BindingKind::Function);

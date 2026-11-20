@@ -2112,6 +2112,42 @@ fn parameter_expressions_are_found_inside_patterns() {
 }
 
 #[test]
+fn body_vars_start_with_the_parameter_they_share_a_name_with() {
+    check(&[
+        (
+            "a default parameter",
+            "function f(a = 0) { var a; return a; } console.log(f(1), f())",
+            "1 0",
+        ),
+        (
+            "a bare rest",
+            "function f(a, ...r) { var a; return a; } console.log(f(1))",
+            "1",
+        ),
+        (
+            "a destructured parameter",
+            "function f({ a }, b = 2) { var a, b; return a + b; } console.log(f({ a: 1 }))",
+            "3",
+        ),
+        (
+            "the arguments object",
+            "function f(a = 0) { var arguments; return typeof arguments + arguments.length; } console.log(f(1, 2))",
+            "object2",
+        ),
+        (
+            "a body function wins",
+            "function f(a = 0) { var a; function a() {} return typeof a; } console.log(f(1))",
+            "function",
+        ),
+        (
+            "the copy is not the parameter",
+            "function f(a = 0, g = () => a) { var a; a = 5; return [a, g()].join(); } console.log(f(1))",
+            "5,1",
+        ),
+    ]);
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (
