@@ -7744,6 +7744,67 @@ mod tests {
     }
 
     #[test]
+    fn kept_cascades_follow_classes_siblings_hover_and_inline_style() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>#box { width: 50px; height: 20px } .wide #box { width: 70px }
+            #box:hover { width: 90px } p + #box { width: 30px }</style>
+            <main id="main"><div id="box"></div></main>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 320.0,
+            height: 180.0,
+        };
+        fn width_of(layout: &crate::layout::LayoutBox, node: NodeId) -> Option<f32> {
+            if layout.node == node {
+                return Some(layout.rect.width);
+            }
+            layout
+                .children
+                .iter()
+                .find_map(|child| width_of(child, node))
+        }
+        let document = browser.document().unwrap();
+        let find = |id: &str| document.borrow().find_element_by_id(id).unwrap();
+        let (main, target) = (find("main"), find("box"));
+        let width =
+            |browser: &Browser| width_of(&browser.layout(viewport).unwrap().root, target).unwrap();
+        assert_eq!(width(&browser), 50.0);
+        document
+            .borrow_mut()
+            .set_attribute(main, "class", "wide".to_string());
+        assert_eq!(width(&browser), 70.0);
+        browser
+            .dispatch_at(viewport, 10.0, 10.0, "pointermove")
+            .expect("pointer move should dispatch");
+        assert_eq!(width(&browser), 90.0);
+        document
+            .borrow_mut()
+            .set_style_property(target, "width", "110px".to_string());
+        assert_eq!(width(&browser), 110.0);
+        document
+            .borrow_mut()
+            .set_style_property(target, "width", "120px".to_string());
+        assert_eq!(width(&browser), 120.0);
+        document.borrow_mut().remove_attribute(target, "style");
+        assert_eq!(width(&browser), 90.0);
+        browser
+            .dispatch_at(viewport, 300.0, 170.0, "pointermove")
+            .expect("pointer move should dispatch");
+        assert_eq!(width(&browser), 70.0);
+        document.borrow_mut().remove_attribute(main, "class");
+        assert_eq!(width(&browser), 50.0);
+        let paragraph = document.borrow_mut().create_element("p");
+        document
+            .borrow_mut()
+            .insert_before(main, paragraph, Some(target))
+            .expect("the paragraph should insert");
+        assert_eq!(width(&browser), 30.0);
+    }
+
+    #[test]
     fn persistent_storage_rewrites_its_file_only_when_the_store_changed() {
         let storage_root = std::env::temp_dir().join(format!(
             "ceri-engine-storage-unchanged-{}-{}",

@@ -129,6 +129,12 @@ impl Clone for LiveRanges {
     }
 }
 
+// a number no other change to any document has had, so two documents never share one
+fn next_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     slots: Vec<Slot>,
@@ -136,6 +142,9 @@ pub struct Document {
     root: NodeId,
     // bumped by every change to the tree, an attribute or character data
     version: u64,
+    // renewed by every change a selector can see unless it reads text or the style attribute:
+    // to the elements of the tree, or to an attribute other than style
+    selector_version: u64,
     // nodes that were created or lost their parent, so their owner can decide whether to free them
     orphans: Vec<NodeId>,
     template_contents: HashMap<NodeId, NodeId>,
@@ -257,6 +266,7 @@ impl Document {
                 generation: 0,
             },
             version: 0,
+            selector_version: next_stamp(),
             orphans: Vec::new(),
             template_contents: HashMap::new(),
             shadow_roots: HashMap::new(),
@@ -327,6 +337,9 @@ impl Document {
     }
 
     fn allocate(&mut self, kind: NodeKind) -> NodeId {
+        if !matches!(kind, NodeKind::Text(_) | NodeKind::Comment(_)) {
+            self.selector_version = next_stamp();
+        }
         let node = NodeData {
             kind,
             parent: None,
@@ -421,6 +434,9 @@ impl Document {
         siblings.remove(index);
         self.data_mut(id)?.parent = None;
         self.version += 1;
+        if !self.is_character_data(id) {
+            self.selector_version = next_stamp();
+        }
         Some((parent, index))
     }
 
@@ -441,6 +457,17 @@ impl Document {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub(crate) fn selector_version(&self) -> u64 {
+        self.selector_version
+    }
+
+    fn is_character_data(&self, id: NodeId) -> bool {
+        matches!(
+            self.kind(id),
+            Some(NodeKind::Text(_) | NodeKind::Comment(_))
+        )
     }
 
     pub fn contains(&self, id: NodeId) -> bool {
@@ -614,6 +641,9 @@ impl Document {
         );
         // a refused style attribute reads as empty, so script edits start from nothing
         let unblocked = attribute == "style" && self.blocked_styles.remove(&id);
+        if attribute != "style" {
+            self.selector_version = next_stamp();
+        }
         self.element_mut(id).map(|element| {
             if unblocked {
                 element.attrs.remove("style");
@@ -1205,6 +1235,9 @@ impl Document {
             }
         });
         self.version += 1;
+        if inserted.iter().any(|&node| !self.is_character_data(node)) {
+            self.selector_version = next_stamp();
+        }
         Ok(inserted)
     }
 
@@ -1251,6 +1284,9 @@ impl Document {
             return Vec::new();
         }
         let freed = self.subtree(id);
+        if freed.iter().any(|&node| !self.is_character_data(node)) {
+            self.selector_version = next_stamp();
+        }
         for &node in &freed {
             self.template_contents.remove(&node);
             if let Some(root) = self.shadow_roots.remove(&node) {

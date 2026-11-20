@@ -780,7 +780,75 @@ type StyleMemo = HashMap<(NodeId, Option<PseudoElement>), Vec<(StyleInputs, Styl
 // the content string of each generated box asked about, which layout asks on every visit
 type ContentMemo = HashMap<(NodeId, Option<PseudoElement>), Option<String>>;
 
+// the declaration that won each property of an element, with its rank and place in the order
+type Cascade = HashMap<String, (Specificity, usize, String)>;
+
+// what selectors and rule conditions read besides the sheet: the tree and its attributes, by
+// the document's selector version, and these parts of the state
+#[derive(Clone, Debug, PartialEq)]
+struct Matching {
+    selector_version: u64,
+    hovered: Option<NodeId>,
+    hovered_part: Option<(NodeId, PseudoElement)>,
+    focused: Option<NodeId>,
+    focus_visible: bool,
+    active: Option<NodeId>,
+    checked: BTreeSet<NodeId>,
+    unchecked: BTreeSet<NodeId>,
+    disabled: BTreeSet<NodeId>,
+    control_values: BTreeMap<NodeId, String>,
+    viewport: (u32, u32),
+    color_scheme: ColorScheme,
+    reduced_motion: bool,
+    root: Option<NodeId>,
+    container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
+    top_layer: Vec<NodeId>,
+    forced: BTreeMap<NodeId, BTreeSet<&'static str>>,
+}
+
+impl Matching {
+    fn of(document: &Document, state: &StyleState) -> Self {
+        Self {
+            selector_version: document.selector_version(),
+            hovered: state.hovered,
+            hovered_part: state.hovered_part,
+            focused: state.focused,
+            focus_visible: state.focus_visible,
+            active: state.active,
+            checked: state.checked.clone(),
+            unchecked: state.unchecked.clone(),
+            disabled: state.disabled.clone(),
+            control_values: state.control_values.clone(),
+            viewport: (
+                state.viewport_width.to_bits(),
+                state.viewport_height.to_bits(),
+            ),
+            color_scheme: state.color_scheme,
+            reduced_motion: state.reduced_motion,
+            root: state.root,
+            container_sizes: state.container_sizes.clone(),
+            top_layer: state.top_layer.clone(),
+            forced: state.forced.clone(),
+        }
+    }
+}
+
+// a cascade and the inline style it was made with
+type KeptCascade = (Option<String>, Rc<Cascade>);
+
+// the cascades of one sheet over one document, kept from layout to layout while nothing a
+// selector reads has changed
+#[derive(Clone, Debug, Default)]
+struct Cascades {
+    matching: Option<Matching>,
+    // the style pass the matching was last checked in
+    pass: u64,
+    entries: HashMap<(NodeId, Option<PseudoElement>), KeptCascade>,
+}
+
 thread_local! {
+    // renewed whenever a style memo begins or ends, as the document and state may differ after
+    static STYLE_PASS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STYLE_MEMO: RefCell<Option<StyleMemo>> = const { RefCell::new(None) };
     static CONTENT_MEMO: RefCell<Option<ContentMemo>> = const { RefCell::new(None) };
 }
@@ -791,6 +859,7 @@ pub(crate) struct MemoizedStyles {
 
 impl Drop for MemoizedStyles {
     fn drop(&mut self) {
+        STYLE_PASS.with(|pass| pass.set(pass.get() + 1));
         STYLE_MEMO.with(|memo| *memo.borrow_mut() = self.previous.0.take());
         CONTENT_MEMO.with(|memo| *memo.borrow_mut() = self.previous.1.take());
     }
@@ -798,6 +867,7 @@ impl Drop for MemoizedStyles {
 
 // the document, stylesheet and state must stay unchanged while the guard lives
 pub(crate) fn memoize_styles() -> MemoizedStyles {
+    STYLE_PASS.with(|pass| pass.set(pass.get() + 1));
     MemoizedStyles {
         previous: (
             STYLE_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
@@ -1806,9 +1876,20 @@ pub struct Stylesheet {
     motion_rules: Vec<usize>,
     // shadow root style elements, by their text
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
+    // whether a selector reads text nodes or the style attribute, which change without the
+    // document's selector version moving
+    reads_unversioned: bool,
+    cascades: RefCell<Cascades>,
     // the pseudo-elements some rule styles, so the rest are not cascaded for nothing
     styled_pseudo_elements: Vec<PseudoElement>,
     font_faces: Vec<FontFaceRule>,
+}
+
+fn reads_unversioned(rules: &[Rule]) -> bool {
+    rules
+        .iter()
+        .flat_map(|rule| &rule.selectors)
+        .any(Selector::reads_unversioned)
 }
 
 fn styled_pseudo_elements(rules: &[Rule]) -> Vec<PseudoElement> {
@@ -2254,6 +2335,8 @@ impl Stylesheet {
         let motion_rules = motion_rules(&rules);
         let styled_pseudo = styled_pseudo_elements(&rules);
         Ok(Self {
+            reads_unversioned: reads_unversioned(&rules),
+            cascades: RefCell::default(),
             rules,
             keyframes,
             index,
@@ -2276,6 +2359,8 @@ impl Stylesheet {
         let styled_pseudo = styled_pseudo_elements(&rules);
         (
             Self {
+                reads_unversioned: reads_unversioned(&rules),
+                cascades: RefCell::default(),
                 rules,
                 keyframes,
                 index,
@@ -2391,6 +2476,8 @@ impl Stylesheet {
                 })
             });
         let inherited = BTreeMap::new();
+        // only cascades are asked for here, and they read none of what this pass writes
+        let _styles = memoize_styles();
         for node in top {
             self.populate_element_custom_properties(document, node, &inherited, state);
         }
@@ -2405,18 +2492,18 @@ impl Stylesheet {
     ) {
         let mut properties = inherited.clone();
         let mut changed = false;
-        for (property, (_, _, value)) in self.cascaded_values(document, node, None, state) {
+        for (property, (_, _, value)) in self.cascaded_values(document, node, None, state).iter() {
             if !property.starts_with("--") {
                 continue;
             }
             changed = true;
             match value.trim().to_ascii_lowercase().as_str() {
                 "initial" => {
-                    properties.remove(property.as_ref());
+                    properties.remove(property);
                 }
                 "inherit" | "unset" => {}
                 _ => {
-                    properties.insert(property.into_owned(), value.into_owned());
+                    properties.insert(property.clone(), value.clone());
                 }
             }
         }
@@ -2566,7 +2653,7 @@ impl Stylesheet {
         // declarations apply in cascade order, so a later shorthand overrides an earlier
         // longhand and the reverse; color comes first for currentColor
         let mut values = values
-            .into_iter()
+            .iter()
             .filter(|(property, _)| !property.starts_with("--"))
             .collect::<Vec<_>>();
         let inherited = style;
@@ -2580,9 +2667,9 @@ impl Stylesheet {
             )
         };
         // all resets every declaration beneath it, so only those that outrank it remain
-        if let Some(index) = values.iter().position(|(property, _)| property == "all") {
-            let (_, (rank, order, value)) = values.swap_remove(index);
-            style = match css_wide_keyword(&value) {
+        if let Some(index) = values.iter().position(|(property, _)| *property == "all") {
+            let (_, &(rank, order, ref value)) = values.swap_remove(index);
+            style = match css_wide_keyword(value) {
                 Some("initial") => initial(),
                 Some(_) => Style::default_for(
                     "",
@@ -2598,10 +2685,10 @@ impl Stylesheet {
             });
         }
         values.sort_unstable_by_key(|(property, (rank, order, _))| {
-            (property.as_ref() != "color", *rank, *order)
+            (*property != "color", *rank, *order)
         });
         for (property, (_, _, value)) in values {
-            let Some(value) = resolve_custom_value(&value, custom_properties) else {
+            let Some(value) = resolve_custom_value(value, custom_properties) else {
                 continue;
             };
             if let Some(keyword) = css_wide_keyword(&value) {
@@ -2610,14 +2697,14 @@ impl Stylesheet {
                 } else {
                     inherited
                 };
-                if !reset_inherited_property(&mut style, &from, &property) {
+                if !reset_inherited_property(&mut style, &from, property) {
                     let from = match keyword {
                         "inherit" => self.parent_style(context),
                         "revert" | "revert-layer" => Some(inherited),
                         _ => Some(initial()),
                     };
                     if let Some(from) = from {
-                        reset_property(&mut style, &from, &property);
+                        reset_property(&mut style, &from, property);
                     }
                 }
                 continue;
@@ -2626,8 +2713,8 @@ impl Stylesheet {
                 animation = parse_animation(&value);
                 continue;
             }
-            apply_declaration(&mut style, &property, &value);
-            base_values.insert(property.into_owned(), value);
+            apply_declaration(&mut style, property, &value);
+            base_values.insert(property.clone(), value);
         }
         // a running transition replaces the declared value while it is in flight
         if let Some(node) = own
@@ -2847,11 +2934,11 @@ impl Stylesheet {
             inherited_custom_properties(context.state, context.document, context.node)
                 .unwrap_or(&empty);
         values
-            .into_iter()
+            .iter()
             .filter_map(|(property, (_, _, raw))| {
                 Some((
-                    property.into_owned(),
-                    resolve_custom_value(&raw, custom_properties)?,
+                    property.clone(),
+                    resolve_custom_value(raw, custom_properties)?,
                 ))
             })
             .collect()
@@ -3081,7 +3168,65 @@ impl Stylesheet {
             })
     }
 
-    fn cascaded_values<'a>(
+    // the cascade of an element or one of its generated boxes, kept from one layout to the
+    // next while a style memo is live and nothing a selector reads has changed
+    fn cascaded_values(
+        &self,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+    ) -> Rc<Cascade> {
+        let cascade = || {
+            Rc::new(
+                self.cascade(document, node, pseudo, state)
+                    .into_iter()
+                    .map(|(property, (rank, order, value))| {
+                        (property.into_owned(), (rank, order, value.into_owned()))
+                    })
+                    .collect::<Cascade>(),
+            )
+        };
+        // a shadow tree's sheet is its style elements' text, which no version follows
+        if self.reads_unversioned
+            || user_agent_sheet().reads_unversioned
+            || document.has_shadow_roots()
+            || !STYLE_MEMO.with(|memo| memo.borrow().is_some())
+        {
+            return cascade();
+        }
+        let inline = document
+            .element(node)
+            .and_then(|element| element.attr("style"))
+            .filter(|_| pseudo.is_none() && !document.style_blocked(node));
+        let key = (node, pseudo);
+        {
+            let mut cascades = self.cascades.borrow_mut();
+            let pass = STYLE_PASS.with(std::cell::Cell::get);
+            if cascades.pass != pass {
+                let matching = Matching::of(document, state);
+                if cascades.matching.as_ref() != Some(&matching) {
+                    cascades.entries.clear();
+                    cascades.matching = Some(matching);
+                }
+                cascades.pass = pass;
+            }
+            if let Some((kept, values)) = cascades.entries.get(&key)
+                && kept.as_deref() == inline
+            {
+                debug_assert_eq!(*values, cascade(), "a kept cascade went stale");
+                return values.clone();
+            }
+        }
+        let values = cascade();
+        self.cascades
+            .borrow_mut()
+            .entries
+            .insert(key, (inline.map(str::to_string), values.clone()));
+        values
+    }
+
+    fn cascade<'a>(
         &'a self,
         document: &'a Document,
         node: NodeId,
@@ -3687,6 +3832,32 @@ impl Selector {
                     specificity.2 + part_specificity.2,
                 )
             })
+    }
+}
+
+impl Selector {
+    // whether matching reads text nodes or the style attribute
+    fn reads_unversioned(&self) -> bool {
+        self.parts.iter().any(|part| {
+            let compound = &part.compound;
+            compound.attributes.iter().any(|attribute| {
+                let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) =
+                    attribute;
+                name.eq_ignore_ascii_case("style")
+            }) || compound.pseudo_classes.iter().any(|class| match class {
+                PseudoClass::Empty => true,
+                PseudoClass::NthChild(_, selectors)
+                | PseudoClass::NthLastChild(_, selectors)
+                | PseudoClass::Not(selectors)
+                | PseudoClass::Is(selectors)
+                | PseudoClass::Where(selectors)
+                | PseudoClass::Host(selectors) => selectors.iter().any(Selector::reads_unversioned),
+                PseudoClass::Has(selectors) => selectors
+                    .iter()
+                    .any(|relative| relative.selector.reads_unversioned()),
+                _ => false,
+            })
+        })
     }
 }
 
