@@ -959,6 +959,7 @@ pub fn layout_with_state(
     });
     let _styles = crate::css::memoize_styles();
     let _widths = memoize_widths();
+    let _boxes = memoize_boxes();
     let mut root = LayoutBox {
         node: document.root(),
         tag: "#document".to_string(),
@@ -2627,7 +2628,107 @@ fn intersect_rect(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
     })
 }
 
+// everything an element's layout is decided by besides the document, stylesheet and state,
+// compared bit for bit
+#[derive(Clone, Copy, PartialEq)]
+struct BoxInputs {
+    numbers: [u32; 11],
+    heights: (Option<u32>, Option<u32>, Option<u32>),
+    list_ordinal: i32,
+    color: Color,
+    weight: FontWeight,
+    text: InheritedText,
+    mode: LayoutMode,
+    zero_font: (crate::font::FontStack, crate::font::FontStyle),
+    environment: crate::css::LayoutEnvironment,
+}
+
+type BoxMemo = HashMap<(NodeId, Option<PseudoElement>), Vec<(BoxInputs, Option<LayoutBox>)>>;
+
+thread_local! {
+    // a flex or grid container lays an item out to measure it and again to place it, often
+    // with the same inputs, and nesting multiplies that
+    static BOX_MEMO: std::cell::RefCell<Option<BoxMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+struct MemoizedBoxes {
+    previous: Option<BoxMemo>,
+}
+
+impl Drop for MemoizedBoxes {
+    fn drop(&mut self) {
+        BOX_MEMO.with(|memo| *memo.borrow_mut() = self.previous.take());
+    }
+}
+
+// the document, stylesheet and state must stay unchanged while the guard lives
+fn memoize_boxes() -> MemoizedBoxes {
+    MemoizedBoxes {
+        previous: BOX_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+    }
+}
+
 fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
+    // floats are shared state the layout writes to, so a box among them is laid out each time
+    if input.floats.is_some() {
+        return layout_element_fresh(input);
+    }
+    let block = input.context.containing_block;
+    let bits = f32::to_bits;
+    let inputs = BoxInputs {
+        numbers: [
+            input.containing_x,
+            input.containing_y,
+            input.containing_width,
+            input.parent.font_size,
+            input.parent.opacity,
+            input.context.viewport.width,
+            input.context.viewport.height,
+            block.x,
+            block.y,
+            block.width,
+            block.height,
+        ]
+        .map(bits),
+        heights: (
+            input.containing_height.map(bits),
+            input.size_override.0.map(bits),
+            input.size_override.1.map(bits),
+        ),
+        list_ordinal: input.list_ordinal,
+        color: input.parent.color,
+        weight: input.parent.weight,
+        text: input.parent.text,
+        mode: input.context.mode,
+        zero_font: crate::css::zero_font(),
+        environment: crate::css::layout_environment(),
+    };
+    let key = (
+        input.node.node,
+        input.node.generated.map(|(pseudo, _)| pseudo),
+    );
+    let known = BOX_MEMO.with(|memo| {
+        memo.borrow()
+            .as_ref()?
+            .get(&key)?
+            .iter()
+            .find(|(seen, _)| *seen == inputs)
+            .map(|(_, layout)| layout.clone())
+    });
+    if let Some(layout) = known {
+        return layout;
+    }
+    let layout = layout_element_fresh(input);
+    BOX_MEMO.with(|memo| {
+        if let Some(memo) = memo.borrow_mut().as_mut() {
+            memo.entry(key).or_default().push((inputs, layout.clone()));
+        }
+    });
+    layout
+}
+
+fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
+    let _profile = crate::profile::scope("layout: element");
     let layout = layout_element_with_gutter(input.clone(), 0.0)?;
     // a vertical scrollbar sits between the border and the padding, so the content box gives
     // up its width and the content lays out again
