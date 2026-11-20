@@ -416,9 +416,18 @@ impl ScriptRuntime {
                         height: bottom - line.rect.y,
                     };
                     line.scrollport = line.rect;
+                    let (a, b) = (line.client, part.client);
+                    let (left, top) = (a.x.min(b.x), a.y.min(b.y));
+                    line.client = Rect {
+                        x: left,
+                        y: top,
+                        width: (a.x + a.width).max(b.x + b.width) - left,
+                        height: (a.y + a.height).max(b.y + b.height) - top,
+                    };
                 }
                 None => lines.push(BoxGeometry {
                     rect,
+                    client: part.client,
                     border: Default::default(),
                     position: part.position,
                     scrollport: rect,
@@ -568,9 +577,9 @@ impl ScriptRuntime {
 
     pub(super) fn bounding_box(&self, node: NodeId) -> Option<Rect> {
         let boxes = self.node_boxes(node);
-        let first = boxes.first()?.rect;
+        let first = boxes.first()?.client;
         Some(boxes.iter().skip(1).fold(first, |union, geometry| {
-            let rect = geometry.rect;
+            let rect = geometry.client;
             let left = union.x.min(rect.x);
             let top = union.y.min(rect.y);
             let right = (union.x + union.width).max(rect.x + rect.width);
@@ -664,7 +673,7 @@ impl ScriptRuntime {
             "getClientRects" => Self::new_array(
                 boxes()
                     .into_iter()
-                    .map(|geometry| rect_object(geometry.rect))
+                    .map(|geometry| rect_object(geometry.client))
                     .collect(),
             ),
             "clientWidth" | "clientHeight" | "clientTop" | "clientLeft" => {

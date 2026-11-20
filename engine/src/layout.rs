@@ -1436,6 +1436,9 @@ fn collect_prose_runs(
 pub(crate) struct BoxGeometry {
     // the border box
     pub(crate) rect: Rect,
+    // the box around the border box once the transforms on it and above it have moved it,
+    // which is what a client rect reports
+    pub(crate) client: Rect,
     pub(crate) border: ResolvedEdges,
     pub(crate) position: Position,
     // the border box less any scrollbar, which client sizes start from
@@ -1447,7 +1450,7 @@ impl LayoutDocument {
     // every node's boxes in viewport coordinates and tree order, leaving out generated content
     pub(crate) fn box_index(&self) -> HashMap<NodeId, Vec<BoxGeometry>> {
         let mut index = HashMap::new();
-        index_boxes(&self.root, (0.0, 0.0), &mut index);
+        index_boxes(&self.root, (0.0, 0.0), None, &mut index);
         index
     }
 
@@ -2109,12 +2112,45 @@ fn append_positioned_nodes(
 fn index_boxes(
     layout: &LayoutBox,
     ancestor_offset: (f32, f32),
+    transform: Option<crate::transform::Matrix>,
     index: &mut HashMap<NodeId, Vec<BoxGeometry>>,
 ) {
     let offset = visual_offset_for(layout, ancestor_offset);
+    let own = translate_rect(layout.rect, offset);
+    let transform = match (transform, layout.transform) {
+        (Some(outer), Some(inner)) => Some(outer.multiply(&inner.about(own.x, own.y))),
+        (outer, inner) => outer.or(inner.map(|inner| inner.about(own.x, own.y))),
+    };
+    let client = |rect: Rect| {
+        let Some(matrix) = transform else {
+            return rect;
+        };
+        let (right, bottom) = (rect.x + rect.width, rect.y + rect.height);
+        let corners = [
+            (rect.x, rect.y),
+            (right, rect.y),
+            (rect.x, bottom),
+            (right, bottom),
+        ]
+        .map(|(x, y)| matrix.map_point(x, y).unwrap_or((x, y)));
+        let edge = |pick: fn(f32, f32) -> f32, axis: fn(&(f32, f32)) -> f32| {
+            corners.iter().map(axis).reduce(pick).unwrap_or(0.0)
+        };
+        let (left, top) = (
+            edge(f32::min, |point| point.0),
+            edge(f32::min, |point| point.1),
+        );
+        Rect {
+            x: left,
+            y: top,
+            width: edge(f32::max, |point| point.0) - left,
+            height: edge(f32::max, |point| point.1) - top,
+        }
+    };
     if !layout.tag.starts_with("::") {
         index.entry(layout.node).or_default().push(BoxGeometry {
-            rect: translate_rect(layout.rect, offset),
+            rect: own,
+            client: client(own),
             border: layout.border.widths,
             position: layout.position,
             scrollport: translate_rect(scrollbar_metrics(layout).scrollport, offset),
@@ -2131,6 +2167,7 @@ fn index_boxes(
         };
         index.entry(*node).or_default().push(BoxGeometry {
             rect,
+            client: client(rect),
             border: ResolvedEdges::default(),
             position: Position::Static,
             scrollport: rect,
@@ -2153,6 +2190,7 @@ fn index_boxes(
         };
         index.entry(node).or_default().push(BoxGeometry {
             rect,
+            client: client(rect),
             border: ResolvedEdges::default(),
             position: Position::Static,
             scrollport: rect,
@@ -2163,7 +2201,7 @@ fn index_boxes(
         });
     }
     for child in &layout.children {
-        index_boxes(child, offset, index);
+        index_boxes(child, offset, transform, index);
     }
 }
 
@@ -11875,6 +11913,36 @@ mod tests {
         // the curve reaches three quarters of the way to its control points
         assert_eq!(measured("p"), [17.0, 17.0, 40.0, 30.0]);
         assert_eq!(measured("g"), [17.0, 17.0, 60.0, 30.0]);
+    }
+
+    #[test]
+    fn a_client_rect_is_the_box_as_its_transforms_leave_it() {
+        let markup = "<style>* { margin: 0; padding: 0; } #a { width: 100px; height: 40px; transform: scale(0.5); } #b { width: 20px; height: 20px; }</style><div id='a'><div id='b'></div></div>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let boxes = |id: &str| {
+            let geometry = index[&document.find_element_by_id(id).expect("element")][0];
+            let sides = |rect: Rect| [rect.x, rect.y, rect.width, rect.height];
+            (sides(geometry.rect), sides(geometry.client))
+        };
+        // the layout box keeps its size, and the client rect shrinks about the middle
+        assert_eq!(
+            boxes("a"),
+            ([0.0, 0.0, 100.0, 40.0], [25.0, 10.0, 50.0, 20.0])
+        );
+        assert_eq!(
+            boxes("b"),
+            ([0.0, 0.0, 20.0, 20.0], [25.0, 10.0, 10.0, 10.0])
+        );
     }
 
     #[test]
