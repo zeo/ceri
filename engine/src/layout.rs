@@ -5483,9 +5483,11 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     .map_or(0.0, |layout| layout.rect.height)
                     + margins;
                 // an item given a min-height and no height of its own, or one in percent
-                // that waits on the row, may be left as little as that min-height
+                // that waits on the row, may be left as little as that min-height, and one
+                // that scrolls its content as little as its frame
                 let own = item.style.height;
-                let minimum = if item.style.min_height != Length::Auto
+                let scrolls = item.style.overflow_axes()[1] != Overflow::Visible;
+                let minimum = if (item.style.min_height != Length::Auto || scrolls)
                     && (own == Length::Auto || own.has_percent())
                 {
                     let frame = item.padding.top
@@ -11534,6 +11536,30 @@ mod tests {
         );
         assert_eq!(find_box(&result.root, "nav").expect("nav").rect.width, 76.0);
         assert_eq!(find_box(&result.root, "u").expect("u").rect.width, 10.0);
+    }
+
+    #[test]
+    fn a_scrolling_grid_item_does_not_grow_its_flexible_row() {
+        let height = |overflow: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; }} section {{ display: grid; height: 200px; grid-template-rows: 20px 1fr; }} nav {{ overflow: {overflow}; }} i {{ display: block; height: 500px; }}</style><section><b></b><nav><i></i></nav></section>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 300.0,
+                    height: 400.0,
+                },
+            );
+            find_box(&result.root, "nav").expect("nav").rect.height
+        };
+        // the row holds the item's content, unless the item scrolls it
+        assert_eq!(height("visible"), 500.0);
+        assert_eq!(height("auto"), 180.0);
+        assert_eq!(height("hidden"), 180.0);
     }
 
     #[test]
