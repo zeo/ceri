@@ -5355,8 +5355,29 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         },
         &column_items,
         &mut |index| {
-            let (minimum, maximum) = intrinsic(&items[index]);
-            [minimum, minimum, maximum]
+            let item = &items[index];
+            let (minimum, maximum) = intrinsic(item);
+            // a scroll container, or an item with a min-width of its own, has that for its
+            // automatic minimum, where any other item has its narrowest content
+            let scrolls = item.style.overflow_axes()[0] != Overflow::Visible;
+            let own = item.style.min_width.resolve(content_width, font_size);
+            let floor = match own {
+                None if !scrolls => minimum,
+                own => {
+                    let inner = item.padding.left
+                        + item.padding.right
+                        + item.border.left
+                        + item.border.right;
+                    let own = own.unwrap_or(0.0);
+                    item.margin.left
+                        + item.margin.right
+                        + match item.style.box_sizing {
+                            crate::css::BoxSizing::BorderBox => own.max(inner),
+                            crate::css::BoxSizing::ContentBox => own + inner,
+                        }
+                }
+            };
+            [floor, minimum, maximum]
         },
     );
     let column_offsets = grid_track_offsets(
@@ -11513,6 +11534,30 @@ mod tests {
         );
         assert_eq!(find_box(&result.root, "nav").expect("nav").rect.width, 76.0);
         assert_eq!(find_box(&result.root, "u").expect("u").rect.width, 10.0);
+    }
+
+    #[test]
+    fn a_scrolling_grid_item_does_not_widen_its_flexible_column() {
+        let width = |overflow: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; }} section {{ display: grid; width: 200px; grid-template-columns: 50px 1fr; }} nav {{ overflow: {overflow}; }} i {{ display: block; width: 400px; height: 10px; }}</style><section><b></b><nav><i></i></nav></section>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 800.0,
+                    height: 100.0,
+                },
+            );
+            find_box(&result.root, "nav").expect("nav").rect.width
+        };
+        // the column holds the item's content, unless the item scrolls it
+        assert_eq!(width("visible"), 400.0);
+        assert_eq!(width("auto"), 150.0);
+        assert_eq!(width("hidden"), 150.0);
     }
 
     #[test]
