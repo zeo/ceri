@@ -414,7 +414,13 @@ impl BrowserConnection {
             .spawn(move || {
                 // every message an engine sends is an object, so the name opens it
                 for message in messages {
-                    let named = format!("{{\"sessionId\":\"{forwarded}\",{}", &message[1..]);
+                    let body = message.strip_prefix('{').unwrap_or(&message);
+                    let joint = if body.trim_start().starts_with('}') {
+                        ""
+                    } else {
+                        ","
+                    };
+                    let named = format!("{{\"sessionId\":\"{forwarded}\"{joint}{body}");
                     if write_frame(&mut lock(&writer), 0x1, named.as_bytes()).is_err() {
                         break;
                     }

@@ -1842,6 +1842,7 @@ impl ScriptRuntime {
         code: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
+        self.key_text_suppressed = false;
         let Some(target) = self.key_target() else {
             return Ok(false);
         };

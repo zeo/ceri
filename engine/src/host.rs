@@ -2640,8 +2640,22 @@ mod tests {
         call(&mut host, "Input.insertText", json!({ "text": "xy" }));
         assert_eq!(status(&host).as_deref(), Some("dxy"));
 
+        // enter types no carriage return into a single-line field
+        let enter = json!({ "type": "keyDown", "key": "Enter", "code": "Enter", "text": "\r" });
+        call(&mut host, "Input.dispatchKeyEvent", enter);
+        call(
+            &mut host,
+            "Input.dispatchKeyEvent",
+            json!({ "type": "keyUp", "key": "Enter", "code": "Enter" }),
+        );
+        assert_eq!(status(&host).as_deref(), Some("dxy"));
+
         let metrics = call(&mut host, "Page.getLayoutMetrics", json!({}));
-        assert_eq!(metrics["cssLayoutViewport"]["clientWidth"], 160.0);
+        // the status paragraph overflows, so the root's bar takes its width from the client
+        let client = metrics["cssLayoutViewport"]["clientWidth"]
+            .as_f64()
+            .expect("a client width");
+        assert!(client < 160.0, "{client}");
         assert_eq!(metrics["cssVisualViewport"]["scale"], 1);
         // the status paragraph runs past the viewport's foot
         assert!(metrics["cssContentSize"]["height"].as_f64() > Some(100.0));
@@ -2660,10 +2674,102 @@ mod tests {
         assert_eq!(shot(&mut host, &mut call, json!({})), (160, 100));
         let clip = json!({ "clip": { "x": 0, "y": 0, "width": 80, "height": 40, "scale": 1 } });
         assert_eq!(shot(&mut host, &mut call, clip), (80, 40));
+        let zoomed = json!({ "clip": { "x": 10, "y": 10, "width": 20, "height": 10, "scale": 2 } });
+        assert_eq!(shot(&mut host, &mut call, zoomed), (40, 20));
+        // a clip on the last half pixel takes the edge pixel, where it used to panic
+        let edge =
+            json!({ "clip": { "x": 159.5, "y": 99.5, "width": 1, "height": 1, "scale": 1 } });
+        assert_eq!(shot(&mut host, &mut call, edge), (1, 1));
+        // a runaway scale is refused instead of overflowing the image size
+        let message = json!({ "id": 99, "method": "Page.captureScreenshot", "params": { "clip": { "x": 0, "y": 0, "width": 10, "height": 10, "scale": 1e9 } } });
+        let (_, answer) = host
+            .automation_call(&message.to_string())
+            .expect("the host answers screenshots");
+        assert!(answer.is_err());
         assert!(
             host.automation_call(r#"{"id":9,"method":"Page.navigate","params":{}}"#)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_prevented_keydown_types_nothing_and_click_counts_come_from_the_protocol() {
+        let browser = Browser::new(bundle(
+            r#"<input id="field" style="display: block; width: 100px; height: 30px; margin: 0; padding: 0; border: 0"><p id="status"></p><script>
+                const status = document.getElementById("status");
+                const field = document.getElementById("field");
+                field.addEventListener("keydown", (event) => { if (event.key === "x") event.preventDefault(); });
+                field.addEventListener("input", () => { status.textContent = field.value; });
+                field.addEventListener("dblclick", () => { status.textContent += "|dbl"; });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 160.0,
+                height: 100.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let status = |host: &EngineHost| {
+            let document = host.browser().document().expect("document should exist");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status");
+            document
+                .borrow()
+                .element_text_content(status)
+                .unwrap_or_default()
+        };
+        let call = |host: &mut EngineHost, method: &str, params: Json| {
+            let message = json!({ "id": 1, "method": method, "params": params });
+            let (_, answer) = host
+                .automation_call(&message.to_string())
+                .expect("the host answers input");
+            answer.unwrap_or_else(|error| panic!("{method} failed: {error:?}"));
+        };
+        let click = |count: u64| {
+            [
+                json!({ "type": "mousePressed", "x": 50, "y": 15, "button": "left", "clickCount": count }),
+                json!({ "type": "mouseReleased", "x": 50, "y": 15, "button": "left", "clickCount": count }),
+            ]
+        };
+        for event in click(1) {
+            call(&mut host, "Input.dispatchMouseEvent", event);
+        }
+        for key in ["a", "x", "b"] {
+            call(
+                &mut host,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyDown", "key": key, "text": key }),
+            );
+            call(
+                &mut host,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyUp", "key": key }),
+            );
+        }
+        // the window path: a prevented keydown swallows the text that follows it
+        host.input(InputEvent::Key {
+            key: "x".to_string(),
+            code: "KeyX".to_string(),
+            modifiers: KeyModifiers::default(),
+            repeat: false,
+            pressed: true,
+        })
+        .expect("key");
+        host.input(InputEvent::TextInput {
+            text: "x".to_string(),
+        })
+        .expect("text");
+        assert_eq!(status(&host), "ab");
+        // a second click at the same spot with clickCount 1 is no double click, as in chrome
+        for event in click(1).into_iter().chain(click(2)) {
+            call(&mut host, "Input.dispatchMouseEvent", event);
+        }
+        assert_eq!(status(&host), "ab|dbl");
     }
 
     #[test]

@@ -519,6 +519,8 @@ pub struct ScriptRuntime {
     active_node: Option<NodeId>,
     // the physical code and auto-repeat flag of the key being dispatched, when the host knows them
     key_detail: Option<(String, bool)>,
+    // a keydown whose default was prevented swallows the text its key would type
+    key_text_suppressed: bool,
     // set while the error event for an uncaught exception is out, so a throwing
     // listener cannot recurse
     reporting_error: bool,
@@ -1582,6 +1584,7 @@ impl ScriptRuntime {
             pointer: events::PointerState::default(),
             active_node: None,
             key_detail: None,
+            key_text_suppressed: false,
             reporting_error: false,
             selection,
             reported_selection: None,
@@ -2408,7 +2411,7 @@ impl ScriptRuntime {
         if self.composition.is_some() {
             return self.composition_commit(text);
         }
-        if text.is_empty() {
+        if std::mem::take(&mut self.key_text_suppressed) || text.is_empty() {
             return Ok(false);
         }
         let Some(control) = self.focused_element else {
@@ -2649,6 +2652,7 @@ impl ScriptRuntime {
         let dispatch =
             self.dispatch_event_with_modifiers(focused, "keydown", key, "", modifiers)?;
         self.drain_microtasks()?;
+        self.key_text_suppressed = dispatch.default_prevented && self.composition.is_none();
         if self.composition.is_some() {
             return Ok(dispatch.handled);
         }

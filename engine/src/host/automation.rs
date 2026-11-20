@@ -1,12 +1,14 @@
 // the devtools protocol calls a window's host answers: input as the window would deliver it,
 // and screenshots of what it would show
 
-use super::{EngineHost, InputEvent, KeyModifiers, PointerButton};
+use super::{EngineHost, InputEvent, KeyModifiers, PointerButton, Press};
 use crate::png::encode_png;
 use crate::script::base64;
 use serde_json::{Value as Json, json};
 
 type Failure = (i64, String);
+
+const MAX_SHOT_SIDE: usize = 16_384;
 
 impl EngineHost {
     // the id and answer of a message the host owns, or none for the browser to answer
@@ -55,6 +57,14 @@ impl EngineHost {
             "mouseMoved" => self.deliver(InputEvent::PointerMove { x, y }),
             "mousePressed" => {
                 let button = pressed(button)?;
+                // the press series is the protocol's clickCount, not the host clock's guess
+                let count = params["clickCount"].as_u64().unwrap_or(1).clamp(1, 3) as u32;
+                self.last_press = (count > 1).then_some(Press {
+                    time: self.clock,
+                    x,
+                    y,
+                    count: count - 1,
+                });
                 self.deliver(InputEvent::PointerDown { x, y, button })
             }
             // a window follows a primary release with its click, and so does this
@@ -93,7 +103,8 @@ impl EngineHost {
         let repeat = params["autoRepeat"] == true;
         let kind = params["type"].as_str().unwrap_or_default();
         match kind {
-            // a keyDown carrying text is a raw key and its character, as a window gets them
+            // a keyDown carrying text is a raw key and its character, as a window gets them;
+            // enter's "\r" and other control text are the key's own action, not typed text
             "keyDown" | "rawKeyDown" => {
                 self.deliver(InputEvent::Key {
                     key,
@@ -102,7 +113,7 @@ impl EngineHost {
                     repeat,
                     pressed: true,
                 })?;
-                match kind == "keyDown" && !text.is_empty() {
+                match kind == "keyDown" && !text.is_empty() && !text.chars().all(char::is_control) {
                     true => self.deliver(InputEvent::TextInput { text }),
                     false => Ok(json!({})),
                 }
@@ -127,7 +138,9 @@ impl EngineHost {
             .layout(self.viewport)
             .map_err(|error| (-32000, error.to_string()))?;
         let (x, y) = self.browser.document_scroll();
-        let (width, height) = (self.viewport.width, self.viewport.height);
+        // the client size leaves out the root's scrollbars, as chrome reports it
+        let port = crate::layout::scrollbar_metrics(&layout.root).scrollport;
+        let (width, height) = (port.width, port.height);
         let content = layout.root.scroll_content;
         let (content_width, content_height) =
             (content.width.max(width), content.height.max(height));
@@ -187,14 +200,16 @@ impl EngineHost {
             let zoom = clip["scale"].as_f64().unwrap_or(1.0) as f32;
             let outside =
                 x < -0.5 || y < -0.5 || x + w > width as f32 + 0.5 || y + h > height as f32 + 0.5;
-            if outside || zoom <= 0.0 || w < 1.0 || h < 1.0 {
+            // the output side is capped as the decoders cap images, so a scale can't blow it up
+            let too_big = (w * zoom).max(h * zoom) > MAX_SHOT_SIDE as f32;
+            if outside || zoom.is_nan() || zoom <= 0.0 || w < 1.0 || h < 1.0 || too_big {
                 return Err((
                     -32000,
                     "Only clips inside the viewport can be captured".to_string(),
                 ));
             }
-            let left = x.round().max(0.0) as usize;
-            let top = y.round().max(0.0) as usize;
+            let left = (x.round().max(0.0) as usize).min(width - 1);
+            let top = (y.round().max(0.0) as usize).min(height - 1);
             let right = ((x + w).round() as usize).clamp(left + 1, width);
             let bottom = ((y + h).round() as usize).clamp(top + 1, height);
             (left, top, right, bottom, zoom)
