@@ -34,6 +34,8 @@ pub(super) struct MeasuredLayout {
     // the sheet it was styled by, which devtools can replace while the document stays
     stylesheet: crate::navigation::SheetIdentity,
     state: StyleState,
+    // nothing in it sampled motion, so it holds at any clock time
+    timeless: bool,
     boxes: HashMap<NodeId, Vec<BoxGeometry>>,
     layout: LayoutDocument,
 }
@@ -317,10 +319,17 @@ impl ScriptRuntime {
         let stale = self.measured.borrow().as_ref().is_none_or(|measured| {
             measured.version != version
                 || measured.stylesheet != stylesheet
-                || measured.state != state
+                || (measured.state != state
+                    && !(measured.timeless
+                        && measured.state
+                            == StyleState {
+                                clock: measured.state.clock,
+                                ..state.clone()
+                            }))
         });
         if stale {
             let mut state = state;
+            let reported = crate::css::moment_reports();
             let mut layout = self.run_layout(&inputs, &state);
             // container queries read sizes from a layout, so a change in them lays out again
             if inputs.stylesheet.has_container_queries() {
@@ -333,6 +342,7 @@ impl ScriptRuntime {
             *self.measured.borrow_mut() = Some(MeasuredLayout {
                 version,
                 stylesheet,
+                timeless: crate::css::moment_reports() == reported && state.transitions.is_empty(),
                 state,
                 boxes: layout.box_index(),
                 layout,

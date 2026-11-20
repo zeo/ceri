@@ -2648,6 +2648,8 @@ struct Kept<Inputs, Answer> {
     answer: Answer,
     // the pass it was last worked out or asked for in
     pass: u64,
+    // how many passes had worked something out by then
+    used: u64,
     // the document's change stamp it was worked out at
     stamp: u64,
     // it sampled motion or sized a query container, so it stands in its own pass only
@@ -2683,6 +2685,9 @@ struct KeptAnswers {
     passes: u64,
     // the number of the pass in progress and the document's change stamp at its start
     pass: Option<(u64, u64)>,
+    // how many passes have worked an answer out, and whether the one in progress has
+    works: u64,
+    worked: bool,
     boxes: KeptMap<(NodeId, Option<PseudoElement>), BoxInputs, Option<LayoutBox>>,
     widths: KeptMap<IntrinsicKey, IntrinsicInputs, f32>,
 }
@@ -2696,7 +2701,7 @@ thread_local! {
 fn kept_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer: Clone>(
     map: &mut KeptMap<Key, Inputs, Answer>,
     (key, inputs): (&Key, &Inputs),
-    pass: u64,
+    (pass, works): (u64, u64),
     stands: impl FnOnce(u64) -> bool,
 ) -> Option<(Answer, bool)> {
     let kept = map
@@ -2713,6 +2718,7 @@ fn kept_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer: Clone>(
         crate::profile::count("kept: answer taken");
     }
     kept.pass = pass;
+    kept.used = works;
     Some((kept.answer.clone(), earlier))
 }
 
@@ -2741,26 +2747,32 @@ impl Drop for KeptPass {
                 *kept = outer;
                 return;
             }
-            let Some((pass, _)) = kept.pass.take() else {
+            if kept.pass.take().is_none() {
                 return;
-            };
+            }
             if kept.under.is_none() {
                 kept.boxes.clear();
                 kept.widths.clear();
                 return;
             }
-            // each kept box holds its whole subtree, so only what a recent pass used stays:
-            // the boxes beside the chain that changed, and not the ones inside them. a pass
-            // that finds nothing changed takes the root box whole and uses nothing else, as
-            // the frame's layout does after a script has measured, so one pass back counts
-            fn prune<Key, Inputs, Answer>(map: &mut KeptMap<Key, Inputs, Answer>, pass: u64) {
+            // each kept box holds its whole subtree, so only what recent work used stays: the
+            // boxes beside the chain that changed, and not the ones inside them. a pass that
+            // works nothing out takes the root box whole and uses nothing else; a page can
+            // make several of those between two changes, as a script measures and a frame
+            // lays out, so they age nothing, and an answer goes once two passes that did
+            // work something out have not asked for it
+            if std::mem::take(&mut kept.worked) {
+                kept.works += 1;
+            }
+            let works = kept.works;
+            fn prune<Key, Inputs, Answer>(map: &mut KeptMap<Key, Inputs, Answer>, works: u64) {
                 map.retain(|_, answers| {
-                    answers.retain(|kept| kept.pass + 1 >= pass && !kept.momentary);
+                    answers.retain(|kept| kept.used + 2 >= works && !kept.momentary);
                     !answers.is_empty()
                 });
             }
-            prune(&mut kept.boxes, pass);
-            prune(&mut kept.widths, pass);
+            prune(&mut kept.boxes, works);
+            prune(&mut kept.widths, works);
         });
     }
 }
@@ -2884,7 +2896,10 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         input.node.node,
         input.node.generated.map(|(pseudo, _)| pseudo),
     );
-    let Some((pass, stamp)) = KEPT.with(|kept| kept.borrow().pass) else {
+    let Some((pass, stamp, works)) = KEPT.with(|kept| {
+        let kept = kept.borrow();
+        kept.pass.map(|(pass, stamp)| (pass, stamp, kept.works))
+    }) else {
         return layout_element_fresh(input);
     };
     let (document, node) = (input.node.document, input.node.node);
@@ -2892,7 +2907,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         kept_answer(
             &mut kept.borrow_mut().boxes,
             (&key, &inputs),
-            pass,
+            (pass, works),
             |since| document.unwritten_since(node, since),
         )
     });
@@ -2913,13 +2928,16 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let layout = layout_element_fresh(input);
     let momentary = crate::css::moment_reports() != reported;
     KEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        kept.worked = true;
         keep_answer(
-            &mut kept.borrow_mut().boxes,
+            &mut kept.boxes,
             key,
             Kept {
                 inputs,
                 answer: layout.clone(),
                 pass,
+                used: works,
                 stamp,
                 momentary,
             },
@@ -6563,7 +6581,10 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         zero_font: crate::css::zero_font(),
         environment: crate::css::layout_environment(),
     };
-    let Some((pass, stamp)) = KEPT.with(|kept| kept.borrow().pass) else {
+    let Some((pass, stamp, works)) = KEPT.with(|kept| {
+        let kept = kept.borrow();
+        kept.pass.map(|(pass, stamp)| (pass, stamp, kept.works))
+    }) else {
         return measure_intrinsic_width(input, minimum);
     };
     let (document, node) = (input.node.document, input.node.node);
@@ -6571,7 +6592,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         kept_answer(
             &mut kept.borrow_mut().widths,
             (&key, &inputs),
-            pass,
+            (pass, works),
             |since| document.unwritten_since(node, since),
         )
     });
@@ -6592,13 +6613,16 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     let width = measure_intrinsic_width(input, minimum);
     let momentary = crate::css::moment_reports() != reported;
     KEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        kept.worked = true;
         keep_answer(
-            &mut kept.borrow_mut().widths,
+            &mut kept.widths,
             key,
             Kept {
                 inputs,
                 answer: width,
                 pass,
+                used: works,
                 stamp,
                 momentary,
             },
@@ -9641,12 +9665,54 @@ mod tests {
                 kept.root == fresh.root,
                 "after write {write} of step {step}"
             );
-            // a second layout of the same document, as a frame makes after a script measured
-            if step % 3 == 0 {
+            // more layouts of the same document, as a script measures and a frame lays out
+            for _ in 0..step % 4 {
                 let again = layout_with_state(&document, &stylesheet, viewport, &state);
                 assert!(again.root == fresh.root, "again after step {step}");
             }
         }
+    }
+
+    // a page makes several layouts between two changes, as a script measures and a frame
+    // lays out; the second change must still find what the first left beside it
+    #[test]
+    fn layouts_that_work_nothing_out_do_not_age_what_is_kept() {
+        let mut document = Document::parse_markup(
+            r#"<style>#wrap, #row { display: flex } #label { width: 50px; flex: none }</style>
+            <div id="wrap"><div id="row"><span id="label">a</span><div id="side"><p>one</p><p>two</p></div></div><div id="other">x</div></div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let label = document.find_element_by_id("label").expect("label");
+        let side = document.find_element_by_id("side").expect("side");
+        let text = document.children(label)[0];
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        let state = StyleState::default();
+        let lay_out =
+            |document: &Document| layout_with_state(document, &stylesheet, viewport, &state);
+        let kept = || KEPT.with(|kept| kept.borrow().boxes.contains_key(&(side, None)));
+        lay_out(&document);
+        document.set_character_data(text, "b".to_string());
+        lay_out(&document);
+        assert!(kept());
+        // these take the row whole and never ask for the box beside the label
+        for _ in 0..5 {
+            lay_out(&document);
+        }
+        assert!(kept());
+        // two layouts that work something else out take the row whole again, and with that
+        // the box inside it has gone unasked for long enough
+        let other = document.find_element_by_id("other").expect("other");
+        let other = document.children(other)[0];
+        for words in ["y", "z"] {
+            document.set_character_data(other, words.to_string());
+            lay_out(&document);
+        }
+        // unless every answer taken is worked out again, which asks for the box too
+        assert!(cfg!(feature = "recheck") || !kept());
     }
 
     #[test]
