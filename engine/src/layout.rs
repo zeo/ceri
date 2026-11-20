@@ -5304,7 +5304,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             stretch: style.justify_content == JustifyContent::FlexStart,
         },
         &column_items,
-        &mut |index| intrinsic(&items[index]),
+        &mut |index| {
+            let (minimum, maximum) = intrinsic(&items[index]);
+            [minimum, minimum, maximum]
+        },
     );
     let column_offsets = grid_track_offsets(
         &column_sizes,
@@ -5402,13 +5405,33 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             &row_items,
             &mut |index| {
                 let item = &items[index];
+                let margins = item.margin.top + item.margin.bottom;
                 let height = item
                     .layout
                     .as_ref()
                     .map_or(0.0, |layout| layout.rect.height)
-                    + item.margin.top
-                    + item.margin.bottom;
-                (height, height)
+                    + margins;
+                // an item given a min-height and no height of its own, or one in percent
+                // that waits on the row, may be left as little as that min-height
+                let own = item.style.height;
+                let minimum = if item.style.min_height != Length::Auto
+                    && (own == Length::Auto || own.has_percent())
+                {
+                    let frame = item.padding.top
+                        + item.padding.bottom
+                        + item.border.top
+                        + item.border.bottom;
+                    let least =
+                        resolve_height(item.style.min_height, None, font_size).unwrap_or(0.0);
+                    let least = match item.style.box_sizing {
+                        crate::css::BoxSizing::BorderBox => least.max(frame),
+                        crate::css::BoxSizing::ContentBox => least + frame,
+                    };
+                    (least + margins).min(height)
+                } else {
+                    height
+                };
+                [minimum, height, height]
             },
         )
     };
@@ -7216,11 +7239,13 @@ fn grow_tracks(sizes: &mut [f32], targets: &[usize], extra: f32) {
 }
 
 // the grid track sizing algorithm (css grid 1, section 11), given each item's span and a way
-// to measure its min-content and max-content contributions
+// to measure its minimum, min-content and max-content contributions; the minimum is what an
+// auto track must leave the item, which a min size of the item's own can set below its
+// content
 fn size_grid_tracks(
     axis: GridAxis<'_>,
     items: &[(usize, usize)],
-    contribution: &mut dyn FnMut(usize) -> (f32, f32),
+    contribution: &mut dyn FnMut(usize) -> [f32; 3],
 ) -> Vec<f32> {
     let GridAxis {
         tracks,
@@ -7294,7 +7319,14 @@ fn size_grid_tracks(
         if !needs_min && !needs_max {
             continue;
         }
-        let (min_content, max_content) = contribution(index);
+        let [minimum, min_content, max_content] = contribution(index);
+        let floor = |targets: &[usize]| {
+            if targets.iter().all(|track| mins[*track] == Sizing::Auto) {
+                minimum
+            } else {
+                min_content
+            }
+        };
         let gaps = gap * (span - 1) as f32;
         let spanned_base = range.clone().map(|track| base[track]).sum::<f32>();
         if crosses_flex {
@@ -7302,7 +7334,7 @@ fn size_grid_tracks(
                 .clone()
                 .filter(|track| flexible(*track) && intrinsic_min(*track))
                 .collect::<Vec<_>>();
-            grow_tracks(&mut base, &targets, min_content - gaps - spanned_base);
+            grow_tracks(&mut base, &targets, floor(&targets) - gaps - spanned_base);
             if available.is_none() {
                 flex_items.push((range, max_content));
             }
@@ -7318,7 +7350,7 @@ fn size_grid_tracks(
         {
             max_content
         } else {
-            min_content
+            floor(&targets)
         };
         grow_tracks(&mut base, &targets, needed - gaps - spanned_base);
         let targets = range
@@ -9729,6 +9761,39 @@ mod tests {
         }
         // unless every answer taken is worked out again, which asks for the box too
         assert!(cfg!(feature = "recheck") || !kept());
+    }
+
+    #[test]
+    fn an_auto_grid_row_shrinks_to_an_items_own_min_height_and_fills_the_grid() {
+        let height_of = |item: &str| {
+            let document = Document::parse_markup(&format!(
+                r#"<div id="grid" style="display: grid; height: 100px; width: 200px"><div id="item" style="{item}"><div style="height: 300px"></div></div></div>"#
+            ))
+            .expect("document should parse");
+            let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 400.0,
+                    height: 400.0,
+                },
+            );
+            let item = document.find_element_by_id("item").expect("item");
+            fn find(layout: &LayoutBox, node: NodeId) -> Option<&LayoutBox> {
+                if layout.node == node {
+                    return Some(layout);
+                }
+                layout.children.iter().find_map(|child| find(child, node))
+            }
+            find(&result.root, item).expect("item box").rect.height
+        };
+        // the row may leave the item nothing, then grows to the grid, and the item fills it
+        assert_eq!(height_of("height: 100%; min-height: 0"), 100.0);
+        assert_eq!(height_of("min-height: 20px; overflow: hidden"), 100.0);
+        // with no min-height of its own the item keeps its content's height
+        assert_eq!(height_of("height: 100%"), 300.0);
+        assert_eq!(height_of(""), 300.0);
     }
 
     #[test]
