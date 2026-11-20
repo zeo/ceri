@@ -4609,6 +4609,14 @@ impl ScriptRuntime {
             Value::Style(handle) => {
                 self.set_element_style_property(&handle, property, value_string)
             }
+            Value::CanvasContext(context) if property == "imageSmoothingEnabled" => {
+                context.borrow_mut().set_smoothing_enabled(value.truthy());
+                true
+            }
+            Value::CanvasContext(context) if property == "imageSmoothingQuality" => {
+                Self::set_canvas_smoothing_quality(&context, &value_string);
+                true
+            }
             Value::CanvasContext(context) if property == "fillStyle" => {
                 self.set_canvas_fill_style(&context, &value_string)
             }

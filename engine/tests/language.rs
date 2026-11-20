@@ -2089,3 +2089,53 @@ fn css_escapes_identifiers_and_answers_supports_like_cssom() {
         ),
     ]);
 }
+
+#[test]
+fn canvas_smoothing_samples_like_chromium() {
+    // seeded noise, then pixels chromium drew from it in edge 157 (cpu raster) at each setting
+    let setup = r#"
+        const W = 64, H = 48;
+        const source = document.createElement("canvas");
+        source.width = W; source.height = H;
+        const sctx = source.getContext("2d");
+        let seed = 12345;
+        const next = () => (seed = (seed * 1103515245 + 12345) >>> 0) >>> 24;
+        for (let i = 0; i < W * H; i++) {
+            sctx.fillStyle = "rgb(" + next() + "," + next() + "," + next() + ")";
+            sctx.fillRect(i % W, Math.floor(i / W), 1, 1);
+        }
+        const draw = (quality, dw, dh, picks) => {
+            const canvas = document.createElement("canvas");
+            canvas.width = dw; canvas.height = dh;
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
+            if (quality === "off") ctx.imageSmoothingEnabled = false; else ctx.imageSmoothingQuality = quality;
+            ctx.drawImage(source, 0, 0, W, H, 0, 0, dw, dh);
+            const data = ctx.getImageData(0, 0, dw, dh).data;
+            return picks.map(([x, y]) => [0, 1, 2].map((c) => data[(y * dw + x) * 4 + c]));
+        };
+        const near = (got, want, slack) => got.every((pixel, i) => pixel.every((v, c) => Math.abs(v - want[i][c]) <= slack));
+    "#;
+    check(&[
+        (
+            "settings",
+            &format!(
+                "{setup} const c = document.createElement('canvas').getContext('2d'); const before = c.imageSmoothingEnabled + ' ' + c.imageSmoothingQuality; c.imageSmoothingQuality = 'high'; c.imageSmoothingQuality = 'best'; c.imageSmoothingEnabled = 0; console.log(before, c.imageSmoothingEnabled, c.imageSmoothingQuality)"
+            ),
+            "true low false high",
+        ),
+        (
+            "nearest and low are exact",
+            &format!(
+                "{setup} const picks = [[3, 2], [10, 7], [17, 12]]; console.log(near(draw('off', 21, 16, picks), [[111, 67, 1], [27, 105, 0], [135, 63, 77]], 0), near(draw('low', 21, 16, picks), [[105, 75, 6], [16, 60, 65], [142, 70, 72]], 0))"
+            ),
+            "true true",
+        ),
+        (
+            "high mipmaps down and medium and high differ up",
+            &format!(
+                "{setup} const picks = [[40, 30], [77, 51]]; console.log(near(draw('high', 21, 16, [[3, 2], [10, 7], [17, 12]]), [[112, 114, 98], [89, 139, 83], [172, 144, 108]], 2), near(draw('high', 128, 96, picks), [[118, 59, 18], [93, 99, 188]], 1), near(draw('medium', 128, 96, picks), [[119, 63, 30], [95, 101, 185]], 1))"
+            ),
+            "true true true",
+        ),
+    ]);
+}

@@ -1,6 +1,6 @@
 // a canvas element's 2d context over a premultiplied RGBA bitmap, drawn the way Skia draws
-// it: rectangles cover pixels by area, and scaled pictures sample bilinearly without mipmaps,
-// which is what Chromium's default smoothing quality of low asks for
+// it on the cpu: rectangles cover pixels by area, and scaled pictures sample as chromium's
+// image smoothing settings choose, measured against its output
 
 use super::typed::{ElementKind, new_typed};
 use super::*;
@@ -27,9 +27,41 @@ pub(super) struct Bitmap {
     pixels: Vec<[u8; 4]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Smoothing {
+    Low,
+    Medium,
+    High,
+}
+
+impl Smoothing {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+// how drawImage samples its source, as chromium picks it from the smoothing settings and
+// whether the draw is a strict upscale
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sampling {
+    Nearest,
+    // skia's legacy bilinear: 16.16 fixed point positions with four bits of subpixel
+    FixedBilinear,
+    Bilinear,
+    // linear between bilinear samples of the two mip levels around this level
+    Mipmapped(f32),
+    Mitchell,
+}
+
 pub(super) struct CanvasContextData {
     node: NodeId,
     fill_style: Color,
+    smoothing_enabled: bool,
+    smoothing_quality: Smoothing,
     bitmap: Bitmap,
     // the bitmap as paint reads it, rebuilt after the next change
     snapshot: Option<std::sync::Arc<Image>>,
@@ -78,6 +110,36 @@ fn normalized((x, y, width, height): Rect4) -> Rect4 {
         width.abs(),
         height.abs(),
     )
+}
+
+impl CanvasContextData {
+    pub(super) fn set_smoothing_enabled(&mut self, enabled: bool) {
+        self.smoothing_enabled = enabled;
+    }
+
+    // chromium's choice: no smoothing is nearest, low the legacy bilinear, and medium or high a
+    // linear mipmap blend unless the draw grows both ways, where high turns cubic
+    fn sampling(&self, from: Rect4, to: Rect4) -> Sampling {
+        if !self.smoothing_enabled {
+            return Sampling::Nearest;
+        }
+        let upscale = to.2 > from.2 && to.3 > from.3;
+        match (self.smoothing_quality, upscale) {
+            (Smoothing::Low, _) => Sampling::FixedBilinear,
+            (Smoothing::Medium, true) => Sampling::Bilinear,
+            (Smoothing::High, true) => Sampling::Mitchell,
+            (_, false) => {
+                // the geometric mean of the two shrinks picks the level, half a level finer
+                let shrink = (from.2 / to.2) * (from.3 / to.3);
+                let level = 0.5 * shrink.log2() - 0.5;
+                if level > 0.0 {
+                    Sampling::Mipmapped(level)
+                } else {
+                    Sampling::Bilinear
+                }
+            }
+        }
+    }
 }
 
 impl Bitmap {
@@ -185,7 +247,118 @@ impl Bitmap {
         })
     }
 
-    fn draw_image(&mut self, source: &Bitmap, from: Rect4, to: Rect4) {
+    // the source position in 16.16 fixed point, from coordinates mapped in f32 as skia maps them
+    fn fixed(position: f32) -> i64 {
+        (position * 65536.0).floor() as i64
+    }
+
+    fn nearest(&self, u: f32, v: f32) -> [u8; 4] {
+        // a position on a pixel's left edge belongs to the pixel before it
+        let column = ((Self::fixed(u) - 1) >> 16).clamp(0, i64::from(self.width) - 1);
+        let row = ((Self::fixed(v) - 1) >> 16).clamp(0, i64::from(self.height) - 1);
+        self.pixels[row as usize * self.width as usize + column as usize]
+    }
+
+    fn fixed_bilinear(&self, u: f32, v: f32) -> [u8; 4] {
+        let x = Self::fixed(u) - (1 << 15);
+        let y = Self::fixed(v) - (1 << 15);
+        let (left, top) = (x >> 16, y >> 16);
+        let (sub_x, sub_y) = (((x >> 12) & 15) as u32, ((y >> 12) & 15) as u32);
+        let at = |column: i64, row: i64| {
+            let column = column.clamp(0, i64::from(self.width) - 1) as usize;
+            let row = row.clamp(0, i64::from(self.height) - 1) as usize;
+            self.pixels[row * self.width as usize + column]
+        };
+        let corners = [
+            (at(left, top), (16 - sub_x) * (16 - sub_y)),
+            (at(left + 1, top), sub_x * (16 - sub_y)),
+            (at(left, top + 1), (16 - sub_x) * sub_y),
+            (at(left + 1, top + 1), sub_x * sub_y),
+        ];
+        std::array::from_fn(|channel| {
+            let total: u32 = corners
+                .iter()
+                .map(|(pixel, weight)| u32::from(pixel[channel]) * weight)
+                .sum();
+            (total >> 8) as u8
+        })
+    }
+
+    // mitchell-netravali with b = c = 1/3 over the 4x4 pixels around a point
+    fn mitchell(&self, u: f32, v: f32) -> [u8; 4] {
+        fn weight(distance: f32) -> f32 {
+            let t = distance.abs();
+            let (b, c) = (1.0 / 3.0, 1.0 / 3.0);
+            if t < 1.0 {
+                ((12.0 - 9.0 * b - 6.0 * c) * t * t * t
+                    + (-18.0 + 12.0 * b + 6.0 * c) * t * t
+                    + (6.0 - 2.0 * b))
+                    / 6.0
+            } else if t < 2.0 {
+                ((-b - 6.0 * c) * t * t * t
+                    + (6.0 * b + 30.0 * c) * t * t
+                    + (-12.0 * b - 48.0 * c) * t
+                    + (8.0 * b + 24.0 * c))
+                    / 6.0
+            } else {
+                0.0
+            }
+        }
+        let (x, y) = (u - 0.5, v - 0.5);
+        let (left, top) = (x.floor(), y.floor());
+        let mut sum = [0.0f32; 4];
+        for row in -1..3 {
+            let wy = weight(y - (top + row as f32));
+            let source_row = (top as i64 + row).clamp(0, i64::from(self.height) - 1) as usize;
+            for column in -1..3 {
+                let w = weight(x - (left + column as f32)) * wy;
+                let source_column =
+                    (left as i64 + column).clamp(0, i64::from(self.width) - 1) as usize;
+                let pixel = self.pixels[source_row * self.width as usize + source_column];
+                for (total, channel) in sum.iter_mut().zip(pixel) {
+                    *total += w * f32::from(channel);
+                }
+            }
+        }
+        // a cubic overshoots, and premultiplied colour may never pass its alpha
+        let alpha = sum[3].round().clamp(0.0, 255.0);
+        std::array::from_fn(|channel| match channel {
+            3 => alpha as u8,
+            _ => sum[channel].round().clamp(0.0, alpha) as u8,
+        })
+    }
+
+    // the next mip level: each pixel the rounded mean of the 2x2 block above it, the odd last
+    // row or column repeating its neighbour
+    fn halved(&self) -> Self {
+        let (width, height) = ((self.width / 2).max(1), (self.height / 2).max(1));
+        let at = |column: u32, row: u32| {
+            let (column, row) = (column.min(self.width - 1), row.min(self.height - 1));
+            self.pixels[(row * self.width + column) as usize]
+        };
+        let pixels = (0..height)
+            .flat_map(|row| (0..width).map(move |column| (column, row)))
+            .map(|(column, row)| {
+                let block = [
+                    at(column * 2, row * 2),
+                    at(column * 2 + 1, row * 2),
+                    at(column * 2, row * 2 + 1),
+                    at(column * 2 + 1, row * 2 + 1),
+                ];
+                std::array::from_fn(|channel| {
+                    let total: u32 = block.iter().map(|pixel| u32::from(pixel[channel])).sum();
+                    ((total + 2) / 4) as u8
+                })
+            })
+            .collect();
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn draw_image(&mut self, source: &Bitmap, from: Rect4, to: Rect4, sampling: Sampling) {
         let (mut sx, mut sy, mut sw, mut sh) = normalized(from);
         let (mut dx, mut dy, mut dw, mut dh) = normalized(to);
         if sw == 0.0 || sh == 0.0 || source.pixels.is_empty() {
@@ -202,10 +375,52 @@ impl Bitmap {
         dy += (top - sy) * ratio_y;
         (dw, dh) = ((right - left) * ratio_x, (bottom - top) * ratio_y);
         (sx, sy, sw, sh) = (left, top, right - left, bottom - top);
+        // the levels a mipmapped draw blends, each with its size relative to the source
+        let levels = match sampling {
+            Sampling::Mipmapped(level) => {
+                let lower = level.floor() as usize;
+                let mut chain = vec![source.clone()];
+                while chain.len() <= lower + 1
+                    && chain
+                        .last()
+                        .is_some_and(|last| last.width > 1 || last.height > 1)
+                {
+                    let next = chain
+                        .last()
+                        .expect("the chain starts with the source")
+                        .halved();
+                    chain.push(next);
+                }
+                let upper = chain.len().min(lower + 2) - 1;
+                Some((chain, lower.min(upper), upper, level - level.floor()))
+            }
+            _ => None,
+        };
+        let (scale_x, scale_y) = (sw / dw, sh / dh);
         self.cover((dx, dy, dw, dh), |pixel, coverage, column, row| {
-            let u = sx + (column as f32 + 0.5 - dx) * sw / dw;
-            let v = sy + (row as f32 + 0.5 - dy) * sh / dh;
-            source_over(pixel, scale(source.sample(u, v), coverage));
+            let u = sx + (column as f32 + 0.5 - dx) * scale_x;
+            let v = sy + (row as f32 + 0.5 - dy) * scale_y;
+            let sample = match (&levels, sampling) {
+                (_, Sampling::Nearest) => source.nearest(u, v),
+                (_, Sampling::FixedBilinear) => source.fixed_bilinear(u, v),
+                (_, Sampling::Mitchell) => source.mitchell(u, v),
+                (Some((chain, lower, upper, blend)), _) => {
+                    let at = |level: &Bitmap| {
+                        let (ratio_x, ratio_y) = (
+                            level.width as f32 / source.width as f32,
+                            level.height as f32 / source.height as f32,
+                        );
+                        level.sample(u * ratio_x, v * ratio_y)
+                    };
+                    let (near, far) = (at(&chain[*lower]), at(&chain[*upper]));
+                    std::array::from_fn(|channel| {
+                        let (near, far) = (f32::from(near[channel]), f32::from(far[channel]));
+                        (near + (far - near) * blend).round() as u8
+                    })
+                }
+                _ => source.sample(u, v),
+            };
+            source_over(pixel, scale(sample, coverage));
         });
     }
 
@@ -338,6 +553,8 @@ impl ScriptRuntime {
                 Rc::new(RefCell::new(CanvasContextData {
                     node,
                     fill_style: Color::BLACK,
+                    smoothing_enabled: true,
+                    smoothing_quality: Smoothing::Low,
                     bitmap: Bitmap::new(width, height),
                     snapshot: None,
                 }))
@@ -481,6 +698,10 @@ impl ScriptRuntime {
         Ok(match property {
             "canvas" => self.node_value(context.borrow().node),
             "fillStyle" => Value::String(color_css(context.borrow().fill_style).into()),
+            "imageSmoothingEnabled" => Value::Bool(context.borrow().smoothing_enabled),
+            "imageSmoothingQuality" => {
+                Value::String(context.borrow().smoothing_quality.name().into())
+            }
             _ => {
                 return Err(runtime_error(format!(
                     "CanvasRenderingContext2D has no property {property}"
@@ -499,6 +720,17 @@ impl ScriptRuntime {
         };
         context.borrow_mut().fill_style = color;
         true
+    }
+
+    // an enum attribute ignores a value outside its set, as webidl has it
+    pub(super) fn set_canvas_smoothing_quality(context: &CanvasContextHandle, value: &str) {
+        let quality = match value {
+            "low" => Smoothing::Low,
+            "medium" => Smoothing::Medium,
+            "high" => Smoothing::High,
+            _ => return,
+        };
+        context.borrow_mut().smoothing_quality = quality;
     }
 
     pub(super) fn call_canvas_method(
@@ -644,7 +876,8 @@ impl ScriptRuntime {
         );
         let from = (from.0 * x, from.1 * y, from.2 * x, from.3 * y);
         let mut context = context.borrow_mut();
-        context.bitmap.draw_image(&source, from, to);
+        let sampling = context.sampling(normalized(from), normalized(to));
+        context.bitmap.draw_image(&source, from, to, sampling);
         context.snapshot = None;
         Ok(())
     }
@@ -803,19 +1036,30 @@ mod tests {
     }
 
     #[test]
-    fn images_scale_bilinearly_with_clipped_source_rectangles() {
+    fn images_scale_with_low_quality_bilinear_and_clipped_source_rectangles() {
         let mut source = Bitmap::new(2, 1);
         source.pixels = vec![[0, 0, 0, 255], [255, 255, 255, 255]];
         let mut bitmap = Bitmap::new(4, 1);
-        bitmap.draw_image(&source, (0.0, 0.0, 2.0, 1.0), (0.0, 0.0, 4.0, 1.0));
+        bitmap.draw_image(
+            &source,
+            (0.0, 0.0, 2.0, 1.0),
+            (0.0, 0.0, 4.0, 1.0),
+            Sampling::FixedBilinear,
+        );
         let reds = bitmap
             .pixels
             .iter()
             .map(|pixel| pixel[0])
             .collect::<Vec<_>>();
-        assert_eq!(reds, [0, 64, 191, 255]);
+        // chromium's low quality bilinear keeps four bits of subpixel position
+        assert_eq!(reds, [0, 63, 191, 255]);
         let mut copy = Bitmap::new(4, 1);
-        copy.draw_image(&source, (-2.0, 0.0, 4.0, 1.0), (0.0, 0.0, 4.0, 1.0));
+        copy.draw_image(
+            &source,
+            (-2.0, 0.0, 4.0, 1.0),
+            (0.0, 0.0, 4.0, 1.0),
+            Sampling::FixedBilinear,
+        );
         let copied = copy.pixels.iter().map(|pixel| pixel[3]).collect::<Vec<_>>();
         assert_eq!(
             copied,
@@ -824,7 +1068,12 @@ mod tests {
         );
         assert_eq!(copy.pixels[2], [0, 0, 0, 255]);
         let mut exact = Bitmap::new(2, 1);
-        exact.draw_image(&source, (0.0, 0.0, 2.0, 1.0), (0.0, 0.0, 2.0, 1.0));
+        exact.draw_image(
+            &source,
+            (0.0, 0.0, 2.0, 1.0),
+            (0.0, 0.0, 2.0, 1.0),
+            Sampling::FixedBilinear,
+        );
         assert_eq!(exact.pixels, source.pixels);
     }
 
