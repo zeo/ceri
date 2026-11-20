@@ -834,6 +834,8 @@ pub(super) fn create(
         );
         globals.push((name, Value::Object(factory)));
     }
+    let image_data = build.function(Native::DomConstructor("ImageData"), "ImageData", 2);
+    globals.push(("ImageData", Value::Object(image_data)));
     DomInterfaces { prototypes }
 }
 
@@ -1778,6 +1780,9 @@ impl ScriptRuntime {
         }
         if interface == "Audio" {
             return self.construct_audio_element(&arguments);
+        }
+        if interface == "ImageData" {
+            return self.construct_image_data(&arguments);
         }
         if interface == "EventTarget" {
             let prototype = match new_target {

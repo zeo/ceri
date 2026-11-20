@@ -933,6 +933,41 @@ impl ScriptRuntime {
         Ok(image_data_object(width, height, data))
     }
 
+    // new ImageData(width, height), or new ImageData(data, width[, height]) over pixels a
+    // typed array already holds
+    pub(super) fn construct_image_data(
+        &mut self,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let Some(Value::TypedArray(array)) = arguments.first() else {
+            return self.create_image_data(arguments.get(..2).unwrap_or(arguments));
+        };
+        let length = {
+            let array = array.borrow();
+            array.end - array.start
+        };
+        let width = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+        let width = self.coerce_uint32(width)? as usize;
+        let fits = width != 0 && length != 0 && length % (width * 4) == 0;
+        let height = if fits { length / (width * 4) } else { 0 };
+        let asked = match arguments.get(2) {
+            Some(height) => self.coerce_uint32(height.clone())? as usize,
+            None => height,
+        };
+        if !fits || asked != height {
+            return Err(self.throw_value(dom_exception(
+                "IndexSizeError",
+                "Failed to construct 'ImageData': The input data length is not a multiple of (4 * width), or does not match the height.",
+            )));
+        }
+        Ok(plain_object([
+            ("width".to_string(), Value::Number(width as f64)),
+            ("height".to_string(), Value::Number(height as f64)),
+            ("data".to_string(), Value::TypedArray(array.clone())),
+            ("colorSpace".to_string(), Value::String("srgb".into())),
+        ]))
+    }
+
     // transparent black pixels of the size given, or of the size of another ImageData
     fn create_image_data(&mut self, arguments: &[Value]) -> Result<Value, ScriptError> {
         let (width, height) = match arguments {

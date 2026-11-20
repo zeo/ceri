@@ -8145,6 +8145,14 @@ mod tests {
                 const same = pen.createImageData(blank);
                 log.push(blank.width, blank.height, blank.data.length, same.data.length);
                 log.push(blank.data.every((byte) => byte === 0));
+                const made = new ImageData(2, 3);
+                const wrapped = new ImageData(new Uint8ClampedArray(16), 2);
+                log.push(made.data.length, wrapped.width + "x" + wrapped.height);
+                try {
+                    new ImageData(new Uint8ClampedArray(10), 2);
+                } catch (error) {
+                    log.push(error.name);
+                }
                 try {
                     pen.createImageData(0, 2);
                 } catch (error) {
@@ -8161,7 +8169,7 @@ mod tests {
         let status = document.find_element_by_id("status").unwrap();
         assert_eq!(
             document.text_content(status),
-            "true true true true true 3 2 24 24 true IndexSizeError"
+            "true true true true true 3 2 24 24 true 24 2x2 IndexSizeError IndexSizeError"
         );
     }
 
