@@ -175,6 +175,8 @@ pub struct LayoutBox {
     // the shapes an outer svg element draws in its content box
     pub(crate) svg: Option<Rc<crate::svg::Scene>>,
     pub(crate) scrollbar: Scrollbar,
+    // scrollbar-gutter: stable, which keeps the room of a vertical bar that is not showing
+    pub(crate) stable_gutter: bool,
     pub(crate) margin: ResolvedEdges,
 }
 
@@ -1014,6 +1016,7 @@ pub fn layout_with_state(
         scroll_offset: (0.0, 0.0),
         svg: None,
         scrollbar: Scrollbar::default(),
+        stable_gutter: false,
         margin: ResolvedEdges::default(),
     };
     // the root element's scrollbar styles draw the viewport's bars
@@ -1753,7 +1756,7 @@ pub(crate) fn scrollbar_metrics(layout: &LayoutBox) -> ScrollbarMetrics {
         width: (rect.width - border.left - border.right).max(0.0),
         height: (rect.height - border.top - border.bottom).max(0.0),
     };
-    let vertical_width = if vertical {
+    let vertical_width = if vertical || (layout.stable_gutter && user_y) {
         thickness_x.min(inner.width)
     } else {
         0.0
@@ -3028,11 +3031,19 @@ fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> 
     let layout = layout_element_with_gutter(input.clone(), 0.0)?;
     // a vertical scrollbar sits between the border and the padding, so the content box gives
     // up its width and the content lays out again
+    let gutter = scrollbar_metrics(&layout).vertical_track.map_or_else(
+        || {
+            (layout.stable_gutter && layout.overflow == Overflow::Auto)
+                .then(|| layout.scrollbar.thickness().0)
+        },
+        |bar| Some(bar.width),
+    );
     if user_scroll_axes(&layout)[1]
-        && let Some(bar) = scrollbar_metrics(&layout).vertical_track
-        && layout.rect.width > bar.width
+        && let Some(gutter) = gutter
+        && gutter > 0.0
+        && layout.rect.width > gutter
     {
-        return layout_element_with_gutter(input, bar.width);
+        return layout_element_with_gutter(input, gutter);
     }
     Some(layout)
 }
@@ -3899,6 +3910,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg,
+        stable_gutter: style.scrollbar_gutter,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -4078,6 +4090,7 @@ fn anonymous_box(
         scroll_offset: (0.0, 0.0),
         svg: None,
         scrollbar: Scrollbar::default(),
+        stable_gutter: false,
         margin: ResolvedEdges::default(),
     }
 }
@@ -5147,6 +5160,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        stable_gutter: style.scrollbar_gutter,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -5685,6 +5699,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        stable_gutter: style.scrollbar_gutter,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -6502,6 +6517,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scroll_content: Size::default(),
         scroll_offset: (0.0, 0.0),
         svg: None,
+        stable_gutter: style.scrollbar_gutter,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -9932,6 +9948,7 @@ impl LayoutBox {
             scroll_offset,
             svg,
             scrollbar,
+            stable_gutter,
             margin,
         } = self;
         *node == other.node
@@ -9977,6 +9994,7 @@ impl LayoutBox {
             && *scroll_offset == other.scroll_offset
             && *svg == other.svg
             && *scrollbar == other.scrollbar
+            && *stable_gutter == other.stable_gutter
             && *margin == other.margin
     }
 
@@ -12073,6 +12091,28 @@ mod tests {
         };
         assert_eq!(widths("stretch"), [150.0, 400.0]);
         assert_eq!(widths("center"), [150.0, 90.0]);
+    }
+
+    #[test]
+    fn a_stable_gutter_keeps_the_room_of_a_scrollbar_that_is_not_showing() {
+        let width = |gutter: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; padding: 0; }} div {{ width: 200px; height: 100px; overflow: auto; scrollbar-gutter: {gutter}; }}</style><div><p>short</p></div>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 800.0,
+                    height: 300.0,
+                },
+            );
+            find_box(&result.root, "p").expect("content").rect.width
+        };
+        assert_eq!(width("auto"), 200.0);
+        assert_eq!(width("stable"), 200.0 - SCROLLBAR_THICKNESS);
     }
 
     #[test]

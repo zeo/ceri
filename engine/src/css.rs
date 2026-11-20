@@ -1608,6 +1608,8 @@ pub(crate) struct Style {
     // the thumb and track colors, none for the platform's
     pub scrollbar_color: Option<(Color, Color)>,
     pub scrollbar_width: ScrollbarWidth,
+    // room for a vertical scrollbar is kept whether or not one shows
+    pub(crate) scrollbar_gutter: bool,
     pub(crate) filter: Option<FilterList>,
     pub(crate) backdrop_filter: Option<FilterList>,
     // horizontal and vertical
@@ -1805,6 +1807,7 @@ impl Style {
             appearance_none: false,
             scrollbar_color: parent_text.scrollbar_color,
             scrollbar_width: ScrollbarWidth::Auto,
+            scrollbar_gutter: false,
             filter: None,
             backdrop_filter: None,
             border_spacing: parent_text.border_spacing,
@@ -5837,6 +5840,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "app-region",
     "scrollbar-color",
     "scrollbar-width",
+    "scrollbar-gutter",
     "fill",
     "fill-opacity",
     "fill-rule",
@@ -6564,6 +6568,11 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "none" => ScrollbarWidth::None,
                 _ => style.scrollbar_width,
             };
+        }
+        "scrollbar-gutter" => {
+            style.scrollbar_gutter = value
+                .split_ascii_whitespace()
+                .any(|word| word.eq_ignore_ascii_case("stable"));
         }
         "filter" => style.filter = parse_filter_list(value).unwrap_or(style.filter),
         "backdrop-filter" => {
