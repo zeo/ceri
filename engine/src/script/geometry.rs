@@ -109,7 +109,6 @@ const PLAIN: &[(&str, &str)] = &[
     ("background-repeat", "repeat"),
     ("background-size", "auto"),
     ("background-position", "0% 0%"),
-    ("box-shadow", "none"),
     ("outline-style", "none"),
     ("outline-width", "0px"),
     ("content", "normal"),
@@ -144,6 +143,7 @@ const COMPUTED: &[&str] = &[
     "position",
     "color",
     "background-color",
+    "box-shadow",
     "opacity",
     "font-size",
     "font-weight",
@@ -281,6 +281,7 @@ impl ScriptRuntime {
         state.viewport_height = self.viewport.height;
         state.color_scheme = extras.color_scheme;
         state.reduced_motion = extras.reduced_motion;
+        state.forced_colors = extras.forced_colors;
         state.clock = self.clock;
         state.transitions = extras.transitions.clone();
         state.animation_starts = extras.animation_starts.clone();
@@ -931,6 +932,7 @@ impl ScriptRuntime {
             viewport_height: self.viewport.height,
             color_scheme: extras.color_scheme,
             reduced_motion: extras.reduced_motion,
+            forced_colors: extras.forced_colors,
             ..StyleState::default()
         };
         crate::css::media_query_matches(query, &state)
@@ -1248,6 +1250,24 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
                 names
                     .iter()
                     .map(|name| family_text(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
+        // each shadow as its colour, offsets, blur and spread, inset last
+        "box-shadow" => style.shadows.map_or_else(
+            || "none".to_string(),
+            |list| {
+                list.shadows()
+                    .iter()
+                    .map(|shadow| {
+                        let lengths =
+                            [shadow.offset_x, shadow.offset_y, shadow.blur, shadow.spread]
+                                .map(|value| length(value, 0.0))
+                                .join(" ");
+                        let inset = if shadow.inset { " inset" } else { "" };
+                        format!("{} {lengths}{inset}", color_text(shadow.color))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             },
