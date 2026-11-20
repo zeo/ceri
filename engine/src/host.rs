@@ -441,7 +441,7 @@ fn run_live_engine_worker(
         let animating = wait.is_some_and(|wait| wait < frame * 2);
         hold_fine_timer(&mut fine_timer, animating);
         if !animating {
-            host.browser.release_spare_frame();
+            host.browser.rest();
         }
         let command = match held.take().or_else(|| queued.borrow_mut().pop_front()) {
             Some(command) => Some(command),

@@ -62,6 +62,10 @@ pub struct NodeData {
     pub kind: NodeKind,
     parent: Option<NodeId>,
     children: Vec<NodeId>,
+    // the document's change stamp when the node itself was last written, and when it or
+    // anything beneath it was
+    written: u64,
+    written_within: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +146,9 @@ pub struct Document {
     root: NodeId,
     // bumped by every change to the tree, an attribute or character data
     version: u64,
+    // the stamp nodes written now are marked with, and whether anyone has read it
+    stamp: u64,
+    stamp_read: std::cell::Cell<bool>,
     // renewed by every change a selector can see unless it reads text or the style attribute:
     // to the elements of the tree, or to an attribute other than style
     selector_version: u64,
@@ -266,6 +273,8 @@ impl Document {
                 generation: 0,
             },
             version: 0,
+            stamp: next_stamp(),
+            stamp_read: std::cell::Cell::new(false),
             selector_version: next_stamp(),
             orphans: Vec::new(),
             template_contents: HashMap::new(),
@@ -340,10 +349,13 @@ impl Document {
         if !matches!(kind, NodeKind::Text(_) | NodeKind::Comment(_)) {
             self.selector_version = next_stamp();
         }
+        let stamp = self.writing_stamp();
         let node = NodeData {
             kind,
             parent: None,
             children: Vec::new(),
+            written: stamp,
+            written_within: stamp,
         };
         self.version += 1;
         let id = if let Some(index) = self.free.pop() {
@@ -376,12 +388,63 @@ impl Document {
         slot.node.as_ref()
     }
 
+    // every write to a node comes through here, so it is also where the node and the chain
+    // above it are stamped as written
     fn data_mut(&mut self, id: NodeId) -> Option<&mut NodeData> {
-        let slot = self.slots.get_mut(id.index as usize)?;
-        if slot.generation != id.generation {
-            return None;
+        let stamp = self.writing_stamp();
+        let mut above = self.data(id)?.parent;
+        let data = self.slots[id.index as usize].node.as_mut()?;
+        data.written = stamp;
+        // a chain already stamped at this stamp was stamped all the way up
+        if std::mem::replace(&mut data.written_within, stamp) != stamp {
+            while let Some(data) = above.and_then(|node| {
+                self.slots
+                    .get_mut(node.index as usize)
+                    .filter(|slot| slot.generation == node.generation)?
+                    .node
+                    .as_mut()
+            }) {
+                if std::mem::replace(&mut data.written_within, stamp) == stamp {
+                    break;
+                }
+                above = data.parent;
+            }
         }
-        slot.node.as_mut()
+        self.slots[id.index as usize].node.as_mut()
+    }
+
+    // the stamp writes take now: a new one once the last has been read, so whoever read it
+    // can tell later writes from the ones it saw
+    fn writing_stamp(&mut self) -> u64 {
+        if self.stamp_read.replace(false) {
+            self.stamp = next_stamp();
+        }
+        self.stamp
+    }
+
+    // the stamp of the writes so far
+    pub(crate) fn change_stamp(&self) -> u64 {
+        self.stamp_read.set(true);
+        self.stamp
+    }
+
+    // whether nothing in the node's subtree, nor any ancestor itself, was written after the
+    // stamp: what an element lays out as hangs on its subtree and on what it inherits
+    pub(crate) fn unwritten_since(&self, id: NodeId, stamp: u64) -> bool {
+        let Some(data) = self.data(id) else {
+            return false;
+        };
+        let mut above = data.parent;
+        if data.written_within > stamp {
+            return false;
+        }
+        while let Some(data) = above.and_then(|node| self.data(node)) {
+            if data.written > stamp {
+                return false;
+            }
+            above = data.parent;
+        }
+        true
     }
 
     fn append_raw(&mut self, parent: NodeId, child: NodeId) {
@@ -674,6 +737,8 @@ impl Document {
             })
             .collect();
         self.content_security_policy = policies;
+        // which style attributes apply is no node's own write
+        self.selector_version = next_stamp();
     }
 
     pub(crate) fn style_blocked(&self, node: NodeId) -> bool {

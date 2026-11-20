@@ -2903,12 +2903,14 @@ impl Browser {
         self.paint_scaled(viewport, 1.0)
     }
 
-    // drops the second frame kept while frames follow each other closely
-    pub(crate) fn release_spare_frame(&self) {
+    // drops what is held only to make the next frame cheaper while frames follow each
+    // other closely: the second canvas and the layout answers kept from the last layout
+    pub(crate) fn rest(&self) {
         if let Some(painted) = self.painted.borrow_mut().as_mut() {
             painted.spare = None;
             painted.behind.clear();
         }
+        crate::layout::forget_kept_answers();
     }
 
     pub fn paint_scaled(

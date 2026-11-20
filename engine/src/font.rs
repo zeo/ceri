@@ -1434,6 +1434,8 @@ type ColorGlyphCache = HashMap<(GlyphKey, [u8; 4]), Option<Rc<ColorGlyph>>>;
 pub struct FontSet {
     source: Option<Rc<dyn FontSource>>,
     web_faces: RefCell<Vec<WebFace>>,
+    // counts the changes to the web faces, which change what text measures
+    web_face_changes: Cell<u64>,
     // the faces a stack's families supply, in order
     stacks: RefCell<HashMap<(FontStack, FontStyle), FaceList>>,
     fallbacks: RefCell<FallbackCache>,
@@ -1454,6 +1456,7 @@ impl FontSet {
         Self {
             source: None,
             web_faces: RefCell::default(),
+            web_face_changes: Cell::new(0),
             stacks: RefCell::default(),
             fallbacks: RefCell::default(),
             shaped: RefCell::default(),
@@ -1471,6 +1474,10 @@ impl FontSet {
 
     pub fn new(regular: Rc<FontFace>, bold: Option<Rc<FontFace>>) -> Self {
         Self::from_source(Rc::new(SingleFaceSource { regular, bold }))
+    }
+
+    pub(crate) fn web_face_changes(&self) -> u64 {
+        self.web_face_changes.get()
     }
 
     pub fn is_builtin(&self) -> bool {
@@ -1494,6 +1501,7 @@ impl FontSet {
             ranges: ranges.into(),
             face,
         });
+        self.web_face_changes.set(self.web_face_changes.get() + 1);
         self.stacks.borrow_mut().clear();
         self.fallbacks.borrow_mut().clear();
         self.shaped.borrow_mut().clear();
@@ -1502,6 +1510,7 @@ impl FontSet {
     pub(crate) fn clear_web_faces(&self) {
         if !self.web_faces.borrow().is_empty() {
             self.web_faces.borrow_mut().clear();
+            self.web_face_changes.set(self.web_face_changes.get() + 1);
             self.stacks.borrow_mut().clear();
             self.fallbacks.borrow_mut().clear();
             self.shaped.borrow_mut().clear();

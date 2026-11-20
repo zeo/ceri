@@ -958,8 +958,7 @@ pub fn layout_with_state(
         root_font_size: root_font_size(document, stylesheet, viewport, style_state),
     });
     let _styles = crate::css::memoize_styles();
-    let _widths = memoize_widths();
-    let _boxes = memoize_boxes();
+    let _answers = keep_answers(document, stylesheet, style_state);
     let mut root = LayoutBox {
         node: document.root(),
         tag: "#document".to_string(),
@@ -2643,29 +2642,178 @@ struct BoxInputs {
     environment: crate::css::LayoutEnvironment,
 }
 
-type BoxMemo = HashMap<(NodeId, Option<PseudoElement>), Vec<(BoxInputs, Option<LayoutBox>)>>;
+// an answer worked out for a node under some inputs: a box or an intrinsic width
+struct Kept<Inputs, Answer> {
+    inputs: Inputs,
+    answer: Answer,
+    // the pass it was last worked out or asked for in
+    pass: u64,
+    // the document's change stamp it was worked out at
+    stamp: u64,
+    // it sampled motion or sized a query container, so it stands in its own pass only
+    momentary: bool,
+}
+
+type KeptMap<Key, Inputs, Answer> = HashMap<Key, Vec<Kept<Inputs, Answer>>>;
+
+// what every kept answer was worked out under besides its own inputs and the nodes it read
+#[derive(PartialEq)]
+struct KeptUnder {
+    stylesheet: u64,
+    selector_version: u64,
+    fonts: (*const crate::font::FontSet, u64),
+    scale: u32,
+    // without the clock, which only motion reads, and the custom properties, which follow
+    // from the rest
+    state: StyleState,
+}
+
+// the boxes and intrinsic widths worked out by the layout in progress and, where they can
+// stand in a later one, by the layout before it. within a layout a flex or grid container
+// lays an item out to measure it and again to place it, and nesting multiplies that. from
+// one layout to the next an answer stands while nothing in its node's subtree and no
+// ancestor of the node has been written, so a frame that moves one thing lays out the chain
+// above it and takes the rest as it was
+#[derive(Default)]
+struct KeptAnswers {
+    // none where no answer outlives its pass; the font set is held so its address stays its
+    under: Option<(KeptUnder, Rc<crate::font::FontSet>)>,
+    passes: u64,
+    // the number of the pass in progress and the document's change stamp at its start
+    pass: Option<(u64, u64)>,
+    boxes: KeptMap<(NodeId, Option<PseudoElement>), BoxInputs, Option<LayoutBox>>,
+    widths: KeptMap<IntrinsicKey, IntrinsicInputs, f32>,
+}
 
 thread_local! {
-    // a flex or grid container lays an item out to measure it and again to place it, often
-    // with the same inputs, and nesting multiplies that
-    static BOX_MEMO: std::cell::RefCell<Option<BoxMemo>> = const { std::cell::RefCell::new(None) };
+    static KEPT: std::cell::RefCell<KeptAnswers> = std::cell::RefCell::default();
 }
 
-struct MemoizedBoxes {
-    previous: Option<BoxMemo>,
+// the answer kept for the inputs when it is from this pass or still stands, and whether it
+// came from an earlier pass
+fn kept_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer: Clone>(
+    map: &mut KeptMap<Key, Inputs, Answer>,
+    (key, inputs): (&Key, &Inputs),
+    pass: u64,
+    stands: impl FnOnce(u64) -> bool,
+) -> Option<(Answer, bool)> {
+    let kept = map
+        .get_mut(key)?
+        .iter_mut()
+        .find(|kept| kept.inputs == *inputs)?;
+    // an answer for one moment only is dropped when its pass ends, so none comes from earlier
+    let earlier = kept.pass != pass;
+    if earlier && !stands(kept.stamp) {
+        return None;
+    }
+    kept.pass = pass;
+    Some((kept.answer.clone(), earlier))
 }
 
-impl Drop for MemoizedBoxes {
+fn keep_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer>(
+    map: &mut KeptMap<Key, Inputs, Answer>,
+    key: Key,
+    answer: Kept<Inputs, Answer>,
+) {
+    let answers = map.entry(key).or_default();
+    match answers.iter_mut().find(|kept| kept.inputs == answer.inputs) {
+        Some(kept) => *kept = answer,
+        None => answers.push(answer),
+    }
+}
+
+struct KeptPass {
+    // the answers of the layout this one runs inside of
+    outer: Option<KeptAnswers>,
+}
+
+impl Drop for KeptPass {
     fn drop(&mut self) {
-        BOX_MEMO.with(|memo| *memo.borrow_mut() = self.previous.take());
+        KEPT.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            if let Some(outer) = self.outer.take() {
+                *kept = outer;
+                return;
+            }
+            let Some((pass, _)) = kept.pass.take() else {
+                return;
+            };
+            if kept.under.is_none() {
+                kept.boxes.clear();
+                kept.widths.clear();
+                return;
+            }
+            // each kept box holds its whole subtree, so only what this pass used stays: the
+            // boxes beside the chain that changed, and not the ones inside them
+            fn prune<Key, Inputs, Answer>(map: &mut KeptMap<Key, Inputs, Answer>, pass: u64) {
+                map.retain(|_, answers| {
+                    answers.retain(|kept| kept.pass == pass && !kept.momentary);
+                    !answers.is_empty()
+                });
+            }
+            prune(&mut kept.boxes, pass);
+            prune(&mut kept.widths, pass);
+        });
     }
 }
 
 // the document, stylesheet and state must stay unchanged while the guard lives
-fn memoize_boxes() -> MemoizedBoxes {
-    MemoizedBoxes {
-        previous: BOX_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
-    }
+fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState) -> KeptPass {
+    KEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        // a layout inside another has its own document, so the outer answers step aside
+        let outer = kept.pass.is_some().then(|| std::mem::take(&mut *kept));
+        // a shadow tree is written without its host hearing of it, and a query container's
+        // size is an answer the pass itself has to write down
+        let lasting = outer.is_none()
+            && !document.has_shadow_roots()
+            && stylesheet.follows_versions()
+            && !stylesheet.has_container_queries();
+        let fonts = crate::font::active_fonts();
+        let under = lasting.then(|| KeptUnder {
+            stylesheet: stylesheet.identity(),
+            selector_version: document.selector_version(),
+            fonts: (Rc::as_ptr(&fonts), fonts.web_face_changes()),
+            scale: crate::font::device_scale().to_bits(),
+            state: StyleState {
+                clock: 0,
+                custom_properties: HashMap::new(),
+                ..state.clone()
+            },
+        });
+        if under.is_none() || kept.under.as_ref().map(|(under, _)| under) != under.as_ref() {
+            kept.boxes.clear();
+            kept.widths.clear();
+            kept.under = under.map(|under| (under, fonts));
+        }
+        kept.passes += 1;
+        kept.pass = Some((kept.passes, document.change_stamp()));
+        KeptPass { outer }
+    })
+}
+
+// drops the answers kept for the next layout
+pub(crate) fn forget_kept_answers() {
+    KEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if kept.pass.is_none() {
+            *kept = KeptAnswers::default();
+        }
+    });
+}
+
+// a layout that takes nothing from the one before it and leaves the kept answers as they were
+#[cfg(test)]
+fn layout_afresh(
+    document: &Document,
+    stylesheet: &Stylesheet,
+    viewport: Size,
+    state: &StyleState,
+) -> LayoutDocument {
+    let kept = KEPT.with(|kept| std::mem::take(&mut *kept.borrow_mut()));
+    let layout = layout_with_state(document, stylesheet, viewport, state);
+    KEPT.with(|answers| *answers.borrow_mut() = kept);
+    layout
 }
 
 fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
@@ -2707,22 +2855,46 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         input.node.node,
         input.node.generated.map(|(pseudo, _)| pseudo),
     );
-    let known = BOX_MEMO.with(|memo| {
-        memo.borrow()
-            .as_ref()?
-            .get(&key)?
-            .iter()
-            .find(|(seen, _)| *seen == inputs)
-            .map(|(_, layout)| layout.clone())
+    let Some((pass, stamp)) = KEPT.with(|kept| kept.borrow().pass) else {
+        return layout_element_fresh(input);
+    };
+    let (document, node) = (input.node.document, input.node.node);
+    let known = KEPT.with(|kept| {
+        kept_answer(
+            &mut kept.borrow_mut().boxes,
+            (&key, &inputs),
+            pass,
+            |since| document.unwritten_since(node, since),
+        )
     });
-    if let Some(layout) = known {
+    if let Some((layout, earlier)) = known {
+        if cfg!(debug_assertions) && earlier {
+            let reported = crate::css::moment_reports();
+            let fresh = layout_element_fresh(input);
+            assert!(fresh == layout, "a kept box went stale: {node:?}");
+            assert_eq!(
+                reported,
+                crate::css::moment_reports(),
+                "a kept box stands for one moment only: {node:?}"
+            );
+        }
         return layout;
     }
+    let reported = crate::css::moment_reports();
     let layout = layout_element_fresh(input);
-    BOX_MEMO.with(|memo| {
-        if let Some(memo) = memo.borrow_mut().as_mut() {
-            memo.entry(key).or_default().push((inputs, layout.clone()));
-        }
+    let momentary = crate::css::moment_reports() != reported;
+    KEPT.with(|kept| {
+        keep_answer(
+            &mut kept.borrow_mut().boxes,
+            key,
+            Kept {
+                inputs,
+                answer: layout.clone(),
+                pass,
+                stamp,
+                momentary,
+            },
+        );
     });
     layout
 }
@@ -2958,6 +3130,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             name: style.container_name,
         };
         CONTAINERS.with(|containers| containers.borrow_mut().insert(node.node, size));
+        crate::css::report_moment();
     }
     if matches!(style.display, Display::Flex | Display::InlineFlex) {
         return Some(layout_flex_element(FlexLayoutInput {
@@ -6343,32 +6516,9 @@ struct IntrinsicInputs {
 }
 
 type IntrinsicKey = (NodeId, Option<PseudoElement>, bool, bool);
-type IntrinsicMemo = HashMap<IntrinsicKey, Vec<(IntrinsicInputs, f32)>>;
 
-thread_local! {
-    // nested flex and grid containers ask for the same widths many times over in one layout
-    static INTRINSIC_MEMO: std::cell::RefCell<Option<IntrinsicMemo>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-struct MemoizedWidths {
-    previous: Option<IntrinsicMemo>,
-}
-
-impl Drop for MemoizedWidths {
-    fn drop(&mut self) {
-        INTRINSIC_MEMO.with(|memo| *memo.borrow_mut() = self.previous.take());
-    }
-}
-
-// the document, stylesheet and state must stay unchanged while the guard lives
-fn memoize_widths() -> MemoizedWidths {
-    MemoizedWidths {
-        previous: INTRINSIC_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
-    }
-}
-
-// an element's outer width at its widest (max-content) or its narrowest (min-content)
+// an element's outer width at its widest (max-content) or its narrowest (min-content); nested
+// flex and grid containers ask for the same widths many times over
 fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     let key = (
         input.node.node,
@@ -6384,22 +6534,46 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         zero_font: crate::css::zero_font(),
         environment: crate::css::layout_environment(),
     };
-    let known = INTRINSIC_MEMO.with(|memo| {
-        memo.borrow()
-            .as_ref()?
-            .get(&key)?
-            .iter()
-            .find(|(seen, _)| *seen == inputs)
-            .map(|&(_, width)| width)
+    let Some((pass, stamp)) = KEPT.with(|kept| kept.borrow().pass) else {
+        return measure_intrinsic_width(input, minimum);
+    };
+    let (document, node) = (input.node.document, input.node.node);
+    let known = KEPT.with(|kept| {
+        kept_answer(
+            &mut kept.borrow_mut().widths,
+            (&key, &inputs),
+            pass,
+            |since| document.unwritten_since(node, since),
+        )
     });
-    if let Some(width) = known {
+    if let Some((width, earlier)) = known {
+        if cfg!(debug_assertions) && earlier {
+            let reported = crate::css::moment_reports();
+            let fresh = measure_intrinsic_width(input, minimum);
+            assert!(fresh == width, "a kept width went stale: {node:?}");
+            assert_eq!(
+                reported,
+                crate::css::moment_reports(),
+                "a kept width stands for one moment only: {node:?}"
+            );
+        }
         return width;
     }
+    let reported = crate::css::moment_reports();
     let width = measure_intrinsic_width(input, minimum);
-    INTRINSIC_MEMO.with(|memo| {
-        if let Some(memo) = memo.borrow_mut().as_mut() {
-            memo.entry(key).or_default().push((inputs, width));
-        }
+    let momentary = crate::css::moment_reports() != reported;
+    KEPT.with(|kept| {
+        keep_answer(
+            &mut kept.borrow_mut().widths,
+            key,
+            Kept {
+                inputs,
+                answer: width,
+                pass,
+                stamp,
+                momentary,
+            },
+        );
     });
     width
 }
@@ -9308,6 +9482,136 @@ fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a few hundred seeded writes of every kind, each followed by a layout that takes what it
+    // can from the one before and by one that takes nothing; the two must not differ
+    #[test]
+    fn a_layout_that_keeps_answers_matches_one_from_nothing_after_any_write() {
+        let mut document = Document::parse_markup(
+            r#"<style>
+            #root { width: 300px; --gap: 4px; font-size: 14px; position: relative }
+            .row { display: flex; gap: var(--gap) }
+            .grid { display: grid; grid-template-columns: 1fr 2fr; gap: var(--gap) }
+            .wide { width: 80% } .tall { height: 40px } .hot { color: red; font-size: 18px }
+            .wide > .tall { margin-left: 10px }
+            p + div { padding: 3px }
+            div:hover { border: 2px solid black }
+            .abs { position: absolute; left: 10px; top: 5px; width: 30px; height: 10px }
+            .spin { animation: grow 1s infinite }
+            @keyframes grow { from { width: 10px } to { width: 90px } }
+            li::before { content: "-" }
+            b, span { padding: inherit; cursor: inherit }
+            </style>
+            <div id="root"><div class="row"><span>one</span><div class="tall"><p>two words</p></div><div class="abs"></div></div><div class="grid"><p>three</p><div class="spin"></div><div><span>four five six</span></div></div><ol><li>a</li><li>b</li></ol><p>tail <b>bold</b> text</p></div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let root = document.find_element_by_id("root").expect("root");
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        let mut state = StyleState::default();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut pick = |below: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % below
+        };
+        const PROPERTIES: [(&str, [&str; 4]); 13] = [
+            ("visibility", ["visible", "hidden", "visible", "hidden"]),
+            ("cursor", ["pointer", "default", "text", "pointer"]),
+            ("pointer-events", ["none", "auto", "none", "auto"]),
+            ("width", ["10px", "50%", "auto", "120px"]),
+            ("height", ["12px", "30px", "auto", "50%"]),
+            ("margin-left", ["0", "7px", "auto", "20px"]),
+            ("padding", ["0", "2px", "9px", "1em"]),
+            ("display", ["block", "flex", "none", "grid"]),
+            ("font-size", ["10px", "20px", "1.5em", "80%"]),
+            ("--gap", ["0px", "2px", "12px", "1em"]),
+            ("position", ["static", "absolute", "relative", "static"]),
+            ("left", ["auto", "5px", "30px", "10%"]),
+            ("flex-grow", ["0", "1", "2", "0"]),
+        ];
+        const CLASSES: [&str; 8] = ["row", "grid", "wide", "tall", "hot", "abs", "spin", ""];
+        const TEXTS: [&str; 4] = [
+            "a",
+            "longer words here to wrap around the line",
+            "",
+            "x y z",
+        ];
+        let mut last = root;
+        for step in 0..600 {
+            let nodes = document.subtree(root);
+            let elements = nodes
+                .iter()
+                .copied()
+                .filter(|&node| document.is_element(node))
+                .collect::<Vec<_>>();
+            let texts = nodes
+                .iter()
+                .copied()
+                .filter(|&node| matches!(document.kind(node), Some(crate::dom::NodeKind::Text(_))))
+                .collect::<Vec<_>>();
+            // half the writes land beside or above the one before, as a page's own do
+            let near = document
+                .parent(last)
+                .filter(|&parent| elements.contains(&parent));
+            let element = match near {
+                Some(parent) if pick(2) == 0 => {
+                    let siblings = document.element_children(parent).collect::<Vec<_>>();
+                    [parent, siblings[pick(siblings.len())]][pick(2)]
+                }
+                _ => elements[pick(elements.len())],
+            };
+            last = element;
+            let write = pick(8);
+            match write {
+                0 | 1 => {
+                    let (property, values) = PROPERTIES[pick(PROPERTIES.len())];
+                    document.set_style_property(element, property, values[pick(4)].to_string());
+                }
+                2 => {
+                    document.set_attribute(element, "class", CLASSES[pick(8)].to_string());
+                }
+                3 if !texts.is_empty() => {
+                    let text = texts[pick(texts.len())];
+                    document.set_character_data(text, TEXTS[pick(4)].to_string());
+                }
+                4 => {
+                    let added = document.create_element(["div", "span", "p"][pick(3)]);
+                    let words = document.create_text(TEXTS[pick(4)]);
+                    document
+                        .append_child(added, words)
+                        .expect("text should append");
+                    let before = document.children(element).first().copied();
+                    document
+                        .insert_before(element, added, before.filter(|_| pick(2) == 0))
+                        .expect("element should insert");
+                }
+                5 if element != root && elements.len() > 6 => {
+                    document.remove(element);
+                }
+                6 => {
+                    state.hovered = (pick(3) > 0).then_some(element);
+                }
+                7 if pick(2) == 0 => {
+                    document.set_attribute(element, "hidden", String::new());
+                }
+                _ => {
+                    document.remove_attribute(element, "hidden");
+                }
+            }
+            state.clock += 130;
+            let kept = layout_with_state(&document, &stylesheet, viewport, &state);
+            let fresh = layout_afresh(&document, &stylesheet, viewport, &state);
+            assert!(
+                kept.root == fresh.root,
+                "after write {write} of step {step}"
+            );
+        }
+    }
 
     #[test]
     fn inherited_text_transform_and_tracking_reach_layout_runs() {

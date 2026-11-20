@@ -775,7 +775,9 @@ struct StyleInputs {
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
 }
 
-type StyleMemo = HashMap<(NodeId, Option<PseudoElement>), Vec<(StyleInputs, Style, Option<u64>)>>;
+// each style with the animation wake its cascade noted and whether it reported motion
+type StyleMemo =
+    HashMap<(NodeId, Option<PseudoElement>), Vec<(StyleInputs, Style, Option<u64>, bool)>>;
 
 // the content string of each generated box asked about, which layout asks on every visit
 type ContentMemo = HashMap<(NodeId, Option<PseudoElement>), Option<String>>;
@@ -876,7 +878,22 @@ pub(crate) fn memoize_styles() -> MemoizedStyles {
     }
 }
 
+thread_local! {
+    // counts the reports that a style or a layout stands for this moment only: it sampled
+    // motion, or it wrote down a query container's size
+    static MOMENT_REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn report_moment() {
+    MOMENT_REPORTS.with(|reports| reports.set(reports.get() + 1));
+}
+
+pub(crate) fn moment_reports() -> u64 {
+    MOMENT_REPORTS.with(std::cell::Cell::get)
+}
+
 fn note_animation_wake(delay: u64) {
+    report_moment();
     ANIMATION_WAKE
         .with(|wake| wake.set(Some(wake.get().map_or(delay, |soonest| soonest.min(delay)))));
 }
@@ -917,6 +934,7 @@ pub(crate) fn take_motion() -> Option<BTreeSet<NodeId>> {
 }
 
 fn note_motion<'a>(node: Option<NodeId>, mut properties: impl Iterator<Item = &'a str>) {
+    report_moment();
     MOTION.with(|motion| {
         if let Some(motion) = motion.borrow_mut().as_mut() {
             match node {
@@ -1874,6 +1892,8 @@ pub struct Stylesheet {
     index: RuleIndex,
     // rules that declare a transition or an animation, checked before a full cascade
     motion_rules: Vec<usize>,
+    // a number no differently parsed sheet has
+    identity: u64,
     // shadow root style elements, by their text
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
     // whether a selector reads text nodes or the style attribute, which change without the
@@ -1883,6 +1903,11 @@ pub struct Stylesheet {
     // the pseudo-elements some rule styles, so the rest are not cascaded for nothing
     styled_pseudo_elements: Vec<PseudoElement>,
     font_faces: Vec<FontFaceRule>,
+}
+
+fn next_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn reads_unversioned(rules: &[Rule]) -> bool {
@@ -2335,6 +2360,7 @@ impl Stylesheet {
         let motion_rules = motion_rules(&rules);
         let styled_pseudo = styled_pseudo_elements(&rules);
         Ok(Self {
+            identity: next_identity(),
             reads_unversioned: reads_unversioned(&rules),
             cascades: RefCell::default(),
             rules,
@@ -2359,6 +2385,7 @@ impl Stylesheet {
         let styled_pseudo = styled_pseudo_elements(&rules);
         (
             Self {
+                identity: next_identity(),
                 reads_unversioned: reads_unversioned(&rules),
                 cascades: RefCell::default(),
                 rules,
@@ -2588,24 +2615,31 @@ impl Stylesheet {
                 .as_ref()?
                 .get(&key)?
                 .iter()
-                .find(|(seen, _, _)| *seen == inputs)
-                .map(|&(_, style, wake)| (style, wake))
+                .find(|(seen, _, _, _)| *seen == inputs)
+                .map(|&(_, style, wake, moving)| (style, wake, moving))
         });
-        if let Some((style, wake)) = known {
+        if let Some((style, wake, moving)) = known {
             if let Some(delay) = wake {
                 note_animation_wake(delay);
+            }
+            if moving {
+                report_moment();
             }
             return style;
         }
         let outer = ANIMATION_WAKE.with(std::cell::Cell::take);
+        let reported = moment_reports();
         let style = self.compute_style(context);
+        let moving = moment_reports() != reported;
         let wake = ANIMATION_WAKE.with(|current| current.replace(outer));
         if let Some(delay) = wake {
             note_animation_wake(delay);
         }
         STYLE_MEMO.with(|memo| {
             if let Some(memo) = memo.borrow_mut().as_mut() {
-                memo.entry(key).or_default().push((inputs, style, wake));
+                memo.entry(key)
+                    .or_default()
+                    .push((inputs, style, wake, moving));
             }
         });
         style
@@ -3150,6 +3184,16 @@ impl Stylesheet {
         &self.font_faces
     }
 
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    // whether everything its selectors read moves the document's selector version, with the
+    // user agent's sheet beside it
+    pub(crate) fn follows_versions(&self) -> bool {
+        !self.reads_unversioned && !user_agent_sheet().reads_unversioned
+    }
+
     pub(crate) fn has_container_queries(&self) -> bool {
         self.rules.iter().any(|rule| {
             rule.conditions
@@ -3191,8 +3235,7 @@ impl Stylesheet {
             )
         };
         // a shadow tree's sheet is its style elements' text, which no version follows
-        if self.reads_unversioned
-            || user_agent_sheet().reads_unversioned
+        if !self.follows_versions()
             || document.has_shadow_roots()
             || !STYLE_MEMO.with(|memo| memo.borrow().is_some())
         {
