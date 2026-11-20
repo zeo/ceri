@@ -8,6 +8,8 @@ This crate is Ceri's browser engine, written against the Rust standard library. 
 
 The engine covers a bounded slice of the web platform. Every unsupported rule, property or API is a named gate in [../docs/engine-research.md](../docs/engine-research.md) rather than a silent failure: unsupported CSS rules are dropped and reported to the page console, and unsupported script surfaces raise typed errors.
 
+How a frame is made, what the engine keeps from one frame to the next, and how to see where a frame's time goes (the `--frames`, `--profile` and `--sweep` switches, and `Performance.getMetrics` over devtools) is in [../docs/frames.md](../docs/frames.md).
+
 The current slice implements:
 
 - HTML tokenization and a small DOM tree built by the tree construction rules: a document always has `html`, `head` and `body`, with head-only elements (`title`, `meta`, `link`, `style`, `script`, `base`, `template`) placed in `head` until body content starts, repeated `html` and `body` tags merging their attributes, and implied end tags for `p`, `li`, `dt`/`dd`, `option`/`optgroup`, headings and table cells, rows and sections (with `tbody` and `colgroup` inserted where a table needs them). An end tag with nothing open to close is dropped, and `</p>` alone makes an empty paragraph. SVG images and markup fragments parse without the implied document elements. Foster parenting, the adoption agency for misnested formatting tags, and RCDATA for `title` and `textarea` are not implemented, and unterminated tags and comments still fail the parse
