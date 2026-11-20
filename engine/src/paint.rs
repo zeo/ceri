@@ -11,9 +11,11 @@ use crate::layout::{
     thumb_placement, translate_rect, user_scroll_range, visual_offset_for, visual_rect_for,
 };
 use crate::png::encode_png;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub struct Canvas {
@@ -3497,11 +3499,69 @@ fn paint_box_surface(
     content_clip
 }
 
-// rasterizes the scene at device resolution over the part of its viewport that shows, then
-// draws that pixel for pixel
+// a scene rasterized over its whole viewport at one scale and subpixel offset
+struct SvgRaster {
+    scene: Rc<crate::svg::Scene>,
+    key: [u32; 5],
+    image: Rc<Image>,
+    used: u64,
+}
+
+// rasters of the scenes that are costly to draw, so a repaint of a sliver of one, or the
+// next frame's whole of it, copies pixels instead of filling its paths again
+#[derive(Default)]
+struct SvgRasters {
+    entries: Vec<SvgRaster>,
+    clock: u64,
+}
+
+thread_local! {
+    static SVG_RASTERS: RefCell<SvgRasters> = RefCell::new(SvgRasters::default());
+}
+
+impl SvgRasters {
+    // the most pixels one raster may hold, and all of them together, at four bytes each
+    const LARGEST: usize = 3_000_000;
+    const BUDGET: usize = 6_000_000;
+    // a scene quicker to draw than this is drawn again each time
+    const WORTH: std::time::Duration = std::time::Duration::from_micros(400);
+
+    fn find(&mut self, scene: &Rc<crate::svg::Scene>, key: [u32; 5]) -> Option<Rc<Image>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.iter_mut().find(|entry| {
+            entry.key == key && (Rc::ptr_eq(&entry.scene, scene) || entry.scene == *scene)
+        })?;
+        entry.used = clock;
+        Some(entry.image.clone())
+    }
+
+    fn keep(&mut self, scene: &Rc<crate::svg::Scene>, key: [u32; 5], image: Rc<Image>) {
+        let pixels = |image: &Image| image.width as usize * image.height as usize;
+        let mut held: usize = self.entries.iter().map(|entry| pixels(&entry.image)).sum();
+        while held + pixels(&image) > Self::BUDGET {
+            let Some(oldest) =
+                (0..self.entries.len()).min_by_key(|&index| self.entries[index].used)
+            else {
+                break;
+            };
+            held -= pixels(&self.entries.swap_remove(oldest).image);
+        }
+        self.entries.push(SvgRaster {
+            scene: scene.clone(),
+            key,
+            image,
+            used: self.clock,
+        });
+    }
+}
+
+// rasterizes the scene at device resolution, then draws that pixel for pixel: a scene of a
+// size worth keeping is drawn whole and kept when it was slow, and a larger one is drawn over
+// the part of its viewport that shows
 fn paint_svg(
     canvas: &mut Canvas,
-    scene: &crate::svg::Scene,
+    scene: &Rc<crate::svg::Scene>,
     rect: Rect,
     area: Shape,
     clip: Option<Rect>,
@@ -3519,47 +3579,84 @@ fn paint_svg(
         return;
     };
     let (scale, shift, nudge) = (canvas.scale, canvas.shift, canvas.nudge);
-    let left = ((bounds.x - shift.0) * scale + nudge.0).floor().max(0.0);
-    let top = ((bounds.y - shift.1) * scale + nudge.1).floor().max(0.0);
-    let right = ((bounds.x + bounds.width - shift.0) * scale + nudge.0)
-        .ceil()
-        .min(canvas.width as f32);
-    let bottom = ((bounds.y + bounds.height - shift.1) * scale + nudge.1)
-        .ceil()
-        .min(canvas.height as f32);
-    if right <= left || bottom <= top {
+    let device = |bounds: Rect| {
+        (
+            ((bounds.x - shift.0) * scale + nudge.0).floor(),
+            ((bounds.y - shift.1) * scale + nudge.1).floor(),
+            ((bounds.x + bounds.width - shift.0) * scale + nudge.0).ceil(),
+            ((bounds.y + bounds.height - shift.1) * scale + nudge.1).ceil(),
+        )
+    };
+    let origin = (
+        (rect.x - shift.0) * scale + nudge.0,
+        (rect.y - shift.1) * scale + nudge.1,
+    );
+    let draw =
+        |canvas: &mut Canvas, image: &Image, (left, top, right, bottom): (f32, f32, f32, f32)| {
+            paint_image(
+                canvas,
+                ImageDraw {
+                    image,
+                    placement: Rect {
+                        x: left / scale + shift.0,
+                        y: top / scale + shift.1,
+                        width: (right - left) / scale,
+                        height: (bottom - top) / scale,
+                    },
+                    area,
+                    clip,
+                    opacity,
+                    repeat: (false, false),
+                    video: None,
+                },
+            );
+        };
+    let rasterize = |(left, top, right, bottom): (f32, f32, f32, f32)| {
+        let mut image = Image::new((right - left) as u32, (bottom - top) as u32);
+        crate::svg::rasterize(
+            scene,
+            &mut image,
+            [scale, 0.0, 0.0, scale, origin.0 - left, origin.1 - top],
+        );
+        image
+    };
+    let whole = device(viewport);
+    let (whole_width, whole_height) = (whole.2 - whole.0, whole.3 - whole.1);
+    if whole_width >= 1.0
+        && whole_height >= 1.0
+        && whole_width * whole_height <= SvgRasters::LARGEST as f32
+    {
+        // the same scene at the same scale and fraction of a pixel rasterizes the same
+        let key = [
+            scale.to_bits(),
+            (origin.0 - whole.0).to_bits(),
+            (origin.1 - whole.1).to_bits(),
+            whole_width as u32,
+            whole_height as u32,
+        ];
+        let kept = SVG_RASTERS.with(|rasters| rasters.borrow_mut().find(scene, key));
+        let image = kept.unwrap_or_else(|| {
+            let started = std::time::Instant::now();
+            let image = Rc::new(rasterize(whole));
+            if started.elapsed() >= SvgRasters::WORTH {
+                SVG_RASTERS.with(|rasters| rasters.borrow_mut().keep(scene, key, image.clone()));
+            }
+            image
+        });
+        draw(canvas, &image, whole);
         return;
     }
-    let mut image = Image::new((right - left) as u32, (bottom - top) as u32);
-    crate::svg::rasterize(
-        scene,
-        &mut image,
-        [
-            scale,
-            0.0,
-            0.0,
-            scale,
-            (rect.x - shift.0) * scale + nudge.0 - left,
-            (rect.y - shift.1) * scale + nudge.1 - top,
-        ],
+    let shown = device(bounds);
+    let shown = (
+        shown.0.max(0.0),
+        shown.1.max(0.0),
+        shown.2.min(canvas.width as f32),
+        shown.3.min(canvas.height as f32),
     );
-    paint_image(
-        canvas,
-        ImageDraw {
-            image: &image,
-            placement: Rect {
-                x: left / scale + shift.0,
-                y: top / scale + shift.1,
-                width: (right - left) / scale,
-                height: (bottom - top) / scale,
-            },
-            area,
-            clip,
-            opacity,
-            repeat: (false, false),
-            video: None,
-        },
-    );
+    if shown.2 <= shown.0 || shown.3 <= shown.1 {
+        return;
+    }
+    draw(canvas, &rasterize(shown), shown);
 }
 
 // the color lies under every image layer, the last layer lowest and the first on top; images
@@ -5267,6 +5364,46 @@ mod tests {
         assert!(scroll_repaint(&canvas, &old, &scroll_layout(6.0, 12.0)).is_none());
     }
 
+    #[test]
+    fn svg_rasters_are_found_by_scene_and_key_and_evicted_oldest_first() {
+        let document = Document::parse_markup(
+            "<svg id='a' viewBox='0 0 10 10'><path d='M0 0h10v10z'/></svg><svg id='b' viewBox='0 0 10 10'><path d='M0 0h5v5z'/></svg>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("svg { display: block; width: 10px; height: 10px }")
+            .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 20.0,
+                height: 20.0,
+            },
+        );
+        let mut scenes = Vec::new();
+        let mut stack = vec![&layout.root];
+        while let Some(layout_box) = stack.pop() {
+            scenes.extend(layout_box.svg.clone());
+            stack.extend(&layout_box.children);
+        }
+        assert_eq!(scenes.len(), 2);
+        let mut rasters = SvgRasters::default();
+        let big = || Rc::new(Image::new(2000, 1400));
+        rasters.keep(&scenes[0], [1, 0, 0, 2000, 1400], big());
+        assert!(rasters.find(&scenes[0], [1, 0, 0, 2000, 1400]).is_some());
+        assert!(rasters.find(&scenes[1], [1, 0, 0, 2000, 1400]).is_none());
+        assert!(rasters.find(&scenes[0], [2, 0, 0, 2000, 1400]).is_none());
+        // an equal scene built again by a later layout finds the raster too
+        let again = Rc::new((*scenes[0]).clone());
+        assert!(rasters.find(&again, [1, 0, 0, 2000, 1400]).is_some());
+        rasters.keep(&scenes[1], [1, 0, 0, 2000, 1400], big());
+        rasters.find(&scenes[0], [1, 0, 0, 2000, 1400]);
+        // a third raster passes the budget, and the one used longest ago goes
+        rasters.keep(&scenes[1], [3, 0, 0, 2000, 1400], big());
+        assert!(rasters.find(&scenes[0], [1, 0, 0, 2000, 1400]).is_some());
+        assert!(rasters.find(&scenes[1], [1, 0, 0, 2000, 1400]).is_none());
+        assert!(rasters.find(&scenes[1], [3, 0, 0, 2000, 1400]).is_some());
+    }
     #[test]
     fn changes_far_apart_damage_separate_rectangles() {
         let old = damage_layout("", 0.0);
