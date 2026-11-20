@@ -148,19 +148,29 @@ impl ScriptRuntime {
         }
     }
 
-    // the receiver a callback's last argument sees: a primitive as its wrapper object
-    fn callback_receiver(&mut self, this: &Value) -> Result<Value, ScriptError> {
-        if matches!(
-            this,
+    // a callback method's receiver coerced once: its elements, and the object the
+    // callback's last argument sees, which is the one the length was read from
+    fn callback_receiver(
+        &mut self,
+        this: &Value,
+        method: &str,
+    ) -> Result<(Vec<Value>, Value), ScriptError> {
+        let object = match this {
             Value::Bool(_)
-                | Value::Number(_)
-                | Value::String(_)
-                | Value::Symbol(_)
-                | Value::BigInt(_)
-        ) {
-            return self.coerce_object(this.clone());
-        }
-        Ok(this.clone())
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Symbol(_)
+            | Value::BigInt(_) => self.coerce_object(this.clone())?,
+            _ => this.clone(),
+        };
+        // a string's wrapper has no observable length lookup, so its characters
+        // are read straight from the primitive
+        let source = if matches!(this, Value::String(_)) {
+            this
+        } else {
+            &object
+        };
+        Ok((self.receiver_values(source, method)?, object))
     }
 
     // a mutating method on a generic receiver such as a Proxy over an array: push and pop
@@ -358,10 +368,9 @@ impl ScriptRuntime {
         }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
-                let values = self.receiver_values(&this, &name)?;
+                let (values, object) = self.callback_receiver(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
                 let receiver = argument(&arguments, 1);
-                let object = self.callback_receiver(&this)?;
                 let length = values.len();
                 let mut mapped = Vec::new();
                 for index in 0..length {
@@ -393,10 +402,9 @@ impl ScriptRuntime {
                 })
             }
             M::FindLast | M::FindLastIndex => {
-                let values = self.receiver_values(&this, &name)?;
+                let (values, object) = self.callback_receiver(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
                 let receiver = argument(&arguments, 1);
-                let object = self.callback_receiver(&this)?;
                 for index in (0..values.len()).rev() {
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
                     let result = self.call_function(
@@ -417,9 +425,8 @@ impl ScriptRuntime {
                 })
             }
             M::Reduce | M::ReduceRight => {
-                let values = self.receiver_values(&this, &name)?;
+                let (values, object) = self.callback_receiver(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
-                let object = self.callback_receiver(&this)?;
                 let indices: Vec<usize> = if matches!(method, M::Reduce) {
                     (0..values.len()).collect()
                 } else {
@@ -557,14 +564,13 @@ impl ScriptRuntime {
                 }))
             }
             M::Flat | M::FlatMap => {
-                let values = self.receiver_values(&this, &name)?;
+                let (values, object) = self.callback_receiver(&this, &name)?;
                 let (depth, mapper) = if matches!(method, M::FlatMap) {
                     (1.0, Some(self.callback(&arguments, &name)?))
                 } else {
                     (self.integer(argument(&arguments, 0), 1.0)?, None)
                 };
                 let mut result = Vec::new();
-                let object = self.callback_receiver(&this)?;
                 for (index, value) in values.into_iter().enumerate() {
                     let value = match &mapper {
                         Some(mapper) => self.call_function(

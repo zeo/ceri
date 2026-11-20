@@ -2131,6 +2131,15 @@ fn lookup_accessor_helpers_ask_a_proxy_for_its_prototype() {
 }
 
 #[test]
+fn array_callbacks_see_the_wrapper_the_length_came_from() {
+    check(&[(
+        "one coercion",
+        "var from; Object.defineProperty(Number.prototype, 'length', { get: function () { from = this; return 1; }, configurable: true }); Number.prototype[0] = 'v'; var seen; Array.prototype.forEach.call(5, function (v, i, o) { seen = o; }); console.log(seen === from, typeof seen)",
+        "true object",
+    )]);
+}
+
+#[test]
 fn canvas_smoothing_samples_like_chromium() {
     // seeded noise, then pixels chromium drew from it in edge 157 (cpu raster) at each setting
     let setup = r#"
