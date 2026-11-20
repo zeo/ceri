@@ -37,6 +37,8 @@ use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorF
 use windows::core::Interface;
 
 const BUFFER_COUNT: u32 = 2;
+// the most bytes of upload buffer kept from one present to the next
+const STAGING_KEPT: usize = 4 << 20;
 
 fn failed(step: &'static str) -> impl Fn(windows::core::Error) -> String {
     move |error| format!("{step}: {error}")
@@ -271,6 +273,11 @@ impl Presenter {
                     0,
                 );
             }
+        }
+        // a whole upload leaves a buffer the size of the frame, which the boxes that follow
+        // have no use for
+        if self.staging.capacity() > STAGING_KEPT {
+            self.staging = Vec::new();
         }
         // the back buffer is two frames old, so it takes the boxes of the last frame too
         let last = self.last_box;
