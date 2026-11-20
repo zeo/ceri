@@ -27,6 +27,15 @@ struct Options {
 }
 
 fn main() -> Result<(), String> {
+    std::thread::Builder::new()
+        .stack_size(ceri_engine::ENGINE_STACK)
+        .spawn(run)
+        .map_err(|error| error.to_string())?
+        .join()
+        .map_err(|_| "the engine thread panicked".to_string())?
+}
+
+fn run() -> Result<(), String> {
     let options = parse_args(env::args_os().skip(1))?;
     let source = fs::read_to_string(&options.input)
         .map_err(|error| format!("could not read {}: {error}", options.input.display()))?;

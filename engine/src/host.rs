@@ -109,6 +109,11 @@ pub enum RegionPress {
     ToggleMaximize,
 }
 
+// layout and paint go one call deeper for each level of the tree, and a debug build's calls
+// are large, so the engine's thread reserves far more than the default; only what is touched
+// is ever backed by memory
+pub const ENGINE_STACK: usize = 64 << 20;
+
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub sequence: u64,
@@ -191,17 +196,33 @@ pub enum EngineWorkerEvent {
 }
 
 pub(crate) enum EngineWorkerCommand {
-    Navigate { request_id: u64, url: String },
-    Input { request_id: u64, event: InputEvent },
-    Render { request_id: u64 },
+    Navigate {
+        request_id: u64,
+        url: String,
+    },
+    Input {
+        request_id: u64,
+        event: InputEvent,
+    },
+    Render {
+        request_id: u64,
+    },
     // the frames go to a presenter that shows videos under the canvas
+    #[cfg_attr(not(feature = "windowed"), expect(dead_code))]
     Planes,
-    Accessibility { request_id: u64 },
-    NavigationFailure { request_id: u64 },
+    Accessibility {
+        request_id: u64,
+    },
+    NavigationFailure {
+        request_id: u64,
+    },
     // work arrived from another thread
     Wake,
     // an event for the page's ceri.listen callbacks
-    HostEvent { name: String, payload: String },
+    HostEvent {
+        name: String,
+        payload: String,
+    },
     Inspector(crate::devtools::Inbound),
     Shutdown,
 }
@@ -224,6 +245,7 @@ impl EngineWorker {
         let (ready, ready_receiver) = mpsc::channel();
         thread::Builder::new()
             .name("ceri-engine".to_string())
+            .stack_size(ENGINE_STACK)
             .spawn(move || {
                 let browser = match factory() {
                     Ok(browser) => browser,
@@ -267,6 +289,7 @@ impl EngineWorker {
             .map(|registration| registration.id.clone());
         thread::Builder::new()
             .name("ceri-engine".to_string())
+            .stack_size(ENGINE_STACK)
             .spawn(move || {
                 if let Some(target) = target {
                     crate::script::set_frame_id(&target);
@@ -333,6 +356,7 @@ impl EngineWorker {
         Ok(request_id)
     }
 
+    #[cfg(feature = "windowed")]
     pub(crate) fn show_planes(&mut self) -> Result<(), String> {
         self.queue(EngineWorkerCommand::Planes)
     }
@@ -429,6 +453,9 @@ fn run_live_engine_worker(
     // a render asked for before its frame slot opens
     let mut deferred = None;
     let mut fine_timer = false;
+    // whether a frame has been made since the page last rested
+    let mut reserved = false;
+    const REST_AFTER: Duration = Duration::from_secs(1);
     loop {
         // timers, frame callbacks, css animations and the window asking again as each frame
         // lands all tick apart, so a page renders at most once per frame slot
@@ -438,11 +465,20 @@ fn run_live_engine_worker(
             .next_wake()
             .map(|delay| Duration::from_millis(delay.max(1)));
         let wait = wake.into_iter().chain(slot).min();
-        let animating = wait.is_some_and(|wait| wait < frame * 2);
-        hold_fine_timer(&mut fine_timer, animating);
-        if !animating {
+        hold_fine_timer(&mut fine_timer, wait.is_some_and(|wait| wait < frame * 2));
+        // what a frame leaves behind to make the next one cheaper is let go once no frame
+        // has come for a while: frames driven by the pointer or the keyboard come apart
+        // from each other with nothing pending between them
+        let quiet = reserved
+            .then(|| REST_AFTER.saturating_sub(last_frame.map_or(REST_AFTER, |at| at.elapsed())));
+        if quiet == Some(Duration::ZERO) {
             host.browser.rest();
+            reserved = false;
         }
+        let wait = wait
+            .into_iter()
+            .chain(quiet.filter(|quiet| !quiet.is_zero()))
+            .min();
         let command = match held.take().or_else(|| queued.borrow_mut().pop_front()) {
             Some(command) => Some(command),
             None => match wait {
@@ -528,6 +564,7 @@ fn run_live_engine_worker(
                 announced = false;
                 if matches!(result, Ok(Some(_))) {
                     last_frame = Some(started);
+                    reserved = true;
                 }
             }
             if !send(event) {

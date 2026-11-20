@@ -71,8 +71,8 @@ pub use font::{
     FontFace, FontSet, FontSource, FontStack, FontStyle, GlyphBitmap, intern_font_stack,
 };
 pub use host::{
-    EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult, KeyModifiers,
-    PointerButton, RegionPress,
+    ENGINE_STACK, EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult,
+    KeyModifiers, PointerButton, RegionPress,
 };
 pub use image::{icon_png, rasterize_icon};
 pub use inflate::{InflateError, zlib_decompress};
