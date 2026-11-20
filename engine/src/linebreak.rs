@@ -161,9 +161,13 @@ pub(crate) fn break_opportunities(text: &str, word_break: WordBreak) -> Vec<(usi
             back -= 1;
         }
         let across = classes[back];
-        // the class before the pair's before, for the rules that look at a hyphen's
-        // context, or none when the text starts there
-        let behind = index.checked_sub(2).map(|back| classes[back]);
+        // the class before the pair's before, past the marks LB9 attached to it, for the
+        // rules that look at a hyphen's context, or none when the text starts there
+        let mut start = index - 1;
+        while start > 0 && attached[start] {
+            start -= 1;
+        }
+        let behind = start.checked_sub(1).map(|back| classes[back]);
         let spaced = before == SP;
         let decision = decide(Pair {
             before,
@@ -288,7 +292,6 @@ fn decide(pair: Pair) -> Option<Break> {
     }
     // LB20a: a hyphen at the start of a word stays with the letter after it
     let word_initial = matches!(before, HY | HH)
-        && (before != HH || before_char == '\u{2010}')
         && matches!(after, AL | HL)
         && behind.is_none_or(|class| matches!(class, BK | CR | LF | NL | SP | ZW | CB | GL));
     if word_initial {
@@ -410,8 +413,11 @@ mod tests {
         // a word-initial hyphen stays with the letter after it, as with the suffix -ing
         assert_eq!(breaks("free -ing"), vec![5]);
         assert_eq!(breaks("well-known"), vec![5]);
-        // only the plain hyphen of the unambiguous set takes the word-initial rule
-        assert_eq!(breaks("free \u{2012}ing"), vec![5, 8]);
+        // every HH hyphen takes the word-initial rule, figure dash included in unicode 17
+        assert_eq!(breaks("free \u{2012}ing"), vec![5]);
+        // marks attached to the hyphen do not hide what precedes it
+        assert_eq!(breaks("free -\u{0301}ing"), vec![5]);
+        assert_eq!(breaks("\u{05D0}\u{05BE}\u{0301}x y"), vec![8]);
         // a hyphen after a Hebrew letter stays with what follows it
         assert_eq!(breaks("\u{05D0}\u{05D1}\u{05BE}x y"), vec![8]);
         // while a maqaf between hebrew letters may still break after itself

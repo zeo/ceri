@@ -95,6 +95,10 @@ def main():
         raise SystemExit("usage: text_tables.py <ucd directory> <output .rs file>")
     ucd, output = Path(sys.argv[1]), Path(sys.argv[2])
 
+    # the header names the data's version; tables labelled with another would lie
+    header = (ucd / "LineBreak.txt").read_text(encoding="utf-8").splitlines()[0]
+    if header.strip() != f"# LineBreak-{VERSION}.txt":
+        sys.exit(f"LineBreak.txt is {header.strip()!r}, expected version {VERSION}")
     defaults, breaks = read_property(ucd / "LineBreak.txt", set(LINE_BREAK_CLASSES))
     line_break = {}
     for first, last, value in defaults:
