@@ -2121,6 +2121,25 @@ fn index_boxes(
             scroll_size: layout.scroll_content,
         });
     }
+    // what an svg draws has no boxes of its own, so its elements are measured by their shapes
+    for (node, [left, top, right, bottom]) in layout.svg.iter().flat_map(|scene| &scene.extents) {
+        let rect = Rect {
+            x: layout.rect.x + offset.0 + left,
+            y: layout.rect.y + offset.1 + top,
+            width: right - left,
+            height: bottom - top,
+        };
+        index.entry(*node).or_default().push(BoxGeometry {
+            rect,
+            border: ResolvedEdges::default(),
+            position: Position::Static,
+            scrollport: rect,
+            scroll_size: Size {
+                width: rect.width,
+                height: rect.height,
+            },
+        });
+    }
     // text nodes are measured by the runs they produced
     for run in &layout.text {
         let Some(node) = run.node else {
@@ -11832,6 +11851,30 @@ mod tests {
         assert_eq!(line("inline-flex"), 50.0);
         assert_eq!(line("inline-grid"), 50.0);
         assert!(line("inline-block") > 50.0);
+    }
+
+    #[test]
+    fn the_elements_inside_an_svg_are_measured_by_the_shapes_they_draw() {
+        let markup = "<style>* { margin: 0; padding: 0; } svg { display: block; margin: 7px; }</style><svg width='100' height='100' viewBox='0 0 50 50'><g id='g' transform='translate(5 5)'><rect id='r' x='10' y='10' width='20' height='5'/><path id='p' d='M0 0 C 0 20 20 20 20 0'/></g></svg>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let measured = |id: &str| {
+            let rect = index[&document.find_element_by_id(id).expect("element")][0].rect;
+            [rect.x, rect.y, rect.width, rect.height]
+        };
+        assert_eq!(measured("r"), [37.0, 37.0, 40.0, 10.0]);
+        // the curve reaches three quarters of the way to its control points
+        assert_eq!(measured("p"), [17.0, 17.0, 40.0, 30.0]);
+        assert_eq!(measured("g"), [17.0, 17.0, 60.0, 30.0]);
     }
 
     #[test]

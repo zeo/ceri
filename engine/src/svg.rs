@@ -839,6 +839,85 @@ pub(crate) struct Scene {
     // the content box the outer svg maps its viewBox onto, from the border box corner
     pub(crate) viewport: (f32, f32, f32, f32),
     items: Vec<Item>,
+    // the left, top, right and bottom of what each element inside draws, stroke left out, from
+    // the border box corner
+    pub(crate) extents: Vec<(NodeId, Extent)>,
+}
+
+pub(crate) type Extent = [f32; 4];
+
+fn union(first: Option<Extent>, second: Option<Extent>) -> Option<Extent> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some([
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]),
+        (first, second) => first.or(second),
+    }
+}
+
+// the box around a path once `matrix` has placed it, with curves taken to their furthest reach
+fn extent(path: &[Segment], matrix: Affine) -> Option<Extent> {
+    let mut bounds = None;
+    let mut reach = |point: Point| {
+        bounds = union(bounds, Some([point.0, point.1, point.0, point.1]));
+    };
+    let (mut from, mut start) = ((0.0, 0.0), (0.0, 0.0));
+    for segment in path {
+        match *segment {
+            Segment::Move(point) => {
+                from = map(matrix, point);
+                start = from;
+                reach(from);
+            }
+            Segment::Line(point) => {
+                from = map(matrix, point);
+                reach(from);
+            }
+            Segment::Cubic(first, second, end) => {
+                let (first, second, end) =
+                    (map(matrix, first), map(matrix, second), map(matrix, end));
+                let at = |t: f32| {
+                    let u = 1.0 - t;
+                    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+                    (
+                        a * from.0 + b * first.0 + c * second.0 + d * end.0,
+                        a * from.1 + b * first.1 + c * second.1 + d * end.1,
+                    )
+                };
+                // where the curve turns back along either axis
+                for (p0, p1, p2, p3) in [
+                    (from.0, first.0, second.0, end.0),
+                    (from.1, first.1, second.1, end.1),
+                ] {
+                    let (a, b, c) = (
+                        (p3 - p2) - 2.0 * (p2 - p1) + (p1 - p0),
+                        2.0 * ((p2 - p1) - (p1 - p0)),
+                        p1 - p0,
+                    );
+                    let root = (b * b - 4.0 * a * c).max(0.0).sqrt();
+                    let turns = if a.abs() > f32::EPSILON {
+                        [(-b + root) / (2.0 * a), (-b - root) / (2.0 * a)]
+                    } else if b.abs() > f32::EPSILON {
+                        [-c / b; 2]
+                    } else {
+                        [0.0; 2]
+                    };
+                    for t in turns {
+                        if b * b >= 4.0 * a * c && t > 0.0 && t < 1.0 {
+                            reach(at(t));
+                        }
+                    }
+                }
+                from = end;
+                reach(end);
+            }
+            Segment::Close => from = start,
+        }
+    }
+    bounds
 }
 
 pub(crate) type StyleOf<'a> = &'a dyn Fn(NodeId, &Style, f32) -> (Style, f32);
@@ -857,6 +936,7 @@ struct Walk<'a> {
     budget: usize,
     // use targets being expanded, so a reference back into itself stops
     using: Vec<NodeId>,
+    extents: Vec<(NodeId, Extent)>,
 }
 
 // the shapes an outer svg element draws into its content box
@@ -868,6 +948,7 @@ pub(crate) fn build(
     style_of: StyleOf<'_>,
 ) -> Scene {
     let mut items = Vec::new();
+    let mut extents = Vec::new();
     if let Some(element) = document.element(root)
         && let Some(view) = viewport_transform(element, (viewport.2, viewport.3))
     {
@@ -876,6 +957,7 @@ pub(crate) fn build(
             style_of,
             budget: MAX_SCENE_ELEMENTS,
             using: Vec::new(),
+            extents: Vec::new(),
         };
         let frame = Frame {
             transform: multiply(translation(viewport.0, viewport.1), view),
@@ -883,8 +965,13 @@ pub(crate) fn build(
             depth: 0,
         };
         render_children(&mut walk, root, root_style, frame, &mut items);
+        extents = walk.extents;
     }
-    Scene { viewport, items }
+    Scene {
+        viewport,
+        items,
+        extents,
+    }
 }
 
 fn render_children(
@@ -893,11 +980,11 @@ fn render_children(
     style: (&Style, f32),
     frame: Frame,
     items: &mut Vec<Item>,
-) {
+) -> Option<Extent> {
     let children = walk.document.element_children(node).collect::<Vec<_>>();
-    for child in children {
-        render(walk, child, style, frame, items);
-    }
+    children.into_iter().fold(None, |all, child| {
+        union(all, render(walk, child, style, frame, items))
+    })
 }
 
 fn render(
@@ -906,21 +993,18 @@ fn render(
     parent: (&Style, f32),
     frame: Frame,
     items: &mut Vec<Item>,
-) {
+) -> Option<Extent> {
     if walk.budget == 0 || frame.depth >= MAX_DEPTH {
-        return;
+        return None;
     }
     walk.budget -= 1;
     let document = walk.document;
-    let Some(element) = document
+    let element = document
         .element(node)
-        .filter(|element| element.namespace == Namespace::Svg)
-    else {
-        return;
-    };
+        .filter(|element| element.namespace == Namespace::Svg)?;
     let (style, font_size) = (walk.style_of)(node, parent.0, parent.1);
     if style.display == Display::None {
-        return;
+        return None;
     }
     let frame = Frame {
         transform: multiply(frame.transform, local_transform(element, &style, font_size)),
@@ -928,7 +1012,7 @@ fn render(
         ..frame
     };
     let mut own = Vec::new();
-    match element.name.as_str() {
+    let extent = match element.name.as_str() {
         "g" | "a" => render_children(walk, node, (&style, font_size), frame, &mut own),
         "svg" => {
             let x = length_attribute(element, "x", frame.size.0, font_size).unwrap_or(0.0);
@@ -945,25 +1029,29 @@ fn render(
                 frame,
                 (x, y, size),
                 &mut own,
-            );
+            )
         }
         "use" => render_use(walk, element, (&style, font_size), frame, &mut own),
-        _ => {
-            if style.visibility == Visibility::Visible
-                && let Some(path) = shape_path(element, frame.size, font_size)
-            {
+        _ => shape_path(element, frame.size, font_size).and_then(|path| {
+            let extent = extent(&path, frame.transform);
+            if style.visibility == Visibility::Visible {
                 own.push(Item::Shape(painted(path, frame, &style, font_size)));
             }
-        }
+            extent
+        }),
+    };
+    // what a use draws belongs to the use, not to the element it copies
+    if let Some(extent) = extent
+        && walk.using.is_empty()
+    {
+        walk.extents.push((node, extent));
     }
-    if own.is_empty() {
-        return;
-    }
-    if style.opacity < 1.0 {
+    if style.opacity < 1.0 && !own.is_empty() {
         items.push(Item::Group(style.opacity.max(0.0), own));
     } else {
         items.extend(own);
     }
+    extent
 }
 
 // a nested svg or a referenced symbol establishes a new viewport at x y with this size
@@ -974,19 +1062,17 @@ fn nested_viewport(
     frame: Frame,
     (x, y, size): (f32, f32, Point),
     items: &mut Vec<Item>,
-) {
+) -> Option<Extent> {
     if size.0 <= 0.0 || size.1 <= 0.0 {
-        return;
+        return None;
     }
-    let Some(view) = viewport_transform(element, size) else {
-        return;
-    };
+    let view = viewport_transform(element, size)?;
     let frame = Frame {
         transform: multiply(frame.transform, multiply(translation(x, y), view)),
         size: view_box(element).map_or(size, |view| (view.2, view.3)),
         ..frame
     };
-    render_children(walk, node, style, frame, items);
+    render_children(walk, node, style, frame, items)
 }
 
 fn render_use(
@@ -995,30 +1081,29 @@ fn render_use(
     style: (&Style, f32),
     frame: Frame,
     items: &mut Vec<Item>,
-) {
+) -> Option<Extent> {
     let document = walk.document;
-    let Some(target) = element
+    let target = element
         .attr("href")
         .or_else(|| element.attr("xlink:href"))
         .and_then(|href| href.trim().strip_prefix('#'))
-        .and_then(|id| document.find_element_by_id(id))
-    else {
-        return;
-    };
+        .and_then(|id| document.find_element_by_id(id))?;
     if walk.using.contains(&target) {
-        return;
+        return None;
     }
     let length = |name: &str, reference: f32| length_attribute(element, name, reference, style.1);
     let x = length("x", frame.size.0).unwrap_or(0.0);
     let y = length("y", frame.size.1).unwrap_or(0.0);
     walk.using.push(target);
-    match document.element(target) {
+    let extent = match document.element(target) {
         Some(symbol)
             if symbol.namespace == Namespace::Svg
                 && matches!(symbol.name.as_str(), "symbol" | "svg") =>
         {
             let (symbol_style, font_size) = (walk.style_of)(target, style.0, style.1);
-            if symbol_style.display != Display::None {
+            if symbol_style.display == Display::None {
+                None
+            } else {
                 let side = |name: &str, reference: f32| {
                     length(name, reference)
                         .or_else(|| length_attribute(symbol, name, reference, font_size))
@@ -1032,7 +1117,7 @@ fn render_use(
                     frame,
                     (x, y, size),
                     items,
-                );
+                )
             }
         }
         _ => {
@@ -1040,10 +1125,11 @@ fn render_use(
                 transform: multiply(frame.transform, translation(x, y)),
                 ..frame
             };
-            render(walk, target, style, frame, items);
+            render(walk, target, style, frame, items)
         }
-    }
+    };
     walk.using.pop();
+    extent
 }
 
 fn painted(path: Vec<Segment>, frame: Frame, style: &Style, font_size: f32) -> Shape {
