@@ -3959,16 +3959,16 @@ fn paint_box_surface(
             width: padding_box.width,
             height: padding_box.height,
         };
+        let mut fitted = fitted_placement(content, &layer.image, layout_box.object_fit);
+        if layout_box.tag == "video" {
+            fitted = whole_sized(fitted, canvas.scale);
+        }
         paint_image(
             canvas,
             ImageDraw {
                 image: &layer.image,
                 // chromium draws replaced images into their pixel-snapped rect
-                placement: canvas.snap_rect(fitted_placement(
-                    content,
-                    &layer.image,
-                    layout_box.object_fit,
-                )),
+                placement: canvas.snap_rect(fitted),
                 area: surface,
                 clip: content_clip,
                 opacity,
@@ -5007,6 +5007,16 @@ fn intersect_rect(first: Rect, second: Rect) -> Rect {
     }
 }
 
+// chromium rounds the size of a video's fitted rect to whole device pixels and keeps its
+// offset, before the rect snaps, so a frame is as wide wherever a fraction puts the box
+fn whole_sized(rect: Rect, scale: f32) -> Rect {
+    Rect {
+        width: (rect.width * scale).round() / scale,
+        height: (rect.height * scale).round() / scale,
+        ..rect
+    }
+}
+
 // where object-fit puts the image inside the content box, centered as object-position defaults
 // blink's object-fit in 1/64 px layout units: the constrained side by integer muldiv and the
 // centring offset truncated, so the rect snaps to the pixels chromium paints
@@ -5640,6 +5650,27 @@ fn glyph_rows(character: char) -> [u8; 7] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_video_frame_takes_a_whole_number_of_device_pixels_from_its_fitted_offset() {
+        // a 16:9 frame contained in a 3464 by 1948 box at 56, 78
+        let fitted = super::Rect {
+            x: 56.444,
+            y: 78.0,
+            width: 3463.111,
+            height: 1948.0,
+        };
+        let sized = super::whole_sized(fitted, 1.0);
+        assert_eq!(
+            (sized.x, sized.width, sized.height),
+            (56.444, 3463.0, 1948.0)
+        );
+        // the right edge then snaps to 3519, where snapping the fitted rect gave 3520
+        assert_eq!((sized.x + sized.width).round(), 3519.0);
+        assert_eq!((fitted.x + fitted.width).round(), 3520.0);
+        let dense = super::whole_sized(fitted, 1.5);
+        assert_eq!(dense.width * 1.5, 5195.0);
+    }
+
     use super::*;
 
     // how much of a pixel a shape covers once blurred by a gaussian of deviation `sigma`, in
