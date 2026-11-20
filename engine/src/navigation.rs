@@ -6993,6 +6993,30 @@ mod tests {
     }
 
     #[test]
+    fn a_control_takes_its_own_font_and_line_height_where_the_page_sets_others() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { font: italic bold 20px/1.45 Georgia, serif }</style><button id="press">B</button><input id="field"><p id="status">idle</p><script>
+                const read = (id) => {
+                    const style = getComputedStyle(document.getElementById(id));
+                    return [style.fontStyle, style.fontWeight, style.fontSize, style.lineHeight, style.fontFamily].join(" ");
+                };
+                document.getElementById("status").textContent = read("press") + "|" + read("field");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        let control = "normal 400 13.3333px normal Arial";
+        assert_eq!(
+            document.element_text_content(status),
+            Some(format!("{control}|{control}"))
+        );
+    }
+
+    #[test]
     fn computed_fonts_serialize_and_element_from_point_hits_as_chrome_does() {
         let mut browser = Browser::new(bundle(
             r#"<style>body { margin: 0; font: 13px/1.4 "Lucida Grande", Lucida Sans Unicode, sans-serif } #head { height: 20px; font-size: 10px; letter-spacing: .06em } button { font: inherit } .same { font-family: inherit }</style><div id="head">A</div><button id="press">B</button><span class="same" id="note">C</span><p id="status">idle</p><script>

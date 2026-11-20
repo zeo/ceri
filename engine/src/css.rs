@@ -6085,7 +6085,7 @@ dialog:not([open]), input[type="hidden" i], datalist, template { display: none }
 dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 1em; background-color: white; color: black }
 dialog:modal { position: fixed; overflow: auto; top: 0; bottom: 0; max-width: calc(100% - 6px - 2em); max-height: calc(100% - 6px - 2em); user-select: text; visibility: visible }
 dialog:modal::backdrop { display: block; position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.1) }
-input, button, select, textarea { font-size: 13.333px; font-family: sans-serif; color: black; letter-spacing: normal; text-transform: none; text-align: start; margin: 0 }
+input, button, select, textarea { font-style: normal; font-weight: 400; font-size: 13.3333px; line-height: normal; font-family: Arial; color: black; letter-spacing: normal; word-spacing: normal; text-transform: none; text-indent: 0; text-shadow: none; text-align: start; margin: 0 }
 input, textarea, select, button, meter, progress { display: inline-block; cursor: default }
 input:not([type]), input[type="text" i], input[type="search" i], input[type="email" i], input[type="url" i], input[type="tel" i], input[type="password" i], input[type="number" i], input[type="date" i], input[type="datetime-local" i], input[type="month" i], input[type="week" i], input[type="time" i], textarea {
   padding: 1px 2px; border: 1px solid #767676; border-radius: 2px; background-color: white; cursor: text
