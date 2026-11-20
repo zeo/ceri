@@ -2969,9 +2969,7 @@ impl Browser {
             }
             (crate::paint::Damage::Areas(areas), Some(mut last)) => {
                 let canvas = Arc::make_mut(&mut last.canvas);
-                for area in areas {
-                    crate::paint::repaint(canvas, &layout, &canvases, area);
-                }
+                crate::paint::repaint_areas(canvas, &layout, &canvases, &areas);
                 last.canvas
             }
             _ => Arc::new(crate::paint::paint_with_canvases(
@@ -7741,6 +7739,43 @@ mod tests {
             .borrow_mut()
             .set_attribute(text, "hidden", String::new());
         assert!(!Rc::ptr_eq(&hovered, &browser.layout(viewport).unwrap()));
+    }
+
+    #[test]
+    fn a_frame_changed_in_two_places_is_one_revision_of_two_boxes() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>body { margin: 0 }
+            div { position: absolute; width: 10px; height: 10px; background: red }</style>
+            <div id="near" style="left: 0; top: 0"></div>
+            <div id="far" style="left: 200px; top: 150px"></div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 320.0,
+            height: 180.0,
+        };
+        let shown = browser.paint(viewport).unwrap().revision().id;
+        let document = browser.document().unwrap();
+        for id in ["near", "far"] {
+            let node = document.borrow().find_element_by_id(id).unwrap();
+            document
+                .borrow_mut()
+                .set_style_property(node, "background", "blue".to_string());
+        }
+        let (base, boxes) = browser
+            .paint(viewport)
+            .unwrap()
+            .revision()
+            .changed
+            .expect("the frame should repaint over the last");
+        assert_eq!(base, shown);
+        // each square with the margin a repaint leaves around what changed
+        assert_eq!(
+            boxes.iter().collect::<Vec<_>>(),
+            [[0, 0, 26, 26], [184, 134, 226, 176]]
+        );
     }
 
     #[test]

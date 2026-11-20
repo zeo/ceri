@@ -168,7 +168,7 @@ impl Presenter {
     }
 
     // uploads premultiplied RGBA pixels and presents them on the next vsync; with the canvas
-    // revision only the box changed since the shown one is uploaded
+    // revision only the boxes changed since the shown one are uploaded
     pub(crate) fn present(
         &mut self,
         rgba: &[u8],
@@ -209,45 +209,34 @@ impl Presenter {
                 frame
             }
         };
-        let upload = match revision {
+        let uploads = match revision {
             Some(revision) if self.shown == Some(revision.id) => return Ok(()),
             Some(Revision {
-                changed: Some((base, [left, top, right, bottom])),
+                changed: Some((base, boxes)),
                 ..
-            }) if self.shown == Some(base) => {
-                // a box reaching the canvas edge reaches the edge pixels repeated past it
-                let right = if right >= width { columns } else { right };
-                let bottom = if bottom >= height { rows } else { bottom };
-                [left, top, right.min(columns), bottom.min(rows)]
-            }
-            _ => whole,
+            }) if self.shown == Some(base) => boxes
+                .iter()
+                .map(|[left, top, right, bottom]| {
+                    // a box reaching the canvas edge reaches the edge pixels repeated past it
+                    let right = if right >= width { columns } else { right };
+                    let bottom = if bottom >= height { rows } else { bottom };
+                    [left, top, right.min(columns), bottom.min(rows)]
+                })
+                .filter(|[left, top, right, bottom]| left < right && top < bottom)
+                .collect(),
+            _ => vec![whole],
         };
         self.shown = revision.map(|revision| revision.id);
-        let [left, top, right, bottom] = upload;
-        if left >= right || top >= bottom {
+        let Some(upload) = uploads.iter().copied().reduce(|all, next| {
+            [
+                all[0].min(next[0]),
+                all[1].min(next[1]),
+                all[2].max(next[2]),
+                all[3].max(next[3]),
+            ]
+        }) else {
             return Ok(());
-        }
-        // a canvas a pixel short of the surface after rounding repeats its edge, since flip
-        // model back buffers start undefined
-        let row_bytes = (right - left) as usize * 4;
-        self.staging.clear();
-        self.staging.resize(row_bytes * (bottom - top) as usize, 0);
-        for (row, target) in (top..bottom).zip(self.staging.chunks_exact_mut(row_bytes)) {
-            let source_row = row.min(height - 1) as usize * width as usize * 4;
-            let source = &rgba[source_row..source_row + width as usize * 4];
-            for (column, to) in (left..right).zip(target.as_chunks_mut::<4>().0.iter_mut()) {
-                let from = &source[column.min(width - 1) as usize * 4..][..4];
-                *to = [from[2], from[1], from[0], from[3]];
-            }
-        }
-        let last = self.last_box;
-        let copied = [
-            left.min(last[0]),
-            top.min(last[1]),
-            right.max(last[2]),
-            bottom.max(last[3]),
-        ];
-        self.last_box = upload;
+        };
         let region = |[left, top, right, bottom]: [u32; 4]| D3D11_BOX {
             left,
             top,
@@ -256,23 +245,51 @@ impl Presenter {
             bottom,
             back: 1,
         };
+        for &[left, top, right, bottom] in &uploads {
+            // a canvas a pixel short of the surface after rounding repeats its edge, since
+            // flip model back buffers start undefined
+            let row_bytes = (right - left) as usize * 4;
+            self.staging.clear();
+            self.staging.resize(row_bytes * (bottom - top) as usize, 0);
+            for (row, target) in (top..bottom).zip(self.staging.chunks_exact_mut(row_bytes)) {
+                let source_row = row.min(height - 1) as usize * width as usize * 4;
+                let source = &rgba[source_row..source_row + width as usize * 4];
+                for (column, to) in (left..right).zip(target.as_chunks_mut::<4>().0.iter_mut()) {
+                    let from = &source[column.min(width - 1) as usize * 4..][..4];
+                    *to = [from[2], from[1], from[0], from[3]];
+                }
+            }
+            // SAFETY: the staging buffer holds the boxed rows at row_bytes each, and the box
+            // lies inside the frame texture, which has the surface size
+            unsafe {
+                self.context.UpdateSubresource(
+                    &frame,
+                    0,
+                    Some(&region([left, top, right, bottom])),
+                    self.staging.as_ptr().cast(),
+                    row_bytes as u32,
+                    0,
+                );
+            }
+        }
+        // the back buffer is two frames old, so it takes the boxes of the last frame too
+        let last = self.last_box;
+        let copied = [
+            upload[0].min(last[0]),
+            upload[1].min(last[1]),
+            upload[2].max(last[2]),
+            upload[3].max(last[3]),
+        ];
+        self.last_box = upload;
         let mut dirty = RECT {
             left: copied[0] as i32,
             top: copied[1] as i32,
             right: copied[2] as i32,
             bottom: copied[3] as i32,
         };
-        // SAFETY: the staging buffer holds the boxed rows at row_bytes each, both boxes lie
-        // inside textures of the surface size, and the dirty rect outlives the present
+        // SAFETY: the copied box lies inside textures of the surface size, and the dirty rect
+        // outlives the present
         unsafe {
-            self.context.UpdateSubresource(
-                &frame,
-                0,
-                Some(&region(upload)),
-                self.staging.as_ptr().cast(),
-                row_bytes as u32,
-                0,
-            );
             let buffer: ID3D11Texture2D = self
                 .swapchain
                 .GetBuffer(0)

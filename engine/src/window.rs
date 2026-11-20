@@ -93,9 +93,8 @@ impl Output {
                     .map_err(|error| format!("window surface buffer failed: {error}"))?;
                 let changed = match revision.changed {
                     // a buffer presented last holds the shown revision outside the box
-                    Some((base, [left, top, right, bottom]))
-                        if buffer.age() == 1 && *shown == Some((base, size)) =>
-                    {
+                    Some((base, boxes)) if buffer.age() == 1 && *shown == Some((base, size)) => {
+                        let [left, top, right, bottom] = boxes.bounds();
                         [left, top, right.min(size.0), bottom.min(size.1)]
                     }
                     _ => [0, 0, size.0, size.1],

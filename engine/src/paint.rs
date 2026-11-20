@@ -64,12 +64,64 @@ fn overlaps(one: [u32; 4], other: [u32; 4]) -> bool {
 }
 
 // numbers what a canvas shows, so a presenter that holds the pixels numbered before can upload
-// only the device box that changed since
+// only the device boxes that changed since
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Revision {
     pub(crate) id: u64,
-    // the revision this one was painted over, and the left, top, right and bottom it repainted
-    pub(crate) changed: Option<(u64, [u32; 4])>,
+    // the revision this one was painted over, and the boxes it repainted
+    pub(crate) changed: Option<(u64, Boxes)>,
+}
+
+// the device boxes a frame repainted, each its left, top, right and bottom; a frame damages
+// only a few areas, and past that many the last box grows to take the rest in
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Boxes {
+    boxes: [[u32; 4]; Region::LIMIT],
+    count: usize,
+}
+
+impl Boxes {
+    fn push(&mut self, added: [u32; 4]) {
+        if self.count < self.boxes.len() {
+            self.boxes[self.count] = added;
+            self.count += 1;
+        } else {
+            let last = &mut self.boxes[self.count - 1];
+            *last = [
+                last[0].min(added[0]),
+                last[1].min(added[1]),
+                last[2].max(added[2]),
+                last[3].max(added[3]),
+            ];
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = [u32; 4]> + '_ {
+        self.boxes[..self.count].iter().copied()
+    }
+
+    // the one box around them all
+    #[cfg_attr(not(feature = "windowed"), expect(dead_code))]
+    pub(crate) fn bounds(&self) -> [u32; 4] {
+        self.iter()
+            .reduce(|all, next| {
+                [
+                    all[0].min(next[0]),
+                    all[1].min(next[1]),
+                    all[2].max(next[2]),
+                    all[3].max(next[3]),
+                ]
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl From<[u32; 4]> for Boxes {
+    fn from(only: [u32; 4]) -> Self {
+        let mut boxes = Self::default();
+        boxes.push(only);
+        boxes
+    }
 }
 
 fn next_revision() -> u64 {
@@ -2463,11 +2515,36 @@ pub(crate) fn repaint(
     }
     canvas.revision = Revision {
         id: next_revision(),
-        changed: Some((
-            canvas.revision.id,
-            [kept.left, kept.top, kept.right, kept.bottom],
-        )),
+        changed: Some((canvas.revision.id, kept_box.into())),
     };
+}
+
+// repaints each area and numbers the result as one change to what the canvas showed, so a
+// presenter holding that uploads the repainted boxes and nothing between them
+pub(crate) fn repaint_areas(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+    areas: &[Rect],
+) {
+    let shown = canvas.revision.id;
+    let mut boxes = Boxes::default();
+    for &area in areas {
+        let last = canvas.revision.id;
+        repaint(canvas, document, canvases, area);
+        match canvas.revision.changed {
+            _ if canvas.revision.id == last => {}
+            Some((_, repainted)) => repainted.iter().for_each(|next| boxes.push(next)),
+            // the repaint fell back to painting everything
+            None => return,
+        }
+    }
+    if boxes.count > 0 {
+        canvas.revision = Revision {
+            id: next_revision(),
+            changed: Some((shown, boxes)),
+        };
+    }
 }
 
 // a frame laid out from the last one by moving one scroller's content a whole number of device
@@ -2833,7 +2910,7 @@ pub(crate) fn scroll(
     }
     canvas.revision = Revision {
         id: next_revision(),
-        changed: Some((shown, changed)),
+        changed: Some((shown, changed.into())),
     };
 }
 
