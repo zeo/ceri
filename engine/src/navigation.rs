@@ -8305,6 +8305,33 @@ mod tests {
     }
 
     #[test]
+    fn computed_display_is_block_level_for_items_floats_and_out_of_flow_boxes() {
+        let mut browser = Browser::new(bundle(
+            r##"<span id="plain">a</span>
+            <div style="display: flex"><span id="item">b</span></div>
+            <div style="display: grid"><span id="cell" style="display: inline-flex">c</span></div>
+            <span id="float" style="float: left">d</span>
+            <span id="absolute" style="position: absolute; display: inline-block">e</span>
+            <p id="status"></p><script>
+                document.getElementById("status").textContent =
+                    ["plain", "item", "cell", "float", "absolute"]
+                        .map((id) => getComputedStyle(document.getElementById(id)).display)
+                        .join(" ") + " " + getComputedStyle(document.documentElement).display;
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().unwrap();
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").unwrap();
+        assert_eq!(
+            document.text_content(status),
+            "inline block flex block block block"
+        );
+    }
+
+    #[test]
     fn animation_frames_come_as_often_as_the_display_refreshes() {
         assert_eq!(
             [30_000, 60_000, 120_000, 144_000, 240_000, 500_000].map(frame_interval),

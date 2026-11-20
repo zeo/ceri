@@ -766,6 +766,22 @@ impl ScriptRuntime {
             .filter(|&ancestor| document.element(ancestor).is_some())
             .map(declared)
             .collect::<Vec<_>>();
+        let item = document
+            .parent_element(node)
+            .and_then(|parent| inputs.stylesheet.computed_style(&document, parent, &state))
+            .is_some_and(|(parent, _)| {
+                matches!(
+                    parent.display,
+                    crate::Display::Flex
+                        | crate::Display::InlineFlex
+                        | crate::Display::Grid
+                        | crate::Display::InlineGrid
+                )
+            });
+        let blockified = item
+            || style.float != crate::css::Float::None
+            || style.position.is_out_of_flow()
+            || document.document_element() == Some(node);
         drop(document);
         let inherited = |property: &str| {
             std::iter::once(&own)
@@ -789,6 +805,7 @@ impl ScriptRuntime {
             margin,
             inherited: &inherited,
             own: &own,
+            blockified,
         };
         for &property in COMPUTED {
             let value = computed_value(property, &computed);
@@ -1167,6 +1184,9 @@ struct ComputedInputs<'a> {
     margin: crate::layout::ResolvedEdges,
     inherited: &'a dyn Fn(&str) -> Option<String>,
     own: &'a BTreeMap<String, String>,
+    // a flex or grid item, a float, an out of flow box and the root compute to a block-level
+    // display whatever they declare
+    blockified: bool,
 }
 
 fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
@@ -1178,6 +1198,7 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
         margin,
         inherited,
         own,
+        blockified,
     } = *inputs;
     let border = geometry.map_or_else(|| used_border(style), |geometry| geometry.border);
     let border_widths = [border.top, border.right, border.bottom, border.left];
@@ -1193,7 +1214,17 @@ fn computed_value(property: &str, inputs: &ComputedInputs<'_>) -> String {
             .map_or_else(|| "auto".to_string(), px)
     };
     match property {
-        "display" => style.display.name().to_string(),
+        "display" => match style.display {
+            crate::Display::Inline | crate::Display::InlineBlock if blockified => {
+                crate::Display::Block
+            }
+            crate::Display::InlineFlex if blockified => crate::Display::Flex,
+            crate::Display::InlineGrid if blockified => crate::Display::Grid,
+            crate::Display::InlineTable if blockified => crate::Display::Table,
+            display => display,
+        }
+        .name()
+        .to_string(),
         "position" => match style.position {
             Position::Static => "static",
             Position::Relative => "relative",
