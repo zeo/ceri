@@ -74,24 +74,40 @@ pub fn enable(on: bool) {
     OPEN.with(|open| open.borrow_mut().clear());
 }
 
-// one line per phase, the most time of its own first: milliseconds per frame of its own and
-// with what it called, and calls per frame
-pub fn report(frames: usize) -> String {
-    let frames = frames.max(1) as f64;
+// what each phase has added up since collecting began, the most time of its own first: its
+// name, the seconds of its own, the seconds with what it called, and its calls
+pub fn phases() -> Vec<(&'static str, f64, f64, u64)> {
     let mut phases = PHASES.with(|phases| phases.borrow().clone());
     phases.sort_by_key(|phase| std::cmp::Reverse(phase.total.saturating_sub(phase.nested)));
+    phases
+        .into_iter()
+        .map(|phase| {
+            let own = phase.total.saturating_sub(phase.nested);
+            (
+                phase.name,
+                own as f64 / 1e9,
+                phase.total as f64 / 1e9,
+                phase.calls,
+            )
+        })
+        .collect()
+}
+
+// one line per phase: milliseconds per frame of its own and with what it called, and calls
+// per frame
+pub fn report(frames: usize) -> String {
+    let frames = frames.max(1) as f64;
     let mut lines = vec![format!(
         "{:<28} {:>9} {:>9} {:>9}",
         "phase", "self ms", "total ms", "calls"
     )];
-    for phase in phases {
-        let own = phase.total.saturating_sub(phase.nested);
+    for (name, own, total, calls) in phases() {
         lines.push(format!(
             "{:<28} {:>9.3} {:>9.3} {:>9.1}",
-            phase.name,
-            own as f64 / 1e6 / frames,
-            phase.total as f64 / 1e6 / frames,
-            phase.calls as f64 / frames
+            name,
+            own * 1e3 / frames,
+            total * 1e3 / frames,
+            calls as f64 / frames
         ));
     }
     lines.join("\n")

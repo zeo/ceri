@@ -265,6 +265,12 @@ impl Browser {
             | "Inspector.disable"
             | "Emulation.setFocusEmulationEnabled" => Some(Ok(json!({}))),
             "Emulation.setEmulatedMedia" => Some(self.emulate_media(params)),
+            // the engine's phase profiler, which collects from the moment it is enabled
+            "Performance.enable" | "Performance.disable" => {
+                crate::profile::enable(method == "Performance.enable");
+                Some(Ok(json!({})))
+            }
+            "Performance.getMetrics" => Some(Ok(json!({ "metrics": performance_metrics() }))),
             "Page.setLifecycleEventsEnabled" => {
                 let enabled = params["enabled"] == true;
                 if let Some(held) = self.session(session) {
@@ -704,6 +710,40 @@ fn error(id: u64, code: i64, message: &str) -> Json {
     json!({ "id": id, "error": { "code": code, "message": message } })
 }
 
+// the profiler's phases as devtools metrics: the names tools already read, from the phases
+// that match them, then every phase under its own name with the seconds of its own, the
+// seconds with what it called, and its calls
+fn performance_metrics() -> Vec<Json> {
+    let phases = crate::profile::phases();
+    let of = |name: &str| {
+        phases
+            .iter()
+            .find(|phase| phase.0 == name)
+            .map_or((0.0, 0), |&(_, _, total, calls)| (total, calls))
+    };
+    let style = phases
+        .iter()
+        .filter(|phase| phase.0.starts_with("style: "))
+        .fold((0.0, 0), |sum, &(_, own, _, calls)| {
+            (sum.0 + own, sum.1 + calls)
+        });
+    let metric = |name: String, value: f64| json!({ "name": name, "value": value });
+    let mut metrics = vec![
+        metric("Frames".to_string(), of("frame: paint").1 as f64),
+        metric("LayoutCount".to_string(), of("layout").1 as f64),
+        metric("LayoutDuration".to_string(), of("layout").0),
+        metric("RecalcStyleCount".to_string(), style.1 as f64),
+        metric("RecalcStyleDuration".to_string(), style.0),
+        metric("ScriptDuration".to_string(), of("script: tick").0),
+    ];
+    for (name, own, total, calls) in phases {
+        metrics.push(metric(format!("{name} self"), own));
+        metrics.push(metric(format!("{name} total"), total));
+        metrics.push(metric(format!("{name} calls"), calls as f64));
+    }
+    metrics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +792,47 @@ mod tests {
             .find(|message| message["id"] == id)
             .unwrap_or_else(|| panic!("no answer to {id} in {messages:?}"));
         &answer["result"]
+    }
+
+    #[test]
+    fn performance_metrics_report_the_phases_of_the_frames_since_enabling() {
+        let (mut browser, messages) = inspected("<p>measured</p>");
+        call(&mut browser, &messages, 1, "Performance.enable", json!({}));
+        let viewport = crate::layout::Size {
+            width: 200.0,
+            height: 100.0,
+        };
+        browser.paint(viewport).expect("the page should paint");
+        let sent = call(
+            &mut browser,
+            &messages,
+            2,
+            "Performance.getMetrics",
+            json!({}),
+        );
+        let metrics = result(&sent, 2)["metrics"].as_array().unwrap().clone();
+        let value = |name: &str| {
+            metrics
+                .iter()
+                .find(|metric| metric["name"] == name)
+                .unwrap_or_else(|| panic!("no {name} among {metrics:?}"))["value"]
+                .as_f64()
+                .unwrap()
+        };
+        assert_eq!(value("Frames"), 1.0);
+        assert_eq!(value("LayoutCount"), 1.0);
+        assert!(value("LayoutDuration") > 0.0);
+        assert!(value("paint: whole frame total") >= value("paint: whole frame self"));
+        assert_eq!(value("paint: whole frame calls"), 1.0);
+        call(&mut browser, &messages, 3, "Performance.disable", json!({}));
+        let sent = call(
+            &mut browser,
+            &messages,
+            4,
+            "Performance.getMetrics",
+            json!({}),
+        );
+        assert_eq!(result(&sent, 4)["metrics"].as_array().unwrap().len(), 6);
     }
 
     #[test]
