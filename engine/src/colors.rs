@@ -861,6 +861,50 @@ fn hex(digits: &str) -> Option<Color> {
 }
 
 // a CSS color, with currentColor resolving to the element's color
+thread_local! {
+    static SYSTEM: std::cell::Cell<crate::css::SystemColors> =
+        std::cell::Cell::new(crate::css::SystemColors::for_scheme(crate::css::ColorScheme::Light));
+}
+
+// the palette the system colour keywords read, set by the style pass that is running
+pub(crate) fn use_system_colors(colors: crate::css::SystemColors) {
+    SYSTEM.with(|system| system.set(colors));
+}
+
+// a system colour keyword, the deprecated ones standing for what css color 4 maps them to
+fn system(name: &str) -> Option<Color> {
+    let colors = SYSTEM.with(std::cell::Cell::get);
+    Some(match name {
+        "canvas" | "activecaption" | "appworkspace" | "background" | "inactivecaption"
+        | "infobackground" | "menu" | "scrollbar" | "window" => colors.canvas,
+        "canvastext" | "captiontext" | "infotext" | "menutext" | "windowtext" => colors.canvas_text,
+        "linktext" => colors.link_text,
+        "visitedtext" => colors.visited_text,
+        "activetext" => colors.active_text,
+        "graytext" | "inactivecaptiontext" => colors.gray_text,
+        "highlight" | "selecteditem" | "accentcolor" => colors.highlight,
+        "highlighttext" | "selecteditemtext" | "accentcolortext" => colors.highlight_text,
+        "buttonface" | "buttonhighlight" | "buttonshadow" | "threedface" => colors.button_face,
+        "buttontext" => colors.button_text,
+        "buttonborder" | "activeborder" | "inactiveborder" | "threeddarkshadow"
+        | "threedhighlight" | "threedlightshadow" | "threedshadow" | "windowframe" => {
+            colors.button_border
+        }
+        "field" => colors.field,
+        "fieldtext" => colors.field_text,
+        "mark" => Color::opaque(255, 255, 0),
+        "marktext" => Color::opaque(0, 0, 0),
+        _ => return None,
+    })
+}
+
+// whether a declared value names a system colour, which forced colours leave standing
+pub(crate) fn names_system_color(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .any(|word| system(&word.to_ascii_lowercase()).is_some())
+}
+
 pub(crate) fn parse(input: &str, current: Color) -> Option<Color> {
     let input = input.trim().to_ascii_lowercase();
     if let Some(digits) = input.strip_prefix('#') {
@@ -881,7 +925,7 @@ pub(crate) fn parse(input: &str, current: Color) -> Option<Color> {
             _ => lab_function(lab_family(name)?, inner).map(Components::color),
         };
     }
-    named(&input)
+    system(&input).or_else(|| named(&input))
 }
 
 #[cfg(test)]

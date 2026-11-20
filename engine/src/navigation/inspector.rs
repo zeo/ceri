@@ -482,7 +482,11 @@ impl Browser {
                 ("prefers-color-scheme", "dark") => preferences.color_scheme = ColorScheme::Dark,
                 ("prefers-reduced-motion", "reduce") => preferences.reduced_motion = true,
                 ("prefers-reduced-motion", "no-preference") => preferences.reduced_motion = false,
-                ("forced-colors", "none") | ("prefers-contrast", "no-preference") => {}
+                ("forced-colors", "active") => {
+                    preferences.forced_colors = Some(crate::css::SystemColors::high_contrast());
+                }
+                ("forced-colors", "none") => preferences.forced_colors = None,
+                ("prefers-contrast", "no-preference") => {}
                 (name, _) => return unsupported(name),
             }
         }

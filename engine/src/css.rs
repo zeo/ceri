@@ -802,11 +802,19 @@ struct Matching {
     control_values: BTreeMap<NodeId, String>,
     viewport: (u32, u32),
     color_scheme: ColorScheme,
+    forced_colors: Option<SystemColors>,
     reduced_motion: bool,
     root: Option<NodeId>,
     container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
     top_layer: Vec<NodeId>,
     forced: BTreeMap<NodeId, BTreeSet<&'static str>>,
+}
+
+impl StyleState {
+    pub(crate) fn system_colors(&self) -> SystemColors {
+        self.forced_colors
+            .unwrap_or_else(|| SystemColors::for_scheme(self.color_scheme))
+    }
 }
 
 impl Matching {
@@ -827,6 +835,7 @@ impl Matching {
                 state.viewport_height.to_bits(),
             ),
             color_scheme: state.color_scheme,
+            forced_colors: state.forced_colors,
             reduced_motion: state.reduced_motion,
             root: state.root,
             container_sizes: state.container_sizes.clone(),
@@ -1049,6 +1058,8 @@ pub(crate) struct InheritedText {
     pub(crate) drag_region: bool,
     pub(crate) pointer_events: bool,
     pub(crate) selectable: bool,
+    // forced-color-adjust: none, under which forced colours leave the author's standing
+    pub(crate) keep_colors: bool,
     pub(crate) list_style_type: ListStyleType,
     pub(crate) list_inside: bool,
     pub(crate) border_collapse: bool,
@@ -1084,6 +1095,7 @@ impl Default for InheritedText {
             drag_region: false,
             pointer_events: true,
             selectable: true,
+            keep_colors: false,
             list_style_type: ListStyleType::Disc,
             list_inside: false,
             border_collapse: false,
@@ -1118,6 +1130,7 @@ pub(crate) fn inherited_text(style: &Style) -> InheritedText {
         drag_region: style.drag_region,
         pointer_events: style.pointer_events,
         selectable: style.selectable,
+        keep_colors: style.keep_colors,
         list_style_type: style.list_style_type,
         list_inside: style.list_inside,
         border_collapse: style.border_collapse,
@@ -1315,6 +1328,8 @@ pub(crate) struct StyleState {
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
     pub(crate) color_scheme: ColorScheme,
+    // the user's palette while the system forces colours, as windows high contrast does
+    pub(crate) forced_colors: Option<SystemColors>,
     pub(crate) reduced_motion: bool,
     pub(crate) clock: u64,
     pub(crate) transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
@@ -1577,6 +1592,7 @@ pub(crate) struct Style {
     // pointer-events other than none, and user-select other than none
     pub(crate) pointer_events: bool,
     pub(crate) selectable: bool,
+    pub(crate) keep_colors: bool,
     pub float: Float,
     pub clear: Clear,
     pub list_style_type: ListStyleType,
@@ -1777,6 +1793,7 @@ impl Style {
             },
             pointer_events: parent_text.pointer_events,
             selectable: parent_text.selectable,
+            keep_colors: parent_text.keep_colors,
             float: Float::None,
             clear: Clear::None,
             list_style_type: parent_text.list_style_type,
@@ -2730,7 +2747,9 @@ impl Stylesheet {
         {
             style.display = Display::None;
         }
+        crate::colors::use_system_colors(state.system_colors());
         let values = self.cascaded_values(document, node, pseudo, state);
+        let cascaded = values.clone();
         let empty_properties = BTreeMap::new();
         let custom_properties =
             inherited_custom_properties(state, document, node).unwrap_or(&empty_properties);
@@ -2909,6 +2928,70 @@ impl Stylesheet {
                 .resolve(font_size, font_size)
                 .unwrap_or_else(|| crate::layout::normal_line_height(style.font_family, font_size));
             style.line_height = Length::px(height);
+        }
+        if let Some(palette) = state.forced_colors.filter(|_| !style.keep_colors) {
+            // a colour the author gave as a system colour stands, any other is forced
+            let stands = |properties: &[&str]| {
+                cascaded.iter().any(|(property, (_, _, value))| {
+                    properties.iter().any(|prefix| property.starts_with(prefix))
+                        && resolve_custom_value(value, custom_properties)
+                            .is_some_and(|value| crate::colors::names_system_color(&value))
+                })
+            };
+            let element = own.and_then(|node| document.element(node));
+            let attribute = |name: &str| element.and_then(|element| element.attr(name));
+            let kind = attribute("type").unwrap_or("").to_ascii_lowercase();
+            let (text, back) = match element.map_or("", |element| element.name.as_str()) {
+                _ if own.is_some_and(|node| state.disabled.contains(&node)) => {
+                    (palette.gray_text, palette.canvas)
+                }
+                "a" | "area" if attribute("href").is_some() => (palette.link_text, palette.canvas),
+                "button" | "select" => (palette.button_text, palette.button_face),
+                "input" if matches!(kind.as_str(), "button" | "submit" | "reset") => {
+                    (palette.button_text, palette.button_face)
+                }
+                "input" | "textarea" => (palette.field_text, palette.field),
+                // anything else takes its text colour from where it sits
+                _ if own.is_none() || element.is_none() => (parent_color, palette.canvas),
+                _ => (palette.canvas_text, palette.canvas),
+            };
+            let inherits = !matches!(
+                element.map_or("", |element| element.name.as_str()),
+                "a" | "area" | "button" | "select" | "input" | "textarea"
+            ) && !own.is_some_and(|node| state.disabled.contains(&node))
+                && document.parent_element(node).is_some();
+            if !stands(&["color"]) {
+                // a forced colour inherits like any other, so a link's text stays a link's
+                style.color = if inherits { parent_color } else { text };
+            }
+            if !stands(&["background"]) && style.background.alpha > 0 {
+                style.background = Color {
+                    alpha: style.background.alpha,
+                    ..back
+                };
+            }
+            if !stands(&["border"]) {
+                for side in &mut style.border {
+                    side.color = None;
+                }
+            }
+            if !stands(&["outline"]) {
+                style.outline.side.color = None;
+            }
+            if !stands(&["text-decoration"]) {
+                style.text_decoration.color = None;
+            }
+            style.text_decoration.shadow = None;
+            style.shadows = None;
+            style.accent_color = None;
+            style.scrollbar_color = None;
+            // images stay, gradients and other generated backgrounds go
+            let pictured = cascaded.iter().any(|(property, (_, _, value))| {
+                property.starts_with("background") && value.contains("url(")
+            });
+            if !pictured {
+                style.backgrounds = None;
+            }
         }
         style
     }
@@ -3555,6 +3638,97 @@ pub enum ColorScheme {
     #[default]
     Light,
     Dark,
+}
+
+// what the css system colour keywords stand for: the user's palette when colours are forced,
+// and chromium's defaults for the colour scheme otherwise
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SystemColors {
+    pub canvas: Color,
+    pub canvas_text: Color,
+    pub link_text: Color,
+    pub visited_text: Color,
+    pub active_text: Color,
+    pub gray_text: Color,
+    pub highlight: Color,
+    pub highlight_text: Color,
+    pub button_face: Color,
+    pub button_text: Color,
+    pub button_border: Color,
+    pub field: Color,
+    pub field_text: Color,
+}
+
+// colours are whole bytes, so equality is total
+impl Eq for SystemColors {}
+
+impl SystemColors {
+    pub fn for_scheme(scheme: ColorScheme) -> Self {
+        let rgb = |value: u32| Color::opaque((value >> 16) as u8, (value >> 8) as u8, value as u8);
+        let [canvas, text, link, visited, face, border, field] = match scheme {
+            ColorScheme::Light => [
+                0xffffff, 0x000000, 0x0000ee, 0x551a8b, 0xefefef, 0x767676, 0xffffff,
+            ],
+            ColorScheme::Dark => [
+                0x121212, 0xffffff, 0x9e9eff, 0xd0adf0, 0x6b6b6b, 0x6b6b6b, 0x3b3b3b,
+            ],
+        };
+        Self {
+            canvas: rgb(canvas),
+            canvas_text: rgb(text),
+            link_text: rgb(link),
+            visited_text: rgb(visited),
+            active_text: rgb(0xff0000),
+            gray_text: rgb(0x808080),
+            highlight: rgb(0x0078d7),
+            highlight_text: rgb(0xffffff),
+            button_face: rgb(face),
+            button_text: rgb(text),
+            button_border: rgb(border),
+            field: rgb(field),
+            field_text: rgb(text),
+        }
+    }
+
+    // white on black with yellow links, the palette forced colours are emulated with
+    pub fn high_contrast() -> Self {
+        let rgb = |value: u32| Color::opaque((value >> 16) as u8, (value >> 8) as u8, value as u8);
+        let (black, white) = (rgb(0x000000), rgb(0xffffff));
+        Self {
+            canvas: black,
+            canvas_text: white,
+            link_text: rgb(0xffff00),
+            visited_text: rgb(0xffff00),
+            active_text: rgb(0xffff00),
+            gray_text: rgb(0x3ff23f),
+            highlight: rgb(0x1aebff),
+            highlight_text: black,
+            button_face: black,
+            button_text: white,
+            button_border: white,
+            field: black,
+            field_text: white,
+        }
+    }
+
+    // the wcag contrast ratio of the page's text against its background, from 1 to 21
+    pub(crate) fn contrast(&self) -> f32 {
+        let luminance = |color: Color| {
+            let channel = |value: u8| {
+                let value = f32::from(value) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.red)
+                + 0.7152 * channel(color.green)
+                + 0.0722 * channel(color.blue)
+        };
+        let (text, canvas) = (luminance(self.canvas_text), luminance(self.canvas));
+        (text.max(canvas) + 0.05) / (text.min(canvas) + 0.05)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5493,6 +5667,7 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "app-region" | "-webkit-app-region" => style.drag_region = from.drag_region,
         "pointer-events" => style.pointer_events = from.pointer_events,
         "user-select" | "-webkit-user-select" => style.selectable = from.selectable,
+        "forced-color-adjust" => style.keep_colors = from.keep_colors,
         "list-style" => {
             style.list_style_type = from.list_style_type;
             style.list_inside = from.list_inside;
@@ -6238,6 +6413,9 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         "pointer-events" => style.pointer_events = !value.trim().eq_ignore_ascii_case("none"),
         "user-select" | "-webkit-user-select" => {
             style.selectable = !value.trim().eq_ignore_ascii_case("none");
+        }
+        "forced-color-adjust" => {
+            style.keep_colors = !value.trim().eq_ignore_ascii_case("auto");
         }
         "list-style-type" => {
             style.list_style_type =

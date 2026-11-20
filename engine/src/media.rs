@@ -140,6 +140,14 @@ impl Range {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Contrast {
+    NoPreference,
+    More,
+    Less,
+    Custom,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Feature {
     Width(Range),
@@ -148,6 +156,8 @@ enum Feature {
     Portrait(bool),
     ColorScheme(ColorScheme),
     ReducedMotion(bool),
+    ForcedColors(bool),
+    Contrast(Contrast),
     Hover(bool),
     FinePointer(bool),
     Always(bool),
@@ -264,9 +274,19 @@ fn parse_feature(text: &str) -> Option<Feature> {
         }),
         "hover" | "any-hover" => Feature::Hover(value == "hover"),
         "pointer" | "any-pointer" => Feature::FinePointer(value == "fine"),
-        "prefers-contrast" | "forced-colors" | "prefers-reduced-transparency" => {
-            Feature::Always(matches!(value, "no-preference" | "none"))
-        }
+        "forced-colors" => Feature::ForcedColors(match value {
+            "active" => true,
+            "none" => false,
+            _ => return None,
+        }),
+        "prefers-contrast" => Feature::Contrast(match value {
+            "no-preference" => Contrast::NoPreference,
+            "more" => Contrast::More,
+            "less" => Contrast::Less,
+            "custom" => Contrast::Custom,
+            _ => return None,
+        }),
+        "prefers-reduced-transparency" => Feature::Always(value == "no-preference"),
         "display-mode" => Feature::Always(value == "standalone"),
         "scripting" => Feature::Always(value == "enabled"),
         _ => return None,
@@ -432,6 +452,18 @@ fn media_feature(feature: &Feature, (width, height): (f32, f32), state: &StyleSt
         Feature::Portrait(portrait) => (height >= width) == portrait,
         Feature::ColorScheme(scheme) => scheme == state.color_scheme,
         Feature::ReducedMotion(reduced) => reduced == state.reduced_motion,
+        Feature::ForcedColors(forced) => forced == state.forced_colors.is_some(),
+        // a forced palette of very high or very low contrast asks for more or for less, as
+        // chromium reads it, and any other for custom
+        Feature::Contrast(asked) => {
+            asked
+                == match state.forced_colors.map(|colors| colors.contrast()) {
+                    None => Contrast::NoPreference,
+                    Some(ratio) if ratio >= 7.0 => Contrast::More,
+                    Some(ratio) if ratio <= 2.5 => Contrast::Less,
+                    Some(_) => Contrast::Custom,
+                }
+        }
         // a desktop window has a mouse
         Feature::Hover(hover) | Feature::FinePointer(hover) => hover,
         Feature::Always(result) => result,

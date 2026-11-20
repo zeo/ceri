@@ -1106,6 +1106,8 @@ struct SelectionUnit {
 pub struct UserPreferences {
     pub color_scheme: ColorScheme,
     pub reduced_motion: bool,
+    // the palette the system forces on pages, as windows high contrast does
+    pub forced_colors: Option<crate::css::SystemColors>,
 }
 
 struct AnimationRun {
@@ -1370,6 +1372,7 @@ impl Browser {
             let mut inputs = page.layout_inputs.borrow_mut();
             inputs.extras.color_scheme = preferences.color_scheme;
             inputs.extras.reduced_motion = preferences.reduced_motion;
+            inputs.extras.forced_colors = preferences.forced_colors;
         }
         self.evaluate_media_queries();
     }
@@ -1412,6 +1415,7 @@ impl Browser {
             extras: StyleState {
                 color_scheme: self.preferences.color_scheme,
                 reduced_motion: self.preferences.reduced_motion,
+                forced_colors: self.preferences.forced_colors,
                 ..StyleState::default()
             },
         }))
@@ -1754,6 +1758,7 @@ impl Browser {
         state.viewport_height = viewport.height;
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
+        state.forced_colors = self.preferences.forced_colors;
         state.clock = clock;
 
         let mut seen = BTreeSet::new();
@@ -2114,6 +2119,7 @@ impl Browser {
         state.viewport_height = viewport.height;
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
+        state.forced_colors = self.preferences.forced_colors;
         self.stylesheet(page)
             .computed_style(&document, element, &state)
             .is_some_and(|(style, _)| style.drag_region)
@@ -2770,6 +2776,7 @@ impl Browser {
         style_state.viewport_height = viewport.height;
         style_state.color_scheme = self.preferences.color_scheme;
         style_state.reduced_motion = self.preferences.reduced_motion;
+        style_state.forced_colors = self.preferences.forced_colors;
         style_state.clock = page.runtime.now();
         style_state.transitions = self.transitions.clone();
         style_state.animation_starts = self
@@ -2919,6 +2926,7 @@ impl Browser {
             hovered: self.hovered_node,
             color_scheme: style_state.color_scheme,
             reduced_motion: style_state.reduced_motion,
+            forced_colors: style_state.forced_colors,
             transitions: style_state.transitions.clone(),
             animation_starts: style_state.animation_starts.clone(),
             image_sizes: style_state.image_sizes.clone(),
@@ -7018,6 +7026,70 @@ mod tests {
         let status = document.find_element_by_id("status").expect("status");
         assert_eq!(document.text_content(status), "0px 0 0 20px true");
         drop(canvas);
+    }
+
+    #[test]
+    fn forced_colours_replace_what_the_author_chose_unless_it_is_a_system_colour() {
+        let page = r##"<style>
+            body { color: #123456; background: #abcdef }
+            #plain { color: red; background: blue; border: 2px solid green; box-shadow: 0 0 4px red }
+            #clear { background: transparent }
+            #kept { forced-color-adjust: none; color: red }
+            #named { color: GrayText; border: 1px solid Highlight }
+            #flag { width: 1px }
+            @media (forced-colors: active) { #flag { width: 7px } }
+            @media (prefers-contrast: more) { #flag { height: 9px } }
+            </style>
+            <p id="plain">a <b id="inner">b</b></p><p id="clear">c</p><p id="kept">d <b id="under">e</b></p>
+            <p id="named">f</p><a id="link" href="/x" style="color: purple">g</a>
+            <button id="press" style="color: red; background: pink">h</button><div id="flag"></div>
+            <p id="status"></p><script>
+            window.read = () => {
+                const style = (id) => getComputedStyle(document.getElementById(id));
+                const flag = document.getElementById("flag").getBoundingClientRect();
+                document.getElementById("status").textContent = [
+                    style("plain").color, style("plain").backgroundColor, style("plain").borderTopColor,
+                    style("plain").boxShadow, style("inner").color, style("clear").backgroundColor,
+                    style("kept").color, style("under").color, style("named").color,
+                    style("named").borderTopColor, style("link").color, style("press").color,
+                    style("press").backgroundColor, flag.width + "x" + flag.height,
+                    matchMedia("(forced-colors: active)").matches,
+                ].join("|");
+            };
+            read();
+            setInterval(read, 10);
+            </script>"##;
+        let mut browser = Browser::new(bundle(page));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let status = |browser: &mut Browser| {
+            browser.advance_time(20).expect("the page reads its styles");
+            let document = browser.document().expect("document should exist");
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            document.text_content(status)
+        };
+        let (red, blue, green) = ("rgb(255, 0, 0)", "rgb(0, 0, 255)", "rgb(0, 128, 0)");
+        assert_eq!(
+            status(&mut browser),
+            format!(
+                "{red}|{blue}|{green}|rgb(255, 0, 0) 0px 0px 4px 0px|{red}|rgba(0, 0, 0, 0)|{red}|{red}|rgb(128, 128, 128)|rgb(0, 120, 215)|rgb(128, 0, 128)|{red}|rgb(255, 192, 203)|1x0|false"
+            )
+        );
+        browser.set_user_preferences(UserPreferences {
+            forced_colors: Some(crate::css::SystemColors::high_contrast()),
+            ..UserPreferences::default()
+        });
+        let (white, black) = ("rgb(255, 255, 255)", "rgb(0, 0, 0)");
+        // the palette's grey and highlight stand where the author named them, a link and a
+        // button take their own pair, and what forced-color-adjust: none covers is left alone
+        assert_eq!(
+            status(&mut browser),
+            format!(
+                "{white}|{black}|{white}|none|{white}|rgba(0, 0, 0, 0)|{red}|{red}|rgb(63, 242, 63)|rgb(26, 235, 255)|rgb(255, 255, 0)|{white}|{black}|7x9|true"
+            )
+        );
     }
 
     #[test]
