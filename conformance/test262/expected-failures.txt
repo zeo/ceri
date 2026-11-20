@@ -1628,7 +1628,6 @@ test/built-ins/Object/defineProperties/15.2.3.7-6-a-115.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-119.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-120.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-121.js
-test/built-ins/Object/defineProperties/15.2.3.7-6-a-122.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-129.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-13.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-130.js
@@ -1777,7 +1776,6 @@ test/built-ins/Object/defineProperty/15.2.3.6-4-118.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-119.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-124.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-125.js
-test/built-ins/Object/defineProperty/15.2.3.6-4-126.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-133.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-134.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-135.js

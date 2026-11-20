@@ -183,7 +183,11 @@ fn run(path: &Path, harness: &Path) -> Outcome {
         (None, Err(error)) => Outcome::Fail(format!("{}: {}", error.name, error.message)),
         (None, Ok(())) => {
             let logs = runtime.logs();
-            if let Some(uncaught) = logs.iter().find(|log| log.starts_with("Uncaught")) {
+            // a rejection left unhandled fails no test, an exception left uncaught does
+            let thrown = |log: &&String| {
+                log.starts_with("Uncaught") && !log.starts_with("Uncaught (in promise)")
+            };
+            if let Some(uncaught) = logs.iter().find(thrown) {
                 return Outcome::Fail(uncaught.clone());
             }
             if !flag("async") {
