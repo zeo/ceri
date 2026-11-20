@@ -67,6 +67,24 @@ impl Drop for Scope {
     }
 }
 
+// counts something that happened under a name, as a phase that takes no time
+pub fn count(name: &'static str) {
+    if !ENABLED.with(Cell::get) {
+        return;
+    }
+    PHASES.with(|phases| {
+        let mut phases = phases.borrow_mut();
+        match phases.iter_mut().find(|phase| phase.name == name) {
+            Some(phase) => phase.calls += 1,
+            None => phases.push(Phase {
+                name,
+                calls: 1,
+                ..Phase::default()
+            }),
+        }
+    });
+}
+
 // starts or stops collecting on this thread, forgetting what was collected before
 pub fn enable(on: bool) {
     ENABLED.with(|enabled| enabled.set(on));

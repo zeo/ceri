@@ -2706,7 +2706,11 @@ fn kept_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer: Clone>(
     // an answer for one moment only is dropped when its pass ends, so none comes from earlier
     let earlier = kept.pass != pass;
     if earlier && !stands(kept.stamp) {
+        crate::profile::count("kept: answer written since");
         return None;
+    }
+    if earlier {
+        crate::profile::count("kept: answer taken");
     }
     kept.pass = pass;
     Some((kept.answer.clone(), earlier))
@@ -2788,6 +2792,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             },
         });
         if under.is_none() || kept.under.as_ref().map(|(under, _)| under) != under.as_ref() {
+            crate::profile::count("kept: all answers dropped");
             kept.boxes.clear();
             kept.widths.clear();
             kept.under = under.map(|under| (under, fonts));

@@ -3336,6 +3336,7 @@ impl Stylesheet {
             if cascades.pass != pass {
                 let matching = Matching::of(document, state);
                 if cascades.matching.as_ref() != Some(&matching) {
+                    crate::profile::count("kept: all cascades dropped");
                     cascades.entries.clear();
                     cascades.matching = Some(matching);
                 } else if cascades.hovered != state.hovered {
