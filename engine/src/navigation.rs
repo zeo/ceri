@@ -25,8 +25,15 @@ use std::sync::Arc;
 
 mod inspector;
 
-// the milliseconds between frames while something animates
+// the milliseconds between frames while something animates, until a window says how often
+// its display refreshes
 pub(crate) const FRAME_INTERVAL: u64 = 16;
+
+// whole milliseconds between frames for a display that refreshes so many times in a thousand
+// seconds, never longer than the display's own interval so no refresh goes without a frame
+pub(crate) fn frame_interval(millihertz: u32) -> u64 {
+    (1_000_000 / u64::from(millihertz.max(1))).clamp(4, FRAME_INTERVAL)
+}
 
 pub const APP_ORIGIN: &str = "https://app.ceri.invalid";
 
@@ -1018,6 +1025,7 @@ pub struct Browser {
     host_runtime_info: Option<HostRuntimeInfo>,
     host_bridge: Option<crate::script::HostBridge>,
     waker: Option<crate::bridge::Waker>,
+    frame_interval: u64,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
     fonts: Rc<FontSet>,
@@ -1186,6 +1194,7 @@ impl Browser {
             host_runtime_info: None,
             host_bridge: None,
             waker: None,
+            frame_interval: FRAME_INTERVAL,
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
@@ -1276,14 +1285,14 @@ impl Browser {
         let motion = (!self.transitions.is_empty()
             || page.runtime.has_live_workers()
             || page.runtime.media_playing())
-        .then_some(FRAME_INTERVAL);
+        .then_some(self.frame_interval);
         // a stepped animation sleeps until its next step; a continuous one needs every frame
         let animation = page
             .animation_wake
             .get()
             .filter(|_| !self.preferences.reduced_motion)
             .map(|at| match at.saturating_sub(page.runtime.now()) {
-                0 => FRAME_INTERVAL,
+                0 => self.frame_interval,
                 delay => delay,
             });
         let task = page.runtime.next_task_delay();
@@ -1316,6 +1325,18 @@ impl Browser {
             page.runtime.set_viewport_metrics(self.viewport);
         }
         self.evaluate_media_queries();
+    }
+
+    // paces animation frames and the frames of anything in motion by the display's refresh
+    pub fn set_refresh_rate(&mut self, millihertz: u32) {
+        self.frame_interval = frame_interval(millihertz);
+        if let Some(page) = self.page.as_mut() {
+            page.runtime.set_frame_interval(self.frame_interval);
+        }
+    }
+
+    pub(crate) fn frame_interval(&self) -> u64 {
+        self.frame_interval
     }
 
     pub fn device_pixel_ratio(&self) -> f32 {
@@ -1618,6 +1639,7 @@ impl Browser {
             runtime.set_locale(locale.clone());
         }
         runtime.set_viewport_metrics(self.viewport);
+        runtime.set_frame_interval(self.frame_interval);
         let inspecting = crate::devtools_serving() || self.inspection.attached();
         if inspecting {
             runtime.capture_console();
@@ -3502,6 +3524,7 @@ impl Browser {
                     runtime.set_locale(locale.clone());
                 }
                 runtime.set_viewport_metrics(self.viewport);
+                runtime.set_frame_interval(self.frame_interval);
                 runtime.set_layout_inputs(layout_inputs.clone());
                 runtime
             },
@@ -8086,6 +8109,42 @@ mod tests {
             (before.0, before.1)
         );
         assert!(!document.unwritten_since(button, before.2));
+    }
+
+    #[test]
+    fn animation_frames_come_as_often_as_the_display_refreshes() {
+        assert_eq!(
+            [30_000, 60_000, 120_000, 144_000, 240_000, 500_000].map(frame_interval),
+            [16, 16, 8, 6, 4, 4]
+        );
+        let frames_in_a_second = |rate: Option<u32>| {
+            let mut browser = Browser::new(bundle(
+                r##"<p id="count">0</p><script>
+                    let count = 0;
+                    const frame = () => {
+                        document.getElementById("count").textContent = ++count;
+                        requestAnimationFrame(frame);
+                    };
+                    requestAnimationFrame(frame);
+                </script>"##,
+            ));
+            if let Some(rate) = rate {
+                browser.set_refresh_rate(rate);
+            }
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load");
+            for _ in 0..1000 {
+                browser.advance_time(1).expect("time should advance");
+            }
+            let document = browser.document().unwrap();
+            let document = document.borrow();
+            let count = document.find_element_by_id("count").unwrap();
+            document.text_content(count).parse::<u32>().unwrap()
+        };
+        assert_eq!(frames_in_a_second(None), 62);
+        assert_eq!(frames_in_a_second(Some(120_000)), 125);
+        assert_eq!(frames_in_a_second(Some(144_000)), 166);
     }
 
     #[test]

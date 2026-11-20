@@ -540,6 +540,8 @@ pub struct ScriptRuntime {
     // the document's options and its form controls, found again only once its elements or
     // attributes change: the style state is built from them for every layout and measure
     controls: RefCell<Option<ControlLists>>,
+    // milliseconds from an animation frame request to its callback
+    frame_interval: u64,
     media_queries: Vec<geometry::MediaQueryRecord>,
     media_list_prototype: Option<ObjectHandle>,
     performance: Value,
@@ -1621,6 +1623,7 @@ impl ScriptRuntime {
             layout_inputs: None,
             measured: RefCell::new(None),
             controls: RefCell::new(None),
+            frame_interval: crate::navigation::FRAME_INTERVAL,
             media_queries: Vec::new(),
             media_list_prototype: None,
             performance: Value::Undefined,
@@ -3166,6 +3169,10 @@ impl ScriptRuntime {
         self.drain_microtasks()?;
         // a resolved press starts the selection gesture even when the range did not move
         Ok(true)
+    }
+
+    pub(crate) fn set_frame_interval(&mut self, milliseconds: u64) {
+        self.frame_interval = milliseconds;
     }
 
     pub(crate) fn set_viewport_metrics(&mut self, viewport: ViewportMetrics) {
@@ -9666,7 +9673,7 @@ impl ScriptRuntime {
                 .map(Value::number)
                 .transpose()?
                 .map_or(0, delay_milliseconds),
-            TaskKind::AnimationFrame => 16,
+            TaskKind::AnimationFrame => self.frame_interval,
             TaskKind::Idle => 0,
         };
         let kind = match kind {

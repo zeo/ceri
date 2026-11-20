@@ -530,6 +530,8 @@ struct AppWindow {
     viewport: Size,
     // the monitor's scale times the page zoom
     scale: f32,
+    // the display's refresh rate in millihertz, once the engine was told
+    refresh_rate: Option<u32>,
     zoom: f32,
     window: Option<Rc<Window>>,
     output: Option<Output>,
@@ -611,6 +613,7 @@ where
             applied_cursor: None,
             viewport,
             scale: 1.0,
+            refresh_rate: None,
             zoom: 1.0,
             window: None,
             output: None,
@@ -818,6 +821,7 @@ impl AppWindow {
         if scale != self.scale {
             self.submit(InputEvent::ScaleChanged(scale));
         }
+        self.follow_refresh_rate();
         let scheme = self.window_color_scheme();
         if scheme != self.preferences.color_scheme {
             self.apply_preferences(scheme);
@@ -976,7 +980,10 @@ impl AppWindow {
                 }
                 self.publish();
             }
-            WindowEvent::Moved(_) => self.publish(),
+            WindowEvent::Moved(_) => {
+                self.follow_refresh_rate();
+                self.publish();
+            }
             WindowEvent::Occluded(_) => self.publish(),
             WindowEvent::CursorLeft { .. } => {
                 if self.edge.take().is_some() {
@@ -1418,6 +1425,19 @@ impl AppWindow {
         };
         if self.submit(InputEvent::PreferencesChanged(preferences)) {
             self.preferences = preferences;
+        }
+    }
+
+    // tells the engine how often the display the window is on refreshes, when that changes
+    fn follow_refresh_rate(&mut self) {
+        let rate = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor())
+            .and_then(|monitor| monitor.refresh_rate_millihertz());
+        if let Some(rate) = rate.filter(|rate| self.refresh_rate != Some(*rate)) {
+            self.refresh_rate = Some(rate);
+            self.submit(InputEvent::RefreshRate(rate));
         }
     }
 

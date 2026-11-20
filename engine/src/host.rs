@@ -36,6 +36,8 @@ fn button_index(button: PointerButton) -> i16 {
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     Resize(Size),
+    // how often the window's display refreshes, in millihertz
+    RefreshRate(u32),
     PointerMove {
         x: f32,
         y: f32,
@@ -448,7 +450,6 @@ fn run_live_engine_worker(
     let mut last_tick = Instant::now();
     let mut announced = false;
     let mut held = None;
-    let frame = Duration::from_millis(crate::navigation::FRAME_INTERVAL);
     let mut last_frame: Option<Instant> = None;
     // a render asked for before its frame slot opens
     let mut deferred = None;
@@ -457,6 +458,7 @@ fn run_live_engine_worker(
     let mut reserved = false;
     const REST_AFTER: Duration = Duration::from_secs(1);
     loop {
+        let frame = Duration::from_millis(host.browser.frame_interval());
         // timers, frame callbacks, css animations and the window asking again as each frame
         // lands all tick apart, so a page renders at most once per frame slot
         let slot = (deferred.is_some() || (host.is_dirty() && !announced))
@@ -868,6 +870,10 @@ impl EngineHost {
                     frame_requested: true,
                     ..InputResult::default()
                 }
+            }
+            InputEvent::RefreshRate(millihertz) => {
+                self.browser.set_refresh_rate(millihertz);
+                InputResult::default()
             }
             InputEvent::ScaleChanged(scale) => {
                 self.scale = normalize_scale(scale);
