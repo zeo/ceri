@@ -49,6 +49,7 @@ mod platform {
     use windows::Win32::Foundation::{
         E_NOTIMPL, E_POINTER, S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
     };
+    use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -71,6 +72,12 @@ mod platform {
         ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
         ID3D11VideoProcessorOutputView,
     };
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_SHADER_RESOURCE as SHADER_READ, D3D11_COMPARISON_NEVER,
+        D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT, D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC,
+        D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_TEXTURE_ADDRESS_CLAMP,
+        ID3D11SamplerState,
+    };
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
         DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
@@ -81,6 +88,7 @@ mod platform {
         DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
         DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_SAMPLE_DESC,
     };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM};
     use windows::Win32::Graphics::Dxgi::{
         DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIKeyedMutex, IDXGIResource1,
     };
@@ -161,7 +169,11 @@ mod platform {
         manager: IMFDXGIDeviceManager,
         multithread: ID3D11Multithread,
         shaders: OnceLock<Result<(ID3D11VertexShader, ID3D11PixelShader), String>>,
+        unpacking: OnceLock<Result<Unpacking, String>>,
     }
+
+    // the shaders that turn nv12 into rgb, and the sampler they read chroma through
+    type Unpacking = (ID3D11VertexShader, ID3D11PixelShader, ID3D11SamplerState);
 
     // SAFETY: d3d11 devices are free threaded, the immediate context is multithread protected
     // before it is shared, and the device manager serializes its own callers
@@ -207,6 +219,7 @@ mod platform {
                     manager,
                     multithread,
                     shaders: OnceLock::new(),
+                    unpacking: OnceLock::new(),
                 })
             }
         }
@@ -383,6 +396,90 @@ mod platform {
             buffer.ok_or_else(|| "Direct3D returned no buffer".to_string())
         }
 
+        // an nv12 texture this device can read drawn into a bgra one through the rows
+        unsafe fn unpack(
+            &self,
+            rows: &ID3D11Buffer,
+            source: &ID3D11Texture2D,
+            target: &ID3D11Texture2D,
+            (width, height): (u32, u32),
+        ) -> Result<(), String> {
+            let (vertices, pixels, between) = self
+                .unpacking
+                .get_or_init(|| unsafe {
+                    let (vertices, pixels) = shaders(&self.device, UNPACK)?;
+                    let described = D3D11_SAMPLER_DESC {
+                        Filter: D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+                        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        ComparisonFunc: D3D11_COMPARISON_NEVER,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    };
+                    let mut sampler = None;
+                    self.device
+                        .CreateSamplerState(&described, Some(&mut sampler))
+                        .map_err(text)?;
+                    let sampler = sampler.ok_or("Direct3D returned no sampler")?;
+                    Ok((vertices, pixels, sampler))
+                })
+                .as_ref()
+                .map_err(Clone::clone)?;
+            // the planes of an nv12 texture are read as one and two channel textures
+            let plane = |format| {
+                let described = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                        },
+                    },
+                };
+                let mut view = None;
+                unsafe {
+                    self.device
+                        .CreateShaderResourceView(source, Some(&described), Some(&mut view))
+                        .map_err(text)?;
+                }
+                view.ok_or_else(|| "Direct3D returned no view".to_string())
+            };
+            let planes = [
+                Some(plane(DXGI_FORMAT_R8_UNORM)?),
+                Some(plane(DXGI_FORMAT_R8G8_UNORM)?),
+            ];
+            let mut drawn = None;
+            unsafe {
+                self.device
+                    .CreateRenderTargetView(target, None, Some(&mut drawn))
+                    .map_err(text)?;
+                let context = &self.context;
+                // decoders on other threads share the context, so the draw's state is held whole
+                self.multithread.Enter();
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.IASetInputLayout(None);
+                context.VSSetShader(vertices, None);
+                context.PSSetShader(pixels, None);
+                context.PSSetConstantBuffers(0, Some(&[Some(rows.clone())]));
+                context.PSSetShaderResources(0, Some(&planes));
+                context.PSSetSamplers(0, Some(&[Some(between.clone())]));
+                context.OMSetRenderTargets(Some(&[drawn]), None);
+                context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    Width: width as f32,
+                    Height: height as f32,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]));
+                context.Draw(3, 0);
+                context.PSSetShaderResources(0, Some(&[None, None]));
+                context.OMSetRenderTargets(None, None);
+                self.multithread.Leave();
+            }
+            Ok(())
+        }
+
         // an hdr10 texture drawn into an sdr one through the curve, as chromium tone maps
         unsafe fn tone(
             &self,
@@ -393,7 +490,7 @@ mod platform {
         ) -> Result<(), String> {
             let (vertices, pixels) = self
                 .shaders
-                .get_or_init(|| unsafe { shaders(&self.device) })
+                .get_or_init(|| unsafe { shaders(&self.device, TONE_MAP) })
                 .as_ref()
                 .map_err(Clone::clone)?;
             let (mut read, mut drawn) = (None, None);
@@ -474,15 +571,86 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
 }
 ";
 
+    // an 8 bit nv12 surface to rgb: luma as it is, chroma read between its samples as if
+    // each sat in the middle of its four luma samples, which is how chromium draws video;
+    // the driver's video processor sets chroma a luma row higher
+    const UNPACK: &str = r"
+cbuffer Matrix : register(b0) {
+    float4 red;
+    float4 green;
+    float4 blue;
+    float4 frame;
+};
+Texture2D<float> luma : register(t0);
+Texture2D<float2> chroma : register(t1);
+SamplerState between : register(s0);
+
+float4 vertices(uint id : SV_VertexID) : SV_Position {
+    float2 at = float2((id << 1) & 2, id & 2);
+    return float4(at * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+float4 pixels(float4 at : SV_Position) : SV_Target {
+    float2 spot = at.xy + frame.xy;
+    float3 yuv = float3(luma.Load(int3(spot, 0)), chroma.SampleLevel(between, spot / frame.zw, 0));
+    return float4(saturate(float3(
+        dot(red.xyz, yuv) + red.w,
+        dot(green.xyz, yuv) + green.w,
+        dot(blue.xyz, yuv) + blue.w)), 1);
+}
+";
+
+    // the rows that take y, u and v as the surface holds them to r, g and b for the 8 bit
+    // colour spaces the shader draws, then the shown part's corner and the surface's size
+    fn unpacking_rows(
+        space: DXGI_COLOR_SPACE_TYPE,
+        shown: Area,
+        surface: (u32, u32),
+    ) -> Option<[[f32; 4]; 4]> {
+        let (kr, kb, studio) = match space {
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 => (0.2126, 0.0722, true),
+            DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 => (0.2126, 0.0722, false),
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 => (0.299, 0.114, true),
+            DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 => (0.299, 0.114, false),
+            _ => return None,
+        };
+        let kg = 1.0 - kr - kb;
+        let (luma, chroma, black) = if studio {
+            (255.0 / 219.0, 255.0 / 224.0, 16.0 / 255.0)
+        } else {
+            (1.0, 1.0, 0.0)
+        };
+        let row = |u: f32, v: f32| {
+            [
+                luma,
+                u * chroma,
+                v * chroma,
+                -black * luma - 128.0 / 255.0 * chroma * (u + v),
+            ]
+        };
+        Some([
+            row(0.0, 2.0 * (1.0 - kr)),
+            row(-2.0 * (1.0 - kb) * kb / kg, -2.0 * (1.0 - kr) * kr / kg),
+            row(2.0 * (1.0 - kb), 0.0),
+            [
+                shown.left as f32,
+                shown.top as f32,
+                surface.0 as f32,
+                surface.1 as f32,
+            ],
+        ])
+    }
+
     unsafe fn shaders(
         device: &ID3D11Device,
+        source: &str,
     ) -> Result<(ID3D11VertexShader, ID3D11PixelShader), String> {
         let compiled = |entry: PCSTR, target: PCSTR| {
             let (mut code, mut errors) = (None, None);
             let compiled = unsafe {
                 D3DCompile(
-                    TONE_MAP.as_ptr().cast(),
-                    TONE_MAP.len(),
+                    source.as_ptr().cast(),
+                    source.len(),
                     PCSTR::null(),
                     None,
                     None,
@@ -587,6 +755,10 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
         // what the presenter last asked for, and what the pool's pictures hold
         wanted: Arc<AtomicBool>,
         hdr10: bool,
+        // for 8 bit sdr the surface is drawn by this device's own shader: the colour space
+        // and the shown part, then a copy of the surface it can read with the shader's rows
+        unpacked: Option<(DXGI_COLOR_SPACE_TYPE, Area)>,
+        readable: Option<(ID3D11Texture2D, ID3D11Buffer)>,
     }
 
     // a converted frame in a texture the presenter opens by its handle; the keyed mutex orders
@@ -749,6 +921,9 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     }
                     false => None,
                 };
+                let unpacked = (decoded == DXGI_FORMAT_NV12
+                    && unpacking_rows(input, picture, coded).is_some())
+                .then_some((input, picture));
                 Ok(Self {
                     enumerator,
                     processor,
@@ -759,6 +934,8 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     staged: None,
                     wanted: Arc::default(),
                     hdr10: false,
+                    unpacked,
+                    readable: None,
                 })
             }
         }
@@ -839,6 +1016,35 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     .map_err(text)?;
                 let texture = texture.ok_or("the decoder gave no texture")?;
                 let slice = surface.GetSubresourceIndex().map_err(text)?;
+                if let Some((space, shown)) = self.unpacked {
+                    let (readable, rows) = match &mut self.readable {
+                        Some(made) => made,
+                        made => {
+                            let mut described = D3D11_TEXTURE2D_DESC::default();
+                            texture.GetDesc(&mut described);
+                            let surface = (described.Width, described.Height);
+                            let rows = unpacking_rows(space, shown, surface)
+                                .ok_or("the colour space has no rows")?;
+                            let readable = gpu.texture(
+                                surface,
+                                DXGI_FORMAT_NV12,
+                                D3D11_USAGE_DEFAULT,
+                                SHADER_READ.0 as u32,
+                                0,
+                                0,
+                            )?;
+                            &*made.insert((readable, gpu.constants(&rows)?))
+                        }
+                    };
+                    // a decoder's surface is one slice of an array only the decoder can bind
+                    gpu.context
+                        .CopySubresourceRegion(readable, 0, 0, 0, 0, &texture, slice, None);
+                    picture.mutex.AcquireSync(0, INFINITE).map_err(text)?;
+                    let drawn = gpu.unpack(rows, readable, &picture.texture, self.size);
+                    let released = picture.mutex.ReleaseSync(0).map_err(text);
+                    drawn.and(released)?;
+                    return Ok(picture);
+                }
                 let processing = (&self.enumerator, &self.processor);
                 let Some(curve) = self.curve.as_ref().filter(|_| !hdr10) else {
                     picture.mutex.AcquireSync(0, INFINITE).map_err(text)?;
