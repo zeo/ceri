@@ -4801,8 +4801,12 @@ impl ScriptRuntime {
                 Self::set_canvas_smoothing_quality(&context, &value_string);
                 true
             }
-            Value::CanvasContext(context) if property == "fillStyle" => {
-                self.set_canvas_fill_style(&context, &value_string)
+            Value::CanvasContext(context) => {
+                let number = self.coerce_number(value.clone()).unwrap_or(f64::NAN) as f32;
+                context
+                    .borrow_mut()
+                    .set_drawing_property(property, &value_string, number);
+                true
             }
             Value::TypedArray(array) => {
                 let Some(index) = uint8_array_property_index(property) else {

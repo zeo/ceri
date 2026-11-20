@@ -7,12 +7,34 @@ use super::*;
 use crate::dom::Namespace;
 use crate::image::Image;
 use crate::layout::ImageLayer;
+use crate::svg::{Affine, Coverage, IDENTITY, LineCap, LineJoin, Pen, Segment};
 
 type Rect4 = (f32, f32, f32, f32);
 // a drawImage source's pixels and the width and height script measures it in
 type Measured = (Bitmap, (f32, f32));
 
 const METHODS: &[&str] = &[
+    "save",
+    "restore",
+    "scale",
+    "rotate",
+    "translate",
+    "transform",
+    "setTransform",
+    "resetTransform",
+    "getTransform",
+    "beginPath",
+    "closePath",
+    "moveTo",
+    "lineTo",
+    "bezierCurveTo",
+    "quadraticCurveTo",
+    "arc",
+    "ellipse",
+    "rect",
+    "fill",
+    "stroke",
+    "strokeRect",
     "fillRect",
     "clearRect",
     "drawImage",
@@ -58,9 +80,114 @@ enum Sampling {
     Mitchell,
 }
 
+// the drawing state save pushes and restore pops
+#[derive(Clone)]
+struct DrawState {
+    // user space to the bitmap's pixels
+    transform: Affine,
+    fill_style: Color,
+    stroke_style: Color,
+    line_width: f32,
+    cap: LineCap,
+    join: LineJoin,
+    miter_limit: f32,
+    alpha: f32,
+}
+
+impl Default for DrawState {
+    fn default() -> Self {
+        Self {
+            transform: IDENTITY,
+            fill_style: Color::BLACK,
+            stroke_style: Color::BLACK,
+            line_width: 1.0,
+            cap: LineCap::Butt,
+            join: LineJoin::Miter,
+            miter_limit: 10.0,
+            alpha: 1.0,
+        }
+    }
+}
+
+// the inverse of a transform, none when it flattens the plane
+fn inverse(matrix: Affine) -> Option<Affine> {
+    let [a, b, c, d, e, f] = matrix;
+    let determinant = a * d - b * c;
+    (determinant.is_finite() && determinant.abs() > f32::EPSILON).then(|| {
+        [
+            d / determinant,
+            -b / determinant,
+            -c / determinant,
+            a / determinant,
+            (c * f - d * e) / determinant,
+            (b * e - a * f) / determinant,
+        ]
+    })
+}
+
+fn map_segment(matrix: Affine, segment: Segment) -> Segment {
+    let at = |point| crate::svg::map(matrix, point);
+    match segment {
+        Segment::Move(point) => Segment::Move(at(point)),
+        Segment::Line(point) => Segment::Line(at(point)),
+        Segment::Cubic(first, second, end) => Segment::Cubic(at(first), at(second), at(end)),
+        Segment::Close => Segment::Close,
+    }
+}
+
+// an arc of an ellipse as cubics, a quarter turn at most in each, from its start point on;
+// the sweep is what the canvas arc rules leave of the two angles
+fn arc_points(
+    center: (f32, f32),
+    radii: (f32, f32),
+    rotation: f32,
+    (start, end): (f32, f32),
+    counterclockwise: bool,
+) -> ((f32, f32), Vec<Segment>) {
+    let turn = std::f32::consts::TAU;
+    let sweep = if counterclockwise {
+        if start - end >= turn {
+            -turn
+        } else {
+            -(start - end).rem_euclid(turn)
+        }
+    } else if end - start >= turn {
+        turn
+    } else {
+        (end - start).rem_euclid(turn)
+    };
+    let (sin, cos) = rotation.sin_cos();
+    let place = |x: f32, y: f32| {
+        let (x, y) = (x * radii.0, y * radii.1);
+        (center.0 + x * cos - y * sin, center.1 + x * sin + y * cos)
+    };
+    let pieces = (sweep.abs() / std::f32::consts::FRAC_PI_2).ceil().max(1.0);
+    let step = sweep / pieces;
+    let reach = 4.0 / 3.0 * (step / 4.0).tan();
+    let mut cubics = Vec::new();
+    for piece in 0..pieces as usize {
+        let (from, to) = (
+            start + step * piece as f32,
+            start + step * (piece + 1) as f32,
+        );
+        let ((from_sin, from_cos), (to_sin, to_cos)) = (from.sin_cos(), to.sin_cos());
+        cubics.push(Segment::Cubic(
+            place(from_cos - reach * from_sin, from_sin + reach * from_cos),
+            place(to_cos + reach * to_sin, to_sin - reach * to_cos),
+            place(to_cos, to_sin),
+        ));
+    }
+    (place(start.cos(), start.sin()), cubics)
+}
+
 pub(super) struct CanvasContextData {
     node: NodeId,
-    fill_style: Color,
+    state: DrawState,
+    saved: Vec<DrawState>,
+    // the current path, already in the bitmap's pixels
+    path: Vec<Segment>,
+    // where the path's pen is and where its subpath began, in the bitmap's pixels
+    pen: Option<((f32, f32), (f32, f32))>,
     smoothing_enabled: bool,
     smoothing_quality: Smoothing,
     bitmap: Bitmap,
@@ -116,6 +243,204 @@ fn normalized((x, y, width, height): Rect4) -> Rect4 {
 }
 
 impl CanvasContextData {
+    fn new(node: NodeId, width: u32, height: u32) -> Self {
+        Self {
+            node,
+            state: DrawState::default(),
+            saved: Vec::new(),
+            path: Vec::new(),
+            pen: None,
+            smoothing_enabled: true,
+            smoothing_quality: Smoothing::Low,
+            bitmap: Bitmap::new(width, height),
+            snapshot: None,
+            tainted: false,
+        }
+    }
+
+    // a point of user space where the transform puts it now
+    fn place(&self, point: (f32, f32)) -> (f32, f32) {
+        crate::svg::map(self.state.transform, point)
+    }
+
+    fn move_to(&mut self, point: (f32, f32)) {
+        let point = self.place(point);
+        self.path.push(Segment::Move(point));
+        self.pen = Some((point, point));
+    }
+
+    // a line to the point, or the start of a subpath at it when the path has none
+    fn line_to(&mut self, point: (f32, f32)) {
+        let placed = self.place(point);
+        match self.pen {
+            None => self.move_to(point),
+            Some((_, start)) => {
+                self.path.push(Segment::Line(placed));
+                self.pen = Some((placed, start));
+            }
+        }
+    }
+
+    fn cubic_to(&mut self, first: (f32, f32), second: (f32, f32), end: (f32, f32)) {
+        if self.pen.is_none() {
+            self.move_to(first);
+        }
+        let (first, second, end) = (self.place(first), self.place(second), self.place(end));
+        self.path.push(Segment::Cubic(first, second, end));
+        self.pen = self.pen.map(|(_, start)| (end, start));
+    }
+
+    // a quadratic curve is the cubic whose controls sit two thirds of the way to its own
+    fn quadratic_to(&mut self, control: (f32, f32), end: (f32, f32)) {
+        if self.pen.is_none() {
+            self.move_to(control);
+        }
+        let (control, end) = (self.place(control), self.place(end));
+        let Some((from, start)) = self.pen else {
+            return;
+        };
+        let toward = |point: (f32, f32)| {
+            (
+                point.0 + (control.0 - point.0) * 2.0 / 3.0,
+                point.1 + (control.1 - point.1) * 2.0 / 3.0,
+            )
+        };
+        self.path
+            .push(Segment::Cubic(toward(from), toward(end), end));
+        self.pen = Some((end, start));
+    }
+
+    fn close_path(&mut self) {
+        if let Some((_, start)) = self.pen {
+            self.path.push(Segment::Close);
+            self.pen = Some((start, start));
+        }
+    }
+
+    fn rect(&mut self, (x, y, width, height): Rect4) {
+        self.move_to((x, y));
+        self.line_to((x + width, y));
+        self.line_to((x + width, y + height));
+        self.line_to((x, y + height));
+        self.close_path();
+    }
+
+    fn arc(
+        &mut self,
+        center: (f32, f32),
+        radii: (f32, f32),
+        rotation: f32,
+        angles: (f32, f32),
+        counterclockwise: bool,
+    ) {
+        let (start, cubics) = arc_points(center, radii, rotation, angles, counterclockwise);
+        self.line_to(start);
+        for cubic in cubics {
+            if let Segment::Cubic(first, second, end) = cubic {
+                self.cubic_to(first, second, end);
+            }
+        }
+    }
+
+    // source-over of a colour through a coverage, thinned by the global alpha
+    fn paint(&mut self, coverage: Option<Coverage>, color: Color) {
+        let Some(coverage) = coverage else {
+            return;
+        };
+        let source = premultiply([color.red, color.green, color.blue, color.alpha]);
+        let alpha = self.state.alpha;
+        let stride = self.bitmap.width as usize;
+        for (index, &value) in coverage.values.iter().enumerate() {
+            let amount = (f32::from(value) * alpha).round() as u32;
+            if amount > 0 {
+                let x = coverage.left as usize + index % coverage.width;
+                let y = coverage.top as usize + index / coverage.width;
+                source_over(
+                    &mut self.bitmap.pixels[y * stride + x],
+                    scale(source, amount),
+                );
+            }
+        }
+        self.snapshot = None;
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.bitmap.width, self.bitmap.height)
+    }
+
+    fn fill_path(&mut self, path: &[Segment], even_odd: bool) {
+        let coverage = crate::svg::path_coverage(path, IDENTITY, None, even_odd, self.size());
+        self.paint(coverage, self.state.fill_style);
+    }
+
+    // the pen is as wide as the transform in force now makes it, so the path goes back to
+    // user space to be outlined there
+    fn stroke_path(&mut self, path: &[Segment]) {
+        let Some(back) = inverse(self.state.transform) else {
+            return;
+        };
+        let user = path
+            .iter()
+            .map(|&segment| map_segment(back, segment))
+            .collect::<Vec<_>>();
+        let pen = Pen {
+            width: self.state.line_width,
+            cap: self.state.cap,
+            join: self.state.join,
+            miter_limit: self.state.miter_limit,
+        };
+        let coverage =
+            crate::svg::path_coverage(&user, self.state.transform, Some(pen), false, self.size());
+        self.paint(coverage, self.state.stroke_style);
+    }
+
+    // a rectangle of user space as a path in the bitmap's pixels, the current path untouched
+    fn rect_path(&self, (x, y, width, height): Rect4) -> Vec<Segment> {
+        let corner = |x, y| self.place((x, y));
+        vec![
+            Segment::Move(corner(x, y)),
+            Segment::Line(corner(x + width, y)),
+            Segment::Line(corner(x + width, y + height)),
+            Segment::Line(corner(x, y + height)),
+            Segment::Close,
+        ]
+    }
+
+    // whether rectangles can take the area-coverage path, which draws what skia draws for
+    // an axis-aligned rectangle
+    fn plain(&self) -> bool {
+        self.state.transform == IDENTITY && self.state.alpha == 1.0
+    }
+
+    // an attribute of the drawing state; a value outside what the attribute takes is ignored
+    pub(super) fn set_drawing_property(&mut self, property: &str, text: &str, number: f32) {
+        let state = &mut self.state;
+        match property {
+            "fillStyle" => state.fill_style = Color::parse(text).unwrap_or(state.fill_style),
+            "strokeStyle" => state.stroke_style = Color::parse(text).unwrap_or(state.stroke_style),
+            "lineWidth" if number.is_finite() && number > 0.0 => state.line_width = number,
+            "miterLimit" if number.is_finite() && number > 0.0 => state.miter_limit = number,
+            "globalAlpha" if (0.0..=1.0).contains(&number) => state.alpha = number,
+            "lineCap" => {
+                state.cap = match text {
+                    "butt" => LineCap::Butt,
+                    "round" => LineCap::Round,
+                    "square" => LineCap::Square,
+                    _ => state.cap,
+                }
+            }
+            "lineJoin" => {
+                state.join = match text {
+                    "miter" => LineJoin::Miter,
+                    "round" => LineJoin::Round,
+                    "bevel" => LineJoin::Bevel,
+                    _ => state.join,
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn set_smoothing_enabled(&mut self, enabled: bool) {
         self.smoothing_enabled = enabled;
     }
@@ -552,17 +877,7 @@ impl ScriptRuntime {
         let (width, height) = canvas_size(&self.document.borrow(), node);
         self.canvas_contexts
             .entry(node)
-            .or_insert_with(|| {
-                Rc::new(RefCell::new(CanvasContextData {
-                    node,
-                    fill_style: Color::BLACK,
-                    smoothing_enabled: true,
-                    smoothing_quality: Smoothing::Low,
-                    bitmap: Bitmap::new(width, height),
-                    snapshot: None,
-                    tainted: false,
-                }))
-            })
+            .or_insert_with(|| Rc::new(RefCell::new(CanvasContextData::new(node, width, height))))
             .clone()
     }
 
@@ -573,10 +888,9 @@ impl ScriptRuntime {
         };
         let (width, height) = canvas_size(&self.document.borrow(), node);
         let mut context = context.borrow_mut();
-        context.bitmap = Bitmap::new(width, height);
-        context.fill_style = Color::BLACK;
-        context.snapshot = None;
-        context.tainted = false;
+        let smoothing = (context.smoothing_enabled, context.smoothing_quality);
+        *context = CanvasContextData::new(node, width, height);
+        (context.smoothing_enabled, context.smoothing_quality) = smoothing;
     }
 
     // a layer for each connected canvas with a bitmap, for paint to place like an img
@@ -714,29 +1028,33 @@ impl ScriptRuntime {
         }
         Ok(match property {
             "canvas" => self.node_value(context.borrow().node),
-            "fillStyle" => Value::String(color_css(context.borrow().fill_style).into()),
+            "fillStyle" => Value::String(color_css(context.borrow().state.fill_style).into()),
+            "strokeStyle" => Value::String(color_css(context.borrow().state.stroke_style).into()),
+            "lineWidth" => Value::Number(context.borrow().state.line_width.into()),
+            "miterLimit" => Value::Number(context.borrow().state.miter_limit.into()),
+            "globalAlpha" => Value::Number(context.borrow().state.alpha.into()),
+            "lineCap" => Value::String(
+                match context.borrow().state.cap {
+                    LineCap::Butt => "butt",
+                    LineCap::Round => "round",
+                    LineCap::Square => "square",
+                }
+                .into(),
+            ),
+            "lineJoin" => Value::String(
+                match context.borrow().state.join {
+                    LineJoin::Miter => "miter",
+                    LineJoin::Round => "round",
+                    LineJoin::Bevel => "bevel",
+                }
+                .into(),
+            ),
             "imageSmoothingEnabled" => Value::Bool(context.borrow().smoothing_enabled),
             "imageSmoothingQuality" => {
                 Value::String(context.borrow().smoothing_quality.name().into())
             }
-            _ => {
-                return Err(runtime_error(format!(
-                    "CanvasRenderingContext2D has no property {property}"
-                )));
-            }
+            _ => Value::Undefined,
         })
-    }
-
-    pub(super) fn set_canvas_fill_style(
-        &mut self,
-        context: &CanvasContextHandle,
-        value: &str,
-    ) -> bool {
-        let Some(color) = Color::parse(value) else {
-            return false;
-        };
-        context.borrow_mut().fill_style = color;
-        true
     }
 
     // an enum attribute ignores a value outside its set, as webidl has it
@@ -756,19 +1074,160 @@ impl ScriptRuntime {
         name: &str,
         arguments: &[Value],
     ) -> Result<Value, ScriptError> {
-        match name {
-            "fillRect" | "clearRect" => {
-                if let Some(&[x, y, width, height]) =
-                    self.canvas_numbers(name, arguments, 4)?.as_deref()
-                {
-                    let mut context = context.borrow_mut();
-                    let fill = context.fill_style;
-                    match name {
-                        "fillRect" => context.bitmap.fill_rect((x, y, width, height), fill),
-                        _ => context.bitmap.clear_rect((x, y, width, height)),
+        // how many numbers each of the path and transform calls takes
+        let takes = match name {
+            "scale" | "translate" | "moveTo" | "lineTo" => 2,
+            "rotate" => 1,
+            "transform" | "bezierCurveTo" => 6,
+            "quadraticCurveTo" | "rect" | "strokeRect" | "fillRect" | "clearRect" => 4,
+            "arc" => 5,
+            "ellipse" => 7,
+            _ => 0,
+        };
+        if takes > 0 {
+            let Some(numbers) = self.canvas_numbers(name, arguments, takes)? else {
+                return Ok(Value::Undefined);
+            };
+            let n = |index: usize| numbers[index];
+            let counterclockwise = arguments.get(takes).is_some_and(Value::truthy);
+            let mut context = context.borrow_mut();
+            let apply = |context: &mut CanvasContextData, matrix: Affine| {
+                context.state.transform = crate::svg::multiply(context.state.transform, matrix);
+            };
+            match name {
+                "scale" => apply(&mut context, [n(0), 0.0, 0.0, n(1), 0.0, 0.0]),
+                "translate" => apply(&mut context, [1.0, 0.0, 0.0, 1.0, n(0), n(1)]),
+                "rotate" => {
+                    let (sin, cos) = n(0).sin_cos();
+                    apply(&mut context, [cos, sin, -sin, cos, 0.0, 0.0]);
+                }
+                "transform" => apply(&mut context, [n(0), n(1), n(2), n(3), n(4), n(5)]),
+                "moveTo" => context.move_to((n(0), n(1))),
+                "lineTo" => context.line_to((n(0), n(1))),
+                "bezierCurveTo" => context.cubic_to((n(0), n(1)), (n(2), n(3)), (n(4), n(5))),
+                "quadraticCurveTo" => context.quadratic_to((n(0), n(1)), (n(2), n(3))),
+                "rect" => context.rect((n(0), n(1), n(2), n(3))),
+                "arc" | "ellipse" => {
+                    let (radii, rotation, angles) = match name {
+                        "arc" => ((n(2), n(2)), 0.0, (n(3), n(4))),
+                        _ => ((n(2), n(3)), n(4), (n(5), n(6))),
+                    };
+                    if radii.0 < 0.0 || radii.1 < 0.0 {
+                        drop(context);
+                        return Err(self.throw_value(dom_exception(
+                            "IndexSizeError",
+                            &format!(
+                                "Failed to execute '{name}' on 'CanvasRenderingContext2D': The radius provided is negative."
+                            ),
+                        )));
                     }
+                    context.arc((n(0), n(1)), radii, rotation, angles, counterclockwise);
+                }
+                "strokeRect" => {
+                    let path = context.rect_path((n(0), n(1), n(2), n(3)));
+                    context.stroke_path(&path);
+                }
+                "fillRect" if context.plain() => {
+                    let fill = context.state.fill_style;
+                    context.bitmap.fill_rect((n(0), n(1), n(2), n(3)), fill);
                     context.snapshot = None;
                 }
+                "fillRect" => {
+                    let path = context.rect_path((n(0), n(1), n(2), n(3)));
+                    context.fill_path(&path, false);
+                }
+                "clearRect" if context.state.transform == IDENTITY => {
+                    context.bitmap.clear_rect((n(0), n(1), n(2), n(3)));
+                    context.snapshot = None;
+                }
+                _ => {
+                    let path = context.rect_path((n(0), n(1), n(2), n(3)));
+                    let size = context.size();
+                    if let Some(coverage) =
+                        crate::svg::path_coverage(&path, IDENTITY, None, false, size)
+                    {
+                        let stride = size.0 as usize;
+                        for (index, &value) in coverage.values.iter().enumerate() {
+                            let x = coverage.left as usize + index % coverage.width;
+                            let y = coverage.top as usize + index / coverage.width;
+                            let pixel = &mut context.bitmap.pixels[y * stride + x];
+                            *pixel = scale(*pixel, 255 - u32::from(value));
+                        }
+                        context.snapshot = None;
+                    }
+                }
+            }
+            return Ok(Value::Undefined);
+        }
+        match name {
+            "save" => {
+                let mut context = context.borrow_mut();
+                let state = context.state.clone();
+                context.saved.push(state);
+                Ok(Value::Undefined)
+            }
+            "restore" => {
+                let mut context = context.borrow_mut();
+                if let Some(state) = context.saved.pop() {
+                    context.state = state;
+                }
+                Ok(Value::Undefined)
+            }
+            "resetTransform" => {
+                context.borrow_mut().state.transform = IDENTITY;
+                Ok(Value::Undefined)
+            }
+            // six numbers, a matrix that names them a to f, or nothing for the identity
+            "setTransform" => {
+                let mut matrix = IDENTITY;
+                let first = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let named = matches!(first, Value::Object(_));
+                if named || arguments.len() >= 6 {
+                    for (index, key) in ["a", "b", "c", "d", "e", "f"].into_iter().enumerate() {
+                        let value = match named {
+                            true => self.get_property(&first, key)?,
+                            false => arguments[index].clone(),
+                        };
+                        matrix[index] = self.coerce_number(value)? as f32;
+                    }
+                }
+                if matrix.iter().all(|value| value.is_finite()) {
+                    context.borrow_mut().state.transform = matrix;
+                }
+                Ok(Value::Undefined)
+            }
+            "getTransform" => {
+                let matrix = context.borrow().state.transform;
+                Ok(plain_object(
+                    ["a", "b", "c", "d", "e", "f"]
+                        .into_iter()
+                        .zip(matrix)
+                        .map(|(key, value)| (key.to_string(), Value::Number(value.into()))),
+                ))
+            }
+            "beginPath" => {
+                let mut context = context.borrow_mut();
+                context.path.clear();
+                context.pen = None;
+                Ok(Value::Undefined)
+            }
+            "closePath" => {
+                context.borrow_mut().close_path();
+                Ok(Value::Undefined)
+            }
+            "fill" => {
+                let even_odd = arguments
+                    .iter()
+                    .any(|argument| argument.string_value() == "evenodd");
+                let mut context = context.borrow_mut();
+                let path = context.path.clone();
+                context.fill_path(&path, even_odd);
+                Ok(Value::Undefined)
+            }
+            "stroke" => {
+                let mut context = context.borrow_mut();
+                let path = context.path.clone();
+                context.stroke_path(&path);
                 Ok(Value::Undefined)
             }
             "drawImage" => {
@@ -1131,6 +1590,71 @@ fn image_data_object(width: u32, height: u32, data: Vec<u8>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_fill_and_stroke_under_the_transform_and_state_that_save_keeps() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="20" height="20"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const c = document.getElementById("c").getContext("2d");
+                const at = (x, y) => [...c.getImageData(x, y, 1, 1).data].join(",");
+                const seen = [];
+                c.fillStyle = "#f00";
+                c.beginPath();
+                c.moveTo(2, 2);
+                c.lineTo(10, 2);
+                c.lineTo(10, 10);
+                c.lineTo(2, 10);
+                c.fill();
+                seen.push(at(5, 5), at(12, 5));
+                c.save();
+                c.translate(10, 10);
+                c.scale(2, 2);
+                c.fillStyle = "#00f";
+                c.fillRect(1, 1, 2, 2);
+                c.restore();
+                seen.push(at(13, 13), at(17, 17), c.fillStyle);
+                c.strokeStyle = "#0f0";
+                c.lineWidth = 2;
+                c.beginPath();
+                c.moveTo(0, 15);
+                c.lineTo(8, 15);
+                c.stroke();
+                seen.push(at(4, 14), at(4, 15), at(4, 17));
+                c.globalAlpha = 0.5;
+                c.fillStyle = "#000";
+                c.fillRect(16, 0, 2, 2);
+                seen.push(at(16, 0));
+                c.globalAlpha = 1;
+                c.beginPath();
+                c.arc(10, 4, 3, 0, Math.PI * 2);
+                c.fillStyle = "#fff";
+                c.fill("evenodd");
+                seen.push(at(10, 4), at(14, 4));
+                c.setTransform(2, 0, 0, 2, 1, 1);
+                const matrix = c.getTransform();
+                c.resetTransform();
+                c.lineWidth = -1;
+                c.lineCap = "pointed";
+                seen.push(matrix.a, matrix.e, c.getTransform().a, c.unknownThing, c.lineWidth, c.lineCap);
+                c.restore();
+                document.getElementById("status").textContent = seen.join(" ");
+                "##,
+            )
+            .expect("canvas drawing should run");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.text_content(status),
+            "255,0,0,255 0,0,0,0 0,0,255,255 0,0,0,0 #ff0000 0,255,0,255 0,255,0,255 0,0,0,0 0,0,0,128 255,255,255,255 0,0,0,0 2 1 1  2 butt"
+        );
+    }
 
     #[test]
     fn media_of_another_origin_taints_a_canvas_unless_asked_for_with_cors() {

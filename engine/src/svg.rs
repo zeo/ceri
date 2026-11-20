@@ -295,7 +295,7 @@ pub(crate) fn fit(view: (f32, f32, f32, f32), size: Point, aspect: &str) -> Affi
     ]
 }
 
-fn multiply(outer: Affine, inner: Affine) -> Affine {
+pub(crate) fn multiply(outer: Affine, inner: Affine) -> Affine {
     [
         outer[0] * inner[0] + outer[2] * inner[1],
         outer[1] * inner[0] + outer[3] * inner[1],
@@ -306,7 +306,7 @@ fn multiply(outer: Affine, inner: Affine) -> Affine {
     ]
 }
 
-fn map(matrix: Affine, point: Point) -> Point {
+pub(crate) fn map(matrix: Affine, point: Point) -> Point {
     (
         matrix[0] * point.0 + matrix[2] * point.1 + matrix[4],
         matrix[1] * point.0 + matrix[3] * point.1 + matrix[5],
@@ -1139,14 +1139,7 @@ fn paint_shape(shape: &Shape, image: &mut Image, transform: Affine, fade: f32) {
         } else {
             (stroke, subpaths, matrix)
         };
-        let scale = scale_of(matrix);
-        let device_radius = stroke.width / 2.0 * scale;
-        let disc_steps = if device_radius > TOLERANCE {
-            (std::f32::consts::PI / (1.0 - TOLERANCE / device_radius).acos()).ceil()
-        } else {
-            8.0
-        }
-        .clamp(8.0, 128.0) as usize;
+        let disc_steps = disc_steps(stroke.width / 2.0 * scale_of(matrix));
         let mut polygons = Vec::new();
         for (points, closed) in &subpaths {
             stroke_polygons(points, *closed, &stroke, disc_steps, &mut polygons);
@@ -1161,6 +1154,123 @@ fn paint_shape(shape: &Shape, image: &mut Image, transform: Affine, fade: f32) {
         }
         fill_edges(image, &edges, false, stroke.color.scale_alpha(fade));
     }
+}
+
+// how much of each pixel in a rectangle of a surface a shape covers, out of 255, row by row
+pub(crate) struct Coverage {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) width: usize,
+    pub(crate) values: Vec<u8>,
+}
+
+// the pen a path is stroked with, its width in the path's own units
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Pen {
+    pub(crate) width: f32,
+    pub(crate) cap: LineCap,
+    pub(crate) join: LineJoin,
+    pub(crate) miter_limit: f32,
+}
+
+// what a path covers on a surface of this size once `matrix` has placed it: its inside by
+// the winding rule or the even-odd one, or with a pen the stroke along it
+pub(crate) fn path_coverage(
+    path: &[Segment],
+    matrix: Affine,
+    pen: Option<Pen>,
+    even_odd: bool,
+    size: (u32, u32),
+) -> Option<Coverage> {
+    let subpaths = flatten(path, matrix);
+    let mut edges = Vec::new();
+    match pen {
+        None => {
+            for (points, _) in &subpaths {
+                let device = points.iter().map(|&point| map(matrix, point));
+                let next = device.clone().cycle().skip(1);
+                edges.extend(device.zip(next));
+            }
+        }
+        Some(pen) => {
+            let stroke = Stroke {
+                color: Color::BLACK,
+                width: pen.width,
+                non_scaling: false,
+                cap: pen.cap,
+                join: pen.join,
+                miter_limit: pen.miter_limit,
+            };
+            let scale = matrix[0].hypot(matrix[1]).max(matrix[2].hypot(matrix[3]));
+            let mut polygons = Vec::new();
+            for (points, closed) in &subpaths {
+                stroke_polygons(
+                    points,
+                    *closed,
+                    &stroke,
+                    disc_steps(pen.width / 2.0 * scale),
+                    &mut polygons,
+                );
+            }
+            for polygon in polygons {
+                let device = polygon
+                    .into_iter()
+                    .map(|point| map(matrix, point))
+                    .collect::<Vec<_>>();
+                crate::font::push_polygon(&mut edges, &device);
+            }
+        }
+    }
+    edge_coverage(&edges, even_odd && pen.is_none(), size)
+}
+
+// the sides of a round join or cap fine enough for its radius on the device
+fn disc_steps(device_radius: f32) -> usize {
+    if device_radius > TOLERANCE {
+        (std::f32::consts::PI / (1.0 - TOLERANCE / device_radius).acos()).ceil()
+    } else {
+        8.0
+    }
+    .clamp(8.0, 128.0) as usize
+}
+
+fn edge_coverage(
+    edges: &[crate::font::Segment],
+    even_odd: bool,
+    size: (u32, u32),
+) -> Option<Coverage> {
+    if edges.is_empty() {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(from, to) in edges {
+        for point in [from, to] {
+            left = left.min(point.0);
+            top = top.min(point.1);
+            right = right.max(point.0);
+            bottom = bottom.max(point.1);
+        }
+    }
+    if !(left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()) {
+        return None;
+    }
+    let left = left.floor().max(0.0) as i32;
+    let top = top.floor().max(0.0) as i32;
+    let right = right.ceil().min(size.0 as f32) as i32;
+    let bottom = bottom.ceil().min(size.1 as f32) as i32;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let (width, height) = ((right - left) as usize, (bottom - top) as usize);
+    let spans = span_edges(edges, (top as f32, bottom as f32), even_odd);
+    let values =
+        crate::font::coverage_grid(&spans, (left as f32, top as f32), width, height, false);
+    Some(Coverage {
+        left,
+        top,
+        width,
+        values,
+    })
 }
 
 fn fill_edges(image: &mut Image, edges: &[crate::font::Segment], even_odd: bool, color: Color) {
