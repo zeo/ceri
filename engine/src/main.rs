@@ -125,16 +125,20 @@ fn main() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         println!("advanced {milliseconds}ms: {} task(s)", executed.tasks_run);
     }
-    if options.frames > 0 {
-        report_frame_times(&mut host, options.frames)?;
-    }
+    let timed = if options.frames > 0 {
+        report_frame_times(&mut host, options.frames)?
+    } else {
+        None
+    };
     let layout = host
         .browser()
         .layout(options.viewport)
         .map_err(|error| error.to_string())?;
+    // after a timed run the page may have nothing new to paint, so its last frame stands
     let frame = host
         .render()
         .map_err(|error| error.to_string())?
+        .or(timed)
         .ok_or_else(|| "host did not produce a frame".to_string())?;
     let canvas = frame.canvas;
     if let Some(parent) = options
@@ -174,26 +178,62 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-// a frame here is one clock tick plus a full layout and paint pass
-fn report_frame_times(host: &mut EngineHost, frames: usize) -> Result<(), String> {
+// a frame here is one clock tick, a layout of what it changed and a paint; the last frame
+// painted comes back for the image the run writes
+fn report_frame_times(
+    host: &mut EngineHost,
+    frames: usize,
+) -> Result<Option<ceri_engine::Frame>, String> {
+    let viewport = host.viewport();
     let mut samples = Vec::with_capacity(frames);
+    // per frame: the tick's script, a layout of what it changed, then the paint, whose own
+    // layout finds the one just made in the cache
+    let mut parts = [
+        Vec::with_capacity(frames),
+        Vec::with_capacity(frames),
+        Vec::with_capacity(frames),
+    ];
+    let mut last = None;
     for _ in 0..frames {
         let started = std::time::Instant::now();
         host.input(InputEvent::AdvanceTime(16))
             .map_err(|error| error.to_string())?;
-        host.render().map_err(|error| error.to_string())?;
-        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        let ticked = started.elapsed();
+        host.browser()
+            .layout(viewport)
+            .map_err(|error| error.to_string())?;
+        let laid_out = started.elapsed();
+        if let Some(frame) = host.render().map_err(|error| error.to_string())? {
+            last = Some(frame);
+        }
+        let rendered = started.elapsed();
+        samples.push(rendered.as_secs_f64() * 1000.0);
+        for (part, span) in parts
+            .iter_mut()
+            .zip([ticked, laid_out - ticked, rendered - laid_out])
+        {
+            part.push(span.as_secs_f64() * 1000.0);
+        }
     }
-    samples.sort_by(|left, right| left.partial_cmp(right).expect("frame times are finite"));
-    let median = samples[samples.len() / 2];
-    let worst = samples[samples.len() - 1];
+    let median = |values: &mut Vec<f64>| {
+        values.sort_by(|left, right| left.partial_cmp(right).expect("frame times are finite"));
+        values[values.len() / 2]
+    };
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let middle = median(&mut samples);
+    let worst = samples[samples.len() - 1];
     println!(
-        "{frames} frames: {median:.2} ms median, {mean:.2} ms mean, {worst:.2} ms worst, {:.0} fps at the median",
-        1000.0 / median.max(f64::EPSILON)
+        "{frames} frames: {middle:.2} ms median, {mean:.2} ms mean, {worst:.2} ms worst, {:.0} fps at the median",
+        1000.0 / middle.max(f64::EPSILON)
     );
-    // the split tells a slow cascade apart from a slow paint pass
-    let viewport = host.viewport();
+    let [script, layout, paint] = &mut parts;
+    println!(
+        "per frame: script {:.2} ms, layout {:.2} ms, paint {:.2} ms",
+        median(script),
+        median(layout),
+        median(paint)
+    );
+    // a layout of a document that has not changed shows what the layout cache costs
     let mut layout_samples = Vec::with_capacity(frames);
     for _ in 0..frames {
         let started = std::time::Instant::now();
@@ -204,10 +244,10 @@ fn report_frame_times(host: &mut EngineHost, frames: usize) -> Result<(), String
     }
     layout_samples.sort_by(|left, right| left.partial_cmp(right).expect("times are finite"));
     println!(
-        "layout only: {:.2} ms median",
+        "layout of an unchanged document: {:.2} ms median",
         layout_samples[layout_samples.len() / 2]
     );
-    Ok(())
+    Ok(last)
 }
 
 fn load_font(path: &Path) -> Result<std::rc::Rc<FontFace>, String> {
