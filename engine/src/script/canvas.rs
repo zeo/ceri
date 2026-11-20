@@ -18,6 +18,7 @@ const METHODS: &[&str] = &[
     "drawImage",
     "getImageData",
     "putImageData",
+    "createImageData",
 ];
 
 #[derive(Clone, Default)]
@@ -759,6 +760,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             "getImageData" => self.get_image_data(context, arguments),
+            "createImageData" => self.create_image_data(arguments),
             _ => {
                 self.put_image_data(context, arguments)?;
                 Ok(Value::Undefined)
@@ -928,21 +930,38 @@ impl ScriptRuntime {
             return Err(self.range_error("Out of memory at ImageData creation"));
         }
         let data = context.borrow().bitmap.image_data(x, y, width, height);
-        let length = data.len();
-        Ok(plain_object([
-            ("width".to_string(), Value::Number(f64::from(width))),
-            ("height".to_string(), Value::Number(f64::from(height))),
-            (
-                "data".to_string(),
-                new_typed(
-                    ElementKind::Uint8Clamped,
-                    Rc::new(RefCell::new(data)),
-                    0,
-                    length,
-                ),
-            ),
-            ("colorSpace".to_string(), Value::String("srgb".into())),
-        ]))
+        Ok(image_data_object(width, height, data))
+    }
+
+    // transparent black pixels of the size given, or of the size of another ImageData
+    fn create_image_data(&mut self, arguments: &[Value]) -> Result<Value, ScriptError> {
+        let (width, height) = match arguments {
+            [other] => {
+                let width = self.get_property(other, "width")?;
+                let height = self.get_property(other, "height")?;
+                (self.coerce_uint32(width)?, self.coerce_uint32(height)?)
+            }
+            _ => {
+                let values = self.canvas_longs("createImageData", arguments, 2)?;
+                (
+                    values[0].unsigned_abs().min(u64::from(u32::MAX)) as u32,
+                    values[1].unsigned_abs().min(u64::from(u32::MAX)) as u32,
+                )
+            }
+        };
+        for (extent, name) in [(width, "width"), (height, "height")] {
+            if extent == 0 {
+                return Err(self.throw_value(dom_exception(
+                    "IndexSizeError",
+                    &format!("Failed to execute 'createImageData' on 'CanvasRenderingContext2D': The source {name} is 0."),
+                )));
+            }
+        }
+        if crate::image::check_dimensions(width, height).is_err() {
+            return Err(self.range_error("Out of memory at ImageData creation"));
+        }
+        let data = vec![0; width as usize * height as usize * 4];
+        Ok(image_data_object(width, height, data))
     }
 
     fn put_image_data(
@@ -991,6 +1010,24 @@ impl ScriptRuntime {
         context.snapshot = None;
         Ok(())
     }
+}
+
+fn image_data_object(width: u32, height: u32, data: Vec<u8>) -> Value {
+    let length = data.len();
+    plain_object([
+        ("width".to_string(), Value::Number(f64::from(width))),
+        ("height".to_string(), Value::Number(f64::from(height))),
+        (
+            "data".to_string(),
+            new_typed(
+                ElementKind::Uint8Clamped,
+                Rc::new(RefCell::new(data)),
+                0,
+                length,
+            ),
+        ),
+        ("colorSpace".to_string(), Value::String("srgb".into())),
+    ])
 }
 
 #[cfg(test)]

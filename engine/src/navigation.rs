@@ -8112,6 +8112,43 @@ mod tests {
     }
 
     #[test]
+    fn the_body_is_active_with_nothing_focused_and_image_data_can_be_made_blank() {
+        let mut browser = Browser::new(bundle(
+            r##"<input id="field"><canvas id="pad" width="4" height="4"></canvas><p id="status"></p>
+            <script>
+                const log = [document.activeElement === document.body];
+                const field = document.getElementById("field");
+                field.focus();
+                log.push(document.activeElement === field);
+                field.blur();
+                log.push(document.activeElement === document.body);
+                log.push(CSS.supports("touch-action", "none"), CSS.supports("forced-color-adjust", "none"));
+                const pen = document.getElementById("pad").getContext("2d");
+                const blank = pen.createImageData(3, -2);
+                const same = pen.createImageData(blank);
+                log.push(blank.width, blank.height, blank.data.length, same.data.length);
+                log.push(blank.data.every((byte) => byte === 0));
+                try {
+                    pen.createImageData(0, 2);
+                } catch (error) {
+                    log.push(error.name);
+                }
+                document.getElementById("status").textContent = log.join(" ");
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().unwrap();
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").unwrap();
+        assert_eq!(
+            document.text_content(status),
+            "true true true true true 3 2 24 24 true IndexSizeError"
+        );
+    }
+
+    #[test]
     fn animation_frames_come_as_often_as_the_display_refreshes() {
         assert_eq!(
             [30_000, 60_000, 120_000, 144_000, 240_000, 500_000].map(frame_interval),

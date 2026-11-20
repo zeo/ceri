@@ -5732,6 +5732,8 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "flex-grow",
     "flex-shrink",
     "flex-wrap",
+    // forced colors are never applied, so there is nothing to opt out of
+    "forced-color-adjust",
     "float",
     "font-family",
     "font-size",
@@ -5807,6 +5809,8 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "text-align",
     "text-transform",
     "top",
+    // the engine turns no touch into a pan or a zoom of its own
+    "touch-action",
     "transform",
     "transform-origin",
     "transition",

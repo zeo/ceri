@@ -3704,8 +3704,10 @@ impl ScriptRuntime {
                     .borrow()
                     .document_element()
                     .map_or(Value::Null, |node| self.node_value(node))),
+                // with nothing focused the body is the active element
                 "activeElement" => Ok(self
                     .active_element()
+                    .or_else(|| self.document.borrow().body())
                     .map_or(Value::Null, |node| self.node_value(node))),
                 _ => Err(runtime_error(format!(
                     "document has no property {property}"
