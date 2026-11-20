@@ -5934,13 +5934,23 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 style_state,
                 parent: child_parent,
                 containing_width: content_width,
-                own_width: true,
+                // a width in percent is a share of the table, set once the table is as wide
+                // as it will be, so the cell counts by its content alone
+                own_width: !cell.style.width.has_percent(),
             },
             minimum,
         )
     };
     let mut column_min = vec![0.0_f32; column_count];
     let mut column_max = vec![0.0_f32; column_count];
+    // the share of the table a column was given by a cell of its own
+    let mut column_share = vec![0.0_f32; column_count];
+    for cell in cells.iter().filter(|cell| cell.columns == 1) {
+        let at = |basis: f32| cell.style.width.resolve(basis, font_size).unwrap_or(0.0);
+        if cell.style.width.has_percent() {
+            column_share[cell.column] = column_share[cell.column].max(at(1.0) - at(0.0));
+        }
+    }
     let mut by_span = (0..cells.len()).collect::<Vec<_>>();
     by_span.sort_by_key(|index| cells[*index].columns);
     for index in by_span {
@@ -5966,6 +5976,9 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         (sum_max + spacing_total)
             .min(content_width)
             .max(sum_min + spacing_total)
+    } else if style.table_fixed {
+        // a fixed table is as wide as it is told to be, whatever its cells hold
+        content_width
     } else {
         content_width.max(sum_min + spacing_total)
     };
@@ -5994,33 +6007,71 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         } else {
             0.0
         };
+        // with every column given a width and room left over, the columns sized in lengths
+        // grow in proportion, and those sized as a share of the table keep it
+        let shared = |column: usize| {
+            cells.iter().any(|cell| {
+                cell.row == 0
+                    && cell.columns == 1
+                    && cell.column == column
+                    && cell.style.width.has_percent()
+            })
+        };
+        let lengths = (0..column_count)
+            .filter(|&column| !shared(column))
+            .filter_map(|column| widths[column])
+            .sum::<f32>();
+        let grow = if open == 0 && lengths > 0.0 && available > fixed {
+            1.0 + (available - fixed) / lengths
+        } else {
+            1.0
+        };
         widths
             .into_iter()
-            .map(|width| width.unwrap_or(share))
-            .collect()
-    } else if available >= sum_max {
-        let extra = available - sum_max;
-        column_max
-            .iter()
-            .map(|maximum| {
-                if sum_max > 0.0 {
-                    maximum + extra * maximum / sum_max
-                } else {
-                    extra / column_count.max(1) as f32
-                }
+            .enumerate()
+            .map(|(column, width)| match width {
+                Some(width) if !shared(column) => width * grow,
+                Some(width) => width,
+                None => share,
             })
             .collect()
     } else {
-        let ratio = if sum_max > sum_min {
-            ((available - sum_min) / (sum_max - sum_min)).clamp(0.0, 1.0)
+        // a column given a share of the table takes it, down to its narrowest content, and
+        // the others divide what is left by their widest and narrowest content
+        let mut widths = column_share
+            .iter()
+            .zip(&column_min)
+            .map(|(share, minimum)| (*share > 0.0).then(|| (available * share).max(*minimum)))
+            .collect::<Vec<_>>();
+        let left = available - widths.iter().flatten().sum::<f32>();
+        let open = |column: &usize| widths[*column].is_none();
+        let sum = |sizes: &[f32]| {
+            (0..column_count)
+                .filter(open)
+                .map(|at| sizes[at])
+                .sum::<f32>()
+        };
+        let (least, most) = (sum(&column_min), sum(&column_max));
+        let count = (0..column_count).filter(open).count().max(1) as f32;
+        let ratio = if most > least {
+            ((left - least) / (most - least)).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        column_min
-            .iter()
-            .zip(&column_max)
-            .map(|(minimum, maximum)| minimum + (maximum - minimum) * ratio)
-            .collect::<Vec<_>>()
+        for column in 0..column_count {
+            if widths[column].is_some() {
+                continue;
+            }
+            let (minimum, maximum) = (column_min[column], column_max[column]);
+            widths[column] = Some(if left >= most && most > 0.0 {
+                maximum + (left - most) * maximum / most
+            } else if left >= most {
+                (left - most) / count
+            } else {
+                minimum + (maximum - minimum) * ratio
+            });
+        }
+        widths.into_iter().flatten().collect::<Vec<_>>()
     };
     if column_widths.is_empty() {
         column_widths.push(0.0);
@@ -6849,6 +6900,60 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             SpaceCollapse::Preserve | SpaceCollapse::BreakSpaces
         );
     let children = node.children(&NO_GENERATED_CONTENT);
+    // a grid with columns of its own is as wide as they are: each the length it names, or
+    // the widest of the items that land in it, taken in turn
+    let columns = style.grid_template_columns.list();
+    if matches!(style.display, Display::Grid | Display::InlineGrid)
+        && columns.repeat.is_none()
+        && !columns.tracks.is_empty()
+    {
+        let breadth = |track: &crate::grid::TrackSize| if minimum { track.min } else { track.max };
+        let mut widths = vec![0.0_f32; columns.tracks.len()];
+        let mut placed = 0;
+        for child in &children {
+            let Child::Element(child) = *child else {
+                continue;
+            };
+            let child_style = stylesheet.style_for(child.style_context(child_parent, style_state));
+            if child_style.display == Display::None || child_style.position.is_out_of_flow() {
+                continue;
+            }
+            let column = placed % widths.len();
+            placed += 1;
+            if matches!(
+                breadth(&columns.tracks[column]),
+                crate::grid::Breadth::Length(_)
+            ) {
+                continue;
+            }
+            let width = intrinsic_width(
+                MaxContentInput {
+                    node: child,
+                    stylesheet,
+                    style_state,
+                    parent: child_parent,
+                    containing_width,
+                    own_width: true,
+                },
+                minimum,
+            );
+            widths[column] = widths[column].max(width);
+        }
+        let gap = style.gap.resolve(0.0, font_size).unwrap_or(0.0).max(0.0);
+        let total = columns
+            .tracks
+            .iter()
+            .zip(&widths)
+            .map(|(track, width)| match breadth(track) {
+                crate::grid::Breadth::Length(length) => {
+                    length.resolve(0.0, font_size).unwrap_or(0.0).max(0.0)
+                }
+                _ => *width,
+            })
+            .sum::<f32>()
+            + gap * (widths.len() - 1) as f32;
+        return extras + bounded(total);
+    }
     let mut joined = String::new();
     let mut after_element = false;
     let mut flex_items = 0_usize;
@@ -11580,6 +11685,52 @@ mod tests {
             "<label style='display: inline-flex'><span>text</span><input type='checkbox' style='width: 30px; height: 17px; padding: 0; border: 0'></label>",
         );
         assert!(worded.0 < boxed.0, "{worded:?} {boxed:?}");
+    }
+
+    #[test]
+    fn a_table_column_takes_its_share_and_a_grid_cell_shrinks_to_its_fixed_tracks() {
+        let markup = "<style>* { margin: 0; padding: 0; } table { width: 400px; border-collapse: collapse; } #share { width: 25%; } #fixed { width: 60px; } .cell { display: grid; grid-template-columns: 10px minmax(0, 1fr) 20px; } u { display: block; white-space: nowrap; }</style><table><tr><th id='share'></th><th id='fixed'></th><th id='rest'></th></tr><tr><td><div class='cell'><i></i><u>a long line of text that would be far wider than a quarter</u><b></b></div></td><td></td><td></td></tr></table>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let table = find_box(&result.root, "table").expect("table");
+        let widths = ["th", "td"].map(|tag| find_box(table, tag).expect("cell").rect.width);
+        // the first column is a quarter of the table whatever its cell could spread to
+        assert_eq!(table.rect.width, 400.0);
+        assert_eq!(widths, [100.0, 100.0]);
+        let cell = find_box(table, "div").expect("grid");
+        assert_eq!(cell.rect.width, 100.0);
+    }
+
+    #[test]
+    fn a_fixed_table_keeps_its_width_and_shares_what_is_over_among_its_length_columns() {
+        let markup = "<style>* { margin: 0; padding: 0; } table { width: 400px; table-layout: fixed; border-collapse: collapse; } td { white-space: nowrap; } #a { width: 25%; } #b { width: 100px; } #c { width: 150px; }</style><table><tr><th id='a'></th><th id='b'></th><th id='c'></th></tr><tr><td>a line of text far wider than the quarter of the table it sits in</td><td></td><td></td></tr></table>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let table = find_box(&result.root, "table").expect("table");
+        let row = &find_box(table, "tr").expect("row").children;
+        let widths = row
+            .iter()
+            .map(|cell| cell.rect.width.round())
+            .collect::<Vec<_>>();
+        // the quarter stays a quarter, and the 50px left over goes to the other two as 2 to 3
+        assert_eq!(table.rect.width, 400.0);
+        assert_eq!(widths, [100.0, 120.0, 180.0]);
     }
 
     #[test]
