@@ -2182,7 +2182,7 @@ impl ScriptRuntime {
                             _ => Value::Undefined,
                         });
                     }
-                    target = match self.prototype_of(&target) {
+                    target = match self.prototype_of_value(&target)? {
                         Some(prototype) => Value::Object(prototype),
                         None => return Ok(Value::Undefined),
                     };

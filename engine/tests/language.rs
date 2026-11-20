@@ -2091,6 +2091,15 @@ fn css_escapes_identifiers_and_answers_supports_like_cssom() {
 }
 
 #[test]
+fn lookup_accessor_helpers_ask_a_proxy_for_its_prototype() {
+    check(&[(
+        "getPrototypeOf trap",
+        "var get = function () {}; var set = function () {}; var proto = Object.defineProperty({}, 'x', { get: get, set: set }); var seen = 0; var p = new Proxy({}, { getPrototypeOf: function () { seen++; return proto; } }); console.log(p.__lookupGetter__('x') === get, p.__lookupSetter__('x') === set, seen)",
+        "true true 2",
+    )]);
+}
+
+#[test]
 fn canvas_smoothing_samples_like_chromium() {
     // seeded noise, then pixels chromium drew from it in edge 157 (cpu raster) at each setting
     let setup = r#"

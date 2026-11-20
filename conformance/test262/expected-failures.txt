@@ -2000,10 +2000,6 @@ test/built-ins/Object/preventExtensions/abrupt-completion.js
 test/built-ins/Object/preventExtensions/throws-when-false.js
 test/built-ins/Object/prop-desc.js
 test/built-ins/Object/proto-from-ctor-realm.js
-test/built-ins/Object/prototype/__lookupGetter__/lookup-own-proto-err.js
-test/built-ins/Object/prototype/__lookupGetter__/lookup-proto-proto-err.js
-test/built-ins/Object/prototype/__lookupSetter__/lookup-own-proto-err.js
-test/built-ins/Object/prototype/__lookupSetter__/lookup-proto-proto-err.js
 test/built-ins/Object/prototype/__proto__/get-abrupt.js
 test/built-ins/Object/prototype/__proto__/set-non-obj-coercible.js
 test/built-ins/Object/prototype/isPrototypeOf/arg-is-proxy.js
