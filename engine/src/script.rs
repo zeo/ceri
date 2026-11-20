@@ -584,6 +584,8 @@ pub struct ScriptRuntime {
     // how an iteration the vm starts names its value when it is not iterable
     iterable_callsite: Option<operations::Callsite>,
     nested_runs: usize,
+    // where the native stack stood when the outermost run began
+    stack_base: usize,
     private_names: u64,
     symbol_counter: u64,
     // arrays being joined, so a cycle prints as empty instead of recursing
@@ -1654,6 +1656,7 @@ impl ScriptRuntime {
             pending_exception: None,
             iterable_callsite: None,
             nested_runs: 0,
+            stack_base: 0,
             private_names: 0,
             symbol_counter: 0,
             joining: Vec::new(),

@@ -2490,6 +2490,23 @@ fn a_scope_past_the_slot_limit_is_refused() {
 }
 
 #[test]
+fn deep_native_reentry_throws_instead_of_overflowing() {
+    let cases = [
+        "function r() { eval('r()'); } try { r(); } catch (e) { console.log(e instanceof RangeError); }",
+        "function r() { [1].map(r); } try { r(); } catch (e) { console.log(e instanceof RangeError); }",
+    ];
+    for source in cases {
+        let output = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || run(source))
+            .expect("thread")
+            .join()
+            .expect("no overflow");
+        assert_eq!(output, Ok("true".to_string()), "{source}");
+    }
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (

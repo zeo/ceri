@@ -154,6 +154,11 @@ const MAX_FRAMES: usize = 10_000;
 // the parent constructor of a derived class, in a slot scripts cannot name
 const SUPER_KEY: &str = "\u{10ffff}#super";
 const MAX_NESTED_RUNS: usize = 400;
+// the native stack the runs nested in one another may take from where the outermost
+// began: a native callback re-enters run through tens of kilobytes of frames, a
+// hundred in a debug build, and a script may run on a thread with as little as the
+// 1 MiB a windows main thread gets
+const NATIVE_STACK_BUDGET: usize = 640 * 1024;
 
 impl ScriptRuntime {
     // ---- entry points ----
@@ -802,7 +807,13 @@ impl ScriptRuntime {
     // ---- the run loop ----
 
     pub(super) fn run(&mut self, frame: Frame) -> Result<RunResult, ScriptError> {
-        if self.nested_runs >= MAX_NESTED_RUNS {
+        let marker = 0u8;
+        let here = std::hint::black_box(&marker) as *const u8 as usize;
+        if self.nested_runs == 0 {
+            self.stack_base = here;
+        } else if self.nested_runs >= MAX_NESTED_RUNS
+            || self.stack_base.saturating_sub(here) > NATIVE_STACK_BUDGET
+        {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
         self.nested_runs += 1;
