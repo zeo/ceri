@@ -7014,14 +7014,21 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                 let side_by_side = if minimum {
                     nowrap_row
                 } else {
+                    // a flex column or a grid makes blocks of its inline children, which stack
                     row_flex
-                        || matches!(
+                        || (!matches!(
+                            style.display,
+                            Display::Flex
+                                | Display::InlineFlex
+                                | Display::Grid
+                                | Display::InlineGrid
+                        ) && matches!(
                             child_display,
                             Display::Inline
                                 | Display::InlineBlock
                                 | Display::InlineFlex
                                 | Display::InlineGrid
-                        )
+                        ))
                 };
                 if side_by_side {
                     inline += width;
@@ -11731,6 +11738,28 @@ mod tests {
         // the quarter stays a quarter, and the 50px left over goes to the other two as 2 to 3
         assert_eq!(table.rect.width, 400.0);
         assert_eq!(widths, [100.0, 120.0, 180.0]);
+    }
+
+    #[test]
+    fn a_flex_column_is_as_wide_as_its_widest_inline_child() {
+        let markup = "<style>* { margin: 0; padding: 0; } #grid { display: grid; grid-template-columns: 1fr auto; width: 400px; } #side { display: flex; flex-direction: column; } b { display: inline-block; width: 50px; height: 10px; } i { display: inline-block; width: 70px; height: 10px; }</style><div id='grid'><div id='body'></div><div id='side'><b></b><i></i><b></b></div></div>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let grid = find_box(&result.root, "div").expect("grid");
+        let widths = grid
+            .children
+            .iter()
+            .map(|item| item.rect.width)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [330.0, 70.0]);
     }
 
     #[test]
