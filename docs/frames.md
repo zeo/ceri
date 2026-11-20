@@ -64,7 +64,7 @@ A running app answers the same questions over devtools. Build it with `.devtools
 {"id": 2, "method": "Performance.getMetrics"}
 ```
 
-`Performance.enable` starts collecting, and each `Performance.getMetrics` returns the totals since then: `Frames`, `LayoutCount`, `LayoutDuration`, `RecalcStyleCount`, `RecalcStyleDuration` and `ScriptDuration` in the units Chromium uses (counts and seconds), then three metrics for every phase, such as `paint: shadow self`, `paint: shadow total` and `paint: shadow calls`. Divide by `Frames` for a per-frame figure. `Performance.disable` stops collecting and forgets the totals.
+`Performance.enable` starts collecting, and each `Performance.getMetrics` returns the totals since then: `LayoutCount`, `LayoutDuration`, `RecalcStyleCount`, `RecalcStyleDuration` and `ScriptDuration` in the units Chromium uses (counts and seconds), then three metrics for every phase, such as `paint: shadow self`, `paint: shadow total` and `paint: shadow calls`. The frames painted are `frame: paint calls`; divide by it for a per-frame figure. `Performance.disable` stops collecting and forgets the totals.
 
 A new phase is one line where the work starts:
 

@@ -729,7 +729,6 @@ fn performance_metrics() -> Vec<Json> {
         });
     let metric = |name: String, value: f64| json!({ "name": name, "value": value });
     let mut metrics = vec![
-        metric("Frames".to_string(), of("frame: paint").1 as f64),
         metric("LayoutCount".to_string(), of("layout").1 as f64),
         metric("LayoutDuration".to_string(), of("layout").0),
         metric("RecalcStyleCount".to_string(), style.1 as f64),
@@ -819,7 +818,7 @@ mod tests {
                 .as_f64()
                 .unwrap()
         };
-        assert_eq!(value("Frames"), 1.0);
+        assert_eq!(value("frame: paint calls"), 1.0);
         assert_eq!(value("LayoutCount"), 1.0);
         assert!(value("LayoutDuration") > 0.0);
         assert!(value("paint: whole frame total") >= value("paint: whole frame self"));
@@ -832,7 +831,7 @@ mod tests {
             "Performance.getMetrics",
             json!({}),
         );
-        assert_eq!(result(&sent, 4)["metrics"].as_array().unwrap().len(), 6);
+        assert_eq!(result(&sent, 4)["metrics"].as_array().unwrap().len(), 5);
     }
 
     #[test]
