@@ -5964,8 +5964,9 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let column_count = occupied.iter().map(Vec::len).max().unwrap_or(0);
     let row_count = rows.len();
 
-    // collapsed borders share their width between neighbours; separated ones keep spacing
-    let collapse_overlap = |side: fn(&ResolvedEdges) -> f32| {
+    // collapsed borders share their width between neighbours, so two that meet overlap by
+    // the narrower and a border that meets none keeps its room; separated ones keep spacing
+    let widest = |side: fn(&ResolvedEdges) -> f32| {
         cells
             .iter()
             .map(|cell| side(&used_border(&cell.style)))
@@ -5973,8 +5974,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     };
     let (spacing_x, spacing_y) = if style.border_collapse {
         (
-            -collapse_overlap(|edges| edges.left.max(edges.right)),
-            -collapse_overlap(|edges| edges.top.max(edges.bottom)),
+            -widest(|edges| edges.left).min(widest(|edges| edges.right)),
+            -widest(|edges| edges.top).min(widest(|edges| edges.bottom)),
         )
     } else {
         style.border_spacing
@@ -11943,6 +11944,31 @@ mod tests {
             boxes("b"),
             ([0.0, 0.0, 20.0, 20.0], [25.0, 10.0, 10.0, 10.0])
         );
+    }
+
+    #[test]
+    fn collapsed_rows_ruled_on_one_side_keep_the_room_of_their_rule() {
+        let pitch = |border: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; padding: 0; }} table {{ border-collapse: collapse; }} td {{ height: 20px; {border} }}</style><table><tr><td>a</td></tr><tr id='second'><td>b</td></tr></table>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 800.0,
+                    height: 300.0,
+                },
+            );
+            let second = document.find_element_by_id("second").expect("row");
+            result.box_index()[&second][0].rect.y
+        };
+        // a rule under each row has nothing to share with the row below it
+        assert_eq!(pitch("border-bottom: 2px solid;"), 22.0);
+        // rules all round share the one between two rows
+        assert_eq!(pitch("border: 2px solid;"), 22.0);
     }
 
     #[test]
