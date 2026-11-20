@@ -6,7 +6,7 @@ How the engine makes a frame, what it carries from one frame to the next, and ho
 
 The engine thread runs a frame in four steps. The names in brackets are the profiler's phases.
 
-1. The page's timers and animation frame callbacks run (`script: tick`).
+1. The page's timers and animation frame callbacks run (`script: tick`, with `script: callback` for each one), then audio, then the resize and intersection observers (`script: observers`), which measure the page and so may lay it out. After every input the engine also looks for transitions and animations to start (`frame: motion`).
 2. Layout works out every box (`frame: layout`, `layout`). Style is part of it: the cascade matches rules to an element (`style: cascade`), the computed style applies them (`style: compute`), and one pass resolves custom properties (`style: custom properties`). Flex and grid containers (`layout: flex`, `layout: grid`) ask their items for intrinsic widths (`layout: intrinsic width`) and lay them out (`layout: element`).
 3. Paint compares the new layout with the one on the canvas (`paint: damage`) and repaints the areas that differ (`paint: repaint`, `paint: document`). A first frame, or one whose size changed, paints everything (`paint: whole frame`). Shapes, borders, shadows, text, images and SVG scenes have phases of their own.
 4. The window uploads the boxes that changed to its frame texture and presents.
@@ -19,7 +19,7 @@ Most frames change little: a playhead moves, a counter ticks, the pointer crosse
 
 | Kept | Stands until |
 | --- | --- |
-| The cascade of each element and generated box | An element is added, removed or moved, or any attribute but `style` changes (the document's selector version). Focus, the active element, checked and disabled sets, control values, the viewport, the color scheme, reduced motion, container sizes, the top layer or a forced pseudo-class changes. The element's own `style` text changes, which drops that one cascade. |
+| The cascade of each element and generated box | An element is added, removed or moved, or any attribute but `style` changes its value (the document's selector version); setting an attribute or a class to what it already is reaches observers and nothing else. Focus, the active element, checked and disabled sets, control values, the viewport, the color scheme, reduced motion, container sizes, the top layer or a forced pseudo-class changes. The element's own `style` text changes, which drops that one cascade. |
 | Boxes and intrinsic widths | Anything in the node's subtree is written, or an ancestor itself is. The sheet, the fonts or their web faces, the device scale, or any part of the style state but the clock changes. A box that sampled an animation or a transition, or sized a query container, lasts one layout. |
 | The custom properties of the last two passes | The document or the state they read changes. |
 | The canvas | Never thrown away while the size holds: damaged areas are repainted over it. While the window still holds the last frame, the next one is painted over the frame before it, which first catches up on the areas it missed, so no frame is copied. |
@@ -34,7 +34,7 @@ Three kinds of page give some of this up:
 - A document with a shadow root keeps none either: a shadow tree is written without its host hearing of it.
 - A sheet with container queries keeps no boxes, because a query container's size is something each layout has to write down.
 
-Kept boxes hold their whole subtree, so only the answers the last two layouts used stay: the boxes beside the chain that changed, and not the ones inside them. The engine thread lets go of the kept layout answers and the second canvas one second after the last frame.
+Kept boxes hold their whole subtree, so only what recent work used stays: the boxes beside the chain that changed, and not the ones inside them. An answer goes once two layouts that worked something out have not asked for it; layouts that find nothing changed, as a frame's does after a script has measured, age nothing. The engine thread lets go of the kept layout answers and the second canvas one second after the last frame.
 
 ## Measuring
 
@@ -73,6 +73,8 @@ let _profile = crate::profile::scope("paint: shadow");
 ```
 
 A scope costs one thread-local read while profiling is off.
+
+Four phases take no time and only count, to say whether a slow frame lost what it kept: `kept: answer taken` (a box or width taken from an earlier layout), `kept: answer written since` (one that was there but whose node or an ancestor had been written), `kept: all answers dropped` and `kept: all cascades dropped` (something global changed). A page that plays or animates should show the last two at zero and the first far above `layout: element`, the boxes laid out afresh.
 
 ## Checking
 
