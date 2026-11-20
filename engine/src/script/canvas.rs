@@ -110,13 +110,23 @@ impl Gradient {
             let a = dx * dx + dy * dy - dr * dr;
             let b = px * dx + py * dy + self.from.2 * dr;
             let c = px * px + py * py - self.from.2 * self.from.2;
-            let t = if a.abs() < 1e-6 {
-                (b.abs() > 1e-6).then(|| c / (2.0 * b))?
+            // the circle through the point with the larger t, among those of a radius that
+            // is not negative
+            let grows = |t: f32| self.from.2 + t * dr >= 0.0;
+            if a.abs() < 1e-6 {
+                (b.abs() > 1e-6)
+                    .then(|| c / (2.0 * b))
+                    .filter(|&t| grows(t))?
             } else {
                 let root = b * b - a * c;
-                (root >= 0.0).then(|| (b + root.sqrt()) / a)?
-            };
-            (self.from.2 + t * dr >= 0.0).then_some(t)?
+                if root < 0.0 {
+                    return None;
+                }
+                let (one, other) = ((b + root.sqrt()) / a, (b - root.sqrt()) / a);
+                [one.max(other), one.min(other)]
+                    .into_iter()
+                    .find(|&t| grows(t))?
+            }
         } else {
             let length = dx * dx + dy * dy;
             if length <= 0.0 {
@@ -2063,6 +2073,13 @@ mod tests {
                 c.fillRect(0, 16, 4, 4);
                 c.globalCompositeOperation = "no-such-mode";
                 seen.push(at(1, 17), c.globalCompositeOperation);
+                const ring = c.createRadialGradient(10, 10, 0, 10, 10, 10);
+                ring.addColorStop(0, "#fff");
+                ring.addColorStop(1, "#000");
+                c.globalCompositeOperation = "source-over";
+                c.fillStyle = ring;
+                c.fillRect(0, 0, 20, 20);
+                seen.push(at(10, 10), at(0, 10));
                 try {
                     fade.addColorStop(2, "#000");
                 } catch (error) {
@@ -2076,7 +2093,7 @@ mod tests {
         let status = document.find_element_by_id("status").expect("status");
         assert_eq!(
             document.text_content(status),
-            "6,6,6,255 249,249,249,255 object true 4/4 4/4 255,0,0,255 0,0,0,0 255,0,0,255 0,255,0,255 0,0,0,0 true 64,64,64,255 multiply IndexSizeError"
+            "6,6,6,255 249,249,249,255 object true 4/4 4/4 255,0,0,255 0,0,0,0 255,0,0,255 0,255,0,255 0,0,0,0 true 64,64,64,255 multiply 237,237,237,255 12,12,12,255 IndexSizeError"
         );
     }
 
