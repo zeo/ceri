@@ -1353,7 +1353,7 @@ impl ScriptRuntime {
                 }
             }
             let mut vars = Vec::new();
-            super::compiler::collect_var_names(&script.body, &mut vars);
+            super::ast::collect_var_names(&script.body, &mut vars);
             for name in vars {
                 if Self::RESTRICTED_VAR.contains(&&*name) {
                     return Err(

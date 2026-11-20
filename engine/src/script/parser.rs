@@ -5,6 +5,7 @@
 use super::ScriptError;
 use super::ast::*;
 use super::lexer::{Lexer, Token, TokenKind};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 const RESERVED: [&str; 37] = [
@@ -504,17 +505,12 @@ impl<'a> Parser<'a> {
         // each lexical name, where it was declared, and whether it is a plain
         // function a sloppy block may declare again under annex b
         let mut lexicals: Vec<(Name, usize, bool)> = Vec::new();
-        let mut vars: Vec<Name> = Vec::new();
         for body in bodies {
             let mut offset = 0;
             for statement in *body {
                 match statement {
                     Stmt::Position(at) => offset = *at,
-                    Stmt::Declaration {
-                        kind: DeclarationKind::Var,
-                        ..
-                    } => var_hoist_names(statement, &mut vars),
-                    Stmt::Declaration { declarators, .. } => {
+                    Stmt::Declaration { kind, declarators } if *kind != DeclarationKind::Var => {
                         let mut names = Vec::new();
                         for declarator in declarators {
                             bound_names(&declarator.target, &mut names);
@@ -529,30 +525,46 @@ impl<'a> Parser<'a> {
                     // a function declared in a block binds lexically there,
                     // while one in a script or a function body declares a var
                     // hoisted to that scope
-                    Stmt::Function(function) => match &function.name {
-                        Some(name) if functions_are_var => vars.push(name.clone()),
-                        Some(name) => {
+                    Stmt::Function(function) if !functions_are_var => {
+                        if let Some(name) = &function.name {
                             let plain = !self.context.strict
                                 && !function.is_async
                                 && !function.is_generator;
                             lexicals.push((name.clone(), offset, plain));
                         }
-                        _ => {}
-                    },
-                    _ => var_hoist_names(statement, &mut vars),
+                    }
+                    _ => {}
                 }
             }
         }
-        let mut seen: Vec<(&str, bool)> = Vec::new();
+        // most lists declare nothing lexically, and then nothing below can collide
+        if lexicals.is_empty() && !parameters_may_not_repeat {
+            return Ok(());
+        }
+        let mut seen: HashMap<&str, bool> = HashMap::new();
         for (name, offset, plain) in &lexicals {
-            if let Some(&(_, earlier)) = seen.iter().find(|(seen, _)| *seen == &**name) {
-                if !(earlier && *plain) {
+            match seen.get(&**name) {
+                Some(&earlier) if !(earlier && *plain) => {
                     return Err(self.declaration_error(name, *offset));
                 }
-                continue;
+                Some(_) => {}
+                None => {
+                    seen.insert(name, *plain);
+                }
             }
-            seen.push((name, *plain));
         }
+        let mut vars = Vec::new();
+        for body in bodies {
+            for statement in *body {
+                match statement {
+                    Stmt::Function(function) if functions_are_var => {
+                        vars.extend(function.name.clone());
+                    }
+                    _ => collect_var_names_in(statement, &mut vars),
+                }
+            }
+        }
+        let vars: HashSet<Name> = vars.into_iter().collect();
         for (name, offset, _) in &lexicals {
             if vars.contains(name) {
                 return Err(self.declaration_error(name, *offset));
@@ -566,18 +578,15 @@ impl<'a> Parser<'a> {
             if let Some(rest) = rest {
                 bound_names(rest, &mut bound);
             }
-            if parameters_may_not_repeat {
-                let mut seen_params: Vec<&str> = Vec::new();
-                for name in &bound {
-                    if seen_params.contains(&&**name) {
-                        let offset = self.peek().map(|token| token.start).unwrap_or(0);
-                        return Err(self.declaration_error(name, offset));
-                    }
-                    seen_params.push(name);
+            let mut seen_params = HashSet::new();
+            for name in &bound {
+                if !seen_params.insert(name.clone()) && parameters_may_not_repeat {
+                    let offset = self.peek().map(|token| token.start).unwrap_or(0);
+                    return Err(self.declaration_error(name, offset));
                 }
             }
             for (name, offset, _) in &lexicals {
-                if bound.contains(name) {
+                if seen_params.contains(name) {
                     return Err(self.declaration_error(name, *offset));
                 }
             }
@@ -2577,84 +2586,6 @@ pub(super) fn parse_script(source: &str) -> Result<Script, ScriptError> {
     let mut parser = Parser::new(source);
     parser.context.in_function = false;
     parser.parse_script()
-}
-
-// var names a statement hoists to the function or script scope that holds it,
-// walking nested statements but never into functions or classes, which bind
-// everything at their own level
-fn var_hoist_names(statement: &Stmt, names: &mut Vec<Name>) {
-    match statement {
-        Stmt::Declaration {
-            kind: DeclarationKind::Var,
-            declarators,
-        } => {
-            for declarator in declarators {
-                bound_names(&declarator.target, names);
-            }
-        }
-        Stmt::Block(body) => var_hoisted(body, names),
-        Stmt::If {
-            consequent,
-            alternate,
-            ..
-        } => {
-            var_hoist_names(consequent, names);
-            if let Some(alternate) = alternate {
-                var_hoist_names(alternate, names);
-            }
-        }
-        Stmt::For { init, body, .. } => {
-            if let Some(ForInit::Declaration {
-                kind: DeclarationKind::Var,
-                declarators,
-            }) = init
-            {
-                for declarator in declarators {
-                    bound_names(&declarator.target, names);
-                }
-            }
-            var_hoist_names(body, names);
-        }
-        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
-            if let ForHead::Declaration {
-                kind: DeclarationKind::Var,
-                target,
-            } = left
-            {
-                bound_names(target, names);
-            }
-            var_hoist_names(body, names);
-        }
-        Stmt::While { body, .. }
-        | Stmt::DoWhile { body, .. }
-        | Stmt::Labeled { body, .. }
-        | Stmt::With { body, .. } => var_hoist_names(body, names),
-        Stmt::Switch { cases, .. } => {
-            for case in cases {
-                var_hoisted(&case.body, names);
-            }
-        }
-        Stmt::Try {
-            block,
-            handler,
-            finalizer,
-        } => {
-            var_hoisted(block, names);
-            if let Some(handler) = handler {
-                var_hoisted(&handler.body, names);
-            }
-            if let Some(finalizer) = finalizer {
-                var_hoisted(finalizer, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn var_hoisted(statements: &[Stmt], names: &mut Vec<Name>) {
-    for statement in statements {
-        var_hoist_names(statement, names);
-    }
 }
 
 // for a direct eval whose caller is strict: the source compiles strict no matter

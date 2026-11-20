@@ -464,3 +464,80 @@ pub(super) fn bound_names(pattern: &Pattern, names: &mut Vec<Name>) {
         Pattern::Default { target, .. } => bound_names(target, names),
     }
 }
+
+// the var names a statement list hoists to the function or script holding it, walking
+// nested statements but never into functions or classes
+pub(super) fn collect_var_names(statements: &[Stmt], names: &mut Vec<Name>) {
+    for statement in statements {
+        collect_var_names_in(statement, names);
+    }
+}
+
+pub(super) fn collect_var_names_in(statement: &Stmt, names: &mut Vec<Name>) {
+    match statement {
+        Stmt::Declaration {
+            kind: DeclarationKind::Var,
+            declarators,
+        } => {
+            for declarator in declarators {
+                bound_names(&declarator.target, names);
+            }
+        }
+        Stmt::Block(body) => collect_var_names(body, names),
+        Stmt::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_var_names_in(consequent, names);
+            if let Some(alternate) = alternate {
+                collect_var_names_in(alternate, names);
+            }
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Declaration {
+                kind: DeclarationKind::Var,
+                declarators,
+            }) = init
+            {
+                for declarator in declarators {
+                    bound_names(&declarator.target, names);
+                }
+            }
+            collect_var_names_in(body, names);
+        }
+        Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+            if let ForHead::Declaration {
+                kind: DeclarationKind::Var,
+                target,
+            } = left
+            {
+                bound_names(target, names);
+            }
+            collect_var_names_in(body, names);
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::With { body, .. } => collect_var_names_in(body, names),
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                collect_var_names(&case.body, names);
+            }
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            collect_var_names(block, names);
+            if let Some(handler) = handler {
+                collect_var_names(&handler.body, names);
+            }
+            if let Some(finalizer) = finalizer {
+                collect_var_names(finalizer, names);
+            }
+        }
+        _ => {}
+    }
+}
