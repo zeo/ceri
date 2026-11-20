@@ -6821,7 +6821,15 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                     measure_text(text, style.font_family, font_size, font, letter_spacing)
                 };
                 let (narrowest, widest) = text_extents(&value, &text, &measure);
-                if minimum {
+                // a run of text in a flex row is an item of its own, with gaps beside it
+                let item =
+                    row_flex && style.display != Display::TableRow && !value.trim().is_empty();
+                if item && (nowrap_row || !minimum) {
+                    flex_items += 1;
+                }
+                if minimum && item && nowrap_row {
+                    inline += narrowest;
+                } else if minimum {
                     widest_block = widest_block.max(narrowest);
                 } else {
                     // a collapsed space beside an element still takes its width on the line
@@ -11482,6 +11490,33 @@ mod tests {
         );
         assert_eq!(find_box(&result.root, "nav").expect("nav").rect.width, 76.0);
         assert_eq!(find_box(&result.root, "u").expect("u").rect.width, 10.0);
+    }
+
+    #[test]
+    fn a_run_of_text_in_a_flex_row_has_a_gap_beside_it_in_the_intrinsic_width() {
+        let width = |gap: &str, inner: &str| {
+            let markup = format!(
+                "<style>* {{ margin: 0; }} section {{ display: flex; }} nav {{ display: flex; gap: {gap}; }} i {{ width: 30px; }}</style><section><nav>{inner}</nav></section>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 400.0,
+                    height: 100.0,
+                },
+            );
+            find_box(&result.root, "nav").expect("nav").rect.width
+        };
+        assert_eq!(width("8px", "<i></i>Save"), width("0", "<i></i>Save") + 8.0);
+        assert_eq!(
+            width("8px", "<i></i>Save<i></i>"),
+            width("0", "<i></i>Save<i></i>") + 16.0
+        );
+        // spaces between items are no item
+        assert_eq!(width("8px", "<i></i> <i></i>"), 68.0);
     }
 
     #[test]
