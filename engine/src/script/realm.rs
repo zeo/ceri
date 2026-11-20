@@ -1330,7 +1330,8 @@ impl ScriptRuntime {
         &mut self,
         source: &str,
         strict: bool,
-    ) -> Result<Value, ScriptError> {        let script = if strict {
+    ) -> Result<Value, ScriptError> {
+        let script = if strict {
             super::parser::parse_script_strict(source)
         } else {
             super::parser::parse_script(source)
@@ -1340,18 +1341,18 @@ impl ScriptRuntime {
             for function in super::compiler::block_functions(&script.body) {
                 let name = function.name.clone().expect("declarations are named");
                 if Self::RESTRICTED_FUNCTION.contains(&&*name) {
-                    return Err(self.type_error(format!(
-                        "cannot declare the global function {name}"
-                    )));
+                    return Err(
+                        self.type_error(format!("cannot declare the global function {name}"))
+                    );
                 }
             }
             let mut vars = Vec::new();
             super::compiler::collect_var_names(&script.body, &mut vars);
             for name in vars {
                 if Self::RESTRICTED_VAR.contains(&&*name) {
-                    return Err(self.type_error(format!(
-                        "cannot declare the global variable {name}"
-                    )));
+                    return Err(
+                        self.type_error(format!("cannot declare the global variable {name}"))
+                    );
                 }
             }
         }

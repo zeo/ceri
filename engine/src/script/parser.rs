@@ -410,9 +410,7 @@ impl<'a> Parser<'a> {
     fn parse_declared_identifier(&mut self) -> Result<Name, ScriptError> {
         let name = self.parse_binding_identifier()?;
         if self.context.strict && (&*name == "eval" || &*name == "arguments") {
-            return Err(self.error_here(format!(
-                "cannot declare {name} in strict mode"
-            )));
+            return Err(self.error_here(format!("cannot declare {name} in strict mode")));
         }
         Ok(name)
     }

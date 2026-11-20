@@ -919,39 +919,40 @@ impl Compiler {
         let functions = block_functions(&script.body);
         let lexicals = lexical_declarations(&script.body);
         let mut grown: Vec<Name> = Vec::new();
-        let scoped_declarations = if script.strict {
-            let mut declarations = lexicals;
-            declarations.extend(vars.iter().map(|name| (name.clone(), BindingKind::Var)));
-            declarations.extend(functions.iter().map(|function| {
-                (
-                    function.name.clone().expect("declarations are named"),
-                    BindingKind::Var,
-                )
-            }));
-            declarations
-        } else {
-            match var_target {
-                Some(target) => {
-                    // each name the caller's scopes do not know becomes a binding in
-                    // its variable environment, appended past the live slots
-                    for name in vars.iter().chain(functions.iter().map(|function| {
-                        function.name.as_ref().expect("declarations are named")
-                    })) {
-                        if self.resolve(name).is_none() {
-                            grown.push(name.clone());
-                            self.state().scopes[target].declare(name.clone(), BindingKind::Var);
+        let scoped_declarations =
+            if script.strict {
+                let mut declarations = lexicals;
+                declarations.extend(vars.iter().map(|name| (name.clone(), BindingKind::Var)));
+                declarations.extend(functions.iter().map(|function| {
+                    (
+                        function.name.clone().expect("declarations are named"),
+                        BindingKind::Var,
+                    )
+                }));
+                declarations
+            } else {
+                match var_target {
+                    Some(target) => {
+                        // each name the caller's scopes do not know becomes a binding in
+                        // its variable environment, appended past the live slots
+                        for name in vars.iter().chain(functions.iter().map(|function| {
+                            function.name.as_ref().expect("declarations are named")
+                        })) {
+                            if self.resolve(name).is_none() {
+                                grown.push(name.clone());
+                                self.state().scopes[target].declare(name.clone(), BindingKind::Var);
+                            }
+                        }
+                    }
+                    None => {
+                        for name in &vars {
+                            let index = self.name(name);
+                            self.emit(Op::DeclareGlobal(index));
                         }
                     }
                 }
-                None => {
-                    for name in &vars {
-                        let index = self.name(name);
-                        self.emit(Op::DeclareGlobal(index));
-                    }
-                }
-            }
-            lexicals
-        };
+                lexicals
+            };
         // the eval's own scope, holding its temporaries and, when strict, its vars
         self.state()
             .scopes
@@ -1029,11 +1030,12 @@ impl Compiler {
         let scoped_declarations = if eval_code && script.strict {
             let mut declarations = lexicals;
             declarations.extend(vars.iter().map(|name| (name.clone(), BindingKind::Var)));
-            declarations.extend(
-                functions
-                    .iter()
-                    .map(|function| (function.name.clone().expect("declarations are named"), BindingKind::Var)),
-            );
+            declarations.extend(functions.iter().map(|function| {
+                (
+                    function.name.clone().expect("declarations are named"),
+                    BindingKind::Var,
+                )
+            }));
             declarations
         } else {
             for name in &vars {
@@ -1343,7 +1345,8 @@ impl Compiler {
         state.var_target = Some(state.scopes.len() - 1);
     }
 
-    fn push_block_scope(&mut self, declarations: &[(Name, BindingKind)]) -> bool {        let materialized = !declarations.is_empty();
+    fn push_block_scope(&mut self, declarations: &[(Name, BindingKind)]) -> bool {
+        let materialized = !declarations.is_empty();
         let mut scope = ScopeInfo::new(ScopeKind::Block, materialized);
         for (name, kind) in declarations {
             scope.declare(name.clone(), *kind);

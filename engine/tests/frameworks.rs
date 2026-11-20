@@ -96,7 +96,8 @@ fn svelte_5_dev_runtime_resolves_a_batch() {
     let mut browser = open("svelte5");
     let status = text(&mut browser, "status");
     assert_eq!(
-        status, "seen 1",
+        status,
+        "seen 1",
         "the dev runtime should flush an effect; status {status:?}, logs {:?}",
         browser.console_logs()
     );

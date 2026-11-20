@@ -1175,9 +1175,8 @@ impl ScriptRuntime {
                         let name = frame.code.names[name as usize].clone();
                         drop(scope);
                         if frame.code.strict {
-                            return Err(self.type_error(format!(
-                                "Assignment to constant variable '{name}'"
-                            )));
+                            return Err(self
+                                .type_error(format!("Assignment to constant variable '{name}'")));
                         }
                         // a sloppy write to an immutable binding is ignored
                     }
@@ -1218,9 +1217,9 @@ impl ScriptRuntime {
                     None => self.get_global(&name)?,
                 };
                 if matches!(value, Value::Uninitialized) {
-                    return Err(self.reference_error(format!(
-                        "cannot access {name} before initialization"
-                    )));
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
                 }
                 frames.last_mut().expect("frame").stack.push(value);
             }
@@ -1334,7 +1333,11 @@ impl ScriptRuntime {
                     }
                 }
                 drop(scope);
-                frames.last_mut().expect("frame").stack.push(Value::Bool(grown));
+                frames
+                    .last_mut()
+                    .expect("frame")
+                    .stack
+                    .push(Value::Bool(grown));
             }
             Op::PopScope => {
                 Self::restore_scopes(frame, frame.scopes.saturating_sub(1));
@@ -1695,11 +1698,7 @@ impl ScriptRuntime {
                     } else {
                         first
                     };
-                    frames
-                        .last_mut()
-                        .expect("frame")
-                        .stack
-                        .push(value);
+                    frames.last_mut().expect("frame").stack.push(value);
                     return Ok(None);
                 }
                 return self.call_in_loop(frames, callee, Value::Undefined, arguments);
