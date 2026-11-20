@@ -1601,8 +1601,8 @@ pub(crate) struct Style {
     pub vertical_align: VerticalAlign,
     pub width: Length,
     pub height: Length,
-    // width and height: fit-content, which leave the lengths auto for everything else
-    pub(crate) fit_content: [bool; 2],
+    // width and height by a content keyword, which leaves the lengths auto for everything else
+    pub(crate) content_size: [ContentSize; 2],
     pub min_width: Length,
     pub max_width: Length,
     pub min_height: Length,
@@ -1721,6 +1721,15 @@ pub(crate) struct BackgroundRepeat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentSize {
+    None,
+    // the widest the content gets, held to the room there is but never under the narrowest
+    Fit,
+    Max,
+    Min,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectFit {
     Fill,
     Contain,
@@ -1792,7 +1801,7 @@ impl Style {
             },
             width: Length::Auto,
             height: Length::Auto,
-            fit_content: [false; 2],
+            content_size: [ContentSize::None; 2],
             min_width: Length::Auto,
             max_width: Length::Auto,
             min_height: Length::Auto,
@@ -5530,11 +5539,11 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
         }
         "width" => {
             style.width = from.width;
-            style.fit_content[0] = from.fit_content[0];
+            style.content_size[0] = from.content_size[0];
         }
         "height" => {
             style.height = from.height;
-            style.fit_content[1] = from.fit_content[1];
+            style.content_size[1] = from.content_size[1];
         }
         "min-width" => style.min_width = from.min_width,
         "max-width" => style.max_width = from.max_width,
@@ -6408,7 +6417,12 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "width" | "height" => {
             let axis = usize::from(property == "height");
-            style.fit_content[axis] = value.trim().eq_ignore_ascii_case("fit-content");
+            style.content_size[axis] = match value.trim().to_ascii_lowercase().as_str() {
+                "fit-content" => ContentSize::Fit,
+                "max-content" => ContentSize::Max,
+                "min-content" => ContentSize::Min,
+                _ => ContentSize::None,
+            };
             let length = parse_length(value).unwrap_or(Length::Auto);
             if axis == 0 {
                 style.width = length;

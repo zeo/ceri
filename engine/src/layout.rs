@@ -6,7 +6,7 @@ use crate::css::{
     Stylesheet, TextAlign, inherited_text,
 };
 use crate::css::{
-    Clear, Cursor, Float, ListStyleType, OverflowWrap, ScrollbarWidth, SpaceCollapse,
+    Clear, ContentSize, Cursor, Float, ListStyleType, OverflowWrap, ScrollbarWidth, SpaceCollapse,
     VerticalAlign, Visibility,
 };
 use crate::dom::{Document, Element, Namespace, NodeId, NodeKind};
@@ -127,6 +127,8 @@ pub struct LayoutBox {
     // the mask-image layers, whose alpha scales everything the box and its subtree paint
     pub(crate) masks: Vec<crate::css::BackgroundLayer>,
     pub(crate) object_fit: crate::css::ObjectFit,
+    // in the top layer, as a modal dialog and its backdrop are
+    pub(crate) top_layer: bool,
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<crate::transform::Matrix>,
     pub(crate) backface_hidden: bool,
@@ -972,6 +974,7 @@ pub fn layout_with_state(
         backgrounds: Vec::new(),
         masks: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
+        top_layer: false,
         transform: None,
         backface_hidden: false,
         clip_path: None,
@@ -1194,6 +1197,7 @@ fn layout_document_children(
         }
         for layout in &mut layer {
             layout.z_index = i32::MAX;
+            layout.top_layer = true;
             layout.creates_stacking_context = true;
         }
         children.append(&mut layer);
@@ -3050,7 +3054,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let explicit_height = resolve_height(style.height, containing_height, font_size)
         .map(inner_height)
         .or_else(|| {
-            let stretch = mode != LayoutMode::Flow && !style.fit_content[1];
+            let stretch = mode != LayoutMode::Flow && style.content_size[1] == ContentSize::None;
             (stretch && inset.top.is_some() && inset.bottom.is_some()).then(|| {
                 (position_block.height
                     - inset.top.unwrap_or(0.0)
@@ -3067,7 +3071,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .resolve(containing_width, font_size)
         .map(inner_width)
         .or_else(|| {
-            let stretch = mode != LayoutMode::Flow && !style.fit_content[0];
+            let stretch = mode != LayoutMode::Flow && style.content_size[0] == ContentSize::None;
             (stretch && inset.left.is_some() && inset.right.is_some()).then(|| {
                 (position_block.width
                     - inset.left.unwrap_or(0.0)
@@ -3086,7 +3090,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .or_else(|| {
             // an out-of-flow box with an auto width shrinks to fit the room its insets leave,
             // as fit-content does in flow
-            (mode != LayoutMode::Flow || style.fit_content[0]).then(|| {
+            (mode != LayoutMode::Flow || style.content_size[0] != ContentSize::None).then(|| {
                 let measure = |minimum: bool| {
                     intrinsic_width(
                         MaxContentInput {
@@ -3105,7 +3109,12 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                 } else {
                     position_block.width - inset.left.unwrap_or(0.0) - inset.right.unwrap_or(0.0)
                 };
-                measure(false).min(room.max(measure(true))) - horizontal_extras
+                let width = match style.content_size[0] {
+                    ContentSize::Max => measure(false),
+                    ContentSize::Min => measure(true),
+                    _ => measure(false).min(room.max(measure(true))),
+                };
+                width - horizontal_extras
             })
         })
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
@@ -3787,6 +3796,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
         clip_path: None,
@@ -3971,6 +3981,7 @@ fn anonymous_box(
         backgrounds: Vec::new(),
         masks: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
+        top_layer: false,
         transform: None,
         backface_hidden: false,
         clip_path: None,
@@ -4728,6 +4739,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         item.base =
             match resolve_main(item.style.flex_basis).or_else(|| resolve_main(main_property)) {
                 Some(size) => to_content(size),
+                None if row && item.style.content_size[0] == ContentSize::Min => min_content,
                 None if row => max_content,
                 None => {
                     let cross =
@@ -5039,6 +5051,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
         clip_path: None,
@@ -5553,6 +5566,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
         clip_path: None,
@@ -6278,6 +6292,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
         clip_path: None,
@@ -6721,6 +6736,12 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     if style.display == Display::None {
         return 0.0;
     }
+    // a box sized to its widest or its narrowest content is that wide whichever is asked for
+    let minimum = match style.content_size[0] {
+        ContentSize::Max if own_width => false,
+        ContentSize::Min if own_width => true,
+        _ => minimum,
+    };
     let font_size = style
         .font_size
         .resolve(parent.font_size, parent.font_size)
@@ -6889,7 +6910,7 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         let gap = style.gap.resolve(0.0, font_size).unwrap_or(0.0).max(0.0);
         inline += gap * (flex_items - 1) as f32;
     }
-    extras + bounded(inline.max(widest_block).min(containing_width.max(0.0)))
+    extras + bounded(inline.max(widest_block))
 }
 
 // one axis of the explicit grid, with auto repeats expanded
@@ -9606,6 +9627,7 @@ impl LayoutBox {
             backgrounds,
             masks,
             object_fit,
+            top_layer,
             transform,
             backface_hidden,
             clip_path,
@@ -9650,6 +9672,7 @@ impl LayoutBox {
             && *backgrounds == other.backgrounds
             && *masks == other.masks
             && *object_fit == other.object_fit
+            && *top_layer == other.top_layer
             && *transform == other.transform
             && *backface_hidden == other.backface_hidden
             && *clip_path == other.clip_path
@@ -11490,6 +11513,33 @@ mod tests {
         );
         assert_eq!(find_box(&result.root, "nav").expect("nav").rect.width, 76.0);
         assert_eq!(find_box(&result.root, "u").expect("u").rect.width, 10.0);
+    }
+
+    #[test]
+    fn width_keywords_size_a_block_by_its_widest_narrowest_or_fitted_content() {
+        let markup = "<style>* { margin: 0; } section { width: 50px; } i, b, u, s { display: block; } i { width: max-content; } b { width: min-content; } u, s { width: fit-content; } nav { display: flex; }</style><section><i>aaaa bbbb cccc</i><b>aaaa bbbb cccc</b><u>aaaa bbbb cccc</u><s>aaaa</s><nav><b>aaaa bbbb cccc</b></nav></section>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+        );
+        let width = |tag: &str| find_box(&result.root, tag).expect("box").rect.width;
+        // one word alone fits the section, so fitted it is as wide as the word
+        let word = width("s");
+        assert!(word > 0.0 && word < 50.0, "{word}");
+        // one line of three words overflows the section, the narrowest is one word wide, and
+        // fitted content takes the room there is
+        assert!(width("i") > 100.0, "{}", width("i"));
+        assert_eq!(width("b"), word);
+        assert_eq!(width("u"), 50.0);
+        // a flex item sized to its narrowest content stays one word wide
+        let nav = find_box(&result.root, "nav").expect("nav");
+        assert_eq!(find_box(nav, "b").expect("item").rect.width, word);
     }
 
     #[test]
