@@ -2091,6 +2091,37 @@ fn css_escapes_identifiers_and_answers_supports_like_cssom() {
 }
 
 #[test]
+fn sloppy_blocks_may_repeat_a_function_declaration() {
+    check(&[
+        (
+            "the later declaration wins",
+            "{ function d() { return 1; } function d() { return 2; } console.log(d()) }",
+            "2",
+        ),
+        (
+            "a switch's clauses too",
+            "switch (1) { case 1: function d() { return 'a'; } default: function d() { return 'b'; } console.log(d()) }",
+            "b",
+        ),
+        (
+            "strict blocks still refuse",
+            "try { eval('\"use strict\"; { function d() {} function d() {} }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a generator is not exempt",
+            "try { eval('{ function d() {} function* d() {} }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+        (
+            "a let is not exempt",
+            "try { eval('{ function d() {} let d; }'); console.log('no throw') } catch (e) { console.log('threw', e instanceof SyntaxError) }",
+            "threw true",
+        ),
+    ]);
+}
+
+#[test]
 fn lookup_accessor_helpers_ask_a_proxy_for_its_prototype() {
     check(&[(
         "getPrototypeOf trap",

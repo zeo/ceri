@@ -501,7 +501,9 @@ impl<'a> Parser<'a> {
         functions_are_var: bool,
         parameters_may_not_repeat: bool,
     ) -> Result<(), ScriptError> {
-        let mut lexicals: Vec<(Name, usize)> = Vec::new();
+        // each lexical name, where it was declared, and whether it is a plain
+        // function a sloppy block may declare again under annex b
+        let mut lexicals: Vec<(Name, usize, bool)> = Vec::new();
         let mut vars: Vec<Name> = Vec::new();
         for body in bodies {
             let mut offset = 0;
@@ -517,11 +519,11 @@ impl<'a> Parser<'a> {
                         for declarator in declarators {
                             bound_names(&declarator.target, &mut names);
                         }
-                        lexicals.extend(names.into_iter().map(|name| (name, offset)));
+                        lexicals.extend(names.into_iter().map(|name| (name, offset, false)));
                     }
                     Stmt::Class(class) => {
                         if let Some(name) = &class.name {
-                            lexicals.push((name.clone(), offset));
+                            lexicals.push((name.clone(), offset, false));
                         }
                     }
                     // a function declared in a block binds lexically there,
@@ -529,21 +531,29 @@ impl<'a> Parser<'a> {
                     // hoisted to that scope
                     Stmt::Function(function) => match &function.name {
                         Some(name) if functions_are_var => vars.push(name.clone()),
-                        Some(name) => lexicals.push((name.clone(), offset)),
+                        Some(name) => {
+                            let plain = !self.context.strict
+                                && !function.is_async
+                                && !function.is_generator;
+                            lexicals.push((name.clone(), offset, plain));
+                        }
                         _ => {}
                     },
                     _ => var_hoist_names(statement, &mut vars),
                 }
             }
         }
-        let mut seen: Vec<&str> = Vec::new();
-        for (name, offset) in &lexicals {
-            if seen.contains(&&**name) {
-                return Err(self.declaration_error(name, *offset));
+        let mut seen: Vec<(&str, bool)> = Vec::new();
+        for (name, offset, plain) in &lexicals {
+            if let Some(&(_, earlier)) = seen.iter().find(|(seen, _)| *seen == &**name) {
+                if !(earlier && *plain) {
+                    return Err(self.declaration_error(name, *offset));
+                }
+                continue;
             }
-            seen.push(name);
+            seen.push((name, *plain));
         }
-        for (name, offset) in &lexicals {
+        for (name, offset, _) in &lexicals {
             if vars.contains(name) {
                 return Err(self.declaration_error(name, *offset));
             }
@@ -566,7 +576,7 @@ impl<'a> Parser<'a> {
                     seen_params.push(name);
                 }
             }
-            for (name, offset) in &lexicals {
+            for (name, offset, _) in &lexicals {
                 if bound.contains(name) {
                     return Err(self.declaration_error(name, *offset));
                 }
