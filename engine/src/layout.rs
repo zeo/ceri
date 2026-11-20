@@ -2745,11 +2745,13 @@ impl Drop for KeptPass {
                 kept.widths.clear();
                 return;
             }
-            // each kept box holds its whole subtree, so only what this pass used stays: the
-            // boxes beside the chain that changed, and not the ones inside them
+            // each kept box holds its whole subtree, so only what a recent pass used stays:
+            // the boxes beside the chain that changed, and not the ones inside them. a pass
+            // that finds nothing changed takes the root box whole and uses nothing else, as
+            // the frame's layout does after a script has measured, so one pass back counts
             fn prune<Key, Inputs, Answer>(map: &mut KeptMap<Key, Inputs, Answer>, pass: u64) {
                 map.retain(|_, answers| {
-                    answers.retain(|kept| kept.pass == pass && !kept.momentary);
+                    answers.retain(|kept| kept.pass + 1 >= pass && !kept.momentary);
                     !answers.is_empty()
                 });
             }
