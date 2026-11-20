@@ -7035,6 +7035,34 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                 } else {
                     widest_block = widest_block.max(width);
                 }
+                // a space that ends an inline child's text, or starts it after a sibling that
+                // did not end in one, keeps its width between the two
+                let words = |at: usize| match children.get(at) {
+                    Some(Child::Element(other)) if other.generated.is_none() => {
+                        Some(other.document.text_content(other.node))
+                    }
+                    _ => None,
+                };
+                let spaced = |text: &Option<String>, end: bool| {
+                    text.as_deref().is_some_and(|text| {
+                        let edge = if end {
+                            text.chars().next_back()
+                        } else {
+                            text.chars().next()
+                        };
+                        !text.trim_ascii().is_empty()
+                            && edge.is_some_and(|c| c.is_ascii_whitespace())
+                    })
+                };
+                if !minimum && keeps_spaces && child_display == Display::Inline {
+                    let own = words(index);
+                    let before = index.checked_sub(1).and_then(words);
+                    let after = spaced(&own, true) && words(index + 1).is_some();
+                    let ahead = spaced(&own, false) && before.is_some() && !spaced(&before, true);
+                    let space =
+                        measure_text(" ", style.font_family, font_size, font, letter_spacing);
+                    inline += (usize::from(after) + usize::from(ahead)) as f32 * space;
+                }
                 if side_by_side && row_flex && child_display != Display::None {
                     flex_items += 1;
                 }
@@ -11760,6 +11788,24 @@ mod tests {
             .map(|item| item.rect.width)
             .collect::<Vec<_>>();
         assert_eq!(widths, [330.0, 70.0]);
+    }
+
+    #[test]
+    fn a_space_that_ends_an_inline_child_counts_toward_the_width_of_its_line() {
+        let markup = "<style>* { margin: 0; padding: 0; } @font-face { font-family: 'Ceri Web'; src: url('ceri-web.woff2'); } body { font: 16px 'Ceri Web'; } div { display: flex; } </style><div><span id='a'><b>ab </b><i>cd</i></span></div><div><u>ab cd</u></div>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let widths = ["span", "u"].map(|tag| find_box(&result.root, tag).expect("item").rect.width);
+        assert!(widths[0] > 0.0);
+        assert_eq!(widths[0], widths[1]);
     }
 
     #[test]
