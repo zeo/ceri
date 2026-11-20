@@ -9636,6 +9636,11 @@ mod tests {
                 kept.root == fresh.root,
                 "after write {write} of step {step}"
             );
+            // a second layout of the same document, as a frame makes after a script measured
+            if step % 3 == 0 {
+                let again = layout_with_state(&document, &stylesheet, viewport, &state);
+                assert!(again.root == fresh.root, "again after step {step}");
+            }
         }
     }
 
