@@ -963,10 +963,10 @@ impl ScriptRuntime {
         let mut local = false;
         let mut scope = snapshot.scope.clone();
         while let Some(current) = scope {
-            let (names, slots, parent) = {
+            let (layout, slots, parent) = {
                 let current = current.borrow();
                 (
-                    current.names.clone(),
+                    current.layout.clone(),
                     current.slots.clone(),
                     current.parent.clone(),
                 )
@@ -976,10 +976,10 @@ impl ScriptRuntime {
                 .code
                 .self_scope
                 .as_ref()
-                .is_some_and(|layout| Rc::ptr_eq(layout, &names));
+                .is_some_and(|own| Rc::ptr_eq(own, &layout));
             let kind = if parent.is_none() {
                 if module { "module" } else { "script" }
-            } else if !local && Rc::ptr_eq(&names, &snapshot.code.layout) {
+            } else if !local && Rc::ptr_eq(&layout, &snapshot.code.layout) {
                 local = true;
                 "local"
             } else if local {
@@ -987,7 +987,8 @@ impl ScriptRuntime {
             } else {
                 "block"
             };
-            let entries: Vec<(String, Value)> = names
+            let entries: Vec<(String, Value)> = layout
+                .names
                 .iter()
                 .zip(slots)
                 .filter(|(name, _)| !name.is_empty() && !name.starts_with('%'))
@@ -1059,7 +1060,7 @@ impl ScriptRuntime {
         let mut scope = snapshot.scope.clone();
         while let Some(current) = scope {
             let current = current.borrow();
-            layers.push(current.names.clone());
+            layers.push(current.layout.clone());
             scope = current.parent.clone();
         }
         layers.reverse();

@@ -2148,6 +2148,77 @@ fn body_vars_start_with_the_parameter_they_share_a_name_with() {
 }
 
 #[test]
+fn a_function_expression_name_is_immutable() {
+    check(&[
+        (
+            "a sloppy write is ignored",
+            "console.log((function f() { f = 1; return typeof f; })())",
+            "function",
+        ),
+        (
+            "so are compound and destructuring writes",
+            "console.log((function f() { f += 1; [f] = [2]; ({ f } = { f: 3 }); return typeof f; })())",
+            "function",
+        ),
+        (
+            "a strict write throws",
+            "console.log((function f() { 'use strict'; try { f = 1; return 'no throw'; } catch (e) { return e instanceof TypeError; } })())",
+            "true",
+        ),
+        (
+            "a var of the same name is its own binding",
+            "console.log((function f() { var f = 1; return f; })())",
+            "1",
+        ),
+    ]);
+}
+
+#[test]
+fn an_inferred_class_name_is_not_bound_inside_the_class() {
+    check(&[(
+        "the outer binding is read",
+        "var A = class { static m() { return typeof A; } }; var B = A; A = 1; console.log(B.m(), B.name)",
+        "number A",
+    )]);
+}
+
+#[test]
+fn direct_eval_keeps_the_callers_bindings_immutable() {
+    check(&[
+        (
+            "a sloppy write to a const throws",
+            "function f() { const c = 1; try { eval('c = 2'); return 'no throw ' + c; } catch (e) { return e instanceof TypeError; } } console.log(f())",
+            "true",
+        ),
+        (
+            "a strict one too",
+            "function f() { 'use strict'; const c = 1; try { eval('c = 2'); return 'no throw'; } catch (e) { return e instanceof TypeError; } } console.log(f())",
+            "true",
+        ),
+        (
+            "a let still in its dead zone throws",
+            "function f() { { try { eval('t'); return 'no throw'; } catch (e) { return e instanceof ReferenceError; } let t; } } console.log(f())",
+            "true",
+        ),
+        (
+            "a class's inner name",
+            "class K { m() { try { eval('K = 1'); return 'no throw'; } catch (e) { return e instanceof TypeError; } } } console.log(new K().m())",
+            "true",
+        ),
+        (
+            "a strict write to a function expression's name throws",
+            "console.log((function g() { 'use strict'; try { eval('g = 1'); return 'no throw'; } catch (e) { return e instanceof TypeError; } })())",
+            "true",
+        ),
+        (
+            "a let is still writable",
+            "function f() { let l = 1; eval('l = 2'); return l; } console.log(f())",
+            "2",
+        ),
+    ]);
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (

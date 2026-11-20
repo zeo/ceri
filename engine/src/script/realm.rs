@@ -1385,17 +1385,12 @@ impl ScriptRuntime {
         .map_err(|error| self.throw_error("SyntaxError", error.message))?;
         let caller: Vec<super::compiler::CallerScope> = chain
             .iter()
-            .map(|(scope, var_scope)| {
+            .map(|(scope, _)| {
                 let scope = scope.borrow();
                 super::compiler::CallerScope {
-                    names: scope
-                        .names
-                        .iter()
-                        .chain(scope.extra.iter())
-                        .cloned()
-                        .collect(),
+                    layout: scope.layout.clone(),
+                    extra: scope.extra.clone(),
                     slots: scope.slots.len() as u16,
-                    var_scope: *var_scope,
                 }
             })
             .collect();

@@ -3,7 +3,7 @@
 // resume it later, and exceptions unwind through try handlers and finally blocks
 
 use super::ast::{FunctionKind, Name};
-use super::compiler::{self, Code, NO_TARGET, Op};
+use super::compiler::{self, Code, Layout, NO_TARGET, Op, ScopeRole};
 use super::object::{
     JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, new_object,
 };
@@ -16,35 +16,18 @@ pub(super) type ScopeRef = Rc<RefCell<Scope>>;
 pub(super) struct Scope {
     pub(super) slots: Vec<Value>,
     pub(super) parent: Option<ScopeRef>,
-    // what each slot is called, for a debugger
-    pub(super) names: Rc<[Name]>,
+    pub(super) layout: Rc<Layout>,
     // names a direct eval added past the compiled layout, one per grown slot
     pub(super) extra: Vec<Name>,
-    // whether this scope is a variable environment, which a sloppy direct eval
-    // extends with its var and function declarations
-    pub(super) var_scope: bool,
 }
 
 impl Scope {
-    pub(super) fn new(names: Rc<[Name]>, parent: Option<ScopeRef>) -> ScopeRef {
+    pub(super) fn new(layout: Rc<Layout>, parent: Option<ScopeRef>) -> ScopeRef {
         Rc::new(RefCell::new(Scope {
-            slots: vec![Value::Undefined; names.len()],
+            slots: vec![Value::Undefined; layout.names.len()],
             parent,
-            names,
+            layout,
             extra: Vec::new(),
-            var_scope: false,
-        }))
-    }
-
-    // a function, method, constructor or module frame's own scope, the variable
-    // environment its code declares in
-    pub(super) fn new_var(names: Rc<[Name]>, parent: Option<ScopeRef>) -> ScopeRef {
-        Rc::new(RefCell::new(Scope {
-            slots: vec![Value::Undefined; names.len()],
-            parent,
-            names,
-            extra: Vec::new(),
-            var_scope: true,
         }))
     }
 }
@@ -721,16 +704,14 @@ impl ScriptRuntime {
         construct: bool,
     ) -> Frame {
         let code = closure.code.clone();
-        let parent = if let Some(names) = &code.self_scope {
-            let scope = Scope::new(names.clone(), closure.scope.clone());
-            // the name binding is immutable, so a sloppy write to it is ignored
-            let cell = Rc::new(RefCell::new(function.clone()));
-            scope.borrow_mut().slots[0] = Value::Binding(cell, false);
+        let parent = if let Some(layout) = &code.self_scope {
+            let scope = Scope::new(layout.clone(), closure.scope.clone());
+            scope.borrow_mut().slots[0] = function.clone();
             Some(scope)
         } else {
             closure.scope.clone()
         };
-        let scope = Scope::new_var(code.layout.clone(), parent);
+        let scope = Scope::new(code.layout.clone(), parent);
         // TDZ: lexical bindings start uninitialized; params and vars start undefined
         let mut frame = Frame::new(
             code.clone(),
@@ -928,6 +909,7 @@ impl ScriptRuntime {
             let found = {
                 let scope = scope.borrow();
                 scope
+                    .layout
                     .names
                     .iter()
                     .position(|slot| *slot == *name)
@@ -936,7 +918,7 @@ impl ScriptRuntime {
                             .extra
                             .iter()
                             .position(|slot| *slot == *name)
-                            .map(|position| scope.names.len() + position)
+                            .map(|position| scope.layout.names.len() + position)
                     })
             };
             if let Some(index) = found {
@@ -1174,11 +1156,9 @@ impl ScriptRuntime {
                     Value::Binding(_, false) => {
                         let name = frame.code.names[name as usize].clone();
                         drop(scope);
-                        if frame.code.strict {
-                            return Err(self
-                                .type_error(format!("Assignment to constant variable '{name}'")));
-                        }
-                        // a sloppy write to an immutable binding is ignored
+                        return Err(
+                            self.type_error(format!("Assignment to constant variable '{name}'"))
+                        );
                     }
                     Value::Uninitialized => {
                         let name = frame.code.names[name as usize].clone();
@@ -1241,12 +1221,9 @@ impl ScriptRuntime {
                             }
                             Value::Binding(_, false) => {
                                 drop(scope);
-                                if frame.code.strict {
-                                    return Err(self.type_error(format!(
-                                        "Assignment to constant variable '{name}'"
-                                    )));
-                                }
-                                // a sloppy write to an immutable binding is ignored
+                                return Err(self.type_error(format!(
+                                    "Assignment to constant variable '{name}'"
+                                )));
                             }
                             slot => *slot = value,
                         }
@@ -1305,8 +1282,8 @@ impl ScriptRuntime {
                     .push(Value::Bool(true));
             }
             Op::PushScope(block) => {
-                let names = frame.code.blocks[block as usize].clone();
-                let scope = Scope::new(names, frame.scope.clone());
+                let layout = frame.code.blocks[block as usize].clone();
+                let scope = Scope::new(layout, frame.scope.clone());
                 // lexical bindings in a block start in their temporal dead zone
                 for slot in scope.borrow_mut().slots.iter_mut() {
                     *slot = Value::Uninitialized;
@@ -1315,18 +1292,18 @@ impl ScriptRuntime {
                 frame.scopes += 1;
             }
             Op::PushVarScope(block) => {
-                let names = frame.code.blocks[block as usize].clone();
+                let layout = frame.code.blocks[block as usize].clone();
                 // a function's variable environment, whose bindings start undefined
-                let scope = Scope::new_var(names, frame.scope.clone());
+                let scope = Scope::new(layout, frame.scope.clone());
                 frame.scope = Some(scope);
                 frame.scopes += 1;
             }
             Op::DeleteGrown { depth, index } => {
                 let scope = Self::scope_at(frame, depth);
                 let mut scope = scope.borrow_mut();
-                let grown = index >= scope.names.len() as u16;
+                let grown = index >= scope.layout.names.len() as u16;
                 if grown {
-                    let position = index as usize - scope.names.len();
+                    let position = index as usize - scope.layout.names.len();
                     scope.slots[index as usize] = Value::Uninitialized;
                     if let Some(name) = scope.extra.get_mut(position) {
                         *name = "".into();
@@ -1346,11 +1323,7 @@ impl ScriptRuntime {
             Op::CloneScope => {
                 let scope = frame.scope.clone().expect("a scope to copy");
                 let scope = scope.borrow();
-                let copy = if scope.var_scope {
-                    Scope::new_var(scope.names.clone(), scope.parent.clone())
-                } else {
-                    Scope::new(scope.names.clone(), scope.parent.clone())
-                };
+                let copy = Scope::new(scope.layout.clone(), scope.parent.clone());
                 copy.borrow_mut().slots = scope.slots.clone();
                 copy.borrow_mut().extra = scope.extra.clone();
                 drop(scope);
@@ -1684,7 +1657,7 @@ impl ScriptRuntime {
                     let mut chain: Vec<(ScopeRef, bool)> = Vec::new();
                     let mut walk = frame.scope.clone();
                     while let Some(scope) = walk {
-                        let flag = scope.borrow().var_scope;
+                        let flag = scope.borrow().layout.role == ScopeRole::Var;
                         walk = scope.borrow().parent.clone();
                         chain.push((scope, flag));
                     }
@@ -1743,7 +1716,7 @@ impl ScriptRuntime {
                 };
                 return self.super_call(frames, arguments);
             }
-            Op::Closure(index) | Op::ClosureNamed(index) => {
+            Op::Closure(index) => {
                 let code = frame.code.children[index as usize].clone();
                 let url = frame
                     .closure

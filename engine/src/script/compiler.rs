@@ -138,7 +138,6 @@ pub(super) enum Op {
     SuperCall(u16),
     SuperCallSpread,
     Closure(u32),
-    ClosureNamed(u32),
     Class {
         template: u32,
         has_super: bool,
@@ -235,9 +234,9 @@ pub(super) struct Code {
     pub(super) children: Vec<Rc<Code>>,
     pub(super) classes: Vec<Rc<ClassTemplate>>,
     pub(super) templates: Vec<TemplateSite>,
-    // the names of the function scope's slots, and of each block scope's
-    pub(super) layout: Rc<[Name]>,
-    pub(super) blocks: Vec<Rc<[Name]>>,
+    // the function scope's slots, and each block scope's
+    pub(super) layout: Rc<Layout>,
+    pub(super) blocks: Vec<Rc<Layout>>,
     pub(super) param_slots: Vec<Option<u16>>,
     pub(super) kind: FunctionKind,
     pub(super) is_async: bool,
@@ -253,7 +252,7 @@ pub(super) struct Code {
     // how many debugger breakpoints sit in these ops
     pub(super) breakpoints: Cell<u32>,
     // a named function expression sees its own name in an enclosing one-slot scope
-    pub(super) self_scope: Option<Rc<[Name]>>,
+    pub(super) self_scope: Option<Rc<Layout>>,
     // simple parameter lists bind straight into slots; others run destructuring code
     pub(super) simple_params: bool,
 }
@@ -270,7 +269,7 @@ pub(super) struct ClassTemplate {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BindingKind {
+pub(super) enum BindingKind {
     Var,
     Let,
     Const,
@@ -279,6 +278,27 @@ enum BindingKind {
     Class,
     Hidden,
     Import,
+    // a named function expression's own name: immutable, but only strict code
+    // is told so when it writes
+    SelfName,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ScopeRole {
+    Block,
+    // a function's variable environment
+    Var,
+    // a catch clause's parameters
+    Catch,
+}
+
+// a scope's slots as compiled: what each is called and what kind of binding it
+// holds, which a direct eval compiled later against the live scope reads back
+#[derive(Debug)]
+pub(super) struct Layout {
+    pub(super) names: Box<[Name]>,
+    pub(super) kinds: Box<[BindingKind]>,
+    pub(super) role: ScopeRole,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -304,6 +324,7 @@ struct ScopeInfo {
     with_object: Option<Name>,
     // a materialized block's index in the function's blocks
     block: u16,
+    role: ScopeRole,
     // bindings at or past this index were grown at run time by a direct eval, so
     // they are deletable; u16::MAX when none are
     grown_from: u16,
@@ -318,17 +339,23 @@ impl ScopeInfo {
             materialized,
             with_object: None,
             block: 0,
+            role: ScopeRole::Block,
             grown_from: u16::MAX,
         }
     }
 
-    // the scope's names in slot order
-    fn layout(&self) -> Rc<[Name]> {
+    fn layout(&self) -> Rc<Layout> {
         let mut names = vec![Name::from(""); self.size as usize];
+        let mut kinds = vec![BindingKind::Hidden; self.size as usize];
         for (name, binding) in &self.bindings {
             names[binding.index as usize] = name.clone();
+            kinds[binding.index as usize] = binding.kind;
         }
-        names.into()
+        Rc::new(Layout {
+            names: names.into(),
+            kinds: kinds.into(),
+            role: self.role,
+        })
     }
 
     fn declare(&mut self, name: Name, kind: BindingKind) -> u16 {
@@ -368,7 +395,7 @@ struct FunctionState {
     classes: Vec<Rc<ClassTemplate>>,
     templates: Vec<TemplateSite>,
     scopes: Vec<ScopeInfo>,
-    blocks: Vec<Rc<[Name]>>,
+    blocks: Vec<Rc<Layout>>,
     positions: Vec<(u32, u32)>,
     is_arrow: bool,
     // global script code: top-level declarations live in the global environment
@@ -510,10 +537,10 @@ pub(super) struct ModuleCode {
 
 // one of a direct eval caller's live scopes, innermost first
 pub(super) struct CallerScope {
-    // the scope's names, with any a direct eval added past the layout
-    pub(super) names: Vec<Name>,
+    pub(super) layout: Rc<Layout>,
+    // names a direct eval added past the layout
+    pub(super) extra: Vec<Name>,
     pub(super) slots: u16,
-    pub(super) var_scope: bool,
 }
 
 enum Folded {
@@ -821,12 +848,15 @@ impl Compiler {
             info.size = scope.slots;
             // bindings past the live slots are ones earlier evals grew, deletable
             info.grown_from = scope.slots;
-            for (index, name) in scope.names.iter().enumerate() {
+            let layout = &scope.layout;
+            let compiled = layout.names.iter().zip(layout.kinds.iter().copied());
+            let grown = scope.extra.iter().map(|name| (name, BindingKind::Var));
+            for (index, (name, kind)) in compiled.chain(grown).enumerate() {
                 info.bindings.insert(
                     name.clone(),
                     Binding {
                         index: index as u16,
-                        kind: BindingKind::Var,
+                        kind,
                     },
                 );
             }
@@ -835,7 +865,7 @@ impl Compiler {
         // the variable environment among them, the innermost one a sloppy eval extends
         let var_target = caller
             .iter()
-            .position(|scope| scope.var_scope)
+            .position(|scope| scope.layout.role == ScopeRole::Var)
             .map(|position| caller.len() - 1 - position);
         self.functions.push(state);
         let mut vars = Vec::new();
@@ -929,7 +959,7 @@ impl Compiler {
             false,
             "",
             0,
-            false,
+            None,
             true,
             Vec::new(),
         );
@@ -1026,7 +1056,7 @@ impl Compiler {
             false,
             "",
             0,
-            false,
+            None,
             true,
             Vec::new(),
         );
@@ -1036,7 +1066,9 @@ impl Compiler {
 
     pub(super) fn compile_module(mut self, module: &Module) -> Result<ModuleCode, ScriptError> {
         let mut state = FunctionState::new(false, false, true);
-        state.scopes.push(ScopeInfo::new(ScopeKind::Function, true));
+        let mut scope = ScopeInfo::new(ScopeKind::Function, true);
+        scope.role = ScopeRole::Var;
+        state.scopes.push(scope);
         self.functions.push(state);
         for _ in 0..4 {
             self.emit(Op::Nop);
@@ -1126,7 +1158,7 @@ impl Compiler {
             false,
             "",
             0,
-            false,
+            None,
             true,
             Vec::new(),
         ));
@@ -1159,12 +1191,12 @@ impl Compiler {
     pub(super) fn compile_function_within(
         mut self,
         function: &FunctionNode,
-        layers: &[Rc<[Name]>],
+        layers: &[Rc<Layout>],
     ) -> Result<Rc<Code>, ScriptError> {
         self.functions.push(FunctionState::new(false, true, false));
-        for names in layers {
+        for layout in layers {
             let mut scope = ScopeInfo::new(ScopeKind::Outer, true);
-            for (slot, name) in names.iter().enumerate() {
+            for (slot, name) in layout.names.iter().enumerate() {
                 let name = match name.is_empty() {
                     true => Name::from(format!("%slot{slot}").as_str()),
                     false => name.clone(),
@@ -1188,17 +1220,18 @@ impl Compiler {
         is_generator: bool,
         name: &str,
         length: u32,
-        self_named: bool,
+        self_scope: Option<Rc<Layout>>,
         simple_params: bool,
         param_slots: Vec<Option<u16>>,
     ) -> Code {
+        let empty = || ScopeInfo::new(ScopeKind::Function, true).layout();
         let layout = match state.is_global {
-            true => Rc::from([]),
+            true => empty(),
             false => state
                 .scopes
                 .iter()
                 .find(|scope| scope.kind == ScopeKind::Function)
-                .map_or_else(|| Rc::from([]), ScopeInfo::layout),
+                .map_or_else(empty, ScopeInfo::layout),
         };
         let mut ops = state.ops;
         // the prologue reserves four slots that only become real when an arrow needed them
@@ -1235,7 +1268,7 @@ impl Compiler {
             text: self.source.clone(),
             positions: state.positions.into(),
             breakpoints: Cell::new(0),
-            self_scope: self_named.then(|| Rc::from([Name::from(name)])),
+            self_scope,
             simple_params,
         }
     }
@@ -1259,6 +1292,7 @@ impl Compiler {
     // declares land over them and closures from the parameter list never see them
     fn push_var_environment(&mut self) {
         let mut scope = ScopeInfo::new(ScopeKind::Function, true);
+        scope.role = ScopeRole::Var;
         let state = self.state();
         scope.block = state.blocks.len() as u16;
         let layout = scope.layout();
@@ -1465,8 +1499,12 @@ impl Compiler {
                 if initialize {
                     self.emit(Op::Dup);
                     self.emit(Op::InitLocal { depth, index });
-                } else if matches!(kind, BindingKind::Const | BindingKind::Import) {
+                } else if matches!(kind, BindingKind::Const | BindingKind::Import)
+                    || kind == BindingKind::SelfName && self.state().strict
+                {
                     self.emit(Op::ThrowConstAssign(name_index));
+                } else if kind == BindingKind::SelfName {
+                    // a sloppy write to the name is dropped, leaving the value as the result
                 } else {
                     self.emit(Op::SetLocal {
                         depth,
@@ -1758,7 +1796,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Class(class) => {
-                self.compile_class(class)?;
+                self.compile_class(class, None)?;
                 let name = class.name.clone().expect("declarations are named");
                 self.compile_set_name(&name, true)?;
                 self.emit(Op::Pop);
@@ -2241,6 +2279,9 @@ impl Compiler {
                         .map(|name| (name, BindingKind::Let))
                         .collect();
                     self.push_block_scope(&declarations);
+                    if let Some(scope) = self.state().scopes.last_mut() {
+                        scope.role = ScopeRole::Catch;
+                    }
                     self.compile_binding(param, DeclarationKind::Let)?;
                     self.compile_block(&handler.body)?;
                     self.pop_block_scope();
@@ -2466,14 +2507,10 @@ impl Compiler {
         if let Pattern::Identifier(name) = target {
             match expression {
                 Expr::Function(function) if function.name.is_none() => {
-                    let mut named = (**function).clone();
-                    named.name = Some(name.clone());
-                    return self.compile_function_value(&Rc::new(named));
+                    return self.compile_function_named(function, Some(name));
                 }
                 Expr::Class(class) if class.name.is_none() => {
-                    let mut named = (**class).clone();
-                    named.name = Some(name.clone());
-                    return self.compile_class_with_binding(&Rc::new(named), false);
+                    return self.compile_class(class, Some(name));
                 }
                 _ => {}
             }
@@ -2483,40 +2520,49 @@ impl Compiler {
 
     // ---- functions ----
 
-    fn compile_function_value(&mut self, function: &Rc<FunctionNode>) -> Result<(), ScriptError> {
-        let code = self.build_function(function)?;
-        let named_expression = code.self_scope.is_some();
+    fn compile_function_value(&mut self, function: &FunctionNode) -> Result<(), ScriptError> {
+        self.compile_function_named(function, None)
+    }
+
+    // a function value whose name, when given, is the one a binding inferred for it
+    fn compile_function_named(
+        &mut self,
+        function: &FunctionNode,
+        name: Option<&Name>,
+    ) -> Result<(), ScriptError> {
+        let code = self.build_function_with(function, false, name)?;
         let state = self.state();
         let index = state.children.len() as u32;
         state.children.push(code);
-        self.emit(if named_expression {
-            Op::ClosureNamed(index)
-        } else {
-            Op::Closure(index)
-        });
+        self.emit(Op::Closure(index));
         Ok(())
     }
 
     fn build_function(&mut self, function: &FunctionNode) -> Result<Rc<Code>, ScriptError> {
-        self.build_function_with(function, false)
+        self.build_function_with(function, false, None)
     }
 
     fn build_function_with(
         &mut self,
         function: &FunctionNode,
         named_expression: bool,
+        inferred_name: Option<&Name>,
     ) -> Result<Rc<Code>, ScriptError> {
         let is_arrow = function.kind == FunctionKind::Arrow;
         let parent_strict = self.functions.last().is_some_and(|state| state.strict);
         let mut state = FunctionState::new(is_arrow, false, function.strict || parent_strict);
         state.async_generator = function.is_async && function.is_generator;
+        let mut self_scope = None;
         if named_expression && let Some(name) = &function.name {
             // the self-name lives in a one-slot scope between the closure and its parent
             let mut outer = ScopeInfo::new(ScopeKind::Outer, true);
-            outer.declare(name.clone(), BindingKind::Const);
+            outer.declare(name.clone(), BindingKind::SelfName);
+            self_scope = Some(outer.layout());
             state.scopes.push(outer);
         }
-        state.scopes.push(ScopeInfo::new(ScopeKind::Function, true));
+        let mut scope = ScopeInfo::new(ScopeKind::Function, true);
+        scope.role = ScopeRole::Var;
+        state.scopes.push(scope);
         self.functions.push(state);
         // four reserved prologue slots, patched when arrows need lexical state
         for _ in 0..4 {
@@ -2602,30 +2648,31 @@ impl Compiler {
         }
         self.emit(Op::Return);
         let state = self.functions.pop().expect("function state");
-        Ok(Rc::new(self.finish(
-            state,
-            Some(function.source),
-            function.kind,
-            function.is_async,
-            function.is_generator,
-            function.name.as_deref().unwrap_or(""),
-            function.length() as u32,
-            named_expression,
-            simple_params,
-            param_slots,
-        )))
+        Ok(Rc::new(
+            self.finish(
+                state,
+                Some(function.source),
+                function.kind,
+                function.is_async,
+                function.is_generator,
+                inferred_name
+                    .or(function.name.as_ref())
+                    .map_or("", |name| name),
+                function.length() as u32,
+                self_scope,
+                simple_params,
+                param_slots,
+            ),
+        ))
     }
 
     // ---- classes ----
 
-    fn compile_class(&mut self, class: &Rc<ClassNode>) -> Result<(), ScriptError> {
-        self.compile_class_with_binding(class, true)
-    }
-
-    fn compile_class_with_binding(
+    // a class value; an inferred name names it without being bound inside the body
+    fn compile_class(
         &mut self,
-        class: &Rc<ClassNode>,
-        _declaration: bool,
+        class: &ClassNode,
+        inferred_name: Option<&Name>,
     ) -> Result<(), ScriptError> {
         // the class scope holds the inner class name and every private name of the body
         let mut declarations = Vec::new();
@@ -2653,17 +2700,17 @@ impl Compiler {
         if let Some(superclass) = &class.superclass {
             self.compile_expression(superclass)?;
         }
-        let name = class.name.clone().unwrap_or_else(|| "".into());
+        let name = class
+            .name
+            .as_ref()
+            .or(inferred_name)
+            .cloned()
+            .unwrap_or_else(|| "".into());
         // the parser named the constructor method before a binding could name the class
-        let constructor = match &class.constructor {
-            Some(constructor) if constructor.name.as_ref() == Some(&name) => constructor.clone(),
-            Some(constructor) => Rc::new(FunctionNode {
-                name: Some(name.clone()),
-                ..(**constructor).clone()
-            }),
-            None => Rc::new(default_constructor(&name, has_super, class.source)),
+        let constructor_code = match &class.constructor {
+            Some(constructor) => self.build_function_with(constructor, false, Some(&name))?,
+            None => self.build_function(&default_constructor(&name, has_super, class.source))?,
         };
-        let constructor_code = self.build_function(&constructor)?;
         let template = Rc::new(ClassTemplate {
             constructor: constructor_code,
         });
@@ -2851,17 +2898,13 @@ impl Compiler {
             Expr::Function(function) => {
                 let named_expression =
                     function.name.is_some() && function.kind == FunctionKind::Normal;
-                let code = self.build_function_with(function, named_expression)?;
+                let code = self.build_function_with(function, named_expression, None)?;
                 let state = self.state();
                 let index = state.children.len() as u32;
                 state.children.push(code);
-                self.emit(if named_expression {
-                    Op::ClosureNamed(index)
-                } else {
-                    Op::Closure(index)
-                });
+                self.emit(Op::Closure(index));
             }
-            Expr::Class(class) => self.compile_class_with_binding(class, false)?,
+            Expr::Class(class) => self.compile_class(class, None)?,
             Expr::Unary { operator, argument } => self.compile_unary(*operator, argument)?,
             Expr::Update {
                 increment,
