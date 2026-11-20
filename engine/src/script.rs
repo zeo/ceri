@@ -14755,15 +14755,8 @@ fn parse_fetch_options(
     let Value::Object(options) = options else {
         return Err(runtime_error("fetch options must be an object"));
     };
+    // members this does not act on, such as mode, credentials and priority, are passed over
     let options = options.borrow();
-    if options.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "method" | "headers" | "body" | "cache" | "redirect" | "signal"
-        )
-    }) {
-        return Err(runtime_error("fetch options contain an unsupported key"));
-    }
     let method = match options.get("method").map(Value::resolve) {
         None | Some(Value::Undefined) => default_method,
         Some(Value::String(method)) => method.to_string(),
