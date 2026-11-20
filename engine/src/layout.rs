@@ -9567,7 +9567,6 @@ fn text_control_value(node: Subject<'_>, style_state: &StyleState) -> Option<Str
                     | "hidden"
                     | "image"
                     | "month"
-                    | "number"
                     | "radio"
                     | "range"
                     | "reset"
@@ -11568,6 +11567,8 @@ mod tests {
         assert_eq!(line("<input>"), filled);
         assert_eq!(line("<input placeholder='hint'>"), filled);
         assert_eq!(line("<input type='password'>"), filled);
+        // a number field is a text field with its value in it
+        assert_eq!(line("<input type='number' value='5'>"), filled);
         assert_eq!(line("<input value='abc' style='overflow: hidden'>"), filled);
         // a checkbox has no text, so the label that leads with one sits with the box's bottom
         // on the baseline and the line grows past the 19px its text alone would take

@@ -6028,6 +6028,16 @@ impl ScriptRuntime {
         true
     }
 
+    // a number field holds a caret as a text field does, and tells script nothing of it
+    fn is_number_input(&self, node: NodeId) -> bool {
+        self.document.borrow().element(node).is_some_and(|element| {
+            element.name == "input"
+                && element
+                    .attr("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("number"))
+        })
+    }
+
     fn is_selection_control(&self, node: NodeId) -> bool {
         let document = self.document.borrow();
         let Some(element) = document.element(node) else {
@@ -6047,7 +6057,6 @@ impl ScriptRuntime {
                         | "hidden"
                         | "image"
                         | "month"
-                        | "number"
                         | "radio"
                         | "range"
                         | "reset"
@@ -6072,7 +6081,7 @@ impl ScriptRuntime {
 
     fn element_selection_start(&self, handle: &ElementHandle) -> Result<Value, ScriptError> {
         let node = handle.id;
-        if !self.is_selection_control(node) {
+        if !self.is_selection_control(node) || self.is_number_input(node) {
             return Ok(Value::Null);
         }
         let value = self.control_value(node).unwrap_or_default();
@@ -6081,7 +6090,7 @@ impl ScriptRuntime {
 
     fn element_selection_end(&self, handle: &ElementHandle) -> Result<Value, ScriptError> {
         let node = handle.id;
-        if !self.is_selection_control(node) {
+        if !self.is_selection_control(node) || self.is_number_input(node) {
             return Ok(Value::Null);
         }
         let value = self.control_value(node).unwrap_or_default();
@@ -6090,7 +6099,7 @@ impl ScriptRuntime {
 
     fn element_selection_direction(&self, handle: &ElementHandle) -> Result<Value, ScriptError> {
         let node = handle.id;
-        if !self.is_selection_control(node) {
+        if !self.is_selection_control(node) || self.is_number_input(node) {
             return Ok(Value::Null);
         }
         let value = self.control_value(node).unwrap_or_default();
