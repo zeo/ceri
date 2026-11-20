@@ -1219,7 +1219,7 @@ impl ScriptRuntime {
 
     fn spread_list(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
         match value {
-            Value::Array(array) => Ok(array.borrow().clone()),
+            Value::Array(array) => Ok(array.borrow().iter().cloned().map(Value::filled).collect()),
             other => self.iterate_to_vec(other),
         }
     }
@@ -1621,7 +1621,7 @@ impl ScriptRuntime {
             }
             Op::ArrayHole => {
                 if let Some(Value::Array(array)) = frame.stack.last() {
-                    array.borrow_mut().push(Value::Undefined);
+                    array.borrow_mut().push(Value::Uninitialized);
                 }
             }
             Op::ArraySpread(_) | Op::ArgumentSpread(_) => {
@@ -1840,7 +1840,9 @@ impl ScriptRuntime {
                 let arguments = match op {
                     Op::CallEval(count) => Self::pop_arguments(frame, count as usize),
                     _ => match Self::pop(frame) {
-                        Value::Array(array) => array.borrow().clone(),
+                        Value::Array(array) => {
+                            array.borrow().iter().cloned().map(Value::filled).collect()
+                        }
                         _ => Vec::new(),
                     },
                 };
@@ -1871,7 +1873,9 @@ impl ScriptRuntime {
                     Value::Undefined
                 };
                 let arguments = match list {
-                    Value::Array(array) => array.borrow().clone(),
+                    Value::Array(array) => {
+                        array.borrow().iter().cloned().map(Value::filled).collect()
+                    }
                     _ => Vec::new(),
                 };
                 return self.call_in_loop(frames, callee, this, arguments);
@@ -1885,7 +1889,9 @@ impl ScriptRuntime {
                 let list = Self::pop(frame);
                 let callee = Self::pop(frame);
                 let arguments = match list {
-                    Value::Array(array) => array.borrow().clone(),
+                    Value::Array(array) => {
+                        array.borrow().iter().cloned().map(Value::filled).collect()
+                    }
                     _ => Vec::new(),
                 };
                 return self.construct_in_loop(frames, callee, arguments, None);
@@ -1897,7 +1903,9 @@ impl ScriptRuntime {
             Op::SuperCallSpread => {
                 let list = Self::pop(frame);
                 let arguments = match list {
-                    Value::Array(array) => array.borrow().clone(),
+                    Value::Array(array) => {
+                        array.borrow().iter().cloned().map(Value::filled).collect()
+                    }
                     _ => Vec::new(),
                 };
                 return self.super_call(frames, arguments);

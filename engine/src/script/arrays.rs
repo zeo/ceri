@@ -378,6 +378,23 @@ impl ScriptRuntime {
                         break;
                     }
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    // an index nothing was put at is passed over, kept as it is by map, and
+                    // seen as undefined by the finds
+                    let value = match value {
+                        Value::Uninitialized if self.inherits(&this, &index.to_string()) => {
+                            self.get_index(&this, Value::Number(index as f64))?
+                        }
+                        Value::Uninitialized if matches!(method, M::Find | M::FindIndex) => {
+                            Value::Undefined
+                        }
+                        Value::Uninitialized => {
+                            if matches!(method, M::Map) {
+                                mapped.push(Value::Uninitialized);
+                            }
+                            continue;
+                        }
+                        value => value,
+                    };
                     let result = self.call_function(
                         callback.clone(),
                         receiver.clone(),
@@ -406,7 +423,9 @@ impl ScriptRuntime {
                 let callback = self.callback(&arguments, &name)?;
                 let receiver = argument(&arguments, 1);
                 for index in (0..values.len()).rev() {
-                    let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    let value = Self::element(&this, &values, index)
+                        .unwrap_or(Value::Undefined)
+                        .filled();
                     let result = self.call_function(
                         callback.clone(),
                         receiver.clone(),
@@ -427,6 +446,8 @@ impl ScriptRuntime {
             M::Reduce | M::ReduceRight => {
                 let (values, object) = self.callback_receiver(&this, &name)?;
                 let callback = self.callback(&arguments, &name)?;
+                // each index is looked at when its turn comes, since the callback may fill or
+                // delete what was there when the method began
                 let indices: Vec<usize> = if matches!(method, M::Reduce) {
                     (0..values.len()).collect()
                 } else {
@@ -434,19 +455,37 @@ impl ScriptRuntime {
                 };
                 let mut indices = indices.into_iter();
                 let mut accumulator = if arguments.len() >= 2 {
-                    arguments[1].clone()
+                    Some(arguments[1].clone())
                 } else {
-                    match indices.next() {
-                        Some(first) => values[first].clone(),
-                        None => {
-                            return Err(
-                                self.type_error("Reduce of empty array with no initial value")
-                            );
-                        }
-                    }
+                    None
                 };
+                while accumulator.is_none() {
+                    let Some(first) = indices.next() else {
+                        return Err(self.type_error("Reduce of empty array with no initial value"));
+                    };
+                    accumulator = match Self::element(&this, &values, first) {
+                        Some(Value::Uninitialized) if !self.inherits(&this, &first.to_string()) => {
+                            None
+                        }
+                        Some(Value::Uninitialized) => {
+                            Some(self.get_index(&this, Value::Number(first as f64))?)
+                        }
+                        value => value,
+                    };
+                }
+                let mut accumulator = accumulator.unwrap_or(Value::Undefined);
                 for index in indices {
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    // a callback may have deleted what was there when the method began
+                    let value = match value {
+                        Value::Uninitialized if !self.inherits(&this, &index.to_string()) => {
+                            continue;
+                        }
+                        Value::Uninitialized => {
+                            self.get_index(&this, Value::Number(index as f64))?
+                        }
+                        value => value,
+                    };
                     accumulator = self.call_function(
                         callback.clone(),
                         Value::Undefined,
@@ -461,7 +500,15 @@ impl ScriptRuntime {
                 Ok(accumulator)
             }
             M::Includes | M::IndexOf | M::LastIndexOf => {
-                let values = self.receiver_values(&this, &name)?;
+                let mut values = self.receiver_values(&this, &name)?;
+                // an index nothing was put at is searched as what a prototype has there
+                for (index, value) in values.iter_mut().enumerate() {
+                    if matches!(value, Value::Uninitialized)
+                        && self.inherits(&this, &index.to_string())
+                    {
+                        *value = self.get_index(&this, Value::Number(index as f64))?;
+                    }
+                }
                 let target = argument(&arguments, 0);
                 let length = values.len();
                 if matches!(method, M::LastIndexOf) {
@@ -489,7 +536,7 @@ impl ScriptRuntime {
                 let start = relative(from, length);
                 for (index, value) in values.iter().enumerate().skip(start) {
                     let found = match method {
-                        M::Includes => same_value_zero(value, &target),
+                        M::Includes => same_value_zero(&value.clone().filled(), &target),
                         _ => strict_equals(value, &target),
                     };
                     if found {
@@ -537,7 +584,7 @@ impl ScriptRuntime {
                 if index < 0.0 || index >= values.len() as f64 {
                     return Ok(Value::Undefined);
                 }
-                Ok(values[index as usize].clone())
+                Ok(values[index as usize].clone().filled())
             }
             M::Concat => {
                 let mut result = self.receiver_values(&this, &name)?;
@@ -738,9 +785,10 @@ impl ScriptRuntime {
         values: Vec<Value>,
         comparator: &Value,
     ) -> Result<Vec<Value>, ScriptError> {
+        // indexes nothing was put at go last with them
         let (mut defined, undefined): (Vec<Value>, Vec<Value>) = values
             .into_iter()
-            .partition(|value| !matches!(value, Value::Undefined));
+            .partition(|value| !matches!(value, Value::Undefined | Value::Uninitialized));
         // default ordering compares string forms, computed once per element
         let keys: Option<Vec<Vec<u16>>> = if matches!(comparator, Value::Undefined) {
             let mut keys = Vec::with_capacity(defined.len());

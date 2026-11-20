@@ -1536,6 +1536,7 @@ impl ScriptRuntime {
                     array
                         .borrow()
                         .get(index as usize)
+                        .filter(|value| !matches!(value, Value::Uninitialized))
                         .cloned()
                         .map(Property::data)
                 } else {
@@ -1594,8 +1595,12 @@ impl ScriptRuntime {
                 keys
             }
             Value::Array(array) if !symbols => {
-                let mut keys: Vec<String> = (0..array.borrow().len())
-                    .map(|index| index.to_string())
+                let mut keys: Vec<String> = array
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| !matches!(value, Value::Uninitialized))
+                    .map(|(index, _)| index.to_string())
                     .collect();
                 keys.push("length".to_string());
                 keys
@@ -2592,7 +2597,10 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Native::IterResultWrap(done) => Ok(self.iterator_result(first, done)),
-            Native::Array(method) => self.call_array_method(method, this, arguments),
+            // an index nothing was put at leaves a method as undefined
+            Native::Array(method) => self
+                .call_array_method(method, this, arguments)
+                .map(Value::filled),
             Native::String(method) => self.call_string_method(method, this, arguments),
             Native::Math(function) => self.call_math(function, arguments),
             Native::NumberFormat(super::numbers::NumberFormat::Locale) => {
@@ -2936,7 +2944,7 @@ impl ScriptRuntime {
                             self.range_error("array exceeds the deterministic length limit")
                         );
                     }
-                    vec![Value::Undefined; length as usize]
+                    vec![Value::Uninitialized; length as usize]
                 } else {
                     arguments
                 };

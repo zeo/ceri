@@ -144,7 +144,8 @@ impl std::error::Error for ScriptError {}
 #[derive(Clone)]
 enum Value {
     Undefined,
-    // a lexical binding read before its declaration ran
+    // a lexical binding read before its declaration ran, or an array index nothing was put
+    // at, which reads as undefined and is no property of the array
     Uninitialized,
     Null,
     Bool(bool),
@@ -10916,6 +10917,14 @@ impl Value {
         }
     }
 
+    // an array slot nothing was put at reads as undefined
+    fn filled(self) -> Self {
+        match self {
+            Self::Uninitialized => Self::Undefined,
+            value => value,
+        }
+    }
+
     fn truthy(&self) -> bool {
         let value = self.resolve();
         match &value {
@@ -12871,6 +12880,7 @@ fn enumerable_object_properties(value: Value) -> Result<Vec<(String, Value)>, Sc
             .iter()
             .cloned()
             .enumerate()
+            .filter(|(_, value)| !matches!(value, Value::Uninitialized))
             .map(|(index, value)| (index.to_string(), value.resolve()))
             .collect(),
         Value::String(source) => source
@@ -12916,7 +12926,7 @@ fn set_array_element(array: &ArrayHandle, index: usize, value: Value) -> Result<
     }
     let mut array = array.borrow_mut();
     if index >= array.len() {
-        array.resize(index + 1, Value::Undefined);
+        array.resize(index + 1, Value::Uninitialized);
     }
     array[index] = value;
     Ok(())
@@ -12933,7 +12943,9 @@ fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError
             "array length must be a non-negative integer within the deterministic limit",
         ));
     }
-    array.borrow_mut().resize(number as usize, Value::Undefined);
+    array
+        .borrow_mut()
+        .resize(number as usize, Value::Uninitialized);
     Ok(())
 }
 
@@ -16373,6 +16385,49 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("a,d true")
+        );
+    }
+
+    #[test]
+    fn an_array_made_with_a_length_has_holes_until_they_are_filled() {
+        let document = document("<p id='status'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const temp = new Array(4);
+                temp[2] = "kept";
+                const seen = [0 in temp, 2 in temp, 3 in temp, temp.length, temp.hasOwnProperty(1)];
+                const visited = [];
+                temp.forEach((value, index) => visited.push(index));
+                seen.push(visited.join("/"), Object.keys(temp).join("/"), temp[0] === undefined);
+                const literal = [1, , 3];
+                seen.push(1 in literal, literal.length);
+                delete literal[0];
+                seen.push(0 in literal);
+                const gap = [1, , 3];
+                seen.push(gap.join("-"), String(gap), JSON.stringify(gap), [...gap].length, 1 in [...gap]);
+                seen.push(1 in gap.map((value) => value * 2), gap.filter(() => true).length);
+                seen.push(gap.reduce((sum, value) => sum + value, 0), gap.indexOf(undefined), gap.includes(undefined));
+                seen.push(new Array(3).fill(0).join(), Array.from(new Array(2)).length, 0 in Array.from(new Array(2)));
+                seen.push(gap.slice(0, 2).length, 1 in gap.slice(0, 2), 1 in gap.concat([4]), gap.some((value) => value === undefined));
+                const [first, second = "default"] = gap;
+                let counted = 0;
+                for (const key in gap) counted += 1;
+                seen.push(second, counted, gap.findIndex((value) => value === undefined), Object.entries(gap).length);
+                document.getElementById("status").textContent = seen.join(" ");
+                "#,
+            )
+            .expect("sparse arrays should run");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "false true false 4 false 2 2 true false 3 false 1--3 1,,3 [1,null,3] 3 true false 2 4 -1 true 0,0,0 2 true 2 false false false default 2 1 2"
+            )
         );
     }
 

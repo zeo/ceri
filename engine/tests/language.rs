@@ -851,7 +851,7 @@ fn edge_cases_hold() {
         (
             "array holes",
             "const a = [1, , 3]; console.log(a.length, a[1], 1 in a)",
-            "3 undefined true",
+            "3 undefined false",
         ),
         (
             "array length",

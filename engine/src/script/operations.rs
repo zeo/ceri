@@ -400,7 +400,7 @@ impl ScriptRuntime {
         let mut outcome = Ok(());
         for value in values {
             match value {
-                Value::Undefined | Value::Null => parts.push(String::new()),
+                Value::Undefined | Value::Null | Value::Uninitialized => parts.push(String::new()),
                 value => match self.coerce_string(value) {
                     Ok(part) => parts.push(part),
                     Err(error) => {
@@ -586,7 +586,7 @@ impl ScriptRuntime {
         match value {
             Value::String(text) => Ok(text.to_string()),
             Value::Number(number) => Ok(number_to_string(number)),
-            Value::Undefined => Ok("undefined".to_string()),
+            Value::Undefined | Value::Uninitialized => Ok("undefined".to_string()),
             Value::Null => Ok("null".to_string()),
             Value::Bool(value) => Ok(value.to_string()),
             Value::Symbol(_) => Err(self.type_error("Cannot convert a Symbol value to a string")),
@@ -1287,11 +1287,20 @@ impl ScriptRuntime {
                 Value::Array(array) => {
                     if number >= 0.0 && number.fract() == 0.0 {
                         let index = number as usize;
-                        if let Some(value) = array.borrow().get(index) {
-                            return Ok(value.clone());
+                        let own = array.borrow().get(index).cloned();
+                        if let Some(value) = own
+                            && !matches!(value, Value::Uninitialized)
+                        {
+                            return Ok(value);
                         }
+                        // an index the array does not have is read from its prototypes
                         if (index as f64) == number {
-                            return Ok(Value::Undefined);
+                            let key = index.to_string();
+                            if !self.inherits(object, &key) {
+                                return Ok(Value::Undefined);
+                            }
+                            let prototype = self.intrinsics.array_prototype.clone();
+                            return self.ordinary_get(prototype, &key, object);
                         }
                     }
                 }
@@ -1381,7 +1390,7 @@ impl ScriptRuntime {
                 if let Some(index) = array_index(key) {
                     let mut array = array.borrow_mut();
                     if let Some(slot) = array.get_mut(index as usize) {
-                        *slot = Value::Undefined;
+                        *slot = Value::Uninitialized;
                     }
                 }
                 Ok(true)
@@ -1426,8 +1435,14 @@ impl ScriptRuntime {
                 if key == "length" {
                     return Ok(true);
                 }
+                // an index nothing was put at is no property of the array, though one of its
+                // prototypes may have it
                 if let Some(index) = array_index(key) {
-                    return Ok((index as usize) < array.borrow().len());
+                    let own = array
+                        .borrow()
+                        .get(index as usize)
+                        .is_some_and(|value| !matches!(value, Value::Uninitialized));
+                    return Ok(own || self.inherits(target, key));
                 }
                 self.host_has(target, key)
             }
@@ -1443,6 +1458,19 @@ impl ScriptRuntime {
             }
             _ => self.host_has(target, key),
         }
+    }
+
+    // whether one of the value's prototypes has the property
+    pub(super) fn inherits(&self, target: &Value, key: &str) -> bool {
+        let mut current = self.prototype_of(target);
+        while let Some(object) = current {
+            let borrowed = object.borrow();
+            if borrowed.contains_key(key) {
+                return true;
+            }
+            current = borrowed.prototype_or(&self.intrinsics);
+        }
+        false
     }
 
     fn host_has(&mut self, target: &Value, key: &str) -> Result<bool, ScriptError> {
@@ -2283,7 +2311,9 @@ impl ScriptRuntime {
 
     pub(super) fn iterate_to_vec(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
         match &value {
-            Value::Array(array) => return Ok(array.borrow().clone()),
+            Value::Array(array) => {
+                return Ok(array.borrow().iter().cloned().map(Value::filled).collect());
+            }
             other if !matches!(other, Value::Object(_)) => {
                 if let Some(values) = host_iterable_values(other) {
                     return Ok(values);
@@ -2313,7 +2343,7 @@ fn step_state(
         let mut borrowed = state.borrow_mut();
         match &mut *borrowed {
             VmIterator::Array { array, index } => {
-                let value = array.borrow().get(*index).cloned();
+                let value = array.borrow().get(*index).cloned().map(Value::filled);
                 return Ok(match value {
                     Some(value) => {
                         *index += 1;
@@ -2440,7 +2470,7 @@ fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
     let pair =
         |first: Value, second: Value| Value::Array(Rc::new(RefCell::new(vec![first, second])));
     Some(match value {
-        Value::Array(values) => values.borrow().clone(),
+        Value::Array(values) => values.borrow().iter().cloned().map(Value::filled).collect(),
         Value::NodeList(nodes) => nodes.iter().cloned().map(Value::Element).collect(),
         Value::String(string) => string
             .chars()
