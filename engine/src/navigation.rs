@@ -2965,8 +2965,11 @@ impl Browser {
                 }
                 last.canvas
             }
-            (crate::paint::Damage::Area(area), Some(mut last)) => {
-                crate::paint::repaint(Arc::make_mut(&mut last.canvas), &layout, &canvases, area);
+            (crate::paint::Damage::Areas(areas), Some(mut last)) => {
+                let canvas = Arc::make_mut(&mut last.canvas);
+                for area in areas {
+                    crate::paint::repaint(canvas, &layout, &canvases, area);
+                }
                 last.canvas
             }
             _ => Arc::new(crate::paint::paint_with_canvases(

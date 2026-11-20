@@ -2171,8 +2171,51 @@ const BASE: Color = Color::opaque(245, 248, 250);
 #[derive(Debug, PartialEq)]
 pub(crate) enum Damage {
     Nothing,
-    Area(Rect),
+    // separate rectangles, so changes far apart do not repaint what lies between them
+    Areas(Vec<Rect>),
     Everything,
+}
+
+// the rectangles a frame changed; ones that touch or sit close merge, and past a few the
+// pair that wastes the least area merges, so a repaint never walks the tree many times
+#[derive(Default)]
+struct Region {
+    rects: Vec<Rect>,
+}
+
+impl Region {
+    const LIMIT: usize = 6;
+    // a repaint reaches a few device pixels past its rectangle, so near neighbours join
+    const NEAR: f32 = 8.0;
+
+    fn add(&mut self, mut rect: Rect) {
+        let near = |a: &Rect, b: &Rect| {
+            a.x <= b.x + b.width + Self::NEAR
+                && b.x <= a.x + a.width + Self::NEAR
+                && a.y <= b.y + b.height + Self::NEAR
+                && b.y <= a.y + a.height + Self::NEAR
+        };
+        while let Some(index) = self.rects.iter().position(|other| near(other, &rect)) {
+            rect = union_rect(rect, self.rects.swap_remove(index));
+        }
+        self.rects.push(rect);
+        while self.rects.len() > Self::LIMIT {
+            let area = |rect: Rect| rect.width * rect.height;
+            let mut best = (0, 1, f32::INFINITY);
+            for first in 0..self.rects.len() {
+                for second in first + 1..self.rects.len() {
+                    let (a, b) = (self.rects[first], self.rects[second]);
+                    let waste = area(union_rect(a, b)) - area(a) - area(b);
+                    if waste < best.2 {
+                        best = (first, second, waste);
+                    }
+                }
+            }
+            let joined = union_rect(self.rects[best.0], self.rects.swap_remove(best.1));
+            self.rects.swap_remove(best.0);
+            self.add(joined);
+        }
+    }
 }
 
 // compares the layout and layers a frame was painted from with the next frame's; a new frame
@@ -2186,7 +2229,7 @@ pub(crate) fn damage(
     if old.viewport != new.viewport || old.prose_selections != new.prose_selections {
         return Damage::Everything;
     }
-    let mut area = None;
+    let mut area = Region::default();
     if !changed_area(&old.root, &new.root, ((0.0, 0.0), (0.0, 0.0)), 0, &mut area) {
         return Damage::Everything;
     }
@@ -2210,11 +2253,11 @@ pub(crate) fn damage(
     if !redrawn.is_empty() && !node_area(&new.root, (0.0, 0.0), &redrawn, &mut area) {
         return Damage::Everything;
     }
-    match area {
-        None => Damage::Nothing,
+    match area.rects {
+        rects if rects.is_empty() => Damage::Nothing,
         // a backdrop filter reads what lies around it, so a change anywhere may reach it
-        Some(_) if has_backdrop(&new.root) => Damage::Everything,
-        Some(rect) => Damage::Area(rect),
+        _ if has_backdrop(&new.root) => Damage::Everything,
+        rects => Damage::Areas(rects),
     }
 }
 
@@ -2225,7 +2268,7 @@ fn changed_area(
     new: &LayoutBox,
     offsets: ((f32, f32), (f32, f32)),
     depth: usize,
-    area: &mut Option<Rect>,
+    area: &mut Region,
 ) -> bool {
     if old.same_own(new) && old.children.len() == new.children.len() {
         if old.transform.is_some() || !old.filters.own.is_empty() {
@@ -2249,8 +2292,7 @@ fn changed_area(
     let (Some(old), Some(new)) = (ink(old, offsets.0), ink(new, offsets.1)) else {
         return false;
     };
-    let changed = union_rect(old, new);
-    *area = Some(area.map_or(changed, |area| union_rect(area, changed)));
+    area.add(union_rect(old, new));
     true
 }
 
@@ -2258,13 +2300,13 @@ fn node_area(
     layout_box: &LayoutBox,
     ancestor_offset: (f32, f32),
     nodes: &[crate::dom::NodeId],
-    area: &mut Option<Rect>,
+    area: &mut Region,
 ) -> bool {
     if nodes.contains(&layout_box.node) {
         let Some(ink) = ink(layout_box, ancestor_offset) else {
             return false;
         };
-        *area = Some(area.map_or(ink, |area| union_rect(area, ink)));
+        area.add(ink);
     }
     if layout_box.transform.is_some() {
         // a transformed layer's ink is out of reach, so a redrawn image under it repaints all
@@ -5077,6 +5119,8 @@ mod tests {
             ),
             ("", "#field { outline-color: #f80 }"),
             ("", "#soft { background: #a48 }"),
+            // two changes far apart, which repaint as two rectangles
+            ("", "#dot { background: #4dff4d } #fade { opacity: 0.35 }"),
         ];
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -5094,11 +5138,13 @@ mod tests {
             for (before, after) in frames {
                 let old = damage_layout(before, scrolled);
                 let new = damage_layout(after, scrolled);
-                let Damage::Area(area) = damage((&old, &[]), (&new, &[]), &[]) else {
+                let Damage::Areas(areas) = damage((&old, &[]), (&new, &[]), &[]) else {
                     panic!("{after} should damage an area");
                 };
                 let mut canvas = paint_with_canvases(&old, &[], scale, false);
-                repaint(&mut canvas, &new, &[], area);
+                for &area in &areas {
+                    repaint(&mut canvas, &new, &[], area);
+                }
                 let whole = paint_with_canvases(&new, &[], scale, false);
                 let width = whole.width() as usize;
                 let differing = canvas
@@ -5111,7 +5157,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert!(
                     differing.is_empty(),
-                    "{after} at {scale}x scrolled {scrolled} outlined {outlined}: {} pixels from {:?} to {:?} differ, damage {area:?}",
+                    "{after} at {scale}x scrolled {scrolled} outlined {outlined}: {} pixels from {:?} to {:?} differ, damage {areas:?}",
                     differing.len(),
                     differing.first(),
                     differing.last(),
@@ -5213,6 +5259,28 @@ mod tests {
         assert!(scroll_repaint(&canvas, &old, &scroll_layout(6.0, 12.0)).is_none());
     }
 
+    #[test]
+    fn changes_far_apart_damage_separate_rectangles() {
+        let old = damage_layout("", 0.0);
+        let new = damage_layout("#dot { background: #4dff4d } #fade { opacity: 0.35 }", 0.0);
+        let Damage::Areas(areas) = damage((&old, &[]), (&new, &[]), &[]) else {
+            panic!("the changes should damage areas");
+        };
+        assert_eq!(areas.len(), 2, "{areas:?}");
+        let covered: f32 = areas.iter().map(|area| area.width * area.height).sum();
+        assert!(covered < 157.0 * 233.0 / 3.0, "{areas:?}");
+        // a crowd of changes stays within the region's limit
+        let mut region = Region::default();
+        for step in 0..40 {
+            region.add(Rect {
+                x: step as f32 * 50.0,
+                y: (step % 7) as f32 * 90.0,
+                width: 4.0,
+                height: 4.0,
+            });
+        }
+        assert!(region.rects.len() <= Region::LIMIT);
+    }
     #[test]
     fn damage_falls_back_to_the_whole_frame_where_it_cannot_bound_a_change() {
         let base = damage_layout("", 0.0);
