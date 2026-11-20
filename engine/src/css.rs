@@ -2973,7 +2973,7 @@ impl Stylesheet {
                 .font_size
                 .resolve(font_size, font_size)
                 .unwrap_or(font_size)
-                .max(1.0);
+                .max(0.0);
             color = style.color;
             weight = style.font_weight;
             text = inherited_text(&style);
@@ -3005,7 +3005,7 @@ impl Stylesheet {
             .font_size
             .resolve(parent_font_size, parent_font_size)
             .unwrap_or(parent_font_size)
-            .max(1.0);
+            .max(0.0);
         (style, font_size)
     }
 

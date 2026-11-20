@@ -6993,6 +6993,34 @@ mod tests {
     }
 
     #[test]
+    fn text_at_a_font_size_of_zero_takes_no_room_and_draws_nothing() {
+        let mut browser = Browser::new(bundle(
+            r##"<body style="margin: 0; background: #000; color: #fff; font: 20px/1.5 sans-serif"><div id="gone" style="font-size: 0">hidden <span id="em" style="display: inline-block; width: 2em; height: 2em"></span></div><div id="back" style="font-size: 0"><b id="shown" style="font-size: 20px">shown</b></div><p id="status"></p><script>
+                const box = (id) => document.getElementById(id).getBoundingClientRect();
+                const style = (id) => getComputedStyle(document.getElementById(id));
+                document.getElementById("status").textContent = [
+                    style("gone").fontSize, box("gone").height, box("em").width,
+                    style("shown").fontSize, box("back").height > 0,
+                ].join(" ");
+            </script></body>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let canvas = browser
+            .paint(Size {
+                width: 200.0,
+                height: 100.0,
+            })
+            .expect("page should paint");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(document.text_content(status), "0px 0 0 20px true");
+        drop(canvas);
+    }
+
+    #[test]
     fn a_control_takes_its_own_font_and_line_height_where_the_page_sets_others() {
         let mut browser = Browser::new(bundle(
             r#"<style>body { font: italic bold 20px/1.45 Georgia, serif }</style><button id="press">B</button><input id="field"><p id="status">idle</p><script>
@@ -10474,7 +10502,7 @@ A</div>
                 body { margin: 0; background: #000; color: #fff; font: 17px/40px "Ceri Web" }
                 .card { left: 0; width: 200px; height: 40px; margin: 0; padding: 0; border: 0; background: #222; color: #fff; border-radius: 6px }
             </style></head><body>
-            <p style="margin: 0; height: 40px">ABAB fi AB</p>
+            <p style="margin: 0; height: 40px">ABAB fi AB</p><p style="margin: 0; font-size: 0">ABAB fi AB</p>
             <div class="card" style="position: fixed; top: 40px">ABAB fi AB</div>
             <dialog id="box" class="card" style="top: 80px">ABAB fi AB</dialog>
             <script>document.getElementById("box").showModal();</script></body></html>"##,

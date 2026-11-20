@@ -3018,7 +3018,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .font_size
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
-        .max(1.0);
+        .max(0.0);
     let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style, font_size));
     let mut margin = resolve_margins(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
@@ -3587,7 +3587,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                         .font_size
                         .resolve(font_size, font_size)
                         .unwrap_or(font_size)
-                        .max(1.0);
+                        .max(0.0);
                     let child_top = flow_top_margin(
                         child,
                         &child_style,
@@ -4599,7 +4599,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             .font_size
             .resolve(font_size, font_size)
             .unwrap_or(font_size)
-            .max(1.0);
+            .max(0.0);
         let child_margin = resolve_margins(child_style.margin, content_width, child_font_size);
         let child_padding = resolve_edges(child_style.padding, content_width, child_font_size);
         let child_border = used_border(&child_style);
@@ -5241,7 +5241,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 .font_size
                 .resolve(font_size, font_size)
                 .unwrap_or(font_size)
-                .max(1.0);
+                .max(0.0);
             let border = used_border(&child_style);
             GridItem {
                 source,
@@ -5743,7 +5743,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             .font_size
             .resolve(font_size, font_size)
             .unwrap_or(font_size)
-            .max(1.0),
+            .max(0.0),
         color: child_style.color,
         weight: child_style.font_weight,
         text: inherited_text(child_style),
@@ -6767,7 +6767,7 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         .font_size
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
-        .max(1.0);
+        .max(0.0);
     let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style, font_size));
     let margin = resolve_edges(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
@@ -7998,7 +7998,7 @@ fn append_inline_element(
         .font_size
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
-        .max(1.0);
+        .max(0.0);
     let line_height = used_line_height(&style, font_size);
     let (above, _) = line_extent(line_height, style.font_family, font_size);
     let raise = match vertical_shift(
@@ -8512,7 +8512,7 @@ fn append_atomic(
         .font_size
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
-        .max(1.0);
+        .max(0.0);
     // an auto width shrinks to the content, as inline-block sizing requires
     let containing_width =
         if style.width == crate::css::Length::Auto && style.aspect_ratio.is_none() {
@@ -8775,7 +8775,7 @@ fn flush_line(
         .into_iter()
         .filter(|decoration| !ends.contains_key(decoration))
         .collect();
-    line.y += height.max(1.0);
+    line.y += height.max(0.0);
     line.used = 0.0;
     line.height = 0.0;
     line.fit_to_floats(content_x, content_width);
@@ -9272,7 +9272,7 @@ fn leading_margin(
             .font_size
             .resolve(font_size, font_size)
             .unwrap_or(font_size)
-            .max(1.0);
+            .max(0.0);
         return Some((
             child.node,
             flow_top_margin(child, &child_style, child_font_size, width, styles),
@@ -9468,7 +9468,7 @@ fn used_line_height(style: &Style, font_size: f32) -> f32 {
             * 64.0)
             .round(),
     };
-    (units / 64.0 / scale).max(1.0)
+    (units / 64.0 / scale).max(0.0)
 }
 
 // chromium's inner editor drops a single-line field's line-height for normal when the font is
