@@ -66,6 +66,8 @@ pub(super) struct CanvasContextData {
     bitmap: Bitmap,
     // the bitmap as paint reads it, rebuilt after the next change
     snapshot: Option<std::sync::Arc<Image>>,
+    // pixels of another origin were drawn in without cors, so script may not read any back
+    tainted: bool,
 }
 
 fn mul255(a: u32, b: u32) -> u32 {
@@ -558,6 +560,7 @@ impl ScriptRuntime {
                     smoothing_quality: Smoothing::Low,
                     bitmap: Bitmap::new(width, height),
                     snapshot: None,
+                    tainted: false,
                 }))
             })
             .clone()
@@ -573,6 +576,7 @@ impl ScriptRuntime {
         context.bitmap = Bitmap::new(width, height);
         context.fill_style = Color::BLACK;
         context.snapshot = None;
+        context.tainted = false;
     }
 
     // a layer for each connected canvas with a bitmap, for paint to place like an img
@@ -661,6 +665,18 @@ impl ScriptRuntime {
             }
             _ => 92,
         };
+        if self
+            .canvas_contexts
+            .get(&node)
+            .is_some_and(|context| context.borrow().tainted)
+        {
+            return Err(self.throw_value(dom_exception(
+                "SecurityError",
+                &format!(
+                    "Failed to execute '{name}' on 'HTMLCanvasElement': Tainted canvases may not be exported."
+                ),
+            )));
+        }
         let encoded = match self.canvas_contexts.get(&node) {
             Some(context) => context.borrow().bitmap.encode(mime, quality),
             None => {
@@ -859,6 +875,10 @@ impl ScriptRuntime {
             )));
         }
         let source = self.canvas_source(&arguments[0])?;
+        let taints = match &arguments[0] {
+            Value::Element(handle) => self.taints_canvas(handle.id),
+            _ => false,
+        };
         let Some(numbers) = self.canvas_numbers("drawImage", &arguments[1..], count - 1)? else {
             return Ok(());
         };
@@ -881,7 +901,44 @@ impl ScriptRuntime {
         let sampling = context.sampling(normalized(from), normalized(to));
         context.bitmap.draw_image(&source, from, to, sampling);
         context.snapshot = None;
+        context.tainted |= taints;
         Ok(())
+    }
+
+    // whether drawing the element leaves a canvas unreadable: a tainted canvas does, and so
+    // does an image or a video of another origin that was not asked for with cors, which
+    // only the app's own files answer
+    fn taints_canvas(&self, node: NodeId) -> bool {
+        if let Some(context) = self.canvas_contexts.get(&node) {
+            return context.borrow().tainted;
+        }
+        let document = self.document.borrow();
+        let source = document.attribute(node, "src").or_else(|| {
+            document
+                .element_children(node)
+                .find(|&child| is_html(&document, child, "source"))
+                .and_then(|child| document.attribute(child, "src"))
+        });
+        let Some(source) = source.map(str::trim) else {
+            return false;
+        };
+        let scheme = |name: &str| {
+            source
+                .get(..name.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(name))
+        };
+        if scheme("data:") || scheme("blob:") {
+            return false;
+        }
+        let location = self.location.borrow();
+        let base = crate::weburl::Url::parse(&location.to_string(), None);
+        let Some(url) = crate::weburl::Url::parse(source, base.as_ref()) else {
+            return false;
+        };
+        let origin = url.origin();
+        origin != location.origin()
+            && !(document.attribute(node, "crossorigin").is_some()
+                && origin == crate::navigation::FILES_ORIGIN)
     }
 
     // the WebIDL long conversion getImageData and putImageData take their coordinates through
@@ -909,6 +966,12 @@ impl ScriptRuntime {
         context: &CanvasContextHandle,
         arguments: &[Value],
     ) -> Result<Value, ScriptError> {
+        if context.borrow().tainted {
+            return Err(self.throw_value(dom_exception(
+                "SecurityError",
+                "Failed to execute 'getImageData' on 'CanvasRenderingContext2D': The canvas has been tainted by cross-origin data.",
+            )));
+        }
         let values = self.canvas_longs("getImageData", arguments, 4)?;
         let (mut x, mut y, mut width, mut height) = (values[0], values[1], values[2], values[3]);
         for (extent, name) in [(width, "width"), (height, "height")] {
@@ -1068,6 +1131,60 @@ fn image_data_object(width: u32, height: u32, data: Vec<u8>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_of_another_origin_taints_a_canvas_unless_asked_for_with_cors() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body>
+            <img id="own" src="/a.png"><img id="data" src="data:image/png;base64,AAAA">
+            <img id="files" src="https://files.ceri.invalid/a.png">
+            <img id="cors" crossorigin="anonymous" src="https://files.ceri.invalid/a.png">
+            <video id="video"><source src="https://files.ceri.invalid/v.mp4"></video>
+            <video id="asked" crossorigin><source src="https://files.ceri.invalid/v.mp4"></video>
+            <canvas id="from" width="2" height="2"></canvas><canvas id="to" width="2" height="2"></canvas>
+            <p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        let node = |id: &str| document.borrow().find_element_by_id(id).expect(id);
+        let taints = ["own", "data", "files", "cors", "video", "asked"]
+            .map(|id| runtime.taints_canvas(node(id)));
+        assert_eq!(taints, [false, false, true, false, true, false]);
+
+        // a tainted canvas taints the canvas it is drawn into, and neither gives pixels back
+        runtime.canvas_context(node("from")).borrow_mut().tainted = true;
+        runtime
+            .execute(
+                r#"
+                const from = document.getElementById("from");
+                const to = document.getElementById("to");
+                const log = [];
+                const attempt = (name, read) => {
+                    try {
+                        read();
+                        log.push(name + ":read");
+                    } catch (error) {
+                        log.push(name + ":" + error.name);
+                    }
+                };
+                attempt("before", () => to.getContext("2d").getImageData(0, 0, 1, 1));
+                to.getContext("2d").drawImage(from, 0, 0);
+                attempt("pixels", () => to.getContext("2d").getImageData(0, 0, 1, 1));
+                attempt("url", () => to.toDataURL());
+                attempt("blob", () => to.toBlob(() => {}));
+                to.width = 2;
+                attempt("reset", () => to.getContext("2d").getImageData(0, 0, 1, 1));
+                document.getElementById("status").textContent = log.join(" ");
+                "#,
+            )
+            .expect("script should run");
+        let document = document.borrow();
+        assert_eq!(
+            document.text_content(node("status")),
+            "before:read pixels:SecurityError url:SecurityError blob:SecurityError reset:read"
+        );
+    }
 
     #[test]
     fn rectangles_cover_pixels_by_area_and_compose_source_over() {
