@@ -3705,7 +3705,8 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
         canvas.push_mask(mask);
     }
     let opaque = canvas.opaque;
-    canvas.opaque &= !scrolls_in_own_layer(canvas, layout_box);
+    canvas.opaque &=
+        !scrolls_in_own_layer(canvas, layout_box) && !floats_in_own_layer(canvas, layout_box);
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
@@ -3752,6 +3753,18 @@ fn scrolls_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
         && !layout_box.is_document()
         && layout_box.background.alpha < 255
         && (x > 0.0 || y > 0.0)
+}
+
+// chromium gives a fixed box, a modal dialog among them, a layer of its own on a dense display,
+// and text in a layer that is not opaque all over is drawn in grayscale
+fn floats_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
+    canvas.scale >= 1.5
+        && (layout_box.position == Position::Fixed || layout_box.z_index == i32::MAX)
+        && (layout_box.background.alpha < 255
+            || layout_box
+                .radii
+                .iter()
+                .any(|(across, down)| *across > 0.0 && *down > 0.0))
 }
 
 fn paint_context_entry(
