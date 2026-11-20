@@ -5982,6 +5982,37 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     };
     let edge_x = spacing_x.max(0.0);
     let edge_y = spacing_y.max(0.0);
+    // the room between each row and the next: collapsed rows overlap by the narrower of the
+    // borders that meet there, the widest under the one and the widest over the other
+    let row_gaps = (1..row_count)
+        .map(|below| {
+            if !style.border_collapse {
+                return spacing_y;
+            }
+            let widest = |ends: bool| {
+                cells
+                    .iter()
+                    .filter(|cell| {
+                        if ends {
+                            cell.row + cell.rows == below
+                        } else {
+                            cell.row == below
+                        }
+                    })
+                    .map(|cell| {
+                        let border = used_border(&cell.style);
+                        if ends { border.bottom } else { border.top }
+                    })
+                    .fold(0.0_f32, f32::max)
+            };
+            -widest(true).min(widest(false))
+        })
+        .collect::<Vec<_>>();
+    let gaps = |rows: std::ops::Range<usize>| {
+        row_gaps[rows.start.min(row_gaps.len())..(rows.end.max(1) - 1).min(row_gaps.len())]
+            .iter()
+            .sum::<f32>()
+    };
 
     // column widths from the cells' minimum and maximum content widths
     let intrinsic = |cell: &TableCellSlot<'_>, minimum: bool| {
@@ -6197,15 +6228,12 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             .as_ref()
             .map_or(0.0, |layout| layout.rect.height);
         let range = cell.row..cell.row + cell.rows;
-        let have =
-            row_heights[range.clone()].iter().sum::<f32>() + spacing_y * (cell.rows - 1) as f32;
+        let have = row_heights[range.clone()].iter().sum::<f32>() + gaps(range.clone());
         if height > have {
             row_heights[range.end - 1] += height - have;
         }
     }
-    let rows_total = row_heights.iter().sum::<f32>()
-        + edge_y * 2.0
-        + spacing_y * row_count.saturating_sub(1) as f32;
+    let rows_total = row_heights.iter().sum::<f32>() + edge_y * 2.0 + gaps(0..row_count);
     // a taller specified table height grows its rows evenly
     if let Some(height) = content_height
         && height > rows_total
@@ -6250,12 +6278,12 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let grid_top = cursor_y;
     let mut row_y = Vec::with_capacity(row_count);
     let mut y = grid_top + edge_y;
-    for height in &row_heights {
+    for (row, height) in row_heights.iter().enumerate() {
         row_y.push(y);
-        y += height + spacing_y;
+        y += height + row_gaps.get(row).copied().unwrap_or(0.0);
     }
     let grid_height = if row_count > 0 {
-        y - spacing_y + edge_y - grid_top
+        y + edge_y - grid_top
     } else {
         0.0
     };
@@ -6269,7 +6297,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let height = row_heights[cell.row..cell.row + cell.rows]
             .iter()
             .sum::<f32>()
-            + spacing_y * (cell.rows - 1) as f32;
+            + gaps(cell.row..cell.row + cell.rows);
         // the free space is measured from the content, which an explicit cell height leaves
         // at the top of a taller box
         let content_top = laid_out.rect.y + laid_out.border.widths.top + {
@@ -11969,6 +11997,25 @@ mod tests {
         assert_eq!(pitch("border-bottom: 2px solid;"), 22.0);
         // rules all round share the one between two rows
         assert_eq!(pitch("border: 2px solid;"), 22.0);
+        // a rule over the last row alone leaves the rows above it as they were
+        let markup = "<style>* { margin: 0; padding: 0; } table { border-collapse: collapse; } td { height: 20px; border-bottom: 2px solid; } #last td { border-top: 2px solid; }</style><table><tr><td>a</td></tr><tr id='second'><td>b</td></tr><tr id='last'><td>c</td></tr></table>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let top = |id: &str| {
+            index[&document.find_element_by_id(id).expect("row")][0]
+                .rect
+                .y
+        };
+        assert_eq!([top("second"), top("last")], [22.0, 42.0]);
     }
 
     #[test]
