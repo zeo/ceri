@@ -2496,11 +2496,11 @@ impl Compiler {
         // with parameter expressions the body's vars live in a variable
         // environment of their own over the parameters, so closures made in the
         // parameter list never see them, as the function instantiation steps give
-        let has_param_expressions = function.rest.is_some()
-            || function
-                .params
-                .iter()
-                .any(|param| matches!(param, Pattern::Default { .. }));
+        let has_param_expressions = function
+            .params
+            .iter()
+            .chain(function.rest.as_ref())
+            .any(contains_expression);
         let simple_params = function.rest.is_none()
             && function
                 .params
@@ -3707,6 +3707,23 @@ fn default_constructor(name: &Name, derived: bool, source: (usize, usize)) -> Fu
         is_generator: false,
         strict: true,
         source,
+    }
+}
+
+// whether binding a pattern runs code: a default or a computed key, at any depth
+fn contains_expression(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Identifier(_) => false,
+        Pattern::Default { .. } | Pattern::Expression(_) => true,
+        Pattern::Object { properties, rest } => {
+            properties.iter().any(|(key, value)| {
+                matches!(key, PropertyKey::Computed(_)) || contains_expression(value)
+            }) || rest.as_deref().is_some_and(contains_expression)
+        }
+        Pattern::Array { elements, rest } => {
+            elements.iter().flatten().any(contains_expression)
+                || rest.as_deref().is_some_and(contains_expression)
+        }
     }
 }
 

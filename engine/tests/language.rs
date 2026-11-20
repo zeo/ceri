@@ -2091,6 +2091,27 @@ fn css_escapes_identifiers_and_answers_supports_like_cssom() {
 }
 
 #[test]
+fn parameter_expressions_are_found_inside_patterns() {
+    check(&[
+        (
+            "a default nested in an array pattern",
+            "var x = 'outer'; function f([g = () => x]) { var x = 'inner'; return g(); } console.log(f([]))",
+            "outer",
+        ),
+        (
+            "a computed key in an object pattern",
+            "var x = 'outer'; var probe; function f({ [(probe = () => x, 'k')]: v }) { var x = 'inner'; return probe(); } console.log(f({ k: 1 }))",
+            "outer",
+        ),
+        (
+            "a default nested in a rest pattern",
+            "var x = 'outer'; function f(...[g = () => x]) { var x = 'inner'; return g(); } console.log(f())",
+            "outer",
+        ),
+    ]);
+}
+
+#[test]
 fn sloppy_blocks_may_repeat_a_function_declaration() {
     check(&[
         (
