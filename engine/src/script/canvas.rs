@@ -40,6 +40,9 @@ const METHODS: &[&str] = &[
     "getLineDash",
     "createLinearGradient",
     "createRadialGradient",
+    "fillText",
+    "strokeText",
+    "measureText",
     "fillRect",
     "clearRect",
     "drawImage",
@@ -223,6 +226,13 @@ impl Composite {
     }
 }
 
+const DEFAULT_FONT: &str = "10px sans-serif";
+
+// the value of an enumerated attribute among those it takes, which a setter keeps
+fn keyword(value: &str, known: &[&'static str]) -> Option<&'static str> {
+    known.iter().copied().find(|name| *name == value)
+}
+
 // the drawing state save pushes and restore pops
 #[derive(Clone)]
 struct DrawState {
@@ -238,6 +248,11 @@ struct DrawState {
     dash_offset: f32,
     alpha: f32,
     composite: Composite,
+    // the font as script gave it, and its size in pixels, families and face
+    font: (Rc<str>, f32, crate::font::FontStack, crate::font::FontStyle),
+    text_align: &'static str,
+    text_baseline: &'static str,
+    direction: &'static str,
     // how much of each pixel of the bitmap drawing may reach, out of 255; none is all of it
     clip: Option<Rc<Vec<u8>>>,
 }
@@ -256,6 +271,18 @@ impl Default for DrawState {
             dash_offset: 0.0,
             alpha: 1.0,
             composite: Composite::SourceOver,
+            font: crate::css::canvas_font(DEFAULT_FONT).map_or(
+                (
+                    DEFAULT_FONT.into(),
+                    10.0,
+                    Default::default(),
+                    crate::font::FontStyle::NORMAL,
+                ),
+                |(size, stack, style)| (DEFAULT_FONT.into(), size, stack, style),
+            ),
+            text_align: "start",
+            text_baseline: "alphabetic",
+            direction: "ltr",
             clip: None,
         }
     }
@@ -644,6 +671,30 @@ impl CanvasContextData {
                 }
             }
             "lineDashOffset" if number.is_finite() => state.dash_offset = number,
+            "font" => {
+                if let Some((size, stack, style)) = crate::css::canvas_font(text) {
+                    state.font = (text.trim().into(), size, stack, style);
+                }
+            }
+            "textAlign" => {
+                let known = ["start", "end", "left", "right", "center"];
+                state.text_align = keyword(text, &known).unwrap_or(state.text_align);
+            }
+            "textBaseline" => {
+                let known = [
+                    "top",
+                    "hanging",
+                    "middle",
+                    "alphabetic",
+                    "ideographic",
+                    "bottom",
+                ];
+                state.text_baseline = keyword(text, &known).unwrap_or(state.text_baseline);
+            }
+            "direction" => {
+                let known = ["ltr", "rtl", "inherit"];
+                state.direction = keyword(text, &known).unwrap_or(state.direction);
+            }
             "globalCompositeOperation" => {
                 if let Some(&(_, composite)) =
                     Composite::NAMES.iter().find(|(name, _)| *name == text)
@@ -1273,6 +1324,10 @@ impl ScriptRuntime {
                 }
             }
             "lineDashOffset" => Value::Number(context.borrow().state.dash_offset.into()),
+            "font" => Value::String(context.borrow().state.font.0.to_string().into()),
+            "textAlign" => Value::String(context.borrow().state.text_align.into()),
+            "textBaseline" => Value::String(context.borrow().state.text_baseline.into()),
+            "direction" => Value::String(context.borrow().state.direction.into()),
             "globalCompositeOperation" => {
                 let composite = context.borrow().state.composite;
                 let name = Composite::NAMES
@@ -1305,6 +1360,141 @@ impl ScriptRuntime {
             }
             _ => Value::Undefined,
         })
+    }
+
+    // the fonts the page lays out with, or the built-in face where there is no page
+    fn canvas_fonts(&self) -> Rc<crate::font::FontSet> {
+        self.layout_inputs
+            .as_ref()
+            .map_or_else(crate::font::active_fonts, |inputs| {
+                inputs.borrow().fonts.clone()
+            })
+    }
+
+    // a line of text in the context's font: how wide it sets, and how far its face reaches
+    // above and below the baseline
+    fn canvas_text_metrics(&self, context: &CanvasContextHandle, text: &str) -> (f32, f32, f32) {
+        let (_, size, stack, style) = context.borrow().state.font.clone();
+        let fonts = self.canvas_fonts();
+        let _active = crate::font::use_fonts(fonts.clone(), 1.0);
+        let ascent = fonts.ascent(stack, size);
+        (
+            fonts.measure(text, stack, size, style),
+            ascent,
+            fonts.content_height(stack, size) - ascent,
+        )
+    }
+
+    // fillText and strokeText: the line set from the point as the alignment and the baseline
+    // say; upright text at one scale takes the glyphs text on the page takes, and any other
+    // transform, or a stroke, takes their outlines
+    fn draw_canvas_text(
+        &mut self,
+        context: &CanvasContextHandle,
+        text: &str,
+        (x, y): (f32, f32),
+        stroke: bool,
+    ) {
+        let (width, ascent, descent) = self.canvas_text_metrics(context, text);
+        let fonts = self.canvas_fonts();
+        let mut context = context.borrow_mut();
+        let state = context.state.clone();
+        let (_, size, stack, style) = state.font;
+        let x = x - match state.text_align {
+            "center" => width / 2.0,
+            "right" | "end" => width,
+            _ => 0.0,
+        };
+        let y = y + match state.text_baseline {
+            "top" => ascent,
+            "hanging" => ascent * 0.8,
+            "middle" => (ascent - descent) / 2.0,
+            "bottom" | "ideographic" => -descent,
+            _ => 0.0,
+        };
+        let [a, b, c, d, _, _] = state.transform;
+        let upright = b == 0.0 && c == 0.0 && a == d && a > 0.0 && !stroke;
+        let _active = crate::font::use_fonts(fonts.clone(), 1.0);
+        if upright && !fonts.is_builtin() {
+            let device_size = size * a;
+            let origin = context.place((x, y));
+            let shaped = fonts.shape(text, stack, device_size, style, true);
+            let (canvas_width, canvas_height) = context.size();
+            for glyph in &shaped.glyphs {
+                let Some(face) = &glyph.face else {
+                    continue;
+                };
+                let pen = ((origin.0 + glyph.x) * 4.0).round() / 4.0;
+                let Some(bitmap) = fonts.text_glyph(face, glyph.glyph, device_size, pen, 0.0)
+                else {
+                    continue;
+                };
+                // the part of the glyph's box that lands on the canvas
+                let (left, top) = (
+                    pen.floor() as i32 + bitmap.left,
+                    origin.1.round() as i32 + bitmap.top,
+                );
+                let columns = left.max(0)..(left + bitmap.width as i32).min(canvas_width as i32);
+                let rows = top.max(0)..(top + bitmap.height as i32).min(canvas_height as i32);
+                if columns.is_empty() || rows.is_empty() {
+                    continue;
+                }
+                let channels = if bitmap.subpixels { 3 } else { 1 };
+                let mut values = Vec::with_capacity(columns.len() * rows.len());
+                for row in rows.clone() {
+                    for column in columns.clone() {
+                        let at = ((row - top) as usize * bitmap.width + (column - left) as usize)
+                            * channels;
+                        let sum: u32 = bitmap.coverage[at..at + channels]
+                            .iter()
+                            .map(|&value| u32::from(value))
+                            .sum();
+                        values.push((sum / channels as u32) as u8);
+                    }
+                }
+                let coverage = Coverage {
+                    left: columns.start,
+                    top: rows.start,
+                    width: columns.len(),
+                    values,
+                };
+                context.paint(Some(coverage), &state.fill_style);
+            }
+            return;
+        }
+        // the outlines as a path in user space, each glyph where the line sets it
+        let shaped = fonts.shape(text, stack, size, style, true);
+        let mut path = Vec::new();
+        for glyph in &shaped.glyphs {
+            let Some(face) = &glyph.face else {
+                continue;
+            };
+            let mut last = None;
+            for (from, to) in crate::font::glyph_edges(&face.face, glyph.glyph, size) {
+                let at = |point: (f32, f32)| (x + glyph.x + point.0, y + point.1);
+                if last != Some(from) {
+                    path.push(Segment::Move(at(from)));
+                }
+                path.push(Segment::Line(at(to)));
+                last = Some(to);
+            }
+        }
+        let pen = stroke.then(|| Pen {
+            width: state.line_width,
+            cap: state.cap,
+            join: state.join,
+            miter_limit: state.miter_limit,
+            dash: &state.dash,
+            dash_offset: state.dash_offset,
+        });
+        let size = context.size();
+        let coverage = crate::svg::path_coverage(&path, state.transform, pen, false, size);
+        let paint = if stroke {
+            &state.stroke_style
+        } else {
+            &state.fill_style
+        };
+        context.paint(coverage, paint);
     }
 
     // a fill or stroke style given as a gradient the context made; anything else is a colour
@@ -1534,6 +1724,47 @@ impl ScriptRuntime {
                 let path = context.path.clone();
                 context.stroke_path(&path);
                 Ok(Value::Undefined)
+            }
+            "fillText" | "strokeText" => {
+                let text = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let rest = arguments.get(1..).unwrap_or_default();
+                if let Some(&[x, y]) = self.canvas_numbers(name, rest, 2)?.as_deref() {
+                    self.draw_canvas_text(context, &text, (x, y), name == "strokeText");
+                }
+                Ok(Value::Undefined)
+            }
+            "measureText" => {
+                let text = arguments
+                    .first()
+                    .map(Value::string_value)
+                    .unwrap_or_default();
+                let (width, ascent, descent) = self.canvas_text_metrics(context, &text);
+                let align = context.borrow().state.text_align;
+                let left = match align {
+                    "center" => width / 2.0,
+                    "right" | "end" => width,
+                    _ => 0.0,
+                };
+                Ok(plain_object(
+                    [
+                        ("width", width),
+                        ("actualBoundingBoxLeft", left),
+                        ("actualBoundingBoxRight", width - left),
+                        ("actualBoundingBoxAscent", ascent),
+                        ("actualBoundingBoxDescent", descent),
+                        ("fontBoundingBoxAscent", ascent),
+                        ("fontBoundingBoxDescent", descent),
+                        ("emHeightAscent", ascent),
+                        ("emHeightDescent", descent),
+                        ("hangingBaseline", ascent * 0.8),
+                        ("alphabeticBaseline", 0.0),
+                        ("ideographicBaseline", -descent),
+                    ]
+                    .map(|(key, value)| (key.to_string(), Value::Number(value.into()))),
+                ))
             }
             "clip" => {
                 let even_odd = arguments
@@ -2094,6 +2325,47 @@ mod tests {
         assert_eq!(
             document.text_content(status),
             "6,6,6,255 249,249,249,255 object true 4/4 4/4 255,0,0,255 0,0,0,0 255,0,0,255 0,255,0,255 0,0,0,0 true 64,64,64,255 multiply 237,237,237,255 12,12,12,255 IndexSizeError"
+        );
+    }
+
+    #[test]
+    fn text_settings_keep_what_they_understand_and_measure_in_the_font() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="20" height="20"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const c = document.getElementById("c").getContext("2d");
+                const seen = [c.font, c.textAlign, c.textBaseline, c.direction];
+                const narrow = c.measureText("abcd").width;
+                c.font = "bold 20px Arial";
+                c.font = "nonsense";
+                c.textAlign = "middle";
+                c.textBaseline = "middle";
+                seen.push(c.font, c.textAlign, c.textBaseline);
+                const wide = c.measureText("abcd");
+                seen.push(wide.width === narrow * 2, wide.width > 0, c.measureText("").width);
+                seen.push(typeof wide.actualBoundingBoxAscent, wide.fontBoundingBoxAscent > 0);
+                c.save();
+                c.font = "8px serif";
+                c.restore();
+                seen.push(c.font);
+                c.fillText("abcd", 2, 10);
+                c.strokeText("abcd", 2, 10);
+                c.fillText("abcd", NaN, 10);
+                document.getElementById("status").textContent = seen.join("|");
+                "##,
+            )
+            .expect("canvas text should run");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.text_content(status),
+            "10px sans-serif|start|alphabetic|ltr|bold 20px Arial|start|middle|true|true|0|number|true|bold 20px Arial"
         );
     }
 

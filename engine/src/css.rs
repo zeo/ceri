@@ -5760,17 +5760,44 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
     }
 }
 
-fn apply_font_shorthand(style: &mut Style, value: &str) {
+// a font shorthand as a canvas takes it: the size in pixels, the families and the face asked
+// for, or none when the value names no size and family
+pub(crate) fn canvas_font(
+    value: &str,
+) -> Option<(f32, crate::font::FontStack, crate::font::FontStyle)> {
+    let mut style = Style::default_for(
+        "",
+        16.0,
+        Color::BLACK,
+        FontWeight::NORMAL,
+        Default::default(),
+    );
+    if !apply_font_shorthand(&mut style, value) {
+        return None;
+    }
+    let size = style
+        .font_size
+        .resolve(16.0, 16.0)
+        .filter(|size| *size >= 0.0)?;
+    Some((
+        size,
+        style.font_family,
+        crate::layout::font_style(&style, size),
+    ))
+}
+
+// whether the value was a font shorthand, with at least a size and a family
+fn apply_font_shorthand(style: &mut Style, value: &str) -> bool {
     let words = split_words(value);
     let Some(size_index) = words.iter().position(|word| {
         parse_length(word.split('/').next().unwrap_or(word)).is_some()
             && !word.chars().all(|character| character.is_ascii_digit())
     }) else {
-        return;
+        return false;
     };
     let families = words[size_index + 1..].join(" ");
     if families.trim().is_empty() {
-        return;
+        return false;
     }
     // the shorthand resets what it leaves out
     style.italic = false;
@@ -5800,6 +5827,7 @@ fn apply_font_shorthand(style: &mut Style, value: &str) {
         style.line_height_absolute = absolute;
     }
     style.font_family = crate::font::intern_font_stack(&families);
+    true
 }
 
 // the properties this engine applies, for @supports
@@ -6813,7 +6841,9 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.font_features.settings = settings;
             }
         }
-        "font" => apply_font_shorthand(style, value),
+        "font" => {
+            apply_font_shorthand(style, value);
+        }
         "flex-direction" => {
             if let Some(direction) = parse_flex_direction(value) {
                 style.flex_direction = direction;

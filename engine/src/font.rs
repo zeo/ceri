@@ -830,6 +830,19 @@ pub(crate) fn coverage_grid(
 
 pub(crate) type Segment = ((f32, f32), (f32, f32));
 
+// a glyph's outline as straight edges at a size, its origin on the baseline and rows
+// growing downwards, for drawing it under a transform a glyph bitmap cannot take
+pub(crate) fn glyph_edges(face: &FontFace, glyph: u16, size: f32) -> Vec<Segment> {
+    let mut edges = Vec::new();
+    if let Some(outline) = face.outline(glyph) {
+        let scale = size / face.units_per_em();
+        for contour in &outline.contours {
+            flatten_contour(contour, scale, 0.0, &mut edges);
+        }
+    }
+    edges
+}
+
 fn flatten_contour(
     contour: &[OutlinePoint],
     scale: f32,

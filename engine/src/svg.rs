@@ -1295,7 +1295,7 @@ fn disc_steps(device_radius: f32) -> usize {
     .clamp(8.0, 128.0) as usize
 }
 
-fn edge_coverage(
+pub(crate) fn edge_coverage(
     edges: &[crate::font::Segment],
     even_odd: bool,
     size: (u32, u32),

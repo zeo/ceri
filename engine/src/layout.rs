@@ -9510,7 +9510,7 @@ fn half_leading(line_height: f32, stack: FontStack, font_size: f32) -> f32 {
 }
 
 // the weight, slant, axis settings, optical size and features a style asks its font for
-fn font_style(style: &Style, font_size: f32) -> FontStyle {
+pub(crate) fn font_style(style: &Style, font_size: f32) -> FontStyle {
     FontStyle {
         weight: style.font_weight.0,
         italic: style.italic,
