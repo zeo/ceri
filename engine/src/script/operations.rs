@@ -591,6 +591,9 @@ impl ScriptRuntime {
             Value::Bool(value) => Ok(value.to_string()),
             Value::Symbol(_) => Err(self.type_error("Cannot convert a Symbol value to a string")),
             Value::BigInt(value) => Ok(value.to_string_radix(10)),
+            Value::ClassList(handle) => {
+                Ok(self.element_attribute(&handle, "class").unwrap_or_default())
+            }
             other => {
                 let primitive = self.coerce_primitive(other, Hint::String)?;
                 self.coerce_string(primitive)
@@ -2012,6 +2015,10 @@ impl ScriptRuntime {
                 Ok(VmIterator::Object { iterator, next })
             }
             Value::Undefined | Value::Null => Err(self.not_iterable(callsite, &value)),
+            Value::ClassList(handle) => Ok(VmIterator::List {
+                values: self.class_tokens(handle),
+                index: 0,
+            }),
             other => match host_iterable_values(other) {
                 Some(values) => Ok(VmIterator::List { values, index: 0 }),
                 None => Err(self.not_iterable(callsite, other)),

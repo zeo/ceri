@@ -392,6 +392,13 @@ enum Builtin {
     ElementClassListRemove(ElementHandle),
     ElementClassListContains(ElementHandle),
     ElementClassListToggle(ElementHandle),
+    ElementClassListItem(ElementHandle),
+    ElementClassListReplace(ElementHandle),
+    ElementClassListSupports,
+    ElementClassListToString(ElementHandle),
+    ElementClassListForEach(ElementHandle),
+    // an iterator over the tokens: their indexes, the tokens, or pairs of both
+    ElementClassListWalk(ElementHandle, &'static str),
     StyleGetPropertyValue(ElementHandle),
     StyleSetProperty(ElementHandle),
     StyleRemoveProperty(ElementHandle),
@@ -4067,9 +4074,31 @@ impl ScriptRuntime {
                 "remove" => Ok(Value::Builtin(Builtin::ElementClassListRemove(handle))),
                 "contains" => Ok(Value::Builtin(Builtin::ElementClassListContains(handle))),
                 "toggle" => Ok(Value::Builtin(Builtin::ElementClassListToggle(handle))),
-                _ => Err(runtime_error(format!(
-                    "classList has no property {property}"
+                "item" => Ok(Value::Builtin(Builtin::ElementClassListItem(handle))),
+                "replace" => Ok(Value::Builtin(Builtin::ElementClassListReplace(handle))),
+                "supports" => Ok(Value::Builtin(Builtin::ElementClassListSupports)),
+                "toString" => Ok(Value::Builtin(Builtin::ElementClassListToString(handle))),
+                "length" => Ok(Value::Number(self.class_tokens(&handle).len() as f64)),
+                "value" => Ok(Value::String(
+                    self.element_attribute(&handle, "class")
+                        .unwrap_or_default()
+                        .into(),
+                )),
+                "forEach" => Ok(Value::Builtin(Builtin::ElementClassListForEach(handle))),
+                "keys" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
+                    handle, "keys",
                 ))),
+                "entries" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
+                    handle, "entries",
+                ))),
+                "values" | "@@iterator" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
+                    handle, "values",
+                ))),
+                _ => Ok(property
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| self.class_tokens(&handle).into_iter().nth(index))
+                    .unwrap_or(Value::Undefined)),
             },
             Value::Location(url) => {
                 let url = url.borrow();
@@ -4689,6 +4718,9 @@ impl ScriptRuntime {
             },
             Value::Dataset(handle) => {
                 self.set_element_attribute(&handle, &dataset_attribute_name(property), value_string)
+            }
+            Value::ClassList(handle) if property == "value" => {
+                self.set_element_attribute(&handle, "class", value_string)
             }
             Value::Style(handle) if property == "cssText" => {
                 if value_string.trim().is_empty() {
@@ -8958,6 +8990,77 @@ impl ScriptRuntime {
                 let force = arguments.get(1).map(Value::truthy);
                 Ok(Value::Bool(self.toggle_class(&handle, &class, force)?))
             }
+            Builtin::ElementClassListItem(handle) => {
+                let index = arguments.first().map_or(Ok(0.0), Value::number)?;
+                Ok((index >= 0.0)
+                    .then(|| self.class_tokens(&handle).into_iter().nth(index as usize))
+                    .flatten()
+                    .unwrap_or(Value::Null))
+            }
+            // the new token takes the place of the old one, or goes if it is there already
+            Builtin::ElementClassListReplace(handle) => {
+                let old = first_class_name(&arguments)?;
+                let new = class_name(arguments.get(1).unwrap_or(&Value::Undefined))?;
+                let tokens = self.class_tokens(&handle);
+                let found = tokens
+                    .iter()
+                    .any(|token| token.string_value() == old);
+                if found {
+                    let mut names: Vec<String> = Vec::new();
+                    for token in tokens {
+                        let name = token.string_value();
+                        let name = if name == old { new.clone() } else { name };
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                    self.set_element_attribute(&handle, "class", names.join(" "));
+                }
+                Ok(Value::Bool(found))
+            }
+            Builtin::ElementClassListForEach(handle) => {
+                let callback = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if !is_callable(&callback) {
+                    return Err(self.type_error(
+                        "Failed to execute 'forEach' on 'DOMTokenList': parameter 1 is not of type 'Function'.",
+                    ));
+                }
+                let this = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                for (index, token) in self.class_tokens(&handle).into_iter().enumerate() {
+                    self.call_function(
+                        callback.clone(),
+                        this.clone(),
+                        vec![
+                            token,
+                            Value::Number(index as f64),
+                            Value::ClassList(handle.clone()),
+                        ],
+                    )?;
+                }
+                Ok(Value::Undefined)
+            }
+            Builtin::ElementClassListWalk(handle, kind) => Ok(iterator_value(
+                self.class_tokens(&handle)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, token)| match kind {
+                        "keys" => Value::Number(index as f64),
+                        "values" => token,
+                        _ => Value::Array(Rc::new(RefCell::new(vec![
+                            Value::Number(index as f64),
+                            token,
+                        ]))),
+                    })
+                    .collect(),
+            )),
+            Builtin::ElementClassListSupports => Err(self.type_error(
+                "Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens.",
+            )),
+            Builtin::ElementClassListToString(handle) => Ok(Value::String(
+                self.element_attribute(&handle, "class")
+                    .unwrap_or_default()
+                    .into(),
+            )),
             Builtin::StyleGetPropertyValue(handle) => {
                 let name = arguments
                     .first()
@@ -9729,6 +9832,21 @@ impl ScriptRuntime {
             .filter(|(_, task)| task.due <= until && self.runs(task))
             .min_by_key(|(_, task)| (task.due, task.id))
             .map(|(index, _)| index)
+    }
+
+    // the element's class names in order, each once, as its token list holds them
+    fn class_tokens(&self, handle: &ElementHandle) -> Vec<Value> {
+        let class = self.element_attribute(handle, "class").unwrap_or_default();
+        let mut names: Vec<&str> = Vec::new();
+        for name in class.split_ascii_whitespace() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| Value::String(name.into()))
+            .collect()
     }
 
     fn has_class(&self, handle: &ElementHandle, class: &str) -> Result<bool, ScriptError> {
@@ -19906,6 +20024,46 @@ mod tests {
             document.borrow().element_text_content(status).as_deref(),
             Some(
                 "left: 40%; width: 0.5%|40%|0.5%|2px !important|left: 40%; --tint: red; top: 2px !important|null"
+            )
+        );
+    }
+
+    #[test]
+    fn a_class_list_reads_as_the_ordered_set_of_its_tokens() {
+        let document = document("<p id='status' class='a b  c b'>idle</p>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const status = document.getElementById("status");
+                const list = status.classList;
+                const seen = [list.length, list.value, list.item(1), list.item(9), list[0], list[9]];
+                seen.push([...list].join());
+                const walked = [];
+                list.forEach((name, index) => walked.push(index + name));
+                for (const name of list) walked.push(name);
+                seen.push(walked.join(""), [...list.entries()].join("|"));
+                seen.push(list.replace("b", "z"), list.replace("missing", "y"), status.className);
+                seen.push(list.replace("a", "c"), String(list), `${list}`, list.toString());
+                list.value = "one two";
+                seen.push(list.length, list.contains("two"), list.missing);
+                try {
+                    list.supports("x");
+                } catch (error) {
+                    seen.push(error.name);
+                }
+                status.textContent = seen.join(" ");
+                "##,
+            )
+            .expect("classList reads should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "3 a b  c b b  a  a,b,c 0a1b2cabc 0,a|1,b|2,c true false a z c true c z c z c z 2 true  TypeError"
             )
         );
     }
