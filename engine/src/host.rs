@@ -438,7 +438,11 @@ fn run_live_engine_worker(
             .next_wake()
             .map(|delay| Duration::from_millis(delay.max(1)));
         let wait = wake.into_iter().chain(slot).min();
-        hold_fine_timer(&mut fine_timer, wait.is_some_and(|wait| wait < frame * 2));
+        let animating = wait.is_some_and(|wait| wait < frame * 2);
+        hold_fine_timer(&mut fine_timer, animating);
+        if !animating {
+            host.browser.release_spare_frame();
+        }
         let command = match held.take().or_else(|| queued.borrow_mut().pop_front()) {
             Some(command) => Some(command),
             None => match wait {

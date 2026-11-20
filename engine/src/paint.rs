@@ -2580,6 +2580,29 @@ pub(crate) fn repaint(
     };
 }
 
+// brings a canvas that shows the frame before the one numbered `front` up to the frame after
+// it: the areas that changed from it to `front` paint again along with the areas changing now,
+// and the result is numbered as a change to `front`
+pub(crate) fn repaint_behind(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+    (behind, areas): (&[Rect], &[Rect]),
+    front: u64,
+) {
+    let mut region = Region::default();
+    for &area in behind.iter().chain(areas) {
+        region.add(area);
+    }
+    let shown = canvas.revision.id;
+    repaint_areas(canvas, document, canvases, &region.rects);
+    if let Some((base, _)) = &mut canvas.revision.changed
+        && *base == shown
+    {
+        *base = front;
+    }
+}
+
 // repaints each area and numbers the result as one change to what the canvas showed, so a
 // presenter holding that uploads the repainted boxes and nothing between them
 pub(crate) fn repaint_areas(

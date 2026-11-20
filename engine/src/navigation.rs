@@ -1035,6 +1035,11 @@ struct Painted {
     scale: f32,
     fonts: Rc<FontSet>,
     canvas: Arc<Canvas>,
+    // the frame before `canvas`, kept while whoever was handed `canvas` still holds it, and
+    // the areas that changed from it to `canvas`; the next frame is painted over it instead
+    // of over a copy of `canvas`
+    spare: Option<Arc<Canvas>>,
+    behind: Vec<crate::layout::Rect>,
     planes: bool,
     generation: u64,
 }
@@ -2898,6 +2903,14 @@ impl Browser {
         self.paint_scaled(viewport, 1.0)
     }
 
+    // drops the second frame kept while frames follow each other closely
+    pub(crate) fn release_spare_frame(&self) {
+        if let Some(painted) = self.painted.borrow_mut().as_mut() {
+            painted.spare = None;
+            painted.behind.clear();
+        }
+    }
+
     pub fn paint_scaled(
         &self,
         viewport: Size,
@@ -2960,24 +2973,51 @@ impl Browser {
             ),
             _ => crate::paint::Damage::Everything,
         };
-        let mut canvas = match (damage, painted.take()) {
-            (crate::paint::Damage::Nothing, Some(mut last)) => {
-                if let Some(plan) = scrolled {
+        let (mut canvas, mut spare, behind) = match (damage, painted.take()) {
+            (crate::paint::Damage::Nothing, Some(mut last)) => match scrolled {
+                Some(plan) => {
                     crate::paint::scroll(Arc::make_mut(&mut last.canvas), plan, &layout, &canvases);
+                    (last.canvas, None, Vec::new())
                 }
-                last.canvas
-            }
+                None => (last.canvas, last.spare, last.behind),
+            },
             (crate::paint::Damage::Areas(areas), Some(mut last)) => {
-                let canvas = Arc::make_mut(&mut last.canvas);
-                crate::paint::repaint_areas(canvas, &layout, &canvases, &areas);
-                last.canvas
+                let shown = last.canvas.revision().id;
+                let spare = last
+                    .spare
+                    .take()
+                    .filter(|spare| Arc::strong_count(spare) == 1);
+                if let Some(canvas) = Arc::get_mut(&mut last.canvas) {
+                    crate::paint::repaint_areas(canvas, &layout, &canvases, &areas);
+                    (last.canvas, None, Vec::new())
+                } else if let Some(mut spare) = spare {
+                    // the frame before the last is let go of by now, so it catches up and
+                    // the two swap
+                    crate::paint::repaint_behind(
+                        Arc::make_mut(&mut spare),
+                        &layout,
+                        &canvases,
+                        (&last.behind, &areas),
+                        shown,
+                    );
+                    (spare, Some(last.canvas), areas)
+                } else {
+                    let held = last.canvas.clone();
+                    let canvas = Arc::make_mut(&mut last.canvas);
+                    crate::paint::repaint_areas(canvas, &layout, &canvases, &areas);
+                    (last.canvas, Some(held), areas)
+                }
             }
-            _ => Arc::new(crate::paint::paint_with_canvases(
-                &layout,
-                &canvases,
-                device_pixel_ratio,
-                planes,
-            )),
+            _ => (
+                Arc::new(crate::paint::paint_with_canvases(
+                    &layout,
+                    &canvases,
+                    device_pixel_ratio,
+                    planes,
+                )),
+                None,
+                Vec::new(),
+            ),
         };
         let unread = |layer: &ImageLayer, canvas: &Canvas| {
             layer.image.pixels.len() < layer.image.width as usize * layer.image.height as usize
@@ -2999,6 +3039,7 @@ impl Browser {
                 device_pixel_ratio,
                 planes,
             ));
+            spare = None;
         }
         let shown = canvas
             .planes()
@@ -3020,6 +3061,8 @@ impl Browser {
             scale: device_pixel_ratio,
             fonts: self.fonts.clone(),
             canvas: canvas.clone(),
+            spare,
+            behind,
             planes,
             generation,
         });
@@ -7775,6 +7818,49 @@ mod tests {
             boxes.iter().collect::<Vec<_>>(),
             [[0, 0, 10, 10], [200, 150, 210, 160]]
         );
+    }
+
+    #[test]
+    fn a_frame_still_held_is_left_alone_and_the_one_before_it_is_painted_over() {
+        let viewport = Size {
+            width: 320.0,
+            height: 180.0,
+        };
+        let page = |left: &str| {
+            let mut browser = Browser::new(bundle(&format!(
+                r##"<style>body {{ margin: 0 }}
+                div {{ position: absolute; top: 0; width: 10px; height: 10px; background: red }}
+                </style><div id="box" style="left: {left}"></div>"##
+            )));
+            browser
+                .navigate("https://app.ceri.invalid/")
+                .expect("page should load");
+            browser
+        };
+        let browser = page("0");
+        let document = browser.document().unwrap();
+        let node = document.borrow().find_element_by_id("box").unwrap();
+        let move_to = |left: &str| {
+            document
+                .borrow_mut()
+                .set_style_property(node, "left", left.to_string());
+        };
+        let first = browser.paint(viewport).unwrap();
+        move_to("40px");
+        let second = browser.paint(viewport).unwrap();
+        let buffer = first.rgba_pixels().as_ptr();
+        drop(first);
+        move_to("80px");
+        let third = browser.paint(viewport).unwrap();
+        assert_eq!(third.rgba_pixels().as_ptr(), buffer);
+        assert_eq!(
+            third.revision().changed.map(|(base, _)| base),
+            Some(second.revision().id)
+        );
+        for (frame, left) in [(&second, "40px"), (&third, "80px")] {
+            let whole = page(left).paint(viewport).unwrap();
+            assert!(frame.rgba_pixels() == whole.rgba_pixels(), "at {left}");
+        }
     }
 
     #[test]
