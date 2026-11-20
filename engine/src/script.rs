@@ -165,6 +165,8 @@ enum Value {
     Error(ErrorHandle),
     Style(ElementHandle),
     ClassList(ElementHandle),
+    // an svg element's className, which reads and writes its class through baseVal
+    AnimatedClass(ElementHandle),
     Event(Rc<events::EventRecord>),
     Response(ResponseHandle),
     ResponseConstructor,
@@ -3939,6 +3941,7 @@ impl ScriptRuntime {
                     "textContent" => {
                         Value::String(self.document.borrow().text_content(node).into())
                     }
+                    "className" if self.is_svg(node) => Value::AnimatedClass(handle.clone()),
                     "className" => Value::String(
                         self.element_attribute(&handle, "class")
                             .unwrap_or_default()
@@ -4102,6 +4105,14 @@ impl ScriptRuntime {
                         .unwrap_or_default()
                         .into(),
                 ),
+            }),
+            Value::AnimatedClass(handle) => Ok(match property {
+                "baseVal" | "animVal" => Value::String(
+                    self.element_attribute(&handle, "class")
+                        .unwrap_or_default()
+                        .into(),
+                ),
+                _ => Value::Undefined,
             }),
             Value::ClassList(handle) => match property {
                 "add" => Ok(Value::Builtin(Builtin::ElementClassListAdd(handle))),
@@ -4720,6 +4731,8 @@ impl ScriptRuntime {
                     self.set_text_node_data(&handle, value_string)?
                 }
                 "textContent" => self.set_element_text_content(&handle, value_string)?,
+                // an svg element's className is read-only: its class is set through baseVal
+                "className" if self.is_svg(handle.id) => true,
                 "className" => self.set_element_attribute(&handle, "class", value_string),
                 "id" => self.set_element_attribute(&handle, "id", value_string),
                 "innerHTML" => self.set_element_inner_html(&handle, value_string)?,
@@ -4756,6 +4769,9 @@ impl ScriptRuntime {
                 self.set_element_attribute(&handle, &dataset_attribute_name(property), value_string)
             }
             Value::ClassList(handle) if property == "value" => {
+                self.set_element_attribute(&handle, "class", value_string)
+            }
+            Value::AnimatedClass(handle) if property == "baseVal" => {
                 self.set_element_attribute(&handle, "class", value_string)
             }
             Value::AbortSignal(signal) if property == "onabort" => {
@@ -9943,6 +9959,13 @@ impl ScriptRuntime {
             .map(|(index, _)| index)
     }
 
+    fn is_svg(&self, node: NodeId) -> bool {
+        self.document
+            .borrow()
+            .element(node)
+            .is_some_and(|element| element.namespace == crate::dom::Namespace::Svg)
+    }
+
     // the element's class names in order, each once, as its token list holds them
     fn class_tokens(&self, handle: &ElementHandle) -> Vec<Value> {
         let class = self.element_attribute(handle, "class").unwrap_or_default();
@@ -10874,6 +10897,7 @@ impl Value {
             Self::Error(error) => format!("{}: {}", error.name, error.message),
             Self::Style(_) => "[style]".to_string(),
             Self::ClassList(_) => "[classList]".to_string(),
+            Self::AnimatedClass(_) => "[object SVGAnimatedString]".to_string(),
             Self::Event(_) => "[event]".to_string(),
             Self::Request(_) => "[object Request]".to_string(),
             Self::Response(_) => "[response]".to_string(),
@@ -13861,6 +13885,7 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Dataset(_)
         | Value::Style(_)
         | Value::ClassList(_)
+        | Value::AnimatedClass(_)
         | Value::Event(_)
         | Value::Request(_)
         | Value::Response(_)
@@ -14397,7 +14422,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Response(left), Value::Response(right)) => Rc::ptr_eq(left, right),
         (Value::VmIterator(left), Value::VmIterator(right)) => Rc::ptr_eq(left, right),
         (Value::Dataset(left), Value::Dataset(right))
-        | (Value::ClassList(left), Value::ClassList(right)) => Rc::ptr_eq(left, right),
+        | (Value::ClassList(left), Value::ClassList(right))
+        | (Value::AnimatedClass(left), Value::AnimatedClass(right)) => Rc::ptr_eq(left, right),
         (Value::Event(left), Value::Event(right)) => Rc::ptr_eq(left, right),
         (Value::FormData(left), Value::FormData(right)) => Rc::ptr_eq(left, right),
         (Value::Blob(left), Value::Blob(right)) => Rc::ptr_eq(left, right),
@@ -20254,6 +20280,38 @@ mod tests {
             Some(
                 "left: 40%; width: 0.5%|40%|0.5%|2px !important|left: 40%; --tint: red; top: 2px !important|null"
             )
+        );
+    }
+
+    #[test]
+    fn an_svg_elements_class_name_is_an_object_that_holds_its_class() {
+        let document = document(
+            "<svg id='icon' class='a b'><path id='line' class='stroke'/></svg><p id='status' class='plain'>idle</p>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const icon = document.getElementById("icon");
+                const line = document.getElementById("line");
+                const status = document.getElementById("status");
+                const seen = [typeof icon.className, icon.className.baseVal, line.className.animVal];
+                seen.push(typeof status.className, String(icon.className));
+                icon.className = "ignored";
+                line.className.baseVal = "dashed wide";
+                seen.push(icon.getAttribute("class"), line.getAttribute("class"), line.classList.contains("wide"));
+                seen.push(icon.className === icon.className);
+                status.textContent = seen.join("|");
+                "##,
+            )
+            .expect("svg class names should read");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("object|a b|stroke|string|[object SVGAnimatedString]|a b|dashed wide|true|true")
         );
     }
 

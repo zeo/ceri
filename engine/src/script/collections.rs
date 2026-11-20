@@ -47,6 +47,7 @@ pub(super) fn key_id(value: &Value) -> KeyId {
         Value::Style(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 1),
         Value::Dataset(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 2),
         Value::ClassList(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 3),
+        Value::AnimatedClass(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 4),
         other => KeyId::Address(value_address(other)),
     }
 }
