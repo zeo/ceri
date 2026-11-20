@@ -21,6 +21,7 @@ struct Options {
     font: Option<PathBuf>,
     bold_font: Option<PathBuf>,
     frames: usize,
+    profile: bool,
 }
 
 fn main() -> Result<(), String> {
@@ -126,7 +127,7 @@ fn main() -> Result<(), String> {
         println!("advanced {milliseconds}ms: {} task(s)", executed.tasks_run);
     }
     let timed = if options.frames > 0 {
-        report_frame_times(&mut host, options.frames)?
+        report_frame_times(&mut host, options.frames, options.profile)?
     } else {
         None
     };
@@ -183,7 +184,9 @@ fn main() -> Result<(), String> {
 fn report_frame_times(
     host: &mut EngineHost,
     frames: usize,
+    profile: bool,
 ) -> Result<Option<ceri_engine::Frame>, String> {
+    ceri_engine::profile::enable(profile);
     let viewport = host.viewport();
     let mut samples = Vec::with_capacity(frames);
     // per frame: the tick's script, a layout of what it changed, then the paint, whose own
@@ -233,6 +236,10 @@ fn report_frame_times(
         median(layout),
         median(paint)
     );
+    if profile {
+        println!("{}", ceri_engine::profile::report(frames));
+        ceri_engine::profile::enable(false);
+    }
     // a layout of a document that has not changed shows what the layout cache costs
     let mut layout_samples = Vec::with_capacity(frames);
     for _ in 0..frames {
@@ -277,6 +284,7 @@ where
     let mut font = None;
     let mut bold_font = None;
     let mut frames = 0_usize;
+    let mut profile = false;
     let mut ticks = Vec::new();
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
@@ -306,9 +314,10 @@ where
             "--font" => font = Some(PathBuf::from(next_value(&mut args, "--font")?)),
             "--bold-font" => bold_font = Some(PathBuf::from(next_value(&mut args, "--bold-font")?)),
             "--tick" => ticks.push(parse_delay(next_value(&mut args, "--tick")?)?),
+            "--profile" => profile = true,
             "--help" | "-h" => {
                 println!(
-                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--frames N] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
+                    "usage: ceri-engine --input FILE [--asset-root DIR] [--url URL] [--output FILE] [--width PX] [--height PX] [--scale RATIO] [--font FILE] [--bold-font FILE] [--frames N] [--profile] [--click ID] [--click-at X,Y] [--move-at X,Y] [--text TEXT] [--key KEY] [--tick MS]"
                 );
                 std::process::exit(0);
             }
@@ -331,6 +340,7 @@ where
         font,
         bold_font,
         frames,
+        profile,
         viewport: Size {
             width: width as f32,
             height: height as f32,

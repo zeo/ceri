@@ -1759,6 +1759,7 @@ fn paint_shadow(
     opacity: f32,
     clip: Option<Rect>,
 ) {
+    let _profile = crate::profile::scope("paint: shadow");
     let (frame, mut base) = if shadow.inset {
         (padding_box, padding_box.outset(-shadow.spread))
     } else {
@@ -2140,6 +2141,7 @@ pub(crate) fn paint_with_canvases(
     scale: f32,
     planes: bool,
 ) -> Canvas {
+    let _profile = crate::profile::scope("paint: whole frame");
     let layers;
     let images = if canvases.is_empty() {
         &document.images
@@ -2225,6 +2227,7 @@ pub(crate) fn damage(
     after: (&LayoutDocument, &[ImageLayer]),
     planes: &[Plane],
 ) -> Damage {
+    let _profile = crate::profile::scope("paint: damage");
     let ((old, old_canvases), (new, new_canvases)) = (before, after);
     if old.viewport != new.viewport || old.prose_selections != new.prose_selections {
         return Damage::Everything;
@@ -2365,6 +2368,7 @@ pub(crate) fn repaint(
     canvases: &[ImageLayer],
     area: Rect,
 ) {
+    let _profile = crate::profile::scope("paint: repaint");
     const MARGIN: u32 = 2;
     let Some(kept) = DeviceBounds::of(canvas, area, None) else {
         return;
@@ -2867,6 +2871,7 @@ fn paint_document(
     images: &[ImageLayer],
     clip: Option<Rect>,
 ) {
+    let _profile = crate::profile::scope("paint: document");
     // the root background paints the whole canvas, as CSS backgrounds require; its images
     // stay with the root box
     if let Some(root) = canvas_background(&document.root) {
@@ -3502,6 +3507,7 @@ fn paint_svg(
     clip: Option<Rect>,
     opacity: f32,
 ) {
+    let _profile = crate::profile::scope("paint: svg");
     let (x, y, width, height) = scene.viewport;
     let viewport = Rect {
         x: rect.x + x,
@@ -4113,6 +4119,7 @@ struct ImageDraw<'a> {
 }
 
 fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
+    let _profile = crate::profile::scope("paint: image");
     let ImageDraw {
         image,
         placement,
@@ -4500,6 +4507,7 @@ fn background_placement(
 }
 
 fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
+    let _profile = crate::profile::scope("paint: text");
     if let Some(shadow) = run.decoration.shadow
         && shadow.color.alpha > 0
     {

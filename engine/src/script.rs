@@ -3615,6 +3615,7 @@ impl ScriptRuntime {
     // runs every task due by the new time in order, each at its own due time, with a
     // microtask checkpoint after each; an uncaught error is reported and the clock moves on
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, ScriptError> {
+        let _profile = crate::profile::scope("script: tick");
         let target = self.clock.saturating_add(milliseconds);
         let mut executed = 0;
         while let Some(index) = self.next_due_task(target) {

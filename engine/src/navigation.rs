@@ -2712,6 +2712,7 @@ impl Browser {
     }
 
     pub fn layout(&self, viewport: Size) -> Result<Rc<LayoutDocument>, NavigationError> {
+        let _profile = crate::profile::scope("frame: layout");
         let page = self.page.as_ref().ok_or(NavigationError::NoPage)?;
         let stylesheet = &self.stylesheet(page);
         let document = page.document.clone();
@@ -2914,6 +2915,7 @@ impl Browser {
         device_pixel_ratio: f32,
         planes: bool,
     ) -> Result<(Arc<Canvas>, Vec<crate::paint::PlaneFrame>), NavigationError> {
+        let _profile = crate::profile::scope("frame: paint");
         let layout = self.layout(viewport)?;
         let mut canvases = self
             .page

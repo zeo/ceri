@@ -35,6 +35,7 @@ mod paint;
 mod png;
 #[cfg(all(feature = "windowed", target_os = "windows"))]
 mod presenter;
+pub mod profile;
 mod range;
 mod script;
 mod selection;

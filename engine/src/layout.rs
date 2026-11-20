@@ -940,6 +940,7 @@ pub fn layout_with_state(
     viewport: Size,
     style_state: &StyleState,
 ) -> LayoutDocument {
+    let _profile = crate::profile::scope("layout");
     CONTAINERS.with(|containers| containers.borrow_mut().clear());
     TOP_LAYER.with(|layer| layer.borrow_mut().clone_from(&style_state.top_layer));
     let _viewport_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
@@ -4090,6 +4091,7 @@ fn resolve_flexible_lengths(items: &mut [&mut FlexItem<'_>], available: f32, gap
 }
 
 fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
+    let _profile = crate::profile::scope("layout: flex");
     let FlexLayoutInput {
         content_height,
         height_bounds,
@@ -4743,6 +4745,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
 }
 
 fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
+    let _profile = crate::profile::scope("layout: grid");
     let GridLayoutInput {
         content_height,
         height_bounds,
@@ -6228,6 +6231,7 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
 
 // an element's outer width at its widest (max-content) or its narrowest (min-content)
 fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
+    let _profile = crate::profile::scope("layout: intrinsic width");
     let MaxContentInput {
         node,
         stylesheet,
@@ -8900,6 +8904,7 @@ fn measure_text(
     font: FontStyle,
     letter_spacing: f32,
 ) -> f32 {
+    let _profile = crate::profile::scope("layout: measure text");
     let fonts = crate::font::active_fonts();
     if fonts.is_builtin() {
         return fonts.measure(text, stack, font_size, font)

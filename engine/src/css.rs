@@ -2354,6 +2354,7 @@ impl Stylesheet {
     }
 
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
+        let _profile = crate::profile::scope("style: custom properties");
         state.custom_properties.clear();
         let top = document
             .element_children(document.root())
@@ -2493,6 +2494,7 @@ impl Stylesheet {
     }
 
     fn compute_style(&self, context: StyleContext<'_>) -> Style {
+        let _profile = crate::profile::scope("style: compute");
         let StyleContext {
             document,
             node,
@@ -3058,6 +3060,7 @@ impl Stylesheet {
         pseudo: Option<PseudoElement>,
         state: &StyleState,
     ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
+        let _profile = crate::profile::scope("style: cascade");
         let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> = HashMap::new();
         // a generated box carries the id, classes and tag of the element that owns it
         let Some(element) = document.element(node) else {
