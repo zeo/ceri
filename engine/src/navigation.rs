@@ -8428,6 +8428,7 @@ mod tests {
             r##"<style>
                 #stage { position: relative; width: 200px; height: 100px; margin: 0; }
                 #overlay { position: absolute; left: 30px; top: 20px; width: 40px; height: 20px; margin: 0; }
+                #status { margin: 0; }
             </style>
             <div id="stage"><button id="overlay">run</button><p id="status">idle</p></div>
             <script>

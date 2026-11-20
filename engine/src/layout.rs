@@ -3152,6 +3152,23 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     });
     let content_width = (content_width - gutter).max(0.0);
     let border_box_width = content_width + horizontal_inner + gutter;
+    // a block child of a block lets the margins of its first and last children through an
+    // edge with no border or padding, where they collapse with its own
+    let in_block_flow = floats.is_some();
+    let leading = in_block_flow
+        .then(|| {
+            leading_margin(
+                node,
+                &style,
+                font_size,
+                content_width,
+                (stylesheet, style_state),
+            )
+        })
+        .flatten();
+    if let Some((_, inner)) = leading {
+        margin.top = collapse_margins(margin.top, inner);
+    }
     let rect = Rect {
         x: if mode == LayoutMode::Flow {
             containing_x + margin.left
@@ -3562,10 +3579,19 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                         .resolve(font_size, font_size)
                         .unwrap_or(font_size)
                         .max(1.0);
-                    let child_top =
-                        resolve_margins(child_style.margin, content_width, child_font_size).top;
+                    let child_top = flow_top_margin(
+                        child,
+                        &child_style,
+                        child_font_size,
+                        content_width,
+                        (stylesheet, style_state),
+                    );
                     let mut child_y = match pending_margin.take() {
                         Some(pending) => line.y + collapse_margins(pending, child_top) - child_top,
+                        // the margin that went through this box's top edge is its own now
+                        None if leading.is_some_and(|(first, _)| first == child.node) => {
+                            line.y - child_top
+                        }
                         None => line.y,
                     };
                     // clearance drops the border box below the floats it clears
@@ -3636,7 +3662,18 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     );
     children.append(&mut line.placed);
     if let Some(pending) = pending_margin.take() {
-        line.y += pending;
+        // the last child's margin goes through a bottom edge that nothing holds in place
+        if in_block_flow
+            && margins_pass_through(node, &style)
+            && border.bottom == 0.0
+            && padding.bottom == 0.0
+            && explicit_height.is_none()
+            && min_height == 0.0
+        {
+            margin.bottom = collapse_margins(margin.bottom, pending);
+        } else {
+            line.y += pending;
+        }
     }
     // a formatting context grows to hold its floats
     if owns_floats && let Some(bottom) = float_area.bottom() {
@@ -9126,6 +9163,90 @@ fn resolve_margins(edges: Edges, containing_width: f32, font_size: f32) -> Resol
 }
 
 // two adjoining vertical margins: the largest positive plus the most negative
+// whether a block is of a kind that lets its children's margins through its edges; its
+// border, padding and height decide the rest
+fn margins_pass_through(node: Subject<'_>, style: &Style) -> bool {
+    node.own().is_some()
+        && !establishes_formatting_context(style)
+        && !(style.display == Display::ListItem && style.list_inside)
+        && node.document.document_element() != Some(node.node)
+        && node.document.shadow_root(node.node).is_none()
+        && node.svg_root().is_none()
+        && !matches!(node.name(), "textarea" | "select" | "canvas" | "video")
+}
+
+// the first child whose top margin reaches a block's top edge, and that margin as it shows
+// there: collapsed with whatever reaches the child's own top edge in turn
+fn leading_margin(
+    node: Subject<'_>,
+    style: &Style,
+    font_size: f32,
+    width: f32,
+    styles: (&Stylesheet, &StyleState),
+) -> Option<(NodeId, f32)> {
+    let (stylesheet, style_state) = styles;
+    if !margins_pass_through(node, style)
+        || used_border(style).top != 0.0
+        || resolve_edges(style.padding, width, font_size).top != 0.0
+        || node.generated_content(stylesheet, style_state)[0].is_some()
+    {
+        return None;
+    }
+    let parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+        text: inherited_text(style),
+        opacity: 1.0,
+    };
+    for &child in node.document.children(node.node) {
+        match node.document.kind(child) {
+            Some(crate::dom::NodeKind::Text(text)) if text.trim().is_empty() => continue,
+            Some(crate::dom::NodeKind::Element(_)) => {}
+            Some(crate::dom::NodeKind::Text(_)) => return None,
+            _ => continue,
+        }
+        let child = Subject::new(node.document, child);
+        let child_style = stylesheet.style_for(child.style_context(parent, style_state));
+        if child_style.display == Display::None
+            || child_style.position.is_out_of_flow()
+            || child_style.float != Float::None
+        {
+            continue;
+        }
+        // text on a line of its own, or a child moved clear of floats, keeps the margins apart
+        if child_style.display.is_inline_level() || child_style.clear != Clear::None {
+            return None;
+        }
+        let child_font_size = child_style
+            .font_size
+            .resolve(font_size, font_size)
+            .unwrap_or(font_size)
+            .max(1.0);
+        return Some((
+            child.node,
+            flow_top_margin(child, &child_style, child_font_size, width, styles),
+        ));
+    }
+    None
+}
+
+// the top margin a block child shows to what lies above it: its own, collapsed with the
+// margins that reach its top edge from inside
+fn flow_top_margin(
+    node: Subject<'_>,
+    style: &Style,
+    font_size: f32,
+    width: f32,
+    styles: (&Stylesheet, &StyleState),
+) -> f32 {
+    let own = resolve_margins(style.margin, width, font_size).top;
+    match leading_margin(node, style, font_size, width, styles) {
+        Some((_, inner)) => collapse_margins(own, inner),
+        None => own,
+    }
+}
+
 fn collapse_margins(first: f32, second: f32) -> f32 {
     first.max(second).max(0.0) + first.min(second).min(0.0)
 }
@@ -9794,6 +9915,56 @@ mod tests {
         // with no min-height of its own the item keeps its content's height
         assert_eq!(height_of("height: 100%"), 300.0);
         assert_eq!(height_of(""), 300.0);
+    }
+
+    #[test]
+    fn margins_collapse_through_the_edges_of_a_block_that_nothing_holds_apart() {
+        let tops = |wrapper: &str| {
+            let document = Document::parse_markup(&format!(
+                r#"<body style="margin: 0"><div id="above" style="height: 10px; margin-bottom: 4px"></div><div id="wrapper" style="{wrapper}"><div id="inner"><h3 id="head" style="margin: 14px 0 6px; height: 10px"></h3></div></div><div id="below" style="height: 5px"></div></body>"#
+            ))
+            .expect("document should parse");
+            let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
+            let result = layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 200.0,
+                    height: 200.0,
+                },
+            );
+            fn find(layout: &LayoutBox, node: NodeId) -> Option<&LayoutBox> {
+                if layout.node == node {
+                    return Some(layout);
+                }
+                layout.children.iter().find_map(|child| find(child, node))
+            }
+            ["wrapper", "inner", "head", "below"].map(|id| {
+                let node = document.find_element_by_id(id).expect(id);
+                let found = find(&result.root, node).expect(id);
+                (found.rect.y, found.rect.height)
+            })
+        };
+        // the heading's margins go through both boxes around it and meet the ones outside
+        assert_eq!(
+            tops(""),
+            [(24.0, 10.0), (24.0, 10.0), (24.0, 10.0), (40.0, 5.0)]
+        );
+        // padding holds the top edge in place, and the bottom still lets the margin through
+        assert_eq!(
+            tops("padding-top: 1px"),
+            [(14.0, 25.0), (29.0, 10.0), (29.0, 10.0), (45.0, 5.0)]
+        );
+        // a box that starts its own formatting context keeps the margins inside
+        assert_eq!(
+            tops("overflow: hidden"),
+            [(14.0, 30.0), (28.0, 10.0), (28.0, 10.0), (44.0, 5.0)]
+        );
+        // a height of its own keeps the bottom margin inside
+        assert_eq!(
+            tops("height: 40px"),
+            [(24.0, 40.0), (24.0, 10.0), (24.0, 10.0), (64.0, 5.0)]
+        );
     }
 
     #[test]
