@@ -286,6 +286,22 @@ impl ScriptRuntime {
         state.transitions = extras.transitions.clone();
         state.animation_starts = extras.animation_starts.clone();
         state.image_sizes = extras.image_sizes.clone();
+        // a canvas and a video know their own sizes before the page has first laid out
+        let document = self.document.borrow();
+        for node in document
+            .find_elements_by_selector("canvas")
+            .unwrap_or_default()
+        {
+            let size = super::canvas_size(&document, node);
+            state.image_sizes.insert(node, size);
+        }
+        for node in document
+            .find_elements_by_selector("video")
+            .unwrap_or_default()
+        {
+            state.image_sizes.insert(node, self.video_size(node));
+        }
+        drop(document);
         // the last measurement knows container sizes the page's own layout may not yet
         state.container_sizes = self.measured.borrow().as_ref().map_or_else(
             || extras.container_sizes.clone(),

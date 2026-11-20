@@ -7093,6 +7093,30 @@ mod tests {
     }
 
     #[test]
+    fn a_canvas_measures_at_its_own_size_before_the_page_first_lays_out() {
+        let mut browser = Browser::new(bundle(
+            r#"<body style="margin: 0"><canvas id="c" width="300" height="120" style="display: block"></canvas><canvas id="wide" width="300" height="120" style="display: block; width: 100px"></canvas><p id="status"></p><script>
+                const size = (id) => {
+                    const canvas = document.getElementById(id);
+                    const box = canvas.getBoundingClientRect();
+                    return [box.width, box.height, canvas.clientWidth, canvas.clientHeight].join("x");
+                };
+                document.getElementById("status").textContent = size("c") + " " + size("wide");
+            </script></body>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.text_content(status),
+            "300x120x300x120 100x40x100x40"
+        );
+    }
+
+    #[test]
     fn a_control_takes_its_own_font_and_line_height_where_the_page_sets_others() {
         let mut browser = Browser::new(bundle(
             r#"<style>body { font: italic bold 20px/1.45 Georgia, serif }</style><button id="press">B</button><input id="field"><p id="status">idle</p><script>
