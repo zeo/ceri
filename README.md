@@ -171,3 +171,7 @@ Scrollbars behave like native scrollbars: the wheel scrolls from anywhere over t
 The window takes its caption from `document.title`, its icon from the packaged favicon (or the PNG or SVG an app passes to `App::icon`), and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document.
 
 Not covered yet: media playback, WebGL and other GPU APIs, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, multi-process renderer isolation with a sandbox, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT license](LICENSE-MIT), at your option.
