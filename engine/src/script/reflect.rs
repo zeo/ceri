@@ -499,6 +499,9 @@ impl ScriptRuntime {
                         );
                     }
                 };
+                if let Value::Array(array) = &first {
+                    return Ok(Value::Bool(self.set_array_prototype(array, prototype)));
+                }
                 let target = self.wrapper_object(&first).map(Value::Object);
                 let Value::Object(object) = target.as_ref().unwrap_or(&first) else {
                     return Ok(Value::Bool(false));

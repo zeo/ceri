@@ -116,7 +116,7 @@ impl JsonParser<'_> {
         self.skip_whitespace();
         if self.bytes.get(self.position) == Some(&b']') {
             self.position += 1;
-            return Ok(Value::Array(Rc::new(RefCell::new(values))));
+            return Ok(Value::Array(Rc::new(RefCell::new(values.into()))));
         }
         loop {
             self.skip_whitespace();
@@ -126,7 +126,7 @@ impl JsonParser<'_> {
                 Some(b',') => self.position += 1,
                 Some(b']') => {
                     self.position += 1;
-                    return Ok(Value::Array(Rc::new(RefCell::new(values))));
+                    return Ok(Value::Array(Rc::new(RefCell::new(values.into()))));
                 }
                 _ => return Err(self.unexpected()),
             }

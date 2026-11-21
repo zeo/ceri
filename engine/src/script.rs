@@ -125,9 +125,70 @@ type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
 type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
 type HeadersHandle = Rc<RefCell<HeadersData>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
-type ArrayHandle = Rc<RefCell<Vec<Value>>>;
+type ArrayHandle = Rc<RefCell<ArrayData>>;
+
+// an array's elements, with what makes it more than a list: the prototype a subclass or
+// setPrototypeOf gave it, and how far preventExtensions, seal or freeze have closed it
+#[derive(Clone, Default)]
+struct ArrayData {
+    values: Vec<Value>,
+    // none for Array.prototype, Some(None) for no prototype at all
+    prototype: Option<Option<object::ObjectHandle>>,
+    integrity: Integrity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Integrity {
+    #[default]
+    Open,
+    // no elements may be added
+    Closed,
+    // nor removed
+    Sealed,
+    // nor changed
+    Frozen,
+}
+
+impl From<Vec<Value>> for ArrayData {
+    fn from(values: Vec<Value>) -> Self {
+        ArrayData {
+            values,
+            prototype: None,
+            integrity: Integrity::Open,
+        }
+    }
+}
+
+impl FromIterator<Value> for ArrayData {
+    fn from_iter<T: IntoIterator<Item = Value>>(values: T) -> Self {
+        values.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl IntoIterator for ArrayData {
+    type Item = Value;
+    type IntoIter = std::vec::IntoIter<Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.into_iter()
+    }
+}
+
+impl std::ops::Deref for ArrayData {
+    type Target = Vec<Value>;
+
+    fn deref(&self) -> &Vec<Value> {
+        &self.values
+    }
+}
+
+impl std::ops::DerefMut for ArrayData {
+    fn deref_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.values
+    }
+}
 // named properties set on arrays, keyed by allocation while the array is alive
-type ArrayExpandos = HashMap<usize, (Weak<RefCell<Vec<Value>>>, Vec<(String, Value)>)>;
+type ArrayExpandos = HashMap<usize, (Weak<RefCell<ArrayData>>, Vec<(String, Value)>)>;
 type NodeListHandle = Rc<Vec<ElementHandle>>;
 type IteratorHandle = Rc<RefCell<IteratorData>>;
 type ErrorHandle = Rc<ErrorData>;
@@ -4266,9 +4327,9 @@ impl ScriptRuntime {
             Value::Navigator => match property {
                 "clipboard" => Ok(Value::Clipboard),
                 "language" => Ok(Value::String(self.locale.as_str().into())),
-                "languages" => Ok(Value::Array(Rc::new(RefCell::new(vec![Value::String(
-                    self.locale.as_str().into(),
-                )])))),
+                "languages" => Ok(Value::Array(Rc::new(RefCell::new(
+                    vec![Value::String(self.locale.as_str().into())].into(),
+                )))),
                 "userAgent" => Ok(Value::String(crate::devtools::user_agent().into())),
                 "appVersion" => Ok(Value::String(
                     crate::devtools::user_agent()
@@ -8430,7 +8491,7 @@ impl ScriptRuntime {
                         Value::Array(Rc::new(RefCell::new(vec![
                             Value::String(name.clone().into()),
                             form_data_entry_value(value),
-                        ])))
+                        ].into())))
                     })
                     .collect(),
             )),
@@ -8547,7 +8608,7 @@ impl ScriptRuntime {
                         Value::Array(Rc::new(RefCell::new(vec![
                             Value::Number(index as f64),
                             Value::Element(node.clone()),
-                        ])))
+                        ].into())))
                     })
                     .collect(),
             )),
@@ -8846,7 +8907,7 @@ impl ScriptRuntime {
                         Value::Array(Rc::new(RefCell::new(vec![
                             Value::String(name.clone().into()),
                             Value::String(value.clone().into()),
-                        ])))
+                        ].into())))
                     })
                     .collect(),
             )),
@@ -9551,7 +9612,7 @@ impl ScriptRuntime {
                         _ => Value::Array(Rc::new(RefCell::new(vec![
                             Value::Number(index as f64),
                             token,
-                        ]))),
+                        ].into()))),
                     })
                     .collect(),
             )),
@@ -10229,7 +10290,7 @@ impl ScriptRuntime {
             Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
         };
         Ok(Value::Promise(self.fulfilled_promise(Value::Array(
-            Rc::new(RefCell::new(requests)),
+            Rc::new(RefCell::new(requests.into())),
         ))))
     }
 
@@ -11197,7 +11258,7 @@ impl ScriptRuntime {
             });
         }
         Ok(self.indexed_db_request(
-            Value::Array(Rc::new(RefCell::new(values))),
+            Value::Array(Rc::new(RefCell::new(values.into()))),
             None,
             Some(transaction),
             None,
@@ -11685,7 +11746,8 @@ impl CloneValue {
                 values
                     .into_iter()
                     .map(Self::into_value)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
             ))),
             Self::Object(properties) => plain_object(
                 properties
@@ -12835,7 +12897,7 @@ fn indexed_db_store_names(value: Option<&Value>) -> Result<Vec<String>, ScriptEr
         value.ok_or_else(|| runtime_error("transaction object store names are required"))?;
     let values = match value.resolve() {
         Value::String(name) => vec![Value::String(name)],
-        Value::Array(values) => values.borrow().clone(),
+        Value::Array(values) => values.borrow().to_vec(),
         _ => {
             return Err(runtime_error(
                 "transaction object store names must be a string or array",
@@ -13310,7 +13372,28 @@ fn runtime_array_index(value: &Value) -> Result<usize, ScriptError> {
     Ok(number as usize)
 }
 
+// why a write to an array element is refused: a frozen array keeps every element, and one
+// closed to extension takes no new ones
+fn array_write_refusal(array: &ArrayHandle, index: usize) -> Option<String> {
+    let array = array.borrow();
+    let present = array
+        .get(index)
+        .is_some_and(|value| !matches!(value, Value::Uninitialized));
+    match array.integrity {
+        Integrity::Frozen => Some(format!(
+            "Cannot assign to read only property '{index}' of object '[object Array]'"
+        )),
+        Integrity::Sealed | Integrity::Closed if !present => Some(format!(
+            "Cannot add property {index}, object is not extensible"
+        )),
+        _ => None,
+    }
+}
+
 fn set_array_element(array: &ArrayHandle, index: usize, value: Value) -> Result<(), ScriptError> {
+    if let Some(refusal) = array_write_refusal(array, index) {
+        return Err(runtime_error(refusal));
+    }
     if index >= MAX_RUNTIME_ARRAY_LENGTH {
         return Err(runtime_error(
             "array index exceeds the deterministic length limit",
@@ -13325,6 +13408,24 @@ fn set_array_element(array: &ArrayHandle, index: usize, value: Value) -> Result<
 }
 
 fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError> {
+    let (length, integrity) = {
+        let array = array.borrow();
+        (array.len(), array.integrity)
+    };
+    // a frozen array keeps its length, and a sealed one cannot lose elements
+    let refused = match integrity {
+        Integrity::Frozen => value.number().ok() != Some(length as f64),
+        Integrity::Sealed => value
+            .number()
+            .ok()
+            .is_some_and(|wanted| wanted < length as f64),
+        _ => false,
+    };
+    if refused {
+        return Err(runtime_error(
+            "Cannot assign to read only property 'length' of object '[object Array]'",
+        ));
+    }
     let number = value.number()?;
     if !number.is_finite()
         || number < 0.0
@@ -13382,7 +13483,7 @@ fn uint8_value(value: &Value) -> Result<u8, ScriptError> {
 fn blob_parts_bytes(parts: Option<&Value>) -> Result<Vec<u8>, ScriptError> {
     let parts = match parts.map(Value::resolve) {
         None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(parts)) => parts.borrow().clone(),
+        Some(Value::Array(parts)) => parts.borrow().to_vec(),
         Some(_) => return Err(runtime_error("Blob parts must be an array")),
     };
     let mut bytes = Vec::new();
@@ -14288,7 +14389,7 @@ fn first_class_name(arguments: &[Value]) -> Result<String, ScriptError> {
 }
 
 // Array.prototype.join(",") without running script; a cycle prints as empty, as join does
-fn array_display(array: &ArrayHandle, visiting: &mut Vec<*const RefCell<Vec<Value>>>) -> String {
+fn array_display(array: &ArrayHandle, visiting: &mut Vec<*const RefCell<ArrayData>>) -> String {
     let pointer = Rc::as_ptr(array);
     if visiting.contains(&pointer) {
         return String::new();

@@ -1129,7 +1129,7 @@ impl ScriptRuntime {
                 let options = options.clone();
                 let values = match &first {
                     Value::Undefined => Vec::new(),
-                    Value::Array(list) => list.borrow().clone(),
+                    Value::Array(list) => list.borrow().to_vec(),
                     _ => {
                         return Err(
                             self.type_error("Iterable yielded a value which is not a string")
@@ -1164,7 +1164,7 @@ impl ScriptRuntime {
             M::GetCanonicalLocales | M::SupportedLocalesOf => {
                 let list = match &first {
                     Value::Undefined => Vec::new(),
-                    Value::Array(list) => list.borrow().clone(),
+                    Value::Array(list) => list.borrow().to_vec(),
                     other => vec![other.clone()],
                 };
                 let mut locales = Vec::new();

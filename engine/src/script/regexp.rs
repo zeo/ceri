@@ -231,7 +231,7 @@ impl ScriptRuntime {
                 None => Value::Undefined,
             })
             .collect();
-        let array = Rc::new(RefCell::new(values));
+        let array: ArrayHandle = Rc::new(RefCell::new(values.into()));
         let start = found.captures[0].map_or(0, |(start, _)| start);
         self.set_array_expando(&array, "index", Value::Number(start as f64));
         self.set_array_expando(&array, "input", Value::String(text.into()));
@@ -249,7 +249,7 @@ impl ScriptRuntime {
                     None => Value::Undefined,
                 })
                 .collect();
-            let indices = Rc::new(RefCell::new(pairs));
+            let indices: ArrayHandle = Rc::new(RefCell::new(pairs.into()));
             let named = if data.regex.names.is_empty() {
                 Value::Undefined
             } else {

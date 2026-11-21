@@ -1238,7 +1238,6 @@ test/built-ins/Object/defineProperties/15.2.3.7-6-a-190.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-191.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-192.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-193.js
-test/built-ins/Object/defineProperties/15.2.3.7-6-a-194.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-195.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-197.js
 test/built-ins/Object/defineProperties/15.2.3.7-6-a-198.js
@@ -1370,7 +1369,6 @@ test/built-ins/Object/defineProperty/15.2.3.6-4-192.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-193.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-194.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-195.js
-test/built-ins/Object/defineProperty/15.2.3.6-4-198.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-199.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-200.js
 test/built-ins/Object/defineProperty/15.2.3.6-4-201.js
@@ -1489,8 +1487,6 @@ test/built-ins/Object/defineProperty/redefine-length-with-various-values-and-con
 test/built-ins/Object/entries/getter-making-future-key-nonenumerable.js
 test/built-ins/Object/entries/getter-removing-future-key.js
 test/built-ins/Object/freeze/15.2.3.9-2-a-10.js
-test/built-ins/Object/freeze/15.2.3.9-2-a-14.js
-test/built-ins/Object/freeze/15.2.3.9-2-d-2.js
 test/built-ins/Object/freeze/abrupt-completion.js
 test/built-ins/Object/freeze/proxy-no-ownkeys-returned-keys-order.js
 test/built-ins/Object/freeze/proxy-with-defineProperty-handler.js
@@ -1511,8 +1507,6 @@ test/built-ins/Object/getOwnPropertySymbols/proxy-invariant-absent-not-configura
 test/built-ins/Object/getOwnPropertySymbols/proxy-invariant-duplicate-string-entry.js
 test/built-ins/Object/getOwnPropertySymbols/proxy-invariant-not-extensible-absent-string-key.js
 test/built-ins/Object/getOwnPropertySymbols/proxy-invariant-not-extensible-extra-string-key.js
-test/built-ins/Object/isFrozen/15.2.3.12-1-5.js
-test/built-ins/Object/isFrozen/15.2.3.12-1-6.js
 test/built-ins/Object/isFrozen/proxy-no-ownkeys-returned-keys-order.js
 test/built-ins/Object/isSealed/proxy-no-ownkeys-returned-keys-order.js
 test/built-ins/Object/keys/15.2.3.14-5-12.js
@@ -1522,7 +1516,6 @@ test/built-ins/Object/keys/proxy-keys.js
 test/built-ins/Object/keys/proxy-non-enumerable-prop-invariant-1.js
 test/built-ins/Object/keys/proxy-non-enumerable-prop-invariant-2.js
 test/built-ins/Object/preventExtensions/15.2.3.10-3-14.js
-test/built-ins/Object/preventExtensions/15.2.3.10-3-4.js
 test/built-ins/Object/preventExtensions/abrupt-completion.js
 test/built-ins/Object/preventExtensions/throws-when-false.js
 test/built-ins/Object/proto-from-ctor-realm.js
@@ -1544,7 +1537,6 @@ test/built-ins/Object/prototype/valueOf/S15.2.4.4_A1_T1.js
 test/built-ins/Object/prototype/valueOf/S15.2.4.4_A1_T2.js
 test/built-ins/Object/prototype/valueOf/S15.2.4.4_A1_T3.js
 test/built-ins/Object/seal/abrupt-completion.js
-test/built-ins/Object/seal/object-seal-o-is-an-array-object.js
 test/built-ins/Object/seal/object-seal-p-is-own-property-of-an-array-object-that-uses-object-s-get-own-property.js
 test/built-ins/Object/seal/proxy-no-ownkeys-returned-keys-order.js
 test/built-ins/Object/seal/proxy-with-defineProperty-handler.js
@@ -3422,7 +3414,6 @@ test/language/expressions/class/private-static-method-brand-check-multiple-evalu
 test/language/expressions/class/private-static-setter-multiple-evaluations-of-class-realm.js
 test/language/expressions/class/restricted-properties.js
 test/language/expressions/class/static-gen-method-param-dflt-yield.js
-test/language/expressions/class/subclass-builtins/subclass-Array.js
 test/language/expressions/class/subclass-builtins/subclass-ArrayBuffer.js
 test/language/expressions/class/subclass-builtins/subclass-DataView.js
 test/language/expressions/class/subclass-builtins/subclass-Function.js
@@ -4643,7 +4634,6 @@ test/language/statements/class/static-init-invalid-return.js
 test/language/statements/class/static-method-gen-non-configurable-err.js
 test/language/statements/class/static-method-non-configurable-err.js
 test/language/statements/class/strict-mode/arguments-callee.js
-test/language/statements/class/subclass-builtins/subclass-Array.js
 test/language/statements/class/subclass-builtins/subclass-ArrayBuffer.js
 test/language/statements/class/subclass-builtins/subclass-DataView.js
 test/language/statements/class/subclass-builtins/subclass-Function.js

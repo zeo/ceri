@@ -250,7 +250,7 @@ impl ScriptRuntime {
                         continue;
                     };
                     let values = match self.get_property(&object, &key)?.resolve() {
-                        Value::Array(values) => values.borrow().clone(),
+                        Value::Array(values) => values.borrow().to_vec(),
                         single => vec![single],
                     };
                     let mut offsets = vec![None; values.len()];

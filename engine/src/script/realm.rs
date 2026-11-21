@@ -2024,11 +2024,12 @@ impl ScriptRuntime {
             }
             Value::String(text) => string_own_property(text, key),
             Value::Array(array) => {
+                let integrity = array.borrow().integrity;
                 if key == "length" {
                     Some(Property {
                         slot: Slot::Data(Value::Number(array.borrow().len() as f64)),
                         enumerable: false,
-                        writable: true,
+                        writable: integrity != super::Integrity::Frozen,
                         configurable: false,
                     })
                 } else if let Some(index) = array_index(key) {
@@ -2037,7 +2038,12 @@ impl ScriptRuntime {
                         .get(index as usize)
                         .filter(|value| !matches!(value, Value::Uninitialized))
                         .cloned()
-                        .map(Property::data)
+                        .map(|value| Property {
+                            slot: Slot::Data(value),
+                            enumerable: true,
+                            writable: integrity != super::Integrity::Frozen,
+                            configurable: integrity < super::Integrity::Sealed,
+                        })
                 } else {
                     self.array_expando(array, key).map(Property::data)
                 }
@@ -2238,6 +2244,9 @@ impl ScriptRuntime {
                         return set_array_length(array, value);
                     }
                     if let Some(index) = array_index(&key) {
+                        if array.borrow().integrity == super::Integrity::Frozen {
+                            return Err(self.type_error(format!("Cannot redefine property: {key}")));
+                        }
                         return set_array_element(array, index as usize, value);
                     }
                     self.set_array_expando(array, &key, value);
@@ -2404,7 +2413,7 @@ impl ScriptRuntime {
     fn array_like_values(&mut self, value: &Value) -> Result<Vec<Value>, ScriptError> {
         match value {
             Value::Undefined | Value::Null => Ok(Vec::new()),
-            Value::Array(array) => Ok(array.borrow().clone()),
+            Value::Array(array) => Ok(array.borrow().to_vec()),
             Value::Object(_) => self.array_like_list(value),
             _ => Err(self.type_error("CreateListFromArrayLike called on non-object")),
         }
@@ -2520,6 +2529,12 @@ impl ScriptRuntime {
                         );
                     }
                 };
+                if let Value::Array(array) = &first {
+                    if !self.set_array_prototype(array, prototype) {
+                        return Err(self.type_error("#<Array> is not extensible"));
+                    }
+                    return Ok(first);
+                }
                 let target = self.wrapper_object(&first).map(Value::Object);
                 if let Value::Object(object) = target.as_ref().unwrap_or(&first) {
                     self.set_object_prototype(object, prototype)?;
@@ -2628,6 +2643,16 @@ impl ScriptRuntime {
                         Some(super::typed_object(array))
                     }
                     Value::Object(object) => Some(object.clone()),
+                    Value::Array(array) => {
+                        let wanted = match native {
+                            Native::ObjectFreeze => super::Integrity::Frozen,
+                            Native::ObjectSeal => super::Integrity::Sealed,
+                            _ => super::Integrity::Closed,
+                        };
+                        let mut array = array.borrow_mut();
+                        array.integrity = array.integrity.max(wanted);
+                        None
+                    }
                     _ => None,
                 };
                 if let Some(object) = &target {
@@ -2653,10 +2678,24 @@ impl ScriptRuntime {
                                         || matches!(property.slot, Slot::Accessor { .. }))
                             })
                     }
+                    Value::Array(array) => {
+                        let array = array.borrow();
+                        let empty = array
+                            .iter()
+                            .all(|value| matches!(value, Value::Uninitialized));
+                        let wanted = if frozen {
+                            super::Integrity::Frozen
+                        } else {
+                            super::Integrity::Sealed
+                        };
+                        array.integrity >= wanted
+                            || (array.integrity == super::Integrity::Closed && empty)
+                    }
                     value => is_primitive(value),
                 }))
             }
             Native::ObjectIsExtensible => Ok(Value::Bool(match &first {
+                Value::Array(array) => array.borrow().integrity == super::Integrity::Open,
                 Value::Object(object) => object.borrow().extensible,
                 Value::TypedArray(array) => array
                     .borrow()
@@ -3581,7 +3620,12 @@ impl ScriptRuntime {
                 } else {
                     arguments
                 };
-                Ok(Self::new_array(values))
+                let array = Self::new_array(values);
+                if subclass && let Value::Array(handle) = &array {
+                    let prototype = self.prototype_from_constructor(&new_target)?;
+                    handle.borrow_mut().prototype = Some(Some(prototype));
+                }
+                Ok(array)
             }
             Native::RegExp(method) => {
                 self.call_regexp(method, Value::Undefined, arguments, Some(new_target))
@@ -3698,6 +3742,28 @@ impl ScriptRuntime {
                 Err(self.type_error(format!("{name} is not a constructor")))
             }
         }
+    }
+
+    // an array's own prototype; one closed to extension keeps the one it has
+    pub(super) fn set_array_prototype(
+        &mut self,
+        array: &ArrayHandle,
+        prototype: Option<ObjectHandle>,
+    ) -> bool {
+        let current = self.prototype_of(&Value::Array(array.clone()));
+        let same = match (&current, &prototype) {
+            (Some(current), Some(prototype)) => Rc::ptr_eq(current, prototype),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return true;
+        }
+        if array.borrow().integrity != super::Integrity::Open {
+            return false;
+        }
+        array.borrow_mut().prototype = Some(prototype);
+        true
     }
 
     pub(super) fn set_object_prototype(

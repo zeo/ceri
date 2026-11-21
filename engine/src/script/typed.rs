@@ -742,7 +742,7 @@ impl ScriptRuntime {
                 };
                 let result = self.call_array_method(array_method, copy, arguments)?;
                 let values = match result {
-                    Value::Array(values) => values.borrow().clone(),
+                    Value::Array(values) => values.borrow().to_vec(),
                     other => vec![other],
                 };
                 self.typed_from_values(kind, values)

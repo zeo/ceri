@@ -737,7 +737,7 @@ impl ScriptRuntime {
                 }
             }
         } else {
-            let arguments = Value::Array(Rc::new(RefCell::new(frame.arguments.clone())));
+            let arguments = Value::Array(Rc::new(RefCell::new(frame.arguments.clone().into())));
             frame.stack.push(arguments);
         }
         frame
@@ -1625,7 +1625,7 @@ impl ScriptRuntime {
             }
             Op::NewArray => frame
                 .stack
-                .push(Value::Array(Rc::new(RefCell::new(Vec::new())))),
+                .push(Value::Array(Rc::new(RefCell::new(Vec::new().into())))),
             Op::ArrayPush => {
                 let value = Self::pop(frame);
                 if let Some(Value::Array(array)) = frame.stack.last() {
@@ -2247,7 +2247,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::Array(Rc::new(RefCell::new(rest))));
+                    .push(Value::Array(Rc::new(RefCell::new(rest.into()))));
             }
             Op::IterClose => {
                 let iterator = Self::pop(frame);

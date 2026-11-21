@@ -106,11 +106,59 @@ fn check_length(length: usize) -> Result<(), ScriptError> {
     Ok(())
 }
 
+// why a method may not change an array that preventExtensions, seal or freeze closed: it
+// would add, remove or change elements the array no longer lets go
+fn array_method_refusal(
+    method: ArrayMethod,
+    array: &super::ArrayData,
+    arguments: &[Value],
+) -> Option<String> {
+    use super::Integrity;
+    use ArrayMethod as M;
+    let length = array.len();
+    let adding = |count: usize| {
+        (count > 0 && array.integrity >= Integrity::Closed)
+            .then(|| format!("Cannot add property {length}, object is not extensible"))
+    };
+    let removing = |count: usize| {
+        (count > 0 && array.integrity >= Integrity::Sealed)
+            .then(|| format!("Cannot delete property '{}' of [object Array]", length - 1))
+    };
+    let changing = || {
+        (length > 0 && array.integrity == Integrity::Frozen).then(|| {
+            "Cannot assign to read only property '0' of object '[object Array]'".to_string()
+        })
+    };
+    match method {
+        M::Push | M::Unshift => adding(arguments.len()).or_else(|| {
+            (!arguments.is_empty() && matches!(method, M::Unshift))
+                .then(changing)
+                .flatten()
+        }),
+        M::Pop | M::Shift => removing(length),
+        M::Splice => {
+            let inserted = arguments.len().saturating_sub(2);
+            let removed = match arguments.get(1) {
+                None if arguments.is_empty() => 0,
+                None => length,
+                Some(Value::Number(count)) => count.max(0.0).min(length as f64) as usize,
+                Some(_) => 0,
+            };
+            adding(inserted.saturating_sub(removed))
+                .or_else(|| removing(removed.saturating_sub(inserted)))
+                .or_else(|| (inserted + removed > 0).then(changing).flatten())
+        }
+        // reversing or sorting a single element writes nothing
+        M::Reverse | M::Sort if length < 2 => None,
+        _ => changing(),
+    }
+}
+
 impl ScriptRuntime {
     // the elements a method reads: the array itself, or an array-like receiver's items
     fn receiver_values(&mut self, this: &Value, method: &str) -> Result<Vec<Value>, ScriptError> {
         match this {
-            Value::Array(array) => Ok(array.borrow().clone()),
+            Value::Array(array) => Ok(array.borrow().to_vec()),
             Value::Undefined | Value::Null => Err(self.type_error(format!(
                 "Array.prototype.{method} called on null or undefined"
             ))),
@@ -373,6 +421,12 @@ impl ScriptRuntime {
         if mutates && !matches!(this, Value::Array(_)) {
             return self.mutate_array_like(method, this, arguments, &name);
         }
+        if mutates
+            && let Value::Array(array) = &this
+            && let Some(refusal) = array_method_refusal(method, &array.borrow(), &arguments)
+        {
+            return Err(self.type_error(refusal));
+        }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
                 let (values, object) = self.callback_receiver(&this, &name)?;
@@ -575,7 +629,7 @@ impl ScriptRuntime {
                     }
                     _ => {
                         let values = self.receiver_values(&this, &name)?;
-                        let array = Rc::new(RefCell::new(values));
+                        let array: ArrayHandle = Rc::new(RefCell::new(values.into()));
                         Ok(Value::String(self.join_array(&array, &separator)?.into()))
                     }
                 }
@@ -722,7 +776,7 @@ impl ScriptRuntime {
             }
             M::Splice | M::ToSpliced => {
                 let mut values = if matches!(method, M::Splice) {
-                    self.receiver_array(&this, &name)?.borrow().clone()
+                    self.receiver_array(&this, &name)?.borrow().to_vec()
                 } else {
                     self.receiver_values(&this, &name)?
                 };
@@ -742,7 +796,7 @@ impl ScriptRuntime {
                 let removed: Vec<Value> = values.splice(start..start + delete, insert).collect();
                 if matches!(method, M::Splice) {
                     let array = self.receiver_array(&this, &name)?;
-                    *array.borrow_mut() = values;
+                    **array.borrow_mut() = values;
                     Ok(Self::new_array(removed))
                 } else {
                     Ok(Self::new_array(values))
@@ -770,14 +824,14 @@ impl ScriptRuntime {
                     ));
                 }
                 let values = if matches!(method, M::Sort) {
-                    self.receiver_array(&this, &name)?.borrow().clone()
+                    self.receiver_array(&this, &name)?.borrow().to_vec()
                 } else {
                     self.receiver_values(&this, &name)?
                 };
                 let sorted = self.sort_values(values, &comparator)?;
                 if matches!(method, M::Sort) {
                     let array = self.receiver_array(&this, &name)?;
-                    *array.borrow_mut() = sorted;
+                    **array.borrow_mut() = sorted;
                     Ok(this)
                 } else {
                     Ok(Self::new_array(sorted))
@@ -924,4 +978,54 @@ fn flatten_into(result: &mut Vec<Value>, value: Value, depth: f64) -> Result<(),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arrays_take_subclass_prototypes_and_close_when_frozen() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                "use strict";
+                const seen = [];
+                class List extends Array { sum() { return this.reduce((a, b) => a + b, 0); } }
+                const list = new List();
+                list.push(1, 2, 3);
+                seen.push(list instanceof List, Array.isArray(list), list.sum(), Object.getPrototypeOf(list) === List.prototype);
+                const frozen = Object.freeze([1, 2]);
+                seen.push(Object.isFrozen(frozen), Object.isExtensible(frozen), Object.getOwnPropertyDescriptor(frozen, 0).writable);
+                for (const change of [() => frozen.push(3), () => { frozen[0] = 9; }, () => { frozen.length = 0; }, () => frozen.sort()]) {
+                    try { change(); seen.push("changed"); } catch (error) { seen.push(error.name); }
+                }
+                seen.push(frozen.join(), Object.freeze([7]).reverse().join());
+                const sealed = Object.seal([1, 2]);
+                sealed[0] = 5;
+                try { sealed.pop(); } catch (error) { seen.push(error.name); }
+                try { delete sealed[1]; } catch (error) { seen.push(error.name); }
+                const closed = Object.preventExtensions([1]);
+                closed[0] = 2;
+                try { closed.push(2); } catch (error) { seen.push(error.name); }
+                seen.push(sealed.join(), closed.join(), Object.isSealed(sealed), Object.isFrozen(sealed));
+                const plain = Object.setPrototypeOf([1], { hello() { return "hi"; } });
+                seen.push(plain.hello(), Reflect.setPrototypeOf(frozen, null));
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(
+                "true|true|6|true|true|false|false|TypeError|TypeError|TypeError|TypeError|1,2|7|\
+                 TypeError|TypeError|TypeError|5,2|2|true|false|hi|false"
+            )
+        );
+    }
 }

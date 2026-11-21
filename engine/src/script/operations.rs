@@ -933,7 +933,10 @@ impl ScriptRuntime {
             Value::String(_) => intrinsics.string_prototype.clone(),
             Value::Symbol(_) => intrinsics.symbol_prototype.clone(),
             Value::BigInt(_) => intrinsics.bigint_prototype.clone(),
-            Value::Array(_) => intrinsics.array_prototype.clone(),
+            Value::Array(array) => match &array.borrow().prototype {
+                None => intrinsics.array_prototype.clone(),
+                Some(prototype) => return prototype.clone(),
+            },
             Value::Error(error) if error.class_name == "DOMException" => {
                 intrinsics.dom_exception_prototype.clone()
             }
@@ -1324,7 +1327,9 @@ impl ScriptRuntime {
                             if !self.inherits(object, &key) {
                                 return Ok(Value::Undefined);
                             }
-                            let prototype = self.intrinsics.array_prototype.clone();
+                            let Some(prototype) = self.prototype_of(object) else {
+                                return Ok(Value::Undefined);
+                            };
                             return self.ordinary_get(prototype, &key, object);
                         }
                     }
@@ -1364,6 +1369,13 @@ impl ScriptRuntime {
             match object {
                 Value::Array(array) => {
                     let index = runtime_array_index(&Value::Number(number))?;
+                    if let Some(refusal) = array_write_refusal(array, index) {
+                        return if strict {
+                            Err(self.type_error(refusal))
+                        } else {
+                            Ok(())
+                        };
+                    }
                     return set_array_element(array, index, value);
                 }
                 Value::TypedArray(array) => return self.typed_set(array, number as usize, value),
@@ -1420,6 +1432,19 @@ impl ScriptRuntime {
             ))),
             Value::Array(array) => {
                 if let Some(index) = array_index(key) {
+                    let present = array
+                        .borrow()
+                        .get(index as usize)
+                        .is_some_and(|value| !matches!(value, Value::Uninitialized));
+                    if present && array.borrow().integrity >= super::Integrity::Sealed {
+                        return if strict {
+                            Err(self.type_error(format!(
+                                "Cannot delete property '{key}' of [object Array]"
+                            )))
+                        } else {
+                            Ok(false)
+                        };
+                    }
                     let mut array = array.borrow_mut();
                     if let Some(slot) = array.get_mut(index as usize) {
                         *slot = Value::Uninitialized;
@@ -1647,7 +1672,7 @@ impl ScriptRuntime {
     }
 
     pub(super) fn new_array(values: Vec<Value>) -> Value {
-        Value::Array(Rc::new(RefCell::new(values)))
+        Value::Array(Rc::new(RefCell::new(values.into())))
     }
 
     // own enumerable properties, string and symbol keyed, as object spread copies them
@@ -2532,8 +2557,9 @@ fn host_instance_of(value: &Value, constructor: &Value) -> bool {
 
 // the values a host collection yields when iterated
 fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
-    let pair =
-        |first: Value, second: Value| Value::Array(Rc::new(RefCell::new(vec![first, second])));
+    let pair = |first: Value, second: Value| {
+        Value::Array(Rc::new(RefCell::new(vec![first, second].into())))
+    };
     Some(match value {
         Value::Array(values) => values.borrow().iter().cloned().map(Value::filled).collect(),
         Value::NodeList(nodes) => nodes.iter().cloned().map(Value::Element).collect(),
