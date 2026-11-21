@@ -1671,7 +1671,7 @@ impl Browser {
                 document
                     .script_elements()
                     .into_iter()
-                    .map(|(node, source)| (nonce(node), source))
+                    .map(|(node, source)| (node, nonce(node), source))
                     .collect::<Vec<_>>(),
             )
         };
@@ -3470,7 +3470,7 @@ impl Browser {
         &self,
         base: &AppUrl,
         html: Option<&str>,
-        sources: &[(Option<String>, ScriptSource)],
+        sources: &[(NodeId, Option<String>, ScriptSource)],
         policies: &Policies,
         runtime: &mut ScriptRuntime,
     ) {
@@ -3480,7 +3480,7 @@ impl Browser {
             policies,
         };
         let mut cursor = 0;
-        for (nonce, source) in sources {
+        for (node, nonce, source) in sources {
             let element = Initiator {
                 nonce: nonce.as_deref(),
                 parser_inserted: true,
@@ -3505,11 +3505,14 @@ impl Browser {
                     runtime.set_script_origin(url, line, column);
                 }
             }
+            let classic = matches!(source, ScriptSource::Inline(_) | ScriptSource::External(_));
+            runtime.set_current_script(classic.then_some(*node));
             if let Err(error) =
                 self.execute_script(base, source, element, &mut module_loader, runtime)
             {
                 runtime.report(format!("script failed to load: {error}"));
             }
+            runtime.set_current_script(None);
             runtime.clear_script_origin();
         }
     }

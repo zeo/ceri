@@ -64,6 +64,7 @@ mod ranges;
 mod realm;
 mod reflect;
 mod regexp;
+mod script_elements;
 mod segmenter;
 mod sockets;
 mod streams;
@@ -765,6 +766,8 @@ pub struct ScriptRuntime {
     // what URL.createObjectURL has handed out and not taken back: the type and bytes by url
     object_urls: HashMap<String, (String, Vec<u8>)>,
     image_loads: HashMap<NodeId, images::ImageLoad>,
+    // the classic script element running, which document.currentScript names
+    current_script: Option<NodeId>,
     media: media::MediaState,
     dialogs: HashMap<NodeId, dialogs::DialogState>,
     // modal dialogs in the order they were shown, closed or removed ones included
@@ -1945,6 +1948,7 @@ impl ScriptRuntime {
             images: RefCell::default(),
             object_urls: HashMap::new(),
             image_loads: HashMap::new(),
+            current_script: None,
             media: media::MediaState::default(),
             dialogs: HashMap::new(),
             top_layer: Vec::new(),
@@ -2398,6 +2402,7 @@ impl ScriptRuntime {
                 }
             }
         }
+        self.prepare_inserted_scripts(&inserted)?;
         Ok(inserted)
     }
 

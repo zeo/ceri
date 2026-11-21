@@ -268,6 +268,9 @@ pub struct Document {
     selector_version: u64,
     // nodes that were created or lost their parent, so their owner can decide whether to free them
     orphans: Vec<NodeId>,
+    // script elements that were prepared already, which inserting again never runs: every
+    // script a parse makes counts, as the page's own run once by the navigation
+    started_scripts: std::collections::HashSet<NodeId>,
     template_contents: HashMap<NodeId, NodeId>,
     // shadow roots by host, and each root's host and whether script may reach it from the host
     shadow_roots: HashMap<NodeId, NodeId>,
@@ -422,6 +425,7 @@ impl Document {
             stamp_read: std::cell::Cell::new(false),
             selector_version: next_stamp(),
             orphans: Vec::new(),
+            started_scripts: std::collections::HashSet::new(),
             template_contents: HashMap::new(),
             shadow_roots: HashMap::new(),
             shadow_hosts: HashMap::new(),
@@ -1980,46 +1984,47 @@ impl Document {
     }
 
     pub(crate) fn script_elements(&self) -> Vec<(NodeId, ScriptSource)> {
-        let mut scripts = Vec::new();
-        for node in self.descendants(self.root) {
-            let Some(element) = self
-                .element(node)
-                .filter(|element| element.name == "script")
-            else {
-                continue;
-            };
-            let kind = element
-                .attr("type")
-                .map(|kind| kind.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if kind == "importmap" {
-                scripts.push((node, ScriptSource::ImportMap(self.text_content(node))));
-                continue;
-            }
-            let is_module = kind == "module";
-            // a data block such as type="application/json" or a template is never run
-            let classic = matches!(
-                kind.as_str(),
-                "" | "text/javascript"
-                    | "application/javascript"
-                    | "application/ecmascript"
-                    | "text/ecmascript"
-                    | "module"
-            );
-            if !classic {
-                continue;
-            }
-            scripts.push((
-                node,
-                match (element.attr("src"), is_module) {
-                    (Some(source), true) => ScriptSource::ExternalModule(source.to_string()),
-                    (Some(source), false) => ScriptSource::External(source.to_string()),
-                    (None, true) => ScriptSource::InlineModule(self.text_content(node)),
-                    (None, false) => ScriptSource::Inline(self.text_content(node)),
-                },
-            ));
+        self.descendants(self.root)
+            .filter_map(|node| Some((node, self.script_source(node)?)))
+            .collect()
+    }
+
+    // what a script element runs, or none for other elements and for data blocks such as
+    // type="application/json" or a template, which never run
+    pub(crate) fn script_source(&self, node: NodeId) -> Option<ScriptSource> {
+        let element = self
+            .element(node)
+            .filter(|element| element.name == "script")?;
+        let kind = element
+            .attr("type")
+            .map(|kind| kind.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if kind == "importmap" {
+            return Some(ScriptSource::ImportMap(self.text_content(node)));
         }
-        scripts
+        let is_module = kind == "module";
+        let runs = matches!(
+            kind.as_str(),
+            "" | "text/javascript"
+                | "application/javascript"
+                | "application/ecmascript"
+                | "text/ecmascript"
+                | "module"
+        );
+        runs.then(|| match (element.attr("src"), is_module) {
+            (Some(source), true) => ScriptSource::ExternalModule(source.to_string()),
+            (Some(source), false) => ScriptSource::External(source.to_string()),
+            (None, true) => ScriptSource::InlineModule(self.text_content(node)),
+            (None, false) => ScriptSource::Inline(self.text_content(node)),
+        })
+    }
+
+    pub(crate) fn script_started(&self, node: NodeId) -> bool {
+        self.started_scripts.contains(&node)
+    }
+
+    pub(crate) fn mark_script_started(&mut self, node: NodeId) {
+        self.started_scripts.insert(node);
     }
 
     pub fn stylesheet_sources(&self) -> Vec<StylesheetSource> {
@@ -2791,11 +2796,15 @@ impl TreeBuilder {
         };
         let void = is_void_element(&name);
         let template = name == "template";
+        let script = name == "script";
         let id = document.allocate(NodeKind::Element(Element {
             name,
             namespace,
             attrs,
         }));
+        if script {
+            document.started_scripts.insert(id);
+        }
         self.created.push(id);
         document.append_raw(target, id);
         if !(self_closing || void) {

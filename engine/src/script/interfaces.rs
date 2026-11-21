@@ -372,6 +372,7 @@ static INTERFACES: &[Interface] = &[
             ("queryCommandState", Method(1)),
             ("queryCommandValue", Method(1)),
             ("activeViewTransition", ReadOnly),
+            ("currentScript", ReadOnly),
             ("createRange", Method(0)),
             ("createTreeWalker", Method(1)),
             ("getAnimations", Method(0)),
@@ -1950,6 +1951,7 @@ impl ScriptRuntime {
             ("queryCommandState", Access::Call) => Value::Bool(false),
             ("queryCommandValue", Access::Call) => Value::String("".into()),
             ("activeViewTransition", Access::Get) => self.active_view_transition(),
+            ("currentScript", Access::Get) if on_document => self.current_script_value(),
             ("createEvent", Access::Call) => {
                 let interface = self.coerce_string(first)?;
                 self.create_legacy_event(&interface)?

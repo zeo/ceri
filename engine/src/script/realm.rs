@@ -218,6 +218,8 @@ pub(super) enum Native {
     XhrDeliver(u32, u64),
     // an img reporting the outcome of the request it started in this generation
     ImageDeliver(crate::dom::NodeId, u64),
+    // an inserted script element's load and run, as a task
+    ScriptElement(crate::dom::NodeId),
     // a dialog reporting that it closed
     DialogClose(crate::dom::NodeId),
     // a media element's source selection and its events, for one run of its load algorithm
@@ -3302,6 +3304,7 @@ impl ScriptRuntime {
             Native::CustomElements(method) => self.call_registry(method, arguments),
             Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
             Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
+            Native::ScriptElement(node) => self.run_script_element(node),
             Native::DialogClose(node) => self.deliver_dialog_close(node),
             Native::MediaLoad(node, generation) => self.deliver_media_load(node, generation),
             Native::MediaCue(cue) => {
