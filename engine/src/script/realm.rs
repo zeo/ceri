@@ -250,10 +250,7 @@ impl Native {
                 | super::intl::IntlMethod::ListFormatConstructor))
             || matches!(self, Native::Promise(function)
                 if matches!(**function, super::promises::PromiseFunction::Constructor))
-            || matches!(self, Native::Stream(function)
-                if matches!(**function, super::streams::StreamFunction::Constructor
-                    | super::streams::StreamFunction::ReaderConstructor
-                    | super::streams::StreamFunction::ControllerConstructor))
+            || matches!(self, Native::Stream(function) if function.is_constructor())
     }
 }
 
