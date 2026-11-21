@@ -116,6 +116,8 @@ pub(super) enum ObjectClass {
     Walk(Rc<RefCell<super::traversal::WalkState>>),
     // the object of a promise value, which keeps its expandos and its prototype
     Promise,
+    // the object of a typed array of this kind, for its named properties and prototype
+    TypedArray(super::typed::ElementKind),
     // what an iterator helper such as map or take hands back
     IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
@@ -194,6 +196,13 @@ impl JsObject {
                 ObjectClass::Set(_) => intrinsics.set_prototype.clone(),
                 ObjectClass::Date(_) => intrinsics.date_prototype.clone(),
                 ObjectClass::Promise => intrinsics.promise_prototype.clone(),
+                ObjectClass::TypedArray(kind) => {
+                    let index = super::typed::ELEMENT_KINDS
+                        .iter()
+                        .position(|(candidate, _)| candidate == kind)
+                        .unwrap_or(0);
+                    intrinsics.typed_prototypes[index].clone()
+                }
                 _ => intrinsics.object_prototype.clone(),
             }),
             None => None,

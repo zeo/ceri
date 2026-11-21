@@ -1664,6 +1664,24 @@ impl ScriptRuntime {
         if let Some(object) = self.wrapper_object(value) {
             return self.own_property_of(&Value::Object(object), key);
         }
+        if let Value::TypedArray(array) = value {
+            if let Some(index) = array_index(key) {
+                return Ok(
+                    super::typed::read_element(&array.borrow(), index as usize).map(|element| {
+                        Property {
+                            slot: Slot::Data(element),
+                            enumerable: true,
+                            writable: true,
+                            configurable: true,
+                        }
+                    }),
+                );
+            }
+            if array.borrow().object.is_none() {
+                return Ok(None);
+            }
+            return self.own_property_of(&Value::Object(super::typed_object(array)), key);
+        }
         if let Value::Object(object) = value
             && let Some(proxy) = super::reflect::proxy_of(object)
         {
@@ -1730,7 +1748,13 @@ impl ScriptRuntime {
                 .filter(|key| is_symbol_key(key) == symbols)
                 .collect());
         }
-        Ok(self.own_keys(value, symbols))
+        let mut keys = self.own_keys(value, symbols);
+        if let Value::TypedArray(array) = value
+            && array.borrow().object.is_some()
+        {
+            keys.extend(self.own_keys(&Value::Object(super::typed_object(array)), symbols));
+        }
+        Ok(keys)
     }
 
     fn own_keys(&self, value: &Value, symbols: bool) -> Vec<String> {
@@ -1865,6 +1889,25 @@ impl ScriptRuntime {
         let (mut property, present) = self.descriptor_from(descriptor)?;
         let object = match target {
             Value::Object(object) => object.clone(),
+            Value::TypedArray(array) => match super::typed::canonical_numeric_index(&key) {
+                Some(number) => {
+                    let index = super::typed::valid_index(&array.borrow(), number);
+                    // an element is always a writable, enumerable and configurable value
+                    let refused = (present[1] && !property.configurable)
+                        || (present[0] && !property.enumerable)
+                        || present[4]
+                        || present[5]
+                        || (present[3] && !property.writable);
+                    let Some(index) = index.filter(|_| !refused) else {
+                        return Err(self.type_error(format!("Cannot redefine property: {key}")));
+                    };
+                    if let (true, Slot::Data(value)) = (present[2], property.slot) {
+                        return self.typed_set(array, index, value);
+                    }
+                    return Ok(());
+                }
+                None => super::typed_object(array),
+            },
             Value::Array(array) => {
                 if let Slot::Data(value) = property.slot {
                     if key == "length" {
@@ -2249,7 +2292,21 @@ impl ScriptRuntime {
             }
             Native::ObjectIs => Ok(Value::Bool(same_value(&first, &argument(&arguments, 1)))),
             Native::ObjectFreeze | Native::ObjectSeal | Native::ObjectPreventExtensions => {
-                if let Value::Object(object) = &first {
+                let target = match &first {
+                    Value::TypedArray(array) => {
+                        if !matches!(native, Native::ObjectPreventExtensions)
+                            && super::typed::element_count(&array.borrow()) > 0
+                        {
+                            return Err(self.type_error(
+                                "Cannot freeze or seal an array buffer view with elements",
+                            ));
+                        }
+                        Some(super::typed_object(array))
+                    }
+                    Value::Object(object) => Some(object.clone()),
+                    _ => None,
+                };
+                if let Some(object) = &target {
                     let mut object = object.borrow_mut();
                     match native {
                         Native::ObjectFreeze => object.freeze(false),
@@ -2277,6 +2334,11 @@ impl ScriptRuntime {
             }
             Native::ObjectIsExtensible => Ok(Value::Bool(match &first {
                 Value::Object(object) => object.borrow().extensible,
+                Value::TypedArray(array) => array
+                    .borrow()
+                    .object
+                    .as_ref()
+                    .is_none_or(|object| object.borrow().extensible),
                 value => !is_primitive(value),
             })),
             Native::ObjectHasOwn => {
@@ -3158,7 +3220,24 @@ impl ScriptRuntime {
                 self.call_date(method, Value::Undefined, arguments, Some(new_target))
             }
             Native::Typed(method) => {
-                self.call_typed(method, Value::Undefined, arguments, Some(new_target))
+                let made = self.call_typed(
+                    method,
+                    Value::Undefined,
+                    arguments,
+                    Some(new_target.clone()),
+                )?;
+                // a subclass hands its own prototype to the typed array it constructs
+                if let (Value::TypedArray(array), Value::Object(_)) = (&made, &new_target)
+                    && let Value::Object(prototype) = self.get_property(&new_target, "prototype")?
+                    && !self
+                        .prototype_of(&made)
+                        .is_some_and(|current| Rc::ptr_eq(&current, &prototype))
+                {
+                    super::typed_object(array)
+                        .borrow_mut()
+                        .set_prototype(Some(prototype));
+                }
+                Ok(made)
             }
             Native::DomConstructor(name) => self.construct_dom(name, arguments, new_target),
             Native::EventConstructor(name) => self.construct_event(name, arguments, new_target),

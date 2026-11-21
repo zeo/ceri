@@ -1175,6 +1175,21 @@ struct TypedArrayData {
     start: usize,
     end: usize,
     kind: typed::ElementKind,
+    // the object for its named properties and a subclass prototype, made when first needed
+    object: Option<object::ObjectHandle>,
+}
+
+fn typed_object(array: &TypedArrayHandle) -> object::ObjectHandle {
+    let mut array = array.borrow_mut();
+    let kind = array.kind;
+    array
+        .object
+        .get_or_insert_with(|| {
+            object::new_object(object::JsObject::with_class(
+                object::ObjectClass::TypedArray(kind),
+            ))
+        })
+        .clone()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

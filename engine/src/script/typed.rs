@@ -148,6 +148,25 @@ impl ElementKind {
     }
 }
 
+// CanonicalNumericIndexString: a key that is the text of a number, such as "1", "-0" or
+// "1.5", which a typed array answers itself instead of looking along its prototypes
+pub(super) fn canonical_numeric_index(key: &str) -> Option<f64> {
+    if key == "-0" {
+        return Some(-0.0);
+    }
+    if super::object::is_symbol_key(key) {
+        return None;
+    }
+    let number = super::operations::string_to_number(key);
+    (super::operations::number_to_string(number) == key).then_some(number)
+}
+
+// the element a numeric key names, none when it is not a valid integer index
+pub(super) fn valid_index(array: &TypedArrayData, number: f64) -> Option<usize> {
+    let whole = number.fract() == 0.0 && !(number == 0.0 && number.is_sign_negative());
+    (whole && number >= 0.0 && number < element_count(array) as f64).then_some(number as usize)
+}
+
 pub(super) fn element_count(array: &TypedArrayData) -> usize {
     (array.end - array.start) / array.kind.size()
 }
@@ -188,6 +207,7 @@ pub(super) fn new_typed(kind: ElementKind, buffer: BytesHandle, start: usize, en
         start,
         end,
         kind,
+        object: None,
     })))
 }
 
@@ -351,6 +371,7 @@ impl ScriptRuntime {
             start: 0,
             end: length,
             kind,
+            object: None,
         };
         for (index, value) in values.into_iter().enumerate() {
             let converted = self.typed_element_value(kind, value)?;
@@ -777,6 +798,35 @@ mod tests {
             ElementKind::Float64
                 .read(&ElementKind::Float64.encode(f64::NAN))
                 .is_nan()
+        );
+    }
+
+    #[test]
+    fn typed_arrays_keep_named_properties_and_subclass_prototypes() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const bytes = new Uint8Array(2);
+                bytes.label = "kept";
+                Object.defineProperty(bytes, "twice", { get() { return this[0] * 2; } });
+                bytes[0] = 21;
+                class Pixels extends Uint8ClampedArray { sum() { return this.reduce((a, b) => a + b, 0); } }
+                const pixels = new Pixels([1, 2, 3]);
+                const seen = [bytes.label, bytes.twice, pixels instanceof Pixels, pixels.sum(), bytes["-0"], Object.keys(bytes).join()];
+                seen.push(Reflect.defineProperty(bytes, "0", { value: 7, writable: false }), Reflect.defineProperty(bytes, "5", { value: 1 }), bytes[0]);
+                try { Object.freeze(bytes); } catch (error) { seen.push(error.name); }
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("kept|42|true|6||0,1,label|false|false|21|TypeError")
         );
     }
 }

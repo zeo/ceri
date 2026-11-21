@@ -935,6 +935,11 @@ impl ScriptRuntime {
             Value::Array(_) => intrinsics.array_prototype.clone(),
             Value::Error(error) => self.error_prototype(&error.name),
             Value::Iterator(_) => intrinsics.iterator_prototype.clone(),
+            Value::TypedArray(array) if array.borrow().object.is_some() => {
+                return super::typed_object(array)
+                    .borrow()
+                    .prototype_or(&self.intrinsics);
+            }
             Value::TypedArray(array) => {
                 let kind = array.borrow().kind;
                 let index = super::typed::ELEMENT_KINDS
@@ -997,6 +1002,13 @@ impl ScriptRuntime {
                     .expect("primitives have prototypes");
                 self.ordinary_get(prototype, key, value)
             }
+            Value::TypedArray(array) => match self.typed_get(array, key) {
+                Some(element) => Ok(element),
+                None if super::typed::canonical_numeric_index(key).is_some() => {
+                    Ok(Value::Undefined)
+                }
+                None => self.ordinary_get(super::typed_object(array), key, value),
+            },
             _ => self.host_get(value, key),
         }
     }
@@ -1123,7 +1135,8 @@ impl ScriptRuntime {
             }
             Value::TypedArray(array) => match array_index(key) {
                 Some(index) => self.typed_set(array, index as usize, value),
-                None => self.assign_member(target.clone(), key, value),
+                None if super::typed::canonical_numeric_index(key).is_some() => Ok(()),
+                None => self.ordinary_set(super::typed_object(array), key, value, target, strict),
             },
             Value::Array(array) if key != "length" && array_index(key).is_none() => {
                 self.set_array_expando(array, key, value);
@@ -1235,6 +1248,7 @@ impl ScriptRuntime {
         }
         let receiver_object = match receiver {
             Value::Object(object) => object.clone(),
+            Value::TypedArray(array) => super::typed_object(array),
             other => match self.wrapper_object(other) {
                 Some(object) => object,
                 None => return self.set_property(receiver, key, value, strict),
@@ -1359,6 +1373,13 @@ impl ScriptRuntime {
     ) -> Result<bool, ScriptError> {
         if let Some(object) = self.wrapper_object(target) {
             return self.delete_property(&Value::Object(object), key, strict);
+        }
+        if let Value::TypedArray(array) = target {
+            if let Some(index) = array_index(key) {
+                return Ok(index as usize >= super::typed::element_count(&array.borrow()));
+            }
+            let object = Value::Object(super::typed_object(array));
+            return self.delete_property(&object, key, strict);
         }
         match target {
             Value::Object(object) if super::reflect::proxy_of(object).is_some() => {
@@ -1708,6 +1729,25 @@ impl ScriptRuntime {
                         Value::Undefined
                     };
                     entries.push((key, value));
+                }
+                Ok(entries)
+            }
+            Value::TypedArray(array) => {
+                let mut entries: Vec<(String, Value)> = {
+                    let array = array.borrow();
+                    (0..super::typed::element_count(&array))
+                        .map(|index| {
+                            let value = with_values
+                                .then(|| super::typed::read_element(&array, index))
+                                .flatten()
+                                .unwrap_or(Value::Undefined);
+                            (index.to_string(), value)
+                        })
+                        .collect()
+                };
+                if array.borrow().object.is_some() {
+                    let object = Value::Object(super::typed_object(array));
+                    entries.extend(self.enumerable_own_properties(&object, with_values)?);
                 }
                 Ok(entries)
             }
