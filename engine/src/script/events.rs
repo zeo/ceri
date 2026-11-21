@@ -230,6 +230,11 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         members: &[("promise", Any), ("reason", Any)],
     },
     EventInterface {
+        name: "ClipboardEvent",
+        parent: "Event",
+        members: &[("clipboardData", Any)],
+    },
+    EventInterface {
         name: "PopStateEvent",
         parent: "Event",
         members: &[("state", Any)],
@@ -477,6 +482,7 @@ fn event_defaults(event_type: &str) -> (&'static str, bool, bool) {
         "reset" => ("Event", true, true),
         "change" | "select" | "DOMContentLoaded" => ("Event", true, false),
         "invalid" => ("Event", false, true),
+        "copy" | "cut" | "paste" => ("ClipboardEvent", true, true),
         "popstate" => ("PopStateEvent", false, false),
         "hashchange" => ("HashChangeEvent", false, false),
         "message" | "messageerror" => ("MessageEvent", false, false),
@@ -725,7 +731,12 @@ impl ScriptRuntime {
             // a rejection event carries its promise and reason where others carry data and error
             let rejection = interface == "PromiseRejectionEvent";
             if let Some(value) = fields.value {
-                set(if rejection { "promise" } else { "data" }, value);
+                let name = match interface {
+                    "PromiseRejectionEvent" => "promise",
+                    "ClipboardEvent" => "clipboardData",
+                    _ => "data",
+                };
+                set(name, value);
             }
             if let Some(state) = fields.state {
                 set("state", state);

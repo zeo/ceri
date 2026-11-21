@@ -616,6 +616,11 @@ pub trait ClipboardProvider {
     fn read_text(&self) -> Result<String, NavigationError>;
 
     fn write_text(&self, text: &str) -> Result<(), NavigationError>;
+
+    // a picture on the clipboard as its type and encoded bytes, where the host can read one
+    fn read_image(&self) -> Result<Option<(String, Vec<u8>)>, NavigationError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -6234,6 +6239,81 @@ mod tests {
         );
         assert_eq!(writes.borrow().as_slice(), ["copied"]);
         assert_eq!(text.borrow().as_str(), "copied");
+    }
+
+    #[test]
+    fn the_clipboard_keys_fire_their_events_and_a_handler_can_take_them_over() {
+        struct PictureClipboard {
+            text: Rc<RefCell<String>>,
+        }
+        impl ClipboardProvider for PictureClipboard {
+            fn read_text(&self) -> Result<String, NavigationError> {
+                Ok(self.text.borrow().clone())
+            }
+            fn write_text(&self, text: &str) -> Result<(), NavigationError> {
+                *self.text.borrow_mut() = text.to_string();
+                Ok(())
+            }
+            fn read_image(&self) -> Result<Option<(String, Vec<u8>)>, NavigationError> {
+                Ok(Some(("image/png".to_string(), vec![1, 2, 3])))
+            }
+        }
+        let text = Rc::new(RefCell::new("from outside".to_string()));
+        let mut browser = Browser::new(bundle(
+            r#"<input id="field" value="kept"><p id="status">idle</p><p id="value"></p><script>
+                const seen = [];
+                const show = () => (document.getElementById("status").textContent = seen.join("|"));
+                let take = true;
+                addEventListener("paste", (event) => {
+                    const data = event.clipboardData;
+                    const file = data.items[1].getAsFile();
+                    let heard = "";
+                    data.items[0].getAsString((value) => (heard = value));
+                    seen.push(event.constructor.name, event.bubbles && event.cancelable,
+                        data.getData("text"), data.types.join(","), data.items.length,
+                        data.items[1].kind + ":" + data.items[1].type, file.name + ":" + file.size,
+                        data.files.length, heard, data.items[0].getAsFile());
+                    data.setData("text/plain", "ignored");
+                    seen.push(data.getData("text/plain"));
+                    if (take) event.preventDefault();
+                    take = false;
+                    show();
+                });
+                addEventListener("copy", (event) => {
+                    event.clipboardData.setData("text/plain", "set by the page");
+                    event.preventDefault();
+                    seen.push("copy");
+                    show();
+                });
+                addEventListener("cut", () => (seen.push("cut seen"), show()));
+                const field = document.getElementById("field");
+                field.addEventListener("input", () => {
+                    document.getElementById("value").textContent = field.value;
+                });
+                field.focus();
+            </script>"#,
+        ))
+        .with_clipboard_provider(Rc::new(PictureClipboard { text: text.clone() }));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let control = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        assert!(browser.key_down_with_modifiers("v", control).unwrap());
+        assert_eq!(
+            element_text(&browser, "status"),
+            "ClipboardEvent|true|from outside|text/plain,Files|2|file:image/png|image.png:3|1|from outside||from outside"
+        );
+        // the handler took the paste, so the field kept its text; the copy it took writes
+        // what it set
+        assert!(browser.key_down_with_modifiers("c", control).unwrap());
+        assert_eq!(text.borrow().as_str(), "set by the page");
+        assert!(element_text(&browser, "status").ends_with("|copy"));
+        // left alone, a paste goes into the field as before
+        assert!(browser.key_down_with_modifiers("v", control).unwrap());
+        assert_eq!(element_text(&browser, "value"), "keptset by the page");
     }
 
     #[test]

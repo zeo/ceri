@@ -4,6 +4,7 @@ mod audio;
 mod bigint;
 mod bridge;
 mod canvas;
+mod clipboard;
 mod collections;
 mod compiler;
 mod console;
@@ -444,6 +445,12 @@ enum Builtin {
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
     CanvasGradientAddColorStop(canvas::GradientHandle),
+    ClipboardGetData(clipboard::TransferHandle),
+    ClipboardSetData(clipboard::TransferHandle),
+    ClipboardClearData(clipboard::TransferHandle),
+    // an item's text for its callback, and its file; none where the item is of the other kind
+    ClipboardItemString(Option<Rc<str>>),
+    ClipboardItemFile(Option<FileHandle>),
     AbortSignalRemoveEventListener(AbortSignalHandle),
     // the statics: a signal already aborted, one a timer aborts, one that follows others
     AbortSignalAbort,
@@ -2749,6 +2756,16 @@ impl ScriptRuntime {
             return Ok(dispatch.handled || moved);
         }
         if !dispatch.default_prevented && self.step_range_by_key(focused, key)? {
+            return Ok(true);
+        }
+        // the clipboard keys fire their events wherever the keys go, and a handler that takes
+        // one over leaves the element's own copying or pasting undone
+        if !dispatch.default_prevented
+            && (modifiers.control || modifiers.meta)
+            && !modifiers.alt
+            && matches!(key.to_ascii_lowercase().as_str(), "c" | "x" | "v")
+            && self.clipboard_shortcut(focused, &key.to_ascii_lowercase())?
+        {
             return Ok(true);
         }
         if dispatch.default_prevented || !self.is_text_control(focused) {
@@ -8752,6 +8769,11 @@ impl ScriptRuntime {
                 self.abort_signal(signal, reason)?;
                 Ok(Value::Undefined)
             }
+            builtin @ (Builtin::ClipboardGetData(_)
+            | Builtin::ClipboardSetData(_)
+            | Builtin::ClipboardClearData(_)
+            | Builtin::ClipboardItemString(_)
+            | Builtin::ClipboardItemFile(_)) => self.call_clipboard_member(builtin, arguments),
             Builtin::CanvasGradientAddColorStop(gradient) => {
                 self.add_color_stop(&gradient, &arguments)
             }
