@@ -526,8 +526,8 @@ mod tests {
 
     #[test]
     fn promises_are_objects_that_subclasses_and_patches_reach() {
-        let document = crate::dom::Document::parse(r#"<p id="out"></p>"#)
-            .expect("document should parse");
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
         let document = Rc::new(RefCell::new(document));
         let mut runtime = ScriptRuntime::new(document.clone());
         runtime
