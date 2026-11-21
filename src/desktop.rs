@@ -68,8 +68,8 @@ fn dib_pixels(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         }
     }
     // thirty two bits with no alpha anywhere is a solid picture, as most screenshots are
-    if rgba.chunks_exact(4).all(|pixel| pixel[3] == 0) {
-        for pixel in rgba.chunks_exact_mut(4) {
+    if rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
     }
