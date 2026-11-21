@@ -244,24 +244,6 @@ fn camel_case(property: &str) -> String {
     result
 }
 
-pub(super) fn rect_object(rect: Rect) -> Value {
-    let entries = [
-        ("x", rect.x),
-        ("y", rect.y),
-        ("width", rect.width),
-        ("height", rect.height),
-        ("top", rect.y),
-        ("right", rect.x + rect.width),
-        ("bottom", rect.y + rect.height),
-        ("left", rect.x),
-    ];
-    plain_object(
-        entries
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), Value::Number(f64::from(value)))),
-    )
-}
-
 impl ScriptRuntime {
     pub(crate) fn set_layout_inputs(&mut self, inputs: Rc<RefCell<LayoutInputs>>) {
         self.layout_inputs = Some(inputs);
@@ -669,11 +651,13 @@ impl ScriptRuntime {
         let boxes = || self.node_boxes(node);
         let number = |value: f32| Value::Number(f64::from(value.round()));
         Ok(Some(match name {
-            "getBoundingClientRect" => rect_object(self.bounding_box(node).unwrap_or_default()),
+            "getBoundingClientRect" => {
+                self.rect_object(self.bounding_box(node).unwrap_or_default())
+            }
             "getClientRects" => Self::new_array(
                 boxes()
                     .into_iter()
-                    .map(|geometry| rect_object(geometry.client))
+                    .map(|geometry| self.rect_object(geometry.client))
                     .collect(),
             ),
             "clientWidth" | "clientHeight" | "clientTop" | "clientLeft" => {

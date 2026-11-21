@@ -1,7 +1,5 @@
 // MutationObserver, ResizeObserver and IntersectionObserver: the document journals its
 // mutations for the first, and the other two compare a fresh layout at each rendering step
-
-use super::geometry::rect_object;
 use super::object::{JsObject, ObjectClass, ObjectHandle, Property, Slot, new_object};
 use super::operations::{is_callable, is_primitive, plain_object};
 use super::realm::{Builder, Native};
@@ -721,7 +719,7 @@ impl ScriptRuntime {
             *last = size;
             entries.push(plain_object([
                 ("target".to_string(), self.node_value(node)),
-                ("contentRect".to_string(), rect_object(content)),
+                ("contentRect".to_string(), self.rect_object(content)),
                 (
                     "borderBoxSize".to_string(),
                     size_object(border.width, border.height),
@@ -818,12 +816,12 @@ impl ScriptRuntime {
                 ("time".to_string(), Value::Number(self.clock as f64)),
                 (
                     "rootBounds".to_string(),
-                    root.map_or(Value::Null, rect_object),
+                    root.map_or(Value::Null, |rect| self.rect_object(rect)),
                 ),
-                ("boundingClientRect".to_string(), rect_object(target)),
+                ("boundingClientRect".to_string(), self.rect_object(target)),
                 (
                     "intersectionRect".to_string(),
-                    rect_object(overlap.unwrap_or_default()),
+                    self.rect_object(overlap.unwrap_or_default()),
                 ),
                 ("isIntersecting".to_string(), Value::Bool(intersecting)),
                 ("intersectionRatio".to_string(), Value::Number(ratio)),

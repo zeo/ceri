@@ -17,6 +17,7 @@ mod encoding;
 mod events;
 mod filereader;
 mod geometry;
+mod geometry_values;
 mod images;
 mod import_map;
 mod inspector;
