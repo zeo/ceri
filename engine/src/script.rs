@@ -15,6 +15,7 @@ mod debugger;
 mod dialogs;
 mod encoding;
 mod events;
+mod filereader;
 mod geometry;
 mod images;
 mod import_map;
@@ -593,6 +594,7 @@ pub struct ScriptRuntime {
     sockets: sockets::Sockets,
     notices: notifications::Notices,
     channels: broadcast::Channels,
+    readers: filereader::Readers,
     audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
@@ -1693,6 +1695,7 @@ impl ScriptRuntime {
             sockets: sockets::Sockets::default(),
             notices: notifications::Notices::default(),
             channels: broadcast::Channels::default(),
+            readers: filereader::Readers::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
             object_urls: HashMap::new(),

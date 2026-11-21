@@ -149,6 +149,10 @@ pub(super) enum Native {
     ChannelConstructor,
     // the messages posted on broadcast channels since the last task go out
     ChannelDeliver,
+    Reader(super::filereader::ReaderMember),
+    ReaderConstructor,
+    // a reader's read of the given generation completes
+    ReaderDeliver(u32, u64),
     Url(super::urls::UrlMember),
     UrlConstructor,
     UrlSearchParams(super::urls::ParamsMember),
@@ -198,6 +202,7 @@ impl Native {
                 | Native::SocketConstructor
                 | Native::NoticeConstructor
                 | Native::ChannelConstructor
+                | Native::ReaderConstructor
                 | Native::UrlConstructor
                 | Native::UrlSearchParamsConstructor
                 | Native::AudioConstructor(_)
@@ -265,6 +270,7 @@ pub(super) struct Intrinsics {
     pub(super) sockets: super::sockets::SocketInterfaces,
     pub(super) notices: super::notifications::NoticeInterfaces,
     pub(super) channels: super::broadcast::ChannelInterfaces,
+    pub(super) readers: super::filereader::ReaderInterfaces,
     pub(super) urls: super::urls::UrlInterfaces,
     pub(super) audio: super::audio::AudioInterfaces,
 }
@@ -1251,6 +1257,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let sockets = super::sockets::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let notices = super::notifications::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let channels = super::broadcast::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let urls = super::urls::create(&build, &object_prototype, &mut globals);
     let audio = super::audio::create(
         &build,
@@ -1306,6 +1313,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         sockets,
         notices,
         channels,
+        readers,
         urls,
         audio,
     };
@@ -2642,6 +2650,8 @@ impl ScriptRuntime {
             Native::Notice(member) => self.call_notice(member, this, arguments),
             Native::Channel(member) => self.call_channel(member, this, arguments),
             Native::ChannelDeliver => self.deliver_broadcasts(),
+            Native::Reader(member) => self.call_reader(member, this, arguments),
+            Native::ReaderDeliver(id, generation) => self.deliver_reader(id, generation),
             Native::Url(member) => self.call_url(member, this, arguments),
             Native::UrlSearchParams(member) => self.call_url_search_params(member, this, arguments),
             Native::UrlConstructor => {
@@ -2674,6 +2684,9 @@ impl ScriptRuntime {
             )),
             Native::ChannelConstructor => Err(self.type_error(
                 "Failed to construct 'BroadcastChannel': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+            )),
+            Native::ReaderConstructor => Err(self.type_error(
+                "Failed to construct 'FileReader': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
             Native::ObserverConstructor(kind) => Err(self.type_error(format!(
                 "Failed to construct '{}': Please use the 'new' operator",
@@ -2986,6 +2999,7 @@ impl ScriptRuntime {
             Native::SocketConstructor => self.construct_socket(arguments, new_target),
             Native::NoticeConstructor => self.construct_notice(arguments, new_target),
             Native::ChannelConstructor => self.construct_channel(arguments, new_target),
+            Native::ReaderConstructor => self.construct_reader(new_target),
             Native::UrlConstructor => self.construct_url(arguments, new_target),
             Native::UrlSearchParamsConstructor => {
                 self.construct_url_search_params(arguments, new_target)
