@@ -153,6 +153,11 @@ pub(super) enum Native {
     ReaderConstructor,
     // a reader's read of the given generation completes
     ReaderDeliver(u32, u64),
+    Port(super::messaging::PortMember),
+    PortConstructor,
+    MessageChannelConstructor,
+    // the messages posted to ports and the window since the last task arrive
+    PortDeliver,
     Url(super::urls::UrlMember),
     UrlConstructor,
     UrlSearchParams(super::urls::ParamsMember),
@@ -203,6 +208,8 @@ impl Native {
                 | Native::NoticeConstructor
                 | Native::ChannelConstructor
                 | Native::ReaderConstructor
+                | Native::PortConstructor
+                | Native::MessageChannelConstructor
                 | Native::UrlConstructor
                 | Native::UrlSearchParamsConstructor
                 | Native::AudioConstructor(_)
@@ -271,6 +278,7 @@ pub(super) struct Intrinsics {
     pub(super) notices: super::notifications::NoticeInterfaces,
     pub(super) channels: super::broadcast::ChannelInterfaces,
     pub(super) readers: super::filereader::ReaderInterfaces,
+    pub(super) ports: super::messaging::PortInterfaces,
     pub(super) urls: super::urls::UrlInterfaces,
     pub(super) audio: super::audio::AudioInterfaces,
 }
@@ -1258,6 +1266,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let notices = super::notifications::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let channels = super::broadcast::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let ports = super::messaging::create(
+        &build,
+        &dom.prototype("EventTarget"),
+        &object_prototype,
+        &mut globals,
+    );
     let urls = super::urls::create(&build, &object_prototype, &mut globals);
     let audio = super::audio::create(
         &build,
@@ -1314,6 +1328,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         notices,
         channels,
         readers,
+        ports,
         urls,
         audio,
     };
@@ -2652,6 +2667,8 @@ impl ScriptRuntime {
             Native::ChannelDeliver => self.deliver_broadcasts(),
             Native::Reader(member) => self.call_reader(member, this, arguments),
             Native::ReaderDeliver(id, generation) => self.deliver_reader(id, generation),
+            Native::Port(member) => self.call_port(member, this, arguments),
+            Native::PortDeliver => self.deliver_port_messages(),
             Native::Url(member) => self.call_url(member, this, arguments),
             Native::UrlSearchParams(member) => self.call_url_search_params(member, this, arguments),
             Native::UrlConstructor => {
@@ -2688,6 +2705,10 @@ impl ScriptRuntime {
             Native::ReaderConstructor => Err(self.type_error(
                 "Failed to construct 'FileReader': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
+            Native::MessageChannelConstructor => Err(self.type_error(
+                "Failed to construct 'MessageChannel': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+            )),
+            Native::PortConstructor => Err(self.type_error("Illegal constructor")),
             Native::ObserverConstructor(kind) => Err(self.type_error(format!(
                 "Failed to construct '{}': Please use the 'new' operator",
                 kind.name()
@@ -3000,6 +3021,8 @@ impl ScriptRuntime {
             Native::NoticeConstructor => self.construct_notice(arguments, new_target),
             Native::ChannelConstructor => self.construct_channel(arguments, new_target),
             Native::ReaderConstructor => self.construct_reader(new_target),
+            Native::MessageChannelConstructor => self.construct_message_channel(new_target),
+            Native::PortConstructor => Err(self.type_error("Illegal constructor")),
             Native::UrlConstructor => self.construct_url(arguments, new_target),
             Native::UrlSearchParamsConstructor => {
                 self.construct_url_search_params(arguments, new_target)

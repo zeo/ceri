@@ -589,6 +589,9 @@ pub(super) struct HostEventFields {
     pub(super) message: Option<String>,
     pub(super) error: Option<Value>,
     pub(super) related_target: Option<Value>,
+    // a MessageEvent's origin and source
+    pub(super) origin: Option<String>,
+    pub(super) source: Option<Value>,
 }
 
 impl ScriptRuntime {
@@ -749,6 +752,12 @@ impl ScriptRuntime {
             }
             if let Some(related) = fields.related_target {
                 set("relatedTarget", related);
+            }
+            if let Some(origin) = fields.origin {
+                set("origin", Value::String(origin.into()));
+            }
+            if let Some(source) = fields.source {
+                set("source", source);
             }
             set("view", Value::Window);
         }

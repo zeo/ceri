@@ -23,6 +23,7 @@ mod inspector;
 mod interfaces;
 mod intl;
 mod json;
+mod messaging;
 pub(crate) use json::quote as json_quote;
 mod lexer;
 mod media;
@@ -351,6 +352,7 @@ enum Builtin {
     Atob,
     Btoa,
     CreateImageBitmap,
+    WindowPostMessage,
     // an ImageBitmap's close, which carries its pixels until it is called
     ImageBitmapClose(canvas::ImageBitmapHandle),
     SetTimeout,
@@ -595,6 +597,7 @@ pub struct ScriptRuntime {
     notices: notifications::Notices,
     channels: broadcast::Channels,
     readers: filereader::Readers,
+    ports: messaging::Ports,
     audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
@@ -1562,6 +1565,10 @@ impl ScriptRuntime {
                 "createImageBitmap".to_string(),
                 Value::Builtin(Builtin::CreateImageBitmap),
             );
+            values.values.insert(
+                "postMessage".to_string(),
+                Value::Builtin(Builtin::WindowPostMessage),
+            );
             values
                 .values
                 .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
@@ -1696,6 +1703,7 @@ impl ScriptRuntime {
             notices: notifications::Notices::default(),
             channels: broadcast::Channels::default(),
             readers: filereader::Readers::default(),
+            ports: messaging::Ports::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
             object_urls: HashMap::new(),
@@ -3870,6 +3878,9 @@ impl ScriptRuntime {
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
+                "postMessage" if self.worker_sender.is_none() => {
+                    Ok(Value::Builtin(Builtin::WindowPostMessage))
+                }
                 "atob" => Ok(Value::Builtin(Builtin::Atob)),
                 "btoa" => Ok(Value::Builtin(Builtin::Btoa)),
                 "createImageBitmap" => Ok(Value::Builtin(Builtin::CreateImageBitmap)),
@@ -8232,6 +8243,7 @@ impl ScriptRuntime {
                     .unwrap_or(Value::Null))
             }
             Builtin::CreateImageBitmap => self.create_image_bitmap(&arguments),
+            Builtin::WindowPostMessage => self.post_window_message(&arguments),
             Builtin::ImageBitmapClose(held) => {
                 held.borrow_mut().take();
                 Ok(Value::Undefined)
