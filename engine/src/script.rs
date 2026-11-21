@@ -645,6 +645,10 @@ pub struct ScriptRuntime {
     media_queries: Vec<geometry::MediaQueryRecord>,
     media_list_prototype: Option<ObjectHandle>,
     performance: Value,
+    // window.visualViewport, which hears resize with the window
+    visual_viewport: Option<ObjectHandle>,
+    // the viewport size the last resize steps saw, so a change fires resize
+    reported_viewport: Option<(f32, f32)>,
     performance_entries: Vec<geometry::PerformanceEntry>,
     event_targets: HashMap<u32, Weak<RefCell<JsObject>>>,
     next_event_target: u32,
@@ -1820,6 +1824,8 @@ impl ScriptRuntime {
             media_queries: Vec::new(),
             media_list_prototype: None,
             performance: Value::Undefined,
+            visual_viewport: None,
+            reported_viewport: None,
             performance_entries: Vec::new(),
             event_targets: HashMap::new(),
             next_event_target: 0,
@@ -1914,6 +1920,11 @@ impl ScriptRuntime {
         };
         runtime.initialize_select_state();
         runtime.performance = runtime.performance_object();
+        let prototype = runtime.intrinsics.hosts["VisualViewport"].clone();
+        prototype
+            .borrow_mut()
+            .set_prototype(Some(runtime.intrinsics.dom.prototype("EventTarget")));
+        runtime.visual_viewport = Some(runtime.new_event_target(prototype));
         runtime.custom_registry = runtime.custom_element_registry();
         runtime
     }
@@ -3888,6 +3899,30 @@ impl ScriptRuntime {
         self.focused_element
     }
 
+    // the rendering step's resize steps: a viewport whose size changed since the last step
+    // fires resize at the window and at visualViewport
+    fn run_resize_steps(&mut self) -> Result<(), ScriptError> {
+        let size = (self.viewport.width, self.viewport.height);
+        let Some(previous) = self.reported_viewport.replace(size) else {
+            return Ok(());
+        };
+        if previous == size {
+            return Ok(());
+        }
+        self.dispatch_window_event("resize")?;
+        if let Some(viewport) = self.visual_viewport.clone()
+            && let ObjectClass::EventTarget(id) = viewport.borrow().class
+        {
+            self.fire(
+                ListenerTarget::Object(id),
+                "resize",
+                HostEventFields::default(),
+            )?;
+            self.drain_microtasks()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
         let dispatch = self.fire(
             ListenerTarget::Window,
@@ -3980,6 +4015,7 @@ impl ScriptRuntime {
             self.pump_audio()?;
             self.drain_microtasks()?;
         }
+        self.run_resize_steps()?;
         {
             let _profile = crate::profile::scope("script: observers");
             self.run_layout_observers()?;
@@ -4031,6 +4067,10 @@ impl ScriptRuntime {
                 "innerWidth" => Ok(Value::Number(self.viewport.width as f64)),
                 "innerHeight" => Ok(Value::Number(self.viewport.height as f64)),
                 "performance" => Ok(self.performance.clone()),
+                "visualViewport" => Ok(self
+                    .visual_viewport
+                    .clone()
+                    .map_or(Value::Null, Value::Object)),
                 "customElements" => Ok(self.custom_registry.clone()),
                 "getComputedStyle" => Ok(self.native_function(
                     Native::Window(geometry::WindowMethod::GetComputedStyle),

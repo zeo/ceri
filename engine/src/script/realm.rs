@@ -305,6 +305,7 @@ const HOST_INTERFACES: &[&str] = &[
     "LockManager",
     "CanvasRenderingContext2D",
     "ImageBitmap",
+    "VisualViewport",
 ];
 
 pub(super) struct Intrinsics {
@@ -1543,6 +1544,22 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         let constructor = build.constructor(Native::IllegalConstructor, name, 0, &prototype);
         globals.push((name, Value::Object(constructor)));
         hosts.insert(*name, prototype);
+    }
+    for name in [
+        "offsetLeft",
+        "offsetTop",
+        "pageLeft",
+        "pageTop",
+        "width",
+        "height",
+        "scale",
+    ] {
+        build.getter(
+            &hosts["VisualViewport"],
+            name,
+            Native::Window(super::geometry::WindowMethod::VisualViewport(name)),
+            None,
+        );
     }
     let segmenters =
         super::segmenter::create(&build, &object_prototype, &iterator_prototype, &intl);

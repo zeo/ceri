@@ -50,6 +50,8 @@ pub(crate) enum WindowMethod {
     MediaRemoveListener,
     PropertyValue,
     PerformanceNow,
+    // a visualViewport getter, by name
+    VisualViewport(&'static str),
     PerformanceMark,
     PerformanceMeasure,
     PerformanceEntries,
@@ -1104,6 +1106,17 @@ impl ScriptRuntime {
                 value.unwrap_or_else(|| Value::String("".into()))
             }
             WindowMethod::PerformanceNow => Value::Number(now),
+            WindowMethod::VisualViewport(name) => {
+                let (left, top) = self.document_scroll_offset();
+                Value::Number(f64::from(match name {
+                    "width" => self.viewport.width,
+                    "height" => self.viewport.height,
+                    "pageLeft" => left,
+                    "pageTop" => top,
+                    "scale" => 1.0,
+                    _ => 0.0,
+                }))
+            }
             WindowMethod::PerformanceMark => {
                 let name = self.coerce_string(first)?;
                 let entry = PerformanceEntry {

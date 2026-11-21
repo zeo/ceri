@@ -4806,6 +4806,52 @@ mod tests {
     }
 
     #[test]
+    fn a_viewport_that_changes_size_fires_resize_at_the_next_rendering_step() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id='status'>idle</p><script>
+              const seen = [];
+              addEventListener("resize", () => seen.push("window:" + innerWidth));
+              visualViewport.addEventListener("resize", () => {
+                seen.push("visual:" + visualViewport.width + "x" + visualViewport.height);
+                document.getElementById("status").textContent = seen.join("|");
+              });
+              seen.push(visualViewport instanceof VisualViewport, visualViewport instanceof EventTarget, visualViewport.scale);
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        browser.advance_time(16).expect("first rendering step");
+        browser
+            .advance_time(16)
+            .expect("a quiet step fires nothing");
+        browser.set_viewport(
+            Size {
+                width: 500.0,
+                height: 320.0,
+            },
+            1.0,
+        );
+        browser.advance_time(16).expect("the step after a resize");
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("true|true|1|window:500|visual:500x320")
+        );
+    }
+
+    #[test]
     fn browser_pumps_a_packaged_worker_without_a_loopback_server() {
         let mut resources = bundle(
             r#"<p id='status'>idle</p><script>
