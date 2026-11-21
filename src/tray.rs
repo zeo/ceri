@@ -20,6 +20,12 @@ pub enum MenuItem {
         // some for an item with a check mark, which flips when chosen
         checked: Option<bool>,
     },
+    // an entry that opens a menu of its own
+    Submenu {
+        text: String,
+        enabled: bool,
+        items: Vec<MenuItem>,
+    },
     Separator,
 }
 
@@ -42,8 +48,21 @@ impl MenuItem {
         }
     }
 
+    pub fn submenu(text: impl Into<String>, items: Vec<MenuItem>) -> Self {
+        Self::Submenu {
+            text: text.into(),
+            enabled: true,
+            items,
+        }
+    }
+
     pub fn disabled(self) -> Self {
         match self {
+            Self::Submenu { text, items, .. } => Self::Submenu {
+                text,
+                enabled: false,
+                items,
+            },
             Self::Item {
                 id, text, checked, ..
             } => Self::Item {
@@ -82,10 +101,67 @@ pub(crate) struct State {
     pub(crate) revision: u32,
 }
 
+// every entry of a menu and its submenus in the order they read, each with the number of the
+// entry that holds it: entries count from 1 and 0 is the menu itself
+pub(crate) fn rows(menu: &[MenuItem]) -> Vec<(usize, &MenuItem)> {
+    fn walk<'a>(menu: &'a [MenuItem], parent: usize, rows: &mut Vec<(usize, &'a MenuItem)>) {
+        for item in menu {
+            rows.push((parent, item));
+            let own = rows.len();
+            if let MenuItem::Submenu { items, .. } = item {
+                walk(items, own, rows);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(menu, 0, &mut found);
+    found
+}
+
+// the entry at a place in that order, counted from 0
+fn row_mut<'a>(menu: &'a mut [MenuItem], left: &mut usize) -> Option<&'a mut MenuItem> {
+    for item in menu {
+        if *left == 0 {
+            return Some(item);
+        }
+        *left -= 1;
+        if let MenuItem::Submenu { items, .. } = item
+            && let Some(found) = row_mut(items, left)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+type ItemParts<'a> = (&'a mut String, &'a mut bool, &'a mut Option<bool>);
+
+fn item_mut<'a>(menu: &'a mut [MenuItem], wanted: &str) -> Option<ItemParts<'a>> {
+    for item in menu {
+        match item {
+            MenuItem::Item {
+                id,
+                text,
+                enabled,
+                checked,
+            } if id == wanted => return Some((text, enabled, checked)),
+            MenuItem::Submenu { items, .. } => {
+                if let Some(found) = item_mut(items, wanted) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl State {
-    // the id of the item at an index, flipping its check mark as a chosen check item does
+    // the id of the item at a place among the rows, flipping its check mark as a chosen check
+    // item does
     pub(crate) fn choose(&mut self, index: usize) -> Option<String> {
-        match self.menu.get_mut(index)? {
+        let mut left = index;
+        match row_mut(&mut self.menu, &mut left)? {
             MenuItem::Item {
                 id,
                 enabled: true,
@@ -175,16 +251,7 @@ impl Tray {
         update: impl FnOnce(&mut String, &mut bool, &mut Option<bool>),
     ) {
         self.change(Change::Menu, |state| {
-            let item = state.menu.iter_mut().find_map(|item| match item {
-                MenuItem::Item {
-                    id,
-                    text,
-                    enabled,
-                    checked,
-                } if id == wanted => Some((text, enabled, checked)),
-                _ => None,
-            });
-            if let Some((text, enabled, checked)) = item {
+            if let Some((text, enabled, checked)) = item_mut(&mut state.menu, wanted) {
                 update(text, enabled, checked);
                 state.revision += 1;
             }
@@ -242,6 +309,28 @@ mod tests {
         assert_eq!(state.choose(3).as_deref(), Some("quit"));
         assert_eq!(state.choose(9), None);
         assert_eq!(state.revision, 2);
+        // rows count through a submenu before what follows it
+        state.menu.insert(
+            1,
+            MenuItem::submenu(
+                "quality",
+                vec![
+                    MenuItem::check("high", "high", true),
+                    MenuItem::check("low", "low", false),
+                ],
+            ),
+        );
+        let parents: Vec<_> = rows(&state.menu)
+            .iter()
+            .map(|(parent, _)| *parent)
+            .collect();
+        assert_eq!(parents, [0, 0, 2, 2, 0, 0, 0]);
+        assert_eq!(state.choose(1), None, "a submenu is not chosen itself");
+        assert_eq!(state.choose(3).as_deref(), Some("low"));
+        assert_eq!(state.choose(6).as_deref(), Some("quit"));
+        assert!(
+            item_mut(&mut state.menu, "low").is_some_and(|(_, _, checked)| *checked == Some(true))
+        );
         assert_eq!(pixels(Some(b"not an image"), 16), None);
     }
 }

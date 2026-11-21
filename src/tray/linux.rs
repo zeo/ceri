@@ -155,6 +155,12 @@ fn item_properties(item: &MenuItem) -> Vec<(&'static str, Value)> {
             }
             properties
         }
+        MenuItem::Submenu { text, enabled, .. } => vec![
+            ("label", Value::str(text.replace('_', "__"))),
+            ("enabled", Value::Bool(*enabled)),
+            ("visible", Value::Bool(true)),
+            ("children-display", Value::str("submenu")),
+        ],
     }
 }
 
@@ -248,7 +254,7 @@ impl Item {
                     .map(|ids| ids.items().iter().filter_map(Value::as_i64).collect())
                     .unwrap_or_default();
                 let menu = lock(&self.state).menu.clone();
-                let groups = (0..=menu.len() as i64)
+                let groups = (0..=super::rows(&menu).len() as i64)
                     .filter(|id| wanted.is_empty() || wanted.contains(id))
                     .filter_map(|id| {
                         let properties = self.properties_of(&menu, id)?;
@@ -332,45 +338,41 @@ impl Item {
         ]
     }
 
-    // item ids are menu positions from 1, and 0 is the root that holds them
+    // item ids are the rows of the menu and its submenus from 1, and 0 is the root
     fn properties_of(&self, menu: &[MenuItem], id: i64) -> Option<Vec<(&'static str, Value)>> {
         match id {
             0 => Some(vec![("children-display", Value::str("submenu"))]),
-            _ => menu.get(usize::try_from(id - 1).ok()?).map(item_properties),
+            _ => super::rows(menu)
+                .get(usize::try_from(id - 1).ok()?)
+                .map(|(_, item)| item_properties(item)),
         }
     }
 
+    // the entry asked for with what it holds, as deep as asked: -1 for all of it
     fn layout(&self, parent: i64, depth: i64) -> Reply {
         let state = lock(&self.state);
-        let entry = |index: usize, item: &MenuItem| {
-            layout(index as i32 + 1, item_properties(item), Vec::new())
-        };
-        let tree = match parent {
-            0 => {
-                let children = match depth {
-                    0 => Vec::new(),
-                    _ => state
-                        .menu
-                        .iter()
-                        .enumerate()
-                        .map(|(index, item)| Value::variant(entry(index, item)))
-                        .collect(),
-                };
-                layout(
-                    0,
-                    vec![("children-display", Value::str("submenu"))],
-                    children,
-                )
-            }
-            _ => {
-                let index = usize::try_from(parent - 1).ok();
-                let item = index.and_then(|index| Some((index, state.menu.get(index)?)));
-                let (index, item) =
-                    item.ok_or_else(|| unknown(format!("no menu item {parent}")))?;
-                entry(index, item)
-            }
-        };
-        Ok(vec![Value::Uint32(state.revision), tree])
+        let rows = super::rows(&state.menu);
+        fn entry(rows: &[(usize, &MenuItem)], id: usize, depth: i64) -> Value {
+            let children = match depth {
+                0 => Vec::new(),
+                _ => rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (parent, _))| *parent == id)
+                    .map(|(index, _)| Value::variant(entry(rows, index + 1, depth - 1)))
+                    .collect(),
+            };
+            let properties = match id {
+                0 => vec![("children-display", Value::str("submenu"))],
+                _ => item_properties(rows[id - 1].1),
+            };
+            layout(id as i32, properties, children)
+        }
+        let id = usize::try_from(parent)
+            .ok()
+            .filter(|id| *id <= rows.len())
+            .ok_or_else(|| unknown(format!("no menu item {parent}")))?;
+        Ok(vec![Value::Uint32(state.revision), entry(&rows, id, depth)])
     }
 
     // true when a check item flipped, so hosts reread the menu

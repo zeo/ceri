@@ -11,11 +11,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreateIcon, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetSystemMetrics,
-    GetWindowLongPtrW, HICON, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSGFLT_ALLOW, PostMessageW, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
-    SM_MENUDROPALIGNMENT, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
-    WM_CONTEXTMENU, WM_NCDESTROY, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GetWindowLongPtrW, HICON, HMENU, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSGFLT_ALLOW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    SM_CXSMICON, SM_MENUDROPALIGNMENT, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu,
+    WM_APP, WM_CONTEXTMENU, WM_NCDESTROY, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCSTR, PCWSTR, w};
 
@@ -213,31 +213,57 @@ impl Window {
     fn show_menu(&self, window: HWND, x: i32, y: i32) {
         // the lock is dropped before the menu's modal loop, so other threads can still update it
         let items = lock(&self.state).menu.clone();
-        // SAFETY: the menu lives until DestroyMenu below, and the strings until each append
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            for (index, item) in items.iter().enumerate() {
-                let _ = match item {
-                    MenuItem::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, None),
-                    MenuItem::Item {
-                        text,
-                        enabled,
-                        checked,
-                        ..
-                    } => {
-                        let mut flags = MF_STRING;
-                        if *checked == Some(true) {
-                            flags |= MF_CHECKED;
+        // each entry is numbered by its row, and a submenu is built before it is attached
+        // SAFETY: a menu lives until its parent is destroyed, and the strings until each append
+        unsafe fn build(items: &[MenuItem], row: &mut usize) -> Option<HMENU> {
+            // SAFETY: as the caller's
+            unsafe {
+                let menu = CreatePopupMenu().ok()?;
+                for item in items {
+                    *row += 1;
+                    // an ampersand would underline the next letter
+                    let label = |text: &str| wide(&text.replace('&', "&&"), usize::MAX);
+                    let _ = match item {
+                        MenuItem::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, None),
+                        MenuItem::Item {
+                            text,
+                            enabled,
+                            checked,
+                            ..
+                        } => {
+                            let mut flags = MF_STRING;
+                            if *checked == Some(true) {
+                                flags |= MF_CHECKED;
+                            }
+                            if !enabled {
+                                flags |= MF_GRAYED;
+                            }
+                            let label = label(text);
+                            AppendMenuW(menu, flags, *row, PCWSTR(label.as_ptr()))
                         }
-                        if !enabled {
-                            flags |= MF_GRAYED;
+                        MenuItem::Submenu {
+                            text,
+                            enabled,
+                            items,
+                        } => {
+                            let mut flags = MF_STRING | MF_POPUP;
+                            if !enabled {
+                                flags |= MF_GRAYED;
+                            }
+                            let child = build(items, row)?;
+                            let label = label(text);
+                            AppendMenuW(menu, flags, child.0 as usize, PCWSTR(label.as_ptr()))
                         }
-                        // an ampersand would underline the next letter
-                        let label = wide(&text.replace('&', "&&"), usize::MAX);
-                        AppendMenuW(menu, flags, index + 1, PCWSTR(label.as_ptr()))
-                    }
-                };
+                    };
+                }
+                Some(menu)
             }
+        }
+        // SAFETY: the menu lives until DestroyMenu below, which takes its submenus with it
+        unsafe {
+            let Some(menu) = build(&items, &mut 0) else {
+                return;
+            };
             // without the foreground the menu stays open when the user clicks elsewhere
             let _ = SetForegroundWindow(window);
             let side = match GetSystemMetrics(SM_MENUDROPALIGNMENT) {
@@ -253,15 +279,16 @@ impl Window {
                 self.notify(window, NIM_SETFOCUS, NOTIFY_ICON_DATA_FLAGS(0));
                 return;
             }
-            let Some(MenuItem::Item { id: wanted, .. }) = items.get(chosen as usize - 1) else {
+            let Some((_, MenuItem::Item { id: wanted, .. })) =
+                super::rows(&items).get(chosen as usize - 1).copied()
+            else {
                 return;
             };
             // the menu may have changed while it was open, so the item is found again by id
             let mut state = lock(&self.state);
-            let index = state
-                .menu
+            let index = super::rows(&state.menu)
                 .iter()
-                .position(|item| matches!(item, MenuItem::Item { id, .. } if id == wanted));
+                .position(|(_, item)| matches!(item, MenuItem::Item { id, .. } if id == wanted));
             let id = index.and_then(|index| state.choose(index));
             drop(state);
             if let Some(id) = id {
