@@ -6825,6 +6825,26 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_resolves_times_urls_and_transforms_as_chrome_does() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>#box { width: 100px; height: 40px; transition-duration: 1s, 250ms; animation-delay: 1500ms; background-image: url("a.png"), none; transform: translate(10px, 50%) rotate(45deg); } #flat { transform: none } #deep { transform: translateZ(5px) }</style><div id="box"></div><div id="flat"></div><div id="deep"></div><p id="status">idle</p><script>
+                const style = (id) => getComputedStyle(document.getElementById(id));
+                document.getElementById("status").textContent = [
+                    style("box").transitionDuration, style("box").animationDelay, style("box").backgroundImage,
+                    style("box").transform, style("flat").transform, style("deep").transform,
+                ].join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("computed style page should load");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "1s, 0.25s|1.5s|url(\"https://app.ceri.invalid/a.png\"), none|matrix(0.707107, 0.707107, -0.707107, 0.707107, 10, 20)|none|matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 5, 1)"
+        );
+    }
+
+    #[test]
     fn script_measures_layout_computed_style_and_media_queries() {
         let mut browser = Browser::new(bundle(
             r#"<style>body { margin: 0 } #box { position: relative; width: 100px; height: 40px; padding: 10px; border: 2px solid red; margin: 5px 0 0 8px; color: rgb(10, 20, 30) } #inner { height: 10px } @media (max-width: 500px) { #box { width: 50px } }</style><div id="box"><div id="inner"></div></div><p id="status">idle</p><script>

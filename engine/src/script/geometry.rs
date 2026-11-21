@@ -209,8 +209,122 @@ const COMPUTED: &[&str] = &[
 ];
 
 // blink prints css numbers to six significant digits
-fn css_number(value: f64) -> String {
-    number_to_string(format!("{value:.5e}").parse().unwrap_or(value))
+// a number as Blink prints CSS numbers, printf's %g with six significant digits: exponent
+// form below 1e-4 or from 1e6, and no trailing zeros
+pub(super) fn css_number(value: f64) -> String {
+    if value == 0.0 || !value.is_finite() {
+        return if value.is_finite() {
+            "0".into()
+        } else {
+            number_to_string(value)
+        };
+    }
+    let formatted = format!("{:.5e}", value.abs());
+    let (mantissa, exponent) = formatted.split_once('e').expect("exponent form");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let exponent: i32 = exponent.parse().expect("an exponent");
+    let sign = if value < 0.0 { "-" } else { "" };
+    let trim = |text: String| {
+        if !text.contains('.') {
+            return text;
+        }
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    if !(-4..6).contains(&exponent) {
+        let mantissa = trim(format!("{}.{}", &digits[..1], &digits[1..]));
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs());
+    }
+    let point = exponent + 1;
+    let text = if point <= 0 {
+        format!("0.{}{digits}", "0".repeat((-point) as usize))
+    } else {
+        let point = point as usize;
+        format!("{}.{}", &digits[..point], &digits[point..])
+    };
+    format!("{sign}{}", trim(text))
+}
+
+// a list of times as their computed value gives them, in seconds
+fn seconds_list(value: &str) -> String {
+    value
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            let seconds = match item.to_ascii_lowercase().strip_suffix("ms") {
+                Some(milliseconds) => milliseconds
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .map(|ms| ms / 1000.0),
+                None => item
+                    .strip_suffix(['s', 'S'])
+                    .and_then(|seconds| seconds.trim().parse::<f64>().ok()),
+            };
+            seconds.map_or_else(
+                || item.to_string(),
+                |seconds| format!("{}s", css_number(seconds)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// url() references made absolute and quoted, as computed values carry them
+fn absolute_urls(value: &str, base: &crate::AppUrl) -> String {
+    let mut output = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("url(") {
+        let Some(end) = rest[start..].find(')') else {
+            break;
+        };
+        output.push_str(&rest[..start]);
+        let inner = rest[start + 4..start + end].trim();
+        let reference = inner
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .or_else(|| {
+                inner
+                    .strip_prefix('\'')
+                    .and_then(|inner| inner.strip_suffix('\''))
+            })
+            .unwrap_or(inner);
+        let resolved = base
+            .resolve(reference)
+            .map_or_else(|_| reference.to_string(), |url| url.to_string());
+        output.push_str(&format!("url(\"{}\")", resolved.replace('"', "\\\"")));
+        rest = &rest[start + end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+// a transform list resolved against the border box, as matrix() or matrix3d()
+fn transform_matrix(value: &str, width: f32, height: f32, font_size: f32) -> Option<String> {
+    let ops = crate::transform::parse_transform_list(value)?;
+    let matrix = ops
+        .iter()
+        .fold(crate::transform::Matrix::IDENTITY, |matrix, op| {
+            matrix.multiply(&op.matrix(width, height, font_size))
+        });
+    let m = matrix.0;
+    let flat = [2, 3, 6, 7, 8, 9, 11, 14]
+        .iter()
+        .all(|&index| m[index] == 0.0)
+        && m[10] == 1.0
+        && m[15] == 1.0;
+    let text = |indices: &[usize]| {
+        indices
+            .iter()
+            .map(|&index| css_number(f64::from(m[index])))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(if flat {
+        format!("matrix({})", text(&[0, 1, 4, 5, 12, 13]))
+    } else {
+        format!("matrix3d({})", text(&(0..16).collect::<Vec<_>>()))
+    })
 }
 
 fn px(value: f32) -> String {
@@ -885,6 +999,37 @@ impl ScriptRuntime {
                 .entry(property.clone())
                 .or_insert_with(|| value.clone());
         }
+        for property in [
+            "transition-duration",
+            "transition-delay",
+            "animation-duration",
+            "animation-delay",
+        ] {
+            if let Some(value) = values.get_mut(property) {
+                *value = seconds_list(value);
+            }
+        }
+        if let Some(base) = self.base_url.clone() {
+            for property in [
+                "background-image",
+                "list-style-image",
+                "border-image-source",
+                "mask-image",
+            ] {
+                if let Some(value) = values.get_mut(property) {
+                    *value = absolute_urls(value, &base);
+                }
+            }
+        }
+        if let Some(value) = values.get_mut("transform")
+            && value != "none"
+        {
+            let (width, height) =
+                geometry.map_or((0.0, 0.0), |found| (found.rect.width, found.rect.height));
+            if let Some(matrix) = transform_matrix(value, width, height, font_size) {
+                *value = matrix;
+            }
+        }
         values
     }
 
@@ -1539,5 +1684,44 @@ fn align_delta(start: f32, size: f32, port: f32, port_size: f32, alignment: &str
         _ if (start < port) == (end > port_end) => 0.0,
         _ if (start < port) == (size <= port_size) => start - port,
         _ => end - port_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::css_number;
+
+    #[test]
+    fn css_numbers_print_as_percent_g_with_six_digits() {
+        let printed: Vec<String> = [
+            1.0,
+            0.5,
+            1.0 / 3.0,
+            1e21,
+            -0.0,
+            1234567.5,
+            123456.7,
+            0.0001,
+            0.00001234,
+            -2.5,
+        ]
+        .into_iter()
+        .map(css_number)
+        .collect();
+        assert_eq!(
+            printed,
+            [
+                "1",
+                "0.5",
+                "0.333333",
+                "1e+21",
+                "0",
+                "1.23457e+06",
+                "123457",
+                "0.0001",
+                "1.234e-05",
+                "-2.5"
+            ]
+        );
     }
 }
