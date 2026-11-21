@@ -781,8 +781,15 @@ impl ScriptRuntime {
             _ => self.error_prototype(kind),
         };
         let mut object = JsObject::with_prototype(Some(prototype), ObjectClass::Error);
+        // AggregateError(errors, message, options) and SuppressedError(error, suppressed, message)
+        // take their message after the values they carry
+        let message_at = match kind {
+            "AggregateError" => 1,
+            "SuppressedError" => 2,
+            _ => 0,
+        };
         if let Some(message) = arguments
-            .first()
+            .get(message_at)
             .filter(|value| !matches!(value, Value::Undefined))
         {
             let message = self.coerce_string(message.clone())?;
@@ -791,10 +798,27 @@ impl ScriptRuntime {
                 Property::hidden(Value::String(message.into())),
             );
         }
-        if let Some(Value::Object(options)) = arguments.get(1)
-            && let Some(cause) = options.borrow().get("cause")
+        if kind != "SuppressedError"
+            && let Some(options @ Value::Object(_)) = arguments.get(message_at + 1)
+            && self.has_property(options, "cause")?
         {
-            object.define("cause".to_string(), Property::hidden(cause.clone()));
+            let cause = self.get_property(options, "cause")?;
+            object.define("cause".to_string(), Property::hidden(cause));
+        }
+        let argument = |index: usize| arguments.get(index).cloned().unwrap_or(Value::Undefined);
+        match kind {
+            "AggregateError" => {
+                let errors = self.iterate_to_vec(argument(0))?;
+                object.define(
+                    "errors".to_string(),
+                    Property::hidden(Self::new_array(errors)),
+                );
+            }
+            "SuppressedError" => {
+                object.define("error".to_string(), Property::hidden(argument(0)));
+                object.define("suppressed".to_string(), Property::hidden(argument(1)));
+            }
+            _ => {}
         }
         Ok(self.with_stack(object))
     }
@@ -1213,13 +1237,6 @@ impl ScriptRuntime {
         frame.stack.split_off(start)
     }
 
-    fn spread_list(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
-        match value {
-            Value::Array(array) => Ok(array.borrow().iter().cloned().map(Value::filled).collect()),
-            other => self.iterate_to_vec(other),
-        }
-    }
-
     // one instruction; Some ends this run with a result
     fn step(&mut self, frames: &mut Vec<Frame>) -> Result<Option<RunResult>, ScriptError> {
         let frame = frames.last_mut().expect("a frame is running");
@@ -1628,7 +1645,7 @@ impl ScriptRuntime {
                     Op::ArgumentSpread(site) => Some(Callsite::Argument(name(site))),
                     _ => None,
                 };
-                let items = self.spread_list(value);
+                let items = self.iterate_to_vec(value);
                 self.iterable_callsite = None;
                 let items = items?;
                 let frame = frames.last_mut().expect("frame");

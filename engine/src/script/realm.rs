@@ -166,6 +166,7 @@ pub(super) enum Native {
     Path(super::path2d::PathMember),
     Matrix(super::matrices::MatrixMember),
     Segmenter(super::segmenter::SegmenterMember),
+    Disposable(super::disposables::DisposableMember, bool),
     Cssom(super::cssom::CssomMember),
     Font(super::fontfaces::FontMember),
     // DOMMatrixReadOnly when true, DOMMatrix otherwise
@@ -248,6 +249,7 @@ impl Native {
                 | Native::Path(super::path2d::PathMember::Constructor)
                 | Native::MatrixConstructor(_)
                 | Native::Segmenter(super::segmenter::SegmenterMember::Constructor)
+                | Native::Disposable(super::disposables::DisposableMember::Constructor, _)
                 | Native::Cssom(super::cssom::CssomMember::SheetConstructor)
                 | Native::Cssom(super::cssom::CssomMember::RuleConstructor)
                 | Native::Font(super::fontfaces::FontMember::FaceConstructor)
@@ -303,6 +305,7 @@ pub(super) struct Intrinsics {
     pub(super) eval_error_prototype: ObjectHandle,
     pub(super) uri_error_prototype: ObjectHandle,
     pub(super) aggregate_error_prototype: ObjectHandle,
+    pub(super) suppressed_error_prototype: ObjectHandle,
     pub(super) dom_exception_prototype: ObjectHandle,
     pub(super) promise_prototype: ObjectHandle,
     pub(super) promise_constructor: ObjectHandle,
@@ -343,6 +346,7 @@ pub(super) struct Intrinsics {
     pub(super) paths: super::path2d::PathInterfaces,
     pub(super) matrices: super::matrices::MatrixInterfaces,
     pub(super) segmenters: super::segmenter::SegmenterInterfaces,
+    pub(super) disposables: super::disposables::DisposableInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
     pub(super) font_faces: super::fontfaces::FontInterfaces,
     pub(super) helpers: super::iterator_helpers::HelperInterfaces,
@@ -439,7 +443,7 @@ impl Builder {
             .define(key.to_string(), Property::hidden(Value::Object(function)));
     }
 
-    fn value(&self, target: &ObjectHandle, key: &str, value: Value) {
+    pub(super) fn value(&self, target: &ObjectHandle, key: &str, value: Value) {
         // a toStringTag is configurable but not writable
         let writable = key != "@@toStringTag";
         target.borrow_mut().define(
@@ -451,7 +455,13 @@ impl Builder {
         );
     }
 
-    fn getter(&self, target: &ObjectHandle, key: &str, getter: Native, setter: Option<Native>) {
+    pub(super) fn getter(
+        &self,
+        target: &ObjectHandle,
+        key: &str,
+        getter: Native,
+        setter: Option<Native>,
+    ) {
         let name = match symbol_description(key) {
             Some(description) if is_symbol_key(key) => format!("[{description}]"),
             _ => key.to_string(),
@@ -635,6 +645,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         "replace",
         "search",
         "split",
+        "dispose",
+        "asyncDispose",
     ] {
         symbol
             .borrow_mut()
@@ -677,11 +689,16 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         "EvalError",
         "URIError",
         "AggregateError",
+        "SuppressedError",
     ] {
         let prototype = plain(&error_prototype);
         build.value(&prototype, "name", Value::String(kind.to_string().into()));
         build.value(&prototype, "message", Value::String(String::new().into()));
-        let length = if kind == "AggregateError" { 2 } else { 1 };
+        let length = match kind {
+            "AggregateError" => 2,
+            "SuppressedError" => 3,
+            _ => 1,
+        };
         let constructor =
             build.constructor(Native::ErrorConstructor(kind), kind, length, &prototype);
         constructor.borrow_mut().set_prototype(Some(error.clone()));
@@ -696,9 +713,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         eval_error_prototype,
         uri_error_prototype,
         aggregate_error_prototype,
-    ]: [ObjectHandle; 7] = error_prototypes
+        suppressed_error_prototype,
+    ]: [ObjectHandle; 8] = error_prototypes
         .try_into()
-        .unwrap_or_else(|_| unreachable!("seven error kinds"));
+        .unwrap_or_else(|_| unreachable!("eight error kinds"));
 
     let dom_exception_prototype = plain(&error_prototype);
     let dom_exception = build.constructor(
@@ -1472,6 +1490,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     }
     let segmenters =
         super::segmenter::create(&build, &object_prototype, &iterator_prototype, &intl);
+    let (disposables, disposable_globals) = super::disposables::create(&build, &object_prototype);
+    globals.extend(disposable_globals);
     globals.push(("Intl", Value::Object(intl)));
 
     let reflect = plain(&object_prototype);
@@ -1578,6 +1598,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         eval_error_prototype,
         uri_error_prototype,
         aggregate_error_prototype,
+        suppressed_error_prototype,
         dom_exception_prototype,
         promise_prototype,
         promise_constructor,
@@ -1617,6 +1638,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         paths,
         matrices,
         segmenters,
+        disposables,
         cssom,
         font_faces,
         helpers,
@@ -3041,6 +3063,9 @@ impl ScriptRuntime {
             Native::Path(member) => self.call_path(member, this, arguments),
             Native::Matrix(member) => self.call_matrix(member, this, arguments),
             Native::Segmenter(member) => self.call_segmenter(member, this, arguments),
+            Native::Disposable(member, asynchronous) => {
+                self.call_disposable(member, asynchronous, this, arguments)
+            }
             Native::Cssom(member) => self.call_cssom(member, this, arguments),
             Native::Font(member) => self.call_font(member, this, arguments),
             Native::MatrixConstructor(_) => Err(self.type_error(
@@ -3460,6 +3485,9 @@ impl ScriptRuntime {
             Native::Markup(_) => self.construct_markup(new_target),
             Native::Path(_) => self.construct_path(arguments, new_target),
             Native::Segmenter(_) => self.construct_segmenter(arguments, new_target),
+            Native::Disposable(_, asynchronous) => {
+                self.construct_disposable(asynchronous, new_target)
+            }
             Native::Cssom(super::cssom::CssomMember::SheetConstructor) => {
                 self.construct_sheet(arguments, new_target)
             }

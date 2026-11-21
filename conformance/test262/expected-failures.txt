@@ -1136,8 +1136,6 @@ test/built-ins/Date/prototype/toTemporalInstant/this-value-non-object.js
 test/built-ins/Date/prototype/toTemporalInstant/this-value-valid-date.js
 test/built-ins/Date/prototype/toUTCString/negative-year.js
 test/built-ins/Date/subclassing.js
-test/built-ins/Error/cause_abrupt.js
-test/built-ins/Error/constructor.js
 test/built-ins/Error/isError/errors-other-realm.js
 test/built-ins/Error/isError/non-error-objects-other-realm.js
 test/built-ins/Error/proto-from-ctor-realm.js
@@ -2496,12 +2494,8 @@ test/built-ins/String/prototype/valueOf/non-generic-realm.js
 test/built-ins/String/raw/special-characters.js
 test/built-ins/String/symbol-wrapping.js
 test/built-ins/Symbol/asyncDispose/cross-realm.js
-test/built-ins/Symbol/asyncDispose/no-key.js
-test/built-ins/Symbol/asyncDispose/prop-desc.js
 test/built-ins/Symbol/asyncIterator/cross-realm.js
 test/built-ins/Symbol/dispose/cross-realm.js
-test/built-ins/Symbol/dispose/no-key.js
-test/built-ins/Symbol/dispose/prop-desc.js
 test/built-ins/Symbol/for/cross-realm.js
 test/built-ins/Symbol/hasInstance/cross-realm.js
 test/built-ins/Symbol/is-constructor.js

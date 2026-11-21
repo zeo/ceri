@@ -126,6 +126,7 @@ pub(super) enum ObjectClass {
     CssRule(Rc<super::cssom::RuleState>),
     // an Intl.Segmenter, the segments of a string, or an iterator over them
     Segmenter(Rc<super::segmenter::SegmenterState>),
+    DisposableStack(Rc<super::disposables::DisposableStack>),
     // a stream, its controller, a reader or an iterator over one
     Stream(super::streams::StreamHandle),
     // the object of a typed array of this kind, for its named properties and prototype

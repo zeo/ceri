@@ -72,6 +72,7 @@ pub(super) enum PromiseFunction {
     FromAsync,
     // a step of Array.fromAsync once what it awaited settled
     FromAsyncStep(Rc<super::from_async::FromAsync>, super::from_async::Phase),
+    DisposalStep(Rc<super::disposables::Disposal>, bool),
 }
 
 fn argument(arguments: &[Value], index: usize) -> Value {
@@ -504,6 +505,9 @@ impl ScriptRuntime {
             PromiseFunction::FromAsync => Ok(self.array_from_async(arguments)),
             PromiseFunction::FromAsyncStep(state, phase) => {
                 self.step_from_async(&state, phase, argument(&arguments, 0))
+            }
+            PromiseFunction::DisposalStep(disposal, rejected) => {
+                self.step_disposal(&disposal, rejected, argument(&arguments, 0))
             }
         }
     }

@@ -238,6 +238,7 @@ impl ScriptRuntime {
             "EvalError" => intrinsics.eval_error_prototype.clone(),
             "URIError" => intrinsics.uri_error_prototype.clone(),
             "AggregateError" => intrinsics.aggregate_error_prototype.clone(),
+            "SuppressedError" => intrinsics.suppressed_error_prototype.clone(),
             _ => intrinsics.error_prototype.clone(),
         }
     }
@@ -2083,15 +2084,9 @@ impl ScriptRuntime {
     fn iterator_state(&mut self, value: Value) -> Result<VmIterator, ScriptError> {
         // taken first, so an iteration the lookup itself runs reports in its own words
         let callsite = self.iterable_callsite.take();
-        let method = match &value {
-            Value::Array(_) => Some(self.get_property(&value, "@@iterator")?),
-            _ => None,
-        };
-        let replaced = method.as_ref().is_some_and(|method| {
-            !matches!(method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(Native::ArrayValues)))
-        });
+        let plain = self.iterates_plainly(&value)?;
         match &value {
-            Value::Array(array) if !replaced => Ok(VmIterator::Array {
+            Value::Array(array) if plain => Ok(VmIterator::Array {
                 array: array.clone(),
                 index: 0,
             }),
@@ -2362,11 +2357,24 @@ impl ScriptRuntime {
         Ok(())
     }
 
+    // whether an array still iterates through the built-in values(), so its elements can be
+    // read directly instead of through a replaced Symbol.iterator
+    pub(super) fn iterates_plainly(&mut self, value: &Value) -> Result<bool, ScriptError> {
+        if !matches!(value, Value::Array(_)) {
+            return Ok(false);
+        }
+        let method = self.get_property(value, "@@iterator")?;
+        Ok(
+            matches!(&method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(Native::ArrayValues))),
+        )
+    }
+
     pub(super) fn iterate_to_vec(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
         match &value {
-            Value::Array(array) => {
+            Value::Array(array) if self.iterates_plainly(&value)? => {
                 return Ok(array.borrow().iter().cloned().map(Value::filled).collect());
             }
+            Value::Array(_) => {}
             other if !matches!(other, Value::Object(_)) => {
                 if let Some(values) = host_iterable_values(other) {
                     return Ok(values);
