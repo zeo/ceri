@@ -145,6 +145,10 @@ pub(super) enum Native {
     XhrConstructor,
     Socket(super::sockets::SocketMember),
     SocketConstructor,
+    Source(super::eventsource::SourceMember),
+    SourceConstructor,
+    // an event source that lost its connection tries again
+    SourceReconnect(u32),
     Notice(super::notifications::NoticeMember),
     NoticeConstructor,
     Channel(super::broadcast::ChannelMember),
@@ -226,6 +230,7 @@ impl Native {
                 | Native::ObserverConstructor(_)
                 | Native::XhrConstructor
                 | Native::SocketConstructor
+                | Native::SourceConstructor
                 | Native::NoticeConstructor
                 | Native::ChannelConstructor
                 | Native::ReaderConstructor
@@ -312,6 +317,7 @@ pub(super) struct Intrinsics {
     pub(super) observers: super::observers::ObserverInterfaces,
     pub(super) xhr: super::xhr::XhrInterfaces,
     pub(super) sockets: super::sockets::SocketInterfaces,
+    pub(super) event_sources: super::eventsource::SourceInterfaces,
     pub(super) notices: super::notifications::NoticeInterfaces,
     pub(super) channels: super::broadcast::ChannelInterfaces,
     pub(super) readers: super::filereader::ReaderInterfaces,
@@ -1472,6 +1478,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let observers = super::observers::create(&build, &object_prototype, &mut globals);
     let xhr = super::xhr::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let sockets = super::sockets::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let event_sources =
+        super::eventsource::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let notices = super::notifications::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let channels = super::broadcast::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
@@ -1555,6 +1563,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         observers,
         xhr,
         sockets,
+        event_sources,
         notices,
         channels,
         readers,
@@ -3030,6 +3039,11 @@ impl ScriptRuntime {
                 "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
             Native::FetchAbort(id) => self.abort_fetch(id),
+            Native::Source(member) => self.call_source(member, this),
+            Native::SourceReconnect(id) => self.reconnect_source(id),
+            Native::SourceConstructor => Err(self.type_error(
+                "Failed to construct 'EventSource': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+            )),
             Native::ReportError => {
                 let error = self.throw_value(first);
                 self.report_exception(error);
@@ -3367,6 +3381,7 @@ impl ScriptRuntime {
             }
             Native::XhrConstructor => self.construct_xhr(new_target),
             Native::SocketConstructor => self.construct_socket(arguments, new_target),
+            Native::SourceConstructor => self.construct_source(arguments, new_target),
             Native::NoticeConstructor => self.construct_notice(arguments, new_target),
             Native::ChannelConstructor => self.construct_channel(arguments, new_target),
             Native::ReaderConstructor => self.construct_reader(new_target),

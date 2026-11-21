@@ -17,6 +17,7 @@ mod debugger;
 mod dialogs;
 mod encoding;
 mod events;
+mod eventsource;
 mod filereader;
 mod from_async;
 mod geometry;
@@ -673,6 +674,7 @@ pub struct ScriptRuntime {
     registries: Vec<std::rc::Weak<RefCell<collections::Registry>>>,
     // outside fetches the host runs off this thread, and the id the next one takes
     fetches: RefCell<Vec<netfetch::PendingFetch>>,
+    event_sources: HashMap<u32, eventsource::SourceState>,
     next_fetch_id: std::cell::Cell<u32>,
     pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
     random_state: u64,
@@ -1807,6 +1809,7 @@ impl ScriptRuntime {
             array_expando_prune_at: 64,
             registries: Vec::new(),
             fetches: RefCell::new(Vec::new()),
+            event_sources: HashMap::new(),
             next_fetch_id: std::cell::Cell::new(0),
             pattern_cache: HashMap::new(),
             random_state: numbers::random_seed(),
@@ -5290,6 +5293,7 @@ impl ScriptRuntime {
             + self.pump_audio()?
             + self.pump_sockets()?
             + self.pump_fetches()?
+            + self.pump_event_sources()?
             + self.pump_notices()?
             + self.pump_media();
         self.drain_microtasks()?;
