@@ -2273,7 +2273,7 @@ impl ScriptRuntime {
                 }
                 let mut level = Level::new(format, width as u32, height as u32, 1);
                 if format.has_depth() || format.has_stencil() {
-                    level.texels.fill([1.0, 0.0, 0.0, 1.0]);
+                    level.fill([1.0, 0.0, 0.0, 1.0]);
                 }
                 let renderbuffer = gl.renderbuffers.get_mut(&id).expect("bound");
                 renderbuffer.level = Some(level);
@@ -2604,13 +2604,7 @@ impl ScriptRuntime {
                     id,
                     face,
                     level,
-                    Level {
-                        width: width as u32,
-                        height: height as u32,
-                        depth: 1,
-                        format,
-                        texels,
-                    },
+                    Level::from_floats(format, width as u32, height as u32, 1, texels),
                 );
                 undefined
             }
@@ -3450,7 +3444,9 @@ impl ScriptRuntime {
                     gl.error(INVALID_VALUE);
                     return Ok(Value::Undefined);
                 }
-                Level::new(target_format, width as u32, height as u32, depth as u32).texels
+                let blank = Level::new(target_format, width as u32, height as u32, depth as u32);
+                gl.store_level(id, face, level, blank);
+                return Ok(Value::Undefined);
             }
             Pixels::Bytes(bytes) => {
                 let Some((pixel, _)) = super::texture::pixel_size(format, kind) else {
@@ -3485,18 +3481,14 @@ impl ScriptRuntime {
                 id, face, level, offsets[0], offsets[1], offsets[2], width, height, depth, &texels,
             );
         } else {
-            gl.store_level(
-                id,
-                face,
-                level,
-                Level {
-                    width: width as u32,
-                    height: height as u32,
-                    depth: depth as u32,
-                    format: target_format,
-                    texels,
-                },
+            let image = Level::from_floats(
+                target_format,
+                width as u32,
+                height as u32,
+                depth as u32,
+                texels,
             );
+            gl.store_level(id, face, level, image);
         }
         Ok(Value::Undefined)
     }

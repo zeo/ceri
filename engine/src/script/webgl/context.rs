@@ -662,7 +662,7 @@ impl Context {
         };
         let depth_stencil = depth_format.map(|format| {
             let mut level = Level::new(format, width, height, 1);
-            level.texels.fill([1.0, 0.0, 0.0, 1.0]);
+            level.fill([1.0, 0.0, 0.0, 1.0]);
             level
         });
         (color, depth_stencil)
@@ -767,9 +767,9 @@ impl Context {
         }
         self.clear_pending = false;
         let blank = [0.0, 0.0, 0.0, if self.alpha { 0.0 } else { 1.0 }];
-        self.color.texels.fill(blank);
+        self.color.fill(blank);
         if let Some(level) = &mut self.depth_stencil {
-            level.texels.fill([1.0, 0.0, 0.0, 1.0]);
+            level.fill([1.0, 0.0, 0.0, 1.0]);
         }
     }
 
@@ -996,7 +996,7 @@ impl Context {
                 for dx in 0..width as u32 {
                     let index = image.index(x as u32 + dx, y as u32 + dy, z as u32 + dz);
                     if let Some(texel) = source.next() {
-                        image.texels[index] = *texel;
+                        image.set(index, *texel);
                     }
                 }
             }
@@ -1724,15 +1724,28 @@ impl Context {
             let stored_depth = level.format.store([depth.clamp(0.0, 1.0), 0.0, 0.0, 0.0])[0];
             let write_mask = self.stencil[0].write_mask & 255;
             let stencil_value = (stencil as u32) & 255;
-            for_area(level, area, |texel| {
-                if write_depth {
-                    texel[0] = stored_depth;
-                }
-                if write_stencil {
-                    let old = texel[1] as u32;
-                    texel[1] = ((old & !write_mask) | (stencil_value & write_mask)) as f32;
-                }
-            });
+            // every channel the buffer has is written, so the rectangle takes one value
+            let whole = (write_depth || !level.format.has_depth())
+                && (write_stencil && write_mask == 255 || !level.format.has_stencil());
+            let clipped = [
+                area[0].max(0) as u32,
+                area[1].max(0) as u32,
+                area[2].clamp(0, level.width as i32) as u32,
+                area[3].clamp(0, level.height as i32) as u32,
+            ];
+            if whole && clipped[0] < clipped[2] && clipped[1] < clipped[3] {
+                level.fill_rect(0, clipped, [stored_depth, stencil_value as f32, 0.0, 1.0]);
+            } else if write_depth || write_stencil {
+                for_area(level, area, |texel| {
+                    if write_depth {
+                        texel[0] = stored_depth;
+                    }
+                    if write_stencil {
+                        let old = texel[1] as u32;
+                        texel[1] = ((old & !write_mask) | (stencil_value & write_mask)) as f32;
+                    }
+                });
+            }
         }
         self.put_back(taken);
     }
@@ -1860,18 +1873,7 @@ impl Context {
             Attachment::Renderbuffer(id) => (self.renderbuffers[&id].level.clone()?, 0),
         };
         if layer > 0 {
-            // a single layer as a 2D image
-            let start = (layer * level.width * level.height) as usize;
-            let texels =
-                level.texels[start..start + (level.width * level.height) as usize].to_vec();
-            return Some((
-                Level {
-                    depth: 1,
-                    texels,
-                    ..level
-                },
-                Some(attachment),
-            ));
+            return Some((level.layer(layer), Some(attachment)));
         }
         Some((level, Some(attachment)))
     }
@@ -2124,7 +2126,9 @@ impl Context {
                     };
                     if let Some(sample) = sample {
                         let index = target.index(x as u32, y as u32, layer);
-                        write(&mut target.texels[index], sample);
+                        let mut texel = target.get(index);
+                        write(&mut texel, sample);
+                        target.set(index, texel);
                     }
                 }
             }
@@ -2990,7 +2994,9 @@ fn for_area(level: &mut Level, [x0, y0, x1, y1]: [i32; 4], mut apply: impl FnMut
     for y in y0.max(0)..y1.min(level.height as i32) {
         for x in x0.max(0)..x1.min(level.width as i32) {
             let index = level.index(x as u32, y as u32, 0);
-            apply(&mut level.texels[index]);
+            let mut texel = level.get(index);
+            apply(&mut texel);
+            level.set(index, texel);
         }
     }
 }
@@ -3004,15 +3010,33 @@ fn fill_color(
 ) {
     let format = level.format;
     let stored = format.store(channels(format.base, color));
-    for y in y0.max(0)..y1.min(level.height as i32) {
-        for x in x0.max(0)..x1.min(level.width as i32) {
-            let index = level.index(x as u32, y as u32, layer);
-            let texel = &mut level.texels[index];
-            for channel in 0..4 {
-                if mask[channel] {
-                    texel[channel] = stored[channel];
-                }
-            }
+    let area = [
+        x0.max(0) as u32,
+        y0.max(0) as u32,
+        x1.clamp(0, level.width as i32) as u32,
+        y1.clamp(0, level.height as i32) as u32,
+    ];
+    if area[0] >= area[2] || area[1] >= area[3] {
+        return;
+    }
+    if mask == [true; 4] {
+        level.fill_rect(layer, area, stored);
+        return;
+    }
+    for y in area[1]..area[3] {
+        for x in area[0]..area[2] {
+            let index = level.index(x, y, layer);
+            let old = level.get(index);
+            level.set(
+                index,
+                std::array::from_fn(|channel| {
+                    if mask[channel] {
+                        stored[channel]
+                    } else {
+                        old[channel]
+                    }
+                }),
+            );
         }
     }
 }

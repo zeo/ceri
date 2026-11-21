@@ -490,13 +490,103 @@ pub(crate) fn from_srgb(encoded: f32) -> f32 {
     }
 }
 
+// the stored texels of a level: four bytes each for a format of eight bits or fewer per
+// channel, as a GPU keeps it, and four floats for the rest; sRGB bytes hold encoded values
+#[derive(Clone)]
+pub(crate) enum Texels {
+    Bytes(Vec<[u8; 4]>),
+    Floats(Vec<[f32; 4]>),
+}
+
+// a run of a level's texels to read and write, such as a band of an attachment
+pub(crate) enum TexelsMut<'a> {
+    Bytes(&'a mut [[u8; 4]]),
+    Floats(&'a mut [[f32; 4]]),
+}
+
+// whether a format's values fit a byte per channel
+fn compact(format: Format) -> bool {
+    matches!(format.kind, Kind::Unorm | Kind::Srgb) && format.bits.iter().all(|&bits| bits <= 8)
+}
+
+fn srgb_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|byte| from_srgb(byte as f32 / 255.0)))
+}
+
+// each byte divided by 255, so a byte reads back as exactly the value store rounded to
+fn unorm_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|byte| byte as f32 / 255.0))
+}
+
+#[inline]
+fn from_bytes(bytes: [u8; 4], srgb: bool) -> [f32; 4] {
+    let unorm = unorm_table();
+    if srgb {
+        let table = srgb_table();
+        [
+            table[usize::from(bytes[0])],
+            table[usize::from(bytes[1])],
+            table[usize::from(bytes[2])],
+            unorm[usize::from(bytes[3])],
+        ]
+    } else {
+        bytes.map(|byte| unorm[usize::from(byte)])
+    }
+}
+
+#[inline]
+fn to_bytes(value: [f32; 4], srgb: bool) -> [u8; 4] {
+    // adding a half and truncating rounds half away from zero for values in 0 to 1
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    if srgb {
+        [
+            byte(to_srgb(value[0])),
+            byte(to_srgb(value[1])),
+            byte(to_srgb(value[2])),
+            byte(value[3]),
+        ]
+    } else {
+        value.map(byte)
+    }
+}
+
+impl TexelsMut<'_> {
+    #[inline]
+    pub(crate) fn get(&self, index: usize, srgb: bool) -> [f32; 4] {
+        match self {
+            TexelsMut::Bytes(texels) => from_bytes(texels[index], srgb),
+            TexelsMut::Floats(texels) => texels[index],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, index: usize, value: [f32; 4], srgb: bool) {
+        match self {
+            TexelsMut::Bytes(texels) => texels[index] = to_bytes(value, srgb),
+            TexelsMut::Floats(texels) => texels[index] = value,
+        }
+    }
+}
+
+impl<'a> TexelsMut<'a> {
+    // consecutive runs of `size` texels
+    pub(crate) fn chunks(self, size: usize) -> Vec<TexelsMut<'a>> {
+        match self {
+            TexelsMut::Bytes(texels) => texels.chunks_mut(size).map(TexelsMut::Bytes).collect(),
+            TexelsMut::Floats(texels) => texels.chunks_mut(size).map(TexelsMut::Floats).collect(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Level {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) depth: u32,
     pub(crate) format: Format,
-    pub(crate) texels: Vec<[f32; 4]>,
+    texels: Texels,
 }
 
 impl Level {
@@ -513,13 +603,52 @@ impl Level {
         } else {
             blank
         };
+        let count = width as usize * height as usize * depth as usize;
+        let texels = if compact(format) {
+            Texels::Bytes(vec![to_bytes(blank, format.kind == Kind::Srgb); count])
+        } else {
+            Texels::Floats(vec![blank; count])
+        };
         Level {
             width,
             height,
             depth,
             format,
-            texels: vec![blank; width as usize * height as usize * depth as usize],
+            texels,
         }
+    }
+
+    // a level holding texels already rounded to its format
+    pub(crate) fn from_floats(
+        format: Format,
+        width: u32,
+        height: u32,
+        depth: u32,
+        texels: Vec<[f32; 4]>,
+    ) -> Level {
+        let srgb = format.kind == Kind::Srgb;
+        let texels = if compact(format) {
+            Texels::Bytes(
+                texels
+                    .into_iter()
+                    .map(|texel| to_bytes(texel, srgb))
+                    .collect(),
+            )
+        } else {
+            Texels::Floats(texels)
+        };
+        Level {
+            width,
+            height,
+            depth,
+            format,
+            texels,
+        }
+    }
+
+    #[inline]
+    fn srgb(&self) -> bool {
+        self.format.kind == Kind::Srgb
     }
 
     #[inline]
@@ -528,8 +657,82 @@ impl Level {
     }
 
     #[inline]
+    pub(crate) fn get(&self, index: usize) -> [f32; 4] {
+        match &self.texels {
+            Texels::Bytes(texels) => from_bytes(texels[index], self.srgb()),
+            Texels::Floats(texels) => texels[index],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, index: usize, value: [f32; 4]) {
+        let srgb = self.srgb();
+        match &mut self.texels {
+            Texels::Bytes(texels) => texels[index] = to_bytes(value, srgb),
+            Texels::Floats(texels) => texels[index] = value,
+        }
+    }
+
+    #[inline]
     pub(crate) fn texel(&self, x: u32, y: u32, z: u32) -> [f32; 4] {
-        self.texels[self.index(x, y, z)]
+        self.get(self.index(x, y, z))
+    }
+
+    pub(crate) fn fill(&mut self, value: [f32; 4]) {
+        let srgb = self.srgb();
+        match &mut self.texels {
+            Texels::Bytes(texels) => texels.fill(to_bytes(value, srgb)),
+            Texels::Floats(texels) => texels.fill(value),
+        }
+    }
+
+    // one value over a rectangle of a layer, already clipped to the level, a row at a time
+    pub(crate) fn fill_rect(&mut self, layer: u32, [x0, y0, x1, y1]: [u32; 4], value: [f32; 4]) {
+        let (width, plane) = (
+            self.width as usize,
+            self.width as usize * self.height as usize,
+        );
+        let rows = (y0 as usize..y1 as usize).map(|y| layer as usize * plane + y * width);
+        let (x0, x1) = (x0 as usize, x1 as usize);
+        let srgb = self.srgb();
+        match &mut self.texels {
+            Texels::Bytes(texels) => {
+                let bytes = to_bytes(value, srgb);
+                for row in rows {
+                    texels[row + x0..row + x1].fill(bytes);
+                }
+            }
+            Texels::Floats(texels) => {
+                for row in rows {
+                    texels[row + x0..row + x1].fill(value);
+                }
+            }
+        }
+    }
+
+    // the texels of one layer, to draw into
+    pub(crate) fn plane_mut(&mut self, layer: u32) -> TexelsMut<'_> {
+        let plane = self.width as usize * self.height as usize;
+        let range = layer as usize * plane..(layer as usize + 1) * plane;
+        match &mut self.texels {
+            Texels::Bytes(texels) => TexelsMut::Bytes(&mut texels[range]),
+            Texels::Floats(texels) => TexelsMut::Floats(&mut texels[range]),
+        }
+    }
+
+    // one layer as a level of its own
+    pub(crate) fn layer(&self, layer: u32) -> Level {
+        let plane = self.width as usize * self.height as usize;
+        let range = layer as usize * plane..(layer as usize + 1) * plane;
+        let texels = match &self.texels {
+            Texels::Bytes(texels) => Texels::Bytes(texels[range].to_vec()),
+            Texels::Floats(texels) => Texels::Floats(texels[range].to_vec()),
+        };
+        Level {
+            depth: 1,
+            texels,
+            ..*self
+        }
     }
 }
 
@@ -775,8 +978,10 @@ impl Texture {
                             }
                             let mean = sum.map(|value| value / count);
                             let index = next.index(x, y, z);
-                            next.texels[index] =
-                                source.format.store(channels(source.format.base, mean));
+                            next.set(
+                                index,
+                                source.format.store(channels(source.format.base, mean)),
+                            );
                         }
                     }
                 }
@@ -1550,13 +1755,18 @@ mod tests {
 
         let mut texture = Texture::new();
         texture.target = TEXTURE_2D;
-        let mut level = Level::new(format, 2, 2, 1);
-        level.texels = vec![
-            [0.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 1.0],
-            [0.0, 1.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 1.0],
-        ];
+        let level = Level::from_floats(
+            format,
+            2,
+            2,
+            1,
+            vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+            ],
+        );
         texture.set_level(0, 0, level);
         let params = Params {
             min_filter: LINEAR,
@@ -1590,7 +1800,7 @@ mod tests {
         assert_eq!(out[1], [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(out[2], [1.0, 0.0, 0.0, 1.0]);
         let mip = texture.level(0, 1).expect("a generated level");
-        assert_eq!(mip.texels[0], [0.250_980_4, 0.250_980_4, 0.250_980_4, 1.0]);
+        assert_eq!(mip.get(0), [0.250_980_4, 0.250_980_4, 0.250_980_4, 1.0]);
         assert_eq!(cube_face([0.0, 0.0, -2.0]), (5, 0.5, 0.5));
     }
 }

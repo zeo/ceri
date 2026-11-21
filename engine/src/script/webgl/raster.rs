@@ -5,7 +5,7 @@
 
 use super::constants::*;
 use super::glsl::{ALL, Base, LANES, Machine, Module, Textures};
-use super::texture::{Format, Level, channels};
+use super::texture::{Format, Kind, Level, TexelsMut, channels};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StencilFace {
@@ -100,7 +100,7 @@ pub(crate) struct Draw<'a> {
 
 // rows of one layer of an attachment, from row `top` down the slice
 pub(crate) struct View<'a> {
-    pub(crate) texels: &'a mut [[f32; 4]],
+    pub(crate) texels: TexelsMut<'a>,
     pub(crate) format: Format,
     pub(crate) width: u32,
     pub(crate) top: u32,
@@ -108,19 +108,31 @@ pub(crate) struct View<'a> {
 
 impl<'a> View<'a> {
     pub(crate) fn layer(level: &'a mut Level, layer: u32) -> View<'a> {
-        let plane = level.width as usize * level.height as usize;
-        let start = layer as usize * plane;
+        let (format, width) = (level.format, level.width);
         View {
-            format: level.format,
-            width: level.width,
+            format,
+            width,
             top: 0,
-            texels: &mut level.texels[start..start + plane],
+            texels: level.plane_mut(layer),
         }
     }
 
     #[inline]
     fn at(&self, x: u32, y: u32) -> usize {
         ((y - self.top) * self.width + x) as usize
+    }
+
+    #[inline]
+    fn get(&self, x: u32, y: u32) -> [f32; 4] {
+        self.texels
+            .get(self.at(x, y), self.format.kind == Kind::Srgb)
+    }
+
+    #[inline]
+    fn set(&mut self, x: u32, y: u32, value: [f32; 4]) {
+        let index = self.at(x, y);
+        self.texels
+            .set(index, value, self.format.kind == Kind::Srgb);
     }
 }
 
@@ -149,11 +161,15 @@ impl<'a> Target<'a> {
         let count = (height as usize).div_ceil(rows).max(1);
         let chunk = |view: View<'a>| {
             let size = rows * view.width as usize;
-            (view.format, view.width, view.texels.chunks_mut(size.max(1)))
+            (
+                view.format,
+                view.width,
+                view.texels.chunks(size.max(1)).into_iter(),
+            )
         };
         let mut colors: Vec<_> = colors.into_iter().map(|view| view.map(chunk)).collect();
         let mut depth = depth_stencil.map(chunk);
-        let next = |entry: &mut Option<(Format, u32, std::slice::ChunksMut<'a, [f32; 4]>)>,
+        let next = |entry: &mut Option<(Format, u32, std::vec::IntoIter<TexelsMut<'a>>)>,
                     top: u32| {
             entry.as_mut().and_then(|(format, width, chunks)| {
                 chunks.next().map(|texels| View {
@@ -1086,11 +1102,7 @@ impl<'a, 't> Fragments<'a, 't> {
         {
             for (lane, &(x, y)) in positions.iter().enumerate() {
                 if mask & (1 << lane) != 0
-                    && !depth_passes(
-                        func,
-                        depths[lane],
-                        view.texels[view.at(x as u32, y as u32)][0],
-                    )
+                    && !depth_passes(func, depths[lane], view.get(x as u32, y as u32)[0])
                 {
                     mask &= !(1 << lane);
                 }
@@ -1119,8 +1131,8 @@ impl<'a, 't> Fragments<'a, 't> {
     fn write(&mut self, x: u32, y: u32, depth: f32, front: bool, lane: usize) {
         let pipeline = self.pipeline;
         if let Some(level) = self.target.depth_stencil.as_mut() {
-            let index = level.at(x, y);
-            let stored = level.texels[index];
+            let stored = level.get(x, y);
+            let mut written = stored;
             let stencil_face = pipeline
                 .stencil
                 .filter(|_| level.format.has_stencil())
@@ -1133,8 +1145,8 @@ impl<'a, 't> Fragments<'a, 't> {
                     reference & face.value_mask,
                     value & face.value_mask,
                 ) {
-                    level.texels[index][1] =
-                        stencil_op(face.fail, value, reference, face.write_mask);
+                    written[1] = stencil_op(face.fail, value, reference, face.write_mask);
+                    level.set(x, y, written);
                     return;
                 }
             }
@@ -1146,13 +1158,20 @@ impl<'a, 't> Fragments<'a, 't> {
                 let value = stored[1] as u32;
                 let reference = face.reference.clamp(0, 255) as u32;
                 let op = if depth_ok { face.pass } else { face.depth_fail };
-                level.texels[index][1] = stencil_op(op, value, reference, face.write_mask);
+                written[1] = stencil_op(op, value, reference, face.write_mask);
+            }
+            if depth_ok
+                && pipeline.depth_test.is_some()
+                && pipeline.depth_mask
+                && level.format.has_depth()
+            {
+                written[0] = level.format.store([depth, 0.0, 0.0, 0.0])[0];
+            }
+            if written != stored {
+                level.set(x, y, written);
             }
             if !depth_ok {
                 return;
-            }
-            if pipeline.depth_test.is_some() && pipeline.depth_mask && level.format.has_depth() {
-                level.texels[index][0] = level.format.store([depth, 0.0, 0.0, 0.0])[0];
             }
         }
         self.passed += 1;
@@ -1165,33 +1184,33 @@ impl<'a, 't> Fragments<'a, 't> {
                 continue;
             };
             let format = level.format;
-            let index = level.at(x, y);
-            let destination = level.texels[index];
+            let destination = level.get(x, y);
             let source: [f32; 4] = std::array::from_fn(|channel| {
                 let word = self.machine.get(slot + channel, lane);
                 match format.kind {
-                    super::texture::Kind::Int => word as i32 as f32,
-                    super::texture::Kind::Uint => word as f32,
+                    Kind::Int => word as i32 as f32,
+                    Kind::Uint => word as f32,
                     _ => f32::from_bits(word),
                 }
             });
             let blended = match pipeline.blend.filter(|_| !format.is_integer()) {
-                Some(blend) => {
-                    let clamp = matches!(
-                        format.kind,
-                        super::texture::Kind::Unorm | super::texture::Kind::Srgb
-                    );
-                    blend_color(&blend, source, destination, clamp)
-                }
+                Some(blend) => blend_color(
+                    &blend,
+                    source,
+                    destination,
+                    matches!(format.kind, Kind::Unorm | Kind::Srgb),
+                ),
                 None => source,
             };
             let stored = format.store(channels(format.base, blended));
-            let texel = &mut level.texels[index];
-            for channel in 0..4 {
+            let texel = std::array::from_fn(|channel| {
                 if mask[channel] {
-                    texel[channel] = stored[channel];
+                    stored[channel]
+                } else {
+                    destination[channel]
                 }
-            }
+            });
+            level.set(x, y, texel);
         }
     }
 }
