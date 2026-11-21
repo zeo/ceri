@@ -177,6 +177,10 @@ pub struct WindowConfig {
     pub always_on_top: bool,
     // only Windows has a taskbar a window can leave
     pub skip_taskbar: bool,
+    // the drop shadow Windows gives a window without decorations
+    pub shadow: bool,
+    // whether the window takes the keyboard when it opens
+    pub focused: bool,
     // pointer input goes to whatever is beneath the window
     pub click_through: bool,
     // screen capture shows the window blank, on Windows and macOS
@@ -208,6 +212,8 @@ impl Default for WindowConfig {
             fullscreen: false,
             always_on_top: false,
             skip_taskbar: false,
+            shadow: true,
+            focused: true,
             click_through: false,
             content_protected: false,
             background: [255, 255, 255],
@@ -732,6 +738,7 @@ impl AppWindow {
             .with_decorations(config.decorations)
             .with_resizable(config.resizable)
             .with_visible(config.visible)
+            .with_active(config.focused)
             .with_maximized(config.maximized || remembered.is_some_and(|known| known.maximized))
             .with_content_protected(config.content_protected);
         if let Some((width, height)) = config.maximum_size {
@@ -748,7 +755,7 @@ impl AppWindow {
             use winit::platform::windows::WindowAttributesExtWindows;
             attributes = attributes
                 .with_skip_taskbar(config.skip_taskbar)
-                .with_undecorated_shadow(true);
+                .with_undecorated_shadow(config.shadow);
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         if let Some(id) = &config.app_id {
