@@ -7112,6 +7112,14 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                 }
             }
             Child::Element(child) => {
+                // a box taken out of the flow adds nothing to the width of what holds it
+                if stylesheet
+                    .style_for(child.style_context(child_parent, style_state))
+                    .position
+                    .is_out_of_flow()
+                {
+                    continue;
+                }
                 after_element = true;
                 let width = intrinsic_width(
                     MaxContentInput {
@@ -12113,6 +12121,23 @@ mod tests {
         };
         assert_eq!(width("auto"), 200.0);
         assert_eq!(width("stable"), 200.0 - SCROLLBAR_THICKNESS);
+    }
+
+    #[test]
+    fn a_box_out_of_the_flow_adds_nothing_to_the_width_of_what_holds_it() {
+        let markup = "<style>* { margin: 0; padding: 0; } #row { display: flex; } #pill { position: relative; display: flex; } i { position: absolute; width: 300px; height: 10px; } b { width: 40px; height: 10px; }</style><div id='row'><div id='pill'><i></i><b></b></div></div>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let pill = document.find_element_by_id("pill").expect("pill");
+        assert_eq!(result.box_index()[&pill][0].rect.width, 40.0);
     }
 
     #[test]
