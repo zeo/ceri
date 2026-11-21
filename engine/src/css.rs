@@ -6253,6 +6253,172 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "z-index",
 ];
 
+pub(crate) fn is_supported_property(property: &str) -> bool {
+    SUPPORTED_PROPERTIES.contains(&property.to_ascii_lowercase().as_str())
+}
+
+const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "revert-layer"];
+
+// a length, a percentage where allowed, or a math function of them; a unitless number is a
+// length only when it is zero
+fn length_token(token: &str, percent: bool) -> bool {
+    if token == "0" {
+        return true;
+    }
+    if token.parse::<f64>().is_ok() || (!percent && token.ends_with('%')) {
+        return false;
+    }
+    matches!(
+        parse_length(token),
+        Some(Length::Terms(_) | Length::Clamp(..) | Length::Smallest(..) | Length::Largest(..))
+    )
+}
+
+fn number_token(token: &str) -> Option<f64> {
+    let token = token.strip_prefix('+').unwrap_or(token);
+    (!token.is_empty() && !token.contains(|c: char| c.is_ascii_alphabetic() && c != 'e'))
+        .then(|| token.parse().ok())
+        .flatten()
+}
+
+fn time_token(token: &str) -> bool {
+    let token = token.to_ascii_lowercase();
+    let digits = token.strip_suffix("ms").or_else(|| token.strip_suffix('s'));
+    digits.and_then(number_token).is_some() || (token.starts_with("calc(") && token.ends_with(')'))
+}
+
+// whether a value fits the numeric grammar of a box, spacing, number or timing property;
+// none for properties whose values are checked elsewhere or not at all
+fn numeric_grammar_accepts(property: &str, value: &str) -> Option<bool> {
+    let lower = value.trim().to_ascii_lowercase();
+    if CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+        || lower.contains("var(")
+        || lower.contains("env(")
+    {
+        return Some(true);
+    }
+    // whitespace inside a function such as calc() does not separate values
+    let mut tokens: Vec<&str> = Vec::new();
+    let (mut depth, mut start) = (0_i32, None);
+    for (index, character) in lower.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            found if found.is_ascii_whitespace() && depth == 0 => {
+                if let Some(begin) = start.take() {
+                    tokens.push(&lower[begin..index]);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        start.get_or_insert(index);
+    }
+    if let Some(begin) = start {
+        tokens.push(&lower[begin..]);
+    }
+    let sides = |most: usize, keywords: &[&str], percent: bool| {
+        (1..=most).contains(&tokens.len())
+            && tokens
+                .iter()
+                .all(|token| keywords.contains(token) || length_token(token, percent))
+    };
+    let sizes = [
+        "auto",
+        "min-content",
+        "max-content",
+        "fit-content",
+        "stretch",
+        "-webkit-fill-available",
+    ];
+    let border = ["thin", "medium", "thick"];
+    let single_number = || match &tokens[..] {
+        [token] => number_token(token),
+        _ => None,
+    };
+    Some(match property {
+        "width" | "height" | "inline-size" | "block-size" => sides(1, &sizes, true),
+        "min-width" | "min-height" | "min-inline-size" | "min-block-size" => sides(1, &sizes, true),
+        "max-width" | "max-height" | "max-inline-size" | "max-block-size" => sides(
+            1,
+            &[
+                "none",
+                "min-content",
+                "max-content",
+                "fit-content",
+                "stretch",
+            ],
+            true,
+        ),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "top" | "right"
+        | "bottom" | "left" | "inset-block-start" | "inset-block-end" | "inset-inline-start"
+        | "inset-inline-end" => sides(1, &["auto"], true),
+        "margin" | "inset" => sides(4, &["auto"], true),
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => sides(1, &[], true),
+        "padding" => sides(4, &[], true),
+        "gap" => sides(2, &["normal"], true),
+        "row-gap" | "column-gap" => sides(1, &["normal"], true),
+        "flex-basis" => sides(
+            1,
+            &[
+                "auto",
+                "content",
+                "min-content",
+                "max-content",
+                "fit-content",
+            ],
+            true,
+        ),
+        "text-indent" => sides(1, &[], true),
+        "letter-spacing" | "word-spacing" => sides(1, &["normal"], true),
+        "font-size" => sides(
+            1,
+            &[
+                "xx-small",
+                "x-small",
+                "small",
+                "medium",
+                "large",
+                "x-large",
+                "xx-large",
+                "xxx-large",
+                "larger",
+                "smaller",
+                "math",
+            ],
+            true,
+        ),
+        "border-width" => sides(4, &border, false),
+        "border-top-width"
+        | "border-right-width"
+        | "border-bottom-width"
+        | "border-left-width"
+        | "outline-width" => sides(1, &border, false),
+        "opacity" | "fill-opacity" | "stroke-opacity" => match &tokens[..] {
+            [token] => {
+                number_token(token).is_some()
+                    || token.strip_suffix('%').and_then(number_token).is_some()
+            }
+            _ => false,
+        },
+        "z-index" => lower == "auto" || single_number().is_some_and(|number| number.fract() == 0.0),
+        "order" => single_number().is_some_and(|number| number.fract() == 0.0),
+        "flex-grow" | "flex-shrink" => single_number().is_some_and(|number| number >= 0.0),
+        "line-height" => {
+            lower == "normal"
+                || single_number().is_some_and(|number| number >= 0.0)
+                || sides(1, &[], true)
+        }
+        "transition-duration" | "transition-delay" | "animation-delay" => {
+            lower.split(',').all(|item| time_token(item.trim()))
+        }
+        "animation-duration" => lower
+            .split(',')
+            .all(|item| item.trim() == "auto" || time_token(item.trim())),
+        _ => return None,
+    })
+}
+
 pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
     if value.is_empty() {
         return false;
@@ -6263,6 +6429,9 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
     let property = property.to_ascii_lowercase();
     if !SUPPORTED_PROPERTIES.contains(&property.as_str()) {
         return false;
+    }
+    if let Some(accepted) = numeric_grammar_accepts(&property, value) {
+        return accepted;
     }
     match property.as_str() {
         "display" => {

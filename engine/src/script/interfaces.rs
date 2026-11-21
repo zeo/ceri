@@ -215,6 +215,8 @@ static INTERFACES: &[Interface] = &[
             ("className", ReadWrite),
             ("classList", ReadOnly),
             ("attributes", ReadOnly),
+            ("attributeStyleMap", ReadOnly),
+            ("computedStyleMap", Method(0)),
             ("innerHTML", ReadWrite),
             ("outerHTML", ReadWrite),
             ("children", ReadOnly),
@@ -1952,6 +1954,8 @@ impl ScriptRuntime {
             ("queryCommandValue", Access::Call) => Value::String("".into()),
             ("activeViewTransition", Access::Get) => self.active_view_transition(),
             ("currentScript", Access::Get) if on_document => self.current_script_value(),
+            ("attributeStyleMap", Access::Get) => self.style_property_map(node, false),
+            ("computedStyleMap", Access::Call) => self.style_property_map(node, true),
             ("createEvent", Access::Call) => {
                 let interface = self.coerce_string(first)?;
                 self.create_legacy_event(&interface)?

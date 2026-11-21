@@ -70,6 +70,7 @@ mod sockets;
 mod streams;
 mod strings;
 mod typed;
+mod typed_om;
 mod urlpattern;
 mod urls;
 mod viewtransitions;

@@ -204,6 +204,7 @@ pub(super) enum Native {
     Offscreen(super::offscreen::OffscreenMember),
     UrlPattern(super::urlpattern::PatternMember),
     XPath(super::xpath::XPathMember),
+    StyleOm(super::typed_om::StyleMember),
     PerfObserver(super::perf_observers::ObserverMember),
     PerfDeliver(Rc<super::perf_observers::PerfObserver>),
     DataTransferConstructor,
@@ -290,6 +291,7 @@ impl Native {
                 | Native::Offscreen(super::offscreen::OffscreenMember::Constructor)
                 | Native::UrlPattern(super::urlpattern::PatternMember::Constructor)
                 | Native::XPath(super::xpath::XPathMember::Constructor)
+                | Native::StyleOm(super::typed_om::StyleMember::Construct(_))
                 | Native::PerfObserver(
                     super::perf_observers::ObserverMember::Constructor
                         | super::perf_observers::ObserverMember::ReportingConstructor
@@ -408,6 +410,7 @@ pub(super) struct Intrinsics {
     pub(super) offscreen: super::offscreen::OffscreenInterfaces,
     pub(super) url_patterns: super::urlpattern::PatternInterfaces,
     pub(super) xpath: super::xpath::XPathInterfaces,
+    pub(super) typed_om: super::typed_om::StyleOmInterfaces,
     pub(super) disposables: super::disposables::DisposableInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
     pub(super) font_faces: super::fontfaces::FontInterfaces,
@@ -850,6 +853,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let css = plain(&object_prototype);
     build.method(&css, "escape", Native::CssEscape, 1);
     build.method(&css, "supports", Native::CssSupports, 1);
+    let typed_om = super::typed_om::create(&build, &object_prototype, &css, &mut globals);
     globals.push(("CSS", Value::Object(css)));
     globals.push((
         "isNaN",
@@ -1779,6 +1783,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         offscreen,
         url_patterns,
         xpath,
+        typed_om,
         hosts,
         perf_observers,
         disposables,
@@ -3277,6 +3282,7 @@ impl ScriptRuntime {
             Native::Offscreen(member) => self.call_offscreen(member, this, arguments),
             Native::UrlPattern(member) => self.call_url_pattern(member, this, arguments),
             Native::XPath(member) => self.call_xpath(member, this, arguments),
+            Native::StyleOm(member) => self.call_style_om(member, this, arguments),
             Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
             Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),
             Native::ViewTransition(transition, which) => {
@@ -3755,6 +3761,9 @@ impl ScriptRuntime {
             Native::Offscreen(_) => self.construct_offscreen(arguments, new_target),
             Native::UrlPattern(_) => self.construct_url_pattern(arguments, new_target),
             Native::XPath(_) => self.construct_xpath_evaluator(new_target),
+            Native::StyleOm(super::typed_om::StyleMember::Construct(name)) => {
+                self.construct_style_om(name, arguments, new_target)
+            }
             Native::PerfObserver(member) => {
                 self.construct_perf_observer(member, arguments, new_target)
             }

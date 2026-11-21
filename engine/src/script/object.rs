@@ -87,6 +87,8 @@ pub(super) enum ObjectClass {
     UrlPattern(Rc<super::urlpattern::UrlPattern>),
     // an XPathResult, XPathExpression or XPathEvaluator
     XPath(Rc<super::xpath::XPathObject>),
+    // a Typed OM value, variable reference, numeric array or style property map
+    StyleOm(Rc<super::typed_om::StyleOm>),
     PerfObserver(Rc<super::perf_observers::PerfObserver>),
     // the entries a PerformanceObserver callback is handed
     PerfEntries(Rc<Vec<super::geometry::PerformanceEntry>>),

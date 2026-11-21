@@ -136,6 +136,31 @@ const PLAIN: &[(&str, &str)] = &[
     ("appearance", "none"),
 ];
 
+// properties whose computed value keeps a declared percentage or auto, where the resolved
+// value getComputedStyle reports is a length
+const DECLARED_WHEN_TYPED: &[&str] = &[
+    "width",
+    "height",
+    "min-width",
+    "min-height",
+    "max-width",
+    "max-height",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "flex-basis",
+    "text-indent",
+];
+
 const INHERITED: &[(&str, &str)] = &[
     ("visibility", "visible"),
     ("cursor", "auto"),
@@ -889,6 +914,17 @@ impl ScriptRuntime {
     }
 
     fn computed_snapshot(&mut self, node: NodeId) -> BTreeMap<String, String> {
+        self.computed_values(node, false)
+    }
+
+    // the values getComputedStyle reports, or with typed the computed values the Typed OM
+    // reifies, which keep declared percentages, auto, a unitless line-height and the
+    // transform functions where getComputedStyle resolves them
+    pub(super) fn computed_values(
+        &mut self,
+        node: NodeId,
+        typed: bool,
+    ) -> BTreeMap<String, String> {
         let mut values = BTreeMap::new();
         let Some(inputs) = self.layout_inputs.clone() else {
             return values;
@@ -1020,6 +1056,48 @@ impl ScriptRuntime {
                     *value = absolute_urls(value, &base);
                 }
             }
+        }
+        if typed {
+            // a side's declared value, from its longhand or the 1-4 values of its shorthand
+            let declared = |property: &str| -> Option<String> {
+                if let Some(value) = own.get(property) {
+                    return Some(value.clone());
+                }
+                let (shorthand, side) = property.rsplit_once('-').unwrap_or(("inset", property));
+                let index = ["top", "right", "bottom", "left"]
+                    .iter()
+                    .position(|&found| found == side)?;
+                let parts: Vec<&str> = own.get(shorthand)?.split_ascii_whitespace().collect();
+                let pick = match (parts.len(), index) {
+                    (1, _) => 0,
+                    (2, index) => index % 2,
+                    (3, 3) => 1,
+                    (_, index) => index,
+                };
+                parts.get(pick).map(|part| part.to_string())
+            };
+            for &property in DECLARED_WHEN_TYPED {
+                match declared(property).map(|value| value.trim().to_ascii_lowercase()) {
+                    Some(value) if value.ends_with('%') || value == "auto" => {
+                        values.insert(property.to_string(), value);
+                    }
+                    None if matches!(
+                        property,
+                        "width" | "height" | "top" | "right" | "bottom" | "left"
+                    ) =>
+                    {
+                        values.insert(property.to_string(), "auto".to_string());
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(line_height) = inherited("line-height")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| value == "normal" || value.parse::<f64>().is_ok())
+            {
+                values.insert("line-height".to_string(), line_height);
+            }
+            return values;
         }
         if let Some(value) = values.get_mut("transform")
             && value != "none"
