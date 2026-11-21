@@ -132,6 +132,15 @@ impl CommandRoutes {
             "window:set-content-protected" => arguments::<Switch>(call)
                 .and_then(|switch| act(WindowAction::ContentProtected(switch.on))),
             "window:labels" => json(&control.labels()),
+            // a BroadcastChannel message, passed to the app's other windows as it came
+            "window:broadcast" => {
+                for other in control.labels() {
+                    if other != label {
+                        control.emit(Some(&other), "ceri:broadcast", &call.payload);
+                    }
+                }
+                Ok("null".to_string())
+            }
             "window:monitors" => {
                 let monitors: Vec<_> = control
                     .monitors()
