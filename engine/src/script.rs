@@ -48,6 +48,7 @@ mod realm;
 mod reflect;
 mod regexp;
 mod sockets;
+mod streams;
 mod strings;
 mod typed;
 mod urls;
@@ -103,7 +104,6 @@ type RequestHandle = Rc<RequestData>;
 type ResponseHandle = Rc<ResponseData>;
 type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
 type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
-type ReadableStreamReaderHandle = Rc<RefCell<ReadableStreamReaderData>>;
 type HeadersHandle = Rc<RefCell<HeadersData>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
 type ArrayHandle = Rc<RefCell<Vec<Value>>>;
@@ -185,8 +185,6 @@ enum Value {
     ResponseConstructor,
     Bytes(BytesHandle),
     TypedArray(TypedArrayHandle),
-    ReadableStream(ReadableStreamHandle),
-    ReadableStreamReader(ReadableStreamReaderHandle),
     Headers(HeadersHandle),
     Promise(PromiseHandle),
     Document,
@@ -449,12 +447,6 @@ enum Builtin {
     ResponseBytes(ResponseHandle),
     ResponseBlob(ResponseHandle),
     ResponseFormData(ResponseHandle),
-    ReadableStreamGetReader(ReadableStreamHandle),
-    ReadableStreamCancel(ReadableStreamHandle),
-    ReadableStreamTee(ReadableStreamHandle),
-    ReadableStreamReaderRead(ReadableStreamReaderHandle),
-    ReadableStreamReaderReleaseLock(ReadableStreamReaderHandle),
-    ReadableStreamReaderCancel(ReadableStreamReaderHandle),
     AbortControllerAbort(AbortControllerHandle),
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
@@ -1390,12 +1382,8 @@ struct ResponseBodyData {
 
 struct ReadableStreamData {
     body: ResponseBodyHandle,
-    canceled: bool,
-}
-
-struct ReadableStreamReaderData {
-    body: ResponseBodyHandle,
-    released: bool,
+    // the ReadableStream script reads the body through, made when first asked for
+    object: Option<object::ObjectHandle>,
 }
 
 #[derive(Clone)]
@@ -4632,7 +4620,7 @@ impl ScriptRuntime {
                 "mimeType" => Ok(Value::String(response.mime_type.clone().into())),
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
-                "body" => Ok(Value::ReadableStream(response.stream.clone())),
+                "body" => Ok(self.body_stream(&response.stream)),
                 "clone" => Ok(Value::Builtin(Builtin::ResponseClone(response))),
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
@@ -4655,7 +4643,7 @@ impl ScriptRuntime {
                 "url" => Ok(Value::String(request.url.to_string().into())),
                 "method" => Ok(Value::String(request.method.clone().into())),
                 "headers" => Ok(Value::Headers(request.headers.clone())),
-                "body" => Ok(Value::ReadableStream(request.stream.clone())),
+                "body" => Ok(self.body_stream(&request.stream)),
                 "cache" => Ok(Value::String(
                     fetch_cache_mode_name(&request.cache_mode).into(),
                 )),
@@ -4674,25 +4662,6 @@ impl ScriptRuntime {
                 "blob" => Ok(Value::Builtin(Builtin::RequestBlob(request))),
                 "formData" => Ok(Value::Builtin(Builtin::RequestFormData(request))),
                 _ => Err(runtime_error(format!("request has no property {property}"))),
-            },
-            Value::ReadableStream(stream) => match property {
-                "locked" => Ok(Value::Bool(stream.borrow().body.borrow().locked)),
-                "getReader" => Ok(Value::Builtin(Builtin::ReadableStreamGetReader(stream))),
-                "cancel" => Ok(Value::Builtin(Builtin::ReadableStreamCancel(stream))),
-                "tee" => Ok(Value::Builtin(Builtin::ReadableStreamTee(stream))),
-                _ => Err(runtime_error(format!(
-                    "ReadableStream has no property {property}"
-                ))),
-            },
-            Value::ReadableStreamReader(reader) => match property {
-                "read" => Ok(Value::Builtin(Builtin::ReadableStreamReaderRead(reader))),
-                "releaseLock" => Ok(Value::Builtin(Builtin::ReadableStreamReaderReleaseLock(
-                    reader,
-                ))),
-                "cancel" => Ok(Value::Builtin(Builtin::ReadableStreamReaderCancel(reader))),
-                _ => Err(runtime_error(format!(
-                    "ReadableStreamDefaultReader has no property {property}"
-                ))),
             },
             Value::Headers(headers) => match property {
                 "append" => Ok(Value::Builtin(Builtin::HeadersAppend(headers))),
@@ -8769,112 +8738,6 @@ impl ScriptRuntime {
                     Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
                 }
             }
-            Builtin::ReadableStreamGetReader(stream) => {
-                let body = stream.borrow().body.clone();
-                let mut body_state = body.borrow_mut();
-                if body_state.locked || body_state.disturbed || body_state.consumed {
-                    return Err(runtime_error("readable stream is already used"));
-                }
-                body_state.locked = true;
-                drop(body_state);
-                Ok(Value::ReadableStreamReader(Rc::new(RefCell::new(
-                    ReadableStreamReaderData {
-                        body,
-                        released: false,
-                    },
-                ))))
-            }
-            Builtin::ReadableStreamCancel(stream) => {
-                let mut stream = stream.borrow_mut();
-                if stream.canceled {
-                    return Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)));
-                }
-                {
-                    let mut body = stream.body.borrow_mut();
-                    body.cursor = body.bytes.len();
-                    body.consumed = true;
-                    body.disturbed = true;
-                    body.locked = false;
-                }
-                stream.canceled = true;
-                Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
-            }
-            Builtin::ReadableStreamTee(stream) => {
-                let body = stream.borrow().body.clone();
-                let mut body_state = body.borrow_mut();
-                if body_state.locked || body_state.disturbed || body_state.consumed {
-                    return Err(runtime_error("readable stream is already used"));
-                }
-                let remaining = body_state.bytes[body_state.cursor..].to_vec();
-                body_state.cursor = body_state.bytes.len();
-                body_state.disturbed = true;
-                body_state.locked = true;
-                drop(body_state);
-                let left = Value::ReadableStream(Rc::new(RefCell::new(ReadableStreamData {
-                    body: response_body(remaining.clone()),
-                    canceled: false,
-                })));
-                let right = Value::ReadableStream(Rc::new(RefCell::new(ReadableStreamData {
-                    body: response_body(remaining),
-                    canceled: false,
-                })));
-                Ok(Value::Array(Rc::new(RefCell::new(vec![left, right]))))
-            }
-            Builtin::ReadableStreamReaderRead(reader) => {
-                let reader = reader.borrow();
-                if reader.released {
-                    return Ok(Value::Promise(
-                        self.rejected_promise("readable stream reader has been released"),
-                    ));
-                }
-                let mut body = reader.body.borrow_mut();
-                if body.cursor >= body.bytes.len() {
-                    body.consumed = true;
-                    body.disturbed = true;
-                    return Ok(Value::Promise(
-                        self.fulfilled_promise(read_result(Value::Undefined, true)),
-                    ));
-                }
-                body.disturbed = true;
-                let end = body.cursor.saturating_add(16).min(body.bytes.len());
-                let chunk = body.bytes[body.cursor..end].to_vec();
-                body.cursor = end;
-                let length = chunk.len();
-                Ok(Value::Promise(self.fulfilled_promise(read_result(
-                    typed::new_typed(
-                        typed::ElementKind::Uint8,
-                        Rc::new(RefCell::new(chunk)),
-                        0,
-                        length,
-                    ),
-                    false,
-                ))))
-            }
-            Builtin::ReadableStreamReaderReleaseLock(reader) => {
-                let mut reader = reader.borrow_mut();
-                if !reader.released {
-                    reader.body.borrow_mut().locked = false;
-                    reader.released = true;
-                }
-                Ok(Value::Undefined)
-            }
-            Builtin::ReadableStreamReaderCancel(reader) => {
-                let mut reader = reader.borrow_mut();
-                if reader.released {
-                    return Ok(Value::Promise(
-                        self.rejected_promise("readable stream reader has been released"),
-                    ));
-                }
-                {
-                    let mut body = reader.body.borrow_mut();
-                    body.cursor = body.bytes.len();
-                    body.consumed = true;
-                    body.disturbed = true;
-                    body.locked = false;
-                }
-                reader.released = true;
-                Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
-            }
             Builtin::AbortControllerAbort(controller) => {
                 let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);
                 let signal = controller.borrow().signal.clone();
@@ -11147,8 +11010,6 @@ impl Value {
             Self::Response(_) => "[response]".to_string(),
             Self::Bytes(_) => "[object ArrayBuffer]".to_string(),
             Self::TypedArray(array) => format!("[object {}]", array.borrow().kind.name()),
-            Self::ReadableStream(_) => "[object ReadableStream]".to_string(),
-            Self::ReadableStreamReader(_) => "[object ReadableStreamDefaultReader]".to_string(),
             Self::Headers(_) => "[object Headers]".to_string(),
             Self::Promise(_) => "[promise]".to_string(),
             Self::Document => "[document]".to_string(),
@@ -12866,7 +12727,7 @@ fn request_handle(
     let body = response_body(body);
     let stream = Rc::new(RefCell::new(ReadableStreamData {
         body: body.clone(),
-        canceled: false,
+        object: None,
     }));
     Rc::new(RequestData {
         url,
@@ -12892,7 +12753,7 @@ fn response_data(
     let body = response_body(bytes);
     let stream = Rc::new(RefCell::new(ReadableStreamData {
         body: body.clone(),
-        canceled: false,
+        object: None,
     }));
     ResponseData {
         url,
@@ -14149,8 +14010,6 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::Response(_)
         | Value::Bytes(_)
         | Value::TypedArray(_)
-        | Value::ReadableStream(_)
-        | Value::ReadableStreamReader(_)
         | Value::Headers(_)
         | Value::Promise(_)
         | Value::Document
@@ -14694,10 +14553,6 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::TypedArray(left), Value::TypedArray(right)) => Rc::ptr_eq(left, right),
         (Value::Request(left), Value::Request(right)) => Rc::ptr_eq(left, right),
         (Value::Headers(left), Value::Headers(right)) => Rc::ptr_eq(left, right),
-        (Value::ReadableStream(left), Value::ReadableStream(right)) => Rc::ptr_eq(left, right),
-        (Value::ReadableStreamReader(left), Value::ReadableStreamReader(right)) => {
-            Rc::ptr_eq(left, right)
-        }
         _ => false,
     }
 }
@@ -22390,7 +22245,7 @@ mod tests {
     }
 
     #[test]
-    fn response_body_stream_reads_fixed_chunks_and_reports_done() {
+    fn response_body_stream_reads_the_body_and_reports_done() {
         let document = document("<p id='status'>idle</p>");
         let mut resources = ResourceBundle::default();
         resources
@@ -22412,7 +22267,7 @@ mod tests {
                     reader.read().then((first) => {
                         reader.read().then((second) => {
                             reader.read().then((third) => {
-                                status.textContent = stream.locked + "|" + response.bodyUsed + "|" + first.value.length + "|" + second.value.length + "|" + third.done;
+                                status.textContent = stream.locked + "|" + response.bodyUsed + "|" + first.value.length + "|" + second.done + "|" + third.done + "|" + (response.body === stream);
                                 reader.releaseLock();
                             });
                         });
@@ -22427,7 +22282,7 @@ mod tests {
             .expect("status should exist");
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
-            Some("true|true|16|10|true")
+            Some("true|true|26|true|true|true")
         );
     }
 

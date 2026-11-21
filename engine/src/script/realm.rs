@@ -159,6 +159,7 @@ pub(super) enum Native {
     Walk(super::traversal::WalkMember),
     Helper(super::iterator_helpers::HelperMember),
     Markup(super::markup::MarkupMember),
+    Stream(Rc<super::streams::StreamFunction>),
     Anim(super::animations::AnimMember),
     AnimConstructor,
     ClipboardItemConstructor,
@@ -249,6 +250,10 @@ impl Native {
                 | super::intl::IntlMethod::ListFormatConstructor))
             || matches!(self, Native::Promise(function)
                 if matches!(**function, super::promises::PromiseFunction::Constructor))
+            || matches!(self, Native::Stream(function)
+                if matches!(**function, super::streams::StreamFunction::Constructor
+                    | super::streams::StreamFunction::ReaderConstructor
+                    | super::streams::StreamFunction::ControllerConstructor))
     }
 }
 
@@ -313,6 +318,7 @@ pub(super) struct Intrinsics {
     pub(super) readers: super::filereader::ReaderInterfaces,
     pub(super) ports: super::messaging::PortInterfaces,
     pub(super) traversal: super::traversal::TraversalInterfaces,
+    pub(super) streams: super::streams::StreamInterfaces,
     pub(super) helpers: super::iterator_helpers::HelperInterfaces,
     pub(super) animations: super::animations::AnimInterfaces,
     pub(super) shapes: super::geometry_values::ShapeInterfaces,
@@ -1473,6 +1479,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let traversal = super::traversal::create(&build, &object_prototype, &mut globals);
     let helpers = super::iterator_helpers::create(&build, &iterator_prototype, &mut globals);
     super::markup::create(&build, &object_prototype, &mut globals);
+    let streams = super::streams::create(
+        &build,
+        &object_prototype,
+        &async_iterator_prototype,
+        &mut globals,
+    );
     let animations = super::animations::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let clipboard_item = build.constructor(
         Native::ClipboardItemConstructor,
@@ -1549,6 +1561,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         readers,
         ports,
         traversal,
+        streams,
         helpers,
         animations,
         shapes,
@@ -2968,6 +2981,7 @@ impl ScriptRuntime {
             Native::Walk(member) => self.call_walk(member, this, arguments),
             Native::Helper(member) => self.call_iterator_helper(member, this, arguments),
             Native::Markup(member) => self.call_markup(member, this, arguments),
+            Native::Stream(function) => self.call_stream((*function).clone(), this, arguments),
             Native::Anim(member) => self.call_animation(member, this, arguments),
             Native::AnimFinish(id, generation) => self.deliver_animation_finish(id, generation),
             Native::Shape(member) => self.call_shape(member, this, arguments),
@@ -3371,6 +3385,7 @@ impl ScriptRuntime {
             }
             Native::Helper(_) => self.construct_iterator(new_target),
             Native::Markup(_) => self.construct_markup(new_target),
+            Native::Stream(function) => self.construct_stream(&function, arguments, new_target),
             Native::Promise(function)
                 if matches!(*function, super::promises::PromiseFunction::Constructor) =>
             {

@@ -117,6 +117,8 @@ pub(super) enum ObjectClass {
     // the object of a promise value, which keeps its expandos and its prototype
     Promise,
     Registry(Rc<RefCell<super::collections::Registry>>),
+    // a stream, its controller, a reader or an iterator over one
+    Stream(super::streams::StreamHandle),
     // the object of a typed array of this kind, for its named properties and prototype
     TypedArray(super::typed::ElementKind),
     // what an iterator helper such as map or take hands back
