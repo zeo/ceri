@@ -255,6 +255,11 @@ struct DrawState {
     direction: &'static str,
     // how much of each pixel of the bitmap drawing may reach, out of 255; none is all of it
     clip: Option<Rc<Vec<u8>>>,
+    // the shadow a shape casts: its colour, how far it blurs and where it falls, in pixels of
+    // the bitmap whatever the transform
+    shadow_color: Color,
+    shadow_blur: f32,
+    shadow_offset: (f32, f32),
 }
 
 impl Default for DrawState {
@@ -284,6 +289,9 @@ impl Default for DrawState {
             text_baseline: "alphabetic",
             direction: "ltr",
             clip: None,
+            shadow_color: Color::transparent(),
+            shadow_blur: 0.0,
+            shadow_offset: (0.0, 0.0),
         }
     }
 }
@@ -521,9 +529,104 @@ impl CanvasContextData {
         }
     }
 
+    // a shape and the shadow it casts beneath it
+    fn paint(&mut self, coverage: Option<Coverage>, paint: &Paint) {
+        if let Some(coverage) = &coverage {
+            self.cast_shadow(coverage, paint);
+        }
+        self.lay(coverage, paint);
+    }
+
+    fn casts_shadow(&self) -> bool {
+        let state = &self.state;
+        state.shadow_color.alpha > 0
+            && (state.shadow_blur > 0.0 || state.shadow_offset != (0.0, 0.0))
+    }
+
+    // the shape's own coverage moved by the offset and blurred, a gaussian whose deviation is
+    // half the blur, laid in the shadow colour as any paint is
+    fn cast_shadow(&mut self, coverage: &Coverage, paint: &Paint) {
+        if !self.casts_shadow() || coverage.width == 0 {
+            return;
+        }
+        let state = &self.state;
+        let (color, sigma) = (state.shadow_color, state.shadow_blur / 2.0);
+        let reach = (sigma * 3.0).ceil() as i32;
+        let (shift_x, shift_y) = (
+            state.shadow_offset.0.round() as i32,
+            state.shadow_offset.1.round() as i32,
+        );
+        // a paint that is itself see-through casts a fainter shadow
+        let strength = match paint {
+            Paint::Color(color) => f32::from(color.alpha) / 255.0,
+            Paint::Gradient(..) => 1.0,
+        };
+        let (wide, tall) = (
+            coverage.width as i32,
+            (coverage.values.len() / coverage.width) as i32,
+        );
+        let (width, height) = ((wide + 2 * reach) as usize, (tall + 2 * reach) as usize);
+        let mut alpha = vec![0.0_f32; width * height];
+        for (index, &value) in coverage.values.iter().enumerate() {
+            let (x, y) = (index % coverage.width, index / coverage.width);
+            alpha[(y + reach as usize) * width + x + reach as usize] = f32::from(value) * strength;
+        }
+        if sigma > 0.0 {
+            let kernel: Vec<f32> = (-reach..=reach)
+                .map(|step| (-(step * step) as f32 / (2.0 * sigma * sigma)).exp())
+                .collect();
+            let total: f32 = kernel.iter().sum();
+            let pass = |from: &[f32], along_x: bool| {
+                let mut to = vec![0.0_f32; from.len()];
+                for y in 0..height as i32 {
+                    for x in 0..width as i32 {
+                        let mut sum = 0.0;
+                        for (weight, step) in kernel.iter().zip(-reach..=reach) {
+                            let (sx, sy) = if along_x {
+                                (x + step, y)
+                            } else {
+                                (x, y + step)
+                            };
+                            if sx >= 0 && sy >= 0 && sx < width as i32 && sy < height as i32 {
+                                sum += weight * from[sy as usize * width + sx as usize];
+                            }
+                        }
+                        to[y as usize * width + x as usize] = sum / total;
+                    }
+                }
+                to
+            };
+            alpha = pass(&pass(&alpha, true), false);
+        }
+        // the part of the shadow's box that lands on the bitmap
+        let (left, top) = (
+            coverage.left - reach + shift_x,
+            coverage.top - reach + shift_y,
+        );
+        let columns = left.max(0)..(left + width as i32).min(self.bitmap.width as i32);
+        let rows = top.max(0)..(top + height as i32).min(self.bitmap.height as i32);
+        if columns.is_empty() || rows.is_empty() {
+            return;
+        }
+        let mut values = Vec::with_capacity(columns.len() * rows.len());
+        for row in rows.clone() {
+            for column in columns.clone() {
+                let at = (row - top) as usize * width + (column - left) as usize;
+                values.push(alpha[at].round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        let shadow = Coverage {
+            left: columns.start,
+            top: rows.start,
+            width: columns.len(),
+            values,
+        };
+        self.lay(Some(shadow), &Paint::Color(color));
+    }
+
     // a paint through a coverage onto the bitmap: thinned by the global alpha and the clip,
     // then composited as the state says
-    fn paint(&mut self, coverage: Option<Coverage>, paint: &Paint) {
+    fn lay(&mut self, coverage: Option<Coverage>, paint: &Paint) {
         let Some(coverage) = coverage else {
             return;
         };
@@ -648,7 +751,8 @@ impl CanvasContextData {
                 if state.transform == IDENTITY
                     && state.alpha == 1.0
                     && state.clip.is_none()
-                    && state.composite == Composite::SourceOver =>
+                    && state.composite == Composite::SourceOver
+                    && !self.casts_shadow() =>
             {
                 Some(color)
             }
@@ -671,6 +775,14 @@ impl CanvasContextData {
                 }
             }
             "lineDashOffset" if number.is_finite() => state.dash_offset = number,
+            "shadowColor" => {
+                if let Some(color) = Color::parse(text) {
+                    state.shadow_color = color;
+                }
+            }
+            "shadowBlur" if number.is_finite() && number >= 0.0 => state.shadow_blur = number,
+            "shadowOffsetX" if number.is_finite() => state.shadow_offset.0 = number,
+            "shadowOffsetY" if number.is_finite() => state.shadow_offset.1 = number,
             "font" => {
                 if let Some((size, stack, style)) = crate::css::canvas_font(text) {
                     state.font = (text.trim().into(), size, stack, style);
@@ -1324,6 +1436,10 @@ impl ScriptRuntime {
                 }
             }
             "lineDashOffset" => Value::Number(context.borrow().state.dash_offset.into()),
+            "shadowColor" => Value::String(color_css(context.borrow().state.shadow_color).into()),
+            "shadowBlur" => Value::Number(context.borrow().state.shadow_blur.into()),
+            "shadowOffsetX" => Value::Number(context.borrow().state.shadow_offset.0.into()),
+            "shadowOffsetY" => Value::Number(context.borrow().state.shadow_offset.1.into()),
             "font" => Value::String(context.borrow().state.font.0.to_string().into()),
             "textAlign" => Value::String(context.borrow().state.text_align.into()),
             "textBaseline" => Value::String(context.borrow().state.text_baseline.into()),
@@ -1420,6 +1536,8 @@ impl ScriptRuntime {
             let origin = context.place((x, y));
             let shaped = fonts.shape(text, stack, device_size, style, true);
             let (canvas_width, canvas_height) = context.size();
+            // the line casts one shadow, so the glyphs gather before any of them is laid
+            let mut glyphs = Vec::new();
             for glyph in &shaped.glyphs {
                 let Some(face) = &glyph.face else {
                     continue;
@@ -1452,13 +1570,43 @@ impl ScriptRuntime {
                         values.push((sum / channels as u32) as u8);
                     }
                 }
-                let coverage = Coverage {
+                glyphs.push(Coverage {
                     left: columns.start,
                     top: rows.start,
                     width: columns.len(),
                     values,
+                });
+            }
+            if context.casts_shadow()
+                && let (Some(left), Some(top)) = (
+                    glyphs.iter().map(|glyph| glyph.left).min(),
+                    glyphs.iter().map(|glyph| glyph.top).min(),
+                )
+            {
+                let edge = |far: fn(&Coverage) -> i32| glyphs.iter().map(far).max().unwrap_or(0);
+                let right = edge(|glyph| glyph.left + glyph.width as i32);
+                let bottom =
+                    edge(|glyph| glyph.top + (glyph.values.len() / glyph.width.max(1)) as i32);
+                let width = (right - left) as usize;
+                let mut values = vec![0_u8; width * (bottom - top) as usize];
+                for glyph in &glyphs {
+                    for (index, &value) in glyph.values.iter().enumerate() {
+                        let x = (glyph.left - left) as usize + index % glyph.width;
+                        let y = (glyph.top - top) as usize + index / glyph.width;
+                        let slot = &mut values[y * width + x];
+                        *slot = (*slot).max(value);
+                    }
+                }
+                let line = Coverage {
+                    left,
+                    top,
+                    width,
+                    values,
                 };
-                context.paint(Some(coverage), &state.fill_style);
+                context.cast_shadow(&line, &state.fill_style);
+            }
+            for glyph in glyphs {
+                context.lay(Some(glyph), &state.fill_style);
             }
             return;
         }
@@ -2256,6 +2404,53 @@ mod tests {
         assert_eq!(
             document.text_content(status),
             "255,0,0,255 0,0,0,0 0,0,255,255 0,0,0,0 #ff0000 0,255,0,255 0,255,0,255 0,0,0,0 0,0,0,128 255,255,255,255 0,0,0,0 2 1 1  2 butt"
+        );
+    }
+
+    #[test]
+    fn a_shape_casts_its_shadow_moved_and_blurred() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="40" height="40"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const c = document.getElementById("c").getContext("2d");
+                const at = (x, y) => [...c.getImageData(x, y, 1, 1).data].join(",");
+                c.fillStyle = "rgba(10, 20, 30, 0.5)";
+                const seen = [c.shadowColor, c.fillStyle, c.shadowBlur, c.shadowOffsetX];
+                c.shadowColor = "rgba(0, 0, 255, 0.5)";
+                c.shadowOffsetX = 10;
+                c.shadowOffsetY = 4;
+                c.fillStyle = "#f00";
+                c.fillRect(4, 4, 8, 8);
+                // the shape, its shadow beside it, and the shape over its own shadow
+                seen.push(at(5, 5), at(20, 14), at(11, 9), at(30, 30));
+                c.clearRect(0, 0, 40, 40);
+                c.shadowOffsetX = 0;
+                c.shadowOffsetY = 0;
+                c.shadowColor = "#000";
+                c.shadowBlur = 8;
+                c.fillRect(16, 16, 8, 8);
+                // the blur spreads past the shape and fades with distance
+                const near = c.getImageData(13, 20, 1, 1).data[3];
+                const far = c.getImageData(8, 20, 1, 1).data[3];
+                seen.push(near > far, far > 0, c.getImageData(1, 20, 1, 1).data[3], c.shadowBlur);
+                c.shadowBlur = -1;
+                seen.push(c.shadowBlur);
+                document.getElementById("status").textContent = seen.join("|");
+                "##,
+            )
+            .expect("script should run");
+        let status = document.borrow().find_element_by_id("status").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "rgba(0, 0, 0, 0)|rgba(10, 20, 30, 0.5)|0|0|255,0,0,255|0,0,255,128|255,0,0,255|0,0,0,0|true|true|0|8|8"
+            )
         );
     }
 

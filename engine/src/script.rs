@@ -12762,8 +12762,25 @@ fn read_result(value: Value, done: bool) -> Value {
     plain_object(result)
 }
 
+// a colour as a canvas hands it back: hex when solid, else rgba with the shortest alpha of
+// two or three places that names the same byte
 fn color_css(color: Color) -> String {
-    format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
+    let Color {
+        red,
+        green,
+        blue,
+        alpha,
+    } = color;
+    if alpha == 255 {
+        return format!("#{red:02x}{green:02x}{blue:02x}");
+    }
+    let exact = f32::from(alpha) / 255.0;
+    let short = (exact * 100.0).round() / 100.0;
+    let shown = match (short * 255.0).round() as u8 == alpha {
+        true => short,
+        false => (exact * 1000.0).round() / 1000.0,
+    };
+    format!("rgba({red}, {green}, {blue}, {shown})")
 }
 
 fn dataset_attribute_name(property: &str) -> String {
