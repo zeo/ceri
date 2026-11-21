@@ -8,6 +8,9 @@ use super::realm::{Builder, Native};
 use super::*;
 use std::collections::VecDeque;
 
+mod bytes;
+use bytes::{ByobRequest, ByteSource, view_of};
+
 // the bytes a body hands out per read
 const BODY_CHUNK: usize = 64 * 1024;
 
@@ -24,6 +27,9 @@ pub(super) enum StreamHandle {
     Pair(Rc<Pair>),
     // a CountQueuingStrategy or ByteLengthQueuingStrategy with its high-water mark
     Strategy(f64),
+    ByteController(Rc<RefCell<Readable>>),
+    ByobReader(Rc<RefCell<Reader>>),
+    ByobRequest(Rc<RefCell<ByobRequest>>),
 }
 
 #[derive(Clone)]
@@ -117,6 +123,21 @@ pub(super) enum StreamFunction {
     PipeSignal(Rc<Pipe>, AbortSignalHandle),
     // a body read to the end for text, json, arrayBuffer or blob answered a read
     Collected(Rc<Collect>, bool),
+    ByteDesiredSize,
+    ByteEnqueue,
+    ByteClose,
+    ByteError,
+    ByobRequest,
+    ByobRequestView,
+    Respond,
+    RespondWithNewView,
+    ByobRead,
+    ByobReleaseLock,
+    ByobCancel,
+    ByobClosed,
+    ByobReaderConstructor,
+    ByteControllerConstructor,
+    ByobRequestConstructor,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +173,9 @@ impl StreamFunction {
                 | StreamFunction::DecoderStreamConstructor
                 | StreamFunction::CompressionConstructor(_)
                 | StreamFunction::StrategyConstructor(_)
+                | StreamFunction::ByobReaderConstructor
+                | StreamFunction::ByteControllerConstructor
+                | StreamFunction::ByobRequestConstructor
         )
     }
 }
@@ -199,12 +223,16 @@ pub(super) struct Readable {
     disturbed: bool,
     reader: Option<Rc<RefCell<Reader>>>,
     controller: Option<ObjectHandle>,
+    // set for a byte stream, whose queue lives here and holds bytes
+    bytes: Option<ByteSource>,
 }
 
 pub(super) struct Reader {
     stream: Option<Rc<RefCell<Readable>>>,
+    // a default reader's reads or a BYOB reader's read-into requests
     requests: VecDeque<PromiseHandle>,
     closed: PromiseHandle,
+    byob: bool,
 }
 
 pub(super) struct TeeState {
@@ -239,6 +267,9 @@ pub(super) struct StreamInterfaces {
     compression: ObjectHandle,
     count_strategy: ObjectHandle,
     byte_strategy: ObjectHandle,
+    byte_controller: ObjectHandle,
+    byob_reader: ObjectHandle,
+    byob_request: ObjectHandle,
 }
 
 use std::cell::Cell;
@@ -343,6 +374,53 @@ pub(super) fn create(
         "ReadableStreamDefaultReader",
         Value::Object(reader_constructor),
     ));
+
+    let byte_controller = plain(object_prototype);
+    getter(&byte_controller, "byobRequest", F::ByobRequest);
+    getter(&byte_controller, "desiredSize", F::ByteDesiredSize);
+    method(&byte_controller, "close", F::ByteClose, 0);
+    method(&byte_controller, "enqueue", F::ByteEnqueue, 1);
+    method(&byte_controller, "error", F::ByteError, 0);
+    tag(&byte_controller, "ReadableByteStreamController");
+    let made = build.constructor(
+        native(F::ByteControllerConstructor),
+        "ReadableByteStreamController",
+        0,
+        &byte_controller,
+    );
+    globals.push(("ReadableByteStreamController", Value::Object(made)));
+
+    let byob_reader = plain(object_prototype);
+    getter(&byob_reader, "closed", F::ByobClosed);
+    method(&byob_reader, "read", F::ByobRead, 1);
+    method(&byob_reader, "releaseLock", F::ByobReleaseLock, 0);
+    method(&byob_reader, "cancel", F::ByobCancel, 0);
+    tag(&byob_reader, "ReadableStreamBYOBReader");
+    let made = build.constructor(
+        native(F::ByobReaderConstructor),
+        "ReadableStreamBYOBReader",
+        1,
+        &byob_reader,
+    );
+    globals.push(("ReadableStreamBYOBReader", Value::Object(made)));
+
+    let byob_request = plain(object_prototype);
+    getter(&byob_request, "view", F::ByobRequestView);
+    method(&byob_request, "respond", F::Respond, 1);
+    method(
+        &byob_request,
+        "respondWithNewView",
+        F::RespondWithNewView,
+        1,
+    );
+    tag(&byob_request, "ReadableStreamBYOBRequest");
+    let made = build.constructor(
+        native(F::ByobRequestConstructor),
+        "ReadableStreamBYOBRequest",
+        0,
+        &byob_request,
+    );
+    globals.push(("ReadableStreamBYOBRequest", Value::Object(made)));
 
     let iterator = plain(async_iterator_prototype);
     method(&iterator, "next", F::IteratorNext, 0);
@@ -496,6 +574,9 @@ pub(super) fn create(
         compression,
         count_strategy,
         byte_strategy,
+        byte_controller,
+        byob_reader,
+        byob_request,
     }
 }
 
@@ -514,6 +595,14 @@ fn readable_state(source: Source, high_water_mark: f64, size: Option<Value>) -> 
         disturbed: false,
         reader: None,
         controller: None,
+        bytes: None,
+    }
+}
+
+fn byte_state(source: Source) -> Readable {
+    Readable {
+        bytes: Some(ByteSource::default()),
+        ..readable_state(source, 0.0, None)
     }
 }
 
@@ -552,12 +641,15 @@ impl ScriptRuntime {
         state: Readable,
         prototype: Option<ObjectHandle>,
     ) -> (Value, Rc<RefCell<Readable>>) {
+        let bytes = state.bytes.is_some();
         let stream = Rc::new(RefCell::new(state));
-        let controller_prototype = self.intrinsics.streams.controller.clone();
-        let controller = self.stream_object(
-            &controller_prototype,
-            StreamHandle::Controller(stream.clone()),
-        );
+        let controller = if bytes {
+            let prototype = self.intrinsics.streams.byte_controller.clone();
+            self.stream_object(&prototype, StreamHandle::ByteController(stream.clone()))
+        } else {
+            let prototype = self.intrinsics.streams.controller.clone();
+            self.stream_object(&prototype, StreamHandle::Controller(stream.clone()))
+        };
         stream.borrow_mut().controller = Some(controller);
         let prototype = prototype.unwrap_or_else(|| self.intrinsics.streams.readable.clone());
         let object = self.stream_object(&prototype, StreamHandle::Readable(stream.clone()));
@@ -570,8 +662,7 @@ impl ScriptRuntime {
             return Value::Object(stream);
         }
         let body = holder.borrow().body.clone();
-        let (value, stream) =
-            self.new_readable(readable_state(Source::Body(body), 0.0, None), None);
+        let (value, stream) = self.new_readable(byte_state(Source::Body(body)), None);
         stream.borrow_mut().started = true;
         if let Value::Object(object) = &value {
             holder.borrow_mut().object = Some(object.clone());
@@ -581,7 +672,7 @@ impl ScriptRuntime {
 
     // a readable stream over bytes, as Blob.stream hands out
     pub(super) fn bytes_stream(&self, bytes: Vec<u8>) -> Value {
-        let state = readable_state(Source::Body(response_body(bytes)), 0.0, None);
+        let state = byte_state(Source::Body(response_body(bytes)));
         let (value, stream) = self.new_readable(state, None);
         stream.borrow_mut().started = true;
         value
@@ -590,7 +681,7 @@ impl ScriptRuntime {
     // a stream the network feeds as a response body arrives, and the flag its cancel sets
     pub(super) fn network_stream(&self) -> (Value, Rc<RefCell<Readable>>, Rc<Cell<bool>>) {
         let canceled = Rc::new(Cell::new(false));
-        let state = readable_state(Source::Network(canceled.clone()), 0.0, None);
+        let state = byte_state(Source::Network(canceled.clone()));
         let (value, stream) = self.new_readable(state, None);
         stream.borrow_mut().started = true;
         (value, stream, canceled)
@@ -737,7 +828,17 @@ impl ScriptRuntime {
                 let stream = self.readable_of(&first)?;
                 self.acquire_reader(&stream)
             }
+            StreamFunction::ByobReaderConstructor => match Self::handle_of(&first) {
+                Some(StreamHandle::Readable(stream)) => self.lock_reader(
+                    &stream,
+                    true,
+                    "Failed to construct 'ReadableStreamBYOBReader': ",
+                ),
+                _ => Err(self.type_error("Failed to construct 'ReadableStreamBYOBReader': parameter 1 is not of type 'ReadableStream'.")),
+            },
             StreamFunction::ControllerConstructor
+            | StreamFunction::ByteControllerConstructor
+            | StreamFunction::ByobRequestConstructor
             | StreamFunction::WritableControllerConstructor
             | StreamFunction::TransformControllerConstructor
             | StreamFunction::ReaderConstructor => Err(self.type_error("Illegal constructor")),
@@ -768,19 +869,50 @@ impl ScriptRuntime {
                 _ => Err(runtime.type_error(format!("ReadableStream: {name} must be a function"))),
             }
         };
-        let start = method(self, "start")?;
-        let pull = method(self, "pull")?;
+        // the underlying source dictionary's members, in the order the standard reads them
+        let auto_allocate = self.auto_allocate_size(&source)?;
         let cancel = method(self, "cancel")?;
-        let (high_water_mark, size) = self.queuing_strategy(strategy, 1.0)?;
-        let state = readable_state(
-            Source::Script {
-                object: source.clone(),
-                pull,
-                cancel,
+        let pull = method(self, "pull")?;
+        let start = method(self, "start")?;
+        let bytes = match &source {
+            Value::Undefined => false,
+            source => match self.get_property(source, "type")? {
+                Value::Undefined => false,
+                kind => match self.coerce_string(kind)?.as_str() {
+                    "bytes" => true,
+                    _ => {
+                        return Err(self.range_error(
+                            "Failed to construct 'ReadableStream': Invalid type is specified",
+                        ));
+                    }
+                },
             },
-            high_water_mark,
-            size,
-        );
+        };
+        let script = Source::Script {
+            object: source.clone(),
+            pull,
+            cancel,
+        };
+        let state = if bytes {
+            let (high_water_mark, size) = self.queuing_strategy(strategy, 0.0)?;
+            if size.is_some() {
+                return Err(self.range_error("Failed to construct 'ReadableStream': Cannot create byte stream with size() defined on the strategy"));
+            }
+            if auto_allocate == Some(0) {
+                return Err(self.type_error(
+                    "Failed to construct 'ReadableStream': autoAllocateChunkSize cannot be 0",
+                ));
+            }
+            let mut state = byte_state(script);
+            state.high_water_mark = high_water_mark;
+            if let Some(source) = state.bytes.as_mut() {
+                source.auto_allocate = auto_allocate;
+            }
+            state
+        } else {
+            let (high_water_mark, size) = self.queuing_strategy(strategy, 1.0)?;
+            readable_state(script, high_water_mark, size)
+        };
         let (value, stream) = self.new_readable(state, prototype);
         let controller = Value::Object(stream.borrow().controller.clone().expect("made with one"));
         let started = match start {
@@ -821,8 +953,28 @@ impl ScriptRuntime {
     }
 
     fn acquire_reader(&mut self, stream: &Rc<RefCell<Readable>>) -> Result<Value, ScriptError> {
+        self.lock_reader(stream, false, "")
+    }
+
+    // failed prefixes the errors with the call that made the reader
+    fn lock_reader(
+        &mut self,
+        stream: &Rc<RefCell<Readable>>,
+        byob: bool,
+        failed: &str,
+    ) -> Result<Value, ScriptError> {
+        let name = if byob {
+            "ReadableStreamBYOBReader"
+        } else {
+            "ReadableStreamDefaultReader"
+        };
         if stream.borrow().reader.is_some() {
-            return Err(self.type_error("ReadableStreamDefaultReader constructor can only accept readable streams that are not yet locked to a reader"));
+            return Err(self.type_error(format!("{failed}{name} constructor can only accept readable streams that are not yet locked to a reader")));
+        }
+        if byob && stream.borrow().bytes.is_none() {
+            return Err(self.type_error(format!(
+                "{failed}Cannot use a BYOB reader with a non-byte stream"
+            )));
         }
         let closed = Self::pending_promise();
         match &stream.borrow().state {
@@ -839,15 +991,24 @@ impl ScriptRuntime {
             stream: Some(stream.clone()),
             requests: VecDeque::new(),
             closed,
+            byob,
         }));
         stream.borrow_mut().reader = Some(reader.clone());
         if let Source::Body(body) = &stream.borrow().source {
             body.borrow_mut().locked = true;
         }
-        let prototype = self.intrinsics.streams.reader.clone();
-        Ok(Value::Object(
-            self.stream_object(&prototype, StreamHandle::Reader(reader)),
-        ))
+        let (prototype, handle) = if byob {
+            (
+                self.intrinsics.streams.byob_reader.clone(),
+                StreamHandle::ByobReader(reader),
+            )
+        } else {
+            (
+                self.intrinsics.streams.reader.clone(),
+                StreamHandle::Reader(reader),
+            )
+        };
+        Ok(Value::Object(self.stream_object(&prototype, handle)))
     }
 
     fn desired_size(stream: &Readable) -> Option<f64> {
@@ -1002,6 +1163,12 @@ impl ScriptRuntime {
         if stream.borrow().close_requested || !matches!(stream.borrow().state, State::Readable) {
             return Err(self.type_error("Cannot enqueue a chunk into a readable stream that is closed or has been requested to be closed"));
         }
+        if stream.borrow().bytes.is_some() {
+            let Some(view) = view_of(&chunk) else {
+                return Err(self.type_error("A byte stream takes only ArrayBufferView chunks"));
+            };
+            return self.byte_enqueue(stream, view);
+        }
         let waiting = stream
             .borrow()
             .reader
@@ -1044,6 +1211,12 @@ impl ScriptRuntime {
     }
 
     fn close_requested(&mut self, stream: &Rc<RefCell<Readable>>) {
+        if stream.borrow().bytes.is_some() {
+            // a byte stream that cannot close cleanly is errored instead, which is all a
+            // source with no caller to throw to can do
+            self.byte_close(stream);
+            return;
+        }
         let empty = {
             let mut stream = stream.borrow_mut();
             stream.close_requested = true;
@@ -1061,9 +1234,15 @@ impl ScriptRuntime {
         stream.borrow_mut().state = State::Closed;
         let reader = stream.borrow().reader.clone();
         if let Some(reader) = reader {
+            // a BYOB reader's reads wait for the source to respond to them
             let (requests, closed) = {
                 let mut reader = reader.borrow_mut();
-                (std::mem::take(&mut reader.requests), reader.closed.clone())
+                let requests = if reader.byob {
+                    VecDeque::new()
+                } else {
+                    std::mem::take(&mut reader.requests)
+                };
+                (requests, reader.closed.clone())
             };
             for request in requests {
                 self.settle_promise(
@@ -1085,6 +1264,7 @@ impl ScriptRuntime {
             stream.queue.clear();
             stream.queued = 0.0;
         }
+        Self::clear_byte_reads(stream);
         let reader = stream.borrow().reader.clone();
         if let Some(reader) = reader {
             let (requests, closed) = {
@@ -1111,11 +1291,22 @@ impl ScriptRuntime {
             State::Readable => {}
         }
         self.close_readable(stream);
+        let reader = stream.borrow().reader.clone();
+        if let Some(reader) = reader.filter(|reader| reader.borrow().byob) {
+            let requests = std::mem::take(&mut reader.borrow_mut().requests);
+            for request in requests {
+                self.settle_promise(
+                    &request,
+                    PromiseOutcome::Fulfilled(read_result(Value::Undefined, true)),
+                );
+            }
+        }
         {
             let mut stream = stream.borrow_mut();
             stream.queue.clear();
             stream.queued = 0.0;
         }
+        Self::clear_byte_reads(stream);
         enum Cancel {
             Script(Value, Value),
             Iterator(Value),
@@ -1181,6 +1372,9 @@ impl ScriptRuntime {
             State::Errored(reason) => return Ok(self.rejected_promise_value(reason)),
             State::Readable => {}
         }
+        if stream.borrow().bytes.is_some() {
+            return self.byte_read(&stream, reader);
+        }
         let queued = {
             let mut stream = stream.borrow_mut();
             let chunk = stream.queue.pop_front();
@@ -1208,12 +1402,18 @@ impl ScriptRuntime {
         let Some(stream) = reader.borrow_mut().stream.take() else {
             return;
         };
+        let message = if reader.borrow().byob {
+            "Releasing BYOB reader"
+        } else {
+            "Releasing reader"
+        };
+        Self::release_byte_reads(&mut stream.borrow_mut());
         let requests = std::mem::take(&mut reader.borrow_mut().requests);
         for request in requests {
-            let reason = self.make_error("TypeError", "Releasing reader");
+            let reason = self.make_error("TypeError", message);
             self.settle_promise(&request, PromiseOutcome::Rejected(reason));
         }
-        let reason = self.make_error("TypeError", "Releasing reader");
+        let reason = self.make_error("TypeError", message);
         let readable = matches!(stream.borrow().state, State::Readable);
         let closed = if readable {
             reader.borrow().closed.clone()
@@ -1248,12 +1448,16 @@ impl ScriptRuntime {
             reasons: RefCell::new([Value::Undefined, Value::Undefined]),
             cancel_promise: Self::pending_promise(),
         });
+        let bytes = stream.borrow().bytes.is_some();
         let mut values = Vec::new();
         for index in 0..2 {
-            let (value, branch) = self.new_readable(
-                readable_state(Source::Tee(tee.clone(), index), 1.0, None),
-                None,
-            );
+            let source = Source::Tee(tee.clone(), index);
+            let state = if bytes {
+                byte_state(source)
+            } else {
+                readable_state(source, 1.0, None)
+            };
+            let (value, branch) = self.new_readable(state, None);
             branch.borrow_mut().started = true;
             tee.branches.borrow_mut().push(branch);
             values.push(value);
@@ -1321,11 +1525,25 @@ impl ScriptRuntime {
             return Ok(());
         }
         let chunk = self.get_property(&result, "value")?;
+        // byte branches each own their bytes, since enqueueing moves them
+        let copy = if tee.original.borrow().bytes.is_some() {
+            let bytes = self.buffer_source_bytes(&chunk)?;
+            let length = bytes.len();
+            typed::new_typed(
+                typed::ElementKind::Uint8,
+                Rc::new(RefCell::new(bytes.into())),
+                0,
+                length,
+            )
+        } else {
+            chunk.clone()
+        };
         for (index, branch) in branches.iter().enumerate() {
             if !tee.canceled[index].get()
                 && matches!(branch.borrow().state, State::Readable)
                 && !branch.borrow().close_requested
             {
+                let chunk = if index == 0 { &chunk } else { &copy };
                 self.enqueue_readable(branch, chunk.clone())?;
             }
         }
@@ -1407,7 +1625,12 @@ impl ScriptRuntime {
         use StreamFunction as F;
         let first = arguments.first().cloned().unwrap_or(Value::Undefined);
         match function {
-            F::Constructor | F::ReaderConstructor | F::ControllerConstructor => Err(self.type_error(
+            F::Constructor
+            | F::ReaderConstructor
+            | F::ControllerConstructor
+            | F::ByobReaderConstructor
+            | F::ByteControllerConstructor
+            | F::ByobRequestConstructor => Err(self.type_error(
                 "Failed to construct: Please use the 'new' operator, this object constructor cannot be called as a function.",
             )),
             F::From => self.stream_of_iterable(first),
@@ -1438,7 +1661,11 @@ impl ScriptRuntime {
                         if mode != "byob" {
                             return Err(self.type_error(format!("Failed to execute 'getReader' on 'ReadableStream': The provided value '{mode}' is not a valid enum value of type ReadableStreamReaderMode.")));
                         }
-                        return Err(self.type_error("Cannot use a BYOB reader with a non-byte stream"));
+                        return self.lock_reader(
+                            &stream,
+                            true,
+                            "Failed to execute 'getReader' on 'ReadableStream': ",
+                        );
                     }
                 }
                 self.acquire_reader(&stream)
@@ -1587,6 +1814,18 @@ impl ScriptRuntime {
                 }
                 Ok(first)
             }
+            F::ByteDesiredSize
+            | F::ByteEnqueue
+            | F::ByteClose
+            | F::ByteError
+            | F::ByobRequest
+            | F::ByobRequestView
+            | F::Respond
+            | F::RespondWithNewView
+            | F::ByobRead
+            | F::ByobReleaseLock
+            | F::ByobCancel
+            | F::ByobClosed => self.call_byte_stream(function, this, arguments),
             other => self.call_writable_stream(other, this, arguments),
         }
     }
@@ -3297,6 +3536,114 @@ mod tests {
             "1,TypeError,function"
         );
     }
+
+    #[test]
+    fn byte_streams_fill_byob_views_and_answer_their_requests() {
+        let show = r#"const show = (v) => v === undefined ? "u" : `${v.constructor.name}:${v.byteOffset}:${Array.from(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))}:${v.buffer.byteLength}`;"#;
+        assert_eq!(
+            run(&format!(
+                r#"{show}
+                let controller;
+                const stream = new ReadableStream({{ type: "bytes", start(c) {{ controller = c; }} }});
+                const chunk = new Uint8Array([1, 2, 3, 4, 5]);
+                controller.enqueue(chunk);
+                const reader = stream.getReader({{ mode: "byob" }});
+                const first = await reader.read(new Uint8Array(3));
+                const second = await reader.read(new Uint8Array(8));
+                return [chunk.byteLength, controller.desiredSize, Object.prototype.toString.call(controller), show(first.value), show(second.value)].join(" ");
+            "#
+            )),
+            "0 0 [object ReadableByteStreamController] Uint8Array:0:1,2,3:3 Uint8Array:0:4,5:8"
+        );
+        assert_eq!(
+            run(&format!(
+                r#"{show}
+                const seen = [];
+                const stream = new ReadableStream({{
+                    type: "bytes",
+                    pull(c) {{
+                        const request = c.byobRequest;
+                        seen.push(show(request.view));
+                        request.view.set([7, 8]);
+                        request.respond(2);
+                        seen.push(String(request.view));
+                    }},
+                }});
+                const result = await stream.getReader({{ mode: "byob" }}).read(new Uint16Array(2));
+                return [show(result.value), ...seen].join(" ");
+            "#
+            )),
+            "Uint16Array:0:7,8:4 Uint8Array:0:0,0,0,0:4 null"
+        );
+        assert_eq!(
+            run(&format!(
+                r#"{show}
+                let controller;
+                const stream = new ReadableStream({{ type: "bytes", start(c) {{ controller = c; }} }});
+                const reader = stream.getReader({{ mode: "byob" }});
+                const odd = reader.read(new Uint16Array(2));
+                controller.enqueue(new Uint8Array([1, 2, 3]));
+                const out = [show((await odd).value), show((await reader.read(new Uint8Array(4))).value)];
+                const least = reader.read(new Uint8Array(4), {{ min: 3 }});
+                controller.enqueue(new Uint8Array([4]));
+                controller.enqueue(new Uint8Array([5, 6]));
+                out.push(show((await least).value));
+                const last = reader.read(new Uint8Array(2));
+                controller.close();
+                controller.byobRequest.respond(0);
+                const closed = await last;
+                out.push(show(closed.value), closed.done);
+                try {{ await reader.read(new Uint8Array(2), {{ min: 3 }}); }} catch (error) {{ out.push(error.name); }}
+                return out.join(" ");
+            "#
+            )),
+            "Uint16Array:0:1,2:4 Uint8Array:0:3:4 Uint8Array:0:4,5,6:4 Uint8Array:0::2 true RangeError"
+        );
+        assert_eq!(
+            run(&format!(
+                r#"{show}
+                const auto = new ReadableStream({{
+                    type: "bytes", autoAllocateChunkSize: 4,
+                    pull(c) {{ c.byobRequest.view[0] = 5; c.byobRequest.respond(1); }},
+                }});
+                const out = [show((await auto.getReader().read()).value)];
+                out.push(show((await new Response("hello world").body.getReader({{ mode: "byob" }}).read(new Uint8Array(5))).value));
+                let controller;
+                const [a, b] = new ReadableStream({{ type: "bytes", start(c) {{ controller = c; }} }}).tee();
+                controller.enqueue(new Uint8Array([1, 2]));
+                const x = (await a.getReader().read()).value, y = (await b.getReader().read()).value;
+                out.push(show(x), show(y), x.buffer === y.buffer);
+                const pending = new ReadableStream({{ type: "bytes", cancel(why) {{ out.push(why); }} }}).getReader({{ mode: "byob" }});
+                const read = pending.read(new Uint8Array(2));
+                await pending.cancel("why");
+                out.push((await read).done);
+                return out.join(" ");
+            "#
+            )),
+            "Uint8Array:0:5:4 Uint8Array:0:104,101,108,108,111:5 Uint8Array:0:1,2:2 Uint8Array:0:1,2:2 false why true"
+        );
+        assert_eq!(
+            run(r#"
+                const out = [];
+                const attempt = (run) => { try { run(); } catch (error) { out.push(error.name); } };
+                attempt(() => new ReadableStream({ type: "byte" }));
+                attempt(() => new ReadableStream({ type: "bytes" }, { size() { return 1; } }));
+                attempt(() => new ReadableStream({ type: "bytes", autoAllocateChunkSize: 0 }));
+                attempt(() => new ReadableStream().getReader({ mode: "byob" }));
+                let controller;
+                const stream = new ReadableStream({ type: "bytes", start(c) { controller = c; } });
+                attempt(() => controller.enqueue(new Uint8Array(0)));
+                const reader = stream.getReader({ mode: "byob" });
+                const pending = reader.read(new Uint8Array(2));
+                reader.releaseLock();
+                try { await pending; } catch (error) { out.push(error.message); }
+                out.push(stream.locked);
+                return out.join();
+            "#),
+            "RangeError,RangeError,TypeError,TypeError,TypeError,Releasing BYOB reader,false"
+        );
+    }
+
     #[test]
     fn writable_streams_write_in_order_and_report_backpressure() {
         assert_eq!(
