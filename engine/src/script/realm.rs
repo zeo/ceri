@@ -197,6 +197,9 @@ pub(super) enum Native {
     PortConstructor,
     // an interface whose objects only the engine makes
     IllegalConstructor,
+    QuadConstructor,
+    PerfObserver(super::perf_observers::ObserverMember),
+    PerfDeliver(Rc<super::perf_observers::PerfObserver>),
     DataTransferConstructor,
     MessageChannelConstructor,
     // the messages posted to ports and the window since the last task arrive
@@ -272,6 +275,11 @@ impl Native {
                 | Native::PointConstructor(_)
                 | Native::PortConstructor
                 | Native::IllegalConstructor
+                | Native::QuadConstructor
+                | Native::PerfObserver(
+                    super::perf_observers::ObserverMember::Constructor
+                        | super::perf_observers::ObserverMember::ReportingConstructor
+                )
                 | Native::DataTransferConstructor
                 | Native::MessageChannelConstructor
                 | Native::UrlConstructor
@@ -376,6 +384,7 @@ pub(super) struct Intrinsics {
     pub(super) navigator_apis: super::navigator_apis::NavigatorInterfaces,
     // prototypes of interfaces whose objects only the engine makes, by name
     pub(super) hosts: HashMap<&'static str, ObjectHandle>,
+    pub(super) perf_observers: super::perf_observers::PerfInterfaces,
     pub(super) paths: super::path2d::PathInterfaces,
     pub(super) matrices: super::matrices::MatrixInterfaces,
     pub(super) segmenters: super::segmenter::SegmenterInterfaces,
@@ -1582,6 +1591,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             None,
         );
     }
+    let perf_observers = super::perf_observers::create(&build, &object_prototype, &mut globals);
     let segmenters =
         super::segmenter::create(&build, &object_prototype, &iterator_prototype, &intl);
     let (disposables, disposable_globals) = super::disposables::create(&build, &object_prototype);
@@ -1737,6 +1747,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         matrices,
         segmenters,
         hosts,
+        perf_observers,
         disposables,
         cssom,
         font_faces,
@@ -3166,6 +3177,8 @@ impl ScriptRuntime {
                 self.call_disposable(member, asynchronous, this, arguments)
             }
             Native::Atomics(op) => self.call_atomics(op, arguments),
+            Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
+            Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),
             Native::ViewTransition(transition, which) => {
                 self.step_view_transition(&transition, which, first)
             }
@@ -3222,6 +3235,7 @@ impl ScriptRuntime {
             Native::DataTransferConstructor => {
                 Err(self.type_error("Constructor DataTransfer requires 'new'"))
             }
+            Native::QuadConstructor => Err(self.type_error("Constructor DOMQuad requires 'new'")),
             Native::PortConstructor | Native::IllegalConstructor => {
                 Err(self.type_error("Illegal constructor"))
             }
@@ -3628,6 +3642,10 @@ impl ScriptRuntime {
                 self.construct_point(read_only, arguments, new_target)
             }
             Native::DataTransferConstructor => Ok(self.new_data_transfer()),
+            Native::QuadConstructor => self.construct_quad(arguments, new_target),
+            Native::PerfObserver(member) => {
+                self.construct_perf_observer(member, arguments, new_target)
+            }
             Native::PortConstructor | Native::IllegalConstructor => {
                 Err(self.type_error("Illegal constructor"))
             }

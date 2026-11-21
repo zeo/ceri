@@ -22,6 +22,18 @@ pub(super) enum NavFunction {
     SendBeacon,
     PostTask,
     Yield,
+    // ceri reaches no camera, microphone or screen capture, as the permissions answer
+    EnumerateDevices,
+    GetUserMedia,
+    GetDisplayMedia,
+    SupportedConstraints,
+    // nor does it run service workers
+    RegisterWorker,
+    GetRegistration,
+    GetRegistrations,
+    // nor WebGPU: no adapter is a valid answer to requestAdapter
+    RequestAdapter,
+    PreferredCanvasFormat,
     // a granted lock's callback runs
     GrantLock(Rc<LockRequest>),
     // the promise a lock's callback handed back settled, and the lock goes
@@ -55,6 +67,9 @@ pub(super) struct NavigatorInterfaces {
     pub(super) locks: ObjectHandle,
     pub(super) user_activation: ObjectHandle,
     permission_status: ObjectHandle,
+    pub(super) media_devices: ObjectHandle,
+    pub(super) service_workers: ObjectHandle,
+    pub(super) gpu: ObjectHandle,
 }
 
 use std::cell::Cell;
@@ -122,12 +137,74 @@ pub(super) fn create(
     method(&scheduler, "yield", NavFunction::Yield, 0);
     globals.push(("scheduler", Value::Object(scheduler)));
     let permission_status = plain(event_target, "PermissionStatus");
+    let media_devices = plain(event_target, "MediaDevices");
+    method(
+        &media_devices,
+        "enumerateDevices",
+        NavFunction::EnumerateDevices,
+        0,
+    );
+    method(&media_devices, "getUserMedia", NavFunction::GetUserMedia, 0);
+    method(
+        &media_devices,
+        "getDisplayMedia",
+        NavFunction::GetDisplayMedia,
+        0,
+    );
+    method(
+        &media_devices,
+        "getSupportedConstraints",
+        NavFunction::SupportedConstraints,
+        0,
+    );
+    let service_workers = plain(event_target, "ServiceWorkerContainer");
+    method(&service_workers, "register", NavFunction::RegisterWorker, 1);
+    method(
+        &service_workers,
+        "getRegistration",
+        NavFunction::GetRegistration,
+        0,
+    );
+    method(
+        &service_workers,
+        "getRegistrations",
+        NavFunction::GetRegistrations,
+        0,
+    );
+    let gpu_prototype = plain(object_prototype, "GPU");
+    method(
+        &gpu_prototype,
+        "requestAdapter",
+        NavFunction::RequestAdapter,
+        0,
+    );
+    method(
+        &gpu_prototype,
+        "getPreferredCanvasFormat",
+        NavFunction::PreferredCanvasFormat,
+        0,
+    );
+    for (prototype, name) in [
+        (&media_devices, "MediaDevices"),
+        (&service_workers, "ServiceWorkerContainer"),
+        (&gpu_prototype, "GPU"),
+    ] {
+        let constructor = build.constructor(Native::IllegalConstructor, name, 0, prototype);
+        globals.push((name, Value::Object(constructor)));
+    }
+    let gpu = new_object(JsObject::with_prototype(
+        Some(gpu_prototype),
+        ObjectClass::Ordinary,
+    ));
     NavigatorInterfaces {
         permissions,
         storage,
         locks,
         user_activation,
         permission_status,
+        media_devices,
+        service_workers,
+        gpu,
     }
 }
 
@@ -387,6 +464,43 @@ impl ScriptRuntime {
                 Ok(Value::Promise(self.fulfilled_promise(Value::Bool(true))))
             }
             NavFunction::LocksRequest => self.request_lock(arguments),
+            NavFunction::EnumerateDevices => Ok(Value::Promise(
+                self.fulfilled_promise(Self::new_array(Vec::new())),
+            )),
+            NavFunction::GetUserMedia | NavFunction::GetDisplayMedia => {
+                let constraints = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let mut wants = false;
+                for kind in ["audio", "video"] {
+                    if !is_primitive(&constraints) {
+                        let wanted = self.get_property(&constraints, kind)?;
+                        wants |= wanted.truthy();
+                    }
+                }
+                let rejection = if matches!(function, NavFunction::GetUserMedia) && !wants {
+                    self.make_error(
+                        "TypeError",
+                        "Failed to execute 'getUserMedia' on 'MediaDevices': At least one of audio and video must be requested",
+                    )
+                } else {
+                    dom_exception("NotAllowedError", "Permission denied")
+                };
+                Ok(Value::Promise(self.rejected_promise_value(rejection)))
+            }
+            NavFunction::SupportedConstraints => Ok(plain_object(Vec::new())),
+            NavFunction::RegisterWorker => {
+                Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                    "NotSupportedError",
+                    "Service workers are not supported in ceri",
+                ))))
+            }
+            NavFunction::GetRegistration => {
+                Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
+            }
+            NavFunction::GetRegistrations => Ok(Value::Promise(
+                self.fulfilled_promise(Self::new_array(Vec::new())),
+            )),
+            NavFunction::RequestAdapter => Ok(Value::Promise(self.fulfilled_promise(Value::Null))),
+            NavFunction::PreferredCanvasFormat => Ok(Value::String("bgra8unorm".into())),
             NavFunction::LocksQuery => {
                 let queue = self.lock_queue.borrow().clone();
                 let (held, pending): (Vec<_>, Vec<_>) =
@@ -570,6 +684,39 @@ impl ScriptRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_service_workers_and_webgpu_answer_that_ceri_has_none() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                (async () => {
+                    seen.push(navigator.mediaDevices instanceof MediaDevices, navigator.mediaDevices instanceof EventTarget);
+                    seen.push((await navigator.mediaDevices.enumerateDevices()).length);
+                    await navigator.mediaDevices.getUserMedia({ video: true }).catch((error) => seen.push(error.name));
+                    await navigator.mediaDevices.getUserMedia({}).catch((error) => seen.push(error.name));
+                    seen.push(navigator.serviceWorker.controller, (await navigator.serviceWorker.getRegistrations()).length);
+                    await navigator.serviceWorker.register("/sw.js").catch((error) => seen.push(error.name));
+                    seen.push(navigator.gpu instanceof GPU, await navigator.gpu.requestAdapter(), navigator.gpu.getPreferredCanvasFormat());
+                    seen.push(new DOMQuad() instanceof DOMQuad);
+                    document.getElementById("out").textContent = seen.join("|");
+                })();
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(
+                "true|true|0|NotAllowedError|TypeError||0|NotSupportedError|true||bgra8unorm|true"
+            )
+        );
+    }
 
     #[test]
     fn navigator_apis_answer_and_locks_take_turns() {

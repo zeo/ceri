@@ -76,6 +76,17 @@ pub(super) struct PerformanceEntry {
     kind: &'static str,
     start: f64,
     duration: f64,
+    detail: Value,
+}
+
+impl PerformanceEntry {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn kind(&self) -> &'static str {
+        self.kind
+    }
 }
 
 // longhand properties getComputedStyle reports, with the value used when nothing sets them;
@@ -988,13 +999,24 @@ impl ScriptRuntime {
         self.drain_microtasks()
     }
 
-    fn performance_entry(&self, entry: &PerformanceEntry) -> Value {
+    pub(super) fn performance_entry(&self, entry: &PerformanceEntry) -> Value {
         plain_object([
             ("name".to_string(), Value::String(entry.name.clone().into())),
             ("entryType".to_string(), Value::String(entry.kind.into())),
             ("startTime".to_string(), Value::Number(entry.start)),
             ("duration".to_string(), Value::Number(entry.duration)),
+            ("detail".to_string(), entry.detail.clone()),
         ])
+    }
+
+    pub(super) fn performance_entry_list(&self) -> Vec<PerformanceEntry> {
+        self.performance_entries.clone()
+    }
+
+    fn record_performance_entry(&mut self, entry: PerformanceEntry) -> Value {
+        self.performance_entries.push(entry.clone());
+        self.notify_perf_observers(&entry);
+        self.performance_entry(&entry)
     }
 
     fn performance_entries(&self, filter: impl Fn(&PerformanceEntry) -> bool) -> Value {
@@ -1119,27 +1141,74 @@ impl ScriptRuntime {
             }
             WindowMethod::PerformanceMark => {
                 let name = self.coerce_string(first)?;
-                let entry = PerformanceEntry {
+                let options = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let (mut start, mut detail) = (now, Value::Null);
+                if let Value::Object(_) = &options {
+                    let given = self.get_property(&options, "startTime")?;
+                    if let Some(time) = self.performance_time(Some(&given))? {
+                        if time < 0.0 {
+                            return Err(self.type_error("Failed to execute 'mark' on 'Performance': 'startTime' cannot be negative."));
+                        }
+                        start = time;
+                    }
+                    detail = match self.get_property(&options, "detail")? {
+                        Value::Undefined => Value::Null,
+                        value => clone_payload(&value, MAX_CLONE_BYTES)
+                            .and_then(CloneValue::into_value)?,
+                    };
+                }
+                self.record_performance_entry(PerformanceEntry {
                     name,
                     kind: "mark",
-                    start: now,
+                    start,
                     duration: 0.0,
-                };
-                self.performance_entries.push(entry.clone());
-                self.performance_entry(&entry)
+                    detail,
+                })
             }
             WindowMethod::PerformanceMeasure => {
                 let name = self.coerce_string(first)?;
-                let start = self.performance_time(arguments.get(1))?.unwrap_or(0.0);
-                let end = self.performance_time(arguments.get(2))?.unwrap_or(now);
-                let entry = PerformanceEntry {
+                let options = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                // a measure takes a start mark and an end mark, or one options object
+                let (start, end, duration, detail) = if let Value::Object(_) = &options {
+                    let start = self.get_property(&options, "start")?;
+                    let end = self.get_property(&options, "end")?;
+                    let duration = match self.get_property(&options, "duration")? {
+                        Value::Undefined => None,
+                        value => Some(self.coerce_number(value)?),
+                    };
+                    let detail = self.get_property(&options, "detail")?;
+                    (
+                        self.performance_time(Some(&start))?,
+                        self.performance_time(Some(&end))?,
+                        duration,
+                        detail,
+                    )
+                } else {
+                    (
+                        self.performance_time(arguments.get(1))?,
+                        self.performance_time(arguments.get(2))?,
+                        None,
+                        Value::Undefined,
+                    )
+                };
+                let (start, end) = match (start, end, duration) {
+                    (Some(start), None, Some(duration)) => (start, start + duration),
+                    (None, Some(end), Some(duration)) => (end - duration, end),
+                    (start, end, _) => (start.unwrap_or(0.0), end.unwrap_or(now)),
+                };
+                let detail = match detail {
+                    Value::Undefined => Value::Null,
+                    value => {
+                        clone_payload(&value, MAX_CLONE_BYTES).and_then(CloneValue::into_value)?
+                    }
+                };
+                self.record_performance_entry(PerformanceEntry {
                     name,
                     kind: "measure",
                     start,
                     duration: end - start,
-                };
-                self.performance_entries.push(entry.clone());
-                self.performance_entry(&entry)
+                    detail,
+                })
             }
             WindowMethod::PerformanceEntries => self.performance_entries(|_| true),
             WindowMethod::PerformanceEntriesByName => {

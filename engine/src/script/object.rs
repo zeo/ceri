@@ -79,6 +79,9 @@ pub(super) enum ObjectClass {
     Arguments,
     // what JSON.rawJSON makes, which JSON.stringify writes out as its text
     RawJson,
+    PerfObserver(Rc<super::perf_observers::PerfObserver>),
+    // the entries a PerformanceObserver callback is handed
+    PerfEntries(Rc<Vec<super::geometry::PerformanceEntry>>),
     Boolean(bool),
     Number(f64),
     String(String),

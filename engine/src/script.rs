@@ -51,6 +51,7 @@ mod operations;
 mod parser;
 mod path2d;
 mod pattern;
+mod perf_observers;
 mod promises;
 mod ranges;
 mod realm;
@@ -650,11 +651,16 @@ pub struct ScriptRuntime {
     performance: Value,
     // window.visualViewport, which hears resize with the window
     visual_viewport: Option<ObjectHandle>,
+    // navigator.mediaDevices and navigator.serviceWorker, which hold listeners
+    media_devices: Option<ObjectHandle>,
+    service_workers: Option<ObjectHandle>,
     // the view transition under way and the object script holds for it
     view_transition: Option<(Value, Rc<viewtransitions::ViewTransition>)>,
     // the viewport size the last resize steps saw, so a change fires resize
     reported_viewport: Option<(f32, f32)>,
     performance_entries: Vec<geometry::PerformanceEntry>,
+    // PerformanceObservers that observe, kept alive while they do
+    perf_observers: Vec<(ObjectHandle, Rc<perf_observers::PerfObserver>)>,
     event_targets: HashMap<u32, Weak<RefCell<JsObject>>>,
     next_event_target: u32,
     // event target objects with listeners stay alive for as long as the listeners do
@@ -1830,9 +1836,12 @@ impl ScriptRuntime {
             media_list_prototype: None,
             performance: Value::Undefined,
             visual_viewport: None,
+            media_devices: None,
+            service_workers: None,
             view_transition: None,
             reported_viewport: None,
             performance_entries: Vec::new(),
+            perf_observers: Vec::new(),
             event_targets: HashMap::new(),
             next_event_target: 0,
             held_targets: HashMap::new(),
@@ -1931,6 +1940,20 @@ impl ScriptRuntime {
             .borrow_mut()
             .set_prototype(Some(runtime.intrinsics.dom.prototype("EventTarget")));
         runtime.visual_viewport = Some(runtime.new_event_target(prototype));
+        let prototype = runtime.intrinsics.navigator_apis.media_devices.clone();
+        runtime.media_devices = Some(runtime.new_event_target(prototype));
+        let prototype = runtime.intrinsics.navigator_apis.service_workers.clone();
+        let service_workers = runtime.new_event_target(prototype);
+        service_workers.borrow_mut().define(
+            "controller".to_string(),
+            object::Property::data(Value::Null),
+        );
+        // no registration ever becomes active, so ready never settles
+        service_workers.borrow_mut().define(
+            "ready".to_string(),
+            object::Property::data(Value::Promise(Self::pending_promise())),
+        );
+        runtime.service_workers = Some(service_workers);
         runtime.custom_registry = runtime.custom_element_registry();
         runtime
     }
@@ -4265,6 +4288,15 @@ impl ScriptRuntime {
                     self.intrinsics.navigator_apis.storage.clone(),
                 )),
                 "locks" => Ok(Value::Object(self.intrinsics.navigator_apis.locks.clone())),
+                "mediaDevices" => Ok(self
+                    .media_devices
+                    .clone()
+                    .map_or(Value::Undefined, Value::Object)),
+                "serviceWorker" => Ok(self
+                    .service_workers
+                    .clone()
+                    .map_or(Value::Undefined, Value::Object)),
+                "gpu" => Ok(Value::Object(self.intrinsics.navigator_apis.gpu.clone())),
                 "userActivation" => Ok(Value::Object(
                     self.intrinsics.navigator_apis.user_activation.clone(),
                 )),

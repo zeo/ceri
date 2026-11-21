@@ -16,6 +16,10 @@ pub(crate) enum ShapeMember {
     PointToJson,
     FromRect(bool),
     FromPoint(bool),
+    QuadFromRect,
+    QuadFromQuad,
+    QuadBounds,
+    QuadToJson,
 }
 
 pub(super) struct ShapeInterfaces {
@@ -23,6 +27,7 @@ pub(super) struct ShapeInterfaces {
     rect_read_only: ObjectHandle,
     point: ObjectHandle,
     pub(super) point_read_only: ObjectHandle,
+    quad: ObjectHandle,
 }
 
 const RECT: [&str; 4] = ["x", "y", "width", "height"];
@@ -128,12 +133,38 @@ pub(super) fn create(
         method(build, &constructor, static_name, from, 0);
         globals.push((name, Value::Object(constructor)));
     }
+    let quad = under(object_prototype);
+    method(build, &quad, "getBounds", ShapeMember::QuadBounds, 0);
+    method(build, &quad, "toJSON", ShapeMember::QuadToJson, 0);
+    tag(&quad, "DOMQuad");
+    let constructor = build.constructor(Native::QuadConstructor, "DOMQuad", 0, &quad);
+    method(
+        build,
+        &constructor,
+        "fromRect",
+        ShapeMember::QuadFromRect,
+        0,
+    );
+    method(
+        build,
+        &constructor,
+        "fromQuad",
+        ShapeMember::QuadFromQuad,
+        0,
+    );
+    globals.push(("DOMQuad", Value::Object(constructor)));
     ShapeInterfaces {
         rect,
         rect_read_only,
         point,
         point_read_only,
+        quad,
     }
+}
+
+fn number_of(runtime: &mut ScriptRuntime, value: &Value, name: &str) -> Result<f64, ScriptError> {
+    let property = runtime.get_property(value, name)?;
+    runtime.coerce_number(property)
 }
 
 impl ScriptRuntime {
@@ -242,6 +273,48 @@ impl ScriptRuntime {
         Ok(self.shape_object(prototype, POINT, values))
     }
 
+    // a DOMQuad over four DOMPoints, each read-only on the quad itself
+    fn quad_object(&self, prototype: ObjectHandle, corners: [[f64; 4]; 4]) -> Value {
+        let quad = new_object(JsObject::with_prototype(
+            Some(prototype),
+            ObjectClass::Ordinary,
+        ));
+        for (index, corner) in corners.into_iter().enumerate() {
+            let point = self.shape_object(self.intrinsics.shapes.point.clone(), POINT, corner);
+            quad.borrow_mut().define(
+                format!("p{}", index + 1),
+                Property {
+                    slot: Slot::Data(point),
+                    enumerable: true,
+                    writable: false,
+                    configurable: true,
+                },
+            );
+        }
+        Value::Object(quad)
+    }
+
+    // the corners of a quad from DOMPointInit dictionaries, as the constructor and fromQuad
+    // read them
+    fn quad_corners(&mut self, points: &[Value]) -> Result<[[f64; 4]; 4], ScriptError> {
+        let mut corners = [[0.0, 0.0, 0.0, 1.0]; 4];
+        for (index, corner) in corners.iter_mut().enumerate() {
+            let given = points.get(index).cloned().unwrap_or(Value::Undefined);
+            *corner = self.shape_numbers(POINT, [0.0, 0.0, 0.0, 1.0], &[given], true)?;
+        }
+        Ok(corners)
+    }
+
+    pub(super) fn construct_quad(
+        &mut self,
+        arguments: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, ScriptError> {
+        let prototype = self.shape_prototype(&new_target, self.intrinsics.shapes.quad.clone())?;
+        let corners = self.quad_corners(&arguments)?;
+        Ok(self.quad_object(prototype, corners))
+    }
+
     pub(super) fn call_shape(
         &mut self,
         member: ShapeMember,
@@ -295,6 +368,72 @@ impl ScriptRuntime {
                 };
                 self.shape_object(prototype, RECT, values)
             }
+            ShapeMember::QuadFromRect => {
+                let [x, y, width, height] = self.shape_numbers(RECT, [0.0; 4], &arguments, true)?;
+                let corner = |x: f64, y: f64| [x, y, 0.0, 1.0];
+                self.quad_object(
+                    self.intrinsics.shapes.quad.clone(),
+                    [
+                        corner(x, y),
+                        corner(x + width, y),
+                        corner(x + width, y + height),
+                        corner(x, y + height),
+                    ],
+                )
+            }
+            ShapeMember::QuadFromQuad => {
+                let source = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let mut points = Vec::new();
+                for name in ["p1", "p2", "p3", "p4"] {
+                    points.push(match &source {
+                        Value::Object(_) => self.get_property(&source, name)?,
+                        _ => Value::Undefined,
+                    });
+                }
+                let corners = self.quad_corners(&points)?;
+                self.quad_object(self.intrinsics.shapes.quad.clone(), corners)
+            }
+            ShapeMember::QuadBounds => {
+                let mut xs = Vec::new();
+                let mut ys = Vec::new();
+                for name in ["p1", "p2", "p3", "p4"] {
+                    let point = self.get_property(&this, name)?;
+                    xs.push(number_of(self, &point, "x")?);
+                    ys.push(number_of(self, &point, "y")?);
+                }
+                // a NaN corner makes the whole box NaN, as Math.min and Math.max would
+                let low = |values: &[f64]| {
+                    values.iter().copied().fold(f64::INFINITY, |a, b| {
+                        if a.is_nan() || b.is_nan() {
+                            f64::NAN
+                        } else {
+                            a.min(b)
+                        }
+                    })
+                };
+                let high = |values: &[f64]| {
+                    values.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
+                        if a.is_nan() || b.is_nan() {
+                            f64::NAN
+                        } else {
+                            a.max(b)
+                        }
+                    })
+                };
+                let (left, top) = (low(&xs), low(&ys));
+                self.shape_object(
+                    self.intrinsics.shapes.rect.clone(),
+                    RECT,
+                    [left, top, high(&xs) - left, high(&ys) - top],
+                )
+            }
+            ShapeMember::QuadToJson => {
+                let mut entries = Vec::new();
+                for name in ["p1", "p2", "p3", "p4"] {
+                    entries.push((name.to_string(), self.get_property(&this, name)?));
+                }
+                plain_object(entries)
+            }
             ShapeMember::FromPoint(read_only) => {
                 let values = self.shape_numbers(POINT, [0.0, 0.0, 0.0, 1.0], &arguments, true)?;
                 let prototype = if read_only {
@@ -342,6 +481,35 @@ mod tests {
             Some(
                 r#"6|10|20|26|true|[object DOMRect]|-4|{"x":0,"y":20,"width":-4,"height":6,"top":20,"right":0,"bottom":26,"left":-4}|0|3|0|true|0|1|{"x":0,"y":5,"z":0,"w":1}|[object DOMPoint]|true|function"#
             )
+        );
+    }
+
+    #[test]
+    fn quads_hold_four_points_and_bound_them() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const quad = new DOMQuad({ x: 1, y: 2 }, { x: 5 }, { x: 4, y: 6 }, { y: -1 });
+                const bounds = quad.getBounds();
+                const fromRect = DOMQuad.fromRect({ x: 1, y: 1, width: 2, height: 3 });
+                const copy = DOMQuad.fromQuad(fromRect);
+                document.getElementById("out").textContent = [
+                    quad.p1 instanceof DOMPoint, quad.p2.w, bounds instanceof DOMRect,
+                    bounds.x, bounds.y, bounds.width, bounds.height,
+                    fromRect.p3.x + "," + fromRect.p3.y, copy.p4.y, copy.p1 === fromRect.p1,
+                    JSON.stringify(new DOMQuad().toJSON().p1),
+                ].join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(r#"true|1|true|0|-1|5|7|3,4|4|false|{"x":0,"y":0,"z":0,"w":1}"#)
         );
     }
 }
