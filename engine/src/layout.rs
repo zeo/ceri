@@ -3197,12 +3197,12 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         .resolve(containing_width, font_size)
         .map(inner_width)
         .unwrap_or(f32::INFINITY);
-    // a width handed down by a flex or grid container still answers to the box's own limits
-    let content_width = size_override
-        .0
-        .unwrap_or(content_width)
-        .min(max_width)
-        .max(min_width);
+    // a width handed down by a flex or grid container still answers to the box's own limits,
+    // where a cell is as wide as its column whatever it asks for
+    let content_width = match size_override.0 {
+        Some(width) if style.display == Display::TableCell => width,
+        width => width.unwrap_or(content_width).min(max_width).max(min_width),
+    };
     // auto margins share the width a block leaves over, which centers it
     if mode == LayoutMode::Flow {
         let free = containing_width - content_width - horizontal_inner - margin.left - margin.right;
@@ -6021,6 +6021,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             let widest = |ends: bool| {
                 cells
                     .iter()
+                    // a td shown as something else keeps its border to itself
+                    .filter(|cell| cell.style.display == Display::TableCell)
                     .filter(|cell| {
                         if ends {
                             cell.row + cell.rows == below
@@ -6171,6 +6173,21 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         };
         let (least, most) = (sum(&column_min), sum(&column_max));
         let count = (0..column_count).filter(open).count().max(1) as f32;
+        // room past what every column asks for goes to the columns no cell gave a width,
+        // while there are any
+        let sized = |column: usize| {
+            cells.iter().any(|cell| {
+                cell.columns == 1 && cell.column == column && cell.style.width != Length::Auto
+            })
+        };
+        let unsized_columns = (0..column_count)
+            .filter(open)
+            .filter(|column| !sized(*column))
+            .collect::<Vec<_>>();
+        let unsized_most = unsized_columns
+            .iter()
+            .map(|column| column_max[*column])
+            .sum::<f32>();
         let ratio = if most > least {
             ((left - least) / (most - least)).clamp(0.0, 1.0)
         } else {
@@ -6181,7 +6198,15 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 continue;
             }
             let (minimum, maximum) = (column_min[column], column_max[column]);
-            widths[column] = Some(if left >= most && most > 0.0 {
+            widths[column] = Some(if left >= most && !unsized_columns.is_empty() {
+                if sized(column) {
+                    maximum
+                } else if unsized_most > 0.0 {
+                    maximum + (left - most) * maximum / unsized_most
+                } else {
+                    (left - most) / unsized_columns.len() as f32
+                }
+            } else if left >= most && most > 0.0 {
                 maximum + (left - most) * maximum / most
             } else if left >= most {
                 (left - most) / count
@@ -12138,6 +12163,28 @@ mod tests {
         );
         let pill = document.find_element_by_id("pill").expect("pill");
         assert_eq!(result.box_index()[&pill][0].rect.width, 40.0);
+    }
+
+    #[test]
+    fn a_cell_keeps_its_column_whatever_its_own_widest_says() {
+        let markup = "<style>* { margin: 0; padding: 0; } table { width: 300px; border-collapse: collapse; } #clip { max-width: 0; overflow: hidden; white-space: nowrap; } #fixed { width: 100px; }</style><table><tr><td id='clip'>a long line that the cell cuts short</td><td id='fixed'>b</td></tr></table>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let width = |id: &str| {
+            index[&document.find_element_by_id(id).expect("cell")][0]
+                .rect
+                .width
+        };
+        assert_eq!([width("clip"), width("fixed")], [200.0, 100.0]);
     }
 
     #[test]
