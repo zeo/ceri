@@ -177,6 +177,9 @@ pub struct LayoutBox {
     pub(crate) scrollbar: Scrollbar,
     // scrollbar-gutter: stable, which keeps the room of a vertical bar that is not showing
     pub(crate) stable_gutter: bool,
+    // how far below its top a flex row's baseline lies: that of its first item, or the
+    // item's bottom edge when it holds no line of text
+    pub(crate) row_baseline: Option<f32>,
     pub(crate) margin: ResolvedEdges,
 }
 
@@ -1017,6 +1020,7 @@ pub fn layout_with_state(
         svg: None,
         scrollbar: Scrollbar::default(),
         stable_gutter: false,
+        row_baseline: None,
         margin: ResolvedEdges::default(),
     };
     // the root element's scrollbar styles draw the viewport's bars
@@ -3911,6 +3915,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         scroll_offset: (0.0, 0.0),
         svg,
         stable_gutter: style.scrollbar_gutter,
+        row_baseline: None,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -4091,6 +4096,7 @@ fn anonymous_box(
         svg: None,
         scrollbar: Scrollbar::default(),
         stable_gutter: false,
+        row_baseline: None,
         margin: ResolvedEdges::default(),
     }
 }
@@ -4388,6 +4394,9 @@ fn last_baseline(layout: &LayoutBox) -> Option<f32> {
 }
 
 fn baselines(layout: &LayoutBox) -> Box<dyn Iterator<Item = f32> + '_> {
+    if let Some(offset) = layout.row_baseline {
+        return Box::new(std::iter::once(layout.rect.y + offset));
+    }
     let fonts = crate::font::active_fonts();
     let own = layout
         .text
@@ -5161,6 +5170,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         scroll_offset: (0.0, 0.0),
         svg: None,
         stable_gutter: style.scrollbar_gutter,
+        row_baseline: None,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -5170,6 +5180,15 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         ),
         margin,
     };
+    if row {
+        layout.row_baseline = layout
+            .children
+            .iter()
+            .find(|item| !item.position.is_out_of_flow())
+            .map(|item| {
+                first_baseline(item).unwrap_or(item.rect.y + item.rect.height) - layout.rect.y
+            });
+    }
     if mode != LayoutMode::Flow {
         position_layout_box(
             &mut layout,
@@ -5700,6 +5719,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scroll_offset: (0.0, 0.0),
         svg: None,
         stable_gutter: style.scrollbar_gutter,
+        row_baseline: None,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -6543,6 +6563,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scroll_offset: (0.0, 0.0),
         svg: None,
         stable_gutter: style.scrollbar_gutter,
+        row_baseline: None,
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
@@ -9982,6 +10003,7 @@ impl LayoutBox {
             svg,
             scrollbar,
             stable_gutter,
+            row_baseline,
             margin,
         } = self;
         *node == other.node
@@ -10028,6 +10050,7 @@ impl LayoutBox {
             && *svg == other.svg
             && *scrollbar == other.scrollbar
             && *stable_gutter == other.stable_gutter
+            && *row_baseline == other.row_baseline
             && *margin == other.margin
     }
 
@@ -12185,6 +12208,31 @@ mod tests {
                 .width
         };
         assert_eq!([width("clip"), width("fixed")], [200.0, 100.0]);
+    }
+
+    #[test]
+    fn a_flex_row_takes_the_baseline_of_its_first_item() {
+        let markup = "<style>* { margin: 0; padding: 0; } @font-face { font-family: 'Ceri Web'; src: url('ceri-web.woff2'); } body { font: 16px/20px 'Ceri Web'; } #grid { display: grid; grid-template-columns: 100px 1fr; align-items: baseline; } #row { display: inline-flex; align-items: center; } i { width: 30px; height: 34px; }</style><div id='grid'><p id='label'>label</p><div><span id='row'><i></i><b>text</b></span></div></div>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let top = |id: &str| {
+            index[&document.find_element_by_id(id).expect("box")][0]
+                .rect
+                .y
+        };
+        let label = find_box(&result.root, "p").expect("label");
+        let baseline = first_baseline(label).expect("label text");
+        // the label's text sits on the bottom of the empty first item, not on the text beside it
+        assert_eq!(baseline.round(), (top("row") + 34.0).round());
     }
 
     #[test]
