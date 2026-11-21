@@ -138,6 +138,7 @@ export const appWindow = Object.freeze({
   setZoom: (zoom) => invoke("window:set-zoom", { zoom }),
   setSize: (width, height) => invoke("window:set-size", { width, height }),
   setPosition: (x, y) => invoke("window:set-position", { x, y }),
+  setMinimumSize: (width, height) => invoke("window:set-minimum-size", { width, height }),
   setSkipTaskbar: (on) => invoke("window:set-skip-taskbar", { on }),
   setClickThrough: (on) => invoke("window:set-click-through", { on }),
   setContentProtected: (on) => invoke("window:set-content-protected", { on }),

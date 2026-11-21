@@ -339,6 +339,8 @@ pub enum WindowAction {
     Fullscreen(bool),
     Title(String),
     Size(u32, u32),
+    // the least the user can shrink the window to, as minimum_width and minimum_height
+    MinimumSize(u32, u32),
     Position(i32, i32),
     Center,
     AlwaysOnTop(bool),
@@ -917,6 +919,9 @@ impl AppWindow {
             }
             WindowAction::Size(width, height) => {
                 let _ = window.request_inner_size(LogicalSize::new(width, height));
+            }
+            WindowAction::MinimumSize(width, height) => {
+                window.set_min_inner_size(Some(LogicalSize::new(width.max(1), height.max(1))));
             }
             WindowAction::Position(x, y) => window.set_outer_position(LogicalPosition::new(x, y)),
             WindowAction::Center => {

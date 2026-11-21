@@ -122,6 +122,8 @@ impl CommandRoutes {
                 .and_then(|switch| act(WindowAction::AlwaysOnTop(switch.on))),
             "window:set-size" => arguments::<Extent>(call)
                 .and_then(|size| act(WindowAction::Size(size.width, size.height))),
+            "window:set-minimum-size" => arguments::<Extent>(call)
+                .and_then(|size| act(WindowAction::MinimumSize(size.width, size.height))),
             "window:set-position" => {
                 arguments::<Place>(call).and_then(|at| act(WindowAction::Position(at.x, at.y)))
             }

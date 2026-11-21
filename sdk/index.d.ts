@@ -90,6 +90,8 @@ export interface AppWindow {
   // logical pixels, as the window's size and position are given everywhere
   setSize(width: number, height: number): Promise<void>;
   setPosition(x: number, y: number): Promise<void>;
+  // the least the user can shrink the window to
+  setMinimumSize(width: number, height: number): Promise<void>;
   setSkipTaskbar(on: boolean): Promise<void>;
   // pointer input goes to whatever is beneath the window
   setClickThrough(on: boolean): Promise<void>;
