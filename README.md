@@ -14,6 +14,17 @@ Release build on Windows x64, running the packaged continuity app at 1120x720:
 
 The CEF 150 build this repository carried before it moved to its own engine measured 411 MB in 252 files, ran six processes, and held 319.7 MB resident for the same app.
 
+Against Tauri on WebView2, with the same app (the clip video recorder, its Tauri release against its ceri port, 2026-11-20, Windows x64 at 1.5x):
+
+| | Tauri | ceri |
+| --- | --- | --- |
+| Window asked for to a drawn shell | 787 ms | 565 ms |
+| CPU over 20 s idle on the home screen | 16 ms | 0 ms |
+| Processes, private bytes, working set | 7, 296 MB, 376 MB | 1, 216 MB, 179 MB |
+| CPU to play a 6 s clip in the editor | 4.69 s | 4.08 s |
+
+In the same run its eight screens matched the WebView2 build at 1x, 1.5x and 2x, where matching means no more than 0.5% of pixels differ by a CIEDE2000 distance over 2.0.
+
 The engine renders at the display device pixel ratio, resolves `font-family` stacks against installed system faces, reaches `4 / 4` on the packaged continuity page, and applies every rule in that page's stylesheet with nothing dropped.
 
 ## Build
@@ -146,9 +157,9 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 ## The engine
 
-[engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex and basic grid layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, its own ES2022 JavaScript engine (parser, bytecode compiler and VM with generators, async functions and an object model with prototypes and descriptors) with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
+[engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex, grid and table layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, SVG, a 2D canvas, audio and video through the system's decoders on Windows, its own ES2022 JavaScript engine (parser, bytecode compiler and VM with generators, async functions and an object model with prototypes and descriptors) with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
 
-Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket. On Windows the runtime backs the clipboard and file input with the platform clipboard and file dialog.
+Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text and pasted pictures, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket. On Windows the runtime backs the clipboard and file input with the platform clipboard and file dialog.
 
 A page can fetch outside its own origin only through origins the operator lists, and only over HTTPS. Windows uses the platform HTTP stack, so TLS trust and updates stay with the operating system and the bundle carries no TLS library:
 
@@ -160,7 +171,7 @@ Every other origin is refused with a typed rejection the page can catch, and nav
 
 The visual surface covers antialiased outline text with system font fallback, PNG, JPEG and GIF images decoded by the engine itself with natural sizing, `object-fit` and background images, rounded corners, gradients, box shadows, group opacity composited through offscreen layers, 2D and 3D transforms with perspective, generated content through `::before` and `::after`, CSS animations that start when they are applied, and transitions on colors, lengths, shadows, gradients, transforms and every other interpolable property the engine styles, including `transition: all`, timed with real `cubic-bezier()` curves and every `steps()` position, and reported to the page through `transition*` and `animation*` events.
 
-Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, a double click takes the word and a triple click the whole value, Ctrl with an arrow or Backspace moves or deletes by word (Alt on macOS), and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard.
+Text fields behave like native fields: a pointer press places the caret, a drag extends the selection, a double click takes the word and a triple click the whole value, Ctrl with an arrow or Backspace moves or deletes by word (Alt on macOS), and Ctrl or Cmd with A, C, X or V selects, copies, cuts and pastes through the host clipboard. The page hears `copy`, `cut` and `paste` first, with a `clipboardData` it can read or fill, and a pasted screenshot arrives there as an image file.
 
 Page text selects the same way outside form fields. A drag can cross paragraphs and inline elements, a double click takes a word, a triple click takes the block, and a drag after a double click grows by whole words. Shift with an arrow, Home or End extends the selection by character, word or line, and Ctrl or Cmd with A selects every rendered line. Copy writes the text as it is drawn, with a line break between blocks, so `<script>` and `<style>` contents never reach the clipboard.
 
@@ -168,9 +179,13 @@ A primary press that moves 4 CSS pixels (3 on macOS) on an element whose `dragga
 
 Scrollbars behave like native scrollbars: the wheel scrolls from anywhere over the gutter, and pressing the thumb drags it with the pointer while it stays grabbed at its press offset.
 
+Beyond the page, an app gets the desktop parts most Tauri apps lean on: windows that can be frameless, transparent, shadowless, click-through, kept out of screen capture or opened without taking focus, and able to remember where they were; a tray icon with check items and submenus; the system's file, folder and message dialogs, with buttons named as the app likes; notifications, start at login, global shortcuts, deep links and a single instance; files dropped on a window; and the Windows high contrast palette, which pages see through `forced-colors`.
+
 The window takes its caption from `document.title`, its icon from the packaged favicon (or the PNG or SVG an app passes to `App::icon`), and remembers its position and size between launches under the per-user profile. If the engine thread stops, the window restarts it once and then shows the engine's own recovery document.
 
-Not covered yet: media playback, WebGL and other GPU APIs, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, multi-process renderer isolation with a sandbox, and any browser-compatibility suite result. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+JavaScript conformance is checked against a test262 subset in CI, with the tests the engine does not yet pass listed in `conformance/test262/expected-failures.txt`.
+
+Not covered yet: WebGL, WebGPU and WebCodecs, video on Linux, `DOMParser`, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, and multi-process renderer isolation with a sandbox. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
 
 ## License
 
