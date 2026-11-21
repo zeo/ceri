@@ -825,9 +825,7 @@ impl AppWindow {
         }
         self.follow_refresh_rate();
         let scheme = self.window_color_scheme();
-        if scheme != self.preferences.color_scheme {
-            self.apply_preferences(scheme);
-        }
+        self.apply_preferences(scheme);
         self.publish();
         self.request_redraw();
         self.window.as_ref().map(|window| window.id())
@@ -983,7 +981,12 @@ impl AppWindow {
     fn window_event(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::Focused(focused) => {
-                if !focused {
+                if focused {
+                    // forced colours can come and go without the theme changing, and the
+                    // window is told of neither while it is out of focus
+                    let scheme = self.window_color_scheme();
+                    self.apply_preferences(scheme);
+                } else {
                     self.submit(InputEvent::Blur);
                 }
                 self.publish();
@@ -1432,9 +1435,12 @@ impl AppWindow {
     fn apply_preferences(&mut self, scheme: ColorScheme) {
         let preferences = UserPreferences {
             color_scheme: scheme,
+            forced_colors: forced_palette(),
             ..self.preferences
         };
-        if self.submit(InputEvent::PreferencesChanged(preferences)) {
+        if preferences != self.preferences
+            && self.submit(InputEvent::PreferencesChanged(preferences))
+        {
             self.preferences = preferences;
         }
     }
@@ -1721,6 +1727,63 @@ fn present_frame(
             *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
         }
     }
+}
+
+// the palette windows forces on applications while its high contrast setting is on, as
+// chromium maps it: the window colours for the page and its fields, the hot light for links
+#[cfg(target_os = "windows")]
+fn forced_palette() -> Option<crate::css::SystemColors> {
+    use windows::Win32::Graphics::Gdi::{
+        COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+        COLOR_HOTLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor, SYS_COLOR_INDEX,
+    };
+    use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut state = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the structure is the one the query fills, and names its own size
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            state.cbSize,
+            Some((&raw mut state).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .ok()?;
+    if !state.dwFlags.contains(HCF_HIGHCONTRASTON) {
+        return None;
+    }
+    let color = |index: SYS_COLOR_INDEX| {
+        // SAFETY: reads one entry of the system colour table
+        let value = unsafe { GetSysColor(index) };
+        crate::css::Color::opaque(value as u8, (value >> 8) as u8, (value >> 16) as u8)
+    };
+    let (link, text) = (color(COLOR_HOTLIGHT), color(COLOR_BTNTEXT));
+    Some(crate::css::SystemColors {
+        canvas: color(COLOR_WINDOW),
+        canvas_text: color(COLOR_WINDOWTEXT),
+        link_text: link,
+        visited_text: link,
+        active_text: link,
+        gray_text: color(COLOR_GRAYTEXT),
+        highlight: color(COLOR_HIGHLIGHT),
+        highlight_text: color(COLOR_HIGHLIGHTTEXT),
+        button_face: color(COLOR_BTNFACE),
+        button_text: text,
+        button_border: text,
+        field: color(COLOR_WINDOW),
+        field_text: color(COLOR_WINDOWTEXT),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn forced_palette() -> Option<crate::css::SystemColors> {
+    None
 }
 
 #[cfg(test)]
