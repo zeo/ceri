@@ -398,6 +398,26 @@ impl ScriptRuntime {
         self.serialize_property(&mut stringifier, String::new(), &Value::Object(wrapper))
     }
 
+    // a frozen, prototype-less object holding JSON text for a primitive, as JSON.rawJSON gives
+    pub(super) fn raw_json(&mut self, text: Value) -> Result<Value, ScriptError> {
+        let text = self.coerce_string(text)?;
+        let padded = |character: Option<char>| matches!(character, Some('\t' | '\n' | '\r' | ' '));
+        if text.is_empty() || padded(text.chars().next()) || padded(text.chars().last()) {
+            return Err(self.throw_error("SyntaxError", "Invalid value for JSON.rawJSON"));
+        }
+        let parsed = self.json_parse(Value::String(text.as_str().into()), Value::Undefined)?;
+        if !is_primitive(&parsed) {
+            return Err(self.throw_error(
+                "SyntaxError",
+                "JSON.rawJSON cannot hold an object or an array",
+            ));
+        }
+        let mut object = JsObject::with_prototype(None, ObjectClass::RawJson);
+        object.insert("rawJSON".to_string(), Value::String(text.into()));
+        object.freeze(false);
+        Ok(Value::Object(new_object(object)))
+    }
+
     fn serialize_property(
         &mut self,
         state: &mut Stringifier,
@@ -447,6 +467,12 @@ impl ScriptRuntime {
             },
             None => value,
         };
+        if let Value::Object(object) = &value
+            && matches!(object.borrow().class, ObjectClass::RawJson)
+        {
+            let text = self.get_property(&value, "rawJSON")?;
+            return Ok(Some(self.coerce_string(text)?));
+        }
         Ok(match value {
             Value::Null => Some("null".to_string()),
             Value::Bool(flag) => Some(flag.to_string()),

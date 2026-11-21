@@ -118,6 +118,8 @@ pub(super) enum Native {
     StringRaw,
     StringFromCodePoint,
     JsonParse,
+    JsonRawJson,
+    JsonIsRawJson,
     JsonStringify,
     Reflect(super::reflect::ReflectMethod),
     ProxyRevoke(Rc<super::reflect::ProxyData>),
@@ -1007,6 +1009,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let json = plain(&object_prototype);
     build.method(&json, "parse", Native::JsonParse, 2);
     build.method(&json, "stringify", Native::JsonStringify, 3);
+    build.method(&json, "rawJSON", Native::JsonRawJson, 1);
+    build.method(&json, "isRawJSON", Native::JsonIsRawJson, 1);
     build.value(&json, "@@toStringTag", Value::String("JSON".into()));
     globals.push(("JSON", Value::Object(json)));
 
@@ -3355,6 +3359,11 @@ impl ScriptRuntime {
                 }))
             }
             Native::JsonParse => self.json_parse(first, argument(&arguments, 1)),
+            Native::JsonRawJson => self.raw_json(first),
+            Native::JsonIsRawJson => Ok(Value::Bool(matches!(
+                &first,
+                Value::Object(object) if matches!(object.borrow().class, ObjectClass::RawJson)
+            ))),
             Native::JsonStringify => {
                 let text =
                     self.json_stringify(first, argument(&arguments, 1), argument(&arguments, 2))?;

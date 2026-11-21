@@ -77,6 +77,8 @@ pub(super) enum ObjectClass {
         arguments: Vec<Value>,
     },
     Arguments,
+    // what JSON.rawJSON makes, which JSON.stringify writes out as its text
+    RawJson,
     Boolean(bool),
     Number(f64),
     String(String),
