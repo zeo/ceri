@@ -145,7 +145,7 @@ pub(crate) fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
     Some((mime_type, bytes))
 }
 
-fn decode_base64(payload: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(payload: &str) -> Option<Vec<u8>> {
     let mut output = Vec::with_capacity(payload.len() * 3 / 4);
     let (mut buffer, mut bits) = (0_u32, 0_u32);
     for byte in payload.bytes() {

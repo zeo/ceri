@@ -2408,6 +2408,54 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_url_loads_as_an_image_until_it_is_revoked() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="6" height="4"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime.set_location(
+            crate::navigation::AppUrl::parse("https://app.ceri.invalid/").expect("url"),
+        );
+        runtime
+            .execute(
+                r##"
+                const status = document.getElementById("status");
+                const seen = [];
+                const show = () => (status.textContent = seen.join("|"));
+                const text = atob(document.getElementById("c").toDataURL().split(",")[1]);
+                const bytes = Uint8Array.from(text, (c) => c.charCodeAt(0));
+                const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+                seen.push(url.startsWith("blob:https://app.ceri.invalid/"), url.length);
+                const first = new Image();
+                first.onload = () => {
+                    seen.push(first.naturalWidth + "x" + first.naturalHeight);
+                    URL.revokeObjectURL(url);
+                    const second = new Image();
+                    second.onload = () => (seen.push("loaded again"), show());
+                    second.onerror = () => (seen.push("gone"), show());
+                    second.src = url + "#again";
+                    show();
+                };
+                first.onerror = () => (seen.push("failed"), show());
+                first.src = url;
+                try { URL.createObjectURL("text"); } catch (error) { seen.push(error.name); }
+                show();
+                "##,
+            )
+            .expect("script should run");
+        for _ in 0..4 {
+            runtime.advance_time(1).expect("image tasks should run");
+        }
+        let status = document.borrow().find_element_by_id("status").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("true|66|TypeError|6x4|gone")
+        );
+    }
+
+    #[test]
     fn a_shape_casts_its_shadow_moved_and_blurred() {
         let document = crate::dom::Document::parse(
             r#"<html><body><canvas id="c" width="40" height="40"></canvas><p id="status"></p></body></html>"#,

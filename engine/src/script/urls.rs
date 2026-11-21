@@ -34,6 +34,8 @@ pub(crate) enum UrlMember {
     ToString,
     CanParse,
     Parse,
+    CreateObjectUrl,
+    RevokeObjectUrl,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +172,8 @@ pub(super) fn create(
     for (name, member) in [
         ("canParse", UrlMember::CanParse),
         ("parse", UrlMember::Parse),
+        ("createObjectURL", UrlMember::CreateObjectUrl),
+        ("revokeObjectURL", UrlMember::RevokeObjectUrl),
     ] {
         let function = build.function(Native::Url(member), name, 1);
         interface_member(&url_constructor, name, Slot::Data(Value::Object(function)));
@@ -388,6 +392,29 @@ impl ScriptRuntime {
         use UrlMember as M;
         match member {
             M::CanParse => return Ok(Value::Bool(self.url_arguments(&arguments)?.is_some())),
+            M::CreateObjectUrl => {
+                let (mime_type, bytes) = match arguments.first() {
+                    Some(Value::Blob(blob)) => (blob.mime_type.clone(), blob.bytes.clone()),
+                    Some(Value::File(file)) => (file.mime_type.clone(), file.bytes.clone()),
+                    _ => {
+                        return Err(self.type_error(
+                            "Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.",
+                        ));
+                    }
+                };
+                let mut random = [0_u8; 16];
+                fill_random(&mut random).map_err(|error| runtime_error(error.to_string()))?;
+                let url = format!("blob:{}/{}", crate::navigation::APP_ORIGIN, uuid_v4(random));
+                self.object_urls.insert(url.clone(), (mime_type, bytes));
+                return Ok(Value::String(url.into()));
+            }
+            M::RevokeObjectUrl => {
+                if let Some(url) = arguments.first() {
+                    let url = self.coerce_string(url.clone())?;
+                    self.object_urls.remove(&*url);
+                }
+                return Ok(Value::Undefined);
+            }
             M::Parse => {
                 return Ok(match self.url_arguments(&arguments)? {
                     Some(url) => {

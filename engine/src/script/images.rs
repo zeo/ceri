@@ -21,10 +21,9 @@ pub(super) struct ImageLoad {
 // the key layout and script both cache a decoded image reference under
 pub(crate) fn image_key(base: &AppUrl, reference: &str) -> Option<String> {
     let reference = reference.trim();
-    if reference
-        .get(..5)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
-    {
+    if reference.get(..5).is_some_and(|scheme| {
+        scheme.eq_ignore_ascii_case("data:") || scheme.eq_ignore_ascii_case("blob:")
+    }) {
         return Some(reference.to_string());
     }
     base.resolve(reference).ok().map(|url| url.to_string())
@@ -37,6 +36,11 @@ fn decode_failure() -> Value {
 impl ScriptRuntime {
     pub(crate) fn image_cache(&self) -> &ImageCache {
         &self.images
+    }
+
+    // the type and bytes behind a url createObjectURL made, until it is revoked
+    pub(crate) fn object_url(&self, url: &str) -> Option<(String, Vec<u8>)> {
+        self.object_urls.get(url).cloned()
     }
 
     pub(crate) fn load_document_images(&mut self) {
@@ -128,7 +132,8 @@ impl ScriptRuntime {
         if let Some(Some(image)) = self.images.borrow().get(url) {
             return Some(image.clone());
         }
-        let decoded = match crate::image::decode_data_url(url) {
+        let held = crate::image::decode_data_url(url).or_else(|| self.object_url(url));
+        let decoded = match held {
             Some((mime_type, bytes)) => {
                 let check = self.content_security_policy().url(
                     crate::csp::Directive::Img,
@@ -139,6 +144,7 @@ impl ScriptRuntime {
                     .then(|| crate::image::decode_image(&bytes, &mime_type).ok())
                     .flatten()
             }
+            None if url.starts_with("blob:") => None,
             None => {
                 let promise = self.fetch(
                     &[Value::String(url.to_string().into())],

@@ -345,6 +345,8 @@ enum Builtin {
     NodeListValues(NodeListHandle),
     NodeListEntries(NodeListHandle),
     StructuredClone,
+    Atob,
+    Btoa,
     SetTimeout,
     ClearTimeout,
     SetInterval,
@@ -582,6 +584,8 @@ pub struct ScriptRuntime {
     audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
+    // what URL.createObjectURL has handed out and not taken back: the type and bytes by url
+    object_urls: HashMap<String, (String, Vec<u8>)>,
     image_loads: HashMap<NodeId, images::ImageLoad>,
     media: media::MediaState,
     dialogs: HashMap<NodeId, dialogs::DialogState>,
@@ -1536,6 +1540,12 @@ impl ScriptRuntime {
             );
             values
                 .values
+                .insert("atob".to_string(), Value::Builtin(Builtin::Atob));
+            values
+                .values
+                .insert("btoa".to_string(), Value::Builtin(Builtin::Btoa));
+            values
+                .values
                 .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
             values
                 .values
@@ -1668,6 +1678,7 @@ impl ScriptRuntime {
             notices: notifications::Notices::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
+            object_urls: HashMap::new(),
             image_loads: HashMap::new(),
             media: media::MediaState::default(),
             dialogs: HashMap::new(),
@@ -3829,6 +3840,8 @@ impl ScriptRuntime {
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
+                "atob" => Ok(Value::Builtin(Builtin::Atob)),
+                "btoa" => Ok(Value::Builtin(Builtin::Btoa)),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
@@ -8186,6 +8199,45 @@ impl ScriptRuntime {
                     .cloned()
                     .map(Value::File)
                     .unwrap_or(Value::Null))
+            }
+            // a string of bytes, one to a character, to base64 and back
+            Builtin::Btoa => {
+                let text = self.coerce_string(arguments.first().cloned().unwrap_or(Value::Undefined))?;
+                let bytes: Option<Vec<u8>> =
+                    text.chars().map(|character| u8::try_from(character).ok()).collect();
+                match bytes {
+                    Some(bytes) => Ok(Value::String(canvas::base64(&bytes).into())),
+                    None => Err(self.throw_value(dom_exception(
+                        "InvalidCharacterError",
+                        "Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",
+                    ))),
+                }
+            }
+            Builtin::Atob => {
+                let text = self.coerce_string(arguments.first().cloned().unwrap_or(Value::Undefined))?;
+                let mut data: String = text
+                    .chars()
+                    .filter(|character| !matches!(character, ' ' | '\t' | '\n' | '\u{c}' | '\r'))
+                    .collect();
+                if data.len().is_multiple_of(4) {
+                    for _ in 0..2 {
+                        if data.ends_with('=') {
+                            data.pop();
+                        }
+                    }
+                }
+                let plain = data
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'));
+                match crate::image::decode_base64(&data).filter(|_| plain && data.len() % 4 != 1) {
+                    Some(bytes) => Ok(Value::String(
+                        bytes.into_iter().map(char::from).collect::<String>().into(),
+                    )),
+                    None => Err(self.throw_value(dom_exception(
+                        "InvalidCharacterError",
+                        "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",
+                    ))),
+                }
             }
             Builtin::StructuredClone => {
                 if arguments.len() > 1
@@ -19054,6 +19106,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn atob_and_btoa_carry_bytes_one_to_a_character() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const name = (run) => { try { return run(); } catch (error) { return error.name; } };
+                document.getElementById("status").textContent = [
+                    btoa("hello"), btoa("ÿ\u0000a"), atob("aGVsbG8="), atob(" aGVs\nbG8 "),
+                    atob("/wBh").charCodeAt(0), atob("YQ").length,
+                    name(() => btoa("Ā")), name(() => atob("a")), name(() => atob("a-b_")),
+                    name(() => window.atob("YWI=")),
+                ].join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "aGVsbG8=|/wBh|hello|hello|255|1|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|ab"
+            )
+        );
+    }
     #[test]
     fn replace_child_puts_the_next_sibling_where_the_old_node_stood() {
         let document = document(

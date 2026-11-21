@@ -3182,7 +3182,8 @@ impl Browser {
         let policies = page.document.borrow().content_security_policy().clone();
         let permitted =
             |url: &str| policies.permits(policies.url(Directive::Img, url, Initiator::default()));
-        let decoded = if let Some((mime_type, bytes)) = crate::image::decode_data_url(&key) {
+        let held = crate::image::decode_data_url(&key).or_else(|| page.runtime.object_url(&key));
+        let decoded = if let Some((mime_type, bytes)) = held {
             permitted(&key)
                 .then(|| crate::image::decode_image(&bytes, &mime_type).ok())
                 .flatten()
