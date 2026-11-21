@@ -24,6 +24,7 @@ mod interfaces;
 mod intl;
 mod json;
 mod messaging;
+mod traversal;
 pub(crate) use json::quote as json_quote;
 mod lexer;
 mod media;
@@ -268,6 +269,8 @@ enum Builtin {
     DocumentImportNode,
     DocumentAdoptNode,
     DocumentCreateRange,
+    DocumentCreateTreeWalker,
+    DocumentCreateNodeIterator,
     DocumentGetSelection,
     LocationAssign,
     LocationReplace,
@@ -3868,6 +3871,8 @@ impl ScriptRuntime {
                 "importNode" => Ok(Value::Builtin(Builtin::DocumentImportNode)),
                 "adoptNode" => Ok(Value::Builtin(Builtin::DocumentAdoptNode)),
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
+                "createTreeWalker" => Ok(Value::Builtin(Builtin::DocumentCreateTreeWalker)),
+                "createNodeIterator" => Ok(Value::Builtin(Builtin::DocumentCreateNodeIterator)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "documentElement" => Ok(self
                     .document
@@ -7403,6 +7408,8 @@ impl ScriptRuntime {
                 let node = self.document.borrow_mut().create_text(text);
                 Ok(self.node_value(node))
             }
+            Builtin::DocumentCreateTreeWalker => self.create_walk(&arguments, false),
+            Builtin::DocumentCreateNodeIterator => self.create_walk(&arguments, true),
             Builtin::DocumentCreateRange => {
                 let start = Boundary {
                     node: self.document_node(),

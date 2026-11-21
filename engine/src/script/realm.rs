@@ -154,6 +154,7 @@ pub(super) enum Native {
     // a reader's read of the given generation completes
     ReaderDeliver(u32, u64),
     Port(super::messaging::PortMember),
+    Walk(super::traversal::WalkMember),
     PortConstructor,
     MessageChannelConstructor,
     // the messages posted to ports and the window since the last task arrive
@@ -279,6 +280,7 @@ pub(super) struct Intrinsics {
     pub(super) channels: super::broadcast::ChannelInterfaces,
     pub(super) readers: super::filereader::ReaderInterfaces,
     pub(super) ports: super::messaging::PortInterfaces,
+    pub(super) traversal: super::traversal::TraversalInterfaces,
     pub(super) urls: super::urls::UrlInterfaces,
     pub(super) audio: super::audio::AudioInterfaces,
 }
@@ -1266,6 +1268,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let notices = super::notifications::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let channels = super::broadcast::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let traversal = super::traversal::create(&build, &object_prototype, &mut globals);
     let ports = super::messaging::create(
         &build,
         &dom.prototype("EventTarget"),
@@ -1329,6 +1332,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         channels,
         readers,
         ports,
+        traversal,
         urls,
         audio,
     };
@@ -2668,6 +2672,7 @@ impl ScriptRuntime {
             Native::Reader(member) => self.call_reader(member, this, arguments),
             Native::ReaderDeliver(id, generation) => self.deliver_reader(id, generation),
             Native::Port(member) => self.call_port(member, this, arguments),
+            Native::Walk(member) => self.call_walk(member, this, arguments),
             Native::PortDeliver => self.deliver_port_messages(),
             Native::Url(member) => self.call_url(member, this, arguments),
             Native::UrlSearchParams(member) => self.call_url_search_params(member, this, arguments),

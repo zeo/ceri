@@ -351,6 +351,8 @@ static INTERFACES: &[Interface] = &[
             ("adoptNode", Method(1)),
             ("createEvent", Method(1)),
             ("createRange", Method(0)),
+            ("createTreeWalker", Method(1)),
+            ("createNodeIterator", Method(1)),
             ("getSelection", Method(0)),
             ("elementFromPoint", Method(2)),
             ("elementsFromPoint", Method(2)),
@@ -1100,7 +1102,8 @@ impl ScriptRuntime {
                 Value::Document,
                 "getElementById" | "querySelector" | "querySelectorAll" | "createElement"
                 | "createTextNode" | "createRange" | "getSelection" | "documentElement"
-                | "activeElement" | "importNode" | "adoptNode",
+                | "activeElement" | "importNode" | "adoptNode" | "createTreeWalker"
+                | "createNodeIterator",
             ) => Value::Document,
             _ => Value::Element(handle),
         };

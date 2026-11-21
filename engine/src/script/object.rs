@@ -112,6 +112,8 @@ pub(super) enum ObjectClass {
     Intl(Rc<super::intl::IntlState>),
     Url(Rc<RefCell<super::urls::UrlState>>),
     UrlSearchParams(Rc<RefCell<super::urls::ParamsState>>),
+    // a TreeWalker or NodeIterator
+    Walk(Rc<RefCell<super::traversal::WalkState>>),
 }
 
 #[derive(Clone)]
