@@ -153,7 +153,7 @@ impl ElementKind {
 }
 
 // binary16 bits for a number, rounded once to the nearest half with ties to even
-fn half_bits(number: f64) -> u16 {
+pub(super) fn half_bits(number: f64) -> u16 {
     if number.is_nan() {
         return 0x7e00;
     }
@@ -176,7 +176,7 @@ fn half_bits(number: f64) -> u16 {
     sign | (((exponent + 15) as u16) << 10) | ((bits >> 42) & 0x3ff) as u16
 }
 
-fn half_value(bits: u16) -> f64 {
+pub(super) fn half_value(bits: u16) -> f64 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = i32::from((bits >> 10) & 0x1f);
     let fraction = f64::from(bits & 0x3ff);

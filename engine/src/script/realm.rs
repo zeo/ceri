@@ -205,6 +205,7 @@ pub(super) enum Native {
     UrlPattern(super::urlpattern::PatternMember),
     XPath(super::xpath::XPathMember),
     StyleOm(super::typed_om::StyleMember),
+    WebGl(super::webgl::GlMember),
     Temporal(super::temporal::TemporalMember),
     PerfObserver(super::perf_observers::ObserverMember),
     PerfDeliver(Rc<super::perf_observers::PerfObserver>),
@@ -413,6 +414,7 @@ pub(super) struct Intrinsics {
     pub(super) url_patterns: super::urlpattern::PatternInterfaces,
     pub(super) xpath: super::xpath::XPathInterfaces,
     pub(super) typed_om: super::typed_om::StyleOmInterfaces,
+    pub(super) webgl: super::webgl::WebGlInterfaces,
     pub(super) temporal: super::temporal::TemporalInterfaces,
     pub(super) disposables: super::disposables::DisposableInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
@@ -857,6 +859,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.method(&css, "escape", Native::CssEscape, 1);
     build.method(&css, "supports", Native::CssSupports, 1);
     let typed_om = super::typed_om::create(&build, &object_prototype, &css, &mut globals);
+    let webgl = super::webgl::create(&build, &object_prototype, &mut globals);
     globals.push(("CSS", Value::Object(css)));
     globals.push((
         "isNaN",
@@ -1797,6 +1800,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         url_patterns,
         xpath,
         typed_om,
+        webgl,
         temporal,
         hosts,
         perf_observers,
@@ -3297,6 +3301,7 @@ impl ScriptRuntime {
             Native::UrlPattern(member) => self.call_url_pattern(member, this, arguments),
             Native::XPath(member) => self.call_xpath(member, this, arguments),
             Native::StyleOm(member) => self.call_style_om(member, this, arguments),
+            Native::WebGl(member) => self.call_webgl(member, this, arguments),
             Native::Temporal(member) => self.call_temporal(member, this, arguments),
             Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
             Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),

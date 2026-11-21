@@ -184,8 +184,14 @@ impl ScriptRuntime {
             OffscreenMember::GetContext => {
                 let kind = self.coerce_string(first)?;
                 Ok(match kind.as_str() {
-                    "2d" => Value::CanvasContext(self.canvas_context(node)),
-                    "bitmaprenderer" | "webgl" | "webgl2" | "webgpu" => Value::Null,
+                    "2d" if !self.has_webgl_context(node) => {
+                        Value::CanvasContext(self.canvas_context(node))
+                    }
+                    "webgl" | "webgl2" => {
+                        let options = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        return self.webgl_get_context(this.clone(), node, &kind, &options);
+                    }
+                    "2d" | "bitmaprenderer" | "webgpu" => Value::Null,
                     _ => {
                         return Err(self.type_error(format!(
                             "Failed to execute 'getContext' on 'OffscreenCanvas': The provided value '{kind}' is not a valid enum value of type OffscreenRenderingContextType."

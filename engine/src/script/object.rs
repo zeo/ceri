@@ -89,6 +89,8 @@ pub(super) enum ObjectClass {
     XPath(Rc<super::xpath::XPathObject>),
     // a Typed OM value, variable reference, numeric array or style property map
     StyleOm(Rc<super::typed_om::StyleOm>),
+    // a WebGL context, one of its objects, or an extension, active info or precision format
+    WebGl(Rc<super::webgl::GlObject>),
     // a value of one of the Temporal types
     Temporal(Rc<super::temporal::Temporal>),
     PerfObserver(Rc<super::perf_observers::PerfObserver>),

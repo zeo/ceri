@@ -371,6 +371,9 @@ fn arc_points(
     (place(start.cos(), start.sin()), cubics)
 }
 
+// a picture for a WebGL upload: width, height and straight-alpha pixels from the top row
+pub(super) type TexturePixels = (u32, u32, Vec<[u8; 4]>);
+
 // the pixels of an ImageBitmap, gone once it is closed
 pub(crate) type ImageBitmapHandle = Rc<RefCell<Option<Bitmap>>>;
 
@@ -1485,6 +1488,7 @@ impl ScriptRuntime {
 
     // setting width or height, even to the value it had, clears the bitmap and the context
     pub(super) fn reset_canvas(&mut self, node: NodeId) {
+        self.resize_webgl(node);
         let Some(context) = self.canvas_contexts.get(&node) else {
             return;
         };
@@ -1497,8 +1501,10 @@ impl ScriptRuntime {
 
     // a layer for each connected canvas with a bitmap, for paint to place like an img
     pub(crate) fn canvas_layers(&self) -> Vec<ImageLayer> {
+        let mut layers = self.webgl_layers();
         let document = self.document.borrow();
-        self.canvas_contexts
+        let drawn = self
+            .canvas_contexts
             .values()
             .filter_map(|context| {
                 let mut context = context.borrow_mut();
@@ -1518,7 +1524,9 @@ impl ScriptRuntime {
                     background: None,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        layers.extend(drawn);
+        layers
     }
 
     pub(super) fn canvas_element_member(
@@ -1593,8 +1601,8 @@ impl ScriptRuntime {
                 ),
             )));
         }
-        let encoded = match self.canvas_contexts.get(&node) {
-            Some(context) => context.borrow().bitmap.encode(mime, quality),
+        let encoded = match self.canvas_bitmap(node) {
+            Some(bitmap) => bitmap.encode(mime, quality),
             None => {
                 let (width, height) = canvas_size(&self.document.borrow(), node);
                 Bitmap::new(width, height).encode(mime, quality)
@@ -2336,11 +2344,73 @@ impl ScriptRuntime {
         }))
     }
 
-    // the pixels a canvas holds, when anything has drawn on it
+    // the pixels a canvas holds, when anything has drawn on it: its 2D bitmap or what its
+    // WebGL context draws
     pub(super) fn canvas_bitmap(&self, node: NodeId) -> Option<Bitmap> {
         self.canvas_contexts
             .get(&node)
             .map(|context| context.borrow().bitmap.clone())
+            .or_else(|| {
+                self.webgl_image(node)
+                    .map(|image| Bitmap::from_image(&image))
+            })
+    }
+
+    // the pixels a WebGL upload takes from an image source: rows from the top, alpha not
+    // multiplied in; None while the source has nothing to show
+    pub(super) fn texture_source(
+        &mut self,
+        source: &Value,
+    ) -> Result<Option<TexturePixels>, ScriptError> {
+        let straight = |bitmap: Bitmap| {
+            let pixels = bitmap
+                .pixels
+                .iter()
+                .map(|&pixel| unpremultiply(pixel))
+                .collect();
+            (bitmap.width, bitmap.height, pixels)
+        };
+        let from_image = |image: std::sync::Arc<crate::image::Image>| {
+            let pixels = image
+                .pixels
+                .iter()
+                .map(|color| [color.red, color.green, color.blue, color.alpha])
+                .collect();
+            (image.width, image.height, pixels)
+        };
+        if let Value::Object(_) = source
+            && Self::offscreen_element(source).is_none()
+            && let Ok(Value::TypedArray(array)) = self.get_property(source, "data")
+            && array.borrow().kind == ElementKind::Uint8Clamped
+        {
+            let width = self.get_property(source, "width")?;
+            let width = self.coerce_uint32(width)?;
+            let height = self.get_property(source, "height")?;
+            let height = self.coerce_uint32(height)?;
+            let array = array.borrow();
+            let bytes = array.buffer.borrow();
+            let bytes = &bytes[super::typed::byte_range(&array)];
+            let pixels = bytes.as_chunks::<4>().0.to_vec();
+            return Ok(Some((width, height, pixels)));
+        }
+        if let Value::Element(handle) = source {
+            let node = handle.id;
+            let document = self.document.borrow();
+            let (image, video) = (
+                is_html(&document, node, "img"),
+                is_html(&document, node, "video"),
+            );
+            drop(document);
+            if image {
+                return Ok(self.image_content(node).ok().flatten().map(from_image));
+            }
+            if video {
+                return Ok(self.video_content(node).map(from_image));
+            }
+        }
+        Ok(self
+            .canvas_source(source)?
+            .map(|(bitmap, _)| straight(bitmap)))
     }
 
     // an ImageBitmap holding pixels until it is closed
@@ -2392,8 +2462,8 @@ impl ScriptRuntime {
                 "Failed to execute 'convertToBlob' on 'OffscreenCanvas': Tainted OffscreenCanvas may not be exported.",
             ))));
         }
-        let encoded = match self.canvas_contexts.get(&node) {
-            Some(context) => context.borrow().bitmap.encode(mime, quality),
+        let encoded = match self.canvas_bitmap(node) {
+            Some(bitmap) => bitmap.encode(mime, quality),
             None => {
                 let (width, height) = canvas_size(&self.document.borrow(), node);
                 Bitmap::new(width, height).encode(mime, quality)
@@ -2461,10 +2531,7 @@ impl ScriptRuntime {
                         "Failed to execute 'drawImage' on 'CanvasRenderingContext2D': The image argument is a canvas element with a width or height of 0.",
                     )));
                 }
-                Ok(self
-                    .canvas_contexts
-                    .get(&node)
-                    .map(|context| context.borrow().bitmap.clone()))
+                Ok(self.canvas_bitmap(node))
             }
             // a video with no frame decoded yet has nothing to draw
             _ => {

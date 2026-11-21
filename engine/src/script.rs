@@ -77,6 +77,7 @@ mod urlpattern;
 mod urls;
 mod viewtransitions;
 mod vm;
+mod webgl;
 mod websocket;
 mod xhr;
 mod xpath;
@@ -794,6 +795,8 @@ pub struct ScriptRuntime {
     scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     viewport: ViewportMetrics,
     canvas_contexts: HashMap<NodeId, CanvasContextHandle>,
+    // each canvas's WebGL context, with the object script holds
+    webgl_contexts: HashMap<NodeId, webgl::WebGlHandle>,
     // the OffscreenCanvas objects standing in front of canvas elements no document holds
     offscreen_canvases: HashMap<NodeId, std::rc::Weak<RefCell<object::JsObject>>>,
     logs: Vec<String>,
@@ -1971,6 +1974,7 @@ impl ScriptRuntime {
             bridge: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
+            webgl_contexts: HashMap::new(),
             offscreen_canvases: HashMap::new(),
             logs: Vec::new(),
             clock: 0,
@@ -2257,6 +2261,7 @@ impl ScriptRuntime {
         self.file_lists.borrow_mut().retain(|node, _| !gone(*node));
         self.scroll_offsets.retain(|node, _| !gone(*node));
         self.canvas_contexts.retain(|node, _| !gone(*node));
+        self.forget_webgl(&gone);
         self.image_loads.retain(|node, _| !gone(*node));
         self.forget_media(gone);
         self.dialogs.retain(|node, _| !gone(*node));
@@ -8241,10 +8246,16 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                if kind != "2d" {
-                    return Ok(Value::Null);
+                match kind.as_str() {
+                    "2d" if !self.has_webgl_context(node) => {
+                        Ok(Value::CanvasContext(self.canvas_context(node)))
+                    }
+                    "webgl" | "experimental-webgl" | "webgl2" => {
+                        let options = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        self.webgl_get_context(Value::Element(handle.clone()), node, &kind, &options)
+                    }
+                    _ => Ok(Value::Null),
                 }
-                Ok(Value::CanvasContext(self.canvas_context(node)))
             }
             Builtin::CanvasMethod(context, name) => {
                 self.call_canvas_method(&context, name, &arguments)
