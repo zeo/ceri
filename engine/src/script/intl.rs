@@ -333,12 +333,97 @@ pub(super) struct RelativeOptions {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct ListOptions {
+    locale: String,
+    // conjunction, disjunction or unit
+    kind: String,
+    // long, short or narrow
+    style: String,
+}
+
+// the pieces a list is joined with: what goes between two items, between the earlier ones of
+// more, and before the last of more
+fn list_joints(options: &ListOptions) -> (String, String, String) {
+    let language = options
+        .locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("en")
+        .to_ascii_lowercase();
+    let narrow = options.style == "narrow";
+    if options.kind == "unit" {
+        return match (language.as_str(), narrow) {
+            ("en", true) => (" ".into(), " ".into(), " ".into()),
+            _ => (", ".into(), ", ".into(), ", ".into()),
+        };
+    }
+    let disjunction = options.kind == "disjunction";
+    let word = match (language.as_str(), disjunction) {
+        ("en", false) if options.style == "short" => "&",
+        ("en", false) => "and",
+        ("en", true) => "or",
+        ("de", false) => "und",
+        ("de", true) => "oder",
+        ("fr", false) => "et",
+        ("fr", true) => "ou",
+        ("es", false) => "y",
+        ("es", true) => "o",
+        ("it", false) => "e",
+        ("it", true) => "o",
+        ("nl", false) => "en",
+        ("nl", true) => "of",
+        ("pt", false) => "e",
+        ("pt", true) => "ou",
+        ("pl", false) => "i",
+        ("pl", true) => "lub",
+        ("uk", false) => "\u{456}",
+        ("uk", true) => "\u{430}\u{431}\u{43e}",
+        ("ru", false) => "\u{438}",
+        ("ru", true) => "\u{438}\u{43b}\u{438}",
+        (_, false) => "and",
+        (_, true) => "or",
+    };
+    if language == "en" && narrow && !disjunction {
+        return (", ".into(), ", ".into(), ", ".into());
+    }
+    let pair = format!(" {word} ");
+    // english puts a comma before the last item of three or more
+    let last = if language == "en" {
+        format!(", {word} ")
+    } else {
+        pair.clone()
+    };
+    (pair, ", ".into(), last)
+}
+
+// the list as pieces of text: each item and the joints between them
+fn list_parts(options: &ListOptions, items: &[String]) -> Vec<(&'static str, String)> {
+    let (pair, middle, last) = list_joints(options);
+    let mut parts = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            let joint = match (items.len(), index == items.len() - 1) {
+                (2, _) => &pair,
+                (_, true) => &last,
+                _ => &middle,
+            };
+            parts.push(("literal", joint.clone()));
+        }
+        parts.push(("element", item.clone()));
+    }
+    parts
+}
+
+#[derive(Clone, Debug)]
 pub(super) enum IntlMethod {
     NumberFormatConstructor,
     DateTimeFormatConstructor,
     CollatorConstructor,
     PluralRulesConstructor,
     RelativeTimeFormatConstructor,
+    ListFormatConstructor,
+    ListFormat,
+    ListFormatToParts,
     GetCanonicalLocales,
     SupportedLocalesOf,
     // getters that hand back a bound format or compare function
@@ -358,6 +443,7 @@ pub(super) enum IntlState {
     Collator(Rc<CollatorOptions>),
     Plural(Rc<PluralOptions>),
     Relative(Rc<RelativeOptions>),
+    List(Rc<ListOptions>),
 }
 
 fn group(integer: &str, separator: &str) -> String {
@@ -1003,6 +1089,74 @@ impl ScriptRuntime {
                     prototype,
                 ))
             }
+            M::ListFormatConstructor => {
+                let locale = self.locale_argument(&first)?;
+                let kind = self
+                    .option_text(&second, "type")?
+                    .unwrap_or_else(|| "conjunction".to_string());
+                let style = self
+                    .option_text(&second, "style")?
+                    .unwrap_or_else(|| "long".to_string());
+                if !matches!(kind.as_str(), "conjunction" | "disjunction" | "unit") {
+                    return Err(self.range_error(format!(
+                        "Value {kind} out of range for Intl.ListFormat options property type"
+                    )));
+                }
+                if !matches!(style.as_str(), "long" | "short" | "narrow") {
+                    return Err(self.range_error(format!(
+                        "Value {style} out of range for Intl.ListFormat options property style"
+                    )));
+                }
+                let prototype = self.intrinsics.intl_prototypes[5].clone();
+                Ok(self.intl_object(
+                    IntlState::List(Rc::new(ListOptions {
+                        locale,
+                        kind,
+                        style,
+                    })),
+                    prototype,
+                ))
+            }
+            M::ListFormat | M::ListFormatToParts => {
+                let state = self.intl_state(&this)?;
+                let IntlState::List(options) = &*state else {
+                    return Err(self.type_error("format is not available on this object"));
+                };
+                let options = options.clone();
+                let values = match &first {
+                    Value::Undefined => Vec::new(),
+                    Value::Array(list) => list.borrow().clone(),
+                    _ => {
+                        return Err(
+                            self.type_error("Iterable yielded a value which is not a string")
+                        );
+                    }
+                };
+                let mut items = Vec::new();
+                for value in values {
+                    let Value::String(text) = value.resolve() else {
+                        return Err(
+                            self.type_error("Iterable yielded a value which is not a string")
+                        );
+                    };
+                    items.push(text.to_string());
+                }
+                let parts = list_parts(&options, &items);
+                if matches!(method, M::ListFormat) {
+                    let joined: String = parts.into_iter().map(|(_, text)| text).collect();
+                    return Ok(Value::String(joined.into()));
+                }
+                let objects = parts
+                    .into_iter()
+                    .map(|(kind, text)| {
+                        self.object_from_entries(vec![
+                            ("type".to_string(), Value::String(kind.into())),
+                            ("value".to_string(), Value::String(text.into())),
+                        ])
+                    })
+                    .collect();
+                Ok(Self::new_array(objects))
+            }
             M::GetCanonicalLocales | M::SupportedLocalesOf => {
                 let list = match &first {
                     Value::Undefined => Vec::new(),
@@ -1112,6 +1266,20 @@ impl ScriptRuntime {
                                     .unwrap_or_else(|| "UTC".to_string())
                                     .into()
                             }),
+                        ),
+                    ],
+                    IntlState::List(options) => vec![
+                        (
+                            "locale".to_string(),
+                            Value::String(options.locale.as_str().into()),
+                        ),
+                        (
+                            "type".to_string(),
+                            Value::String(options.kind.as_str().into()),
+                        ),
+                        (
+                            "style".to_string(),
+                            Value::String(options.style.as_str().into()),
                         ),
                     ],
                     _ => vec![(

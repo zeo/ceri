@@ -19250,6 +19250,34 @@ mod tests {
     }
 
     #[test]
+    fn list_format_joins_items_as_the_locale_does() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const three = ["a", "b", "c"];
+                const list = (locale, options, items = three) => new Intl.ListFormat(locale, options).format(items);
+                document.getElementById("status").textContent = [
+                    list("en"), list("en", {}, ["a", "b"]), list("en", { type: "disjunction" }),
+                    list("en", { style: "short" }), list("en", { style: "narrow" }),
+                    list("en", { type: "unit" }), list("en", { type: "unit", style: "narrow" }),
+                    list("de"), list("uk"), list("en", {}, ["a"]), list("en", {}, []),
+                    JSON.stringify(new Intl.ListFormat("en").formatToParts(["x", "y"])),
+                    new Intl.ListFormat("fr", { type: "disjunction" }).resolvedOptions().type,
+                    (() => { try { new Intl.ListFormat("en", { type: "odd" }); } catch (error) { return error.name; } })(),
+                ].join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "a, b, and c|a and b|a, b, or c|a, b, & c|a, b, c|a, b, c|a b c|a, b und c|a, b \u{456} c|a||[{\"type\":\"element\",\"value\":\"x\"},{\"type\":\"literal\",\"value\":\" and \"},{\"type\":\"element\",\"value\":\"y\"}]|disjunction|RangeError"
+            )
+        );
+    }
+    #[test]
     fn atob_and_btoa_carry_bytes_one_to_a_character() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

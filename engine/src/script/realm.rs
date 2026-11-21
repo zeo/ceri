@@ -230,7 +230,8 @@ impl Native {
                 | super::intl::IntlMethod::DateTimeFormatConstructor
                 | super::intl::IntlMethod::CollatorConstructor
                 | super::intl::IntlMethod::PluralRulesConstructor
-                | super::intl::IntlMethod::RelativeTimeFormatConstructor))
+                | super::intl::IntlMethod::RelativeTimeFormatConstructor
+                | super::intl::IntlMethod::ListFormatConstructor))
     }
 }
 
@@ -279,7 +280,7 @@ pub(super) struct Intrinsics {
     pub(super) text_encoder_prototype: ObjectHandle,
     pub(super) bigint_prototype: ObjectHandle,
     pub(super) text_decoder_prototype: ObjectHandle,
-    // NumberFormat, DateTimeFormat, Collator, PluralRules and RelativeTimeFormat
+    // NumberFormat, DateTimeFormat, Collator, PluralRules, RelativeTimeFormat and ListFormat
     pub(super) intl_prototypes: Vec<ObjectHandle>,
     pub(super) dom: super::interfaces::DomInterfaces,
     pub(super) events: super::events::EventInterfaces,
@@ -1202,6 +1203,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             I::RelativeTimeFormatConstructor,
             "format",
         ),
+        ("ListFormat", I::ListFormatConstructor, "format"),
     ] {
         let prototype = plain(&object_prototype);
         match (name, extra) {
@@ -1219,6 +1221,20 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             ),
             ("PluralRules", _) => {
                 build.method(&prototype, "select", Native::Intl(Rc::new(I::Select)), 1)
+            }
+            ("ListFormat", _) => {
+                build.method(
+                    &prototype,
+                    "format",
+                    Native::Intl(Rc::new(I::ListFormat)),
+                    1,
+                );
+                build.method(
+                    &prototype,
+                    "formatToParts",
+                    Native::Intl(Rc::new(I::ListFormatToParts)),
+                    1,
+                );
             }
             _ => build.method(
                 &prototype,
