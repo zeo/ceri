@@ -344,9 +344,11 @@ enum Builtin {
     FormDataForEach(FormDataHandle),
     BlobSlice(BlobHandle),
     BlobText(BlobHandle),
+    BlobStream(BlobHandle),
     BlobBytes(BlobHandle),
     FileSlice(FileHandle),
     FileText(FileHandle),
+    FileStream(FileHandle),
     FileBytes(FileHandle),
     FileListItem(FileListHandle),
     NodeListItem(NodeListHandle),
@@ -4571,6 +4573,7 @@ impl ScriptRuntime {
                 "slice" => Ok(Value::Builtin(Builtin::BlobSlice(blob))),
                 "text" => Ok(Value::Builtin(Builtin::BlobText(blob))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::BlobBytes(blob))),
+                "stream" => Ok(Value::Builtin(Builtin::BlobStream(blob))),
                 _ => Err(runtime_error(format!("Blob has no property {property}"))),
             },
             Value::BlobConstructor => {
@@ -4584,6 +4587,7 @@ impl ScriptRuntime {
                 "slice" => Ok(Value::Builtin(Builtin::FileSlice(file))),
                 "text" => Ok(Value::Builtin(Builtin::FileText(file))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::FileBytes(file))),
+                "stream" => Ok(Value::Builtin(Builtin::FileStream(file))),
                 _ => Err(runtime_error(format!("File has no property {property}"))),
             },
             Value::FileConstructor => {
@@ -7066,6 +7070,16 @@ impl ScriptRuntime {
             .cloned()
             .unwrap_or(Value::Undefined)
             .resolve();
+        // a stream body is kept as the response's own and read when a body method asks
+        if let (Some(streams::StreamHandle::Readable(_)), Value::Object(stream)) =
+            (Self::handle_of(&body), &body)
+        {
+            let response = self.construct_response_parts(Value::Null, init, None)?;
+            if let Value::Response(made) = &response {
+                made.stream.borrow_mut().object = Some(stream.clone());
+            }
+            return Ok(response);
+        }
         self.construct_response_parts(body, init, None)
     }
 
@@ -8197,6 +8211,8 @@ impl ScriptRuntime {
                     mime_type,
                 })))
             }
+            Builtin::BlobStream(blob) => Ok(self.bytes_stream(blob.bytes.clone())),
+            Builtin::FileStream(file) => Ok(self.bytes_stream(file.bytes.clone())),
             Builtin::BlobText(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
                 String::from_utf8_lossy(&blob.bytes).into_owned().into(),
             )))),
@@ -8696,12 +8712,22 @@ impl ScriptRuntime {
                 );
                 Ok(Value::Response(Rc::new(cloned)))
             }
+            Builtin::ResponseText(response) if Self::script_body(&response.stream).is_some() => {
+                let stream = Self::script_body(&response.stream).expect("checked above");
+                response.body.borrow_mut().disturbed = true;
+                self.collect_body(&stream, streams::BodyKind::Text, response.mime_type.clone())
+            }
             Builtin::ResponseText(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
                     String::from_utf8_lossy(&body).into_owned().into(),
                 )))),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
+            Builtin::ResponseJson(response) if Self::script_body(&response.stream).is_some() => {
+                let stream = Self::script_body(&response.stream).expect("checked above");
+                response.body.borrow_mut().disturbed = true;
+                self.collect_body(&stream, streams::BodyKind::Json, response.mime_type.clone())
+            }
             Builtin::ResponseJson(response) => {
                 let body = match self.consume_response_body(&response) {
                     Ok(body) => body,
@@ -8713,12 +8739,22 @@ impl ScriptRuntime {
                     Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
                 }
             }
+            Builtin::ResponseBytes(response) if Self::script_body(&response.stream).is_some() => {
+                let stream = Self::script_body(&response.stream).expect("checked above");
+                response.body.borrow_mut().disturbed = true;
+                self.collect_body(&stream, streams::BodyKind::Bytes, response.mime_type.clone())
+            }
             Builtin::ResponseBytes(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(
                     self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body)))),
                 )),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
+            Builtin::ResponseBlob(response) if Self::script_body(&response.stream).is_some() => {
+                let stream = Self::script_body(&response.stream).expect("checked above");
+                response.body.borrow_mut().disturbed = true;
+                self.collect_body(&stream, streams::BodyKind::Blob, response.mime_type.clone())
+            }
             Builtin::ResponseBlob(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::Blob(
                     Rc::new(BlobData {

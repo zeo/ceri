@@ -115,6 +115,25 @@ pub(super) enum StreamFunction {
     PipeRead(Rc<Pipe>, bool),
     PipeClosed(Rc<Pipe>, bool),
     PipeSignal(Rc<Pipe>, AbortSignalHandle),
+    // a body read to the end for text, json, arrayBuffer or blob answered a read
+    Collected(Rc<Collect>, bool),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BodyKind {
+    Text,
+    Json,
+    Bytes,
+    Blob,
+}
+
+// a stream body being read to its end for one of the body methods
+pub(super) struct Collect {
+    reader: Rc<RefCell<Reader>>,
+    bytes: RefCell<Vec<u8>>,
+    kind: BodyKind,
+    mime_type: String,
+    result: PromiseHandle,
 }
 
 impl StreamFunction {
@@ -508,7 +527,7 @@ impl ScriptRuntime {
         self.native_function(native(function), "", 1)
     }
 
-    fn handle_of(value: &Value) -> Option<StreamHandle> {
+    pub(super) fn handle_of(value: &Value) -> Option<StreamHandle> {
         match value {
             Value::Object(object) => match &object.borrow().class {
                 ObjectClass::Stream(handle) => Some(handle.clone()),
@@ -556,6 +575,106 @@ impl ScriptRuntime {
             holder.borrow_mut().object = Some(object.clone());
         }
         value
+    }
+
+    // a readable stream over bytes, as Blob.stream hands out
+    pub(super) fn bytes_stream(&self, bytes: Vec<u8>) -> Value {
+        let state = readable_state(Source::Body(response_body(bytes)), 0.0, None);
+        let (value, stream) = self.new_readable(state, None);
+        stream.borrow_mut().started = true;
+        value
+    }
+
+    // the stream a body was made from when script gave one, rather than bytes
+    pub(super) fn script_body(holder: &ReadableStreamHandle) -> Option<Rc<RefCell<Readable>>> {
+        let object = holder.borrow().object.clone()?;
+        let stream = match &object.borrow().class {
+            ObjectClass::Stream(StreamHandle::Readable(stream)) => stream.clone(),
+            _ => return None,
+        };
+        let own = matches!(&stream.borrow().source, Source::Body(body) if Rc::ptr_eq(body, &holder.borrow().body));
+        (!own).then_some(stream)
+    }
+
+    // reads a stream body to its end and answers as the body method asked
+    pub(super) fn collect_body(
+        &mut self,
+        stream: &Rc<RefCell<Readable>>,
+        kind: BodyKind,
+        mime_type: String,
+    ) -> Result<Value, ScriptError> {
+        if stream.borrow().reader.is_some() || stream.borrow().disturbed {
+            return Ok(Value::Promise(
+                self.rejected_promise("body stream already read"),
+            ));
+        }
+        let reader = match self.acquire_reader(stream)? {
+            Value::Object(object) => match &object.borrow().class {
+                ObjectClass::Stream(StreamHandle::Reader(reader)) => reader.clone(),
+                _ => unreachable!("acquire_reader makes a reader"),
+            },
+            _ => unreachable!("acquire_reader makes a reader"),
+        };
+        let collect = Rc::new(Collect {
+            reader,
+            bytes: RefCell::new(Vec::new()),
+            kind,
+            mime_type,
+            result: Self::pending_promise(),
+        });
+        self.collect_next(&collect)?;
+        Ok(Value::Promise(collect.result.clone()))
+    }
+
+    fn collect_next(&mut self, collect: &Rc<Collect>) -> Result<(), ScriptError> {
+        let read = self.read_from(&collect.reader)?;
+        let fulfilled = self.stream_step(StreamFunction::Collected(collect.clone(), true));
+        let rejected = self.stream_step(StreamFunction::Collected(collect.clone(), false));
+        self.promise_then(read, Some(&fulfilled), Some(&rejected))?;
+        Ok(())
+    }
+
+    fn collected(
+        &mut self,
+        collect: &Rc<Collect>,
+        fulfilled: bool,
+        result: Value,
+    ) -> Result<(), ScriptError> {
+        if !fulfilled {
+            self.settle_promise(&collect.result, PromiseOutcome::Rejected(result));
+            return Ok(());
+        }
+        if !self.get_property(&result, "done")?.truthy() {
+            let chunk = self.get_property(&result, "value")?;
+            if !matches!(chunk, Value::TypedArray(_) | Value::Bytes(_)) {
+                let error = self.make_error("TypeError", "body stream chunks must be Uint8Array");
+                self.release_reader(&collect.reader);
+                self.settle_promise(&collect.result, PromiseOutcome::Rejected(error));
+                return Ok(());
+            }
+            let bytes = self.buffer_source_bytes(&chunk)?;
+            collect.bytes.borrow_mut().extend(bytes);
+            return self.collect_next(collect);
+        }
+        self.release_reader(&collect.reader);
+        let bytes = std::mem::take(&mut *collect.bytes.borrow_mut());
+        let outcome = match collect.kind {
+            BodyKind::Text => Ok(Value::String(
+                String::from_utf8_lossy(&bytes).into_owned().into(),
+            )),
+            BodyKind::Json => self.parse_json(&String::from_utf8_lossy(&bytes)),
+            BodyKind::Bytes => Ok(Value::Bytes(Rc::new(RefCell::new(bytes)))),
+            BodyKind::Blob => Ok(Value::Blob(Rc::new(BlobData {
+                bytes,
+                mime_type: collect.mime_type.clone(),
+            }))),
+        };
+        let outcome = match outcome {
+            Ok(value) => PromiseOutcome::Fulfilled(value),
+            Err(error) => PromiseOutcome::Rejected(self.take_thrown(error)),
+        };
+        self.settle_promise(&collect.result, outcome);
+        Ok(())
     }
 
     pub(super) fn construct_stream(
@@ -2919,6 +3038,10 @@ impl ScriptRuntime {
                 self.pipe_finish(&pipe, error)?;
                 Ok(Value::Undefined)
             }
+            F::Collected(collect, fulfilled) => {
+                self.collected(&collect, fulfilled, first)?;
+                Ok(Value::Undefined)
+            }
             F::PipeSignal(pipe, signal) => {
                 let reason = signal.borrow().reason.clone().unwrap_or(Value::Undefined);
                 self.pipe_aborted(&pipe, reason)?;
@@ -3211,6 +3334,24 @@ mod tests {
                 try { await done; return "resolved"; } catch (error) { return error.message; }
             "#),
             "stopped"
+        );
+    }
+    #[test]
+    fn responses_read_streams_and_blobs_hand_out_streams() {
+        assert_eq!(
+            run(r#"
+                const encoder = new TextEncoder();
+                const source = ReadableStream.from([encoder.encode('{"a":'), encoder.encode('1}')]);
+                const parsed = await new Response(source).json();
+                const text = await new Response(new Blob(["blob text"]).stream()).text();
+                const piped = await new Response(
+                    ReadableStream.from(["x", "y"]).pipeThrough(new TextEncoderStream())
+                ).arrayBuffer();
+                let refused;
+                try { await new Response(ReadableStream.from(["not bytes"])).text(); } catch (error) { refused = error.name; }
+                return [parsed.a, text, piped.byteLength, refused].join("|");
+            "#),
+            "1|blob text|2|TypeError"
         );
     }
 }
