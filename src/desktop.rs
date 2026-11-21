@@ -22,6 +22,58 @@ impl ClipboardProvider for DesktopClipboard {
     fn write_text(&self, text: &str) -> Result<(), NavigationError> {
         platform::write_clipboard_text(self, text).map_err(NavigationError::Clipboard)
     }
+
+    #[cfg(target_os = "windows")]
+    fn read_image(&self) -> Result<Option<(String, Vec<u8>)>, NavigationError> {
+        platform::read_clipboard_image().map_err(NavigationError::Clipboard)
+    }
+}
+
+// the size and RGBA pixels of a device independent bitmap as the clipboard packs one: a
+// header, any colour masks, then rows of blue, green, red from the bottom up unless the
+// height is negative
+#[cfg(any(target_os = "windows", test))]
+fn dib_pixels(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let long = |at: usize| Some(i32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?));
+    let header = usize::try_from(long(0)?).ok().filter(|size| *size >= 40)?;
+    let (width, height) = (long(4)?, long(8)?);
+    let bits = u16::from_le_bytes(dib.get(14..16)?.try_into().ok()?);
+    let compression = long(16)?;
+    // uncompressed rows, or the same with the masks spelled out
+    if width <= 0 || height == 0 || !matches!(bits, 24 | 32) || !matches!(compression, 0 | 3) {
+        return None;
+    }
+    let (columns, rows) = (width as usize, height.unsigned_abs() as usize);
+    if columns.checked_mul(rows)? > 1 << 26 {
+        return None;
+    }
+    // a forty byte header keeps its three masks after it, and larger ones hold them
+    let masks = if compression == 3 && header == 40 {
+        12
+    } else {
+        0
+    };
+    let palette = usize::try_from(long(32)?).ok()?.checked_mul(4)?;
+    let each = usize::from(bits / 8);
+    let stride = (columns * each + 3) & !3;
+    let start = header.checked_add(masks)?.checked_add(palette)?;
+    let packed = dib.get(start..start.checked_add(stride.checked_mul(rows)?)?)?;
+    let mut rgba = Vec::with_capacity(columns * rows * 4);
+    for row in 0..rows {
+        let source = if height > 0 { rows - 1 - row } else { row };
+        let line = &packed[source * stride..][..columns * each];
+        for pixel in line.chunks_exact(each) {
+            let alpha = if each == 4 { pixel[3] } else { 255 };
+            rgba.extend([pixel[2], pixel[1], pixel[0], alpha]);
+        }
+    }
+    // thirty two bits with no alpha anywhere is a solid picture, as most screenshots are
+    if rgba.chunks_exact(4).all(|pixel| pixel[3] == 0) {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+    }
+    Some((columns as u32, rows as u32, rgba))
 }
 
 // the operating system's time zone rules, so script Date objects show local time
@@ -109,10 +161,12 @@ mod platform {
     use windows::Win32::Globalization::GetUserDefaultLocaleName;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
-        OpenClipboard, SetClipboardData,
+        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    use windows::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    };
+    use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
     use windows::Win32::System::Time::{
         FileTimeToSystemTime, GetTimeZoneInformation, SystemTimeToFileTime,
         SystemTimeToTzSpecificLocalTime, TIME_ZONE_INFORMATION,
@@ -236,6 +290,44 @@ mod platform {
             let _ = GlobalUnlock(memory);
         }
         Ok(String::from_utf16_lossy(&units))
+    }
+
+    // a picture as a PNG file: the one an app put there under that name, or the bitmap
+    // every screenshot comes with, encoded
+    pub(super) fn read_clipboard_image() -> Result<Option<(String, Vec<u8>)>, String> {
+        // SAFETY: the name is a terminated wide string
+        let png = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
+        let held = [png, u32::from(CF_DIB.0)].into_iter().find(|format| {
+            // SAFETY: the call only reports availability
+            *format != 0 && unsafe { IsClipboardFormatAvailable(*format) }.is_ok()
+        });
+        let Some(format) = held else {
+            return Ok(None);
+        };
+        let _clipboard = Clipboard::open()?;
+        // SAFETY: the clipboard is open and the returned handle stays owned by the system
+        let Ok(handle) = (unsafe { GetClipboardData(format) }) else {
+            return Ok(None);
+        };
+        let memory = HGLOBAL(handle.0);
+        // SAFETY: the handle came from the clipboard, so it names global memory of the size
+        // GlobalSize gives, which stays locked while it is copied
+        let bytes = unsafe {
+            let pointer = GlobalLock(memory) as *const u8;
+            if pointer.is_null() {
+                return Err("the clipboard picture could not be locked".to_string());
+            }
+            let bytes = std::slice::from_raw_parts(pointer, GlobalSize(memory)).to_vec();
+            let _ = GlobalUnlock(memory);
+            bytes
+        };
+        let file = if format == png {
+            Some(bytes)
+        } else {
+            super::dib_pixels(&bytes)
+                .map(|(width, height, rgba)| ceri_engine::png_from_rgba(width, height, &rgba))
+        };
+        Ok(file.map(|file| ("image/png".to_string(), file)))
     }
 
     pub(super) fn write_clipboard_text(
@@ -422,6 +514,35 @@ mod platform {
 mod tests {
     use super::{DesktopClipboard, DesktopFilePicker, posix_locale_tag, user_locale};
     use ceri_engine::{ClipboardProvider, FilePickerRequest};
+
+    #[test]
+    fn a_clipboard_bitmap_reads_bottom_up_as_rgba() {
+        // two by two, 24 bits: rows are padded to four bytes and the last row comes first
+        let mut dib = vec![0_u8; 40];
+        dib[0] = 40;
+        dib[4] = 2;
+        dib[8] = 2;
+        dib[14] = 24;
+        dib.extend([1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0]);
+        let (width, height, rgba) = super::dib_pixels(&dib).expect("bitmap");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            rgba,
+            [9, 8, 7, 255, 12, 11, 10, 255, 3, 2, 1, 255, 6, 5, 4, 255]
+        );
+        // 32 bits top down with masks after the header, and alpha left at nothing
+        let mut dib = vec![0_u8; 40];
+        dib[0] = 40;
+        dib[4] = 1;
+        dib[8..12].copy_from_slice(&(-1_i32).to_le_bytes());
+        dib[14] = 32;
+        dib[16] = 3;
+        dib.extend([0; 12]);
+        dib.extend([30, 20, 10, 0]);
+        assert_eq!(super::dib_pixels(&dib), Some((1, 1, vec![10, 20, 30, 255])));
+        assert_eq!(super::dib_pixels(&dib[..44]), None, "cut short");
+        assert_eq!(super::dib_pixels(&[]), None);
+    }
 
     #[test]
     fn locales_come_out_as_bcp_47_tags() {

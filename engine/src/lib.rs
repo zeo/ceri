@@ -75,6 +75,11 @@ pub use host::{
     KeyModifiers, PointerButton, RegionPress,
 };
 pub use image::{icon_png, rasterize_icon};
+
+// eight bit RGBA pixels, row after row, as a PNG file
+pub fn png_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    png::encode_png(width, height, 4, rgba)
+}
 pub use inflate::{InflateError, zlib_decompress};
 pub use layout::{LayoutDocument, Rect, Size, ThumbDrag, layout};
 #[cfg(feature = "native-http")]
