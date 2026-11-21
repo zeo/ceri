@@ -41,6 +41,179 @@ pub(super) enum MathFunction {
     Tan,
     Tanh,
     Trunc,
+    F16round,
+    SumPrecise,
+}
+
+// the binary16 value nearest a number, ties to even, as Math.f16round and Float16Array keep it
+pub(super) fn f16_round(value: f64) -> f64 {
+    if value.is_nan() || value.is_infinite() || value == 0.0 {
+        return value;
+    }
+    let magnitude = value.abs();
+    // the largest finite half is 65504, and halfway to the next power is where it overflows
+    if magnitude >= 65520.0 {
+        return f64::INFINITY.copysign(value);
+    }
+    let rounded = if magnitude < 2f64.powi(-14) {
+        (magnitude * 2f64.powi(24)).round_ties_even() * 2f64.powi(-24)
+    } else {
+        let exponent = magnitude.log2().floor() as i32;
+        let exponent = if 2f64.powi(exponent) > magnitude {
+            exponent - 1
+        } else {
+            exponent
+        };
+        let unit = 2f64.powi(exponent - 10);
+        (magnitude / unit).round_ties_even() * unit
+    };
+    rounded.copysign(value)
+}
+
+fn two_sum(x: f64, y: f64) -> (f64, f64) {
+    let high = x + y;
+    let back = high - x;
+    let low = (x - (high - back)) + (y - back);
+    (high, low)
+}
+
+// the exactly rounded sum of the numbers: a list of non-overlapping partial sums kept exact,
+// with sums past the largest double carried in units of 2^1024, as the proposal's reference
+// implementation does
+pub(super) fn sum_precise(values: &[f64]) -> f64 {
+    const HALF_RANGE: f64 = 8.98846567431158e307; // 2^1023
+    const MAX_ULP: f64 = 1.99584030953472e292; // 2^971, the spacing of doubles at the top
+    let mut partials: Vec<f64> = Vec::new();
+    let mut overflow = 0_i64;
+    let mut everything_negative_zero = true;
+    let (mut positive_infinity, mut negative_infinity, mut nan) = (false, false, false);
+    for &value in values {
+        if value.is_nan() {
+            nan = true;
+            continue;
+        }
+        if value == f64::INFINITY {
+            positive_infinity = true;
+            continue;
+        }
+        if value == f64::NEG_INFINITY {
+            negative_infinity = true;
+            continue;
+        }
+        if !(value == 0.0 && value.is_sign_negative()) {
+            everything_negative_zero = false;
+        }
+        if value == 0.0 {
+            continue;
+        }
+        let mut x = value;
+        let mut kept = 0;
+        for index in 0..partials.len() {
+            let mut y = partials[index];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let (mut high, mut low) = two_sum(x, y);
+            if high.is_infinite() {
+                let sign = if high > 0.0 { 1.0 } else { -1.0 };
+                overflow += sign as i64;
+                x = (x - sign * HALF_RANGE) - sign * HALF_RANGE;
+                if x.abs() < y.abs() {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                (high, low) = two_sum(x, y);
+            }
+            if low != 0.0 {
+                partials[kept] = low;
+                kept += 1;
+            }
+            x = high;
+        }
+        partials.truncate(kept);
+        if x != 0.0 {
+            partials.push(x);
+        }
+    }
+    if nan || (positive_infinity && negative_infinity) {
+        return f64::NAN;
+    }
+    if positive_infinity {
+        return f64::INFINITY;
+    }
+    if negative_infinity {
+        return f64::NEG_INFINITY;
+    }
+    if everything_negative_zero {
+        return -0.0;
+    }
+    let mut next_index = partials.len() as isize - 1;
+    let (mut high, mut low) = (0.0, 0.0);
+    if overflow != 0 {
+        let next = if next_index >= 0 {
+            partials[next_index as usize]
+        } else {
+            0.0
+        };
+        next_index -= 1;
+        if overflow.abs() > 1 || (overflow > 0 && next > 0.0) || (overflow < 0 && next < 0.0) {
+            return if overflow > 0 {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            };
+        }
+        (high, low) = two_sum(overflow as f64 * HALF_RANGE, next / 2.0);
+        low *= 2.0;
+        if (2.0 * high).is_infinite() {
+            // a sum exactly half a unit below 2^1024 rounds to the largest double only when what
+            // remains pulls it down
+            let below = next_index >= 0 && partials[next_index as usize] < 0.0;
+            let above = next_index >= 0 && partials[next_index as usize] > 0.0;
+            return if high > 0.0 {
+                if high == HALF_RANGE && low == -(MAX_ULP / 2.0) && below {
+                    f64::MAX
+                } else {
+                    f64::INFINITY
+                }
+            } else if high == -HALF_RANGE && low == MAX_ULP / 2.0 && above {
+                -f64::MAX
+            } else {
+                f64::NEG_INFINITY
+            };
+        }
+        if low != 0.0 {
+            next_index += 1;
+            if next_index as usize >= partials.len() {
+                partials.push(low);
+            } else {
+                partials[next_index as usize] = low;
+            }
+            low = 0.0;
+        }
+        high *= 2.0;
+    }
+    while next_index >= 0 {
+        let x = high;
+        let y = partials[next_index as usize];
+        next_index -= 1;
+        high = x + y;
+        low = y - (high - x);
+        if low != 0.0 {
+            break;
+        }
+    }
+    // a remainder of exactly half a unit takes its direction from the next partial
+    if next_index >= 0
+        && ((low < 0.0 && partials[next_index as usize] < 0.0)
+            || (low > 0.0 && partials[next_index as usize] > 0.0))
+    {
+        let y = low * 2.0;
+        let x = high + y;
+        if x - high == y {
+            high = x;
+        }
+    }
+    high
 }
 
 pub(super) const MATH_FUNCTIONS: &[(&str, MathFunction, u32)] = &[
@@ -62,6 +235,8 @@ pub(super) const MATH_FUNCTIONS: &[(&str, MathFunction, u32)] = &[
     ("floor", MathFunction::Floor, 1),
     ("fround", MathFunction::Fround, 1),
     ("hypot", MathFunction::Hypot, 2),
+    ("f16round", MathFunction::F16round, 1),
+    ("sumPrecise", MathFunction::SumPrecise, 1),
     ("imul", MathFunction::Imul, 2),
     ("log", MathFunction::Log, 1),
     ("log1p", MathFunction::Log1p, 1),
@@ -456,6 +631,23 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         use MathFunction as F;
+        if let F::SumPrecise = function {
+            let iterable = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let iterator = self.get_iterator(iterable)?;
+            let mut values = Vec::new();
+            while let Some(item) = self.iterator_step(&iterator)? {
+                let Value::Number(number) = item else {
+                    let error = self.type_error("Math.sumPrecise requires an iterable of numbers");
+                    let thrown = self.take_thrown(error);
+                    if let Err(error) = self.iterator_close(&iterator) {
+                        self.take_thrown(error);
+                    }
+                    return Err(self.throw_value(thrown));
+                };
+                values.push(number);
+            }
+            return Ok(Value::Number(sum_precise(&values)));
+        }
         let mut numbers = Vec::with_capacity(arguments.len());
         let takes = match function {
             F::Max | F::Min | F::Hypot => arguments.len(),
@@ -487,6 +679,8 @@ impl ScriptRuntime {
             F::Expm1 => x.exp_m1(),
             F::Floor => x.floor(),
             F::Fround => f64::from(x as f32),
+            F::F16round => f16_round(x),
+            F::SumPrecise => unreachable!("summed above"),
             F::Hypot => {
                 if numbers.iter().any(|value| value.is_infinite()) {
                     f64::INFINITY
@@ -609,6 +803,24 @@ impl ScriptRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precise_sums_and_half_rounding_are_exact() {
+        assert_eq!(sum_precise(&[1e20, 0.1, -1e20]), 0.1);
+        assert_eq!(sum_precise(&[0.1, 0.2, 0.3]), 0.6);
+        assert_eq!(sum_precise(&[f64::MAX, f64::MAX, -f64::MAX]), f64::MAX);
+        assert_eq!(sum_precise(&[f64::MAX, f64::MAX]), f64::INFINITY);
+        assert!(sum_precise(&[]).is_sign_negative());
+        assert!(sum_precise(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+        assert_eq!(sum_precise(&[-0.0, 0.0]), 0.0);
+        assert!(!sum_precise(&[-0.0, 0.0]).is_sign_negative());
+        assert_eq!(f16_round(1.337), 1.3369140625);
+        assert_eq!(f16_round(65519.0), 65504.0);
+        assert_eq!(f16_round(65520.0), f64::INFINITY);
+        assert_eq!(f16_round(5.960464477539063e-8), 5.960464477539063e-8);
+        assert_eq!(f16_round(2.9e-8), 0.0);
+        assert_eq!(f16_round(1.00048828125), 1.0);
+    }
 
     #[test]
     fn fixed_formatting_rounds_halves_up_on_exact_values() {

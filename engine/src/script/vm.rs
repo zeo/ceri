@@ -2186,6 +2186,14 @@ impl ScriptRuntime {
                 self.iterable_callsite = None;
                 frames.last_mut().expect("frame").stack.push(iterator?);
             }
+            Op::ArgumentsIterator => {
+                let Value::Array(array) = Self::pop(frame) else {
+                    unreachable!("arguments arrive as an array")
+                };
+                frame.stack.push(Value::VmIterator(Rc::new(RefCell::new(
+                    VmIterator::Array { array, index: 0 },
+                ))));
+            }
             Op::GetAsyncIterator => {
                 let value = Self::pop(frame);
                 let iterator = self.get_async_iterator(value)?;

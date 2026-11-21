@@ -205,6 +205,8 @@ pub(super) enum Op {
     JumpIfNullishChain(u32),
     ChainEnd,
     GetIterator(Option<u32>),
+    // an iterator over the argument list, which no replaced array iterator can reach
+    ArgumentsIterator,
     GetAsyncIterator,
     IterValue,
     IterRest,
@@ -2770,7 +2772,7 @@ impl Compiler {
                 let index = self.state().function_scope_index();
                 self.state().scopes[index].declare(name, BindingKind::Param);
             }
-            self.emit(Op::GetIterator(None));
+            self.emit(Op::ArgumentsIterator);
             for param in &function.params {
                 self.emit(Op::IterValue);
                 self.compile_pattern(param, Some(DeclarationKind::Let))?;
@@ -3223,7 +3225,14 @@ impl Compiler {
                 self.emit(Op::Pop);
             }
             Expr::SuperCall(arguments) => {
-                if arguments
+                // a default constructor hands its arguments on as they are, past any
+                // replaced array iterator
+                if let [Argument::Spread(list @ Expr::Identifier(name))] = arguments.as_slice()
+                    && &**name == DEFAULT_ARGUMENTS
+                {
+                    self.compile_expression(list)?;
+                    self.emit(Op::SuperCallSpread);
+                } else if arguments
                     .iter()
                     .any(|argument| matches!(argument, Argument::Spread(_)))
                 {
@@ -3935,13 +3944,16 @@ enum RefKind {
     SuperIndex,
 }
 
+// the rest list of a default derived constructor, a name no script can write
+const DEFAULT_ARGUMENTS: &str = "%args";
+
 fn default_constructor(name: &Name, derived: bool, source: (usize, usize)) -> FunctionNode {
     let (params, rest, body) = if derived {
         (
             Vec::new(),
-            Some(Pattern::Identifier("args".into())),
+            Some(Pattern::Identifier(DEFAULT_ARGUMENTS.into())),
             vec![Stmt::Expression(Expr::SuperCall(vec![Argument::Spread(
-                Expr::Identifier("args".into()),
+                Expr::Identifier(DEFAULT_ARGUMENTS.into()),
             )]))],
         )
     } else {

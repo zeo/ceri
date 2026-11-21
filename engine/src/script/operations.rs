@@ -2083,12 +2083,19 @@ impl ScriptRuntime {
     fn iterator_state(&mut self, value: Value) -> Result<VmIterator, ScriptError> {
         // taken first, so an iteration the lookup itself runs reports in its own words
         let callsite = self.iterable_callsite.take();
+        let method = match &value {
+            Value::Array(_) => Some(self.get_property(&value, "@@iterator")?),
+            _ => None,
+        };
+        let replaced = method.as_ref().is_some_and(|method| {
+            !matches!(method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(Native::ArrayValues)))
+        });
         match &value {
-            Value::Array(array) => Ok(VmIterator::Array {
+            Value::Array(array) if !replaced => Ok(VmIterator::Array {
                 array: array.clone(),
                 index: 0,
             }),
-            Value::Object(_) => {
+            Value::Array(_) | Value::Object(_) => {
                 let method = self.get_property(&value, "@@iterator")?;
                 if !is_callable(&method) {
                     return Err(self.not_iterable(callsite, &value));
