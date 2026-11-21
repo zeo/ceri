@@ -166,6 +166,7 @@ pub(super) enum Native {
     Path(super::path2d::PathMember),
     Matrix(super::matrices::MatrixMember),
     Segmenter(super::segmenter::SegmenterMember),
+    Cssom(super::cssom::CssomMember),
     // DOMMatrixReadOnly when true, DOMMatrix otherwise
     MatrixConstructor(bool),
     Stream(Rc<super::streams::StreamFunction>),
@@ -246,6 +247,8 @@ impl Native {
                 | Native::Path(super::path2d::PathMember::Constructor)
                 | Native::MatrixConstructor(_)
                 | Native::Segmenter(super::segmenter::SegmenterMember::Constructor)
+                | Native::Cssom(super::cssom::CssomMember::SheetConstructor)
+                | Native::Cssom(super::cssom::CssomMember::RuleConstructor)
                 | Native::Helper(super::iterator_helpers::HelperMember::Constructor)
                 | Native::Markup(
                     super::markup::MarkupMember::Parser | super::markup::MarkupMember::Serializer
@@ -337,6 +340,7 @@ pub(super) struct Intrinsics {
     pub(super) paths: super::path2d::PathInterfaces,
     pub(super) matrices: super::matrices::MatrixInterfaces,
     pub(super) segmenters: super::segmenter::SegmenterInterfaces,
+    pub(super) cssom: super::cssom::CssomInterfaces,
     pub(super) helpers: super::iterator_helpers::HelperInterfaces,
     pub(super) animations: super::animations::AnimInterfaces,
     pub(super) shapes: super::geometry_values::ShapeInterfaces,
@@ -1502,6 +1506,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let helpers = super::iterator_helpers::create(&build, &iterator_prototype, &mut globals);
     super::markup::create(&build, &object_prototype, &mut globals);
     let paths = super::path2d::create(&build, &object_prototype, &mut globals);
+    let cssom = super::cssom::create(&build, &object_prototype, &mut globals);
     let navigator_apis = super::navigator_apis::create(
         &build,
         &object_prototype,
@@ -1602,6 +1607,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         paths,
         matrices,
         segmenters,
+        cssom,
         helpers,
         animations,
         shapes,
@@ -3024,6 +3030,7 @@ impl ScriptRuntime {
             Native::Path(member) => self.call_path(member, this, arguments),
             Native::Matrix(member) => self.call_matrix(member, this, arguments),
             Native::Segmenter(member) => self.call_segmenter(member, this, arguments),
+            Native::Cssom(member) => self.call_cssom(member, this, arguments),
             Native::MatrixConstructor(_) => Err(self.type_error(
                 "Failed to construct 'DOMMatrix': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
@@ -3441,6 +3448,10 @@ impl ScriptRuntime {
             Native::Markup(_) => self.construct_markup(new_target),
             Native::Path(_) => self.construct_path(arguments, new_target),
             Native::Segmenter(_) => self.construct_segmenter(arguments, new_target),
+            Native::Cssom(super::cssom::CssomMember::SheetConstructor) => {
+                self.construct_sheet(arguments, new_target)
+            }
+            Native::Cssom(_) => Err(self.type_error("Illegal constructor")),
             Native::MatrixConstructor(read_only) => {
                 self.construct_matrix(read_only, arguments, new_target)
             }

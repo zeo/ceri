@@ -11,6 +11,7 @@ mod clipboard;
 mod collections;
 mod compiler;
 mod console;
+mod cssom;
 mod custom;
 mod dates;
 mod debugger;
@@ -681,6 +682,9 @@ pub struct ScriptRuntime {
     event_sources: HashMap<u32, eventsource::SourceState>,
     // when the user last pressed or typed into the page, for navigator.userActivation
     activated_at: Option<u64>,
+    // the sheet object of each style element, and the constructed sheets each root adopted
+    sheet_objects: RefCell<HashMap<NodeId, object::ObjectHandle>>,
+    adopted_sheets: RefCell<HashMap<NodeId, Vec<object::ObjectHandle>>>,
     // Web Locks requests, granted ones first in the order they were made
     lock_queue: RefCell<Vec<Rc<navigator_apis::LockRequest>>>,
     next_fetch_id: std::cell::Cell<u32>,
@@ -1831,6 +1835,8 @@ impl ScriptRuntime {
             fetches: RefCell::new(Vec::new()),
             event_sources: HashMap::new(),
             activated_at: None,
+            sheet_objects: RefCell::new(HashMap::new()),
+            adopted_sheets: RefCell::new(HashMap::new()),
             lock_queue: RefCell::new(Vec::new()),
             next_fetch_id: std::cell::Cell::new(0),
             pattern_cache: HashMap::new(),

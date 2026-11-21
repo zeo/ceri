@@ -2804,7 +2804,7 @@ impl Browser {
                 })
                 .chain(stylesheets.iter().filter_map(|(_, source)| match source {
                     StylesheetSource::Inline(text) => Some(text.as_str()),
-                    StylesheetSource::External(_) => None,
+                    StylesheetSource::External(_) | StylesheetSource::Cssom(_) => None,
                 }));
             policies.add_bundled(policy, inline);
         }
@@ -3583,7 +3583,7 @@ impl Browser {
             .into_iter()
             .map(|source| {
                 let text = match &source.1 {
-                    StylesheetSource::Inline(text) => text.clone(),
+                    StylesheetSource::Inline(text) | StylesheetSource::Cssom(text) => text.clone(),
                     StylesheetSource::External(_) => String::new(),
                 };
                 (source, text)
@@ -3738,6 +3738,7 @@ fn load_sheet(
         parser_inserted: true,
     };
     match source {
+        StylesheetSource::Cssom(text) => Ok(Some(text.clone())),
         StylesheetSource::Inline(source) => {
             if !policies.permits(policies.inline(Directive::StyleElem, source, element)) {
                 return Ok(None);
@@ -7259,6 +7260,40 @@ mod tests {
                 "0,{} {} {} 255,InvalidStateError",
                 expected.red, expected.green, expected.blue
             ))
+        );
+    }
+
+    #[test]
+    fn rules_from_the_cssom_and_adopted_sheets_style_the_page() {
+        let mut browser = Browser::new(bundle(
+            r#"<style id="s"></style><p class="css-1" id="p">x</p><p class="made" id="q">y</p><x-card id="card"></x-card><p id="status">idle</p><script>
+                const sheet = document.getElementById("s").sheet;
+                sheet.insertRule(".css-1{color:rgb(0, 128, 0)}", sheet.cssRules.length);
+                const made = new CSSStyleSheet();
+                made.replaceSync(".made { color: rgb(0, 0, 255) }");
+                document.adoptedStyleSheets = [made];
+                const root = document.getElementById("card").attachShadow({ mode: "open" });
+                root.innerHTML = '<span id="inside">z</span>';
+                const shadowSheet = new CSSStyleSheet();
+                shadowSheet.replaceSync("span { color: rgb(255, 0, 0) }");
+                root.adoptedStyleSheets = [shadowSheet];
+                const color = (element) => getComputedStyle(element).color;
+                const before = [color(document.getElementById("p")), color(document.getElementById("q")), color(root.getElementById("inside"))];
+                shadowSheet.replaceSync("span { color: rgb(1, 2, 3) }");
+                sheet.disabled = true;
+                before.push(color(root.getElementById("inside")), color(document.getElementById("p")));
+                document.getElementById("status").textContent = before.join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("rgb(0, 128, 0)|rgb(0, 0, 255)|rgb(255, 0, 0)|rgb(1, 2, 3)|rgb(0, 0, 0)")
         );
     }
 

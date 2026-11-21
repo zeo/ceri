@@ -159,7 +159,9 @@ impl Browser {
             .zip(&inputs.sheets)
             .map(|((owner, source), (_, text))| {
                 let (inline, url) = match source {
-                    StylesheetSource::Inline(_) => (true, self.document_url()),
+                    StylesheetSource::Inline(_) | StylesheetSource::Cssom(_) => {
+                        (true, self.document_url())
+                    }
                     StylesheetSource::External(href) => {
                         let resolved = self.current_url.as_ref().and_then(|base| {
                             base.resolve(&href).ok().map(|url: AppUrl| url.to_string())

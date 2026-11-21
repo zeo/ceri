@@ -280,6 +280,13 @@ pub struct Document {
     content_security_policy: Rc<crate::csp::Policies>,
     // elements whose markup style attribute the policy refused, until script sets one
     blocked_styles: HashSet<NodeId>,
+    // the rules of a style element's sheet once script changed them through the CSSOM, with
+    // the element's text they were made from; new text replaces them
+    sheet_rules: HashMap<NodeId, (String, Vec<String>)>,
+    // the text of the sheets script adopted, for the document and for each shadow root
+    adopted_sheets: HashMap<NodeId, Vec<String>>,
+    // style elements whose sheet script disabled
+    disabled_sheets: HashSet<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,6 +321,8 @@ pub enum ScriptSource {
 pub enum StylesheetSource {
     Inline(String),
     External(String),
+    // rules script gave a sheet through the CSSOM, which no policy checks, as in browsers
+    Cssom(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -400,6 +409,9 @@ impl Document {
             element_changes: None,
             content_security_policy: Rc::default(),
             blocked_styles: HashSet::new(),
+            sheet_rules: HashMap::new(),
+            adopted_sheets: HashMap::new(),
+            disabled_sheets: HashSet::new(),
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -1242,6 +1254,12 @@ impl Document {
                 let element = self
                     .element(child)
                     .filter(|element| element.name == "style")?;
+                if self.disabled_sheets.contains(&child) {
+                    return None;
+                }
+                if let Some(rules) = self.cssom_rules(child) {
+                    return Some(rules.join("\n"));
+                }
                 let text = self.text_content(child);
                 let check = policies.inline(
                     crate::csp::Directive::StyleElem,
@@ -1253,8 +1271,54 @@ impl Document {
                 );
                 policies.permits(check).then_some(text)
             })
+            .chain(
+                self.adopted_sheets
+                    .get(&root)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            )
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // the rules script set on a style element's sheet, while its text is still what they came from
+    pub(crate) fn cssom_rules(&self, node: NodeId) -> Option<&Vec<String>> {
+        let (text, rules) = self.sheet_rules.get(&node)?;
+        (self.text_content(node) == *text).then_some(rules)
+    }
+
+    pub(crate) fn set_cssom_rules(&mut self, node: NodeId, rules: Vec<String>) {
+        let text = self.text_content(node);
+        self.sheet_rules.insert(node, (text, rules));
+        self.version += 1;
+        self.selector_version = next_stamp();
+    }
+
+    pub(crate) fn set_adopted_sheets(&mut self, root: NodeId, sheets: Vec<String>) {
+        if sheets.is_empty() {
+            self.adopted_sheets.remove(&root);
+        } else {
+            self.adopted_sheets.insert(root, sheets);
+        }
+        self.version += 1;
+        self.selector_version = next_stamp();
+    }
+
+    pub(crate) fn set_sheet_disabled(&mut self, node: NodeId, disabled: bool) {
+        let changed = if disabled {
+            self.disabled_sheets.insert(node)
+        } else {
+            self.disabled_sheets.remove(&node)
+        };
+        if changed {
+            self.version += 1;
+            self.selector_version = next_stamp();
+        }
+    }
+
+    pub(crate) fn sheet_disabled(&self, node: NodeId) -> bool {
+        self.disabled_sheets.contains(&node)
     }
 
     // document order of two nodes in one tree; nodes in different trees order by id
@@ -1886,8 +1950,15 @@ impl Document {
             let Some(element) = self.element(node) else {
                 continue;
             };
+            if self.disabled_sheets.contains(&node) {
+                continue;
+            }
             if element.name == "style" {
-                stylesheets.push((node, StylesheetSource::Inline(self.text_content(node))));
+                let source = match self.cssom_rules(node) {
+                    Some(rules) => StylesheetSource::Cssom(rules.join("\n")),
+                    None => StylesheetSource::Inline(self.text_content(node)),
+                };
+                stylesheets.push((node, source));
             } else if element.name == "link"
                 && element.attr("rel").is_some_and(|rel| {
                     rel.split_ascii_whitespace()
@@ -1897,6 +1968,9 @@ impl Document {
             {
                 stylesheets.push((node, StylesheetSource::External(href.to_string())));
             }
+        }
+        for text in self.adopted_sheets.get(&self.root).into_iter().flatten() {
+            stylesheets.push((self.root, StylesheetSource::Cssom(text.clone())));
         }
         stylesheets
     }

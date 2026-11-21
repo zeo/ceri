@@ -120,6 +120,9 @@ pub(super) enum ObjectClass {
     // a Path2D and the calls that made it
     Path(super::path2d::PathHandle),
     Matrix(Rc<RefCell<super::matrices::MatrixState>>),
+    // a CSSStyleSheet, and a rule it lists
+    Sheet(Rc<super::cssom::SheetState>),
+    CssRule(Rc<super::cssom::RuleState>),
     // an Intl.Segmenter, the segments of a string, or an iterator over them
     Segmenter(Rc<super::segmenter::SegmenterState>),
     // a stream, its controller, a reader or an iterator over one

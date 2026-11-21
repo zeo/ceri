@@ -320,6 +320,8 @@ static INTERFACES: &[Interface] = &[
             ("host", ReadOnly),
             ("mode", ReadOnly),
             ("innerHTML", ReadWrite),
+            ("styleSheets", ReadOnly),
+            ("adoptedStyleSheets", ReadWrite),
         ],
     },
     Interface {
@@ -335,6 +337,8 @@ static INTERFACES: &[Interface] = &[
             ("readyState", ReadOnly),
             ("visibilityState", ReadOnly),
             ("hidden", ReadOnly),
+            ("styleSheets", ReadOnly),
+            ("adoptedStyleSheets", ReadWrite),
             ("children", ReadOnly),
             ("firstElementChild", ReadOnly),
             ("lastElementChild", ReadOnly),
@@ -611,7 +615,7 @@ static INTERFACES: &[Interface] = &[
     Interface {
         name: "HTMLStyleElement",
         parent: "HTMLElement",
-        members: &[],
+        members: &[("sheet", ReadOnly), ("media", Attr("media"))],
     },
     Interface {
         name: "HTMLDivElement",
@@ -1265,6 +1269,13 @@ impl ScriptRuntime {
                         _ => Value::Document,
                     }
                 }
+            }
+            ("sheet", Access::Get) => self.style_sheet_of(node),
+            ("styleSheets", Access::Get) => self.style_sheets_of(node),
+            ("adoptedStyleSheets", Access::Get) => self.adopted_sheets_value(node),
+            ("adoptedStyleSheets", Access::Set) => {
+                self.set_adopted_sheets(node, first)?;
+                Value::Undefined
             }
             ("documentElement", Access::Get) if parsed_document => {
                 let element = self.document.borrow().document_element_of(node);
