@@ -727,6 +727,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(&array, "isArray", Value::Builtin(Builtin::ArrayIsArray));
     build.method(&array, "from", Native::ArrayFrom, 1);
     build.method(&array, "of", Native::ArrayOf, 0);
+    build.method(
+        &array,
+        "fromAsync",
+        Native::Promise(Rc::new(super::promises::PromiseFunction::FromAsync)),
+        1,
+    );
     globals.push(("Array", Value::Object(array)));
 
     let array_iterator_prototype = plain(&iterator_prototype);

@@ -45,6 +45,9 @@ pub(super) enum PromiseFunction {
         value: Value,
         rejected: bool,
     },
+    FromAsync,
+    // a step of Array.fromAsync once what it awaited settled
+    FromAsyncStep(Rc<super::from_async::FromAsync>, super::from_async::Phase),
 }
 
 fn argument(arguments: &[Value], index: usize) -> Value {
@@ -264,6 +267,10 @@ impl ScriptRuntime {
                     return Err(self.throw_value(value));
                 }
                 Ok(value)
+            }
+            PromiseFunction::FromAsync => Ok(self.array_from_async(arguments)),
+            PromiseFunction::FromAsyncStep(state, phase) => {
+                self.step_from_async(&state, phase, argument(&arguments, 0))
             }
         }
     }

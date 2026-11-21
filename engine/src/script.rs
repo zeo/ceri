@@ -18,6 +18,7 @@ mod dialogs;
 mod encoding;
 mod events;
 mod filereader;
+mod from_async;
 mod geometry;
 mod geometry_values;
 mod images;
