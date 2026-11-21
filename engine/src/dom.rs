@@ -445,8 +445,51 @@ impl Document {
         let mut document = Self::new();
         let root = document.root;
         document.parse_into(root, source, true)?;
+        document.attach_declarative_shadows(root);
         document.orphans.clear();
         Ok(document)
+    }
+
+    // each <template shadowrootmode> a parse built becomes its parent's shadow root holding
+    // the template's content; a parent that already has a shadow root keeps the template
+    pub fn attach_declarative_shadows(&mut self, root: NodeId) {
+        let templates: Vec<(NodeId, bool)> = self
+            .subtree(root)
+            .into_iter()
+            .filter_map(|id| {
+                let element = self.element(id)?;
+                if element.namespace != Namespace::Html || element.name != "template" {
+                    return None;
+                }
+                match element
+                    .attr("shadowrootmode")?
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "open" => Some((id, true)),
+                    "closed" => Some((id, false)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (template, open) in templates {
+            let Some(host) = self
+                .parent(template)
+                .filter(|&host| self.element(host).is_some())
+            else {
+                continue;
+            };
+            let Some(shadow) = self.attach_shadow(host, open) else {
+                continue;
+            };
+            if let Some(content) = self.template_content(template) {
+                for child in self.children(content).to_vec() {
+                    self.append_child(shadow, child)
+                        .expect("parsed content always fits in a new shadow root");
+                }
+            }
+            self.remove(template);
+        }
     }
 
     // markup with no implied html, head or body, as an svg image or a bare fragment of markup

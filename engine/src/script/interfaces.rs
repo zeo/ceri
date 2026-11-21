@@ -265,6 +265,7 @@ static INTERFACES: &[Interface] = &[
             ("replaceWith", Method(0)),
             ("remove", Method(0)),
             ("insertAdjacentHTML", Method(2)),
+            ("setHTMLUnsafe", Method(1)),
             ("insertAdjacentElement", Method(2)),
             ("insertAdjacentText", Method(2)),
         ],
@@ -321,6 +322,7 @@ static INTERFACES: &[Interface] = &[
             ("host", ReadOnly),
             ("mode", ReadOnly),
             ("innerHTML", ReadWrite),
+            ("setHTMLUnsafe", Method(1)),
             ("styleSheets", ReadOnly),
             ("adoptedStyleSheets", ReadWrite),
         ],
@@ -1859,6 +1861,21 @@ impl ScriptRuntime {
                     self.replace_children_quietly(node, Some(fragment));
                     Value::Undefined
                 }
+            }
+            // innerHTML that also turns <template shadowrootmode> into shadow roots
+            ("setHTMLUnsafe", Access::Call) => {
+                let source = self.coerce_string(first)?;
+                let fragment = self.parse_fragment(&source)?;
+                self.document
+                    .borrow_mut()
+                    .attach_declarative_shadows(fragment);
+                let target = self
+                    .document
+                    .borrow_mut()
+                    .ensure_template_content(node)
+                    .unwrap_or(node);
+                self.replace_children_quietly(target, Some(fragment));
+                Value::Undefined
             }
             ("createEvent", Access::Call) => {
                 let interface = self.coerce_string(first)?;

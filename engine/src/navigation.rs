@@ -4774,6 +4774,38 @@ mod tests {
     }
 
     #[test]
+    fn declarative_shadow_roots_attach_on_load_and_through_set_html_unsafe() {
+        let mut browser = Browser::new(bundle(
+            r##"<div id="host"><template shadowrootmode="open"><b>inside</b><slot></slot></template>light</div>
+            <div id="later"></div><div id="plain"></div><p id='status'>idle</p><script>
+              const host = document.getElementById("host");
+              const later = document.getElementById("later");
+              later.setHTMLUnsafe('<span id="s"><template shadowrootmode="closed"><i>hidden</i></template></span>');
+              document.getElementById("plain").innerHTML = '<span><template shadowrootmode="open"></template></span>';
+              const span = later.querySelector("#s");
+              host.shadowRoot.setHTMLUnsafe("<em>swapped</em>");
+              document.getElementById("status").textContent = [
+                host.shadowRoot.mode, host.shadowRoot.innerHTML, host.textContent.trim(),
+                span.shadowRoot, span.querySelector("template"),
+                document.querySelector("#plain template") !== null,
+              ].join("|");
+            </script>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("open|<em>swapped</em>|light|||true")
+        );
+    }
+
+    #[test]
     fn browser_pumps_a_packaged_worker_without_a_loopback_server() {
         let mut resources = bundle(
             r#"<p id='status'>idle</p><script>
