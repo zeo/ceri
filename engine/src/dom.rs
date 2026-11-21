@@ -529,6 +529,14 @@ impl Document {
         source: &str,
         whole_document: bool,
     ) -> Result<(), ParseError> {
+        // the input stream's newline normalization: CR LF and lone CR become LF
+        let normalized;
+        let source = if source.contains('\r') {
+            normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+            normalized.as_str()
+        } else {
+            source
+        };
         let tokens = tokenize(source)?;
         let mut builder = TreeBuilder {
             parent,
@@ -2876,7 +2884,8 @@ impl TreeBuilder {
                             .chars()
                             .all(|character| character.is_ascii_whitespace())
                         {
-                            if self.html.is_none() {
+                            // before html and before head, whitespace is dropped
+                            if self.html.is_none() || self.head.is_none() {
                                 return;
                             }
                         } else {
@@ -2884,9 +2893,21 @@ impl TreeBuilder {
                         }
                     }
                 }
+                let target = self.target();
+                // characters inserted after a text node join it, as when an ignored tag
+                // stood between them
+                let last = document.children(target).last().copied();
+                if let Some(last) = last
+                    && self.created.last() == Some(&last)
+                    && matches!(document.kind(last), Some(NodeKind::Text(_)))
+                    && let Some(NodeKind::Text(existing)) =
+                        document.data_mut(last).map(|data| &mut data.kind)
+                {
+                    existing.push_str(&text);
+                    return;
+                }
                 let id = document.allocate(NodeKind::Text(text));
                 self.created.push(id);
-                let target = self.target();
                 document.append_raw(target, id);
             }
             Token::Comment(text) => {
