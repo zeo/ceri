@@ -7,6 +7,9 @@ use super::operations::is_primitive;
 use super::strings::locale_compare;
 use super::*;
 
+mod date_patterns;
+mod date_patterns_data;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Language {
     English,
@@ -44,6 +47,11 @@ fn language(locale: &str) -> Language {
     }
 }
 
+// the decimal separator a locale writes
+pub(super) fn decimal_separator(locale: &str) -> &'static str {
+    separators(language(locale)).1
+}
+
 // group separator, decimal separator, and whether currency follows the number
 fn separators(language: Language) -> (&'static str, &'static str, bool) {
     match language {
@@ -55,179 +63,6 @@ fn separators(language: Language) -> (&'static str, &'static str, bool) {
         Language::French => ("\u{202f}", ",", true),
         Language::Russian | Language::Polish => ("\u{a0}", ",", true),
         _ => (",", ".", false),
-    }
-}
-
-const MONTHS: [[&str; 12]; 7] = [
-    [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ],
-    [
-        "Januar",
-        "Februar",
-        "März",
-        "April",
-        "Mai",
-        "Juni",
-        "Juli",
-        "August",
-        "September",
-        "Oktober",
-        "November",
-        "Dezember",
-    ],
-    [
-        "janvier",
-        "février",
-        "mars",
-        "avril",
-        "mai",
-        "juin",
-        "juillet",
-        "août",
-        "septembre",
-        "octobre",
-        "novembre",
-        "décembre",
-    ],
-    [
-        "enero",
-        "febrero",
-        "marzo",
-        "abril",
-        "mayo",
-        "junio",
-        "julio",
-        "agosto",
-        "septiembre",
-        "octubre",
-        "noviembre",
-        "diciembre",
-    ],
-    [
-        "gennaio",
-        "febbraio",
-        "marzo",
-        "aprile",
-        "maggio",
-        "giugno",
-        "luglio",
-        "agosto",
-        "settembre",
-        "ottobre",
-        "novembre",
-        "dicembre",
-    ],
-    [
-        "janeiro",
-        "fevereiro",
-        "março",
-        "abril",
-        "maio",
-        "junho",
-        "julho",
-        "agosto",
-        "setembro",
-        "outubro",
-        "novembro",
-        "dezembro",
-    ],
-    [
-        "januari",
-        "februari",
-        "maart",
-        "april",
-        "mei",
-        "juni",
-        "juli",
-        "augustus",
-        "september",
-        "oktober",
-        "november",
-        "december",
-    ],
-];
-
-const WEEKDAYS: [[&str; 7]; 7] = [
-    [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ],
-    [
-        "Sonntag",
-        "Montag",
-        "Dienstag",
-        "Mittwoch",
-        "Donnerstag",
-        "Freitag",
-        "Samstag",
-    ],
-    [
-        "dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi",
-    ],
-    [
-        "domingo",
-        "lunes",
-        "martes",
-        "miércoles",
-        "jueves",
-        "viernes",
-        "sábado",
-    ],
-    [
-        "domenica",
-        "lunedì",
-        "martedì",
-        "mercoledì",
-        "giovedì",
-        "venerdì",
-        "sabato",
-    ],
-    [
-        "domingo",
-        "segunda-feira",
-        "terça-feira",
-        "quarta-feira",
-        "quinta-feira",
-        "sexta-feira",
-        "sábado",
-    ],
-    [
-        "zondag",
-        "maandag",
-        "dinsdag",
-        "woensdag",
-        "donderdag",
-        "vrijdag",
-        "zaterdag",
-    ],
-];
-
-fn names_index(language: Language) -> usize {
-    match language {
-        Language::German => 1,
-        Language::French => 2,
-        Language::Spanish => 3,
-        Language::Italian => 4,
-        Language::Portuguese => 5,
-        Language::Dutch => 6,
-        _ => 0,
     }
 }
 
@@ -358,6 +193,11 @@ pub(super) struct DateOptions {
     minute: Option<String>,
     second: Option<String>,
     hour12: Option<bool>,
+    hour_cycle: Option<String>,
+    time_zone_name: Option<String>,
+    fractional: Option<u8>,
+    // the time fields came from toLocaleString's defaults rather than the caller
+    default_time: bool,
     // the zone asked for, as an IANA identifier or a +hh:mm offset; none for the host's own
     zone: Option<String>,
 }
@@ -374,6 +214,8 @@ impl DateOptions {
             && self.hour.is_none()
             && self.minute.is_none()
             && self.second.is_none()
+            && self.time_zone_name.is_none()
+            && self.fractional.is_none()
     }
 
     // the components toLocaleString and its siblings show by default
@@ -387,6 +229,7 @@ impl DateOptions {
             self.hour = Some("numeric".to_string());
             self.minute = Some("2-digit".to_string());
             self.second = Some("2-digit".to_string());
+            self.default_time = true;
         }
     }
 }
@@ -500,6 +343,7 @@ pub(super) enum IntlMethod {
     ListFormatConstructor,
     ListFormat,
     ListFormatToParts,
+    FormatDateToParts,
     GetCanonicalLocales,
     SupportedLocalesOf,
     // getters that hand back a bound format or compare function
@@ -584,204 +428,6 @@ pub(super) fn format_number(options: &NumberOptions, value: f64) -> String {
             }
         }
     }
-}
-
-fn two(value: f64) -> String {
-    format!("{:02}", value as i64)
-}
-
-pub(super) fn format_date(options: &DateOptions, local: f64) -> String {
-    if local.is_nan() {
-        return "Invalid Date".to_string();
-    }
-    let language = language(&options.locale);
-    let names = names_index(language);
-    let days = (local / 86_400_000.0).floor();
-    let (year, month, date) = super::dates::civil_from_days(days);
-    let within = local.rem_euclid(86_400_000.0);
-    let (hours, minutes, seconds) = (
-        (within / 3_600_000.0).floor(),
-        (within / 60_000.0).floor() % 60.0,
-        (within / 1000.0).floor() % 60.0,
-    );
-    let weekday = (days + 4.0).rem_euclid(7.0) as usize;
-    let english_order = matches!(language, Language::English)
-        && !options.locale.to_ascii_lowercase().starts_with("en-gb");
-    let hour12 = options
-        .hour12
-        .unwrap_or(matches!(language, Language::English) && english_order);
-    let month_name = MONTHS[names][month as usize];
-    let short_month: String = month_name.chars().take(3).collect();
-    let weekday_name = WEEKDAYS[names][weekday];
-
-    let time = |with_seconds: bool| -> String {
-        let seconds_text = if with_seconds {
-            format!(":{}", two(seconds))
-        } else {
-            String::new()
-        };
-        if hour12 {
-            let hour = hours as i64 % 12;
-            let hour = if hour == 0 { 12 } else { hour };
-            let meridiem = if hours < 12.0 { "AM" } else { "PM" };
-            let hour = if options.hour.as_deref() == Some("2-digit") {
-                two(hour as f64)
-            } else {
-                hour.to_string()
-            };
-            format!("{hour}:{}{seconds_text} {meridiem}", two(minutes))
-        } else {
-            format!("{}:{}{seconds_text}", two(hours), two(minutes))
-        }
-    };
-    let numeric_date = |two_digit_year: bool| -> String {
-        let year_text = if two_digit_year {
-            two(year.rem_euclid(100.0))
-        } else {
-            format!("{}", year as i64)
-        };
-        match language {
-            Language::English if english_order => {
-                format!("{}/{}/{year_text}", month as i64 + 1, date as i64)
-            }
-            Language::English => format!("{}/{}/{year_text}", two(date), two(month + 1.0)),
-            Language::German | Language::Russian | Language::Polish => {
-                format!("{}.{}.{year_text}", two(date), two(month + 1.0))
-            }
-            Language::Dutch => format!("{}-{}-{year_text}", date as i64, month as i64 + 1),
-            Language::Japanese | Language::Chinese => {
-                format!("{year_text}/{}/{}", month as i64 + 1, date as i64)
-            }
-            _ => format!("{}/{}/{year_text}", two(date), two(month + 1.0)),
-        }
-    };
-    let long_date = |weekday_too: bool, abbreviated: bool| -> String {
-        let month_text = if abbreviated {
-            short_month.clone()
-        } else {
-            month_name.to_string()
-        };
-        let day_month = match language {
-            Language::English if english_order => {
-                format!("{month_text} {}, {}", date as i64, year as i64)
-            }
-            Language::German => format!("{}. {month_text} {}", date as i64, year as i64),
-            Language::Spanish | Language::Portuguese => {
-                format!("{} de {month_text} de {}", date as i64, year as i64)
-            }
-            _ => format!("{} {month_text} {}", date as i64, year as i64),
-        };
-        if weekday_too {
-            format!("{weekday_name}, {day_month}")
-        } else {
-            day_month
-        }
-    };
-
-    if options.date_style.is_some() || options.time_style.is_some() {
-        let date_part = options.date_style.as_deref().map(|style| match style {
-            "full" => long_date(true, false),
-            "long" => long_date(false, false),
-            "medium" => long_date(false, true),
-            _ => numeric_date(true),
-        });
-        let time_part = options
-            .time_style
-            .as_deref()
-            .map(|style| time(style != "short"));
-        return match (date_part, time_part) {
-            (Some(date), Some(time)) => {
-                let joiner = if matches!(options.date_style.as_deref(), Some("full" | "long"))
-                    && matches!(language, Language::English)
-                {
-                    " at "
-                } else {
-                    ", "
-                };
-                format!("{date}{joiner}{time}")
-            }
-            (Some(date), None) => date,
-            (None, Some(time)) => time,
-            (None, None) => String::new(),
-        };
-    }
-
-    let any_date = options.weekday.is_some()
-        || options.year.is_some()
-        || options.month.is_some()
-        || options.day.is_some();
-    let any_time = options.hour.is_some() || options.minute.is_some() || options.second.is_some();
-    let (date_requested, time_requested) = if !any_date && !any_time {
-        (true, false)
-    } else {
-        (any_date, any_time)
-    };
-    let mut parts = Vec::new();
-    if date_requested {
-        let textual_month = matches!(options.month.as_deref(), Some("long" | "short" | "narrow"));
-        if textual_month {
-            let month_text = match options.month.as_deref() {
-                Some("long") => month_name.to_string(),
-                Some("narrow") => month_name.chars().take(1).collect(),
-                _ => short_month.clone(),
-            };
-            let mut text = match (options.day.is_some(), options.year.is_some()) {
-                (true, true) => match language {
-                    Language::English if english_order => {
-                        format!("{month_text} {}, {}", date as i64, year as i64)
-                    }
-                    Language::German => format!("{}. {month_text} {}", date as i64, year as i64),
-                    _ => format!("{} {month_text} {}", date as i64, year as i64),
-                },
-                (true, false) => match language {
-                    Language::English if english_order => format!("{month_text} {}", date as i64),
-                    Language::German => format!("{}. {month_text}", date as i64),
-                    _ => format!("{} {month_text}", date as i64),
-                },
-                (false, true) => format!("{month_text} {}", year as i64),
-                (false, false) => month_text,
-            };
-            if let Some(style) = &options.weekday {
-                let weekday_text: String = match style.as_str() {
-                    "long" => weekday_name.to_string(),
-                    "narrow" => weekday_name.chars().take(1).collect(),
-                    _ => weekday_name.chars().take(3).collect(),
-                };
-                text = format!("{weekday_text}, {text}");
-            }
-            parts.push(text);
-        } else if options.year.is_some() && options.month.is_none() && options.day.is_none() {
-            parts.push(if options.year.as_deref() == Some("2-digit") {
-                two(year.rem_euclid(100.0))
-            } else {
-                format!("{}", year as i64)
-            });
-        } else if let (Some(style), false) = (
-            &options.weekday,
-            options.day.is_some() || options.month.is_some() || options.year.is_some(),
-        ) {
-            parts.push(match style.as_str() {
-                "long" => weekday_name.to_string(),
-                "narrow" => weekday_name.chars().take(1).collect(),
-                _ => weekday_name.chars().take(3).collect(),
-            });
-        } else {
-            parts.push(numeric_date(options.year.as_deref() == Some("2-digit")));
-        }
-    }
-    if time_requested {
-        let with_seconds = options.second.is_some();
-        if options.hour.is_some() {
-            parts.push(time(with_seconds));
-        } else {
-            parts.push(if with_seconds {
-                format!("{}:{}", two(minutes), two(seconds))
-            } else {
-                two(minutes)
-            });
-        }
-    }
-    parts.join(", ")
 }
 
 fn plural_category(options: &PluralOptions, value: f64) -> &'static str {
@@ -1054,19 +700,48 @@ impl ScriptRuntime {
             locale: self.locale_argument(locales)?,
             ..DateOptions::default()
         };
-        result.date_style = self.option_text(options, "dateStyle")?;
-        result.time_style = self.option_text(options, "timeStyle")?;
-        result.weekday = self.option_text(options, "weekday")?;
-        result.year = self.option_text(options, "year")?;
-        result.month = self.option_text(options, "month")?;
-        result.day = self.option_text(options, "day")?;
-        result.hour = self.option_text(options, "hour")?;
-        result.minute = self.option_text(options, "minute")?;
-        result.second = self.option_text(options, "second")?;
+        let numeric: &[&str] = &["numeric", "2-digit"];
+        let text_or_numeric: &[&str] = &["numeric", "2-digit", "narrow", "short", "long"];
+        let styles: &[&str] = &["full", "long", "medium", "short"];
+        result.weekday = self.date_option(options, "weekday", &["narrow", "short", "long"])?;
+        result.year = self.date_option(options, "year", numeric)?;
+        result.month = self.date_option(options, "month", text_or_numeric)?;
+        result.day = self.date_option(options, "day", numeric)?;
+        result.hour = self.date_option(options, "hour", numeric)?;
+        result.minute = self.date_option(options, "minute", numeric)?;
+        result.second = self.date_option(options, "second", numeric)?;
+        result.time_zone_name = self.date_option(
+            options,
+            "timeZoneName",
+            &[
+                "short",
+                "long",
+                "shortOffset",
+                "longOffset",
+                "shortGeneric",
+                "longGeneric",
+            ],
+        )?;
+        result.date_style = self.date_option(options, "dateStyle", styles)?;
+        result.time_style = self.date_option(options, "timeStyle", styles)?;
         if !is_primitive(options) {
             result.hour12 = match self.get_property(options, "hour12")? {
                 Value::Undefined => None,
                 value => Some(value.truthy()),
+            };
+            result.hour_cycle =
+                self.date_option(options, "hourCycle", &["h11", "h12", "h23", "h24"])?;
+            result.fractional = match self.get_property(options, "fractionalSecondDigits")? {
+                Value::Undefined => None,
+                value => {
+                    let digits = self.coerce_number(value)?;
+                    if !(1.0..=3.0).contains(&digits.floor()) {
+                        return Err(
+                            self.range_error("fractionalSecondDigits value is out of range.")
+                        );
+                    }
+                    Some(digits.floor() as u8)
+                }
             };
             if let Some(zone) = self.option_text(options, "timeZone")? {
                 result.zone = Some(match canonical_zone(&zone) {
@@ -1079,7 +754,36 @@ impl ScriptRuntime {
                 });
             }
         }
+        let components = result.weekday.is_some()
+            || result.year.is_some()
+            || result.month.is_some()
+            || result.day.is_some()
+            || result.hour.is_some()
+            || result.minute.is_some()
+            || result.second.is_some()
+            || result.time_zone_name.is_some()
+            || result.fractional.is_some();
+        if components && (result.date_style.is_some() || result.time_style.is_some()) {
+            return Err(self.type_error(
+                "Can't set option dateStyle or timeStyle together with date and time components",
+            ));
+        }
         Ok(result)
+    }
+
+    // a date option, refused unless it is one of the values the option takes
+    fn date_option(
+        &mut self,
+        options: &Value,
+        key: &str,
+        allowed: &[&str],
+    ) -> Result<Option<String>, ScriptError> {
+        match self.option_text(options, key)? {
+            Some(value) if !allowed.contains(&value.as_str()) => Err(self.range_error(format!(
+                "Value {value} out of range for Intl.DateTimeFormat options property {key}"
+            ))),
+            value => Ok(value),
+        }
     }
 
     // a date's time value in the formatter's zone
@@ -1107,7 +811,50 @@ impl ScriptRuntime {
         if time.is_nan() {
             return Err(self.range_error("Invalid time value"));
         }
-        Ok(format_date(options, self.zoned(options, time)))
+        let (local, offset, zone) = self.zone_view(options, time);
+        Ok(date_patterns::format(
+            options,
+            local,
+            offset,
+            zone.as_deref(),
+        ))
+    }
+
+    // the wall clock time a formatter shows for a time value, its offset in seconds and the
+    // zone it is in
+    fn zone_view(&self, options: &DateOptions, time: f64) -> (f64, i64, Option<String>) {
+        let local = self.zoned(options, time);
+        let offset = ((local - time) / 1000.0).round() as i64;
+        let zone = match &options.zone {
+            Some(zone) => Some(zone.clone()),
+            None => self.time_zone.name(time),
+        };
+        (local, offset, zone)
+    }
+
+    fn format_date_parts(
+        &mut self,
+        options: &DateOptions,
+        date: &Value,
+    ) -> Result<Value, ScriptError> {
+        let time = match date {
+            Value::Undefined => self.now_milliseconds(),
+            other => self.coerce_number(other.clone())?,
+        };
+        if time.is_nan() {
+            return Err(self.range_error("Invalid time value"));
+        }
+        let (local, offset, zone) = self.zone_view(options, time);
+        let parts = date_patterns::format_parts(options, local, offset, zone.as_deref())
+            .into_iter()
+            .map(|part| {
+                self.object_from_entries(vec![
+                    ("type".to_string(), Value::String(part.kind.into())),
+                    ("value".to_string(), Value::String(part.value.into())),
+                ])
+            })
+            .collect();
+        Ok(Self::new_array(parts))
     }
 
     fn intl_state(&mut self, this: &Value) -> Result<Rc<IntlState>, ScriptError> {
@@ -1277,6 +1024,14 @@ impl ScriptRuntime {
             M::FormatDate(options) => Ok(Value::String(
                 self.format_date_with(&options, &first)?.into(),
             )),
+            M::FormatDateToParts => {
+                let state = self.intl_state(&this)?;
+                let IntlState::Date(options) = &*state else {
+                    return Err(self.type_error("formatToParts is not available on this object"));
+                };
+                let options = options.clone();
+                self.format_date_parts(&options, &first)
+            }
             M::Compare(options) => {
                 let left = self.coerce_string(first)?;
                 let right = self.coerce_string(second)?;
@@ -1334,25 +1089,67 @@ impl ScriptRuntime {
                             Value::Number(options.maximum_fraction as f64),
                         ),
                     ],
-                    IntlState::Date(options) => vec![
-                        (
-                            "locale".to_string(),
-                            Value::String(options.locale.as_str().into()),
-                        ),
-                        ("calendar".to_string(), Value::String("gregory".into())),
-                        ("numberingSystem".to_string(), Value::String("latn".into())),
-                        (
-                            "timeZone".to_string(),
-                            Value::String(match &options.zone {
-                                Some(zone) => zone.as_str().into(),
-                                None => self
-                                    .time_zone
-                                    .name(0.0)
-                                    .unwrap_or_else(|| "UTC".to_string())
-                                    .into(),
-                            }),
-                        ),
-                    ],
+                    IntlState::Date(options) => {
+                        let mut entries = vec![
+                            (
+                                "locale".to_string(),
+                                Value::String(options.locale.as_str().into()),
+                            ),
+                            ("calendar".to_string(), Value::String("gregory".into())),
+                            ("numberingSystem".to_string(), Value::String("latn".into())),
+                            (
+                                "timeZone".to_string(),
+                                Value::String(match &options.zone {
+                                    Some(zone) => zone.as_str().into(),
+                                    None => self
+                                        .time_zone
+                                        .name(0.0)
+                                        .unwrap_or_else(|| "UTC".to_string())
+                                        .into(),
+                                }),
+                            ),
+                        ];
+                        if options.hour.is_some() || options.time_style.is_some() {
+                            let cycle = date_patterns::hour_cycle(options);
+                            entries.push(("hourCycle".to_string(), Value::String(cycle.into())));
+                            entries.push((
+                                "hour12".to_string(),
+                                Value::Bool(matches!(cycle, "h11" | "h12")),
+                            ));
+                        }
+                        let defaulted = options.is_empty();
+                        let fields = [
+                            ("weekday", &options.weekday),
+                            ("year", &options.year),
+                            ("month", &options.month),
+                            ("day", &options.day),
+                            ("hour", &options.hour),
+                            ("minute", &options.minute),
+                            ("second", &options.second),
+                            ("timeZoneName", &options.time_zone_name),
+                            ("dateStyle", &options.date_style),
+                            ("timeStyle", &options.time_style),
+                        ];
+                        for (name, value) in fields {
+                            let shown = match value {
+                                Some(value) => Some(value.clone()),
+                                None if defaulted && matches!(name, "year" | "month" | "day") => {
+                                    Some("numeric".to_string())
+                                }
+                                None => None,
+                            };
+                            if let Some(shown) = shown {
+                                entries.push((name.to_string(), Value::String(shown.into())));
+                            }
+                        }
+                        if let Some(digits) = options.fractional {
+                            entries.push((
+                                "fractionalSecondDigits".to_string(),
+                                Value::Number(f64::from(digits)),
+                            ));
+                        }
+                        entries
+                    }
                     IntlState::List(options) => vec![
                         (
                             "locale".to_string(),
@@ -1463,6 +1260,9 @@ mod tests {
     #[test]
     fn dates_plurals_and_relative_times_format() {
         let local = 1_705_331_045_000.0;
+        let format_date = |options: &DateOptions, local: f64| {
+            date_patterns::format(options, local, 0, Some("UTC"))
+        };
         let mut date = DateOptions {
             locale: "en-US".to_string(),
             ..DateOptions::default()

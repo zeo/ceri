@@ -1561,6 +1561,14 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
                 2,
             ),
         }
+        if name == "DateTimeFormat" {
+            build.method(
+                &prototype,
+                "formatToParts",
+                Native::Intl(Rc::new(I::FormatDateToParts)),
+                1,
+            );
+        }
         build.method(
             &prototype,
             "resolvedOptions",
