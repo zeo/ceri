@@ -42,6 +42,7 @@ mod atomics;
 mod display_names_data;
 mod displaynames;
 mod disposables;
+mod durationformat;
 mod lexer;
 mod locale;
 mod locale_data;

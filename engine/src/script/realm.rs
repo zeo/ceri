@@ -200,6 +200,7 @@ pub(super) enum Native {
     QuadConstructor,
     Locale(super::locale::LocaleMember),
     DisplayNames(super::displaynames::DisplayMember),
+    DurationFormat(super::durationformat::DurationMember),
     PerfObserver(super::perf_observers::ObserverMember),
     PerfDeliver(Rc<super::perf_observers::PerfObserver>),
     DataTransferConstructor,
@@ -280,6 +281,7 @@ impl Native {
                 | Native::QuadConstructor
                 | Native::Locale(super::locale::LocaleMember::Constructor)
                 | Native::DisplayNames(super::displaynames::DisplayMember::Constructor)
+                | Native::DurationFormat(super::durationformat::DurationMember::Constructor)
                 | Native::PerfObserver(
                     super::perf_observers::ObserverMember::Constructor
                         | super::perf_observers::ObserverMember::ReportingConstructor
@@ -394,6 +396,7 @@ pub(super) struct Intrinsics {
     pub(super) segmenters: super::segmenter::SegmenterInterfaces,
     pub(super) locales: super::locale::LocaleInterfaces,
     pub(super) display_names: super::displaynames::DisplayInterfaces,
+    pub(super) duration_formats: super::durationformat::DurationInterfaces,
     pub(super) disposables: super::disposables::DisposableInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
     pub(super) font_faces: super::fontfaces::FontInterfaces,
@@ -1602,6 +1605,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         super::segmenter::create(&build, &object_prototype, &iterator_prototype, &intl);
     let locales = super::locale::create(&build, &object_prototype, &intl);
     let display_names = super::displaynames::create(&build, &object_prototype, &intl);
+    let duration_formats = super::durationformat::create(&build, &object_prototype, &intl);
     let (disposables, disposable_globals) = super::disposables::create(&build, &object_prototype);
     globals.extend(disposable_globals);
     globals.push(("Intl", Value::Object(intl)));
@@ -1756,6 +1760,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         segmenters,
         locales,
         display_names,
+        duration_formats,
         hosts,
         perf_observers,
         disposables,
@@ -3189,6 +3194,7 @@ impl ScriptRuntime {
             Native::Atomics(op) => self.call_atomics(op, arguments),
             Native::Locale(member) => self.call_locale(member, this, arguments),
             Native::DisplayNames(member) => self.call_display_names(member, this, arguments),
+            Native::DurationFormat(member) => self.call_duration_format(member, this, arguments),
             Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
             Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),
             Native::ViewTransition(transition, which) => {
@@ -3657,6 +3663,7 @@ impl ScriptRuntime {
             Native::QuadConstructor => self.construct_quad(arguments, new_target),
             Native::Locale(_) => self.construct_locale(arguments, new_target),
             Native::DisplayNames(_) => self.construct_display_names(arguments, new_target),
+            Native::DurationFormat(_) => self.construct_duration_format(arguments, new_target),
             Native::PerfObserver(member) => {
                 self.construct_perf_observer(member, arguments, new_target)
             }
