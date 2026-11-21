@@ -38,6 +38,7 @@ mod navigator_apis;
 mod netfetch;
 mod traversal;
 pub(crate) use json::quote as json_quote;
+mod atomics;
 mod disposables;
 mod lexer;
 mod media;

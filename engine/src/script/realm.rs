@@ -169,6 +169,7 @@ pub(super) enum Native {
     Matrix(super::matrices::MatrixMember),
     Segmenter(super::segmenter::SegmenterMember),
     Disposable(super::disposables::DisposableMember, bool),
+    Atomics(super::atomics::AtomicsOp),
     Cssom(super::cssom::CssomMember),
     Font(super::fontfaces::FontMember),
     // DOMMatrixReadOnly when true, DOMMatrix otherwise
@@ -1013,6 +1014,13 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.method(&json, "isRawJSON", Native::JsonIsRawJson, 1);
     build.value(&json, "@@toStringTag", Value::String("JSON".into()));
     globals.push(("JSON", Value::Object(json)));
+
+    let atomics = plain(&object_prototype);
+    for (key, op, length) in super::atomics::ATOMICS_METHODS {
+        build.method(&atomics, key, Native::Atomics(*op), *length);
+    }
+    build.value(&atomics, "@@toStringTag", Value::String("Atomics".into()));
+    globals.push(("Atomics", Value::Object(atomics)));
 
     let console = plain(&object_prototype);
     for (key, method) in super::console::CONSOLE_METHODS {
@@ -3084,6 +3092,7 @@ impl ScriptRuntime {
             Native::Disposable(member, asynchronous) => {
                 self.call_disposable(member, asynchronous, this, arguments)
             }
+            Native::Atomics(op) => self.call_atomics(op, arguments),
             Native::Cssom(member) => self.call_cssom(member, this, arguments),
             Native::Font(member) => self.call_font(member, this, arguments),
             Native::MatrixConstructor(_) => Err(self.type_error(
