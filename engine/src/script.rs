@@ -683,6 +683,8 @@ pub struct ScriptRuntime {
     event_sources: HashMap<u32, eventsource::SourceState>,
     // when the user last pressed or typed into the page, for navigator.userActivation
     activated_at: Option<u64>,
+    // the element the page asked to show fullscreen, which the window follows
+    fullscreen_element: Option<NodeId>,
     // document.fonts and the faces it holds
     font_set: RefCell<Option<object::ObjectHandle>>,
     font_set_faces: RefCell<Vec<object::ObjectHandle>>,
@@ -1839,6 +1841,7 @@ impl ScriptRuntime {
             fetches: RefCell::new(Vec::new()),
             event_sources: HashMap::new(),
             activated_at: None,
+            fullscreen_element: None,
             font_set: RefCell::new(None),
             font_set_faces: RefCell::new(Vec::new()),
             sheet_objects: RefCell::new(HashMap::new()),
@@ -2852,6 +2855,10 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
+        // escape takes the page out of fullscreen before anything else sees it, as browsers do
+        if key == "Escape" && self.fullscreen_requested() {
+            return self.leave_fullscreen();
+        }
         self.note_key_press(key);
         let Some(focused) = self.key_target() else {
             return Ok(false);

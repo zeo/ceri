@@ -130,6 +130,8 @@ pub struct Frame {
     pub viewport: Size,
     pub scale: f32,
     pub title: Option<String>,
+    // whether the page asked for fullscreen through requestFullscreen
+    pub fullscreen: bool,
     pub canvas: std::sync::Arc<Canvas>,
     // video frames to show under the canvas where it leaves them transparent
     #[cfg_attr(
@@ -1130,6 +1132,7 @@ impl EngineHost {
             viewport: self.viewport,
             scale: self.scale,
             title: self.browser.title(),
+            fullscreen: self.browser.fullscreen(),
             canvas,
             planes,
         };

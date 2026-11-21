@@ -2019,6 +2019,13 @@ impl Browser {
             .and_then(|page| page.document.borrow().title())
     }
 
+    // whether the page has an element shown fullscreen, which the window follows
+    pub fn fullscreen(&self) -> bool {
+        self.page
+            .as_ref()
+            .is_some_and(|page| page.runtime.fullscreen_requested())
+    }
+
     pub fn accessibility_tree(&self) -> Option<AccessibilityNode> {
         self.page
             .as_ref()
@@ -7284,6 +7291,43 @@ mod tests {
                 "0,{} {} {} 255,InvalidStateError",
                 expected.red, expected.green, expected.blue
             ))
+        );
+    }
+
+    #[test]
+    fn fullscreen_follows_requests_made_after_a_press_and_escape_leaves_it() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><button id="go">go</button><script>
+                const seen = [];
+                const note = (...items) => { seen.push(...items); document.getElementById("status").textContent = seen.join(","); };
+                document.addEventListener("fullscreenchange", () => note("change:" + (document.fullscreenElement ? document.fullscreenElement.tagName : "none")));
+                document.documentElement.requestFullscreen().catch((error) => note(error.name));
+                document.getElementById("go").addEventListener("click", () => {
+                    document.documentElement.requestFullscreen().then(() => note("granted", document.fullscreen, document.fullscreenEnabled));
+                });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(
+            !browser.fullscreen(),
+            "a request without a press is refused"
+        );
+        browser.set_pointer_button(0, true);
+        browser.click_id("go").expect("click should run");
+        browser.set_pointer_button(0, false);
+        assert!(browser.fullscreen());
+        browser
+            .key_down_with_modifiers("Escape", KeyModifiers::default())
+            .expect("escape should run");
+        assert!(!browser.fullscreen());
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("TypeError,change:HTML,granted,true,true,change:none")
         );
     }
 

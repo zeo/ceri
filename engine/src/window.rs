@@ -548,6 +548,8 @@ struct AppWindow {
     render_request: Option<u64>,
     latest_frame: Option<Frame>,
     applied_title: Option<String>,
+    // the fullscreen the page last asked for, so only its changes move the window
+    page_fullscreen: bool,
     applied_cursor: Option<crate::css::Cursor>,
     viewport: Size,
     // the monitor's scale times the page zoom
@@ -640,6 +642,7 @@ where
             render_request: None,
             latest_frame: None,
             applied_title: None,
+            page_fullscreen: false,
             applied_cursor: None,
             viewport,
             scale: 1.0,
@@ -1418,6 +1421,16 @@ impl AppWindow {
         }
     }
 
+    fn apply_fullscreen(&mut self, frame: &Frame) {
+        if frame.fullscreen == self.page_fullscreen {
+            return;
+        }
+        self.page_fullscreen = frame.fullscreen;
+        if let Some(window) = &self.window {
+            window.set_fullscreen(frame.fullscreen.then_some(Fullscreen::Borderless(None)));
+        }
+    }
+
     fn apply_title(&mut self, frame: &Frame) {
         let title = frame
             .title
@@ -1472,6 +1485,7 @@ impl AppWindow {
             return;
         }
         self.apply_title(&frame);
+        self.apply_fullscreen(&frame);
         let Some(output) = &mut self.output else {
             return;
         };
@@ -1945,6 +1959,7 @@ mod tests {
             },
             scale: 1.0,
             title: None,
+            fullscreen: false,
             canvas: std::sync::Arc::new(crate::paint::Canvas::new(
                 4,
                 3,

@@ -206,6 +206,7 @@ static INTERFACES: &[Interface] = &[
         name: "Element",
         parent: "Node",
         members: &[
+            ("requestFullscreen", Method(0)),
             ("tagName", ReadOnly),
             ("localName", ReadOnly),
             ("namespaceURI", ReadOnly),
@@ -340,6 +341,10 @@ static INTERFACES: &[Interface] = &[
             ("styleSheets", ReadOnly),
             ("adoptedStyleSheets", ReadWrite),
             ("fonts", ReadOnly),
+            ("fullscreenElement", ReadOnly),
+            ("fullscreenEnabled", ReadOnly),
+            ("fullscreen", ReadOnly),
+            ("exitFullscreen", Method(0)),
             ("children", ReadOnly),
             ("firstElementChild", ReadOnly),
             ("lastElementChild", ReadOnly),
@@ -1273,6 +1278,22 @@ impl ScriptRuntime {
             }
             ("sheet", Access::Get) => self.style_sheet_of(node),
             ("fonts", Access::Get) if on_document => self.font_set(),
+            ("requestFullscreen", Access::Call) => self.request_fullscreen(node)?,
+            ("exitFullscreen", Access::Call) if on_document => {
+                if self.leave_fullscreen()? {
+                    Value::Promise(self.fulfilled_promise(Value::Undefined))
+                } else {
+                    Value::Promise(self.rejected_promise("Document not active"))
+                }
+            }
+            ("fullscreenElement", Access::Get) if on_document => {
+                let element = self.fullscreen_element;
+                self.optional_node(element)
+            }
+            ("fullscreenEnabled", Access::Get) if on_document => Value::Bool(true),
+            ("fullscreen", Access::Get) if on_document => {
+                Value::Bool(self.fullscreen_element.is_some())
+            }
             ("styleSheets", Access::Get) => self.style_sheets_of(node),
             ("adoptedStyleSheets", Access::Get) => self.adopted_sheets_value(node),
             ("adoptedStyleSheets", Access::Set) => {

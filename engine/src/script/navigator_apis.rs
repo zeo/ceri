@@ -170,6 +170,54 @@ impl ScriptRuntime {
         self.activated_at = Some(self.clock);
     }
 
+    // whether the user pressed or typed into the page in the last few seconds
+    pub(super) fn transiently_active(&self) -> bool {
+        self.activated_at
+            .is_some_and(|at| self.clock.saturating_sub(at) <= ACTIVATION_MILLISECONDS)
+    }
+
+    pub(crate) fn fullscreen_requested(&self) -> bool {
+        self.fullscreen_element.is_some()
+    }
+
+    // leaves fullscreen and tells the element that held it
+    pub(crate) fn leave_fullscreen(&mut self) -> Result<bool, ScriptError> {
+        let Some(node) = self.fullscreen_element.take() else {
+            return Ok(false);
+        };
+        let event = self.new_event(
+            "Event",
+            "fullscreenchange".to_string(),
+            true,
+            false,
+            true,
+            true,
+        );
+        self.dispatch(&event, super::events::ListenerTarget::Node(node))?;
+        Ok(true)
+    }
+
+    pub(super) fn request_fullscreen(&mut self, node: NodeId) -> Result<Value, ScriptError> {
+        if !self.transiently_active() {
+            return Ok(Value::Promise(
+                self.rejected_promise("Permissions check failed"),
+            ));
+        }
+        if self.fullscreen_element != Some(node) {
+            self.fullscreen_element = Some(node);
+            let event = self.new_event(
+                "Event",
+                "fullscreenchange".to_string(),
+                true,
+                false,
+                true,
+                true,
+            );
+            self.dispatch(&event, super::events::ListenerTarget::Node(node))?;
+        }
+        Ok(Value::Promise(self.fulfilled_promise(Value::Undefined)))
+    }
+
     fn lock_info(&self, request: &LockRequest) -> Value {
         plain_object([
             (
