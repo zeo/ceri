@@ -1703,10 +1703,10 @@ impl ScriptRuntime {
             Value::Window => {
                 let global = self.global.borrow();
                 global.accessors.get(key).cloned().or_else(|| {
-                    global
-                        .values
-                        .get(key)
-                        .map(|value| Property::data(value.resolve()))
+                    global.values.get(key).map(|value| Property {
+                        enumerable: !global.hidden.contains(key),
+                        ..Property::data(value.resolve())
+                    })
                 })
             }
             _ => None,
@@ -1912,6 +1912,7 @@ impl ScriptRuntime {
                         if property.writable && property.enumerable && property.configurable =>
                     {
                         global.accessors.remove(&key);
+                        global.hidden.remove(&key);
                         global.values.insert(key, value);
                     }
                     _ => {

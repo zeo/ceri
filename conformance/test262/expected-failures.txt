@@ -61,7 +61,6 @@ test/built-ins/Array/of/return-abrupt-from-data-property-using-proxy.js
 test/built-ins/Array/of/return-abrupt-from-data-property.js
 test/built-ins/Array/of/return-abrupt-from-setting-length.js
 test/built-ins/Array/of/sets-length.js
-test/built-ins/Array/prop-desc.js
 test/built-ins/Array/proto-from-ctor-realm-one.js
 test/built-ins/Array/proto-from-ctor-realm-two.js
 test/built-ins/Array/proto-from-ctor-realm-zero.js
@@ -757,7 +756,6 @@ test/built-ins/ArrayBuffer/options-maxbytelength-object.js
 test/built-ins/ArrayBuffer/options-maxbytelength-poisoned.js
 test/built-ins/ArrayBuffer/options-maxbytelength-undefined.js
 test/built-ins/ArrayBuffer/options-non-object.js
-test/built-ins/ArrayBuffer/prop-desc.js
 test/built-ins/ArrayBuffer/proto-from-ctor-realm.js
 test/built-ins/ArrayBuffer/prototype-from-newtarget.js
 test/built-ins/ArrayBuffer/prototype/byteLength/detached-buffer.js
@@ -903,10 +901,8 @@ test/built-ins/ArrayBuffer/prototype/transferToImmutable/this-is-sharedarraybuff
 test/built-ins/ArrayBuffer/prototype/transferToImmutable/to-larger.js
 test/built-ins/ArrayBuffer/prototype/transferToImmutable/to-same-or-smaller.js
 test/built-ins/BigInt/is-a-constructor.js
-test/built-ins/BigInt/prop-desc.js
 test/built-ins/BigInt/prototype/valueOf/cross-realm.js
 test/built-ins/BigInt/wrapper-object-ordinary-toprimitive.js
-test/built-ins/Boolean/prop-desc.js
 test/built-ins/Boolean/proto-from-ctor-realm.js
 test/built-ins/DataView/buffer-does-not-have-arraybuffer-data-throws-sab.js
 test/built-ins/DataView/buffer-reference-sab.js
@@ -921,7 +917,6 @@ test/built-ins/DataView/custom-proto-access-throws.js
 test/built-ins/DataView/custom-proto-if-not-object-fallbacks-to-default-prototype-sab.js
 test/built-ins/DataView/custom-proto-if-object-is-used-sab.js
 test/built-ins/DataView/custom-proto-if-object-is-used.js
-test/built-ins/DataView/dataview.js
 test/built-ins/DataView/defined-bytelength-and-byteoffset-sab.js
 test/built-ins/DataView/defined-byteoffset-sab.js
 test/built-ins/DataView/defined-byteoffset-undefined-bytelength-sab.js
@@ -1127,7 +1122,6 @@ test/built-ins/Date/S15.9.3.2_A3_T1.2.js
 test/built-ins/Date/UTC/not-a-constructor.js
 test/built-ins/Date/now/not-a-constructor.js
 test/built-ins/Date/parse/not-a-constructor.js
-test/built-ins/Date/prop-desc.js
 test/built-ins/Date/proto-from-ctor-realm-one.js
 test/built-ins/Date/proto-from-ctor-realm-two.js
 test/built-ins/Date/proto-from-ctor-realm-zero.js
@@ -1147,7 +1141,6 @@ test/built-ins/Error/cause_abrupt.js
 test/built-ins/Error/constructor.js
 test/built-ins/Error/isError/errors-other-realm.js
 test/built-ins/Error/isError/non-error-objects-other-realm.js
-test/built-ins/Error/prop-desc.js
 test/built-ins/Error/proto-from-ctor-realm.js
 test/built-ins/Error/prototype/stack/getter-cross-realm.js
 test/built-ins/Error/prototype/stack/getter-data-property-shadows.js
@@ -1222,7 +1215,6 @@ test/built-ins/Function/internals/Construct/base-ctor-revoked-proxy-realm.js
 test/built-ins/Function/internals/Construct/base-ctor-revoked-proxy.js
 test/built-ins/Function/internals/Construct/derived-return-val-realm.js
 test/built-ins/Function/internals/Construct/derived-this-uninitialized-realm.js
-test/built-ins/Function/prop-desc.js
 test/built-ins/Function/proto-from-ctor-realm-prototype.js
 test/built-ins/Function/proto-from-ctor-realm.js
 test/built-ins/Function/prototype/Symbol.hasInstance/this-val-not-callable.js
@@ -1294,7 +1286,6 @@ test/built-ins/JSON/parse/reviver-forward-modifies-object.js
 test/built-ins/JSON/parse/reviver-get-name-err.js
 test/built-ins/JSON/parse/reviver-object-define-prop-err.js
 test/built-ins/JSON/parse/reviver-object-non-configurable-prop-create.js
-test/built-ins/JSON/prop-desc.js
 test/built-ins/JSON/rawJSON/basic.js
 test/built-ins/JSON/rawJSON/bigint-raw-json-can-be-stringified.js
 test/built-ins/JSON/rawJSON/builtin.js
@@ -1322,7 +1313,6 @@ test/built-ins/Map/Symbol.species/symbol-species-name.js
 test/built-ins/Map/Symbol.species/symbol-species.js
 test/built-ins/Map/iterator-item-first-entry-returns-abrupt.js
 test/built-ins/Map/iterator-item-second-entry-returns-abrupt.js
-test/built-ins/Map/map.js
 test/built-ins/Map/proto-from-ctor-realm.js
 test/built-ins/Map/prototype/clear/context-is-set-object-throws.js
 test/built-ins/Map/prototype/clear/context-is-weakmap-object-throws.js
@@ -1374,7 +1364,6 @@ test/built-ins/Math/f16round/not-a-constructor.js
 test/built-ins/Math/f16round/prop-desc.js
 test/built-ins/Math/f16round/value-conversion.js
 test/built-ins/Math/hypot/Math.hypot_NoArgs.js
-test/built-ins/Math/prop-desc.js
 test/built-ins/Math/sumPrecise/length.js
 test/built-ins/Math/sumPrecise/name.js
 test/built-ins/Math/sumPrecise/not-a-constructor.js
@@ -1385,21 +1374,14 @@ test/built-ins/Math/sumPrecise/sum-is-minus-zero.js
 test/built-ins/Math/sumPrecise/sum.js
 test/built-ins/Math/sumPrecise/takes-iterable.js
 test/built-ins/Math/sumPrecise/throws-on-non-number.js
-test/built-ins/NativeErrors/EvalError/prop-desc.js
 test/built-ins/NativeErrors/EvalError/proto-from-ctor-realm.js
-test/built-ins/NativeErrors/RangeError/prop-desc.js
 test/built-ins/NativeErrors/RangeError/proto-from-ctor-realm.js
-test/built-ins/NativeErrors/ReferenceError/prop-desc.js
 test/built-ins/NativeErrors/ReferenceError/proto-from-ctor-realm.js
-test/built-ins/NativeErrors/SyntaxError/prop-desc.js
 test/built-ins/NativeErrors/SyntaxError/proto-from-ctor-realm.js
-test/built-ins/NativeErrors/TypeError/prop-desc.js
 test/built-ins/NativeErrors/TypeError/proto-from-ctor-realm.js
-test/built-ins/NativeErrors/URIError/prop-desc.js
 test/built-ins/NativeErrors/URIError/proto-from-ctor-realm.js
 test/built-ins/Number/isFinite/length.js
 test/built-ins/Number/isFinite/name.js
-test/built-ins/Number/prop-desc.js
 test/built-ins/Number/proto-from-ctor-realm.js
 test/built-ins/Number/prototype/toExponential/return-abrupt-tointeger-fractiondigits-symbol.js
 test/built-ins/Number/prototype/toExponential/return-abrupt-tointeger-fractiondigits.js
@@ -1764,14 +1746,6 @@ test/built-ins/Object/freeze/proxy-with-defineProperty-handler.js
 test/built-ins/Object/freeze/throws-when-false.js
 test/built-ins/Object/freeze/typedarray-backed-by-resizable-buffer.js
 test/built-ins/Object/fromEntries/evaluation-order.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-10.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-11.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-4.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-5.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-6.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-7.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-8.js
-test/built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-9.js
 test/built-ins/Object/getOwnPropertyDescriptors/observable-operations.js
 test/built-ins/Object/getOwnPropertyNames/15.2.3.4-4-44.js
 test/built-ins/Object/getOwnPropertyNames/15.2.3.4-4-47.js
@@ -1800,7 +1774,6 @@ test/built-ins/Object/preventExtensions/15.2.3.10-3-14.js
 test/built-ins/Object/preventExtensions/15.2.3.10-3-4.js
 test/built-ins/Object/preventExtensions/abrupt-completion.js
 test/built-ins/Object/preventExtensions/throws-when-false.js
-test/built-ins/Object/prop-desc.js
 test/built-ins/Object/proto-from-ctor-realm.js
 test/built-ins/Object/prototype/__proto__/get-abrupt.js
 test/built-ins/Object/prototype/__proto__/set-non-obj-coercible.js
@@ -1918,7 +1891,6 @@ test/built-ins/Promise/allSettledKeyed/resolves-empty-object.js
 test/built-ins/Promise/allSettledKeyed/result-property-descriptors.js
 test/built-ins/Promise/allSettledKeyed/symbol-keys.js
 test/built-ins/Promise/any/iter-arg-is-poisoned.js
-test/built-ins/Promise/promise.js
 test/built-ins/Promise/proto-from-ctor-realm.js
 test/built-ins/Promise/race/resolved-then-catch-finally.js
 test/built-ins/Proxy/apply/arguments-realm.js
@@ -2014,7 +1986,6 @@ test/built-ins/Proxy/preventExtensions/trap-is-missing-target-is-proxy.js
 test/built-ins/Proxy/preventExtensions/trap-is-not-callable-realm.js
 test/built-ins/Proxy/preventExtensions/trap-is-not-callable.js
 test/built-ins/Proxy/preventExtensions/trap-is-null-target-is-proxy.js
-test/built-ins/Proxy/proxy.js
 test/built-ins/Proxy/revocable/not-a-constructor.js
 test/built-ins/Proxy/revocable/tco-fn-realm.js
 test/built-ins/Proxy/set/call-parameters-prototype-index.js
@@ -2043,7 +2014,6 @@ test/built-ins/Reflect/getPrototypeOf/not-a-constructor.js
 test/built-ins/Reflect/isExtensible/not-a-constructor.js
 test/built-ins/Reflect/ownKeys/not-a-constructor.js
 test/built-ins/Reflect/preventExtensions/not-a-constructor.js
-test/built-ins/Reflect/prop-desc.js
 test/built-ins/Reflect/set/different-property-descriptors.js
 test/built-ins/Reflect/set/not-a-constructor.js
 test/built-ins/Reflect/set/return-false-if-target-is-not-writable.js
@@ -2096,7 +2066,6 @@ test/built-ins/RegExp/named-groups/string-replace-escaped.js
 test/built-ins/RegExp/named-groups/unicode-property-names-invalid.js
 test/built-ins/RegExp/named-groups/unicode-property-names-valid.js
 test/built-ins/RegExp/named-groups/unicode-property-names.js
-test/built-ins/RegExp/prop-desc.js
 test/built-ins/RegExp/proto-from-ctor-realm.js
 test/built-ins/RegExp/prototype/Symbol.match/builtin-success-g-set-lastindex-err.js
 test/built-ins/RegExp/prototype/Symbol.match/builtin-success-g-set-lastindex.js
@@ -2491,11 +2460,9 @@ test/built-ins/Set/prototype/union/set-like-class-order.js
 test/built-ins/Set/prototype/union/size-is-a-number.js
 test/built-ins/Set/prototype/values/does-not-have-setdata-internal-slot-map.js
 test/built-ins/Set/prototype/values/does-not-have-setdata-internal-slot-weakset.js
-test/built-ins/Set/set.js
 test/built-ins/String/S15.5.1.1_A1_T8.js
 test/built-ins/String/S15.5.1.1_A1_T9.js
 test/built-ins/String/S15.5.5.1_A3.js
-test/built-ins/String/prop-desc.js
 test/built-ins/String/proto-from-ctor-realm.js
 test/built-ins/String/prototype/charAt/S15.5.4.4_A1_T1.js
 test/built-ins/String/prototype/charCodeAt/S15.5.4.5_A1_T1.js
@@ -2573,7 +2540,6 @@ test/built-ins/Symbol/species/builtin-getter-name.js
 test/built-ins/Symbol/species/cross-realm.js
 test/built-ins/Symbol/species/subclassing.js
 test/built-ins/Symbol/split/cross-realm.js
-test/built-ins/Symbol/symbol.js
 test/built-ins/Symbol/toPrimitive/cross-realm.js
 test/built-ins/Symbol/toStringTag/cross-realm.js
 test/built-ins/Symbol/unscopables/cross-realm.js
@@ -3228,8 +3194,6 @@ test/built-ins/TypedArray/prototype/with/value-coercion-shrinks.js
 test/built-ins/TypedArray/prototype/with/value-throw-completion.js
 test/built-ins/TypedArray/resizable-buffer-length-tracking-1.js
 test/built-ins/TypedArray/resizable-buffer-length-tracking-2.js
-test/built-ins/TypedArrayConstructors/BigInt64Array/prop-desc.js
-test/built-ins/TypedArrayConstructors/BigUint64Array/prop-desc.js
 test/built-ins/TypedArrayConstructors/ctors-bigint/buffer-arg/bufferbyteoffset-throws-from-modulo-element-size-sab.js
 test/built-ins/TypedArrayConstructors/ctors-bigint/buffer-arg/byteoffset-is-negative-throws-sab.js
 test/built-ins/TypedArrayConstructors/ctors-bigint/buffer-arg/byteoffset-is-negative-zero-sab.js
@@ -3587,7 +3551,6 @@ test/built-ins/WeakMap/prototype/has/does-not-have-weakmapdata-internal-slot-set
 test/built-ins/WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-map.js
 test/built-ins/WeakMap/prototype/set/does-not-have-weakmapdata-internal-slot-set.js
 test/built-ins/WeakMap/prototype/set/throw-if-key-cannot-be-held-weakly.js
-test/built-ins/WeakMap/weakmap.js
 test/built-ins/WeakSet/proto-from-ctor-realm.js
 test/built-ins/WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-map.js
 test/built-ins/WeakSet/prototype/add/does-not-have-weaksetdata-internal-slot-set.js
@@ -3596,7 +3559,6 @@ test/built-ins/WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-
 test/built-ins/WeakSet/prototype/delete/does-not-have-weaksetdata-internal-slot-set.js
 test/built-ins/WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-map.js
 test/built-ins/WeakSet/prototype/has/does-not-have-weaksetdata-internal-slot-set.js
-test/built-ins/WeakSet/weakset.js
 test/language/arguments-object/10.6-10-c-ii-1.js
 test/language/arguments-object/10.6-10-c-ii-2.js
 test/language/arguments-object/10.6-12-2.js

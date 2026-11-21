@@ -509,6 +509,8 @@ struct Environment {
     accessors: HashMap<String, object::Property>,
     // the names scripts declared with let, const or class, which an eval's var may not take
     lexicals: HashSet<String>,
+    // the built-in constructors and namespaces among the values, which are not enumerable
+    hidden: HashSet<String>,
 }
 
 impl Environment {
@@ -1547,11 +1549,13 @@ impl ScriptRuntime {
         let global = Rc::new(RefCell::new(Environment::default()));
         let (intrinsics, intrinsic_globals) = create_intrinsics();
         let selection = ranges::new_selection(&intrinsics);
-        global.borrow_mut().values.extend(
-            intrinsic_globals
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value)),
-        );
+        {
+            let mut global = global.borrow_mut();
+            for (name, value) in intrinsic_globals {
+                global.hidden.insert(name.to_string());
+                global.values.insert(name.to_string(), value);
+            }
+        }
         // the value properties nothing may write, delete or redefine
         for (name, value) in [
             ("NaN", Value::Number(f64::NAN)),

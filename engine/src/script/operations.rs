@@ -1408,6 +1408,7 @@ impl ScriptRuntime {
                 }
                 global.accessors.remove(key);
                 global.values.remove(key);
+                global.hidden.remove(key);
                 Ok(true)
             }
             _ => Ok(true),
