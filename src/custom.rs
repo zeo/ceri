@@ -329,6 +329,18 @@ impl App {
         self
     }
 
+    // a window has opened, the launch windows included; its state and native handle are
+    // there to read by its label
+    pub fn on_window_opened(mut self, mut hook: impl FnMut(&AppHandle, &str) + 'static) -> Self {
+        let handle = self.handle.clone();
+        // the launch windows open before the app's start hook runs
+        self.lifecycle.opened = Some(Box::new(move |control, label| {
+            handle.attach(control);
+            hook(&handle, label);
+        }));
+        self
+    }
+
     pub fn on_closed(mut self, mut hook: impl FnMut(&AppHandle, &str) + 'static) -> Self {
         let handle = self.handle.clone();
         self.lifecycle.closed = Some(Box::new(move |_, label| hook(&handle, label)));

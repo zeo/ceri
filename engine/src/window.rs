@@ -472,6 +472,8 @@ pub struct Lifecycle {
     // whether a window its user or app asked to close may close
     pub close_requested: Option<CloseHook>,
     pub closed: Option<ClosedHook>,
+    // a window is open and its state, native handle included, can be read by its label
+    pub opened: Option<ClosedHook>,
     // files let go over a window, before its page hears of them
     pub dropped: Option<DropHook>,
     // after the last window has gone, before run returns
@@ -669,7 +671,11 @@ where
             self.control.published().windows.remove(&this.config.label);
             return;
         }
+        let label = this.config.label.clone();
         self.windows.insert(id, this);
+        if let Some(hook) = &mut self.lifecycle.opened {
+            hook(&self.control, &label);
+        }
     }
 
     // a close the user or app asked for, which the app may refuse
