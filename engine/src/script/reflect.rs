@@ -445,9 +445,13 @@ impl ScriptRuntime {
                             Some(trap) => self
                                 .call_function(trap, Self::proxy_handler(&proxy), vec![target])?
                                 .truthy(),
-                            None => {
-                                matches!(&target, Value::Object(object) if object.borrow().extensible)
-                            }
+                            None => match &target {
+                                Value::Object(object) => object.borrow().extensible,
+                                Value::Array(array) => {
+                                    array.borrow().integrity == super::Integrity::Open
+                                }
+                                _ => false,
+                            },
                         }
                     }
                     None => object.borrow().extensible,
@@ -471,6 +475,11 @@ impl ScriptRuntime {
                                     ));
                                 }
                                 None => {
+                                    if let Value::Array(array) = &target {
+                                        let mut array = array.borrow_mut();
+                                        array.integrity =
+                                            array.integrity.max(super::Integrity::Closed);
+                                    }
                                     if let Value::Object(target) = target {
                                         target.borrow_mut().extensible = false;
                                     }

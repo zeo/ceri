@@ -217,7 +217,13 @@ fn pinned_test262_subset_matches_its_expectations() {
     let next = AtomicUsize::new(0);
     let failures = Mutex::new(Vec::new());
     let (passed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let workers = std::thread::available_parallelism().map_or(4, |count| count.get());
+    // CERI_TEST262_WORKERS caps the threads, since tests that build arrays near the length
+    // limit take hundreds of megabytes each and a full machine can run out
+    let workers = std::env::var("CERI_TEST262_WORKERS")
+        .ok()
+        .and_then(|count| count.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |count| count.get()));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             std::thread::Builder::new()

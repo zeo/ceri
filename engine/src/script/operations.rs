@@ -1032,7 +1032,7 @@ impl ScriptRuntime {
             return Ok(element);
         }
         if let Value::Array(array) = value
-            && let Some(found) = self.array_expando(array, key)
+            && let Some(found) = self.array_property_get(array, key, value)?
         {
             return Ok(found);
         }
@@ -1150,7 +1150,30 @@ impl ScriptRuntime {
                 None if super::typed::canonical_numeric_index(key).is_some() => Ok(()),
                 None => self.ordinary_set(super::typed_object(array), key, value, target, strict),
             },
-            Value::Array(array) if key != "length" && array_index(key).is_none() => {
+            Value::Array(array) if key != "length" => {
+                if self.array_property_set(array, key, value.clone(), strict)? {
+                    return Ok(());
+                }
+                if let Some(index) = array_index(key) {
+                    if let Some(refusal) = array_write_refusal(array, index as usize) {
+                        return if strict {
+                            Err(self.type_error(refusal))
+                        } else {
+                            Ok(())
+                        };
+                    }
+                    return set_array_element(array, index as usize, value);
+                }
+                if array.borrow().integrity != super::Integrity::Open {
+                    return if strict {
+                        Err(self.type_error(format!(
+                            "Cannot add property {}, object is not extensible",
+                            display_key(key)
+                        )))
+                    } else {
+                        Ok(())
+                    };
+                }
                 self.set_array_expando(array, key, value);
                 Ok(())
             }
@@ -1158,34 +1181,76 @@ impl ScriptRuntime {
         }
     }
 
-    // named properties on arrays, such as the raw strings of a template or match details;
-    // entries hold a weak reference so the allocation cannot be reused while keyed here
-    pub(super) fn array_expando(&self, array: &ArrayHandle, key: &str) -> Option<Value> {
-        if self.array_expandos.is_empty() {
-            return None;
+    pub(super) fn set_array_expando(&mut self, array: &ArrayHandle, key: &str, value: Value) {
+        let mut array = array.borrow_mut();
+        match array.properties.iter_mut().find(|(name, _)| name == key) {
+            Some((_, property)) => property.slot = Slot::Data(value),
+            None => array
+                .properties
+                .push((key.to_string(), Property::data(value))),
         }
-        let (_, properties) = self.array_expandos.get(&(Rc::as_ptr(array) as usize))?;
-        properties
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
     }
 
-    pub(super) fn set_array_expando(&mut self, array: &ArrayHandle, key: &str, value: Value) {
-        let address = Rc::as_ptr(array) as usize;
-        if self.array_expandos.len() >= self.array_expando_prune_at {
-            self.array_expandos
-                .retain(|_, (array, _)| array.strong_count() > 0);
-            self.array_expando_prune_at = (self.array_expandos.len() * 2).max(64);
+    // what an array's own property list holds for a key, read as a get would: a getter runs
+    // with the array as this
+    fn array_property_get(
+        &mut self,
+        array: &ArrayHandle,
+        key: &str,
+        receiver: &Value,
+    ) -> Result<Option<Value>, ScriptError> {
+        let slot = match array.borrow().own(key) {
+            Some(property) => property.slot.clone(),
+            None => return Ok(None),
+        };
+        Ok(Some(match slot {
+            Slot::Data(value) => value,
+            Slot::Accessor {
+                get: Some(getter), ..
+            } => self.call_function(getter, receiver.clone(), Vec::new())?,
+            Slot::Accessor { get: None, .. } => Value::Undefined,
+        }))
+    }
+
+    // a write to an array through its own property list; false when the key is not there
+    fn array_property_set(
+        &mut self,
+        array: &ArrayHandle,
+        key: &str,
+        value: Value,
+        strict: bool,
+    ) -> Result<bool, ScriptError> {
+        let found = array
+            .borrow()
+            .own(key)
+            .map(|property| (property.slot.clone(), property.writable));
+        let Some((slot, writable)) = found else {
+            return Ok(false);
+        };
+        match slot {
+            Slot::Accessor {
+                set: Some(setter), ..
+            } => {
+                self.call_function(setter, Value::Array(array.clone()), vec![value])?;
+            }
+            Slot::Accessor { set: None, .. } if strict => {
+                return Err(self.type_error(format!(
+                    "Cannot set property {} of [object Array] which has only a getter",
+                    display_key(key)
+                )));
+            }
+            Slot::Data(_) if !writable || array.borrow().integrity == super::Integrity::Frozen => {
+                if strict {
+                    return Err(self.type_error(format!(
+                        "Cannot assign to read only property '{}' of object '[object Array]'",
+                        display_key(key)
+                    )));
+                }
+            }
+            Slot::Data(_) => self.set_array_expando(array, key, value),
+            Slot::Accessor { .. } => {}
         }
-        let (_, properties) = self
-            .array_expandos
-            .entry(address)
-            .or_insert_with(|| (Rc::downgrade(array), Vec::new()));
-        match properties.iter_mut().find(|(name, _)| name == key) {
-            Some((_, slot)) => *slot = value,
-            None => properties.push((key.to_string(), value)),
-        }
+        Ok(true)
     }
 
     fn window_set(&mut self, key: &str, value: Value) -> Result<(), ScriptError> {
@@ -1324,6 +1389,9 @@ impl ScriptRuntime {
                         // an index the array does not have is read from its prototypes
                         if (index as f64) == number {
                             let key = index.to_string();
+                            if let Some(found) = self.array_property_get(array, &key, object)? {
+                                return Ok(found);
+                            }
                             if !self.inherits(object, &key) {
                                 return Ok(Value::Undefined);
                             }
@@ -1369,6 +1437,9 @@ impl ScriptRuntime {
             match object {
                 Value::Array(array) => {
                     let index = runtime_array_index(&Value::Number(number))?;
+                    if self.array_property_set(array, &index.to_string(), value.clone(), strict)? {
+                        return Ok(());
+                    }
                     if let Some(refusal) = array_write_refusal(array, index) {
                         return if strict {
                             Err(self.type_error(refusal))
@@ -1430,7 +1501,36 @@ impl ScriptRuntime {
                 "Cannot convert undefined or null to object (deleting '{}')",
                 display_key(key)
             ))),
+            Value::Array(_) if key == "length" => {
+                if strict {
+                    return Err(
+                        self.type_error("Cannot delete property 'length' of [object Array]")
+                    );
+                }
+                Ok(false)
+            }
             Value::Array(array) => {
+                let configurable = array
+                    .borrow()
+                    .own(key)
+                    .map(|property| property.configurable);
+                match configurable {
+                    Some(true) => {
+                        array
+                            .borrow_mut()
+                            .properties
+                            .retain(|(name, _)| name != key);
+                        return Ok(true);
+                    }
+                    Some(false) if strict => {
+                        return Err(self.type_error(format!(
+                            "Cannot delete property '{}' of [object Array]",
+                            display_key(key)
+                        )));
+                    }
+                    Some(false) => return Ok(false),
+                    None => {}
+                }
                 if let Some(index) = array_index(key) {
                     let present = array
                         .borrow()
@@ -1490,7 +1590,7 @@ impl ScriptRuntime {
                 Ok(false)
             }
             Value::Array(array) => {
-                if key == "length" {
+                if key == "length" || array.borrow().own(key).is_some() {
                     return Ok(true);
                 }
                 // an index nothing was put at is no property of the array, though one of its
@@ -1741,6 +1841,26 @@ impl ScriptRuntime {
                 for key in keys {
                     let value = if with_values {
                         self.ordinary_get(object.clone(), &key, source)?
+                    } else {
+                        Value::Undefined
+                    };
+                    entries.push((key, value));
+                }
+                Ok(entries)
+            }
+            // an array with named properties or set-apart elements answers through its keys
+            // and descriptors; a plain list of elements takes the quick path below
+            Value::Array(array) if !array.borrow().properties.is_empty() => {
+                let mut entries = Vec::new();
+                for key in self.own_property_keys(source, false)? {
+                    if !self
+                        .own_property_of(source, &key)?
+                        .is_some_and(|property| property.enumerable)
+                    {
+                        continue;
+                    }
+                    let value = if with_values {
+                        self.get_property(source, &key)?
                     } else {
                         Value::Undefined
                     };

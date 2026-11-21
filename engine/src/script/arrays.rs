@@ -117,11 +117,11 @@ fn array_method_refusal(
     use ArrayMethod as M;
     let length = array.len();
     let adding = |count: usize| {
-        (count > 0 && array.integrity >= Integrity::Closed)
+        (count > 0 && (array.integrity >= Integrity::Closed || array.fixed_length))
             .then(|| format!("Cannot add property {length}, object is not extensible"))
     };
     let removing = |count: usize| {
-        (count > 0 && array.integrity >= Integrity::Sealed)
+        (count > 0 && (array.integrity >= Integrity::Sealed || array.fixed_length))
             .then(|| format!("Cannot delete property '{}' of [object Array]", length - 1))
     };
     let changing = || {
@@ -155,6 +155,13 @@ fn array_method_refusal(
 }
 
 impl ScriptRuntime {
+    // whether a hole in an array is still a property: one its property list holds, as an
+    // accessor element does, or one a prototype has
+    fn holds(&self, this: &Value, key: &str) -> bool {
+        matches!(this, Value::Array(array) if array.borrow().own(key).is_some())
+            || self.inherits(this, key)
+    }
+
     // ArraySpeciesCreate: an array made like the receiver, so a subclass's map or filter
     // hands back the subclass; a plain array, or a constructor without a species, gives one
     // of Array's own
@@ -200,10 +207,6 @@ impl ScriptRuntime {
         // CreateDataPropertyOrThrow defines each element, over whatever the constructor put there
         for (index, value) in values.into_iter().enumerate() {
             if matches!(value, Value::Uninitialized) {
-                continue;
-            }
-            if matches!(made, Value::Array(_)) {
-                self.set_index(&made, Value::Number(index as f64), value, true)?;
                 continue;
             }
             let descriptor = self.object_from_entries(vec![
@@ -507,7 +510,7 @@ impl ScriptRuntime {
                     // an index nothing was put at is passed over, kept as it is by map, and
                     // seen as undefined by the finds
                     let value = match value {
-                        Value::Uninitialized if self.inherits(&this, &index.to_string()) => {
+                        Value::Uninitialized if self.holds(&this, &index.to_string()) => {
                             self.get_index(&this, Value::Number(index as f64))?
                         }
                         Value::Uninitialized if matches!(method, M::Find | M::FindIndex) => {
@@ -590,7 +593,7 @@ impl ScriptRuntime {
                         return Err(self.type_error("Reduce of empty array with no initial value"));
                     };
                     accumulator = match Self::element(&this, &values, first) {
-                        Some(Value::Uninitialized) if !self.inherits(&this, &first.to_string()) => {
+                        Some(Value::Uninitialized) if !self.holds(&this, &first.to_string()) => {
                             None
                         }
                         Some(Value::Uninitialized) => {
@@ -604,7 +607,7 @@ impl ScriptRuntime {
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
                     // a callback may have deleted what was there when the method began
                     let value = match value {
-                        Value::Uninitialized if !self.inherits(&this, &index.to_string()) => {
+                        Value::Uninitialized if !self.holds(&this, &index.to_string()) => {
                             continue;
                         }
                         Value::Uninitialized => {
@@ -630,7 +633,7 @@ impl ScriptRuntime {
                 // an index nothing was put at is searched as what a prototype has there
                 for (index, value) in values.iter_mut().enumerate() {
                     if matches!(value, Value::Uninitialized)
-                        && self.inherits(&this, &index.to_string())
+                        && self.holds(&this, &index.to_string())
                     {
                         *value = self.get_index(&this, Value::Number(index as f64))?;
                     }
@@ -1083,6 +1086,17 @@ mod tests {
                 seen.push(plain.hello(), Reflect.setPrototypeOf(frozen, null));
                 const doubled = list.map((x) => x * 2);
                 seen.push(doubled instanceof List, doubled.sum(), list.filter((x) => x > 1).length, list.slice(1) instanceof List, [1].map((x) => x) instanceof List, Array[Symbol.species] === Array);
+                const lazy = [1, 2];
+                let reads = 0;
+                Object.defineProperty(lazy, 1, { get() { reads++; return 20; }, enumerable: true, configurable: true });
+                Object.defineProperty(lazy, "total", { get() { return this[0] + this[1]; } });
+                Object.defineProperty(lazy, 0, { value: 10, writable: false });
+                try { lazy[0] = 5; } catch (error) { seen.push(error.name); }
+                seen.push(lazy[1], lazy.total, lazy.map((x) => x).join(), Object.keys(lazy).join(), reads > 0, lazy.length);
+                const fixed = [1, 2];
+                Object.defineProperty(fixed, "length", { writable: false });
+                try { fixed.push(3); } catch (error) { seen.push(error.name); }
+                try { delete fixed.length; } catch (error) { seen.push(error.name); }
                 document.getElementById("out").textContent = seen.join("|");
                 "#,
             )
@@ -1092,7 +1106,7 @@ mod tests {
             document.borrow().element_text_content(out).as_deref(),
             Some(
                 "true|true|6|true|true|false|false|TypeError|TypeError|TypeError|TypeError|1,2|7|\
-                 TypeError|TypeError|TypeError|5,2|2|true|false|hi|false|true|12|2|true|false|true"
+                 TypeError|TypeError|TypeError|5,2|2|true|false|hi|false|true|12|2|true|false|true|TypeError|20|30|10,20|0,1|true|2|TypeError|TypeError"
             )
         );
     }

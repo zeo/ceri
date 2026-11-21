@@ -318,6 +318,20 @@ impl ScriptRuntime {
                     }
                 }
             }
+            // an array behind a proxy is walked by index too, as IsArray sees through proxies
+            Value::Object(_) if self.is_array(&value)? => {
+                let length = self.get_property(&value, "length")?;
+                let length = self.coerce_number(length)?.max(0.0) as usize;
+                for index in 0..length {
+                    let name = index.to_string();
+                    let element = self.internalize(value.clone(), name.clone(), reviver)?;
+                    if matches!(element, Value::Undefined) {
+                        self.delete_property(&value, &name, false)?;
+                    } else {
+                        self.set_property(&value, &name, element, false)?;
+                    }
+                }
+            }
             Value::Object(_) => {
                 let keys: Vec<String> = self
                     .own_enumerable_entries(&value)?

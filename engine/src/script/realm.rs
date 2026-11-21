@@ -2024,13 +2024,25 @@ impl ScriptRuntime {
                 }
             }
             Value::String(text) => string_own_property(text, key),
+            Value::Array(array) if array.borrow().own(key).is_some() => {
+                let mut property = array.borrow().own(key).cloned().expect("checked above");
+                let integrity = array.borrow().integrity;
+                if integrity >= super::Integrity::Sealed {
+                    property.configurable = false;
+                }
+                if integrity == super::Integrity::Frozen && matches!(property.slot, Slot::Data(_)) {
+                    property.writable = false;
+                }
+                Some(property)
+            }
             Value::Array(array) => {
                 let integrity = array.borrow().integrity;
                 if key == "length" {
                     Some(Property {
                         slot: Slot::Data(Value::Number(array.borrow().len() as f64)),
                         enumerable: false,
-                        writable: integrity != super::Integrity::Frozen,
+                        writable: integrity != super::Integrity::Frozen
+                            && !array.borrow().fixed_length,
                         configurable: false,
                     })
                 } else if let Some(index) = array_index(key) {
@@ -2046,7 +2058,7 @@ impl ScriptRuntime {
                             configurable: integrity < super::Integrity::Sealed,
                         })
                 } else {
-                    self.array_expando(array, key).map(Property::data)
+                    None
                 }
             }
             Value::Window => {
@@ -2106,15 +2118,38 @@ impl ScriptRuntime {
                 }
                 keys
             }
-            Value::Array(array) if !symbols => {
-                let mut keys: Vec<String> = array
-                    .borrow()
+            Value::Array(array) => {
+                let array = array.borrow();
+                let mut indices: Vec<usize> = array
                     .iter()
                     .enumerate()
                     .filter(|(_, value)| !matches!(value, Value::Uninitialized))
-                    .map(|(index, _)| index.to_string())
+                    .map(|(index, _)| index)
+                    .chain(
+                        array
+                            .properties
+                            .iter()
+                            .filter_map(|(name, _)| array_index(name).map(|index| index as usize)),
+                    )
                     .collect();
-                keys.push("length".to_string());
+                indices.sort_unstable();
+                let mut keys: Vec<String> = if symbols {
+                    Vec::new()
+                } else {
+                    indices.into_iter().map(|index| index.to_string()).collect()
+                };
+                if !symbols {
+                    keys.push("length".to_string());
+                }
+                keys.extend(
+                    array
+                        .properties
+                        .iter()
+                        .map(|(name, _)| name)
+                        .filter(|name| array_index(name).is_none())
+                        .filter(|name| keep(name))
+                        .cloned(),
+                );
                 keys
             }
             Value::String(text) if !symbols => {
@@ -2240,20 +2275,7 @@ impl ScriptRuntime {
                 None => super::typed_object(array),
             },
             Value::Array(array) => {
-                if let Slot::Data(value) = property.slot {
-                    if key == "length" {
-                        return set_array_length(array, value);
-                    }
-                    if let Some(index) = array_index(&key) {
-                        if array.borrow().integrity == super::Integrity::Frozen {
-                            return Err(self.type_error(format!("Cannot redefine property: {key}")));
-                        }
-                        return set_array_element(array, index as usize, value);
-                    }
-                    self.set_array_expando(array, &key, value);
-                    return Ok(());
-                }
-                return Err(self.type_error("accessor properties on arrays are not supported"));
+                return self.define_array_property(array, key, property, present);
             }
             Value::Window => {
                 let existing = self.global.borrow().accessors.get(&key).cloned();
@@ -3741,6 +3763,164 @@ impl ScriptRuntime {
             other => {
                 let name = format!("{other:?}");
                 Err(self.type_error(format!("{name} is not a constructor")))
+            }
+        }
+    }
+
+    // ValidateAndApplyPropertyDescriptor for an array: an element or name keeps its plain
+    // slot while it is an ordinary writable, enumerable, configurable value, and moves to the
+    // array's property list once an accessor or other attributes set it apart
+    fn define_array_property(
+        &mut self,
+        array: &ArrayHandle,
+        key: String,
+        mut property: Property,
+        present: [bool; 6],
+    ) -> Result<(), ScriptError> {
+        if key == "length" {
+            // length is a data property that is never enumerable or configurable
+            let accessor = present[4] || present[5];
+            if accessor
+                || (present[1] && property.configurable)
+                || (present[0] && property.enumerable)
+            {
+                return Err(self.type_error("Cannot redefine property: length"));
+            }
+            let fixed =
+                array.borrow().fixed_length || array.borrow().integrity == super::Integrity::Frozen;
+            if fixed && present[3] && property.writable {
+                return Err(self.type_error("Cannot redefine property: length"));
+            }
+            if let Slot::Data(value) = &property.slot
+                && present[2]
+            {
+                set_array_length(array, value.clone())?;
+            }
+            if present[3] && !property.writable {
+                array.borrow_mut().fixed_length = true;
+            }
+            return Ok(());
+        }
+        let index = array_index(&key).map(|index| index as usize);
+        let current = self.own_property_of(&Value::Array(array.clone()), &key)?;
+        let refuse =
+            |runtime: &mut Self| runtime.type_error(format!("Cannot redefine property: {key}"));
+        match &current {
+            None => {
+                if array.borrow().integrity != super::Integrity::Open {
+                    return Err(self.type_error(format!(
+                        "Cannot define property {key}, object is not extensible"
+                    )));
+                }
+            }
+            Some(current) => {
+                let accessor = present[4] || present[5];
+                let data = present[2] || present[3];
+                let is_accessor = matches!(current.slot, Slot::Accessor { .. });
+                if !current.configurable {
+                    let changes_kind = (accessor && !is_accessor) || (data && is_accessor);
+                    let unchanged = match (&current.slot, &property.slot) {
+                        (Slot::Data(old), Slot::Data(new)) => {
+                            super::operations::same_value(old, new)
+                        }
+                        _ => true,
+                    };
+                    let same_accessors = match (&current.slot, &property.slot) {
+                        (
+                            Slot::Accessor { get, set },
+                            Slot::Accessor {
+                                get: new_get,
+                                set: new_set,
+                            },
+                        ) => {
+                            (!present[4]
+                                || super::operations::same_value(
+                                    get.as_ref().unwrap_or(&Value::Undefined),
+                                    new_get.as_ref().unwrap_or(&Value::Undefined),
+                                ))
+                                && (!present[5]
+                                    || super::operations::same_value(
+                                        set.as_ref().unwrap_or(&Value::Undefined),
+                                        new_set.as_ref().unwrap_or(&Value::Undefined),
+                                    ))
+                        }
+                        _ => true,
+                    };
+                    let invalid = (present[1] && property.configurable)
+                        || (present[0] && property.enumerable != current.enumerable)
+                        || changes_kind
+                        || (!is_accessor
+                            && !current.writable
+                            && ((present[3] && property.writable) || (present[2] && !unchanged)))
+                        || (is_accessor && !same_accessors);
+                    if invalid {
+                        return Err(refuse(self));
+                    }
+                }
+                // what the descriptor leaves out keeps its current setting
+                if !present[0] {
+                    property.enumerable = current.enumerable;
+                }
+                if !present[1] {
+                    property.configurable = current.configurable;
+                }
+                match (&current.slot, &mut property.slot) {
+                    (Slot::Data(old), Slot::Data(new)) if !accessor => {
+                        if !present[2] {
+                            *new = old.clone();
+                        }
+                        if !present[3] {
+                            property.writable = current.writable;
+                        }
+                    }
+                    (
+                        Slot::Accessor { get, set },
+                        Slot::Accessor {
+                            get: new_get,
+                            set: new_set,
+                        },
+                    ) => {
+                        if !present[4] {
+                            *new_get = get.clone();
+                        }
+                        if !present[5] {
+                            *new_set = set.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let plain = matches!(property.slot, Slot::Data(_))
+            && property.writable
+            && property.enumerable
+            && property.configurable;
+        let mut data = array.borrow_mut();
+        data.properties.retain(|(name, _)| *name != key);
+        match (index, plain) {
+            (Some(index), true) => {
+                let Slot::Data(value) = property.slot else {
+                    unreachable!("plain is data")
+                };
+                drop(data);
+                set_array_element_unchecked(array, index, value)
+            }
+            (Some(index), false) => {
+                if index >= MAX_RUNTIME_ARRAY_LENGTH {
+                    return Err(
+                        self.range_error("array index exceeds the deterministic length limit")
+                    );
+                }
+                if index >= data.len() {
+                    data.resize(index + 1, Value::Uninitialized);
+                }
+                data[index] = Value::Uninitialized;
+                data.properties.push((key, property));
+                Ok(())
+            }
+            (None, _) => {
+                data.properties.push((key, property));
+                Ok(())
             }
         }
     }

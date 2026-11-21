@@ -135,6 +135,20 @@ struct ArrayData {
     // none for Array.prototype, Some(None) for no prototype at all
     prototype: Option<Option<object::ObjectHandle>>,
     integrity: Integrity,
+    // named properties, and elements an accessor or attributes set apart, whose slot in
+    // values stays a hole
+    properties: Vec<(String, object::Property)>,
+    // length was made non-writable: it cannot change, so nothing is added past the end
+    fixed_length: bool,
+}
+
+impl ArrayData {
+    fn own(&self, key: &str) -> Option<&object::Property> {
+        self.properties
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, property)| property)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,6 +169,8 @@ impl From<Vec<Value>> for ArrayData {
             values,
             prototype: None,
             integrity: Integrity::Open,
+            properties: Vec::new(),
+            fixed_length: false,
         }
     }
 }
@@ -188,7 +204,6 @@ impl std::ops::DerefMut for ArrayData {
     }
 }
 // named properties set on arrays, keyed by allocation while the array is alive
-type ArrayExpandos = HashMap<usize, (Weak<RefCell<ArrayData>>, Vec<(String, Value)>)>;
 type NodeListHandle = Rc<Vec<ElementHandle>>;
 type IteratorHandle = Rc<RefCell<IteratorData>>;
 type ErrorHandle = Rc<ErrorData>;
@@ -794,8 +809,6 @@ pub struct ScriptRuntime {
     // arrays being joined, so a cycle prints as empty instead of recursing
     joining: Vec<ArrayHandle>,
     template_cache: HashMap<(usize, usize), (Rc<compiler::Code>, Value)>,
-    array_expandos: ArrayExpandos,
-    array_expando_prune_at: usize,
     // the FinalizationRegistry objects whose targets are watched after each turn
     registries: Vec<std::rc::Weak<RefCell<collections::Registry>>>,
     // outside fetches the host runs off this thread, and the id the next one takes
@@ -1964,8 +1977,6 @@ impl ScriptRuntime {
             symbol_counter: 0,
             joining: Vec::new(),
             template_cache: HashMap::new(),
-            array_expandos: HashMap::new(),
-            array_expando_prune_at: 64,
             registries: Vec::new(),
             fetches: RefCell::new(Vec::new()),
             event_sources: HashMap::new(),
@@ -13386,6 +13397,9 @@ fn array_write_refusal(array: &ArrayHandle, index: usize) -> Option<String> {
         Integrity::Sealed | Integrity::Closed if !present => Some(format!(
             "Cannot add property {index}, object is not extensible"
         )),
+        _ if array.fixed_length && index >= array.len() => Some(format!(
+            "Cannot add property {index}, the array's length is read-only"
+        )),
         _ => None,
     }
 }
@@ -13394,6 +13408,15 @@ fn set_array_element(array: &ArrayHandle, index: usize, value: Value) -> Result<
     if let Some(refusal) = array_write_refusal(array, index) {
         return Err(runtime_error(refusal));
     }
+    set_array_element_unchecked(array, index, value)
+}
+
+// an element write that integrity was already checked for, or that defineProperty settles
+fn set_array_element_unchecked(
+    array: &ArrayHandle,
+    index: usize,
+    value: Value,
+) -> Result<(), ScriptError> {
     if index >= MAX_RUNTIME_ARRAY_LENGTH {
         return Err(runtime_error(
             "array index exceeds the deterministic length limit",
@@ -13408,10 +13431,15 @@ fn set_array_element(array: &ArrayHandle, index: usize, value: Value) -> Result<
 }
 
 fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError> {
-    let (length, integrity) = {
+    let (length, integrity, fixed) = {
         let array = array.borrow();
-        (array.len(), array.integrity)
+        (array.len(), array.integrity, array.fixed_length)
     };
+    if fixed && value.number().ok() != Some(length as f64) {
+        return Err(runtime_error(
+            "Cannot assign to read only property 'length' of object '[object Array]'",
+        ));
+    }
     // a frozen array keeps its length, and a sealed one cannot lose elements
     let refused = match integrity {
         Integrity::Frozen => value.number().ok() != Some(length as f64),
@@ -13436,9 +13464,29 @@ fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError
             "array length must be a non-negative integer within the deterministic limit",
         ));
     }
-    array
-        .borrow_mut()
-        .resize(number as usize, Value::Uninitialized);
+    let wanted = number as usize;
+    let mut array = array.borrow_mut();
+    // elements in the property list past the new end go with the rest, unless one of them
+    // cannot be deleted, which keeps the array long enough to hold it
+    let kept = array
+        .properties
+        .iter()
+        .filter(|(name, property)| {
+            !property.configurable
+                && object::array_index(name).is_some_and(|index| index as usize >= wanted)
+        })
+        .filter_map(|(name, _)| object::array_index(name))
+        .max();
+    let length = kept.map_or(wanted, |index| index as usize + 1);
+    array.properties.retain(|(name, _)| {
+        object::array_index(name).is_none_or(|index| (index as usize) < length)
+    });
+    array.resize(length, Value::Uninitialized);
+    if kept.is_some() {
+        return Err(runtime_error(
+            "Cannot delete a non-configurable element while shortening the array",
+        ));
+    }
     Ok(())
 }
 
