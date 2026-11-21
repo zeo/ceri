@@ -364,6 +364,30 @@ impl JsObject {
         &self.entries
     }
 
+    // the prototype set on the object itself, which the cycle collector follows
+    pub(super) fn own_prototype(&self) -> Option<&ObjectHandle> {
+        self.prototype.as_ref()
+    }
+
+    // empties an object the cycle collector found unreachable: what it held, and its class
+    pub(super) fn take_for_collection(&mut self) -> (Vec<Value>, ObjectClass) {
+        let mut values = Vec::new();
+        for (_, property) in self.entries.drain(..) {
+            match property.slot {
+                Slot::Data(value) => values.push(value),
+                Slot::Accessor { get, set } => values.extend(get.into_iter().chain(set)),
+            }
+        }
+        self.index = None;
+        if let Some(prototype) = self.prototype.take() {
+            values.push(Value::Object(prototype));
+        }
+        (
+            values,
+            std::mem::replace(&mut self.class, ObjectClass::Ordinary),
+        )
+    }
+
     pub(super) fn freeze(&mut self, writable: bool) {
         self.extensible = false;
         for (_, property) in &mut self.entries {
@@ -398,7 +422,9 @@ pub(super) fn is_private_key(key: &str) -> bool {
 }
 
 pub(super) fn new_object(object: JsObject) -> ObjectHandle {
-    Rc::new(RefCell::new(object))
+    let handle = Rc::new(RefCell::new(object));
+    super::heap::register_object(&handle);
+    handle
 }
 
 #[cfg(test)]

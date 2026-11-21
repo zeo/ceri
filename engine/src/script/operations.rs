@@ -1772,7 +1772,9 @@ impl ScriptRuntime {
     }
 
     pub(super) fn new_array(values: Vec<Value>) -> Value {
-        Value::Array(Rc::new(RefCell::new(values.into())))
+        let array = Rc::new(RefCell::new(values.into()));
+        super::heap::register_array(&array);
+        Value::Array(array)
     }
 
     // own enumerable properties, string and symbol keyed, as object spread copies them

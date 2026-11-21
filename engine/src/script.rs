@@ -43,6 +43,7 @@ mod display_names_data;
 mod displaynames;
 mod disposables;
 mod durationformat;
+mod heap;
 mod lexer;
 mod locale;
 mod locale_data;
@@ -1725,6 +1726,8 @@ impl ScriptRuntime {
         session_storage: Option<StorageHandle>,
         host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
+        // a runtime dropped before this one may have left cycles behind
+        heap::collect_if_due();
         let global = Rc::new(RefCell::new(Environment::default()));
         let (intrinsics, intrinsic_globals) = create_intrinsics();
         let selection = ranges::new_selection(&intrinsics);
@@ -4187,6 +4190,10 @@ impl ScriptRuntime {
             executed += 1;
         }
         self.clock = target;
+        {
+            let _profile = crate::profile::scope("script: cycles");
+            heap::collect_if_due();
+        }
         {
             let _profile = crate::profile::scope("script: audio");
             self.pump_audio()?;

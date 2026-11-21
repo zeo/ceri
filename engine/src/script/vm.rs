@@ -23,12 +23,14 @@ pub(super) struct Scope {
 
 impl Scope {
     pub(super) fn new(layout: Rc<Layout>, parent: Option<ScopeRef>) -> ScopeRef {
-        Rc::new(RefCell::new(Scope {
+        let scope = Rc::new(RefCell::new(Scope {
             slots: vec![Value::Undefined; layout.names.len()],
             parent,
             layout,
             extra: Vec::new(),
-        }))
+        }));
+        super::heap::register_scope(&scope);
+        scope
     }
 }
 
