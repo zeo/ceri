@@ -44,6 +44,7 @@ mod object;
 mod observers;
 mod operations;
 mod parser;
+mod path2d;
 mod pattern;
 mod promises;
 mod ranges;

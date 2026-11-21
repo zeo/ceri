@@ -32,6 +32,10 @@ const METHODS: &[&str] = &[
     "arc",
     "ellipse",
     "rect",
+    "arcTo",
+    "roundRect",
+    "isPointInPath",
+    "isPointInStroke",
     "fill",
     "stroke",
     "strokeRect",
@@ -530,6 +534,205 @@ impl CanvasContextData {
                 self.cubic_to(first, second, end);
             }
         }
+    }
+
+    // a line toward the corner at the first point, rounded into the line toward the second
+    fn arc_to(&mut self, corner: (f32, f32), toward: (f32, f32), radius: f32) {
+        let Some((pen, _)) = self.pen else {
+            self.move_to(corner);
+            return;
+        };
+        let Some(back) = inverse(self.state.transform) else {
+            return;
+        };
+        let from = crate::svg::map(back, pen);
+        let (first, second) = (
+            (from.0 - corner.0, from.1 - corner.1),
+            (toward.0 - corner.0, toward.1 - corner.1),
+        );
+        let cross = first.0 * second.1 - first.1 * second.0;
+        let (first_length, second_length) = (first.0.hypot(first.1), second.0.hypot(second.1));
+        if radius == 0.0 || first_length == 0.0 || second_length == 0.0 || cross.abs() < 1e-6 {
+            self.line_to(corner);
+            return;
+        }
+        let (first, second) = (
+            (first.0 / first_length, first.1 / first_length),
+            (second.0 / second_length, second.1 / second_length),
+        );
+        let angle = (first.0 * second.0 + first.1 * second.1)
+            .clamp(-1.0, 1.0)
+            .acos();
+        let reach = radius / (angle / 2.0).tan();
+        let bisector = (first.0 + second.0, first.1 + second.1);
+        let bisector_length = bisector.0.hypot(bisector.1);
+        let middle = radius / (angle / 2.0).sin();
+        let center = (
+            corner.0 + bisector.0 / bisector_length * middle,
+            corner.1 + bisector.1 / bisector_length * middle,
+        );
+        let start = (corner.0 + first.0 * reach, corner.1 + first.1 * reach);
+        let end = (corner.0 + second.0 * reach, corner.1 + second.1 * reach);
+        let angles = (
+            (start.1 - center.1).atan2(start.0 - center.0),
+            (end.1 - center.1).atan2(end.0 - center.0),
+        );
+        self.arc(center, (radius, radius), 0.0, angles, cross > 0.0);
+    }
+
+    // a rectangle with rounded corners, radii shrunk together where they would overlap
+    fn round_rect(
+        &mut self,
+        (mut x, mut y, mut width, mut height): Rect4,
+        mut radii: [(f32, f32); 4],
+    ) {
+        if width < 0.0 {
+            x += width;
+            width = -width;
+            radii = [radii[1], radii[0], radii[3], radii[2]];
+        }
+        if height < 0.0 {
+            y += height;
+            height = -height;
+            radii = [radii[3], radii[2], radii[1], radii[0]];
+        }
+        let [top_left, top_right, bottom_right, bottom_left] = radii;
+        let fit = [
+            width / (top_left.0 + top_right.0),
+            width / (bottom_left.0 + bottom_right.0),
+            height / (top_left.1 + bottom_left.1),
+            height / (top_right.1 + bottom_right.1),
+        ]
+        .into_iter()
+        .filter(|scale| scale.is_finite())
+        .fold(1.0_f32, f32::min);
+        let [top_left, top_right, bottom_right, bottom_left] =
+            [top_left, top_right, bottom_right, bottom_left].map(|(rx, ry)| (rx * fit, ry * fit));
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let corner = |context: &mut Self,
+                      center: (f32, f32),
+                      radii: (f32, f32),
+                      from: f32,
+                      point: (f32, f32)| {
+            if radii.0 > 0.0 && radii.1 > 0.0 {
+                context.arc(center, radii, 0.0, (from, from + quarter), false);
+            } else {
+                context.line_to(point);
+            }
+        };
+        self.move_to((x + top_left.0, y));
+        self.line_to((x + width - top_right.0, y));
+        corner(
+            self,
+            (x + width - top_right.0, y + top_right.1),
+            top_right,
+            -quarter,
+            (x + width, y),
+        );
+        self.line_to((x + width, y + height - bottom_right.1));
+        corner(
+            self,
+            (x + width - bottom_right.0, y + height - bottom_right.1),
+            bottom_right,
+            0.0,
+            (x + width, y + height),
+        );
+        self.line_to((x + bottom_left.0, y + height));
+        corner(
+            self,
+            (x + bottom_left.0, y + height - bottom_left.1),
+            bottom_left,
+            quarter,
+            (x, y + height),
+        );
+        self.line_to((x, y + top_left.1));
+        corner(
+            self,
+            (x + top_left.0, y + top_left.1),
+            top_left,
+            2.0 * quarter,
+            (x, y),
+        );
+        self.close_path();
+        self.move_to((x, y));
+    }
+
+    fn replay(&mut self, ops: &[super::path2d::PathOp]) {
+        use super::path2d::PathOp;
+        for op in ops {
+            match op {
+                PathOp::Move(point) => self.move_to(*point),
+                PathOp::Line(point) => self.line_to(*point),
+                PathOp::Cubic(first, second, end) => self.cubic_to(*first, *second, *end),
+                PathOp::Quadratic(control, end) => self.quadratic_to(*control, *end),
+                PathOp::Close => self.close_path(),
+                PathOp::Rect(rect) => self.rect(*rect),
+                PathOp::Arc(center, radii, rotation, angles, counterclockwise) => {
+                    self.arc(*center, *radii, *rotation, *angles, *counterclockwise)
+                }
+                PathOp::ArcTo(corner, toward, radius) => self.arc_to(*corner, *toward, *radius),
+                PathOp::RoundRect(rect, radii) => self.round_rect(*rect, *radii),
+                PathOp::Transformed(matrix, ops) => {
+                    let saved = self.state.transform;
+                    self.state.transform = crate::svg::multiply(saved, *matrix);
+                    self.replay(ops);
+                    self.state.transform = saved;
+                }
+            }
+        }
+    }
+
+    // a Path2D as a path in the bitmap's pixels under the transform in force, the current
+    // path untouched
+    fn path_from(&mut self, ops: &[super::path2d::PathOp]) -> Vec<Segment> {
+        let (path, pen) = (std::mem::take(&mut self.path), self.pen.take());
+        self.replay(ops);
+        let made = std::mem::replace(&mut self.path, path);
+        self.pen = pen;
+        made
+    }
+
+    // whether a point of the bitmap lies inside the path, or under its stroke
+    fn hit(&self, path: &[Segment], point: (f32, f32), even_odd: bool, stroke: bool) -> bool {
+        let (width, height) = self.size();
+        if !(point.0 >= 0.0 && point.1 >= 0.0 && point.0 < width as f32 && point.1 < height as f32)
+        {
+            return false;
+        }
+        let coverage = if stroke {
+            let Some(back) = inverse(self.state.transform) else {
+                return false;
+            };
+            let user = path
+                .iter()
+                .map(|&segment| map_segment(back, segment))
+                .collect::<Vec<_>>();
+            let pen = Pen {
+                width: self.state.line_width,
+                cap: self.state.cap,
+                join: self.state.join,
+                miter_limit: self.state.miter_limit,
+                dash: &self.state.dash,
+                dash_offset: self.state.dash_offset,
+            };
+            crate::svg::path_coverage(&user, self.state.transform, Some(pen), false, self.size())
+        } else {
+            crate::svg::path_coverage(path, IDENTITY, None, even_odd, self.size())
+        };
+        let Some(coverage) = coverage else {
+            return false;
+        };
+        let (x, y) = (
+            point.0 as i64 - i64::from(coverage.left),
+            point.1 as i64 - i64::from(coverage.top),
+        );
+        if x < 0 || y < 0 || x as usize >= coverage.width {
+            return false;
+        }
+        coverage
+            .values
+            .get(y as usize * coverage.width + x as usize)
+            .is_some_and(|&value| value >= 128)
     }
 
     // a shape and the shadow it casts beneath it
@@ -1726,7 +1929,7 @@ impl ScriptRuntime {
             "rotate" => 1,
             "transform" | "bezierCurveTo" => 6,
             "quadraticCurveTo" | "rect" | "strokeRect" | "fillRect" | "clearRect" => 4,
-            "arc" => 5,
+            "arc" | "arcTo" => 5,
             "ellipse" => 7,
             _ => 0,
         };
@@ -1753,6 +1956,16 @@ impl ScriptRuntime {
                 "bezierCurveTo" => context.cubic_to((n(0), n(1)), (n(2), n(3)), (n(4), n(5))),
                 "quadraticCurveTo" => context.quadratic_to((n(0), n(1)), (n(2), n(3))),
                 "rect" => context.rect((n(0), n(1), n(2), n(3))),
+                "arcTo" => {
+                    if n(4) < 0.0 {
+                        drop(context);
+                        return Err(self.throw_value(dom_exception(
+                            "IndexSizeError",
+                            "Failed to execute 'arcTo' on 'CanvasRenderingContext2D': The radius provided is negative.",
+                        )));
+                    }
+                    context.arc_to((n(0), n(1)), (n(2), n(3)), n(4));
+                }
                 "arc" | "ellipse" => {
                     let (radii, rotation, angles) = match name {
                         "arc" => ((n(2), n(2)), 0.0, (n(3), n(4))),
@@ -1865,16 +2078,61 @@ impl ScriptRuntime {
                 let even_odd = arguments
                     .iter()
                     .any(|argument| argument.string_value() == "evenodd");
+                let given = arguments.first().and_then(Self::path_of);
                 let mut context = context.borrow_mut();
-                let path = context.path.clone();
+                let path = match given {
+                    Some(ops) => context.path_from(&ops.borrow()),
+                    None => context.path.clone(),
+                };
                 context.fill_path(&path, even_odd);
                 Ok(Value::Undefined)
             }
             "stroke" => {
+                let given = arguments.first().and_then(Self::path_of);
                 let mut context = context.borrow_mut();
-                let path = context.path.clone();
+                let path = match given {
+                    Some(ops) => context.path_from(&ops.borrow()),
+                    None => context.path.clone(),
+                };
                 context.stroke_path(&path);
                 Ok(Value::Undefined)
+            }
+            "roundRect" => {
+                let Some(numbers) = self.canvas_numbers(name, arguments, 4)? else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(radii) = self.round_rect_radii("roundRect", arguments.get(4))? else {
+                    return Ok(Value::Undefined);
+                };
+                context
+                    .borrow_mut()
+                    .round_rect((numbers[0], numbers[1], numbers[2], numbers[3]), radii);
+                Ok(Value::Undefined)
+            }
+            "isPointInPath" | "isPointInStroke" => {
+                let given = arguments.first().and_then(Self::path_of);
+                let rest = if given.is_some() {
+                    arguments.get(1..).unwrap_or_default()
+                } else {
+                    arguments
+                };
+                let Some(point) = self.canvas_numbers(name, rest, 2)? else {
+                    return Ok(Value::Bool(false));
+                };
+                let even_odd = rest
+                    .get(2)
+                    .is_some_and(|rule| rule.string_value() == "evenodd");
+                let mut context = context.borrow_mut();
+                let path = match given {
+                    Some(ops) => context.path_from(&ops.borrow()),
+                    None => context.path.clone(),
+                };
+                Ok(Value::Bool(context.hit(
+                    &path,
+                    (point[0], point[1]),
+                    even_odd,
+                    name == "isPointInStroke",
+                )))
             }
             "fillText" | "strokeText" => {
                 let text = arguments
@@ -1921,8 +2179,12 @@ impl ScriptRuntime {
                 let even_odd = arguments
                     .iter()
                     .any(|argument| argument.string_value() == "evenodd");
+                let given = arguments.first().and_then(Self::path_of);
                 let mut context = context.borrow_mut();
-                let path = context.path.clone();
+                let path = match given {
+                    Some(ops) => context.path_from(&ops.borrow()),
+                    None => context.path.clone(),
+                };
                 context.clip_to(&path, even_odd);
                 Ok(Value::Undefined)
             }
